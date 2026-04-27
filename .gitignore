@@ -1,0 +1,27 @@
+# Local configuration and secrets
+.env
+*.env
+SolarFusionAPI.txt
+
+# Local database and backups
+*.db
+*.sqlite
+*.sqlite3
+backups/
+
+# Imported/exported business files
+*.xlsx
+*.xls
+*.pdf
+uploads/
+
+# Python cache and local runtime files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtual environments and editor noise
+.venv/
+venv/
+.idea/
+.vscode/

@@ -1,32 +1,53 @@
 # Monitoring Board Local
 
-Aplicação local em Python para:
-
-- importar o `Project Overview` do Excel para SQLite
-- registar monitorização diária por colar tabela
-- manter histórico por data e estado atual por asset
-- gerir corretivas com tickets, urgência e visitas
+Aplicacao local em Flask para acompanhar instalacoes, monitorizacao diaria,
+contratos, tickets corretivos, exportacoes e integracoes.
 
 ## Arranque
 
-1. Instalar dependências:
+1. Criar e ativar um ambiente Python, se necessario.
+
+2. Instalar dependencias:
 
 ```powershell
-pip install flask openpyxl
+pip install -r requirements.txt
 ```
 
-2. Arrancar a app:
+3. Criar a configuracao local:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+4. Preencher `.env` com os valores locais, incluindo as credenciais atuais do
+   FusionSolar.
+
+5. Arrancar a app:
 
 ```powershell
 python app.py
 ```
 
-3. Abrir no browser:
+6. Abrir no browser:
 
 `http://127.0.0.1:5000`
 
+## Ficheiros locais
+
+Estes ficheiros nao devem ir para Git:
+
+- `.env`
+- `monitoring_board.db`
+- ficheiros Excel e PDF
+- `uploads/`
+- `backups/`
+- `__pycache__/`
+- `SolarFusionAPI.txt`
+
 ## Notas
 
-- A app cria a base `monitoring_board.db` na pasta do projeto.
-- Ao arrancar, tenta importar automaticamente o ficheiro `.xlsx` presente na pasta.
-- Se uma instalação diária vier com nome diferente, a linha fica pendente em `Monitorização` até ser associada a um asset. A partir daí fica guardado um alias para futuras importações.
+- A app cria `monitoring_board.db` na pasta do projeto.
+- Ao arrancar, tenta importar automaticamente o primeiro ficheiro `.xlsx`
+  presente na pasta.
+- As credenciais FusionSolar devem ser trocadas no portal/fornecedor e depois
+  atualizadas em `.env` ou no ecra de Integracoes da app.

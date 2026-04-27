@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -27,11 +28,28 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 
 
 BASE_DIR = Path(__file__).resolve().parent
+
+
+def load_local_env() -> None:
+    env_path = BASE_DIR / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        if key and key not in os.environ:
+            os.environ[key] = value.strip().strip('"').strip("'")
+
+
+load_local_env()
+
 DB_PATH = BASE_DIR / "monitoring_board.db"
 DEFAULT_EXCEL_PATH = next(BASE_DIR.glob("*.xlsx"), None)
 BACKUP_DIR = BASE_DIR / "backups"
 CONTRACTS_DIR = BASE_DIR / "uploads" / "contracts"
-FUSIONSOLAR_TXT_PATH = BASE_DIR / "SolarFusionAPI.txt"
 INTEGRATION_PROVIDER_FUSIONSOLAR = "FusionSolar"
 INTEGRATION_PROVIDER_OPTIONS = [INTEGRATION_PROVIDER_FUSIONSOLAR]
 DEFAULT_FUSIONSOLAR_SYNC_HOURS = "08:00,14:00"
@@ -134,7 +152,7 @@ FUSIONSOLAR_SYNC_LOCK = threading.Lock()
 
 def create_app() -> Flask:
     app = Flask(__name__)
-    app.config["SECRET_KEY"] = "monitoring-board-local-secret"
+    app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET_KEY", "monitoring-board-local-secret")
     app.config["DATABASE"] = str(DB_PATH)
     app.config["EXCEL_PATH"] = str(DEFAULT_EXCEL_PATH) if DEFAULT_EXCEL_PATH else ""
 
@@ -3252,24 +3270,24 @@ def ensure_predefined_export_templates(conn: sqlite3.Connection) -> None:
         )
 
 
-def parse_fusionsolar_credentials_file() -> dict[str, str]:
-    if not FUSIONSOLAR_TXT_PATH.exists():
-        return {}
-    data: dict[str, str] = {}
-    for line in FUSIONSOLAR_TXT_PATH.read_text(encoding="utf-8", errors="ignore").splitlines():
-        if ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        normalized_key = normalize_name(key)
-        data[normalized_key] = value.strip()
+def get_fusionsolar_env_config() -> dict[str, str]:
     return {
-        "username": data.get("username", ""),
-        "password": data.get("password", ""),
+        "username": os.environ.get("FUSIONSOLAR_USERNAME", "").strip(),
+        "password": os.environ.get("FUSIONSOLAR_PASSWORD", "").strip(),
+        "base_url": os.environ.get("FUSIONSOLAR_BASE_URL", "").strip(),
+        "login_endpoint": os.environ.get("FUSIONSOLAR_LOGIN_ENDPOINT", DEFAULT_FUSIONSOLAR_LOGIN_ENDPOINT).strip(),
+        "plants_endpoint": os.environ.get("FUSIONSOLAR_STATIONS_ENDPOINT", DEFAULT_FUSIONSOLAR_STATIONS_ENDPOINT).strip(),
+        "real_time_endpoint": os.environ.get(
+            "FUSIONSOLAR_REALTIME_ENDPOINT",
+            DEFAULT_FUSIONSOLAR_REALTIME_ENDPOINT,
+        ).strip(),
+        "alarms_endpoint": os.environ.get("FUSIONSOLAR_ALARMS_ENDPOINT", DEFAULT_FUSIONSOLAR_ALARMS_ENDPOINT).strip(),
+        "sync_hours": os.environ.get("FUSIONSOLAR_SYNC_HOURS", DEFAULT_FUSIONSOLAR_SYNC_HOURS).strip(),
     }
 
 
 def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
-    credentials = parse_fusionsolar_credentials_file()
+    env_config = get_fusionsolar_env_config()
     existing = conn.execute(
         "SELECT * FROM integration_configs WHERE provider = ?",
         (INTEGRATION_PROVIDER_FUSIONSOLAR,),
@@ -3280,6 +3298,7 @@ def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
             UPDATE integration_configs
             SET username = CASE WHEN COALESCE(username, '') = '' THEN ? ELSE username END,
                 password = CASE WHEN COALESCE(password, '') = '' THEN ? ELSE password END,
+                base_url = CASE WHEN COALESCE(base_url, '') = '' THEN ? ELSE base_url END,
                 login_endpoint = CASE WHEN COALESCE(login_endpoint, '') = '' THEN ? ELSE login_endpoint END,
                 plants_endpoint = CASE WHEN COALESCE(plants_endpoint, '') = '' THEN ? ELSE plants_endpoint END,
                 real_time_endpoint = CASE WHEN COALESCE(real_time_endpoint, '') = '' THEN ? ELSE real_time_endpoint END,
@@ -3289,13 +3308,14 @@ def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
             WHERE provider = ?
             """,
             (
-                credentials.get("username", ""),
-                credentials.get("password", ""),
-                DEFAULT_FUSIONSOLAR_LOGIN_ENDPOINT,
-                DEFAULT_FUSIONSOLAR_STATIONS_ENDPOINT,
-                DEFAULT_FUSIONSOLAR_REALTIME_ENDPOINT,
-                DEFAULT_FUSIONSOLAR_ALARMS_ENDPOINT,
-                DEFAULT_FUSIONSOLAR_SYNC_HOURS,
+                env_config["username"],
+                env_config["password"],
+                env_config["base_url"],
+                env_config["login_endpoint"],
+                env_config["plants_endpoint"],
+                env_config["real_time_endpoint"],
+                env_config["alarms_endpoint"],
+                env_config["sync_hours"],
                 datetime.now().isoformat(timespec="seconds"),
                 INTEGRATION_PROVIDER_FUSIONSOLAR,
             ),
@@ -3311,16 +3331,16 @@ def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
         """,
         (
             INTEGRATION_PROVIDER_FUSIONSOLAR,
-            credentials.get("username", ""),
-            credentials.get("password", ""),
-            "",
-            DEFAULT_FUSIONSOLAR_LOGIN_ENDPOINT,
-            DEFAULT_FUSIONSOLAR_STATIONS_ENDPOINT,
-            DEFAULT_FUSIONSOLAR_REALTIME_ENDPOINT,
-            DEFAULT_FUSIONSOLAR_ALARMS_ENDPOINT,
+            env_config["username"],
+            env_config["password"],
+            env_config["base_url"],
+            env_config["login_endpoint"],
+            env_config["plants_endpoint"],
+            env_config["real_time_endpoint"],
+            env_config["alarms_endpoint"],
             0,
             0,
-            DEFAULT_FUSIONSOLAR_SYNC_HOURS,
+            env_config["sync_hours"],
             datetime.now().isoformat(timespec="seconds"),
             datetime.now().isoformat(timespec="seconds"),
         ),

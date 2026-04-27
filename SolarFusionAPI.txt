@@ -1,2 +1,0 @@
-password: SolcorOM_API_2026!x7Q
-Username: solcor_om_api
