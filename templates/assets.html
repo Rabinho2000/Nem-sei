@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">Instalacoes</p>
+    <h2>Todas as instalacoes do Project Overview</h2>
+    <p class="muted">Consulta rapida dos parametros principais, do grupo de instalacao e do ultimo estado monitorizado.</p>
+  </div>
+</section>
+
+<details class="card asset-edit-details" id="new-asset">
+  <summary class="asset-edit-summary">Acrescentar nova instalacao</summary>
+  <form class="stack-form asset-edit-form" method="post">
+    <label>Central
+      <input type="text" name="project_name" placeholder="Nome da central" required>
+    </label>
+    <label>Instalacao
+      <input type="text" name="installation_group" placeholder="Grupo/instalacao, se aplicavel">
+    </label>
+    <label>Empresa
+      <input type="text" name="company_name" placeholder="Cliente ou empresa">
+    </label>
+    <label>Localizacao
+      <input type="text" name="location" placeholder="Ex. Leiria">
+    </label>
+    <label>Morada
+      <input type="text" name="address" placeholder="Morada">
+    </label>
+    <label>kWp
+      <input type="text" name="kwp" placeholder="Potencia">
+    </label>
+    <label>Contrato
+      <input type="text" name="contract_type" placeholder="Ex. EPC, ESCO">
+    </label>
+    <label>Maintenance
+      <select name="maintenance">
+        <option value="">-</option>
+        <option value="yes">Sim</option>
+        <option value="no">Nao</option>
+      </select>
+    </label>
+    <label>O&amp;M ativo
+      <select name="active_contract">
+        <option value="">-</option>
+        <option value="yes">Ativo</option>
+        <option value="no">Sem contrato</option>
+      </select>
+    </label>
+    <label>Inicio contrato
+      <input type="date" name="start_contract">
+    </label>
+    <label>Fim contrato
+      <input type="date" name="end_contract">
+    </label>
+    <label>Nome contacto
+      <input type="text" name="contact_name" placeholder="Nome do contacto">
+    </label>
+    <label>Email contacto
+      <input type="text" name="contact_email" placeholder="Email">
+    </label>
+    <label>Telefone contacto
+      <input type="text" name="contact_phone" placeholder="Telefone">
+    </label>
+    <label>Notas
+      <textarea name="notes" rows="4" placeholder="Observacoes iniciais"></textarea>
+    </label>
+    <button class="button" type="submit">Criar instalacao</button>
+  </form>
+</details>
+
+<section class="card">
+  <form class="filters js-auto-submit" method="get">
+    <input type="text" name="search" value="{{ search }}" placeholder="Pesquisar por nome, empresa, localizacao ou alias">
+    <select name="contract_type">
+      <option value="">Todos os contratos</option>
+      {% for contract_type in contract_types %}
+        <option value="{{ contract_type }}" {{ 'selected' if contract_filter == contract_type else '' }}>{{ contract_type }}</option>
+      {% endfor %}
+    </select>
+    <select name="active_contract">
+      <option value="">O&M ativo ou nao</option>
+      <option value="yes" {{ 'selected' if om_filter == 'yes' else '' }}>Com contrato ativo</option>
+      <option value="no" {{ 'selected' if om_filter == 'no' else '' }}>Sem contrato ativo</option>
+    </select>
+    <button class="button" type="submit">Aplicar</button>
+  </form>
+</section>
+
+<section class="card">
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Central</th>
+          <th>Instalacao</th>
+          <th>Empresa</th>
+          <th>Localizacao</th>
+          <th>kWp</th>
+          <th>Contrato</th>
+          <th>O&M</th>
+          <th>Estado atual</th>
+          <th>Tickets</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for asset in assets %}
+          <tr>
+            <td>{{ asset.project_name }}</td>
+            <td>{{ asset.installation_group or asset.project_name }}</td>
+            <td>{{ asset.company_name or "-" }}</td>
+            <td>{{ asset.location or "-" }}</td>
+            <td>{{ asset.kwp or "-" }}</td>
+            <td>{{ asset.contract_type or "-" }}</td>
+            <td><span class="chip {{ 'om-active' if asset.active_contract == 'yes' else 'om-inactive' }}">{{ om_status_label(asset.active_contract) }}</span></td>
+            <td>
+              {% if asset.latest_status %}
+                <span class="chip {{ status_colors.get(asset.latest_status, 'muted') }}">{{ asset.latest_status }}</span>
+                <small>{{ asset.latest_status_date }}</small>
+              {% else %}
+                <span class="muted">Sem estado</span>
+              {% endif %}
+            </td>
+            <td>{{ asset.open_tickets }}</td>
+            <td><a class="table-link" href="{{ url_for('asset_detail', asset_id=asset.id) }}">Abrir</a></td>
+          </tr>
+        {% else %}
+          <tr><td colspan="10" class="muted">Sem assets para estes filtros.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

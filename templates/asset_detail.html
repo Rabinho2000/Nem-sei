@@ -1,0 +1,242 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">Instalacao</p>
+    <h2>{{ asset.project_name }}</h2>
+    <p class="muted">{{ asset.company_name or "Sem empresa definida" }}</p>
+  </div>
+  <div class="hero-actions">
+    <a class="button" href="#asset-edit">Editar informacoes</a>
+    <a class="button secondary" href="{{ url_for('assets') }}">Voltar</a>
+  </div>
+</section>
+
+<section class="grid two">
+  <details class="card asset-edit-details" id="asset-edit">
+    <summary class="asset-edit-summary">Editar informacoes da instalacao</summary>
+    <form class="stack-form asset-edit-form" method="post" action="{{ url_for('update_asset', asset_id=asset.id) }}">
+      <label>Central
+        <input type="text" name="project_name" value="{{ asset.project_name }}">
+      </label>
+      <label>Instalacao
+        <input type="text" name="installation_group" value="{{ asset.installation_group or asset.project_name }}">
+      </label>
+      <label>Empresa
+        <input type="text" name="company_name" value="{{ asset.company_name or '' }}">
+      </label>
+      <label>Localizacao
+        <input type="text" name="location" value="{{ asset.location or '' }}">
+      </label>
+      <label>Morada
+        <input type="text" name="address" value="{{ asset.address or '' }}">
+      </label>
+      <label>Contrato
+        <input type="text" name="contract_type" value="{{ asset.contract_type or '' }}">
+      </label>
+      <label>Maintenance
+        <select name="maintenance">
+          <option value="" {{ 'selected' if not asset.maintenance else '' }}>-</option>
+          <option value="yes" {{ 'selected' if asset.maintenance == 'yes' else '' }}>Sim</option>
+          <option value="no" {{ 'selected' if asset.maintenance == 'no' else '' }}>Nao</option>
+        </select>
+      </label>
+      <label>O&amp;M ativo
+        <select name="active_contract">
+          <option value="" {{ 'selected' if not asset.active_contract else '' }}>-</option>
+          <option value="yes" {{ 'selected' if asset.active_contract == 'yes' else '' }}>Ativo</option>
+          <option value="no" {{ 'selected' if asset.active_contract == 'no' else '' }}>Sem contrato</option>
+        </select>
+      </label>
+      <label>Inicio contrato
+        <input type="date" name="start_contract" value="{{ asset.start_contract or '' }}">
+      </label>
+      <label>Fim contrato
+        <input type="date" name="end_contract" value="{{ asset.end_contract or '' }}">
+      </label>
+      <label>Nome contacto
+        <input type="text" name="contact_name" value="{{ asset.contact_name or '' }}">
+      </label>
+      <label>Email contacto
+        <input type="text" name="contact_email" value="{{ asset.contact_email or '' }}">
+      </label>
+      <label>Telefone contacto
+        <input type="text" name="contact_phone" value="{{ asset.contact_phone or '' }}">
+      </label>
+      <label>Notas
+        <textarea name="notes" rows="4">{{ asset.notes or '' }}</textarea>
+      </label>
+      <div class="hero-actions">
+        <button class="button" type="submit">Guardar instalacao</button>
+        <button class="button danger-button" type="submit" formaction="{{ url_for('delete_asset', asset_id=asset.id) }}">Apagar instalacao</button>
+      </div>
+    </form>
+  </details>
+
+  <article class="card">
+    <div class="section-title"><h3>Instalacao</h3></div>
+    <form class="stack-form" method="post" action="{{ url_for('update_asset_installation_group', asset_id=asset.id) }}">
+      <label>Grupo de instalacao
+        <input type="text" name="installation_group" value="{{ asset.installation_group or asset.project_name }}" placeholder="Ex. Sicobrita">
+      </label>
+      <p class="muted">Usa este campo para agrupar varias centrais da mesma instalacao. Os tickets continuam ligados a esta central especifica.</p>
+      <button class="button secondary" type="submit">Guardar grupo</button>
+    </form>
+  </article>
+
+  <article class="card">
+    <div class="section-title"><h3>Contrato O&amp;M</h3></div>
+    <form class="stack-form" method="post" action="{{ url_for('update_asset_contract', asset_id=asset.id) }}" enctype="multipart/form-data">
+      <label>Data de inicio
+        <input type="date" name="contract_start_date" value="{{ om_contract.contract_start_date if om_contract else '' }}">
+      </label>
+      <label>Data de fim
+        <input type="date" name="contract_end_date" value="{{ om_contract.contract_end_date if om_contract else '' }}">
+      </label>
+      <label>Valor anual
+        <input type="number" step="0.01" min="0" name="annual_value" value="{{ om_contract.annual_value if om_contract and om_contract.annual_value is not none else '' }}" placeholder="Ex. 2500.00">
+      </label>
+      <label>PDF do contrato
+        <input type="file" name="contract_pdf" accept="application/pdf,.pdf">
+      </label>
+      <label>Notas do contrato
+        <textarea name="contract_notes" rows="4" placeholder="Observacoes ou notas de validacao manual">{{ om_contract.notes if om_contract else '' }}</textarea>
+      </label>
+      <div class="hero-actions">
+        <button class="button" type="submit">Guardar contrato</button>
+        {% if om_contract and om_contract.pdf_path %}
+          <a class="button secondary" href="{{ url_for('open_asset_contract', asset_id=asset.id) }}" target="_blank" rel="noopener">Abrir contrato</a>
+        {% endif %}
+      </div>
+    </form>
+    {% if om_contract %}
+      <div class="list compact-list">
+        <div class="list-row">
+          <div>
+            <strong>Estado atual do contrato</strong>
+            <p>
+              Inicio: {{ format_date_pt(om_contract.contract_start_date) if om_contract.contract_start_date else "-" }} |
+              Fim: {{ format_date_pt(om_contract.contract_end_date) if om_contract.contract_end_date else "-" }} |
+              Valor anual: {{ om_contract.annual_value if om_contract.annual_value is not none else "-" }}
+            </p>
+            <p>{{ om_contract.original_filename or "Sem PDF associado" }}</p>
+          </div>
+        </div>
+      </div>
+    {% else %}
+      <p class="muted">Ainda nao existe contrato O&amp;M associado a esta central.</p>
+    {% endif %}
+  </article>
+
+  <article class="card">
+    <div class="section-title"><h3>Parametros</h3></div>
+    <dl class="details">
+      <div><dt>No. Projeto</dt><dd>{{ asset.project_number or "-" }}</dd></div>
+      <div><dt>Localizacao</dt><dd>{{ asset.location or "-" }}</dd></div>
+      <div><dt>Morada</dt><dd>{{ asset.address or "-" }}</dd></div>
+      <div><dt>Paineis</dt><dd>{{ asset.panels or "-" }}</dd></div>
+      <div><dt>kWp</dt><dd>{{ asset.kwp or "-" }}</dd></div>
+      <div><dt>Contrato</dt><dd>{{ asset.contract_type or "-" }}</dd></div>
+      <div><dt>O&M</dt><dd><span class="chip {{ 'om-active' if asset.active_contract == 'yes' else 'om-inactive' }}">{{ om_status_label(asset.active_contract) }}</span></dd></div>
+      <div><dt>Inicio</dt><dd>{{ format_date_pt(asset.start_contract) if asset.start_contract else "-" }}</dd></div>
+      <div><dt>Fim</dt><dd>{{ format_date_pt(asset.end_contract) if asset.end_contract else "-" }}</dd></div>
+      <div><dt>Status detalhe</dt><dd>{{ asset.status_detail or "-" }}</dd></div>
+      <div><dt>Acesso</dt><dd>{{ asset.access_type or "-" }}</dd></div>
+      <div><dt>Cobertura</dt><dd>{{ asset.coverage_type or "-" }}</dd></div>
+    </dl>
+  </article>
+</section>
+
+<section class="grid two">
+  <article class="card">
+    <div class="section-title"><h3>Contacto</h3></div>
+    <dl class="details">
+      <div><dt>Nome</dt><dd>{{ asset.contact_name or "-" }}</dd></div>
+      <div><dt>Cargo</dt><dd>{{ asset.contact_role or "-" }}</dd></div>
+      <div><dt>Email</dt><dd>{{ asset.contact_email or "-" }}</dd></div>
+      <div><dt>Telefone</dt><dd>{{ asset.contact_phone or "-" }}</dd></div>
+      <div><dt>Notas</dt><dd>{{ asset.notes or "-" }}</dd></div>
+      <div><dt>Comentario manutencao</dt><dd>{{ asset.maintenance_comment or "-" }}</dd></div>
+    </dl>
+  </article>
+
+  <article class="card">
+    <div class="section-title"><h3>Aliases</h3></div>
+    <form class="inline-form" method="post" action="{{ url_for('add_alias', asset_id=asset.id) }}">
+      <input type="text" name="alias_name" placeholder="Adicionar nome alternativo">
+      <button class="button" type="submit">Guardar alias</button>
+    </form>
+    <div class="alias-list">
+      {% for alias in aliases %}
+        <form class="alias-row" method="post" action="{{ url_for('update_alias', asset_id=asset.id, alias_id=alias.id) }}">
+          <input type="text" name="alias_name" value="{{ alias.alias_name }}">
+          <div class="hero-actions">
+            <button class="button secondary" type="submit">Editar</button>
+            <button class="button danger-button" type="submit" formaction="{{ url_for('delete_alias', asset_id=asset.id, alias_id=alias.id) }}">Apagar</button>
+          </div>
+        </form>
+      {% else %}
+        <p class="muted">Sem aliases ainda.</p>
+      {% endfor %}
+    </div>
+  </article>
+
+  <article class="card">
+    <div class="section-title"><h3>Tickets</h3></div>
+    <div class="list">
+      {% for ticket in tickets %}
+        <div class="list-row ticket-history-row">
+          <div class="ticket-history-main">
+            <strong>{{ ticket.title }}</strong>
+            <p>{{ ticket.next_action or ticket.notes or "-" }}</p>
+          </div>
+          <div class="chips">
+            <span class="chip {{ status_colors.get(ticket.status, 'muted') }}">{{ ticket.status }}</span>
+            <span class="chip">{{ ticket.urgency }}</span>
+          </div>
+          <div class="ticket-history-visits">
+            {% for visit in visits_by_ticket.get(ticket.id, [])[:3] %}
+              <div class="visit-entry compact-visit">
+                <strong>{{ visit.visit_date }}</strong>
+                <p>{{ visit.result or "-" }}</p>
+              </div>
+            {% else %}
+              <p class="muted">Sem visitas.</p>
+            {% endfor %}
+          </div>
+        </div>
+      {% else %}
+        <p class="muted">Sem tickets para esta instalacao.</p>
+      {% endfor %}
+    </div>
+  </article>
+</section>
+
+<section class="card">
+  <div class="section-title"><h3>Historico de monitorizacao</h3></div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Data</th>
+          <th>Estado</th>
+          <th>Notas</th>
+          <th>Origem</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in monitoring_history %}
+          <tr>
+            <td>{{ row.record_date }}</td>
+            <td><span class="chip {{ status_colors.get(row.status, 'muted') }}">{{ row.status }}</span></td>
+            <td>{{ row.notes or "-" }}</td>
+            <td>{{ row.source or "-" }}</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="4" class="muted">Sem historico ainda.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

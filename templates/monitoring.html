@@ -1,0 +1,559 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">Monitorizacao</p>
+    <h2>Historico e estado por central</h2>
+    <p class="muted">Filtra por central, estado e datas para veres o historico completo de cada instalacao. Se um problema antigo nao aparecer na lista do dia, a app marca-o automaticamente como resolvido.</p>
+  </div>
+</section>
+
+<datalist id="monitoring-asset-options">
+  {% for asset in assets_for_mapping %}
+    <option value="{{ asset.project_name }}" data-id="{{ asset.id }}"></option>
+  {% endfor %}
+</datalist>
+
+<section class="tab-shell">
+  <div class="tab-bar">
+    <button class="tab-button active" type="button" data-tab-target="monitoring-overview">Resumo</button>
+    <button class="tab-button" type="button" data-tab-target="monitoring-import">Importacao</button>
+    <button class="tab-button" type="button" data-tab-target="monitoring-comparison">Comparacao</button>
+    <button class="tab-button" type="button" data-tab-target="monitoring-central">Central</button>
+    <button class="tab-button" type="button" data-tab-target="monitoring-history">Historico</button>
+  </div>
+
+  <section class="tab-panel active" id="monitoring-overview">
+    <section class="cards">
+      <article class="card stat-card">
+        <span>Registos historicos filtrados</span>
+        <strong>{{ monitoring_stats.history_records }}</strong>
+      </article>
+      <article class="card stat-card">
+        <span>Centrais no filtro</span>
+        <strong>{{ monitoring_stats.centrals_in_filter }}</strong>
+      </article>
+      <article class="card stat-card">
+        <span>Instalacoes no filtro</span>
+        <strong>{{ monitoring_stats.installations_in_filter }}</strong>
+      </article>
+      <article class="card stat-card">
+        <span>Erros atuais</span>
+        <strong>{{ monitoring_stats.current_errors }}</strong>
+      </article>
+      <article class="card stat-card">
+        <span>Desconectadas atuais</span>
+        <strong>{{ monitoring_stats.current_disconnected }}</strong>
+      </article>
+    </section>
+
+    <section class="card">
+      <div class="section-title"><h3>Filtros de monitorizacao</h3></div>
+      <form class="filters monitoring-filters js-auto-submit" method="get">
+        <input type="text" name="search" value="{{ search }}" placeholder="Pesquisar central, alias ou empresa">
+        <div class="asset-picker" data-autosubmit="true">
+          <input class="asset-picker-input" type="text" list="monitoring-asset-options" placeholder="Escrever instalacao ou central">
+          <input type="hidden" name="asset_id" value="{{ asset_filter or '' }}">
+          <small class="asset-picker-hint">Comeca a escrever para escolher.</small>
+        </div>
+        <select name="status">
+          <option value="">Todos os estados</option>
+          {% for status in monitoring_statuses %}
+            <option value="{{ status }}" {{ 'selected' if status_filter == status else '' }}>{{ status }}</option>
+          {% endfor %}
+        </select>
+        <select name="om_only">
+          <option value="yes" {{ 'selected' if om_only == 'yes' else '' }}>So O&amp;M ativo</option>
+          <option value="no" {{ 'selected' if om_only == 'no' else '' }}>Todas as centrais</option>
+        </select>
+        <input type="date" name="start_date" value="{{ start_date }}">
+        <input type="date" name="end_date" value="{{ end_date }}">
+        <button class="button" type="submit">Aplicar</button>
+        <a class="button secondary" href="{{ url_for('monitoring') }}">Limpar</a>
+      </form>
+    </section>
+
+    <section class="card">
+      <div class="section-title"><h3>Estado atual por instalacao</h3></div>
+      <div class="list installation-stack">
+        {% for group in grouped_latest_rows %}
+          <details class="installation-card" {% if asset_filter and selected_asset and selected_asset.installation_group == group.installation_group %}open{% endif %}>
+            <summary class="installation-summary">
+              <div>
+                <strong>{{ group.installation_group }}</strong>
+                <p>{{ group.location or "-" }} | {{ group.member_count }} centrais</p>
+              </div>
+              <div class="chips">
+                <span class="chip {{ 'om-active' if group.active_contract == 'yes' else 'om-inactive' }}">{{ om_status_label(group.active_contract) }}</span>
+                <span class="chip {{ status_colors.get(group.group_status, 'muted') }}">{{ group.group_status or 'Sem estado' }}</span>
+                <span class="chip">{{ group.record_date or '-' }}</span>
+              </div>
+            </summary>
+            <div class="table-wrap compact-top-space">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Central</th>
+                    <th>Estado</th>
+                    <th>Data</th>
+                    <th>Historico</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for member in group.members %}
+                    <tr>
+                      <td>{{ member.project_name }}</td>
+                      <td><span class="chip {{ status_colors.get(member.status, 'muted') }}">{{ member.status }}</span></td>
+                      <td>{{ member.record_date }}</td>
+                      <td><a class="table-link" href="{{ url_for('monitoring', asset_id=member.asset_id) }}">{{ member.history_count }} registos</a></td>
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          </details>
+        {% else %}
+          <p class="muted">Sem instalacoes para estes filtros.</p>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="section-title"><h3>Estado atual por central</h3></div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Instalacao</th>
+              <th>Central</th>
+              <th>Localizacao</th>
+              <th>Contrato</th>
+              <th>O&amp;M</th>
+              <th>Estado atual</th>
+              <th>Data</th>
+              <th>Historico</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in latest_rows %}
+              <tr>
+                <td>{{ row.installation_group or row.project_name }}</td>
+                <td>{{ row.project_name }}</td>
+                <td>{{ row.location or "-" }}</td>
+                <td>{{ row.contract_type or "-" }}</td>
+                <td><span class="chip {{ 'om-active' if row.active_contract == 'yes' else 'om-inactive' }}">{{ om_status_label(row.active_contract) }}</span></td>
+                <td><span class="chip {{ status_colors.get(row.status, 'muted') }}">{{ row.status }}</span></td>
+                <td>{{ row.record_date }}</td>
+                <td><a class="table-link" href="{{ url_for('monitoring', asset_id=row.asset_id) }}">{{ row.history_count }} registos</a></td>
+              </tr>
+            {% else %}
+              <tr><td colspan="8" class="muted">Sem monitorizacao ainda.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </section>
+
+  <section class="tab-panel" id="monitoring-import">
+    <section class="grid two monitoring-layout">
+      <article class="card">
+        <div class="section-title"><h3>Nova importacao diaria</h3></div>
+        <form method="post" class="stack-form">
+          <label>Data
+            <input type="date" name="record_date" value="{{ today_iso }}">
+          </label>
+          <label>Plataforma de origem
+            <select name="platform_source">
+              {% for source in monitoring_sources %}
+                <option value="{{ source }}">{{ source }}</option>
+              {% endfor %}
+            </select>
+          </label>
+          <label>Tipo de importacao
+            <select name="import_scope">
+              <option value="complete">Snapshot completo do estado</option>
+              <option value="partial">Lista parcial / intradiaria</option>
+            </select>
+          </label>
+          <label>Notas por defeito
+            <input type="text" name="default_notes" placeholder="Opcional">
+          </label>
+          <p class="muted">Usa "Snapshot completo" quando a tabela representa o estado total do dia. Se for parcial, a app nao resolve automaticamente os problemas que nao aparecem.</p>
+          <label>Tabela colada
+            <textarea name="pasted_table" rows="12" placeholder="Instalacao    Estado&#10;AHBV de Lagos    Erro&#10;Absorvalor    Desconectada"></textarea>
+          </label>
+          <button class="button" type="submit">Importar monitorizacao</button>
+        </form>
+      </article>
+
+      <article class="card">
+        <div class="section-title"><h3>Linhas por resolver</h3></div>
+        <div class="list unresolved-list">
+          {% for row in unresolved %}
+            <form class="list-row unresolved-form" method="post" action="{{ url_for('resolve_unmatched', row_id=row.id) }}">
+              <div>
+                <strong>{{ row.original_name }}</strong>
+                <p>{{ row.status }} | {{ row.record_date }}</p>
+              </div>
+              <div class="resolve-controls">
+                <div class="asset-picker">
+                  <input class="asset-picker-input" type="text" list="monitoring-asset-options" placeholder="Escrever central">
+                  <input type="hidden" name="asset_id" value="">
+                </div>
+                <button class="button secondary" type="submit">Associar</button>
+              </div>
+            </form>
+          {% else %}
+            <p class="muted">Sem linhas pendentes. Os nomes foram reconhecidos.</p>
+          {% endfor %}
+        </div>
+      </article>
+    </section>
+  </section>
+
+  <section class="tab-panel" id="monitoring-comparison">
+    {% if batch_insight %}
+      <section class="card">
+        <div class="section-title">
+          <h3>Comparacao da ultima tabela importada</h3>
+        </div>
+        <div class="central-summary">
+          <div>
+            <strong>Tabela de {{ batch_insight.batch.record_date }}</strong>
+            <p>Inserida em {{ batch_insight.batch.imported_at }} | comparada com o estado anterior de cada central</p>
+          </div>
+          <div class="chips">
+            <span class="chip danger">{{ batch_insight.new_problem_assets|length }} novas ocorrencias O&amp;M</span>
+            <span class="chip warning">{{ batch_insight.persistent_problem_assets|length }} recorrentes O&amp;M</span>
+            <span class="chip success">{{ batch_insight.resolved_assets|length }} resolvidas O&amp;M</span>
+          </div>
+        </div>
+
+        <div class="grid two">
+          <article class="card nested-card">
+            <div class="section-title"><h3>Novas com problema em O&amp;M</h3></div>
+            <div class="list compact-list">
+              {% for item in batch_insight.new_problem_assets %}
+                <div class="list-row">
+                  <div>
+                    <strong><a class="table-link" href="{{ url_for('monitoring', asset_id=item.asset_id) }}">{{ item.project_name }}</a></strong>
+                    <p>Antes: {{ item.previous_status }} | Agora: {{ item.current_status }}</p>
+                  </div>
+                  <div class="chips">
+                    <span class="chip om-active">O&amp;M ativo</span>
+                    <span class="chip {{ status_colors.get(item.current_status, 'muted') }}">{{ item.current_status }}</span>
+                  </div>
+                </div>
+              {% else %}
+                <p class="muted">Nao houve novas centrais com erro ou desconexao nesta importacao.</p>
+              {% endfor %}
+            </div>
+          </article>
+
+          <article class="card nested-card">
+            <div class="section-title"><h3>Leitura recomendada</h3></div>
+            <div class="list compact-list">
+              <div class="list-row">
+                <div>
+                  <strong>Novas ocorrencias</strong>
+                  <p>Centrais O&amp;M que antes estavam sem problema e agora entraram em erro ou desconexao.</p>
+                </div>
+              </div>
+              <div class="list-row">
+                <div>
+                  <strong>Recorrentes</strong>
+                  <p>Centrais O&amp;M que ja estavam com problema e continuam com problema nesta tabela.</p>
+                </div>
+              </div>
+              <div class="list-row">
+                <div>
+                  <strong>Resolvidas</strong>
+                  <p>Centrais O&amp;M que estavam com problema antes e agora ficaram resolvidas ou operacionais.</p>
+                </div>
+              </div>
+            </div>
+          </article>
+        </div>
+
+        {% if batch_insight.persistent_problem_assets or batch_insight.resolved_assets %}
+          <div class="grid two top-space">
+            <article class="card nested-card">
+              <div class="section-title"><h3>Recorrentes em O&amp;M</h3></div>
+              <div class="list compact-list">
+                {% for item in batch_insight.persistent_problem_assets %}
+                  <div class="list-row">
+                    <div>
+                      <strong><a class="table-link" href="{{ url_for('monitoring', asset_id=item.asset_id) }}">{{ item.project_name }}</a></strong>
+                      <p>Antes: {{ item.previous_status }} | Agora: {{ item.current_status }}</p>
+                    </div>
+                    <div class="chips">
+                      <span class="chip warning">Recorrente</span>
+                    </div>
+                  </div>
+                {% else %}
+                  <p class="muted">Sem centrais recorrentes nesta importacao.</p>
+                {% endfor %}
+              </div>
+            </article>
+
+            <article class="card nested-card">
+              <div class="section-title"><h3>Resolvidas em O&amp;M</h3></div>
+              <div class="list compact-list">
+                {% for item in batch_insight.resolved_assets %}
+                  <div class="list-row">
+                    <div>
+                      <strong><a class="table-link" href="{{ url_for('monitoring', asset_id=item.asset_id) }}">{{ item.project_name }}</a></strong>
+                      <p>Antes: {{ item.previous_status }} | Agora: {{ item.current_status }}</p>
+                    </div>
+                    <div class="chips">
+                      <span class="chip success">{{ item.current_status }}</span>
+                    </div>
+                  </div>
+                {% else %}
+                  <p class="muted">Sem resolucoes nesta importacao.</p>
+                {% endfor %}
+              </div>
+            </article>
+          </div>
+        {% endif %}
+      </section>
+    {% else %}
+      <section class="card"><p class="muted">Ainda nao existe comparacao de batch para mostrar. Depois de importares uma tabela, esta vista ganha valor.</p></section>
+    {% endif %}
+  </section>
+
+  <section class="tab-panel" id="monitoring-central">
+    {% if selected_asset %}
+      <section class="card">
+        <div class="section-title"><h3>Central selecionada</h3></div>
+        <div class="central-summary">
+          <div>
+            <strong><a class="table-link" href="{{ url_for('asset_detail', asset_id=selected_asset.id) }}">{{ selected_asset.project_name }}</a></strong>
+            <p>{{ selected_asset.installation_group or selected_asset.project_name }} | {{ selected_asset.location or "-" }} | {{ selected_asset.contract_type or "-" }} | {{ om_status_label(selected_asset.active_contract) }}</p>
+          </div>
+          <div class="chips">
+            <span class="chip {{ 'om-active' if selected_asset.active_contract == 'yes' else 'om-inactive' }}">{{ om_status_label(selected_asset.active_contract) }}</span>
+            {% if selected_asset.latest_status %}
+              <span class="chip {{ status_colors.get(selected_asset.latest_status, 'muted') }}">{{ selected_asset.latest_status }}</span>
+            {% endif %}
+            {% if selected_asset.latest_status_date %}
+              <span class="chip">{{ selected_asset.latest_status_date }}</span>
+            {% endif %}
+          </div>
+        </div>
+        {% if selected_group_assets|length > 1 %}
+          <div class="table-wrap compact-top-space">
+            <table>
+              <thead>
+                <tr>
+                  <th>Central da mesma instalacao</th>
+                  <th>Estado atual</th>
+                  <th>Data</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for member in selected_group_assets %}
+                  <tr>
+                    <td>{{ member.project_name }}</td>
+                    <td><span class="chip {{ status_colors.get(member.status, 'muted') }}">{{ member.status or 'Sem estado' }}</span></td>
+                    <td>{{ member.record_date or "-" }}</td>
+                    <td>
+                      {% if member.id != selected_asset.id %}
+                        <a class="table-link" href="{{ url_for('monitoring', asset_id=member.id) }}">Ver central</a>
+                      {% endif %}
+                    </td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% endif %}
+        <div class="table-wrap compact-top-space">
+          <table>
+            <thead>
+              <tr>
+                <th>Problema</th>
+                <th>Data de aparecimento</th>
+                <th>Ultimo registo com problema</th>
+                <th>Data de desaparecimento</th>
+                <th>Como ficou</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for period in asset_problem_periods %}
+                <tr>
+                  <td><span class="chip {{ status_colors.get(period.status, 'muted') }}">{{ period.status }}</span></td>
+                  <td>{{ period.started_on }}</td>
+                  <td>{{ period.last_problem_on }}</td>
+                  <td>{{ period.resolved_on or "-" }}</td>
+                  <td>{{ period.resolution_status }}</td>
+                </tr>
+              {% else %}
+                <tr><td colspan="5" class="muted">Sem janelas de erro ou desconexao para esta central.</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Data</th>
+                <th>Estado</th>
+                <th>Importado em</th>
+                <th>Notas</th>
+                <th>Origem</th>
+                <th>Acoes</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in asset_history %}
+                <tr>
+                  <td><input form="history-form-{{ row.id }}" type="date" name="record_date" value="{{ row.record_date }}"></td>
+                  <td>
+                    <select form="history-form-{{ row.id }}" name="status">
+                      {% for status in monitoring_statuses %}
+                        <option value="{{ status }}" {{ 'selected' if row.status == status else '' }}>{{ status }}</option>
+                      {% endfor %}
+                    </select>
+                  </td>
+                  <td>{{ row.imported_at or "-" }}</td>
+                  <td><textarea form="history-form-{{ row.id }}" name="notes" rows="2">{{ row.notes or '' }}</textarea></td>
+                  <td>{{ row.source or "-" }}</td>
+                  <td>
+                    <form id="history-form-{{ row.id }}" class="history-edit-form" method="post" action="{{ url_for('update_monitoring_record', record_id=row.id) }}">
+                      <div class="hero-actions">
+                        <button class="button secondary" type="submit">Guardar</button>
+                        <button class="button danger-button" type="submit" formaction="{{ url_for('delete_monitoring_record', record_id=row.id) }}">Apagar</button>
+                      </div>
+                    </form>
+                  </td>
+                </tr>
+              {% else %}
+                <tr><td colspan="6" class="muted">Sem historico para esta central.</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    {% else %}
+      <section class="card"><p class="muted">Seleciona uma central nos filtros ou na lista de estado atual para veres este separador preenchido.</p></section>
+    {% endif %}
+  </section>
+
+  <section class="tab-panel" id="monitoring-history">
+    <section class="card">
+      <div class="section-title"><h3>Historico de tabelas importadas</h3></div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Data da tabela</th>
+              <th>Inserida em</th>
+              <th>Origem</th>
+              <th>Registos</th>
+              <th>Associados</th>
+              <th>Por mapear</th>
+              <th>Resolvidos auto</th>
+              <th>Notas</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for batch in import_batches %}
+              <tr>
+                <td>{{ batch.record_date }}</td>
+                <td>{{ batch.imported_at }}</td>
+                <td>{{ batch.source }}</td>
+                <td>{{ batch.imported_count }}</td>
+                <td>{{ batch.matched_count }}</td>
+                <td>{{ batch.unmatched_count }}</td>
+                <td>{{ batch.auto_resolved_count }}</td>
+                <td>{{ batch.default_notes or "-" }}</td>
+              </tr>
+              {% if batch.raw_input %}
+                <tr class="batch-input-row">
+                  <td colspan="8">
+                    <details class="batch-input-details">
+                      <summary>Ver tabela inserida</summary>
+                      <pre>{{ batch.raw_input }}</pre>
+                    </details>
+                  </td>
+                </tr>
+              {% endif %}
+            {% else %}
+              <tr><td colspan="8" class="muted">Ainda nao existem tabelas importadas manualmente.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="section-title"><h3>Historico filtrado</h3></div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Data</th>
+              <th>Importado em</th>
+              <th>Instalacao</th>
+              <th>Central</th>
+              <th>Localizacao</th>
+              <th>Estado</th>
+              <th>Contrato</th>
+              <th>Notas</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in history_rows %}
+              <tr>
+                <td>{{ row.record_date }}</td>
+                <td>{{ row.imported_at or "-" }}</td>
+                <td>{{ row.installation_group or row.project_name }}</td>
+                <td>{{ row.project_name }}</td>
+                <td>{{ row.location or "-" }}</td>
+                <td><span class="chip {{ status_colors.get(row.status, 'muted') }}">{{ row.status }}</span></td>
+                <td>{{ row.contract_type or "-" }}</td>
+                <td>
+                  <span class="chip {{ 'om-active' if row.active_contract == 'yes' else 'om-inactive' }}">{{ om_status_label(row.active_contract) }}</span>
+                  {{ row.notes or "-" }}
+                </td>
+                <td><a class="table-link" href="{{ url_for('monitoring', asset_id=row.asset_id) }}">Ver central</a></td>
+              </tr>
+            {% else %}
+              <tr><td colspan="9" class="muted">Sem resultados para este filtro.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </section>
+</section>
+
+<script>
+  (function () {
+    const shell = document.querySelector('.tab-shell');
+    if (!shell) return;
+    const buttons = shell.querySelectorAll('.tab-button');
+    const panels = shell.querySelectorAll('.tab-panel');
+    function activateTab(targetId) {
+      buttons.forEach((button) => {
+        button.classList.toggle('active', button.dataset.tabTarget === targetId);
+      });
+      panels.forEach((panel) => {
+        panel.classList.toggle('active', panel.id === targetId);
+      });
+    }
+    buttons.forEach((button) => {
+      button.addEventListener('click', function () {
+        activateTab(button.dataset.tabTarget);
+      });
+    });
+    const initialTab = {{ ('monitoring-central' if selected_asset else ('monitoring-comparison' if batch_insight else 'monitoring-overview'))|tojson }};
+    activateTab(initialTab);
+  })();
+</script>
+{% endblock %}

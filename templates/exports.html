@@ -1,0 +1,153 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">Exportacoes</p>
+    <h2>Area de exportacao</h2>
+    <p class="muted">Escolhe os dados, as colunas, o formato e guarda templates para reutilizar depois.</p>
+  </div>
+</section>
+
+<datalist id="export-asset-options">
+  {% for asset in assets_for_mapping %}
+    <option value="{{ asset.project_name }}" data-id="{{ asset.id }}"></option>
+  {% endfor %}
+</datalist>
+
+<section class="grid two">
+  <article class="card">
+    <div class="section-title"><h3>Configurar exportacao</h3></div>
+    <form method="post" class="stack-form">
+      <label>Tabela
+        <select name="dataset">
+          {% for key, config in datasets.items() %}
+            <option value="{{ key }}" {{ 'selected' if selected_dataset == key else '' }}>{{ config.label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Formato
+        <select name="export_format">
+          <option value="xlsx" {{ 'selected' if template_format == 'xlsx' else '' }}>Excel</option>
+          <option value="pdf" {{ 'selected' if template_format == 'pdf' else '' }}>PDF</option>
+        </select>
+      </label>
+      <label>Pesquisa
+        <input type="text" name="search" value="{{ template_filters.get('search', request.args.get('search', '')) }}" placeholder="Central, alias, notas">
+      </label>
+      <label>Central
+        {% set current_asset = template_filters.get('asset_id', request.args.get('asset_id', '')) %}
+        <div class="asset-picker">
+          <input class="asset-picker-input" type="text" list="export-asset-options" placeholder="Todas ou escrever central">
+          <input type="hidden" name="asset_id" value="{{ current_asset or '' }}">
+        </div>
+      </label>
+      <label>Filtro O&amp;M
+        {% set current_om_only = template_filters.get('om_only', request.args.get('om_only', 'yes')) %}
+        <select name="om_only">
+          <option value="yes" {{ 'selected' if current_om_only == 'yes' else '' }}>So O&amp;M ativo</option>
+          <option value="no" {{ 'selected' if current_om_only == 'no' else '' }}>Todas as centrais</option>
+        </select>
+      </label>
+
+      {% if selected_dataset == 'monitoring' %}
+        <label>Estado
+          <select name="status">
+            {% set current_status = template_filters.get('status', request.args.get('status', '')) %}
+            <option value="">Todos</option>
+            {% for status in ['Erro','Desconectada','Resolvido','Operacional'] %}
+              <option value="{{ status }}" {{ 'selected' if current_status == status else '' }}>{{ status }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Data inicial
+          <input type="date" name="start_date" value="{{ template_filters.get('start_date', request.args.get('start_date', '')) }}">
+        </label>
+        <label>Data final
+          <input type="date" name="end_date" value="{{ template_filters.get('end_date', request.args.get('end_date', '')) }}">
+        </label>
+      {% elif selected_dataset == 'tickets' %}
+        <label>Estado
+          <select name="status">
+            {% set current_status = template_filters.get('status', request.args.get('status', '')) %}
+            <option value="">Todos</option>
+            {% for status in ticket_statuses %}
+              <option value="{{ status }}" {{ 'selected' if current_status == status else '' }}>{{ status }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Urgencia
+          <select name="urgency">
+            {% set current_urgency = template_filters.get('urgency', request.args.get('urgency', '')) %}
+            <option value="">Todas</option>
+            {% for urgency in ticket_urgencies %}
+              <option value="{{ urgency }}" {{ 'selected' if current_urgency == urgency else '' }}>{{ urgency }}</option>
+            {% endfor %}
+          </select>
+        </label>
+      {% endif %}
+
+      <div class="section-title"><h3>Colunas</h3></div>
+      <div class="checkbox-grid">
+        {% for column_key, column_label in datasets[selected_dataset]['columns'] %}
+          <label class="checkbox-item">
+            <input type="checkbox" name="columns" value="{{ column_key }}" {{ 'checked' if column_key in selected_columns else '' }}>
+            <span>{{ column_label }}</span>
+          </label>
+        {% endfor %}
+      </div>
+
+      <div class="hero-actions">
+        <button class="button" type="submit" name="action" value="download">Exportar</button>
+        <button class="button secondary" type="submit" formaction="{{ url_for('exports') }}" formmethod="get">Atualizar preview</button>
+      </div>
+
+      <div class="inline-form">
+        <input type="text" name="template_name" placeholder="Nome do template">
+        <button class="button secondary" type="submit" name="action" value="save_template">Guardar template</button>
+      </div>
+    </form>
+  </article>
+
+  <article class="card">
+    <div class="section-title"><h3>Templates guardados</h3></div>
+    <div class="list compact-list">
+      {% for template in templates_rows %}
+        <div class="list-row">
+          <div>
+            <strong><a class="table-link" href="{{ url_for('exports', template_id=template.id) }}">{{ template.name }}</a></strong>
+            <p>{{ datasets[template.dataset]['label'] }} | {{ template.export_format|upper }} | {{ template.created_at }}</p>
+          </div>
+        </div>
+      {% else %}
+        <p class="muted">Ainda nao existem templates guardados.</p>
+      {% endfor %}
+    </div>
+  </article>
+</section>
+
+<section class="card">
+  <div class="section-title"><h3>Preview</h3></div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          {% for _, label in preview_headers %}
+            <th>{{ label }}</th>
+          {% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in preview_rows %}
+          <tr>
+            {% for key, _ in preview_headers %}
+              <td>{{ row.get(key, '-') or '-' }}</td>
+            {% endfor %}
+          </tr>
+        {% else %}
+          <tr><td colspan="{{ preview_headers|length or 1 }}" class="muted">Sem dados para este preview.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

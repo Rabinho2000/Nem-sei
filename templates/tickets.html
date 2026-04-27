@@ -1,0 +1,248 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">Corretivas</p>
+    <h2>Tickets organizados por central</h2>
+    <p class="muted">A central aparece primeiro. Dentro de cada central ves os varios tickets, visitas e historico.</p>
+  </div>
+</section>
+
+<datalist id="ticket-asset-options">
+  {% for asset in assets %}
+    <option value="{{ asset.project_name }}" data-id="{{ asset.id }}"></option>
+  {% endfor %}
+</datalist>
+
+<section class="cards">
+  <article class="card stat-card">
+    <span>Centrais no filtro</span>
+    <strong>{{ ticket_stats.centrals }}</strong>
+  </article>
+  <article class="card stat-card">
+    <span>Tickets no filtro</span>
+    <strong>{{ ticket_stats.tickets }}</strong>
+  </article>
+  <article class="card stat-card">
+    <span>Tickets abertos</span>
+    <strong>{{ ticket_stats.open }}</strong>
+  </article>
+  <article class="card stat-card">
+    <span>Criticos abertos</span>
+    <strong>{{ ticket_stats.critical }}</strong>
+  </article>
+</section>
+
+<section class="card">
+  <div class="section-title"><h3>Filtros de corretivas</h3></div>
+  <form class="filters monitoring-filters js-auto-submit" method="get">
+    <input type="text" name="search" value="{{ search }}" placeholder="Pesquisar por central, alias, ticket ou notas">
+    <div class="asset-picker" data-autosubmit="true">
+      <input class="asset-picker-input" type="text" list="ticket-asset-options" placeholder="Escrever instalacao ou central">
+      <input type="hidden" name="asset_id" value="{{ asset_filter or '' }}">
+      <small class="asset-picker-hint">Comeca a escrever para escolher.</small>
+    </div>
+    <select name="status">
+      <option value="">Todos os estados</option>
+      {% for status in ticket_statuses %}
+        <option value="{{ status }}" {{ 'selected' if status_filter == status else '' }}>{{ status }}</option>
+      {% endfor %}
+    </select>
+    <select name="urgency">
+      <option value="">Todas as urgencias</option>
+      {% for urgency in ticket_urgencies %}
+        <option value="{{ urgency }}" {{ 'selected' if urgency_filter == urgency else '' }}>{{ urgency }}</option>
+      {% endfor %}
+    </select>
+    <select name="om_only">
+      <option value="yes" {{ 'selected' if om_only == 'yes' else '' }}>So O&amp;M ativo</option>
+      <option value="no" {{ 'selected' if om_only == 'no' else '' }}>Todas as centrais</option>
+    </select>
+    <button class="button" type="submit">Aplicar</button>
+    <a class="button secondary" href="{{ url_for('tickets') }}">Limpar</a>
+  </form>
+</section>
+
+<section class="card">
+  <div class="section-title"><h3>Criar ticket</h3></div>
+  <form method="post" class="ticket-form">
+    <div class="asset-picker">
+      <input class="asset-picker-input" type="text" list="ticket-asset-options" placeholder="Escrever instalacao ou central" required>
+      <input type="hidden" name="asset_id" value="{{ asset_filter or '' }}">
+      <small class="asset-picker-hint">Escolhe a central antes de criar.</small>
+    </div>
+    <input type="text" name="title" placeholder="Titulo do ticket" required>
+    <select name="urgency">
+      {% for urgency in ticket_urgencies %}
+        <option value="{{ urgency }}">{{ urgency }}</option>
+      {% endfor %}
+    </select>
+    <select name="status">
+      {% for status in ticket_statuses %}
+        <option value="{{ status }}">{{ status }}</option>
+      {% endfor %}
+    </select>
+    <input type="text" name="installation_ref" placeholder="Inversor, zona, referencia">
+    <input type="text" name="next_action" placeholder="Proxima acao">
+    <textarea name="notes" rows="3" placeholder="Notas do problema"></textarea>
+    <button class="button" type="submit">Criar</button>
+  </form>
+</section>
+
+{% if selected_asset %}
+  <section class="card">
+    <div class="section-title"><h3>Historico da central selecionada</h3></div>
+    <div class="central-summary">
+      <div>
+        <strong><a class="table-link" href="{{ url_for('asset_detail', asset_id=selected_asset.id) }}">{{ selected_asset.project_name }}</a></strong>
+        <p>{{ selected_asset.location or "-" }} | {{ selected_asset.contract_type or "-" }} | {{ om_status_label(selected_asset.active_contract) }}</p>
+      </div>
+      {% if central_summary %}
+        <div class="chips">
+          <span class="chip {{ 'om-active' if selected_asset.active_contract == 'yes' else 'om-inactive' }}">{{ om_status_label(selected_asset.active_contract) }}</span>
+          <span class="chip">{{ central_summary.total }} tickets</span>
+          <span class="chip">{{ central_summary.open }} abertos</span>
+          <span class="chip">{{ central_summary.visits }} visitas</span>
+          {% if central_summary.critical %}
+            <span class="chip danger">{{ central_summary.critical }} criticos</span>
+          {% endif %}
+        </div>
+      {% endif %}
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Atualizacao</th>
+            <th>Titulo</th>
+            <th>Estado</th>
+            <th>Urgencia</th>
+            <th>Visitas</th>
+            <th>Proxima acao</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for ticket in central_history %}
+            <tr>
+              <td>{{ ticket.updated_at }}</td>
+              <td>{{ ticket.title }}</td>
+              <td><span class="chip {{ status_colors.get(ticket.status, 'muted') }}">{{ ticket.status }}</span></td>
+              <td>{{ ticket.urgency }}</td>
+              <td>{{ ticket.visit_count }}</td>
+              <td>{{ ticket.next_action or "-" }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="6" class="muted">Sem tickets para esta central.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endif %}
+
+<section class="list ticket-stack">
+  {% for group in grouped_tickets %}
+    <details class="card central-ticket-card central-ticket-details" {% if asset_filter|string == group.asset_id|string or group.critical_count %}open{% endif %}>
+      <summary class="ticket-summary">
+        <div>
+          <h3><a class="table-link" href="{{ url_for('tickets', asset_id=group.asset_id) }}">{{ group.project_name }}</a></h3>
+          <p class="muted">{{ group.location or "-" }} | {{ group.contract_type or "-" }} | {{ om_status_label(group.active_contract) }}</p>
+        </div>
+        <div class="chips">
+          <span class="chip {{ 'om-active' if group.active_contract == 'yes' else 'om-inactive' }}">{{ om_status_label(group.active_contract) }}</span>
+          <span class="chip">{{ group.tickets|length }} tickets</span>
+          <span class="chip">{{ group.open_count }} abertos</span>
+          {% if group.critical_count %}
+            <span class="chip danger">{{ group.critical_count }} criticos</span>
+          {% endif %}
+        </div>
+      </summary>
+
+      <div class="central-ticket-list">
+        {% for ticket in group.tickets %}
+          <div class="ticket-item">
+            <div class="ticket-item-head">
+              <div>
+                <strong>{{ ticket.title }}</strong>
+                <p class="muted">
+                  {% if ticket.installation_ref %}{{ ticket.installation_ref }} | {% endif %}
+                  criado {{ ticket.created_at }} | atualizado {{ ticket.updated_at }}
+                </p>
+              </div>
+              <div class="chips">
+                <span class="chip {{ status_colors.get(ticket.status, 'muted') }}">{{ ticket.status }}</span>
+                <span class="chip">{{ ticket.urgency }}</span>
+              </div>
+            </div>
+
+            <div class="ticket-grid">
+              <form method="post" action="{{ url_for('update_ticket', ticket_id=ticket.id) }}" class="stack-form">
+                <label>Estado
+                  <select name="status">
+                    {% for status in ticket_statuses %}
+                      <option value="{{ status }}" {{ 'selected' if ticket.status == status else '' }}>{{ status }}</option>
+                    {% endfor %}
+                  </select>
+                </label>
+                <label>Urgencia
+                  <select name="urgency">
+                    {% for urgency in ticket_urgencies %}
+                      <option value="{{ urgency }}" {{ 'selected' if ticket.urgency == urgency else '' }}>{{ urgency }}</option>
+                    {% endfor %}
+                  </select>
+                </label>
+                <label>Proxima acao
+                  <input type="text" name="next_action" value="{{ ticket.next_action or '' }}">
+                </label>
+                <label>Notas
+                  <textarea name="notes" rows="4">{{ ticket.notes or '' }}</textarea>
+                </label>
+                <div class="hero-actions">
+                  <button class="button secondary" type="submit">Atualizar ticket</button>
+                  <button class="button danger-button" type="submit" formaction="{{ url_for('delete_ticket', ticket_id=ticket.id) }}">Apagar ticket</button>
+                </div>
+              </form>
+
+              <div class="visit-column">
+                <form method="post" action="{{ url_for('add_visit', ticket_id=ticket.id) }}" class="stack-form">
+                  <label>Data da visita
+                    <input type="date" name="visit_date" value="{{ today_iso }}">
+                  </label>
+                  <label>Tecnico
+                    <input type="text" name="technician" placeholder="Nome do tecnico">
+                  </label>
+                  <label>Resultado
+                    <input type="text" name="result" placeholder="visitado, resolvido, aguarda material">
+                  </label>
+                  <label>Notas
+                    <textarea name="notes" rows="3"></textarea>
+                  </label>
+                  <label>Proxima acao
+                    <input type="text" name="next_action" placeholder="Se houver acao seguinte">
+                  </label>
+                  <button class="button" type="submit">Registar visita</button>
+                </form>
+
+                <div class="visit-log">
+                  {% for visit in visits_by_ticket.get(ticket.id, []) %}
+                    <div class="visit-entry">
+                      <strong>{{ visit.visit_date }}</strong>
+                      <p>{{ visit.technician or "Sem tecnico" }}{% if visit.result %} | {{ visit.result }}{% endif %}</p>
+                      <p>{{ visit.notes or "-" }}</p>
+                      {% if visit.next_action %}<small>Proxima acao: {{ visit.next_action }}</small>{% endif %}
+                    </div>
+                  {% else %}
+                    <p class="muted">Sem visitas registadas.</p>
+                  {% endfor %}
+                </div>
+              </div>
+            </div>
+          </div>
+        {% endfor %}
+      </div>
+    </details>
+  {% else %}
+    <article class="card"><p class="muted">Sem tickets para estes filtros.</p></article>
+  {% endfor %}
+</section>
+{% endblock %}

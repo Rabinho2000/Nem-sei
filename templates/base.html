@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="pt">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title or "Monitoring Board" }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div>
+          <p class="eyebrow">Solcoraction</p>
+          <h1>Monitoring Board</h1>
+          <p class="sidebar-copy">Vista diaria de monitorizacao, instalacoes e corretivas.</p>
+        </div>
+        <button class="theme-toggle" type="button" id="theme-toggle">Dark mode</button>
+        <nav class="nav">
+          <a href="{{ url_for('dashboard') }}" class="{{ 'active' if request.endpoint == 'dashboard' else '' }}">Dashboard</a>
+          <a href="{{ url_for('assets') }}" class="{{ 'active' if request.endpoint in ['assets', 'asset_detail'] else '' }}">Instalacoes</a>
+          <a href="{{ url_for('monitoring') }}" class="{{ 'active' if request.endpoint == 'monitoring' else '' }}">Monitorizacao</a>
+          <a href="{{ url_for('tickets') }}" class="{{ 'active' if request.endpoint == 'tickets' else '' }}">Corretivas</a>
+          <a href="{{ url_for('integrations') }}" class="{{ 'active' if request.endpoint == 'integrations' else '' }}">Integracoes</a>
+          <a href="{{ url_for('renewals') }}" class="{{ 'active' if request.endpoint == 'renewals' else '' }}">Renovacoes</a>
+          <a href="{{ url_for('exports') }}" class="{{ 'active' if request.endpoint == 'exports' else '' }}">Exportacoes</a>
+          <a href="{{ url_for('settings') }}" class="{{ 'active' if request.endpoint == 'settings' else '' }}">Importacao</a>
+        </nav>
+      </aside>
+      <main class="content">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}
+            <div class="flash-stack">
+              {% for category, message in messages %}
+                <div class="flash {{ category }}">{{ message }}</div>
+              {% endfor %}
+            </div>
+          {% endif %}
+        {% endwith %}
+        {% block content %}{% endblock %}
+      </main>
+    </div>
+    <script>
+      (function () {
+        const storageKey = "monitoring-board-theme";
+        const root = document.documentElement;
+        const toggle = document.getElementById("theme-toggle");
+        const saved = localStorage.getItem(storageKey);
+        const preferredDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+        const initialTheme = saved || (preferredDark ? "dark" : "light");
+        root.dataset.theme = initialTheme;
+        if (toggle) {
+          toggle.textContent = initialTheme === "dark" ? "Light mode" : "Dark mode";
+          toggle.addEventListener("click", function () {
+            const nextTheme = root.dataset.theme === "dark" ? "light" : "dark";
+            root.dataset.theme = nextTheme;
+            localStorage.setItem(storageKey, nextTheme);
+            toggle.textContent = nextTheme === "dark" ? "Light mode" : "Dark mode";
+          });
+        }
+      })();
+
+      (function () {
+        function debounce(fn, wait) {
+          let timeout;
+          return function () {
+            clearTimeout(timeout);
+            timeout = setTimeout(fn, wait);
+          };
+        }
+
+        function submitForm(form) {
+          if (!form || form.dataset.submitting === "true") return;
+          form.dataset.submitting = "true";
+          form.requestSubmit ? form.requestSubmit() : form.submit();
+        }
+
+        document.querySelectorAll(".asset-picker").forEach(function (picker) {
+          const input = picker.querySelector(".asset-picker-input");
+          const hidden = picker.querySelector('input[type="hidden"][name="asset_id"]');
+          const listId = input ? input.getAttribute("list") : "";
+          if (!input || !hidden || !listId) return;
+          const options = Array.from(document.querySelectorAll("#" + CSS.escape(listId) + " option"));
+          const form = picker.closest("form");
+
+          function findOption(value) {
+            const normalized = (value || "").trim().toLowerCase();
+            return options.find(function (option) {
+              return option.value.trim().toLowerCase() === normalized;
+            });
+          }
+
+          function optionById(id) {
+            return options.find(function (option) {
+              return option.dataset.id === id;
+            });
+          }
+
+          function syncFromInput(shouldSubmit) {
+            const value = input.value.trim();
+            if (!value) {
+              hidden.value = "";
+              if (shouldSubmit && picker.dataset.autosubmit === "true") submitForm(form);
+              return;
+            }
+            const option = findOption(value);
+            if (!option) return;
+            hidden.value = option.dataset.id || "";
+            if (shouldSubmit && picker.dataset.autosubmit === "true") submitForm(form);
+          }
+
+          if (hidden.value && !input.value) {
+            const selected = optionById(hidden.value);
+            if (selected) input.value = selected.value;
+          }
+
+          input.addEventListener("change", function () {
+            input.setCustomValidity("");
+            syncFromInput(true);
+          });
+          input.addEventListener("keydown", function (event) {
+            if (event.key !== "Enter") return;
+            const exact = findOption(input.value);
+            if (!exact) {
+              const term = input.value.trim().toLowerCase();
+              const firstMatch = options.find(function (option) {
+                return option.value.toLowerCase().includes(term);
+              });
+              if (firstMatch) input.value = firstMatch.value;
+            }
+            syncFromInput(true);
+          });
+          if (form) {
+            form.addEventListener("submit", function (event) {
+              syncFromInput(false);
+              if (input.required && input.value.trim() && !hidden.value) {
+                input.setCustomValidity("Escolhe uma instalacao da lista.");
+                input.reportValidity();
+                event.preventDefault();
+              } else {
+                input.setCustomValidity("");
+              }
+            });
+          }
+        });
+
+        document.querySelectorAll("form.js-auto-submit").forEach(function (form) {
+          const delayedSubmit = debounce(function () {
+            submitForm(form);
+          }, 550);
+
+          form.querySelectorAll("select, input[type='date']").forEach(function (field) {
+            field.addEventListener("change", function () {
+              submitForm(form);
+            });
+          });
+
+          form.querySelectorAll("input[type='text']:not(.asset-picker-input)").forEach(function (field) {
+            field.addEventListener("input", delayedSubmit);
+          });
+        });
+      })();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,181 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">Overview</p>
+    <h2>Painel geral da operacao</h2>
+    <p class="muted">Resumo rapido do estado atual das centrais, da monitorizacao recente e das corretivas em curso.</p>
+  </div>
+  <div class="hero-actions">
+    <a class="button" href="{{ url_for('monitoring') }}">Ver monitorizacao</a>
+    <a class="button secondary" href="{{ url_for('tickets') }}">Ver corretivas</a>
+  </div>
+</section>
+
+<section class="cards">
+  <a class="card stat-card card-link" href="{{ url_for('assets', active_contract='yes') }}">
+    <span>Instalacoes com O&amp;M ativo</span>
+    <strong>{{ stats.active_om_assets }}</strong>
+  </a>
+  <a class="card stat-card card-link" href="{{ url_for('assets', active_contract='no') }}">
+    <span>Instalacoes em pipeline</span>
+    <strong>{{ stats.pipeline_assets }}</strong>
+  </a>
+  <a class="card stat-card card-link" href="{{ url_for('tickets', om_only='yes', scope='open') }}">
+    <span>Tickets abertos em O&amp;M</span>
+    <strong>{{ stats.open_tickets_active_om }}</strong>
+  </a>
+  <a class="card stat-card card-link" href="{{ url_for('monitoring', om_only='yes', issue_only='yes') }}">
+    <span>Problemas ativos em O&amp;M</span>
+    <strong>{{ stats.critical_active_issues }}</strong>
+  </a>
+  <a class="card stat-card card-link" href="{{ url_for('renewals', focus='expired') }}">
+    <span>O&amp;M terminado</span>
+    <strong>{{ stats.expired_renewals }}</strong>
+  </a>
+  <a class="card stat-card card-link" href="{{ url_for('renewals', focus='year') }}">
+    <span>A terminar este ano</span>
+    <strong>{{ stats.renewals_this_year }}</strong>
+  </a>
+  <a class="card stat-card card-link" href="{{ url_for('renewals', focus='90') }}">
+    <span>Nos proximos 90 dias</span>
+    <strong>{{ stats.renewals_next_90_days }}</strong>
+  </a>
+</section>
+
+<section class="grid two">
+  <article class="card">
+    <div class="section-title">
+      <h3>Estado atual das centrais</h3>
+    </div>
+    <div class="status-list">
+      {% for status, total in stats.status_counts.items() %}
+        <a class="status-pill {{ status_colors.get(status, 'muted') }} card-link" href="{{ url_for('monitoring', status=status, om_only='no') }}">
+          <span>{{ status }}</span>
+          <strong>{{ total }}</strong>
+        </a>
+      {% else %}
+        <p class="muted">Sem dados de monitorizacao.</p>
+      {% endfor %}
+    </div>
+  </article>
+
+  <article class="card">
+    <div class="section-title">
+      <h3>Monitorizacao nos ultimos dias</h3>
+    </div>
+    <div class="list compact-list">
+      {% for day in monitoring_by_day %}
+        <a class="list-row card-link" href="{{ url_for('monitoring', start_date=day.record_date, end_date=day.record_date, om_only='no') }}">
+          <div>
+            <strong>{{ day.record_date }}</strong>
+            <p>Total de registos do dia</p>
+          </div>
+          <div class="metric-badge">{{ day.total }}</div>
+        </a>
+      {% else %}
+        <p class="muted">Sem historico disponivel.</p>
+      {% endfor %}
+    </div>
+  </article>
+</section>
+
+<section class="grid two">
+  <article class="card">
+    <div class="section-title">
+      <h3>Centrais a acompanhar</h3>
+    </div>
+    <div class="list">
+      {% for asset in critical_assets %}
+        <div class="list-row">
+          <div>
+            <strong><a class="table-link" href="{{ url_for('asset_detail', asset_id=asset.id) }}">{{ asset.project_name }}</a></strong>
+            <p>{{ asset.record_date or "-" }}</p>
+          </div>
+          <div class="chips">
+            <span class="chip om-active">O&amp;M ativo</span>
+            {% if asset.status %}
+              <span class="chip {{ status_colors.get(asset.status, 'muted') }}">{{ asset.status }}</span>
+            {% endif %}
+            {% if asset.open_tickets %}
+              <span class="chip">{{ asset.open_tickets }} tickets</span>
+            {% endif %}
+          </div>
+        </div>
+      {% else %}
+        <p class="muted">Sem centrais criticas neste momento.</p>
+      {% endfor %}
+    </div>
+  </article>
+
+  <article class="card">
+    <div class="section-title">
+      <h3>Corretivas por central O&amp;M</h3>
+    </div>
+    <div class="list">
+      {% for asset in open_ticket_assets %}
+        <div class="list-row">
+          <div>
+            <strong><a class="table-link" href="{{ url_for('tickets', asset_id=asset.id) }}">{{ asset.project_name }}</a></strong>
+            <p>Ultima atualizacao {{ asset.last_update }}</p>
+          </div>
+          <div class="chips">
+            <span class="chip">{{ asset.ticket_count }} tickets</span>
+            {% if asset.critical_count %}
+              <span class="chip danger">{{ asset.critical_count }} criticos</span>
+            {% endif %}
+          </div>
+        </div>
+      {% else %}
+        <p class="muted">Sem tickets abertos.</p>
+      {% endfor %}
+    </div>
+  </article>
+</section>
+
+<section class="card">
+  <div class="section-title">
+    <h3>Renovacoes a acompanhar</h3>
+  </div>
+  <div class="list compact-list">
+    {% for item in renewal_focus %}
+      <div class="list-row">
+        <div>
+          <strong><a class="table-link" href="{{ url_for('asset_detail', asset_id=item.id) }}">{{ item.project_name }}</a></strong>
+          <p>{{ item.installation_group or item.project_name }} | fim {{ format_date_pt(item.contract_end_date) if item.contract_end_date else '-' }}</p>
+        </div>
+        <div class="chips">
+          <span class="chip">{{ item.renewal_status or 'Por contactar' }}</span>
+          <a class="button secondary" href="{{ url_for('renewals') }}">Ver renovacoes</a>
+        </div>
+      </div>
+    {% else %}
+      <p class="muted">Sem renovacoes criticas neste momento.</p>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="card">
+  <div class="section-title">
+    <h3>Centrais sem contrato ativo</h3>
+  </div>
+  <div class="list">
+    {% for asset in potential_assets %}
+      <div class="list-row">
+        <div>
+          <strong><a class="table-link" href="{{ url_for('asset_detail', asset_id=asset.id) }}">{{ asset.project_name }}</a></strong>
+          <p>{{ asset.record_date or "-" }}</p>
+        </div>
+        <div class="chips">
+          <span class="chip om-inactive">Sem contrato</span>
+          {% if asset.status %}
+            <span class="chip {{ status_colors.get(asset.status, 'muted') }}">{{ asset.status }}</span>
+          {% endif %}
+        </div>
+      </div>
+    {% else %}
+      <p class="muted">Sem centrais fora de contrato com problemas neste momento.</p>
+    {% endfor %}
+  </div>
+</section>
+{% endblock %}

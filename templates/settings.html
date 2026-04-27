@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">Importação</p>
+    <h2>Base de dados e Excel</h2>
+    <p class="muted">Importa de novo o ficheiro Excel para atualizar a base SQLite local.</p>
+  </div>
+</section>
+
+<section class="cards">
+  <article class="card stat-card"><span>Instalacoes</span><strong>{{ db_info.assets }}</strong></article>
+  <article class="card stat-card"><span>Registos de monitorização</span><strong>{{ db_info.monitoring }}</strong></article>
+  <article class="card stat-card"><span>Tickets</span><strong>{{ db_info.tickets }}</strong></article>
+  <article class="card stat-card"><span>Aliases</span><strong>{{ db_info.aliases }}</strong></article>
+</section>
+
+<section class="card">
+  <p class="muted">A reimportacao do Excel substitui os dados atuais da base. A app cria um backup automatico antes de executar a operacao.</p>
+  <form method="post" class="stack-form">
+    <label>Caminho do Excel
+      <input type="text" name="excel_path" value="{{ excel_path }}">
+    </label>
+    <button class="button" type="submit">Reimportar do Excel</button>
+  </form>
+</section>
+{% endblock %}
