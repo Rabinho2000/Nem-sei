@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">Performance debug</p>
+    <h2>{{ record.project_name }}</h2>
+    <p class="muted">{{ record.period_type }} | {{ record.period_date }}</p>
+  </div>
+  <div class="hero-actions">
+    <a class="button secondary" href="{{ url_for('performance', asset_id=record.asset_id, period_type=record.period_type, period_date=record.period_date, om_only='no') }}">Voltar</a>
+  </div>
+</section>
+
+<section class="grid two">
+  <article class="card">
+    <div class="section-title"><h3>Selecao</h3></div>
+    <dl class="details">
+      <div><dt>Central</dt><dd>{{ record.project_name }}</dd></div>
+      <div><dt>External ID / stationCode</dt><dd>{{ record.external_id or "-" }}</dd></div>
+      <div><dt>Tipo periodo</dt><dd>{{ record.period_type }}</dd></div>
+      <div><dt>Data periodo</dt><dd>{{ record.period_date }}</dd></div>
+      <div><dt>Producao kWh</dt><dd>{{ record.production_kwh if record.production_kwh is not none else "-" }}</dd></div>
+      <div><dt>Chave usada</dt><dd>{{ record.selected_production_key or "-" }}</dd></div>
+      <div><dt>Valor bruto usado</dt><dd>{{ record.selected_production_raw_value or "-" }}</dd></div>
+      <div><dt>Qualidade dados</dt><dd>{{ record.data_quality or "-" }}</dd></div>
+      <div><dt>Estado</dt><dd><span class="chip {{ status_colors.get(record.performance_status, 'muted') }}">{{ record.performance_status or "-" }}</span></dd></div>
+    </dl>
+    {% if record.notes %}
+      <p class="muted">{{ record.notes }}</p>
+    {% endif %}
+  </article>
+
+  <article class="card">
+    <div class="section-title"><h3>Payload</h3></div>
+    <pre class="message-preview">{{ pretty_payload }}</pre>
+  </article>
+</section>
+{% endblock %}

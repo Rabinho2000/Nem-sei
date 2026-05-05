@@ -1,0 +1,5 @@
+<datalist id="integration-asset-options">
+  {% for asset in assets_for_mapping %}
+    <option value="{{ asset.project_name }}" data-id="{{ asset.id }}"></option>
+  {% endfor %}
+</datalist>

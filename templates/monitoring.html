@@ -45,6 +45,14 @@
         <span>Desconectadas atuais</span>
         <strong>{{ monitoring_stats.current_disconnected }}</strong>
       </article>
+      <article class="card stat-card">
+        <span>Prioridade critica</span>
+        <strong>{{ monitoring_stats.critical_priority }}</strong>
+      </article>
+      <article class="card stat-card">
+        <span>Recorrentes 90 dias</span>
+        <strong>{{ monitoring_stats.recurring_90d }}</strong>
+      </article>
     </section>
 
     <section class="card">
@@ -60,6 +68,12 @@
           <option value="">Todos os estados</option>
           {% for status in monitoring_statuses %}
             <option value="{{ status }}" {{ 'selected' if status_filter == status else '' }}>{{ status }}</option>
+          {% endfor %}
+        </select>
+        <select name="source">
+          <option value="">Todas as origens</option>
+          {% for source in monitoring_sources %}
+            <option value="{{ source }}" {{ 'selected' if source_filter == source else '' }}>{{ source }}</option>
           {% endfor %}
         </select>
         <select name="om_only">
@@ -96,6 +110,9 @@
                     <th>Central</th>
                     <th>Estado</th>
                     <th>Data</th>
+                    <th>Prioridade</th>
+                    <th>Dias</th>
+                    <th>Rec.</th>
                     <th>Historico</th>
                   </tr>
                 </thead>
@@ -105,6 +122,9 @@
                       <td>{{ member.project_name }}</td>
                       <td><span class="chip {{ status_colors.get(member.status, 'muted') }}">{{ member.status }}</span></td>
                       <td>{{ member.record_date }}</td>
+                      <td><span class="chip {{ 'danger' if member.auto_priority == 'Critica' else 'warning' if member.auto_priority == 'Alta' else 'accent' }}">{{ member.auto_priority }}</span></td>
+                      <td>{{ member.problem_days }}</td>
+                      <td>{{ member.recurrence_count }}</td>
                       <td><a class="table-link" href="{{ url_for('monitoring', asset_id=member.asset_id) }}">{{ member.history_count }} registos</a></td>
                     </tr>
                   {% endfor %}
@@ -131,6 +151,9 @@
               <th>O&amp;M</th>
               <th>Estado atual</th>
               <th>Data</th>
+              <th>Prioridade</th>
+              <th>Dias</th>
+              <th>Rec.</th>
               <th>Historico</th>
             </tr>
           </thead>
@@ -144,10 +167,13 @@
                 <td><span class="chip {{ 'om-active' if row.active_contract == 'yes' else 'om-inactive' }}">{{ om_status_label(row.active_contract) }}</span></td>
                 <td><span class="chip {{ status_colors.get(row.status, 'muted') }}">{{ row.status }}</span></td>
                 <td>{{ row.record_date }}</td>
+                <td><span class="chip {{ 'danger' if row.auto_priority == 'Critica' else 'warning' if row.auto_priority == 'Alta' else 'accent' }}">{{ row.auto_priority }}</span></td>
+                <td>{{ row.problem_days }}</td>
+                <td>{{ row.recurrence_count }}</td>
                 <td><a class="table-link" href="{{ url_for('monitoring', asset_id=row.asset_id) }}">{{ row.history_count }} registos</a></td>
               </tr>
             {% else %}
-              <tr><td colspan="8" class="muted">Sem monitorizacao ainda.</td></tr>
+              <tr><td colspan="11" class="muted">Sem monitorizacao ainda.</td></tr>
             {% endfor %}
           </tbody>
         </table>

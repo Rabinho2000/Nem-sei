@@ -59,11 +59,38 @@
             {% endfor %}
           </select>
         </label>
+        <label>Origem
+          <select name="source">
+            {% set current_source = template_filters.get('source', request.args.get('source', '')) %}
+            <option value="">Todas</option>
+            {% for source in monitoring_sources %}
+              <option value="{{ source }}" {{ 'selected' if current_source == source else '' }}>{{ source }}</option>
+            {% endfor %}
+          </select>
+        </label>
         <label>Data inicial
           <input type="date" name="start_date" value="{{ template_filters.get('start_date', request.args.get('start_date', '')) }}">
         </label>
         <label>Data final
           <input type="date" name="end_date" value="{{ template_filters.get('end_date', request.args.get('end_date', '')) }}">
+        </label>
+      {% elif selected_dataset in ['executive_report', 'monitoring_report'] %}
+        <label>Periodo
+          {% set current_period = template_filters.get('period', request.args.get('period', 'week')) %}
+          <select name="period">
+            <option value="day" {{ 'selected' if current_period == 'day' else '' }}>Diario</option>
+            <option value="week" {{ 'selected' if current_period == 'week' else '' }}>Semanal</option>
+            <option value="month" {{ 'selected' if current_period == 'month' else '' }}>Mensal</option>
+          </select>
+        </label>
+        <label>Origem
+          {% set current_source = template_filters.get('source', request.args.get('source', '')) %}
+          <select name="source">
+            <option value="">Todas</option>
+            {% for source in monitoring_sources %}
+              <option value="{{ source }}" {{ 'selected' if current_source == source else '' }}>{{ source }}</option>
+            {% endfor %}
+          </select>
         </label>
       {% elif selected_dataset == 'tickets' %}
         <label>Estado

@@ -1,0 +1,18 @@
+<section class="cards">
+  <article class="card stat-card">
+    <span>Ultimo sync</span>
+    <strong>{{ config.last_sync_at or '-' }}</strong>
+  </article>
+  <article class="card stat-card">
+    <span>Estado</span>
+    <strong>{{ config.last_sync_status or 'sem sync' }}</strong>
+  </article>
+  <article class="card stat-card">
+    <span>Auto-sync</span>
+    <strong>{{ 'ativo' if config.auto_sync_enabled else 'desligado' }}</strong>
+  </article>
+  <article class="card stat-card">
+    <span>Horarios</span>
+    <strong>{{ config.sync_hours or '-' }}</strong>
+  </article>
+</section>

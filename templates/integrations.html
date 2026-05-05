@@ -1,195 +1,79 @@
 {% extends "base.html" %}
 {% block content %}
-<section class="hero">
-  <div>
-    <p class="eyebrow">Integracoes</p>
-    <h2>FusionSolar</h2>
-    <p class="muted">Sincronizacao automatica duas vezes por dia, check manual e lista de centrais por resolver.</p>
-    <p class="muted">Configurado para API Account Mode da documentacao SmartPVMS: login por XSRF-TOKEN, lista de centrais, realtime por planta e alarmes ativos.</p>
+{% include "integrations/_hero.html" %}
+{% include "integrations/_asset_options.html" %}
+
+<section class="tab-shell" id="integrations-tabs">
+  <div class="tab-bar integration-tab-bar">
+    <button class="tab-button active" type="button" data-tab-target="integrations-summary">Resumo</button>
+    <button class="tab-button" type="button" data-tab-target="integrations-fusionsolar">FusionSolar</button>
+    <button class="tab-button" type="button" data-tab-target="integrations-mappings">Mapeamentos</button>
+    <button class="tab-button" type="button" data-tab-target="integrations-link-audit">Validacao</button>
+    <button class="tab-button" type="button" data-tab-target="integrations-alerts">Alertas</button>
+    <button class="tab-button" type="button" data-tab-target="integrations-assets">Instalacoes</button>
+    <button class="tab-button" type="button" data-tab-target="integrations-history">Historico</button>
   </div>
-  <div class="hero-actions">
-    <form method="post">
-      <input type="hidden" name="action" value="test_connection">
-      <button class="button secondary" type="submit">Testar ligacao</button>
-    </form>
-    <form method="post">
-      <input type="hidden" name="action" value="sync_now">
-      <button class="button" type="submit">Sincronizar agora</button>
-    </form>
-  </div>
+
+  <section class="tab-panel active" id="integrations-summary">
+    {% include "integrations/_sync_status.html" %}
+    {% include "integrations/_telegram.html" %}
+  </section>
+
+  <section class="tab-panel" id="integrations-fusionsolar">
+    {% include "integrations/_fusionsolar_config.html" %}
+  </section>
+
+  <section class="tab-panel" id="integrations-mappings">
+    {% include "integrations/_fusionsolar_mappings.html" %}
+    {% include "integrations/_unresolved.html" %}
+  </section>
+
+  <section class="tab-panel" id="integrations-link-audit">
+    {% include "integrations/_fusionsolar_link_audit.html" %}
+  </section>
+
+  <section class="tab-panel" id="integrations-alerts">
+    {% include "integrations/_alert_filters.html" %}
+    {% include "integrations/_alert_blacklist.html" %}
+  </section>
+
+  <section class="tab-panel" id="integrations-assets">
+    {% include "integrations/_bulk_alerts.html" %}
+  </section>
+
+  <section class="tab-panel" id="integrations-history">
+    {% include "integrations/_sync_history.html" %}
+  </section>
 </section>
 
-<datalist id="integration-asset-options">
-  {% for asset in assets_for_mapping %}
-    <option value="{{ asset.project_name }}" data-id="{{ asset.id }}"></option>
-  {% endfor %}
-</datalist>
+<script>
+  (function () {
+    const shell = document.getElementById('integrations-tabs');
+    if (!shell) return;
+    const buttons = shell.querySelectorAll('.tab-button');
+    const panels = shell.querySelectorAll('.tab-panel');
 
-<section class="cards">
-  <article class="card stat-card">
-    <span>Ultimo sync</span>
-    <strong>{{ config.last_sync_at or '-' }}</strong>
-  </article>
-  <article class="card stat-card">
-    <span>Estado</span>
-    <strong>{{ config.last_sync_status or 'sem sync' }}</strong>
-  </article>
-  <article class="card stat-card">
-    <span>Auto-sync</span>
-    <strong>{{ 'ativo' if config.auto_sync_enabled else 'desligado' }}</strong>
-  </article>
-  <article class="card stat-card">
-    <span>Horarios</span>
-    <strong>{{ config.sync_hours or '-' }}</strong>
-  </article>
-</section>
+    function activateTab(targetId, updateHash) {
+      buttons.forEach((button) => {
+        button.classList.toggle('active', button.dataset.tabTarget === targetId);
+      });
+      panels.forEach((panel) => {
+        panel.classList.toggle('active', panel.id === targetId);
+      });
+      if (updateHash) {
+        history.replaceState(null, '', '#' + targetId);
+      }
+    }
 
-<section class="grid two">
-  <article class="card">
-    <div class="section-title"><h3>Configuracao da integracao</h3></div>
-    <form method="post" class="stack-form">
-      <input type="hidden" name="action" value="save_config">
-      <label>Username
-        <input type="text" name="username" value="{{ config.username or '' }}">
-      </label>
-      <label>Password
-        <input type="text" name="password" value="{{ config.password or '' }}">
-      </label>
-      <label>Base URL
-        <input type="text" name="base_url" value="{{ config.base_url or '' }}" placeholder="https://xxx.fusionsolar.huawei.com">
-      </label>
-      <label>Login endpoint
-        <input type="text" name="login_endpoint" value="{{ config.login_endpoint or '/thirdData/login' }}" placeholder="/thirdData/login">
-      </label>
-      <label>Stations endpoint
-        <input type="text" name="plants_endpoint" value="{{ config.plants_endpoint or '/thirdData/stations' }}" placeholder="/thirdData/stations">
-      </label>
-      <label>Real-time endpoint
-        <input type="text" name="real_time_endpoint" value="{{ config.real_time_endpoint or '/thirdData/getStationRealKpi' }}" placeholder="/thirdData/getStationRealKpi">
-      </label>
-      <label>Alarms endpoint
-        <input type="text" name="alarms_endpoint" value="{{ config.alarms_endpoint or '/thirdData/getAlarmList' }}" placeholder="/thirdData/getAlarmList">
-      </label>
-      <label>Horarios do auto-sync
-        <input type="text" name="sync_hours" value="{{ config.sync_hours or '08:00,14:00' }}" placeholder="08:00,14:00">
-      </label>
-      <p class="muted">Defaults da documentacao: `/thirdData/login`, `/thirdData/stations`, `/thirdData/getStationRealKpi`, `/thirdData/getAlarmList`.</p>
-      <label class="checkbox-inline">
-        <input type="checkbox" name="enabled" {{ 'checked' if config.enabled else '' }}>
-        <span>Integracao ativa</span>
-      </label>
-      <label class="checkbox-inline">
-        <input type="checkbox" name="auto_sync_enabled" {{ 'checked' if config.auto_sync_enabled else '' }}>
-        <span>Auto-sync 2x por dia</span>
-      </label>
-      <button class="button" type="submit">Guardar configuracao</button>
-      {% if config.last_error %}
-        <p class="muted">Ultimo erro: {{ config.last_error }}</p>
-      {% endif %}
-    </form>
-  </article>
+    buttons.forEach((button) => {
+      button.addEventListener('click', function () {
+        activateTab(button.dataset.tabTarget, true);
+      });
+    });
 
-  <article class="card">
-    <div class="section-title"><h3>Mapeamentos atuais</h3></div>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Central local</th>
-            <th>Instalacao</th>
-            <th>External ID</th>
-            <th>External name</th>
-            <th>Ultimo estado</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for row in mapped_assets %}
-            <tr>
-              <td><a class="table-link" href="{{ url_for('asset_detail', asset_id=row.asset_id) }}">{{ row.project_name }}</a></td>
-              <td>{{ row.installation_group or row.project_name }}</td>
-              <td>{{ row.external_id or '-' }}</td>
-              <td>{{ row.external_name or '-' }}</td>
-              <td>{{ row.last_status or '-' }}</td>
-            </tr>
-          {% else %}
-            <tr><td colspan="5" class="muted">Ainda nao existem centrais mapeadas ao FusionSolar.</td></tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-  </article>
-</section>
-
-<section class="card">
-  <div class="section-title"><h3>Por resolver</h3></div>
-  <div class="list">
-    {% for row in unresolved_rows %}
-      <div class="list-row unresolved-row">
-        <div>
-          <strong>{{ row.external_name }}</strong>
-          <p>ID externo: {{ row.external_id or '-' }} | Estado: {{ row.external_status or '-' }}</p>
-        </div>
-        <form method="post" class="inline-form unresolved-action-form">
-          <input type="hidden" name="action" value="resolve_unresolved">
-          <input type="hidden" name="unresolved_id" value="{{ row.id }}">
-          <div class="asset-picker">
-            <input class="asset-picker-input" type="text" list="integration-asset-options" placeholder="Escrever central">
-            <input type="hidden" name="asset_id" value="{{ row.suggested_asset_id or '' }}">
-          </div>
-          <button class="button secondary" type="submit">Associar</button>
-        </form>
-        <div class="hero-actions">
-          <form method="post">
-            <input type="hidden" name="action" value="create_asset_from_unresolved">
-            <input type="hidden" name="unresolved_id" value="{{ row.id }}">
-            <button class="button secondary" type="submit">Criar asset</button>
-          </form>
-          <form method="post">
-            <input type="hidden" name="action" value="ignore_unresolved">
-            <input type="hidden" name="unresolved_id" value="{{ row.id }}">
-            <button class="button danger-button" type="submit">Ignorar</button>
-          </form>
-        </div>
-      </div>
-    {% else %}
-      <p class="muted">Sem centrais por resolver neste momento.</p>
-    {% endfor %}
-  </div>
-</section>
-
-<section class="card">
-  <div class="section-title"><h3>Historico de syncs</h3></div>
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>Inicio</th>
-          <th>Fim</th>
-          <th>Trigger</th>
-          <th>Estado</th>
-          <th>Associados</th>
-          <th>Por resolver</th>
-          <th>Resolvidos auto</th>
-          <th>Erro</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for run in sync_runs %}
-          <tr>
-            <td>{{ run.started_at }}</td>
-            <td>{{ run.finished_at or '-' }}</td>
-            <td>{{ run.trigger_type or '-' }}</td>
-            <td><span class="chip {{ integration_status_colors.get(run.status or 'pending', 'muted') }}">{{ run.status or 'pending' }}</span></td>
-            <td>{{ run.matched_count }}</td>
-            <td>{{ run.unresolved_count }}</td>
-            <td>{{ run.auto_resolved_count }}</td>
-            <td>{{ run.error_message or '-' }}</td>
-          </tr>
-        {% else %}
-          <tr><td colspan="8" class="muted">Ainda nao houve syncs FusionSolar.</td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-</section>
+    const initialTab = window.location.hash ? window.location.hash.slice(1) : 'integrations-summary';
+    const hasInitialTab = Array.from(panels).some((panel) => panel.id === initialTab);
+    activateTab(hasInitialTab ? initialTab : 'integrations-summary', false);
+  })();
+</script>
 {% endblock %}

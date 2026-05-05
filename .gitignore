@@ -8,9 +8,11 @@ SolarFusionAPI.txt
 *.sqlite
 *.sqlite3
 backups/
+logs/
 
 # Imported/exported business files
 *.xlsx
+*.xlsm
 *.xls
 *.pdf
 uploads/

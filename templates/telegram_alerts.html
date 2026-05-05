@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">Telegram Alerts</p>
+    <h2>Historico de alertas</h2>
+    <p class="muted">Registo local das tentativas de envio para Telegram.</p>
+  </div>
+  <div class="hero-actions">
+    <a class="button secondary" href="{{ url_for('integrations') }}">Configuracao Telegram</a>
+  </div>
+</section>
+
+<section class="card">
+  <form class="filters js-auto-submit" method="get">
+    <select name="status">
+      <option value="">Todos os status</option>
+      {% for status in ['sent', 'failed', 'blocked'] %}
+        <option value="{{ status }}" {{ 'selected' if status_filter == status else '' }}>{{ status }}</option>
+      {% endfor %}
+    </select>
+    <select name="asset_id">
+      <option value="">Todas as instalacoes</option>
+      {% for asset in assets_for_mapping %}
+        <option value="{{ asset.id }}" {{ 'selected' if asset_filter == asset.id|string else '' }}>{{ asset.project_name }}</option>
+      {% endfor %}
+    </select>
+    <select name="alert_type">
+      <option value="">Todos os tipos</option>
+      {% for alert_type in alert_types %}
+        <option value="{{ alert_type }}" {{ 'selected' if alert_type_filter == alert_type else '' }}>{{ alert_type }}</option>
+      {% endfor %}
+    </select>
+    <select name="blocked_reason">
+      <option value="">Todos os motivos</option>
+      {% for reason in blocked_reasons %}
+        <option value="{{ reason }}" {{ 'selected' if blocked_reason_filter == reason else '' }}>{{ reason }}</option>
+      {% endfor %}
+    </select>
+    <button class="button" type="submit">Aplicar</button>
+    <a class="button secondary" href="{{ url_for('telegram_alerts') }}">Limpar</a>
+  </form>
+</section>
+
+<section class="card">
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Data/hora</th>
+          <th>Instalacao</th>
+          <th>Tipo</th>
+          <th>Status</th>
+          <th>Motivo bloqueio</th>
+          <th>Mensagem</th>
+          <th>Erro</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for alert in alerts %}
+          <tr>
+            <td>{{ alert.sent_at }}</td>
+            <td>{{ alert.project_name or '-' }}</td>
+            <td>{{ alert.alert_type }}</td>
+            <td><span class="chip {{ 'success' if alert.status == 'sent' else 'warning' if alert.status == 'blocked' else 'danger' }}">{{ alert.status }}</span></td>
+            <td>{{ alert.blocked_reason or '-' }}</td>
+            <td><pre class="message-preview">{{ alert.message }}</pre></td>
+            <td>{{ alert.error_message or '-' }}</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="7" class="muted">Ainda nao existem alertas Telegram registados.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

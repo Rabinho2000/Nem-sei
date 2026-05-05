@@ -1,0 +1,35 @@
+<section class="card">
+  <div class="section-title"><h3>Historico de syncs</h3></div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Inicio</th>
+          <th>Fim</th>
+          <th>Trigger</th>
+          <th>Estado</th>
+          <th>Associados</th>
+          <th>Por resolver</th>
+          <th>Resolvidos auto</th>
+          <th>Erro</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for run in sync_runs %}
+          <tr>
+            <td>{{ run.started_at }}</td>
+            <td>{{ run.finished_at or '-' }}</td>
+            <td>{{ run.trigger_type or '-' }}</td>
+            <td><span class="chip {{ integration_status_colors.get(run.status or 'pending', 'muted') }}">{{ run.status or 'pending' }}</span></td>
+            <td>{{ run.matched_count }}</td>
+            <td>{{ run.unresolved_count }}</td>
+            <td>{{ run.auto_resolved_count }}</td>
+            <td>{{ run.error_message or '-' }}</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="8" class="muted">Ainda nao houve syncs FusionSolar.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>

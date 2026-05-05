@@ -1,0 +1,77 @@
+<section class="card">
+  <div class="section-title">
+    <div>
+      <h3>Validacao FusionSolar</h3>
+      <p class="muted">Confirma se cada central que vem do FusionSolar esta ligada a instalacao local certa.</p>
+    </div>
+    <div class="chips">
+      <span class="chip success">{{ link_audit_counts.ok }} OK</span>
+      <span class="chip warning">{{ link_audit_counts.attention }} atencao</span>
+      <span class="chip danger">{{ link_audit_counts.review }} rever</span>
+      <span class="chip accent">{{ link_audit_counts.unresolved }} por resolver</span>
+    </div>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Validacao</th>
+          <th>FusionSolar</th>
+          <th>Central local</th>
+          <th>Instalacao local</th>
+          <th>Estado</th>
+          <th>Ultimo sync</th>
+          <th>Motivo</th>
+          <th>Alterar</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in link_audit_rows %}
+          <tr>
+            <td>
+              <span class="chip {{ 'success' if row.verdict == 'OK' else 'warning' if row.verdict == 'Atencao' else 'accent' if row.verdict == 'Por resolver' else 'danger' }}">
+                {{ row.verdict }}
+              </span>
+            </td>
+            <td>
+              <strong>{{ row.external_name or '-' }}</strong>
+              <p class="muted">ID externo: {{ row.external_id or '-' }}</p>
+              {% if row.duplicate_count and row.duplicate_count > 1 %}
+                <p><span class="chip warning">{{ row.duplicate_count }} na mesma central</span></p>
+              {% endif %}
+            </td>
+            <td>
+              {% if row.asset_id %}
+                <a class="table-link" href="{{ url_for('asset_detail', asset_id=row.asset_id) }}">{{ row.project_name }}</a>
+              {% else %}
+                <span class="muted">Sem associacao</span>
+              {% endif %}
+            </td>
+            <td>{{ row.installation_group or '-' }}</td>
+            <td>{{ row.last_status or '-' }}</td>
+            <td>{{ row.last_sync_at or '-' }}</td>
+            <td>{{ row.reason }}</td>
+            <td>
+              <form method="post" class="inline-form compact-action-form">
+                {% if row.integration_id %}
+                  <input type="hidden" name="action" value="update_fusionsolar_mapping">
+                  <input type="hidden" name="integration_id" value="{{ row.integration_id }}">
+                {% else %}
+                  <input type="hidden" name="action" value="resolve_unresolved">
+                  <input type="hidden" name="unresolved_id" value="{{ row.unresolved_id }}">
+                {% endif %}
+                <div class="asset-picker">
+                  <input class="asset-picker-input" type="text" list="integration-asset-options" placeholder="Escolher central" required>
+                  <input type="hidden" name="asset_id" value="{{ row.asset_id or '' }}">
+                </div>
+                <button class="button secondary" type="submit">Guardar</button>
+              </form>
+            </td>
+          </tr>
+        {% else %}
+          <tr><td colspan="8" class="muted">Ainda nao existem centrais FusionSolar para validar.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>

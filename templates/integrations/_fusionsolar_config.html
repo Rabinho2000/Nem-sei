@@ -1,0 +1,58 @@
+<section class="card">
+  <div class="section-title"><h3>Configuracao da integracao</h3></div>
+  <form method="post" class="stack-form">
+    <input type="hidden" name="action" value="save_config">
+    <div class="grid two">
+      <label>Username
+        <input type="text" name="username" value="{{ config.username or '' }}">
+      </label>
+      <label>Password
+        <input type="password" name="password" value="" autocomplete="new-password" placeholder="{{ 'Configurada em ' ~ config.password_source if config.password_configured else 'Por configurar' }}">
+      </label>
+      <label>Base URL
+        <input type="text" name="base_url" value="{{ config.base_url or '' }}" placeholder="https://xxx.fusionsolar.huawei.com">
+      </label>
+      <label>Horarios do auto-sync
+        <input type="text" name="sync_hours" value="{{ config.sync_hours or '08:00,14:00' }}" placeholder="08:00,14:00">
+      </label>
+    </div>
+
+    <div class="grid two">
+      <label>Login endpoint
+        <input type="text" name="login_endpoint" value="{{ config.login_endpoint or '/thirdData/login' }}" placeholder="/thirdData/login">
+      </label>
+      <label>Stations endpoint
+        <input type="text" name="plants_endpoint" value="{{ config.plants_endpoint or '/thirdData/stations' }}" placeholder="/thirdData/stations">
+      </label>
+      <label>Real-time endpoint
+        <input type="text" name="real_time_endpoint" value="{{ config.real_time_endpoint or '/thirdData/getStationRealKpi' }}" placeholder="/thirdData/getStationRealKpi">
+      </label>
+      <label>Alarms endpoint
+        <input type="text" name="alarms_endpoint" value="{{ config.alarms_endpoint or '/thirdData/getAlarmList' }}" placeholder="/thirdData/getAlarmList">
+      </label>
+      <label>Day KPI endpoint
+        <input type="text" name="day_kpi_endpoint" value="{{ config.day_kpi_endpoint or '/thirdData/getKpiStationDay' }}" placeholder="/thirdData/getKpiStationDay">
+      </label>
+      <label>Month KPI endpoint
+        <input type="text" name="month_kpi_endpoint" value="{{ config.month_kpi_endpoint or '/thirdData/getKpiStationMonth' }}" placeholder="/thirdData/getKpiStationMonth">
+      </label>
+    </div>
+
+    <p class="muted">A password nao e mostrada. Deixa em branco para manter a atual; se estiver definida em `.env`, esse valor tem prioridade.</p>
+    <p class="muted">Defaults da documentacao: `/thirdData/login`, `/thirdData/stations`, `/thirdData/getStationRealKpi`, `/thirdData/getAlarmList`, `/thirdData/getKpiStationDay`, `/thirdData/getKpiStationMonth`.</p>
+    <div class="hero-actions">
+      <label class="checkbox-inline">
+        <input type="checkbox" name="enabled" {{ 'checked' if config.enabled else '' }}>
+        <span>Integracao ativa</span>
+      </label>
+      <label class="checkbox-inline">
+        <input type="checkbox" name="auto_sync_enabled" {{ 'checked' if config.auto_sync_enabled else '' }}>
+        <span>Auto-sync 2x por dia</span>
+      </label>
+    </div>
+    <button class="button" type="submit">Guardar configuracao</button>
+    {% if config.last_error %}
+      <p class="muted">Ultimo erro: {{ config.last_error }}</p>
+    {% endif %}
+  </form>
+</section>

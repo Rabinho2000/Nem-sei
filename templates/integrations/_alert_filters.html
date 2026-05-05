@@ -1,0 +1,72 @@
+<section class="card">
+  <div class="section-title">
+    <h3>Filtros de alertas</h3>
+    <form method="post">
+      <input type="hidden" name="action" value="set_alert_baseline">
+      <button class="button secondary" type="submit">Definir estado atual como baseline</button>
+    </form>
+  </div>
+  <form method="post" class="stack-form">
+    <input type="hidden" name="action" value="save_alert_settings">
+    <div class="grid two">
+      <div class="stack-form">
+        <label class="checkbox-inline">
+          <input type="checkbox" name="telegram_alerts_enabled" {{ 'checked' if alert_settings['TELEGRAM_ALERTS_ENABLED'] == 'true' else '' }}>
+          <span>Telegram alerts enabled</span>
+        </label>
+        <label>Alert scope
+          <select name="alert_scope">
+            {% for scope in alert_scope_options %}
+              <option value="{{ scope }}" {{ 'selected' if alert_settings['ALERT_SCOPE'] == scope else '' }}>{{ scope }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Minimum alert type/severity
+          <select name="MINIMUM_ALERT_SEVERITY">
+            {% for severity in ['info', 'warning', 'critical'] %}
+              <option value="{{ severity }}" {{ 'selected' if alert_settings['MINIMUM_ALERT_SEVERITY'] == severity else '' }}>{{ severity }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label class="checkbox-inline">
+          <input type="checkbox" name="IGNORE_HISTORICAL_ALERTS" {{ 'checked' if alert_settings['IGNORE_HISTORICAL_ALERTS'] == 'true' else '' }}>
+          <span>Ignorar historico anterior ao baseline</span>
+        </label>
+        <p class="muted">Baseline atual: {{ alert_settings['ALERT_BASELINE_AT'] or 'ainda nao definido' }}</p>
+      </div>
+      <div class="checkbox-grid">
+        {% for key, label in [
+          ('SEND_NEW_ERROR_ALERTS', 'Enviar novos erros'),
+          ('SEND_OFFLINE_ALERTS', 'Enviar desconexoes'),
+          ('SEND_RESOLVED_ALERTS', 'Enviar resolvidos'),
+          ('SEND_PERSISTENT_ALERTS', 'Enviar persistentes'),
+          ('SEND_RECURRENT_ALERTS', 'Enviar recorrentes'),
+          ('DAYTIME_OFFLINE_ONLY', 'Desconexao so de dia')
+        ] %}
+          <label class="checkbox-inline">
+            <input type="checkbox" name="{{ key }}" {{ 'checked' if alert_settings[key] == 'true' else '' }}>
+            <span>{{ label }}</span>
+          </label>
+        {% endfor %}
+      </div>
+    </div>
+    <div class="filters">
+      <label>Novo erro cooldown min.
+        <input type="number" min="0" name="NEW_ERROR_COOLDOWN_MINUTES" value="{{ alert_settings['NEW_ERROR_COOLDOWN_MINUTES'] }}">
+      </label>
+      <label>Offline cooldown min.
+        <input type="number" min="0" name="OFFLINE_COOLDOWN_MINUTES" value="{{ alert_settings['OFFLINE_COOLDOWN_MINUTES'] }}">
+      </label>
+      <label>Resolvido cooldown min.
+        <input type="number" min="0" name="RESOLVED_COOLDOWN_MINUTES" value="{{ alert_settings['RESOLVED_COOLDOWN_MINUTES'] }}">
+      </label>
+      <label>Persistente cooldown h
+        <input type="number" min="0" name="PERSISTENT_COOLDOWN_HOURS" value="{{ alert_settings['PERSISTENT_COOLDOWN_HOURS'] }}">
+      </label>
+      <label>Recorrente cooldown h
+        <input type="number" min="0" name="RECURRENT_COOLDOWN_HOURS" value="{{ alert_settings['RECURRENT_COOLDOWN_HOURS'] }}">
+      </label>
+    </div>
+    <button class="button" type="submit">Guardar filtros</button>
+  </form>
+</section>

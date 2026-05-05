@@ -3,6 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>{{ title or "Monitoring Board" }}</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
   </head>
@@ -19,12 +20,18 @@
           <a href="{{ url_for('dashboard') }}" class="{{ 'active' if request.endpoint == 'dashboard' else '' }}">Dashboard</a>
           <a href="{{ url_for('assets') }}" class="{{ 'active' if request.endpoint in ['assets', 'asset_detail'] else '' }}">Instalacoes</a>
           <a href="{{ url_for('monitoring') }}" class="{{ 'active' if request.endpoint == 'monitoring' else '' }}">Monitorizacao</a>
+          <a href="{{ url_for('performance') }}" class="{{ 'active' if request.endpoint == 'performance' else '' }}">Performance</a>
           <a href="{{ url_for('tickets') }}" class="{{ 'active' if request.endpoint == 'tickets' else '' }}">Corretivas</a>
-          <a href="{{ url_for('integrations') }}" class="{{ 'active' if request.endpoint == 'integrations' else '' }}">Integracoes</a>
+          <a href="{{ url_for('integrations') }}" class="{{ 'active' if request.endpoint in ['integrations', 'telegram_alerts'] else '' }}">Integracoes</a>
           <a href="{{ url_for('renewals') }}" class="{{ 'active' if request.endpoint == 'renewals' else '' }}">Renovacoes</a>
           <a href="{{ url_for('exports') }}" class="{{ 'active' if request.endpoint == 'exports' else '' }}">Exportacoes</a>
           <a href="{{ url_for('settings') }}" class="{{ 'active' if request.endpoint == 'settings' else '' }}">Importacao</a>
         </nav>
+        {% if current_username %}
+          <form method="post" action="{{ url_for('auth.logout') }}" class="logout-form">
+            <button class="button secondary" type="submit">Sair</button>
+          </form>
+        {% endif %}
       </aside>
       <main class="content">
         {% with messages = get_flashed_messages(with_categories=true) %}
@@ -40,6 +47,18 @@
       </main>
     </div>
     <script>
+      (function () {
+        const csrfToken = document.querySelector("meta[name='csrf-token']")?.getAttribute("content") || "";
+        document.querySelectorAll("form[method='post'], form[method='POST']").forEach(function (form) {
+          if (!csrfToken || form.querySelector("input[name='csrf_token']")) return;
+          const input = document.createElement("input");
+          input.type = "hidden";
+          input.name = "csrf_token";
+          input.value = csrfToken;
+          form.appendChild(input);
+        });
+      })();
+
       (function () {
         const storageKey = "monitoring-board-theme";
         const root = document.documentElement;

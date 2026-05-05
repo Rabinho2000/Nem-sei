@@ -1,0 +1,18 @@
+<section class="card">
+  <div class="section-title"><h3>Telegram</h3></div>
+  <div class="grid two">
+    <dl class="details">
+      <div><dt>Bot configurado</dt><dd>{{ 'sim' if telegram_config.token_configured else 'nao' }}</dd></div>
+      <div><dt>Token</dt><dd>{{ telegram_config.masked_token or '-' }}</dd></div>
+      <div><dt>Chat ID configurado</dt><dd>{{ 'sim' if telegram_config.chat_id_configured else 'nao' }}</dd></div>
+      <div><dt>Alertas Telegram ativos</dt><dd>{{ 'sim' if telegram_config.alerts_enabled else 'nao' }}</dd></div>
+      <div><dt>Resumo diario ativo</dt><dd>{{ 'sim' if telegram_config.daily_summary_enabled else 'nao' }}</dd></div>
+    </dl>
+    <form method="post" class="stack-form">
+      <input type="hidden" name="action" value="test_telegram">
+      <p class="muted">Configuracao lida do ficheiro `.env` ou das variaveis de ambiente. O token completo nunca e mostrado aqui.</p>
+      <button class="button secondary" type="submit">Enviar mensagem de teste</button>
+      <a class="button secondary" href="{{ url_for('telegram_alerts') }}">Ver historico</a>
+    </form>
+  </div>
+</section>

@@ -1,0 +1,29 @@
+<section class="card">
+  <div class="section-title"><h3>Blacklist de alertas</h3></div>
+  <form method="post" class="filters">
+    <input type="hidden" name="action" value="add_alert_blacklist">
+    <div class="asset-picker">
+      <input class="asset-picker-input" type="text" list="integration-asset-options" name="asset_name" placeholder="Pesquisar instalacao">
+      <input type="hidden" name="asset_id" value="">
+    </div>
+    <input type="text" name="reason" placeholder="Motivo">
+    <button class="button secondary" type="submit">Adicionar a blacklist</button>
+  </form>
+  <div class="list compact-list">
+    {% for row in alert_blacklist_rows %}
+      <div class="list-row">
+        <div>
+          <strong>{{ row.project_name or row.asset_name or '-' }}</strong>
+          <p>{{ row.reason or '-' }} | {{ row.created_at }}</p>
+        </div>
+        <form method="post">
+          <input type="hidden" name="action" value="remove_alert_blacklist">
+          <input type="hidden" name="blacklist_id" value="{{ row.id }}">
+          <button class="button secondary" type="submit">Remover</button>
+        </form>
+      </div>
+    {% else %}
+      <p class="muted">Sem instalacoes na blacklist.</p>
+    {% endfor %}
+  </div>
+</section>

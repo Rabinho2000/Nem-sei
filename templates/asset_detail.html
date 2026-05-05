@@ -66,6 +66,31 @@
       <label>Notas
         <textarea name="notes" rows="4">{{ asset.notes or '' }}</textarea>
       </label>
+      <label class="checkbox-inline">
+        <input type="checkbox" name="monitoring_enabled" {{ 'checked' if asset.monitoring_enabled is none or asset.monitoring_enabled else '' }}>
+        <span>Considerar para monitorizacao</span>
+      </label>
+      <label class="checkbox-inline">
+        <input type="checkbox" name="alerts_enabled" {{ 'checked' if asset.alerts_enabled is none or asset.alerts_enabled else '' }}>
+        <span>Receber alertas Telegram</span>
+      </label>
+      <label class="checkbox-inline">
+        <input type="checkbox" name="selected_for_alerts" {{ 'checked' if asset.selected_for_alerts else '' }}>
+        <span>Incluir explicitamente nos alertas Telegram</span>
+      </label>
+      <label>Estado de monitorizacao
+        <select name="monitoring_status">
+          {% for status in asset_monitoring_statuses %}
+            <option value="{{ status }}" {{ 'selected' if (asset.monitoring_status or 'active') == status else '' }}>{{ status }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Silenciada ate
+        <input type="datetime-local" name="silenced_until" value="{{ asset.silenced_until[:16] if asset.silenced_until else '' }}">
+      </label>
+      <label>Motivo
+        <textarea name="silence_reason" rows="3">{{ asset.silence_reason or '' }}</textarea>
+      </label>
       <div class="hero-actions">
         <button class="button" type="submit">Guardar instalacao</button>
         <button class="button danger-button" type="submit" formaction="{{ url_for('delete_asset', asset_id=asset.id) }}">Apagar instalacao</button>
@@ -143,7 +168,84 @@
       <div><dt>Status detalhe</dt><dd>{{ asset.status_detail or "-" }}</dd></div>
       <div><dt>Acesso</dt><dd>{{ asset.access_type or "-" }}</dd></div>
       <div><dt>Cobertura</dt><dd>{{ asset.coverage_type or "-" }}</dd></div>
+      <div><dt>Monitorizacao</dt><dd>{{ 'ativa' if asset.monitoring_enabled is none or asset.monitoring_enabled else 'desativada' }}</dd></div>
+      <div><dt>Alertas</dt><dd>{{ 'ativos' if asset.alerts_enabled is none or asset.alerts_enabled else 'desativados' }}</dd></div>
+      <div><dt>Selecionada para alertas</dt><dd>{{ 'sim' if asset.selected_for_alerts else 'nao' }}</dd></div>
+      <div><dt>Estado alertas</dt><dd>{{ asset.monitoring_status or "active" }}</dd></div>
+      <div><dt>Silenciada ate</dt><dd>{{ asset.silenced_until or "-" }}</dd></div>
     </dl>
+  </article>
+
+  <article class="card">
+    <div class="section-title">
+      <h3>Performance</h3>
+      <a class="button secondary" href="{{ url_for('performance', asset_id=asset.id, om_only='no') }}">Abrir</a>
+    </div>
+    <div class="list compact-list">
+      <div class="list-row">
+        <div>
+          <strong>Último dia</strong>
+          <p>{{ latest_daily_performance.period_date if latest_daily_performance else "Sem dados" }}</p>
+        </div>
+        {% if latest_daily_performance %}
+          <div class="chips">
+            <span class="chip {{ status_colors.get(latest_daily_performance.performance_status, 'muted') }}">{{ latest_daily_performance.performance_status }}</span>
+            <span class="chip">{{ "%.1f"|format(latest_daily_performance.deviation_pct) if latest_daily_performance.deviation_pct is not none else "-" }}%</span>
+          </div>
+          {% with record=latest_daily_performance %}{% include "_performance_bar.html" %}{% endwith %}
+        {% endif %}
+      </div>
+      <div class="list-row performance-summary-row">
+        <div>
+          <strong>MTD</strong>
+          <p>{{ latest_mtd_performance.period_date if latest_mtd_performance else "Sem dados" }}</p>
+        </div>
+        {% if latest_mtd_performance %}
+          {% with record=latest_mtd_performance %}{% include "_performance_bar.html" %}{% endwith %}
+        {% endif %}
+      </div>
+      <div class="list-row">
+        <div>
+          <strong>Último mês</strong>
+          <p>{{ latest_monthly_performance.period_date if latest_monthly_performance else "Sem dados" }}</p>
+        </div>
+        {% if latest_monthly_performance %}
+          <div class="chips">
+            <span class="chip {{ status_colors.get(latest_monthly_performance.performance_status, 'muted') }}">{{ latest_monthly_performance.performance_status }}</span>
+            <span class="chip">{{ "%.1f"|format(latest_monthly_performance.deviation_pct) if latest_monthly_performance.deviation_pct is not none else "-" }}%</span>
+          </div>
+          {% with record=latest_monthly_performance %}{% include "_performance_bar.html" %}{% endwith %}
+        {% endif %}
+      </div>
+    </div>
+  </article>
+
+  <article class="card">
+    <div class="section-title"><h3>Definições performance</h3></div>
+    <form class="stack-form" method="post" action="{{ url_for('update_asset_performance_settings', asset_id=asset.id) }}">
+      <label class="checkbox-inline">
+        <input type="checkbox" name="enabled" {{ 'checked' if performance_settings.enabled else '' }}>
+        <span>Performance ativa</span>
+      </label>
+      <div class="grid two">
+        <label>Atenção %
+          <input type="number" step="0.1" name="warning_deviation_pct" value="{{ performance_settings.warning_deviation_pct }}">
+        </label>
+        <label>Alerta %
+          <input type="number" step="0.1" name="alert_deviation_pct" value="{{ performance_settings.alert_deviation_pct }}">
+        </label>
+        <label>Crítico %
+          <input type="number" step="0.1" name="critical_deviation_pct" value="{{ performance_settings.critical_deviation_pct }}">
+        </label>
+        <label>Anos histórico
+          <input type="number" min="1" name="baseline_years" value="{{ performance_settings.baseline_years }}">
+        </label>
+      </div>
+      <label>Orçamento mensal kWh/kWp
+        <textarea name="monthly_budget_json" rows="6" placeholder='{"01": 80, "02": 95, "03": 125}'>{{ performance_settings.monthly_budget_json or '' }}</textarea>
+      </label>
+      <button class="button" type="submit">Guardar performance</button>
+    </form>
   </article>
 </section>
 

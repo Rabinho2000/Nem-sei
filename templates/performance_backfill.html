@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">Backfill historico</p>
+    <h2>Performance</h2>
+    <p class="muted">Importa producao historica FusionSolar para alimentar referencias kWh/kWp.</p>
+  </div>
+  <div class="hero-actions">
+    <a class="button secondary" href="{{ url_for('performance') }}">Voltar</a>
+  </div>
+</section>
+
+<section class="card">
+  <div class="section-title"><h3>Backfill historico</h3></div>
+  <form class="stack-form" method="post">
+    <div class="grid two">
+      <label>Tipo de periodo
+        <select name="period_type">
+          <option value="day" {{ 'selected' if period_type == 'day' else '' }}>daily</option>
+          <option value="month" {{ 'selected' if period_type == 'month' else '' }}>monthly</option>
+        </select>
+      </label>
+      <label>Central
+        <select name="asset_id">
+          <option value="">Todas as centrais FusionSolar mapeadas</option>
+          {% for asset in assets_for_backfill %}
+            <option value="{{ asset.asset_id }}" {{ 'selected' if selected_asset_id == asset.asset_id else '' }}>{{ asset.project_name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Ano inicial
+        <input type="number" min="2000" max="{{ current_year }}" name="from_year" value="{{ from_year }}">
+      </label>
+      <label>Ano final
+        <input type="number" min="2000" max="{{ current_year }}" name="to_year" value="{{ to_year }}">
+      </label>
+      <label>Data inicial
+        <input type="date" name="date_from" value="{{ date_from }}">
+      </label>
+      <label>Data final
+        <input type="date" name="date_to" value="{{ date_to }}">
+      </label>
+      <label>Maximo chamadas API por execucao
+        <input type="number" min="1" max="100" name="max_api_calls" value="{{ max_api_calls }}">
+      </label>
+    </div>
+    <p class="muted">No modo diario, a FusionSolar devolve meses completos: uma chamada por mes e por cada 100 centrais. Estimativa atual: {{ estimated_api_calls }} chamadas API para {{ estimated_station_count }} centrais.</p>
+    <p class="muted">A API suporta apenas uma chamada KPI por minuto. Evita backfills anuais para todas as centrais; usa intervalos curtos e retoma pelo mes indicado se houver limite.</p>
+    <button class="button" type="submit">Executar backfill</button>
+  </form>
+</section>
+
+<section class="cards">
+  <article class="card stat-card">
+    <span>Registos atualizados</span>
+    <strong>-</strong>
+  </article>
+  <article class="card stat-card">
+    <span>Sem producao</span>
+    <strong>-</strong>
+  </article>
+  <article class="card stat-card">
+    <span>Erros API</span>
+    <strong>-</strong>
+  </article>
+</section>
+{% endblock %}

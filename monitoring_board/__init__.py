@@ -1,0 +1,1 @@
+"""Monitoring Board application helpers."""

@@ -1,0 +1,61 @@
+<section class="card">
+  <div class="section-title"><h3>Aplicar filtros em massa</h3></div>
+  <form method="post" class="hero-actions">
+    <input type="hidden" name="action" value="bulk_alert_action">
+    <button class="button secondary" name="bulk_action" value="blacklist_non_oem" type="submit">Blacklist sem Maintenance=yes</button>
+    <button class="button secondary" name="bulk_action" value="disable_no_active_contract" type="submit">Desativar sem contrato ativo</button>
+    <button class="button secondary" name="bulk_action" value="enable_only_oem" type="submit">Ativar apenas O&amp;M</button>
+    <button class="button" name="bulk_action" value="set_baseline" type="submit">Definir baseline atual</button>
+  </form>
+  <div class="table-wrap compact-top-space">
+    <table>
+      <thead>
+        <tr>
+          <th>Instalacao</th>
+          <th>Maintenance</th>
+          <th>Active Contract</th>
+          <th>Estado atual</th>
+          <th>Alertas</th>
+          <th>Monitoring status</th>
+          <th>Blacklist</th>
+          <th>Selected</th>
+          <th>Ultimo alerta</th>
+          <th>Acoes</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for asset in alert_filter_assets %}
+          <tr>
+            <td><a class="table-link" href="{{ url_for('asset_detail', asset_id=asset.id) }}">{{ asset.project_name }}</a></td>
+            <td>{{ asset.maintenance or '-' }}</td>
+            <td>{{ asset.active_contract or '-' }}</td>
+            <td>{{ asset.latest_status or '-' }}</td>
+            <td>{{ 'sim' if asset.alerts_enabled else 'nao' }}</td>
+            <td>{{ asset.monitoring_status or 'active' }}</td>
+            <td>{{ 'sim' if asset.blacklisted else 'nao' }}</td>
+            <td>{{ 'sim' if asset.selected_for_alerts else 'nao' }}</td>
+            <td>{{ asset.last_alert_sent or '-' }}</td>
+            <td>
+              <form method="post" class="inline-form compact-action-form">
+                <input type="hidden" name="action" value="quick_alert_action">
+                <input type="hidden" name="asset_id" value="{{ asset.id }}">
+                <select name="quick_action">
+                  <option value="disable_alerts">Desativar alertas</option>
+                  <option value="enable_alerts">Ativar alertas</option>
+                  <option value="blacklist">Adicionar blacklist</option>
+                  <option value="unblacklist">Remover blacklist</option>
+                  <option value="out_of_scope">Fora de O&amp;M</option>
+                  <option value="silence_24h">Silenciar 24h</option>
+                  <option value="reactivate">Reativar</option>
+                </select>
+                <button class="button secondary" type="submit">Aplicar</button>
+              </form>
+            </td>
+          </tr>
+        {% else %}
+          <tr><td colspan="10" class="muted">Sem instalacoes para mostrar.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>

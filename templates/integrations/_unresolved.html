@@ -1,0 +1,36 @@
+<section class="card">
+  <div class="section-title"><h3>Por resolver</h3></div>
+  <div class="list">
+    {% for row in unresolved_rows %}
+      <div class="list-row unresolved-row">
+        <div>
+          <strong>{{ row.external_name }}</strong>
+          <p>ID externo: {{ row.external_id or '-' }} | Estado: {{ row.external_status or '-' }}</p>
+        </div>
+        <form method="post" class="inline-form unresolved-action-form">
+          <input type="hidden" name="action" value="resolve_unresolved">
+          <input type="hidden" name="unresolved_id" value="{{ row.id }}">
+          <div class="asset-picker">
+            <input class="asset-picker-input" type="text" list="integration-asset-options" placeholder="Escrever central">
+            <input type="hidden" name="asset_id" value="{{ row.suggested_asset_id or '' }}">
+          </div>
+          <button class="button secondary" type="submit">Associar</button>
+        </form>
+        <div class="hero-actions">
+          <form method="post">
+            <input type="hidden" name="action" value="create_asset_from_unresolved">
+            <input type="hidden" name="unresolved_id" value="{{ row.id }}">
+            <button class="button secondary" type="submit">Criar asset</button>
+          </form>
+          <form method="post">
+            <input type="hidden" name="action" value="ignore_unresolved">
+            <input type="hidden" name="unresolved_id" value="{{ row.id }}">
+            <button class="button danger-button" type="submit">Ignorar</button>
+          </form>
+        </div>
+      </div>
+    {% else %}
+      <p class="muted">Sem centrais por resolver neste momento.</p>
+    {% endfor %}
+  </div>
+</section>

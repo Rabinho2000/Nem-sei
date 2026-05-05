@@ -93,6 +93,26 @@ a {
   height: 100vh;
 }
 
+.logout-form {
+  margin-top: auto;
+}
+
+.login-page {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.login-card {
+  width: min(420px, 100%);
+}
+
+.login-card h1 {
+  margin: 0 0 24px;
+  font-family: Georgia, "Times New Roman", serif;
+}
+
 .sidebar h1,
 .hero h2,
 .ticket-card h3 {
@@ -109,6 +129,14 @@ a {
 .muted,
 small {
   color: var(--muted);
+}
+
+.message-preview {
+  margin: 0;
+  white-space: pre-wrap;
+  max-width: 420px;
+  font: inherit;
+  color: inherit;
 }
 
 .eyebrow {
@@ -210,6 +238,49 @@ small {
   font-size: 2rem;
 }
 
+.dashboard-shell {
+  display: grid;
+  gap: 20px;
+}
+
+.dashboard-kpis {
+  grid-template-columns: repeat(4, minmax(180px, 1fr));
+}
+
+.dashboard-kpis .stat-card {
+  min-height: 132px;
+}
+
+.dashboard-main {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(320px, 0.8fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.dashboard-side {
+  display: grid;
+  gap: 18px;
+}
+
+.dashboard-health {
+  display: grid;
+  gap: 10px;
+}
+
+.health-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.health-row:last-child {
+  border-bottom: 0;
+}
+
 .card-link {
   display: block;
   cursor: pointer;
@@ -247,6 +318,14 @@ button {
   background: var(--brand);
   color: white;
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  line-height: 1.2;
+  min-height: 44px;
+  white-space: nowrap;
+  text-align: center;
 }
 
 .button.secondary {
@@ -259,6 +338,7 @@ input,
 select,
 textarea {
   width: 100%;
+  min-width: 0;
   border: 1px solid var(--line);
   padding: 12px 14px;
   background: var(--input-bg);
@@ -268,7 +348,7 @@ textarea {
 .asset-picker {
   display: grid;
   gap: 6px;
-  min-width: 220px;
+  min-width: 0;
 }
 
 .asset-picker-hint {
@@ -319,6 +399,11 @@ label {
 
 .section-title {
   margin-bottom: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
 .section-title h3 {
@@ -327,6 +412,7 @@ label {
 
 .table-wrap {
   overflow: auto;
+  max-width: 100%;
 }
 
 .compact-top-space {
@@ -399,6 +485,12 @@ th {
   border: 1px solid var(--line);
   border-radius: 18px;
   background: var(--row-bg);
+  min-width: 0;
+}
+
+.list-row > div,
+.central-summary > div {
+  min-width: 0;
 }
 
 .block {
@@ -431,6 +523,12 @@ th {
   display: flex;
   gap: 10px;
   margin-bottom: 16px;
+}
+
+.compact-action-form {
+  margin-bottom: 0;
+  align-items: center;
+  min-width: 260px;
 }
 
 .checkbox-inline {
@@ -485,6 +583,13 @@ th {
   background: var(--panel-soft);
 }
 
+.integration-tab-bar {
+  position: sticky;
+  top: 18px;
+  z-index: 5;
+  backdrop-filter: blur(12px);
+}
+
 .tab-button {
   background: transparent;
   color: var(--muted);
@@ -536,6 +641,120 @@ th {
 
 .compact-list .list-row {
   padding: 12px 14px;
+}
+
+.performance-table {
+  min-width: 980px;
+}
+
+.performance-cell {
+  min-width: 240px;
+}
+
+.performance-meter {
+  display: grid;
+  gap: 6px;
+  min-width: 220px;
+}
+
+.performance-main {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.performance-track {
+  height: 12px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--panel-strong);
+  border: 1px solid var(--line);
+}
+
+.performance-track.is-dashed {
+  background-image: repeating-linear-gradient(
+    45deg,
+    transparent 0,
+    transparent 6px,
+    color-mix(in srgb, var(--muted) 22%, transparent) 6px,
+    color-mix(in srgb, var(--muted) 22%, transparent) 10px
+  );
+}
+
+.performance-fill {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: inherit;
+  background: var(--muted);
+}
+
+.performance-label {
+  font-size: 0.9rem;
+  white-space: nowrap;
+}
+
+.performance-sub {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.performance-details {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.performance-details summary {
+  cursor: pointer;
+}
+
+.performance-details dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 12px;
+  margin: 8px 0 0;
+}
+
+.performance-details div {
+  display: grid;
+  gap: 2px;
+}
+
+.performance-details dt,
+.performance-details dd {
+  margin: 0;
+}
+
+.performance-details dd {
+  color: var(--text);
+}
+
+.performance-meter.status-ok .performance-fill {
+  background: var(--success);
+}
+
+.performance-meter.status-atencao .performance-fill {
+  background: var(--warning);
+}
+
+.performance-meter.status-alerta .performance-fill {
+  background: #d97706;
+}
+
+.performance-meter.status-critico .performance-fill {
+  background: var(--danger);
+}
+
+.performance-meter.status-sem-referencia .performance-fill,
+.performance-meter.status-sem-dados .performance-fill {
+  background: var(--muted);
+}
+
+.performance-summary-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.5fr) minmax(220px, 1fr);
+  align-items: center;
 }
 
 .installation-card {
@@ -637,7 +856,12 @@ th {
 
 .monitoring-filters {
   display: grid;
-  grid-template-columns: 1.4fr repeat(5, minmax(0, 1fr)) auto auto;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  align-items: start;
+}
+
+.monitoring-filters .button {
+  width: 100%;
 }
 
 .monitoring-layout {
@@ -990,6 +1214,8 @@ th {
   .shell,
   .cards,
   .grid.two,
+  .dashboard-kpis,
+  .dashboard-main,
   .ticket-grid {
     grid-template-columns: 1fr;
   }
@@ -1007,5 +1233,9 @@ th {
   .monitoring-filters {
     grid-template-columns: 1fr;
     display: grid;
+  }
+
+  .integration-tab-bar {
+    position: static;
   }
 }
