@@ -8,7 +8,7 @@ from flask import Flask
 
 
 def configure_logging(app: Flask, log_dir: Path) -> None:
-    log_dir.mkdir(exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
     handler = RotatingFileHandler(log_dir / "monitoring_board.log", maxBytes=512_000, backupCount=3, encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     handler.setLevel(logging.INFO)

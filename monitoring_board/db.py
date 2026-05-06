@@ -15,7 +15,7 @@ def get_db(path: str) -> sqlite3.Connection:
 
 
 def create_database_backup(db_path: Path, backup_dir: Path) -> Path:
-    backup_dir.mkdir(exist_ok=True)
+    backup_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = backup_dir / f"{db_path.stem}_{timestamp}.db"
     shutil.copy2(db_path, backup_path)

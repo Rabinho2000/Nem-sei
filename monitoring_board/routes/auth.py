@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+from urllib.parse import urlsplit
+
 from flask import Blueprint, current_app, flash, redirect, render_template, request, session, url_for
 
 from monitoring_board.security import app_password_configured, app_username, check_app_password, csrf_token
 
 
 auth_bp = Blueprint("auth", __name__)
+
+
+def safe_local_next_url(value: str | None) -> str:
+    next_url = (value or "").strip()
+    parsed = urlsplit(next_url)
+    if parsed.path.startswith("/") and not parsed.netloc and not parsed.scheme:
+        return next_url
+    return url_for("dashboard")
 
 
 @auth_bp.route("/login", methods=["GET", "POST"])
@@ -22,10 +32,7 @@ def login() -> str:
             session["username"] = username
             csrf_token()
             current_app.logger.info("Login successful for %s", username)
-            next_url = request.form.get("next") or url_for("dashboard")
-            if not next_url.startswith("/"):
-                next_url = url_for("dashboard")
-            return redirect(next_url)
+            return redirect(safe_local_next_url(request.form.get("next")))
         current_app.logger.warning("Login failed for %s", username or "<empty>")
         flash("Login invalido.", "error")
     return render_template("login.html", title="Login", expected_username=app_username())

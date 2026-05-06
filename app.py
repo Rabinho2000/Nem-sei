@@ -26,7 +26,7 @@ from flask import Flask, abort, flash, g, has_app_context, redirect, render_temp
 from monitoring_board.db import create_database_backup, ensure_column, get_db, query_all, query_scalar
 from monitoring_board.logging_config import configure_logging
 from monitoring_board.routes.auth import auth_bp
-from monitoring_board.security import app_password_configured, csrf_token
+from monitoring_board.security import app_password_configured, csrf_token, flask_secret_key
 from monitoring_board.services.fusionsolar import (
     build_provider_url,
     describe_fusionsolar_health_state,
@@ -67,11 +67,74 @@ def load_local_env() -> None:
 
 load_local_env()
 
-DB_PATH = BASE_DIR / "monitoring_board.db"
+
+@dataclass(frozen=True)
+class RuntimePaths:
+    data_dir: Path
+    database: Path
+    backups: Path
+    uploads: Path
+    contracts: Path
+    logs: Path
+
+
+def resolve_data_dir(data_dir_value: str | None = None) -> Path:
+    raw_value = os.environ.get("DATA_DIR", "") if data_dir_value is None else data_dir_value
+    if not raw_value or not raw_value.strip():
+        return BASE_DIR
+
+    configured_path = Path(raw_value.strip()).expanduser()
+    if not configured_path.is_absolute():
+        configured_path = BASE_DIR / configured_path
+    return configured_path.resolve()
+
+
+def build_runtime_paths(data_dir_value: str | None = None) -> RuntimePaths:
+    data_dir = resolve_data_dir(data_dir_value)
+    uploads_dir = data_dir / "uploads"
+    return RuntimePaths(
+        data_dir=data_dir,
+        database=data_dir / "monitoring_board.db",
+        backups=data_dir / "backups",
+        uploads=uploads_dir,
+        contracts=uploads_dir / "contracts",
+        logs=data_dir / "logs",
+    )
+
+
+def ensure_runtime_directories(runtime_paths: RuntimePaths) -> None:
+    for directory in (
+        runtime_paths.data_dir,
+        runtime_paths.backups,
+        runtime_paths.uploads,
+        runtime_paths.contracts,
+        runtime_paths.logs,
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+
+
+def store_runtime_relative_path(path: Path) -> str:
+    return str(path.relative_to(RUNTIME_PATHS.data_dir))
+
+
+def resolve_runtime_file_path(stored_path: str) -> Path:
+    path = Path(stored_path)
+    if path.is_absolute():
+        return path
+
+    data_path = RUNTIME_PATHS.data_dir / path
+    if data_path.exists():
+        return data_path
+    return BASE_DIR / path
+
+
+RUNTIME_PATHS = build_runtime_paths()
+DB_PATH = RUNTIME_PATHS.database
 DEFAULT_EXCEL_PATH = next(BASE_DIR.glob("*.xlsx"), None)
-BACKUP_DIR = BASE_DIR / "backups"
-CONTRACTS_DIR = BASE_DIR / "uploads" / "contracts"
-LOG_DIR = BASE_DIR / "logs"
+BACKUP_DIR = RUNTIME_PATHS.backups
+UPLOAD_DIR = RUNTIME_PATHS.uploads
+CONTRACTS_DIR = RUNTIME_PATHS.contracts
+LOG_DIR = RUNTIME_PATHS.logs
 INTEGRATION_PROVIDER_FUSIONSOLAR = "FusionSolar"
 INTEGRATION_PROVIDER_OPTIONS = [INTEGRATION_PROVIDER_FUSIONSOLAR]
 DEFAULT_FUSIONSOLAR_SYNC_HOURS = "08:00,14:00"
@@ -239,11 +302,14 @@ FUSIONSOLAR_SYNC_LOCK = threading.Lock()
 
 
 def create_app() -> Flask:
+    ensure_runtime_directories(RUNTIME_PATHS)
     app = Flask(__name__)
-    app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET_KEY", "monitoring-board-local-secret")
+    app.config["SECRET_KEY"] = flask_secret_key()
+    app.config["DATA_DIR"] = str(RUNTIME_PATHS.data_dir)
     app.config["DATABASE"] = str(DB_PATH)
     app.config["EXCEL_PATH"] = str(DEFAULT_EXCEL_PATH) if DEFAULT_EXCEL_PATH else ""
     configure_logging(app, LOG_DIR)
+    app.logger.info("Using database at %s", app.config["DATABASE"])
     app.register_blueprint(auth_bp)
     if not app_password_configured():
         app.logger.warning("APP_PASSWORD_HASH/APP_PASSWORD is not configured; login is locked until .env is updated.")
@@ -1127,7 +1193,7 @@ def create_app() -> Flask:
 
         contract = query_one("SELECT pdf_path FROM om_contracts WHERE asset_id = ?", (asset_id,))
         if contract and contract["pdf_path"]:
-            contract_path = BASE_DIR / contract["pdf_path"]
+            contract_path = resolve_runtime_file_path(contract["pdf_path"])
             if contract_path.exists():
                 contract_path.unlink()
 
@@ -1180,10 +1246,10 @@ def create_app() -> Flask:
             target_path = CONTRACTS_DIR / filename
             uploaded_file.save(target_path)
             if stored_path:
-                old_path = BASE_DIR / stored_path
+                old_path = resolve_runtime_file_path(stored_path)
                 if old_path.exists() and old_path != target_path:
                     old_path.unlink()
-            stored_path = str(target_path.relative_to(BASE_DIR))
+            stored_path = store_runtime_relative_path(target_path)
             original_filename = uploaded_file.filename
 
         if existing_contract:
@@ -1244,7 +1310,7 @@ def create_app() -> Flask:
             flash("Esta central ainda nao tem contrato associado.", "error")
             return redirect(url_for("asset_detail", asset_id=asset_id))
 
-        contract_path = BASE_DIR / contract["pdf_path"]
+        contract_path = resolve_runtime_file_path(contract["pdf_path"])
         if not contract_path.exists():
             flash("O ficheiro do contrato nao foi encontrado no projeto.", "error")
             return redirect(url_for("asset_detail", asset_id=asset_id))

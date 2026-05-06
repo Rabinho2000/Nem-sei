@@ -43,7 +43,8 @@ explicitamente `python app.py --host 0.0.0.0`.
 - A password FusionSolar nao e mostrada no ecra. Se `FUSIONSOLAR_PASSWORD`
   estiver definida em `.env`, esse valor tem prioridade e nao e copiado para a
   base de dados.
-- Os logs ficam em `logs/monitoring_board.log`, fora do Git.
+- Os logs ficam em `logs/monitoring_board.log`, fora do Git. Se `DATA_DIR`
+  estiver definido, ficam em `DATA_DIR/logs/monitoring_board.log`.
 
 ## Estrutura
 
@@ -72,9 +73,26 @@ Estes ficheiros nao devem ir para Git:
 - `__pycache__/`
 - `SolarFusionAPI.txt`
 
+## Diretorio de dados
+
+Por defeito, sem `DATA_DIR`, a app mantem o comportamento local atual e usa a
+pasta do projeto para `monitoring_board.db`, `uploads/`, `backups/` e `logs/`.
+
+Em Docker/Raspberry Pi, define `DATA_DIR` para uma pasta persistente montada,
+por exemplo `/data`. Nesse modo a app usa:
+
+- `/data/monitoring_board.db`
+- `/data/uploads/`
+- `/data/backups/`
+- `/data/logs/`
+
+Ao arrancar, a app cria automaticamente esses diretorios se ainda nao existirem.
+O caminho da base de dados usada fica registado em `monitoring_board.log`.
+
 ## Notas
 
-- A app cria `monitoring_board.db` na pasta do projeto.
+- A app cria `monitoring_board.db` na pasta do projeto, ou em `DATA_DIR` quando
+  esta variavel estiver definida.
 - Ao arrancar, tenta importar automaticamente o primeiro ficheiro `.xlsx`
   presente na pasta.
 - As credenciais FusionSolar devem ser trocadas no portal/fornecedor e depois

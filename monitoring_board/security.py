@@ -6,9 +6,20 @@ import secrets
 from flask import session
 from werkzeug.security import check_password_hash
 
+INSECURE_SECRET_KEYS = {"", "change-me", "monitoring-board-local-secret"}
+
 
 def app_username() -> str:
     return os.environ.get("APP_USERNAME", "admin").strip() or "admin"
+
+
+def flask_secret_key() -> str:
+    secret_key = os.environ.get("FLASK_SECRET_KEY", "").strip()
+    if secret_key in INSECURE_SECRET_KEYS:
+        raise RuntimeError(
+            "Configura FLASK_SECRET_KEY no ficheiro .env com um valor secreto antes de arrancar a app."
+        )
+    return secret_key
 
 
 def app_password_configured() -> bool:
