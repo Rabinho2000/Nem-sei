@@ -5760,7 +5760,7 @@ def run_scheduled_integration_sync(app: Flask, provider: str) -> None:
         with closing(get_db(app.config["DATABASE"])) as conn:
             try:
                 current_app.logger.info("Scheduled %s sync started", provider)
-                result = run_fusionsolar_sync(conn, provider, trigger_type="scheduled")
+                result = run_integration_sync(conn, provider, trigger_type="scheduled")
                 current_app.logger.info("Scheduled %s sync completed: %s", provider, result)
             except Exception:
                 current_app.logger.exception("Scheduled %s sync failed", provider)
@@ -8159,6 +8159,10 @@ def upsert_integration_unresolved(
     )
 
 
+def run_integration_sync(conn: sqlite3.Connection, provider: str, trigger_type: str = "manual") -> dict[str, Any]:
+    return run_fusionsolar_sync(conn, provider, trigger_type=trigger_type)
+
+
 def run_fusionsolar_sync(conn: sqlite3.Connection, provider: str, trigger_type: str = "manual") -> dict[str, Any]:
     with FUSIONSOLAR_SYNC_LOCK:
         config = get_integration_config(conn, provider)
@@ -8375,6 +8379,20 @@ def run_fusionsolar_sync(conn: sqlite3.Connection, provider: str, trigger_type: 
             conn.commit()
             raise
 
+def run_all_integration_syncs(conn: sqlite3.Connection, trigger_type: str = "manual") -> dict[str, Any]:
+    results: dict[str, Any] = {}
+    errors: dict[str, str] = {}
+    for provider in INTEGRATION_PROVIDER_OPTIONS:
+        config = get_integration_config(conn, provider)
+        if config is None or not config["enabled"]:
+            continue
+        try:
+            results[provider] = run_integration_sync(conn, provider, trigger_type=trigger_type)
+        except Exception as exc:
+            errors[provider] = str(exc)
+    if not results and errors:
+        raise ValueError("; ".join(f"{provider}: {message}" for provider, message in errors.items()))
+    return {"results": results, "errors": errors}
 
 def resolve_fusionsolar_unresolved(conn: sqlite3.Connection, unresolved_id: int, asset_id: int) -> None:
     row = conn.execute(

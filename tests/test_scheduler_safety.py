@@ -96,3 +96,84 @@ def test_refresh_scheduler_registers_stable_single_instance_provider_jobs(tmp_pa
         app_module.SCHEDULER = original_scheduler
 
 
+def test_scheduled_sigenergy_sync_uses_provider_neutral_wrapper(tmp_path, monkeypatch) -> None:
+    flask_app, original_database = _make_test_app(tmp_path)
+    calls: list[tuple[str, str]] = []
+
+    def fake_run_integration_sync(_conn, provider: str, trigger_type: str = "manual") -> dict[str, int]:
+        calls.append((provider, trigger_type))
+        return {"matched": 0}
+
+    monkeypatch.setattr(app_module, "run_integration_sync", fake_run_integration_sync)
+    try:
+        app_module.run_scheduled_integration_sync(flask_app, app_module.INTEGRATION_PROVIDER_SIGENERGY)
+    finally:
+        flask_app.config["DATABASE"] = original_database
+
+    assert calls == [(app_module.INTEGRATION_PROVIDER_SIGENERGY, "scheduled")]
+
+
+def test_run_all_integration_syncs_dispatches_enabled_providers_through_wrapper(tmp_path, monkeypatch) -> None:
+    db_path = tmp_path / "all-syncs.db"
+    app_module.ensure_database(str(db_path))
+    calls: list[tuple[str, str]] = []
+
+    def fake_run_integration_sync(_conn, provider: str, trigger_type: str = "manual") -> dict[str, int]:
+        calls.append((provider, trigger_type))
+        return {"matched": 1}
+
+    monkeypatch.setattr(app_module, "run_integration_sync", fake_run_integration_sync)
+    with get_db(str(db_path)) as conn:
+        _insert_enabled_config(conn, app_module.INTEGRATION_PROVIDER_FUSIONSOLAR)
+        _insert_enabled_config(conn, app_module.INTEGRATION_PROVIDER_SIGENERGY)
+
+        result = app_module.run_all_integration_syncs(conn, trigger_type="manual-test")
+
+    assert calls == [
+        (app_module.INTEGRATION_PROVIDER_FUSIONSOLAR, "manual-test"),
+        (app_module.INTEGRATION_PROVIDER_SIGENERGY, "manual-test"),
+    ]
+    assert sorted(result["results"]) == [
+        app_module.INTEGRATION_PROVIDER_FUSIONSOLAR,
+        app_module.INTEGRATION_PROVIDER_SIGENERGY,
+    ]
+
+
+def test_provider_sync_failures_persist_through_existing_sync_run_path(tmp_path, monkeypatch) -> None:
+    db_path = tmp_path / "sync-failure.db"
+    app_module.ensure_database(str(db_path))
+
+    def fake_provider_check(_conn, _provider: str, dry_run: bool = False) -> dict[str, Any]:
+        raise ValueError("provider unavailable")
+
+    if hasattr(app_module, "run_provider_check"):
+        monkeypatch.setattr(app_module, "run_provider_check", fake_provider_check)
+    else:
+        monkeypatch.setattr(app_module, "run_fusionsolar_check", fake_provider_check)
+    with get_db(str(db_path)) as conn:
+        _insert_enabled_config(conn, app_module.INTEGRATION_PROVIDER_SIGENERGY)
+
+        try:
+            app_module.run_integration_sync(conn, app_module.INTEGRATION_PROVIDER_SIGENERGY, trigger_type="scheduled")
+        except ValueError:
+            pass
+
+        run = conn.execute(
+            """
+            SELECT status, error_message
+            FROM integration_sync_runs
+            WHERE provider = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (app_module.INTEGRATION_PROVIDER_SIGENERGY,),
+        ).fetchone()
+        config = conn.execute(
+            "SELECT last_sync_status, last_error FROM integration_configs WHERE provider = ?",
+            (app_module.INTEGRATION_PROVIDER_SIGENERGY,),
+        ).fetchone()
+
+    assert run["status"] == "error"
+    assert "provider unavailable" in run["error_message"]
+    assert config["last_sync_status"] == "error"
+    assert "provider unavailable" in config["last_error"]
