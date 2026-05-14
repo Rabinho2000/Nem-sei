@@ -1,0 +1,12 @@
+{
+  "code": 0,
+  "msg": "success",
+  "data": {
+    "systemId": "SIG-001",
+    "pvPower": 4.25,
+    "gridPower": -0.5,
+    "batteryPower": 1.1,
+    "batterySoc": 78,
+    "loadPower": 3.4
+  }
+}

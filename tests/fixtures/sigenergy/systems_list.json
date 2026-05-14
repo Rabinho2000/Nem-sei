@@ -1,0 +1,18 @@
+{
+  "code": 0,
+  "msg": "success",
+  "data": {
+    "list": [
+      {
+        "systemId": "SIG-001",
+        "systemName": "Sigenergy Test Site 1",
+        "systemStatus": "running"
+      },
+      {
+        "systemId": "SIG-002",
+        "systemName": "Sigenergy Test Site 2",
+        "systemStatus": "offline"
+      }
+    ]
+  }
+}

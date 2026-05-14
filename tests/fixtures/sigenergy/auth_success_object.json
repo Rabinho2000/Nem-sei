@@ -1,0 +1,8 @@
+{
+  "code": 0,
+  "msg": "success",
+  "data": {
+    "accessToken": "fake-sigenergy-token-object",
+    "expiresIn": 43199
+  }
+}

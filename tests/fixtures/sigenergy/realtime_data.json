@@ -1,0 +1,9 @@
+{
+  "code": 0,
+  "msg": "success",
+  "data": {
+    "systemId": "SIG-001",
+    "systemStatus": "running",
+    "runningStatus": "grid connected"
+  }
+}

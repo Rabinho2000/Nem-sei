@@ -1,0 +1,5 @@
+{
+  "code": 0,
+  "msg": "success",
+  "data": "{\"accessToken\":\"fake-sigenergy-token-json-string\",\"expiresIn\":43199}"
+}
