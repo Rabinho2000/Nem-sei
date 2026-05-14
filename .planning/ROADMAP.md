@@ -31,6 +31,14 @@ This roadmap assumes the current product is already useful and should be hardene
 
 **Requirements:** REQ-004, REQ-005, REQ-009
 
+**Plans:** 2 plans
+
+**Progress:** In Progress - 1/2 plans complete as of 2026-05-14.
+
+Plans:
+- [x] 02-01-PLAN.md - Scheduler registration and scheduled provider dispatch safety.
+- [ ] 02-02-PLAN.md - Persisted background job startup recovery and observability.
+
 **Scope:**
 
 - Audit APScheduler registration and startup recovery paths.
