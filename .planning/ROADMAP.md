@@ -85,6 +85,13 @@ Plans:
 
 **Requirements:** REQ-005, REQ-011, REQ-012
 
+**Plans:** 3 plans
+
+Plans:
+- [ ] 04-01-PLAN.md - Performance calculation and report period regressions.
+- [ ] 04-02-PLAN.md - Telegram throttling and recovery alert regressions.
+- [ ] 04-03-PLAN.md - Export and customer report failure handling regressions.
+
 **Scope:**
 
 - Add regression coverage for production performance calculations and reporting periods.
