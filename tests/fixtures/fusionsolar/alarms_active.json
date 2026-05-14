@@ -1,0 +1,21 @@
+{
+  "success": true,
+  "failCode": 0,
+  "message": "OK",
+  "data": [
+    {
+      "stationCode": "FS-PLANT-002",
+      "lev": 3,
+      "alarmName": "String current minor alarm",
+      "deviceName": "Inverter 01",
+      "raiseTime": 1768478400000
+    },
+    {
+      "stationCode": "FS-PLANT-003",
+      "lev": 1,
+      "alarmName": "Inverter critical alarm",
+      "deviceName": "Inverter 02",
+      "raiseTime": 1768478400000
+    }
+  ]
+}

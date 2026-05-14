@@ -1,0 +1,32 @@
+{
+  "success": true,
+  "failCode": 0,
+  "message": "OK",
+  "data": {
+    "pageNo": 1,
+    "pageCount": 1,
+    "total": 4,
+    "list": [
+      {
+        "plantCode": "FS-PLANT-001",
+        "plantName": "Fixture Solar Healthy",
+        "capacity": "50.0"
+      },
+      {
+        "plantCode": "FS-PLANT-002",
+        "plantName": "Fixture Solar Minor Alarm",
+        "capacity": "42.5"
+      },
+      {
+        "plantCode": "FS-PLANT-003",
+        "plantName": "Fixture Solar Critical Alarm",
+        "capacity": "75.0"
+      },
+      {
+        "stationCode": "FS-STATION-004",
+        "stationName": "Fixture Solar Disconnected",
+        "capacity": "20.0"
+      }
+    ]
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "success": true,
+  "failCode": 0,
+  "message": "OK",
+  "data": [
+    {
+      "stationCode": "FS-PLANT-001",
+      "dataItemMap": {
+        "real_health_state": "3",
+        "active_power": "34.2"
+      }
+    },
+    {
+      "stationCode": "FS-PLANT-002",
+      "dataItemMap": {
+        "real_health_state": "3",
+        "active_power": "12.8"
+      }
+    },
+    {
+      "stationCode": "FS-PLANT-003",
+      "dataItemMap": {
+        "real_health_state": "2",
+        "active_power": "0"
+      }
+    },
+    {
+      "stationCode": "FS-STATION-004",
+      "dataItemMap": {
+        "real_health_state": "1",
+        "active_power": "0"
+      }
+    }
+  ]
+}

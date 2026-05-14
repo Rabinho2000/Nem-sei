@@ -1,0 +1,37 @@
+{
+  "success": true,
+  "failCode": 0,
+  "message": "OK",
+  "data": [
+    {
+      "stationCode": "FS-PLANT-001",
+      "collectTime": 1768435200000,
+      "dataItemMap": {
+        "PVYield": "123.45",
+        "inverterYield": "222.22",
+        "inverter_power": "333.33",
+        "selfUsePower": "45.67",
+        "ongrid_power": "77.78"
+      }
+    },
+    {
+      "stationCode": "FS-PLANT-002",
+      "collectTime": 1768435200000,
+      "dataItemMap": {
+        "inverterYield": "98.76",
+        "inverter_power": "111.11",
+        "selfUsePower": "12.34",
+        "ongrid_power": "86.42"
+      }
+    },
+    {
+      "stationCode": "FS-PLANT-003",
+      "collectTime": 1768435200000,
+      "dataItemMap": {
+        "inverter_power": "54.32",
+        "selfUsePower": "20.00",
+        "ongrid_power": "34.32"
+      }
+    }
+  ]
+}
