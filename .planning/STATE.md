@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: in_progress
-last_updated: "2026-05-14T12:32:25.619Z"
+last_updated: "2026-05-14T15:48:23Z"
 progress:
   total_phases: 6
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 3
-  completed_plans: 2
+  completed_plans: 3
 ---
 
 # Project State
@@ -20,7 +20,8 @@ progress:
 - Current roadmap milestone: `Stabilize Existing Monitoring Board`.
 - Completed Phase 1 Plan 01: runtime artifact and deployment hygiene.
 - Completed Phase 2 Plan 01: scheduler registration and scheduled provider dispatch safety.
-- Next recommended action: execute or plan Phase 2 Plan 02 for persisted background job startup recovery and observability.
+- Completed Phase 2 Plan 02: persisted background job startup recovery and observability.
+- Next recommended action: verify Phase 2 or plan Phase 3 provider integration correctness.
 
 ## Key Decisions
 
@@ -35,6 +36,9 @@ progress:
 - Treat provider API behavior, timestamps, units, and rate limits as assumptions requiring verification.
 - Use stable APScheduler IDs plus `replace_existing`, `max_instances=1`, `coalesce=True`, and explicit misfire grace for recurring provider jobs.
 - Route scheduled/all-provider integration syncs through `run_integration_sync()` while preserving `run_fusionsolar_sync()` compatibility.
+- Recover all pending background jobs on startup in ascending id order without a hidden cap.
+- Leave pending job rows pending when APScheduler registration fails so future startup recovery can retry them.
+- Return a small recovery summary from `schedule_pending_background_jobs()` for startup observability.
 
 ## Known Context
 
@@ -59,8 +63,9 @@ progress:
 - Created initial `PROJECT.md`, `REQUIREMENTS.md`, `ROADMAP.md`, `STATE.md`, and `config.json` for GSD planning.
 - Completed Phase 1 Plan 01 in `2b8d717` and `d162c4a`; summary at `.planning/phases/01-runtime-artifact-and-deployment-hygiene/01-01-SUMMARY.md`.
 - Completed Phase 2 Plan 01 in `b8c62be` and `6e1cf07`; summary at `.planning/phases/02-background-job-and-scheduler-safety/02-01-SUMMARY.md`.
+- Completed Phase 2 Plan 02 in `1b81adb` and `eefe653`; summary at `.planning/phases/02-background-job-and-scheduler-safety/02-02-SUMMARY.md`.
 
 ## Session Continuity
 
-- Stopped at: Completed `02-01-PLAN.md`.
+- Stopped at: Completed `02-02-PLAN.md`.
 - Resume file: None.
