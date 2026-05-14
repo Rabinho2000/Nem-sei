@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: in_progress
-last_updated: "2026-05-14T16:37:44.000Z"
+last_updated: "2026-05-14T16:39:00.000Z"
 progress:
   total_phases: 6
   completed_phases: 2
   total_plans: 6
-  completed_plans: 4
+  completed_plans: 5
 ---
 
 # Project State
@@ -21,6 +21,7 @@ progress:
 - Completed Phase 1 Plan 01: runtime artifact and deployment hygiene.
 - Completed Phase 2 Plan 01: scheduler registration and scheduled provider dispatch safety.
 - Completed Phase 2 Plan 02: persisted background job startup recovery and observability.
+- Completed Phase 3 Plan 01: FusionSolar fixture-backed provider contract coverage.
 - Completed Phase 3 Plan 02: Sigenergy fixture-backed provider contract coverage.
 - Next recommended action: execute Phase 3 Plan 03 provider assumptions note and phase-level regression command.
 
@@ -42,6 +43,8 @@ progress:
 - Return a small recovery summary from `schedule_pending_background_jobs()` for startup observability.
 - Use fake, stable Sigenergy provider fixtures with no live secrets/customer data for contract coverage.
 - Cover Sigenergy provider behavior through existing parser and sync seams before considering production-code changes.
+- Use fake, stable FusionSolar provider fixtures with no live secrets/customer data for contract coverage.
+- Keep FusionSolar timestamp semantics unchanged until real provider samples prove a timezone conversion bug.
 
 ## Known Context
 
@@ -68,6 +71,7 @@ progress:
 - Completed Phase 2 Plan 01 in `b8c62be` and `6e1cf07`; summary at `.planning/phases/02-background-job-and-scheduler-safety/02-01-SUMMARY.md`.
 - Completed Phase 2 Plan 02 in `1b81adb` and `eefe653`; summary at `.planning/phases/02-background-job-and-scheduler-safety/02-02-SUMMARY.md`.
 - Verified Phase 2 in `.planning/phases/02-background-job-and-scheduler-safety/02-VERIFICATION.md`.
+- Completed Phase 3 Plan 01 in `674dd12` and `51cc6b7`; summary at `.planning/phases/03-provider-integration-correctness/03-01-SUMMARY.md`.
 - Completed Phase 3 Plan 02 in `54ae413` and `3b2b425`; summary at `.planning/phases/03-provider-integration-correctness/03-02-SUMMARY.md`.
 
 ## Session Continuity
