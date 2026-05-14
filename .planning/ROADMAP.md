@@ -10,6 +10,8 @@ This roadmap assumes the current product is already useful and should be hardene
 
 **Requirements:** REQ-001, REQ-003, REQ-004, REQ-010
 
+**Progress:** Complete - 1/1 plans complete as of 2026-05-14.
+
 **Scope:**
 
 - Ensure `.gitignore` covers SQLite sidecars such as `*.db-wal` and `*.db-shm`.
@@ -113,4 +115,3 @@ This roadmap assumes the current product is already useful and should be hardene
 - `app.py` complexity is reduced in a targeted area.
 - Extracted code has a clear module boundary and test coverage.
 - No unrelated refactors or feature changes are bundled into the extraction.
-
