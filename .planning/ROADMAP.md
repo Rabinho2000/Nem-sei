@@ -58,6 +58,13 @@ Plans:
 
 **Requirements:** REQ-005, REQ-006, REQ-011
 
+**Plans:** 3 plans
+
+Plans:
+- [ ] 03-01-PLAN.md - FusionSolar fixture-backed provider contract coverage.
+- [ ] 03-02-PLAN.md - Sigenergy fixture-backed provider contract coverage.
+- [ ] 03-03-PLAN.md - Provider assumptions note and phase-level regression command.
+
 **Scope:**
 
 - Pin realistic mocked API fixtures for key provider responses.
