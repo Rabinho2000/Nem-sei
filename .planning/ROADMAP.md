@@ -60,10 +60,12 @@ Plans:
 
 **Plans:** 3 plans
 
+**Progress:** Complete - 3/3 plans complete as of 2026-05-14.
+
 Plans:
-- [ ] 03-01-PLAN.md - FusionSolar fixture-backed provider contract coverage.
-- [ ] 03-02-PLAN.md - Sigenergy fixture-backed provider contract coverage.
-- [ ] 03-03-PLAN.md - Provider assumptions note and phase-level regression command.
+- [x] 03-01-PLAN.md - FusionSolar fixture-backed provider contract coverage.
+- [x] 03-02-PLAN.md - Sigenergy fixture-backed provider contract coverage.
+- [x] 03-03-PLAN.md - Provider assumptions note and phase-level regression command.
 
 **Scope:**
 
