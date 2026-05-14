@@ -136,7 +136,8 @@ UPLOAD_DIR = RUNTIME_PATHS.uploads
 CONTRACTS_DIR = RUNTIME_PATHS.contracts
 LOG_DIR = RUNTIME_PATHS.logs
 INTEGRATION_PROVIDER_FUSIONSOLAR = "FusionSolar"
-INTEGRATION_PROVIDER_OPTIONS = [INTEGRATION_PROVIDER_FUSIONSOLAR]
+INTEGRATION_PROVIDER_SIGENERGY = "Sigenergy"
+INTEGRATION_PROVIDER_OPTIONS = [INTEGRATION_PROVIDER_FUSIONSOLAR, INTEGRATION_PROVIDER_SIGENERGY]
 DEFAULT_FUSIONSOLAR_SYNC_HOURS = "08:00,14:00"
 DEFAULT_FUSIONSOLAR_LOGIN_ENDPOINT = "/thirdData/login"
 DEFAULT_FUSIONSOLAR_STATIONS_ENDPOINT = "/thirdData/stations"
@@ -5706,11 +5707,11 @@ def refresh_integration_scheduler(app: Flask) -> None:
     if SCHEDULER is None:
         return
     for job in list(SCHEDULER.get_jobs()):
-        if job.id.startswith("fusionsolar-sync-") or job.id == "telegram-daily-summary":
+        if job.id.startswith("integration-sync-") or job.id.startswith("fusionsolar-sync-") or job.id == "telegram-daily-summary":
             SCHEDULER.remove_job(job.id)
 
     with closing(get_db(app.config["DATABASE"])) as conn:
-        config = get_integration_config(conn, INTEGRATION_PROVIDER_FUSIONSOLAR)
+        configs = [get_integration_config(conn, provider) for provider in INTEGRATION_PROVIDER_OPTIONS]
     if telegram_daily_summary_enabled():
         SCHEDULER.add_job(
             func=run_scheduled_telegram_daily_summary,
@@ -5720,21 +5721,28 @@ def refresh_integration_scheduler(app: Flask) -> None:
             args=[app],
             id="telegram-daily-summary",
             replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1800,
         )
-    if config is None or not config["enabled"] or not config["auto_sync_enabled"]:
-        return
-
-    for index, item in enumerate(normalize_sync_hours(config["sync_hours"] or DEFAULT_FUSIONSOLAR_SYNC_HOURS).split(","), start=1):
-        hour, minute = item.split(":")
-        SCHEDULER.add_job(
-            func=run_scheduled_fusionsolar_sync,
-            trigger="cron",
-            hour=int(hour),
-            minute=int(minute),
-            args=[app],
-            id=f"fusionsolar-sync-{index}",
-            replace_existing=True,
-        )
+    for config in configs:
+        if config is None or not config["enabled"] or not config["auto_sync_enabled"]:
+            continue
+        provider = str(config["provider"])
+        for index, item in enumerate(normalize_sync_hours(config["sync_hours"] or DEFAULT_FUSIONSOLAR_SYNC_HOURS).split(","), start=1):
+            hour, minute = item.split(":")
+            SCHEDULER.add_job(
+                func=run_scheduled_integration_sync,
+                trigger="cron",
+                hour=int(hour),
+                minute=int(minute),
+                args=[app, provider],
+                id=f"integration-sync-{normalize_name(provider).replace(' ', '-')}-{index}",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=1800,
+            )
 
 
 def run_scheduled_telegram_daily_summary(app: Flask) -> None:
@@ -5747,14 +5755,19 @@ def run_scheduled_telegram_daily_summary(app: Flask) -> None:
                 current_app.logger.exception("Scheduled Telegram daily summary failed")
 
 
-def run_scheduled_fusionsolar_sync(app: Flask) -> None:
+def run_scheduled_integration_sync(app: Flask, provider: str) -> None:
     with app.app_context():
         with closing(get_db(app.config["DATABASE"])) as conn:
             try:
-                run_fusionsolar_sync(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, trigger_type="scheduled")
+                current_app.logger.info("Scheduled %s sync started", provider)
+                result = run_fusionsolar_sync(conn, provider, trigger_type="scheduled")
+                current_app.logger.info("Scheduled %s sync completed: %s", provider, result)
             except Exception:
-                pass
+                current_app.logger.exception("Scheduled %s sync failed", provider)
 
+
+def run_scheduled_fusionsolar_sync(app: Flask) -> None:
+    run_scheduled_integration_sync(app, INTEGRATION_PROVIDER_FUSIONSOLAR)
 
 def get_fusionsolar_endpoint_config(config: sqlite3.Row | dict[str, Any]) -> dict[str, str]:
     return {

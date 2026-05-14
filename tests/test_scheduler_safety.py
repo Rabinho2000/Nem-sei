@@ -1,0 +1,98 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+import app as app_module
+from monitoring_board.db import get_db
+
+
+@dataclass
+class FakeJob:
+    id: str
+
+
+class FakeScheduler:
+    def __init__(self) -> None:
+        self.started = 0
+        self.jobs: dict[str, FakeJob] = {}
+        self.add_calls: list[dict[str, Any]] = []
+        self.remove_calls: list[str] = []
+
+    def start(self) -> None:
+        self.started += 1
+
+    def get_jobs(self) -> list[FakeJob]:
+        return list(self.jobs.values())
+
+    def remove_job(self, job_id: str) -> None:
+        self.remove_calls.append(job_id)
+        self.jobs.pop(job_id, None)
+
+    def add_job(self, **kwargs: Any) -> None:
+        self.add_calls.append(kwargs)
+        self.jobs[str(kwargs["id"])] = FakeJob(str(kwargs["id"]))
+
+
+def _insert_enabled_config(conn, provider: str, sync_hours: str = "08:00,14:00") -> None:
+    now = app_module.datetime.now().isoformat(timespec="seconds")
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO integration_configs (
+            provider, enabled, auto_sync_enabled, sync_hours, created_at, updated_at
+        ) VALUES (?, 1, 1, ?, ?, ?)
+        """,
+        (provider, sync_hours, now, now),
+    )
+    conn.commit()
+
+
+def _make_test_app(tmp_path):
+    db_path = tmp_path / "scheduler-safety.db"
+    app_module.ensure_database(str(db_path))
+    flask_app = app_module.app
+    original_database = flask_app.config["DATABASE"]
+    flask_app.config["DATABASE"] = str(db_path)
+    return flask_app, original_database
+
+
+def test_refresh_scheduler_registers_stable_single_instance_provider_jobs(tmp_path, monkeypatch) -> None:
+    flask_app, original_database = _make_test_app(tmp_path)
+    fake_scheduler = FakeScheduler()
+    fake_scheduler.jobs["fusionsolar-sync-1"] = FakeJob("fusionsolar-sync-1")
+    original_scheduler = app_module.SCHEDULER
+    monkeypatch.setattr(app_module, "telegram_daily_summary_enabled", lambda: True)
+    app_module.SCHEDULER = fake_scheduler
+    try:
+        with get_db(flask_app.config["DATABASE"]) as conn:
+            _insert_enabled_config(conn, app_module.INTEGRATION_PROVIDER_FUSIONSOLAR)
+            _insert_enabled_config(conn, app_module.INTEGRATION_PROVIDER_SIGENERGY)
+
+        app_module.refresh_integration_scheduler(flask_app)
+        first_ids = sorted(fake_scheduler.jobs)
+        app_module.refresh_integration_scheduler(flask_app)
+        second_ids = sorted(fake_scheduler.jobs)
+
+        assert first_ids == second_ids
+        assert len(second_ids) == len(set(second_ids))
+        assert "fusionsolar-sync-1" not in second_ids
+        assert "fusionsolar-sync-1" in fake_scheduler.remove_calls
+        assert any("fusionsolar" in job_id for job_id in second_ids)
+        assert any("sigenergy" in job_id for job_id in second_ids)
+
+        recurring_calls = [
+            call
+            for call in fake_scheduler.add_calls
+            if str(call["id"]).startswith("integration-sync-") or call["id"] == "telegram-daily-summary"
+        ]
+        assert recurring_calls
+        for call in recurring_calls:
+            assert call["replace_existing"] is True
+            assert call["max_instances"] == 1
+            assert call["coalesce"] is True
+            assert call["misfire_grace_time"] == 1800
+    finally:
+        flask_app.config["DATABASE"] = original_database
+        app_module.SCHEDULER = original_scheduler
+
+
