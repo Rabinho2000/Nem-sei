@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import calendar
 import html
 import io
@@ -23,9 +24,29 @@ import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import current_app
 from flask import Flask, abort, flash, g, has_app_context, redirect, render_template, request, send_file, session, url_for
-from monitoring_board.db import create_database_backup, ensure_column, get_db, query_all, query_scalar
+from monitoring_board.db import configure_database_for_runtime, create_database_backup, ensure_column, get_db, query_all, query_scalar
 from monitoring_board.logging_config import configure_logging
 from monitoring_board.routes.auth import auth_bp
+from monitoring_board.routes.field_routes import field_routes_bp
+from monitoring_board.runtime import (
+    BACKUP_DIR,
+    BASE_DIR,
+    CONTRACTS_DIR,
+    DB_PATH,
+    DEFAULT_EXCEL_PATH,
+    LOG_DIR,
+    RUNTIME_PATHS,
+    UPLOAD_DIR,
+    build_runtime_paths,
+    ensure_runtime_directories,
+    env_flag,
+    load_local_env,
+    max_upload_bytes,
+    path_is_within,
+    resolve_runtime_file_path,
+    resolve_runtime_file_path_within,
+    store_runtime_relative_path,
+)
 from monitoring_board.security import app_password_configured, csrf_token, flask_secret_key
 from monitoring_board.services.fusionsolar import (
     build_provider_url,
@@ -45,99 +66,21 @@ from openpyxl import Workbook
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.utils import ImageReader
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.pdfgen import canvas
 
 
-BASE_DIR = Path(__file__).resolve().parent
-
-
-def load_local_env() -> None:
-    env_path = BASE_DIR / ".env"
-    if not env_path.exists():
-        return
-    for line in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, value = stripped.split("=", 1)
-        key = key.strip()
-        if key and key not in os.environ:
-            os.environ[key] = value.strip().strip('"').strip("'")
-
-
-load_local_env()
-
-
-@dataclass(frozen=True)
-class RuntimePaths:
-    data_dir: Path
-    database: Path
-    backups: Path
-    uploads: Path
-    contracts: Path
-    logs: Path
-
-
-def resolve_data_dir(data_dir_value: str | None = None) -> Path:
-    raw_value = os.environ.get("DATA_DIR", "") if data_dir_value is None else data_dir_value
-    if not raw_value or not raw_value.strip():
-        return BASE_DIR
-
-    configured_path = Path(raw_value.strip()).expanduser()
-    if not configured_path.is_absolute():
-        configured_path = BASE_DIR / configured_path
-    return configured_path.resolve()
-
-
-def build_runtime_paths(data_dir_value: str | None = None) -> RuntimePaths:
-    data_dir = resolve_data_dir(data_dir_value)
-    uploads_dir = data_dir / "uploads"
-    return RuntimePaths(
-        data_dir=data_dir,
-        database=data_dir / "monitoring_board.db",
-        backups=data_dir / "backups",
-        uploads=uploads_dir,
-        contracts=uploads_dir / "contracts",
-        logs=data_dir / "logs",
-    )
-
-
-def ensure_runtime_directories(runtime_paths: RuntimePaths) -> None:
-    for directory in (
-        runtime_paths.data_dir,
-        runtime_paths.backups,
-        runtime_paths.uploads,
-        runtime_paths.contracts,
-        runtime_paths.logs,
-    ):
-        directory.mkdir(parents=True, exist_ok=True)
-
-
-def store_runtime_relative_path(path: Path) -> str:
-    return str(path.relative_to(RUNTIME_PATHS.data_dir))
-
-
-def resolve_runtime_file_path(stored_path: str) -> Path:
-    path = Path(stored_path)
-    if path.is_absolute():
-        return path
-
-    data_path = RUNTIME_PATHS.data_dir / path
-    if data_path.exists():
-        return data_path
-    return BASE_DIR / path
-
-
-RUNTIME_PATHS = build_runtime_paths()
-DB_PATH = RUNTIME_PATHS.database
-DEFAULT_EXCEL_PATH = next(BASE_DIR.glob("*.xlsx"), None)
-BACKUP_DIR = RUNTIME_PATHS.backups
-UPLOAD_DIR = RUNTIME_PATHS.uploads
-CONTRACTS_DIR = RUNTIME_PATHS.contracts
-LOG_DIR = RUNTIME_PATHS.logs
 INTEGRATION_PROVIDER_FUSIONSOLAR = "FusionSolar"
 INTEGRATION_PROVIDER_SIGENERGY = "Sigenergy"
 INTEGRATION_PROVIDER_OPTIONS = [INTEGRATION_PROVIDER_FUSIONSOLAR, INTEGRATION_PROVIDER_SIGENERGY]
+BACKGROUND_JOB_TYPES_PERFORMANCE = (
+    "fusionsolar_production_sync",
+    "fusionsolar_production_backfill",
+    "fusionsolar_month_cycle",
+    "performance_reference_recalculation",
+)
+BACKGROUND_JOB_STALE_RUNNING_MINUTES = 30
 DEFAULT_FUSIONSOLAR_SYNC_HOURS = "08:00,14:00"
 DEFAULT_FUSIONSOLAR_LOGIN_ENDPOINT = "/thirdData/login"
 DEFAULT_FUSIONSOLAR_STATIONS_ENDPOINT = "/thirdData/stations"
@@ -146,10 +89,18 @@ DEFAULT_FUSIONSOLAR_ALARMS_ENDPOINT = "/thirdData/getAlarmList"
 DEFAULT_FUSIONSOLAR_DAY_KPI_ENDPOINT = "/thirdData/getKpiStationDay"
 DEFAULT_FUSIONSOLAR_MONTH_KPI_ENDPOINT = "/thirdData/getKpiStationMonth"
 DEFAULT_FUSIONSOLAR_ALARMS_LANGUAGE = "en_US"
+DEFAULT_SIGENERGY_BASE_URL = "https://api-eu.sigencloud.com"
+DEFAULT_SIGENERGY_AUTH_ENDPOINT = "/openapi/auth/login/key"
+DEFAULT_SIGENERGY_SYSTEMS_ENDPOINT = "/openapi/system/list"
+DEFAULT_SIGENERGY_REALTIME_ENDPOINT = "/openapi/system/realtime/data"
+DEFAULT_SIGENERGY_ENERGY_FLOW_ENDPOINT = "/openapi/systems/{system_id}/energyFlow"
+DEFAULT_SIGENERGY_REGION = "eu"
 FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_MINUTES = 60
 FUSIONSOLAR_PERFORMANCE_KPI_DELAY_SECONDS = 65
 FUSIONSOLAR_PERFORMANCE_MAX_API_CALLS = 20
 FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL: datetime | None = None
+SIGENERGY_TOKEN_CACHE: dict[str, dict[str, Any]] = {}
+SIGENERGY_TOKEN_LOCK = threading.Lock()
 
 STATUS_COLORS = {
     "Erro": "danger",
@@ -171,6 +122,21 @@ STATUS_COLORS = {
 
 TICKET_STATUSES = ["Aberto", "Em analise", "Agendado", "Em visita", "Resolvido", "Fechado"]
 TICKET_URGENCIES = ["Baixa", "Media", "Alta", "Critica"]
+MONTH_NAMES_PT = [
+    "",
+    "Janeiro",
+    "Fevereiro",
+    "Março",
+    "Abril",
+    "Maio",
+    "Junho",
+    "Julho",
+    "Agosto",
+    "Setembro",
+    "Outubro",
+    "Novembro",
+    "Dezembro",
+]
 MONITORING_SOURCES = ["FusionSolar", "Sigenergy", "Manual / Outro"]
 ASSET_MONITORING_STATUSES = ["active", "silenced", "maintenance", "out_of_scope", "disabled"]
 OK_MONITORING_STATUSES = {"Operacional", "Resolvido", "OK"}
@@ -281,6 +247,24 @@ EXPORT_DATASETS = {
             ("latest_notes", "Notas"),
         ],
     },
+    "production_report": {
+        "label": "Relatorio de producao mensal/anual",
+        "columns": [
+            ("period", "Periodo"),
+            ("project_name", "Instalacao"),
+            ("location", "Localizacao"),
+            ("provider", "Origem API"),
+            ("production_kwh", "Producao kWh"),
+            ("specific_yield", "kWh/kWp"),
+            ("expected_kwh", "Producao esperada kWh"),
+            ("deviation_pct", "Desvio %"),
+            ("performance_status", "Estado performance"),
+            ("data_points", "Pontos de dados"),
+            ("data_source", "Tipo de dados"),
+            ("last_update", "Ultima atualizacao"),
+            ("notes", "Notas"),
+        ],
+    },
 }
 
 GROUP_INHERITED_FIELDS = [
@@ -309,6 +293,11 @@ def create_app() -> Flask:
     app.config["DATA_DIR"] = str(RUNTIME_PATHS.data_dir)
     app.config["DATABASE"] = str(DB_PATH)
     app.config["EXCEL_PATH"] = str(DEFAULT_EXCEL_PATH) if DEFAULT_EXCEL_PATH else ""
+    app.config["MAX_CONTENT_LENGTH"] = max_upload_bytes()
+    app.config["SESSION_COOKIE_HTTPONLY"] = True
+    app.config["SESSION_COOKIE_SAMESITE"] = os.environ.get("SESSION_COOKIE_SAMESITE", "Lax").strip() or "Lax"
+    app.config["SESSION_COOKIE_SECURE"] = env_flag("SESSION_COOKIE_SECURE", False)
+    app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=12)
     configure_logging(app, LOG_DIR)
     app.logger.info("Using database at %s", app.config["DATABASE"])
     app.register_blueprint(auth_bp)
@@ -316,6 +305,7 @@ def create_app() -> Flask:
         app.logger.warning("APP_PASSWORD_HASH/APP_PASSWORD is not configured; login is locked until .env is updated.")
 
     ensure_database(app.config["DATABASE"])
+    app.register_blueprint(field_routes_bp)
     with closing(get_db(app.config["DATABASE"])) as bootstrap_conn:
         populate_missing_installation_groups(bootstrap_conn)
         populate_missing_group_metadata(bootstrap_conn)
@@ -400,6 +390,15 @@ def create_app() -> Flask:
             heading="Erro interno",
             message="Aconteceu um erro inesperado. Consulta os logs para o detalhe tecnico.",
         ), 500
+
+    @app.errorhandler(413)
+    def request_too_large_error(error: Exception) -> tuple[str, int]:
+        return render_template(
+            "error.html",
+            title="Ficheiro demasiado grande",
+            heading="Ficheiro demasiado grande",
+            message="O ficheiro enviado excede o limite configurado para uploads.",
+        ), 413
 
     @app.route("/")
     def dashboard() -> str:
@@ -560,31 +559,41 @@ def create_app() -> Flask:
         if request.method == "POST":
             action = request.form.get("action", "sync").strip()
             if action == "recalculate_references":
-                result = recalculate_performance_references(
+                job_id, created = create_background_job(
                     g.db,
-                    period_type=period_type,
-                    period_date=target,
-                    asset_id=int(request.form["asset_id"]) if request.form.get("asset_id", "").isdigit() else None,
-                    provider=INTEGRATION_PROVIDER_FUSIONSOLAR,
+                    "performance_reference_recalculation",
+                    {
+                        "provider": INTEGRATION_PROVIDER_FUSIONSOLAR,
+                        "period_type": period_type,
+                        "period_date": target.isoformat(),
+                        "asset_id": int(request.form["asset_id"]) if request.form.get("asset_id", "").isdigit() else None,
+                    },
                 )
-                flash(
-                    f"Referências recalculadas: {result['records_processed']} registos, {result['references_created']} com referência, {result['still_without_reference']} sem referência.",
-                    "success",
-                )
+                g.db.commit()
+                if created:
+                    schedule_background_job(current_app._get_current_object(), job_id)
+                    flash(f"Recalculo de referencias enviado para background (job #{job_id}).", "success")
+                else:
+                    flash(f"Ja existe um recalculo de referencias pendente/em execucao (job #{job_id}).", "warning")
                 return redirect(url_for("performance", period_type=period_type, period_date=target.isoformat()))
-            try:
-                result = run_fusionsolar_production_sync(
+            if action == "sync":
+                job_id, created = create_background_job(
                     g.db,
-                    INTEGRATION_PROVIDER_FUSIONSOLAR,
-                    target_date=target,
-                    period_type=period_type,
+                    "fusionsolar_production_sync",
+                    {
+                        "provider": INTEGRATION_PROVIDER_FUSIONSOLAR,
+                        "period_type": period_type,
+                        "target_date": target.isoformat(),
+                    },
                 )
-                flash(
-                    f"Sync de produção concluído: {result['processed']} centrais processadas, {result['missing_data']} sem dados, {result['no_reference']} sem referência.",
-                    "success",
-                )
-            except Exception as exc:
-                flash(f"Falha no sync de produção: {exc}", "error")
+                g.db.commit()
+                if created:
+                    schedule_background_job(current_app._get_current_object(), job_id)
+                    flash(f"Sync de producao enviado para background (job #{job_id}).", "success")
+                else:
+                    flash(f"Ja existe um sync de producao pendente/em execucao (job #{job_id}).", "warning")
+                return redirect(url_for("performance", period_type=period_type, period_date=target.isoformat()))
+            flash("Acao de performance invalida.", "error")
             return redirect(url_for("performance", period_type=period_type, period_date=target.isoformat()))
 
         search = request.args.get("search", "").strip()
@@ -617,7 +626,23 @@ def create_app() -> Flask:
                 a.location,
                 a.kwp,
                 a.active_contract,
-                pr.*
+                pr.id,
+                pr.external_id,
+                pr.period_type,
+                pr.period_date,
+                pr.production_kwh,
+                pr.specific_yield,
+                pr.expected_kwh,
+                pr.expected_specific_yield,
+                pr.deviation_pct,
+                pr.performance_status,
+                pr.expected_source,
+                pr.data_quality,
+                pr.notes,
+                pr.selected_production_key,
+                pr.selected_production_raw_value,
+                pr.created_at,
+                pr.updated_at
             FROM assets a
             LEFT JOIN production_records pr
               ON pr.asset_id = a.id
@@ -659,6 +684,8 @@ def create_app() -> Flask:
             period_date=target.isoformat(),
             month_value=target.strftime("%Y-%m"),
             selected_asset_id=asset_id,
+            background_jobs=fetch_latest_background_jobs(g.db, job_types=BACKGROUND_JOB_TYPES_PERFORMANCE),
+            fusionsolar_api_warning=get_fusionsolar_performance_cooldown_reason(g.db),
             reference_summary=reference_summary,
             performance_statuses=["OK", "Atenção", "Alerta", "Crítico", "Sem referência", "Sem dados"],
         )
@@ -721,36 +748,50 @@ def create_app() -> Flask:
             )
             estimated_api_calls = estimated_periods * estimated_chunks
 
+        if request.method == "POST" and request.form.get("action") == "month_cycle":
+            cycle_month = normalize_report_month(request.form.get("cycle_month", ""))
+            cycle_asset_ids = [int(value) for value in request.form.getlist("cycle_asset_ids") if value.isdigit()]
+            if not cycle_asset_ids:
+                flash("Escolhe pelo menos uma instalacao para o ciclo.", "error")
+                return redirect(url_for("performance_backfill", period_type=period_type))
+            job_id, created = create_background_job(
+                g.db,
+                "fusionsolar_month_cycle",
+                {
+                    "provider": INTEGRATION_PROVIDER_FUSIONSOLAR,
+                    "report_month": cycle_month,
+                    "asset_ids": cycle_asset_ids,
+                },
+            )
+            g.db.commit()
+            if created:
+                schedule_background_job(current_app._get_current_object(), job_id)
+                flash(f"Ciclo mensal FusionSolar enviado para background (job #{job_id}).", "success")
+            else:
+                flash(f"Ja existe um ciclo mensal FusionSolar pendente/em execucao (job #{job_id}).", "warning")
+            return redirect(url_for("performance_backfill", period_type=period_type, cycle_month=cycle_month))
+
         if request.method == "POST":
-            try:
-                result = run_fusionsolar_production_backfill(
-                    g.db,
-                    provider=INTEGRATION_PROVIDER_FUSIONSOLAR,
-                    period_type=period_type,
-                    from_year=from_year,
-                    to_year=to_year,
-                    asset_id=asset_id,
-                    date_from=date_from,
-                    date_to=date_to,
-                    max_api_calls=max_api_calls,
-                )
-                flash(
-                    "Backfill histórico concluído: "
-                    f"{result['assets_processed']} centrais, "
-                    f"{result['records_updated']} registos atualizados, "
-                    f"{result.get('api_calls_used', 0)} chamadas API, "
-                    f"{result.get('months_processed', 0)} meses importados, "
-                    f"{result['references_created']} referências criadas, "
-                    f"{result['still_without_reference']} ainda sem referência, "
-                    f"{result['missing_production']} sem produção, "
-                    f"{result['api_errors']} erros API, "
-                    f"{result['mtd_records_updated']} MTD recalculados."
-                    + (f" {result['stopped_reason']}" if result.get("stopped_reason") else ""),
-                    "success" if result["api_errors"] == 0 else "warning",
-                )
-            except Exception as exc:
-                category = "warning" if "3 anos" in str(exc) else "error"
-                flash(f"Falha no backfill histórico: {exc}", category)
+            job_id, created = create_background_job(
+                g.db,
+                "fusionsolar_production_backfill",
+                {
+                    "provider": INTEGRATION_PROVIDER_FUSIONSOLAR,
+                    "period_type": period_type,
+                    "from_year": from_year,
+                    "to_year": to_year,
+                    "asset_id": asset_id,
+                    "date_from": date_from.isoformat() if date_from else "",
+                    "date_to": date_to.isoformat() if date_to else "",
+                    "max_api_calls": max_api_calls,
+                },
+            )
+            g.db.commit()
+            if created:
+                schedule_background_job(current_app._get_current_object(), job_id)
+                flash(f"Backfill historico enviado para background (job #{job_id}).", "success")
+            else:
+                flash(f"Ja existe um backfill historico pendente/em execucao (job #{job_id}).", "warning")
             return redirect(
                 url_for(
                     "performance_backfill",
@@ -777,7 +818,10 @@ def create_app() -> Flask:
             estimated_station_count=estimated_station_count,
             selected_asset_id=asset_id,
             assets_for_backfill=assets_for_backfill,
+            background_jobs=fetch_latest_background_jobs(g.db, job_types=BACKGROUND_JOB_TYPES_PERFORMANCE),
+            fusionsolar_api_warning=get_fusionsolar_performance_cooldown_reason(g.db),
             current_year=current_year,
+            cycle_month=request.args.get("cycle_month", date.today().strftime("%Y-%m")),
         )
 
     @app.route("/assets", methods=["GET", "POST"])
@@ -932,6 +976,8 @@ def create_app() -> Flask:
         if asset is None:
             flash("Asset nao encontrado.", "error")
             return redirect(url_for("assets"))
+        calendar_month = normalize_calendar_month(request.args.get("calendar_month", ""))
+        calendar_start, calendar_end, previous_month, next_month = calendar_month_bounds(calendar_month)
 
         om_contract = query_one(
             """
@@ -953,6 +999,18 @@ def create_app() -> Flask:
             """,
             (asset_id,),
         )
+        calendar_history = query_all(
+            g.db,
+            """
+            SELECT id, asset_id, record_date, status, notes, source
+            FROM monitoring_records
+            WHERE asset_id = ?
+              AND record_date <= ?
+            ORDER BY record_date ASC, id ASC
+            """,
+            (asset_id, calendar_end.isoformat()),
+        )
+        asset_error_calendar = build_asset_error_calendar(calendar_month, calendar_history)
         tickets = query_all(
             g.db,
             """
@@ -1023,6 +1081,10 @@ def create_app() -> Flask:
             asset=asset,
             om_contract=om_contract,
             monitoring_history=monitoring_history,
+            asset_error_calendar=asset_error_calendar,
+            calendar_month=calendar_month,
+            previous_month=previous_month,
+            next_month=next_month,
             tickets=tickets,
             aliases=aliases,
             visits_by_ticket=visits_by_ticket,
@@ -1194,8 +1256,8 @@ def create_app() -> Flask:
 
         contract = query_one("SELECT pdf_path FROM om_contracts WHERE asset_id = ?", (asset_id,))
         if contract and contract["pdf_path"]:
-            contract_path = resolve_runtime_file_path(contract["pdf_path"])
-            if contract_path.exists():
+            contract_path = resolve_runtime_file_path_within(contract["pdf_path"], CONTRACTS_DIR)
+            if contract_path is not None and contract_path.exists():
                 contract_path.unlink()
 
         g.db.execute("DELETE FROM assets WHERE id = ?", (asset_id,))
@@ -1241,17 +1303,25 @@ def create_app() -> Flask:
             if suffix != ".pdf":
                 flash("O contrato tem de ser um ficheiro PDF.", "error")
                 return redirect(url_for("asset_detail", asset_id=asset_id))
+            header = uploaded_file.stream.read(5)
+            uploaded_file.stream.seek(0)
+            if header != b"%PDF-":
+                flash("O contrato enviado nao parece ser um PDF valido.", "error")
+                return redirect(url_for("asset_detail", asset_id=asset_id))
             CONTRACTS_DIR.mkdir(parents=True, exist_ok=True)
             safe_stem = normalize_name(asset["project_name"]).replace(" ", "-") or f"asset-{asset_id}"
             filename = f"{asset_id}_{safe_stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-            target_path = CONTRACTS_DIR / filename
+            target_path = (CONTRACTS_DIR / filename).resolve()
+            if not path_is_within(target_path, CONTRACTS_DIR):
+                current_app.logger.error("Rejected contract upload outside contracts directory for asset %s", asset_id)
+                abort(400)
             uploaded_file.save(target_path)
             if stored_path:
-                old_path = resolve_runtime_file_path(stored_path)
-                if old_path.exists() and old_path != target_path:
+                old_path = resolve_runtime_file_path_within(stored_path, CONTRACTS_DIR)
+                if old_path is not None and old_path.exists() and old_path != target_path:
                     old_path.unlink()
             stored_path = store_runtime_relative_path(target_path)
-            original_filename = uploaded_file.filename
+            original_filename = Path(uploaded_file.filename).name[:255]
 
         if existing_contract:
             g.db.execute(
@@ -1311,12 +1381,15 @@ def create_app() -> Flask:
             flash("Esta central ainda nao tem contrato associado.", "error")
             return redirect(url_for("asset_detail", asset_id=asset_id))
 
-        contract_path = resolve_runtime_file_path(contract["pdf_path"])
+        contract_path = resolve_runtime_file_path_within(contract["pdf_path"], CONTRACTS_DIR)
+        if contract_path is None:
+            current_app.logger.warning("Blocked contract path outside contracts directory for asset %s", asset_id)
+            abort(404)
         if not contract_path.exists():
             flash("O ficheiro do contrato nao foi encontrado no projeto.", "error")
             return redirect(url_for("asset_detail", asset_id=asset_id))
 
-        return send_file(contract_path, mimetype="application/pdf", as_attachment=False)
+        return send_file(contract_path, mimetype="application/pdf", as_attachment=False, max_age=0)
 
     @app.route("/asset/<int:asset_id>/alias", methods=["POST"])
     def add_alias(asset_id: int):
@@ -1785,6 +1858,7 @@ def create_app() -> Flask:
         urgency_filter = request.args.get("urgency", "").strip()
         scope = request.args.get("scope", "").strip()
         om_only = request.args.get("om_only", "yes").strip()
+        calendar_month = normalize_calendar_month(request.args.get("calendar_month", ""))
 
         conditions = []
         params: list[Any] = []
@@ -1859,6 +1933,52 @@ def create_app() -> Flask:
             )
         )
         grouped_tickets = group_tickets_by_asset(ticket_rows)
+        calendar_start, calendar_end, previous_month, next_month = calendar_month_bounds(calendar_month)
+        calendar_conditions = [
+            "mr.status IN ('Erro', 'Desconectada')",
+            "mr.record_date BETWEEN ? AND ?",
+        ]
+        calendar_params: list[Any] = [calendar_start.isoformat(), calendar_end.isoformat()]
+        if search:
+            wildcard = f"%{search}%"
+            calendar_conditions.append(
+                "(a.project_name LIKE ? OR a.alias_blob LIKE ? OR COALESCE(mr.notes, '') LIKE ? OR COALESCE(mr.source, '') LIKE ?)"
+            )
+            calendar_params.extend([wildcard, wildcard, wildcard, wildcard])
+        if asset_filter:
+            calendar_conditions.append("a.id = ?")
+            calendar_params.append(asset_filter)
+        if om_only == "yes":
+            calendar_conditions.append("a.active_contract = 'yes'")
+        calendar_where_sql = f"WHERE {' AND '.join(calendar_conditions)}"
+
+        calendar_rows = query_all(
+            g.db,
+            f"""
+            SELECT
+                mr.id,
+                mr.asset_id,
+                mr.status,
+                mr.record_date,
+                mr.notes,
+                mr.source,
+                a.project_name
+            FROM monitoring_records mr
+            JOIN assets a ON a.id = mr.asset_id
+            {calendar_where_sql}
+            ORDER BY
+                mr.record_date,
+                CASE mr.status
+                    WHEN 'Erro' THEN 1
+                    WHEN 'Desconectada' THEN 2
+                    ELSE 3
+                END,
+                a.project_name COLLATE NOCASE,
+                mr.id DESC
+            """,
+            calendar_params,
+        )
+        error_calendar = build_error_calendar(calendar_month, calendar_rows)
 
         selected_asset = None
         central_history = []
@@ -1905,6 +2025,10 @@ def create_app() -> Flask:
             central_history=central_history,
             central_summary=central_summary,
             ticket_stats=ticket_stats,
+            error_calendar=error_calendar,
+            calendar_month=calendar_month,
+            previous_month=previous_month,
+            next_month=next_month,
             search=search,
             asset_filter=asset_filter,
             status_filter=status_filter,
@@ -1975,78 +2099,48 @@ def create_app() -> Flask:
 
     @app.route("/exports", methods=["GET", "POST"])
     def exports() -> str:
-        selected_dataset = request.values.get("dataset", "monitoring").strip()
-        if selected_dataset not in EXPORT_DATASETS:
-            selected_dataset = "monitoring"
-
         if request.method == "POST":
-            action = request.form.get("action", "download")
-            export_format = request.form.get("export_format", "xlsx").strip().lower()
-            columns = request.form.getlist("columns") or [column[0] for column in EXPORT_DATASETS[selected_dataset]["columns"]]
-            filters = extract_export_filters(request.form, selected_dataset)
-
-            if action == "save_template":
-                template_name = request.form.get("template_name", "").strip()
-                if not template_name:
-                    flash("Indica um nome para o template.", "error")
-                    return redirect(url_for("exports", dataset=selected_dataset))
-                g.db.execute(
-                    """
-                    INSERT INTO export_templates (name, dataset, export_format, columns_json, filters_json, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        template_name,
-                        selected_dataset,
-                        export_format,
-                        json.dumps(columns, ensure_ascii=True),
-                        json.dumps(filters, ensure_ascii=True),
-                        datetime.now().isoformat(timespec="seconds"),
-                    ),
+            asset_id_raw = request.form.get("asset_id", "").strip()
+            report_month = normalize_report_month(request.form.get("report_month", ""))
+            electricity_price = parse_float_value(request.form.get("electricity_price")) or 0.20725
+            sell_price = parse_float_value(request.form.get("sell_price")) or 0.0
+            force_api = request.form.get("force_api") == "on"
+            if not asset_id_raw.isdigit():
+                flash("Escolhe uma instalacao FusionSolar para gerar o relatorio.", "error")
+                return redirect(url_for("exports", report_month=report_month))
+            try:
+                report = build_fusionsolar_customer_production_report(
+                    g.db,
+                    asset_id=int(asset_id_raw),
+                    report_month=report_month,
+                    electricity_price=electricity_price,
+                    sell_price=sell_price,
+                    force_api=force_api,
                 )
-                g.db.commit()
-                flash("Template de exportacao guardado.", "success")
-                return redirect(url_for("exports", dataset=selected_dataset))
+                return export_customer_production_pdf(report)
+            except Exception as exc:
+                if is_fusionsolar_rate_limit_error(exc):
+                    flash(mark_fusionsolar_performance_rate_limited(g.db), "warning")
+                    g.db.commit()
+                    return redirect(url_for("exports", asset_id=asset_id_raw, report_month=report_month))
+                if "FusionSolar API temporariamente limitada" in str(exc):
+                    flash(str(exc), "warning")
+                    return redirect(url_for("exports", asset_id=asset_id_raw, report_month=report_month))
+                current_app.logger.exception("Falha ao gerar relatorio de producao")
+                flash(f"Falha ao gerar relatorio de producao: {exc}", "error")
+                return redirect(url_for("exports", asset_id=asset_id_raw, report_month=report_month))
 
-            if action == "download":
-                rows, headers = build_export_dataset(g.db, selected_dataset, filters, columns)
-                filename = f"{selected_dataset}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                return export_rows_file(rows, headers, filename, export_format)
-
-        template_id = request.args.get("template_id", "").strip()
-        active_template = None
-        template_filters = {}
-        template_columns = [column[0] for column in EXPORT_DATASETS[selected_dataset]["columns"]]
-        template_format = "xlsx"
-        if template_id:
-            active_template = query_one("SELECT * FROM export_templates WHERE id = ?", (template_id,))
-            if active_template:
-                selected_dataset = active_template["dataset"]
-                template_filters = json.loads(active_template["filters_json"])
-                template_columns = json.loads(active_template["columns_json"])
-                template_format = active_template["export_format"]
-
-        templates_rows = query_all(
-            g.db,
-            "SELECT * FROM export_templates ORDER BY created_at DESC, id DESC",
-        )
-        preview_filters = template_filters or extract_export_filters(request.args, selected_dataset, for_query=True)
-        preview_columns = template_columns if active_template else request.args.getlist("columns") or [column[0] for column in EXPORT_DATASETS[selected_dataset]["columns"]]
-        preview_rows, preview_headers = build_export_dataset(g.db, selected_dataset, preview_filters, preview_columns, limit=20)
+        selected_asset_id = request.args.get("asset_id", "").strip()
+        report_month = normalize_report_month(request.args.get("report_month", ""))
 
         return render_template(
             "exports.html",
-            datasets=EXPORT_DATASETS,
-            selected_dataset=selected_dataset,
-            templates_rows=templates_rows,
-            active_template=active_template,
-            preview_rows=preview_rows,
-            preview_headers=preview_headers,
-            selected_columns=preview_columns,
-            template_filters=template_filters,
-            template_format=template_format,
-            monitoring_sources=MONITORING_SOURCES,
-            assets_for_mapping=query_all(g.db, "SELECT id, project_name FROM assets ORDER BY project_name COLLATE NOCASE"),
+            report_assets=get_fusionsolar_report_assets(g.db),
+            selected_asset_id=selected_asset_id,
+            report_month=report_month,
+            electricity_price=request.args.get("electricity_price", "0.20725"),
+            sell_price=request.args.get("sell_price", "0.00"),
+            fusionsolar_api_warning=get_fusionsolar_performance_cooldown_reason(g.db),
         )
 
     @app.route("/integrations", methods=["GET", "POST"])
@@ -2094,6 +2188,28 @@ def create_app() -> Flask:
                 return redirect(url_for("integrations"))
 
             if action == "test_connection":
+                messages = []
+                failures = []
+                for item_provider in INTEGRATION_PROVIDER_OPTIONS:
+                    item_config = get_integration_config(g.db, item_provider)
+                    if item_config is None or not item_config["enabled"]:
+                        continue
+                    try:
+                        result = run_provider_check(g.db, item_provider, dry_run=True)
+                        messages.append(
+                            f"{item_provider}: {result['station_count']} centrais, {result['realtime_count']} respostas realtime"
+                        )
+                    except Exception as exc:
+                        failures.append(f"{item_provider}: {exc}")
+                if messages:
+                    flash("Ligacao validada: " + " | ".join(messages), "success")
+                if failures:
+                    flash("Falha no teste: " + " | ".join(failures), "error")
+                if not messages and not failures:
+                    flash("Nao ha integracoes ativas para testar.", "warning")
+                return redirect(url_for("integrations"))
+
+            if action == "test_fusionsolar_connection":
                 try:
                     result = run_fusionsolar_check(g.db, provider, dry_run=True)
                     flash(
@@ -2106,13 +2222,19 @@ def create_app() -> Flask:
 
             if action == "sync_now":
                 try:
-                    result = run_fusionsolar_sync(g.db, provider, trigger_type="manual")
-                    flash(
-                        f"Sync FusionSolar concluido: {result['matched']} associados, {result['unresolved']} por resolver, {result['auto_resolved']} resolvidos.",
-                        "success",
-                    )
+                    result = run_all_integration_syncs(g.db, trigger_type="manual")
+                    summaries = [
+                        f"{item_provider}: {item_result['matched']} associados, {item_result['unresolved']} por resolver, {item_result['auto_resolved']} resolvidos"
+                        for item_provider, item_result in result["results"].items()
+                    ]
+                    if summaries:
+                        flash("Sync concluido: " + " | ".join(summaries), "success")
+                    else:
+                        flash("Nao ha integracoes ativas para sincronizar.", "warning")
+                    if result["errors"]:
+                        flash("Falhas no sync: " + " | ".join(f"{key}: {value}" for key, value in result["errors"].items()), "error")
                 except Exception as exc:
-                    flash(f"Falha ao sincronizar FusionSolar: {exc}", "error")
+                    flash(f"Falha ao sincronizar integracoes: {exc}", "error")
                 return redirect(url_for("integrations"))
 
             if action == "test_telegram":
@@ -2241,7 +2363,7 @@ def create_app() -> Flask:
                 unresolved_id = int(request.form["unresolved_id"])
                 asset_id = int(request.form["asset_id"])
                 resolve_fusionsolar_unresolved(g.db, unresolved_id, asset_id)
-                flash("Entrada FusionSolar associada ao asset.", "success")
+                flash("Entrada API associada ao asset.", "success")
                 return redirect(url_for("integrations") + "#integrations-link-audit")
 
             if action == "update_fusionsolar_mapping":
@@ -2254,37 +2376,39 @@ def create_app() -> Flask:
             if action == "create_asset_from_unresolved":
                 unresolved_id = int(request.form["unresolved_id"])
                 asset_id = create_asset_from_unresolved(g.db, unresolved_id)
-                flash("Asset criado a partir da entrada FusionSolar por resolver.", "success")
+                flash("Asset criado a partir da entrada API por resolver.", "success")
                 return redirect(url_for("asset_detail", asset_id=asset_id))
 
             if action == "ignore_unresolved":
                 unresolved_id = int(request.form["unresolved_id"])
                 ignore_fusionsolar_unresolved(g.db, unresolved_id)
-                flash("Entrada FusionSolar marcada como ignorada.", "success")
+                flash("Entrada API marcada como ignorada.", "success")
                 return redirect(url_for("integrations"))
 
         config = get_integration_config(g.db, provider)
+        integration_configs = [get_integration_config(g.db, item_provider) for item_provider in INTEGRATION_PROVIDER_OPTIONS]
+        integration_configs = [item for item in integration_configs if item is not None]
         sync_runs = query_all(
             g.db,
             """
             SELECT *
             FROM integration_sync_runs
-            WHERE provider = ?
+            WHERE provider IN (?, ?)
             ORDER BY started_at DESC, id DESC
             LIMIT 20
             """,
-            (provider,),
+            (INTEGRATION_PROVIDER_FUSIONSOLAR, INTEGRATION_PROVIDER_SIGENERGY),
         )
         unresolved_rows = query_all(
             g.db,
             """
             SELECT *
             FROM integration_unresolved
-            WHERE provider = ? AND resolution_status = 'pending'
+            WHERE provider IN (?, ?) AND resolution_status = 'pending'
             ORDER BY created_at DESC, id DESC
             LIMIT 100
             """,
-            (provider,),
+            (INTEGRATION_PROVIDER_FUSIONSOLAR, INTEGRATION_PROVIDER_SIGENERGY),
         )
         mapped_assets = query_all(
             g.db,
@@ -2292,10 +2416,10 @@ def create_app() -> Flask:
             SELECT ai.*, a.project_name, a.installation_group
             FROM asset_integrations ai
             JOIN assets a ON a.id = ai.asset_id
-            WHERE ai.provider = ?
+            WHERE ai.provider IN (?, ?)
             ORDER BY a.installation_group COLLATE NOCASE, a.project_name COLLATE NOCASE
             """,
-            (provider,),
+            (INTEGRATION_PROVIDER_FUSIONSOLAR, INTEGRATION_PROVIDER_SIGENERGY),
         )
         link_audit_rows = get_fusionsolar_link_audit_rows(g.db, provider)
         link_audit_counts = {
@@ -2344,6 +2468,7 @@ def create_app() -> Flask:
             "integrations.html",
             provider=provider,
             config=config,
+            integration_configs=integration_configs,
             sync_runs=sync_runs,
             unresolved_rows=unresolved_rows,
             mapped_assets=mapped_assets,
@@ -2355,6 +2480,7 @@ def create_app() -> Flask:
             alert_scope_options=ALERT_SCOPE_OPTIONS,
             alert_filter_assets=alert_filter_assets,
             alert_blacklist_rows=alert_blacklist_rows,
+            fusionsolar_api_warning=get_fusionsolar_performance_cooldown_reason(g.db),
         )
 
     @app.route("/telegram-alerts")
@@ -2617,6 +2743,7 @@ def create_app() -> Flask:
 
 def ensure_database(path: str) -> None:
     with closing(get_db(path)) as conn:
+        configure_database_for_runtime(conn)
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS assets (
@@ -2855,6 +2982,18 @@ def ensure_database(path: str) -> None:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS background_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                params_json TEXT,
+                result_json TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT
+            );
+
             CREATE TABLE IF NOT EXISTS alert_blacklist (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 asset_id INTEGER NULL,
@@ -2909,6 +3048,7 @@ def ensure_database(path: str) -> None:
              AND latest.marker = mr.record_date || 'T' || printf('%09d', mr.id);
             """
         )
+        ensure_database_indexes(conn)
         ensure_column(conn, "monitoring_records", "batch_id INTEGER")
         ensure_column(conn, "monitoring_unmatched", "batch_id INTEGER")
         ensure_column(conn, "assets", "installation_group TEXT")
@@ -2933,6 +3073,214 @@ def ensure_database(path: str) -> None:
         ensure_predefined_export_templates(conn)
         ensure_alert_settings_defaults(conn)
         conn.commit()
+
+
+def ensure_database_indexes(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_monitoring_records_asset_date_id
+            ON monitoring_records(asset_id, record_date DESC, id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_monitoring_records_record_date_source
+            ON monitoring_records(record_date, source);
+
+        CREATE INDEX IF NOT EXISTS idx_monitoring_records_status_record_date
+            ON monitoring_records(status, record_date);
+
+        CREATE INDEX IF NOT EXISTS idx_production_records_provider_period_asset
+            ON production_records(provider, period_type, period_date, asset_id);
+
+        CREATE INDEX IF NOT EXISTS idx_production_records_performance_status
+            ON production_records(performance_status);
+
+        CREATE INDEX IF NOT EXISTS idx_asset_integrations_provider_external_id
+            ON asset_integrations(provider, external_id);
+
+        CREATE INDEX IF NOT EXISTS idx_asset_integrations_provider_enabled_asset
+            ON asset_integrations(provider, enabled, asset_id);
+
+        CREATE INDEX IF NOT EXISTS idx_tickets_asset_status
+            ON tickets(asset_id, status);
+
+        CREATE INDEX IF NOT EXISTS idx_integration_unresolved_provider_resolution_created
+            ON integration_unresolved(provider, resolution_status, created_at);
+
+        CREATE INDEX IF NOT EXISTS idx_telegram_alerts_alert_key_status
+            ON telegram_alerts(alert_key, status);
+
+        CREATE INDEX IF NOT EXISTS idx_alert_blacklist_asset_active
+            ON alert_blacklist(asset_id, active);
+
+        CREATE INDEX IF NOT EXISTS idx_background_jobs_type_status_created
+            ON background_jobs(job_type, status, created_at);
+        """
+    )
+
+
+def encode_job_params(params: dict[str, Any]) -> str:
+    return json.dumps(params, ensure_ascii=True, sort_keys=True)
+
+
+def create_background_job(
+    conn: sqlite3.Connection,
+    job_type: str,
+    params: dict[str, Any],
+    prevent_duplicate: bool = True,
+) -> tuple[int, bool]:
+    if prevent_duplicate:
+        existing = conn.execute(
+            """
+            SELECT id
+            FROM background_jobs
+            WHERE job_type = ? AND status IN ('pending', 'running')
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (job_type,),
+        ).fetchone()
+        if existing is not None:
+            return int(existing["id"]), False
+
+    now = datetime.now().isoformat(timespec="seconds")
+    cursor = conn.execute(
+        """
+        INSERT INTO background_jobs (job_type, status, params_json, created_at)
+        VALUES (?, 'pending', ?, ?)
+        """,
+        (job_type, encode_job_params(params), now),
+    )
+    return int(cursor.lastrowid), True
+
+
+def mark_background_job_running(conn: sqlite3.Connection, job_id: int) -> bool:
+    now = datetime.now().isoformat(timespec="seconds")
+    cursor = conn.execute(
+        """
+        UPDATE background_jobs
+        SET status = 'running', started_at = ?, error_message = NULL
+        WHERE id = ? AND status = 'pending'
+        """,
+        (now, job_id),
+    )
+    conn.commit()
+    return cursor.rowcount == 1
+
+
+def mark_background_job_success(conn: sqlite3.Connection, job_id: int, result: dict[str, Any]) -> None:
+    now = datetime.now().isoformat(timespec="seconds")
+    conn.execute(
+        """
+        UPDATE background_jobs
+        SET status = 'success', result_json = ?, error_message = NULL, finished_at = ?
+        WHERE id = ?
+        """,
+        (json.dumps(result, ensure_ascii=True, sort_keys=True), now, job_id),
+    )
+    conn.commit()
+
+
+def mark_background_job_failed(conn: sqlite3.Connection, job_id: int, error_message: str) -> None:
+    now = datetime.now().isoformat(timespec="seconds")
+    conn.execute(
+        """
+        UPDATE background_jobs
+        SET status = 'failed', error_message = ?, finished_at = ?
+        WHERE id = ?
+        """,
+        (error_message[:2000], now, job_id),
+    )
+    conn.commit()
+
+
+def mark_stale_running_background_jobs_failed(
+    conn: sqlite3.Connection,
+    stale_after_minutes: int = BACKGROUND_JOB_STALE_RUNNING_MINUTES,
+) -> int:
+    cutoff = datetime.now() - timedelta(minutes=stale_after_minutes)
+    now = datetime.now().isoformat(timespec="seconds")
+    cursor = conn.execute(
+        """
+        UPDATE background_jobs
+        SET status = 'failed',
+            error_message = ?,
+            finished_at = ?
+        WHERE status = 'running'
+          AND COALESCE(started_at, created_at) < ?
+        """,
+        (
+            f"Job marked failed on startup after being running for more than {stale_after_minutes} minutes.",
+            now,
+            cutoff.isoformat(timespec="seconds"),
+        ),
+    )
+    conn.commit()
+    return cursor.rowcount
+
+
+def fetch_pending_background_job_ids(conn: sqlite3.Connection) -> list[int]:
+    rows = query_all(
+        conn,
+        """
+        SELECT id
+        FROM background_jobs
+        WHERE status = 'pending'
+        ORDER BY id ASC
+        """,
+    )
+    return [int(row["id"]) for row in rows]
+
+
+def fetch_latest_background_jobs(
+    conn: sqlite3.Connection,
+    limit: int = 10,
+    job_types: tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
+    params: list[Any] = []
+    where_sql = ""
+    if job_types:
+        placeholders = ", ".join("?" for _ in job_types)
+        where_sql = f"WHERE job_type IN ({placeholders})"
+        params.extend(job_types)
+    params.append(limit)
+    rows = conn.execute(
+        f"""
+        SELECT id, job_type, status, params_json, result_json, error_message, created_at, started_at, finished_at
+        FROM background_jobs
+        {where_sql}
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
+    jobs: list[dict[str, Any]] = []
+    for row in rows:
+        job = dict(row)
+        result_summary = ""
+        if row["result_json"]:
+            try:
+                result = json.loads(row["result_json"])
+            except json.JSONDecodeError:
+                result = {}
+            if isinstance(result, dict):
+                parts = []
+                if result.get("records_updated") is not None:
+                    parts.append(f"registos: {result['records_updated']}")
+                if result.get("monthly_records_updated") is not None:
+                    parts.append(f"mensais: {result['monthly_records_updated']}")
+                if result.get("api_calls_used") is not None:
+                    parts.append(f"chamadas API: {result['api_calls_used']}")
+                if result.get("wait_cycles"):
+                    parts.append(f"esperas: {result['wait_cycles']}")
+                if result.get("resume_hint"):
+                    parts.append(f"retomar: {result['resume_hint']}")
+                if result.get("stopped_reason"):
+                    parts.append(str(result["stopped_reason"]))
+                elif result.get("status"):
+                    parts.append(f"estado: {result['status']}")
+                result_summary = " | ".join(parts)
+        job["result_summary"] = result_summary
+        jobs.append(job)
+    return jobs
 
 
 def query_one(sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
@@ -3293,8 +3641,42 @@ def get_fusionsolar_link_audit_rows(conn: sqlite3.Connection, provider: str) -> 
             }
         )
 
+    unmapped_local_rows = query_all(
+        conn,
+        """
+        SELECT a.id, a.project_name, a.installation_group
+        FROM assets a
+        WHERE a.active_contract = 'yes'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM asset_integrations ai
+              WHERE ai.provider = ? AND ai.asset_id = a.id AND ai.enabled = 1
+          )
+        ORDER BY a.project_name COLLATE NOCASE
+        """,
+        (provider,),
+    )
+    for row in unmapped_local_rows:
+        rows.append(
+            {
+                "integration_id": None,
+                "unresolved_id": None,
+                "external_id": "",
+                "external_name": "",
+                "asset_id": int(row["id"]),
+                "project_name": row["project_name"] or "",
+                "installation_group": row["installation_group"] or "",
+                "last_status": "",
+                "last_sync_at": "",
+                "verdict": "Rever",
+                "reason": "Central local O&M sem entrada devolvida pelo FusionSolar. Verifica a autorizacao da planta na conta northbound.",
+                "duplicate_count": 0,
+                "duplicate_names": "",
+            }
+        )
+
     priority = {"Rever": 0, "Atencao": 1, "Por resolver": 2, "OK": 3}
-    return sorted(rows, key=lambda item: (priority.get(item["verdict"], 9), item["external_name"].lower()))
+    return sorted(rows, key=lambda item: (priority.get(item["verdict"], 9), (item["external_name"] or item["project_name"]).lower()))
 
 
 def parse_date_value(value: str | None) -> date | None:
@@ -3559,12 +3941,13 @@ def status_rank(status: str) -> int:
     order = {
         "Erro": 1,
         "Desconectada": 2,
-        "Aberto": 3,
-        "Em analise": 4,
-        "Agendado": 5,
-        "Em visita": 6,
-        "Resolvido": 7,
-        "Operacional": 8,
+        "Alerta": 3,
+        "Aberto": 4,
+        "Em analise": 5,
+        "Agendado": 6,
+        "Em visita": 7,
+        "Resolvido": 8,
+        "Operacional": 9,
         "ok": 8,
     }
     return order.get(status or "", 99)
@@ -3654,7 +4037,7 @@ def html_line(value: Any) -> str:
 def get_latest_monitoring_row(conn: sqlite3.Connection, asset_id: int) -> sqlite3.Row | None:
     return conn.execute(
         """
-        SELECT id, status, record_date, created_at
+        SELECT id, status, record_date, source, created_at
         FROM monitoring_records
         WHERE asset_id = ?
         ORDER BY record_date DESC, id DESC
@@ -4954,11 +5337,13 @@ def extract_export_filters(source: Any, dataset: str, for_query: bool = False) -
                 "end_date": get_value("end_date", "").strip(),
             }
         )
-    elif dataset in {"executive_report", "monitoring_report"}:
+    elif dataset in {"executive_report", "monitoring_report", "production_report"}:
         filters.update(
             {
                 "period": get_value("period", "week").strip() or "week",
                 "source": get_value("source", "").strip(),
+                "report_month": get_value("report_month", "").strip(),
+                "report_year": get_value("report_year", "").strip(),
             }
         )
     else:
@@ -4969,27 +5354,70 @@ def extract_export_filters(source: Any, dataset: str, for_query: bool = False) -
             }
         )
     if for_query:
+        if dataset == "production_report" and filters.get("period") not in {"month", "year"}:
+            filters["period"] = "month"
         return filters
+    if dataset == "production_report" and filters.get("period") not in {"month", "year"}:
+        filters["period"] = "month"
     return {key: value for key, value in filters.items() if value}
 
 
-def report_period_dates(period: str) -> tuple[str, str]:
+def normalize_report_month(value: str | None) -> str:
+    if value:
+        try:
+            return datetime.strptime(value.strip(), "%Y-%m").strftime("%Y-%m")
+        except ValueError:
+            pass
+    return date.today().strftime("%Y-%m")
+
+
+def normalize_report_year(value: str | None) -> int:
+    if value and value.strip().isdigit():
+        year = int(value.strip())
+        if 2000 <= year <= date.today().year + 1:
+            return year
+    return date.today().year
+
+
+def report_period_dates(period: str, report_month: str | None = None, report_year: str | None = None) -> tuple[str, str]:
     today = date.today()
     if period == "day":
         return today.isoformat(), today.isoformat()
+    if period == "year":
+        year = normalize_report_year(report_year)
+        start = date(year, 1, 1)
+        end = date(year, 12, 31)
+        if year == today.year:
+            end = today
+        return start.isoformat(), end.isoformat()
     if period == "month":
-        return today.replace(day=1).isoformat(), today.isoformat()
+        month_value = normalize_report_month(report_month)
+        month_start = datetime.strptime(month_value, "%Y-%m").date()
+        _, last_day = calendar.monthrange(month_start.year, month_start.month)
+        month_end = month_start.replace(day=last_day)
+        if month_start.year == today.year and month_start.month == today.month:
+            month_end = today
+        return month_start.isoformat(), month_end.isoformat()
     return (today - timedelta(days=7)).isoformat(), today.isoformat()
 
 
-def report_period_label(period: str) -> str:
-    start_date, end_date = report_period_dates(period)
+def report_period_label(period: str, report_month: str | None = None, report_year: str | None = None) -> str:
+    start_date, end_date = report_period_dates(period, report_month, report_year)
     labels = {
         "day": "Diario",
         "week": "Semanal",
         "month": "Mensal",
+        "year": "Anual",
     }
     return f"{labels.get(period, 'Semanal')} ({start_date} a {end_date})"
+
+
+def report_sync_bounds(filters: dict[str, str]) -> tuple[int, int, date, date]:
+    period = filters.get("period", "month")
+    start_raw, end_raw = report_period_dates(period, filters.get("report_month"), filters.get("report_year"))
+    start = datetime.strptime(start_raw, "%Y-%m-%d").date()
+    end = datetime.strptime(end_raw, "%Y-%m-%d").date()
+    return start.year, end.year, start, end
 
 
 def build_monitoring_report_rows(
@@ -4998,7 +5426,7 @@ def build_monitoring_report_rows(
     limit: int | None = None,
 ) -> list[dict[str, Any]]:
     period = filters.get("period", "week")
-    start_date, end_date = report_period_dates(period)
+    start_date, end_date = report_period_dates(period, filters.get("report_month"), filters.get("report_year"))
     source_filter = filters.get("source", "")
 
     filter_sql = []
@@ -5104,7 +5532,7 @@ def build_monitoring_report_rows(
 
         rows.append(
             {
-                "period": report_period_label(period),
+                "period": report_period_label(period, filters.get("report_month"), filters.get("report_year")),
                 "project_name": asset["project_name"],
                 "location": asset["location"] or "-",
                 "current_status": asset["current_status"] or "-",
@@ -5137,7 +5565,11 @@ def build_executive_report_rows(
     filters: dict[str, str],
     limit: int | None = None,
 ) -> list[dict[str, Any]]:
-    start_date, end_date = report_period_dates(filters.get("period", "week"))
+    start_date, end_date = report_period_dates(
+        filters.get("period", "week"),
+        filters.get("report_month"),
+        filters.get("report_year"),
+    )
     source_filter = filters.get("source", "")
     source_sql = "AND mr.source = ?" if source_filter else ""
     source_params: list[Any] = [source_filter] if source_filter else []
@@ -5233,6 +5665,128 @@ def build_executive_report_rows(
             }
         )
 
+    return rows[:limit] if limit else rows
+
+
+def production_report_status(rows: list[sqlite3.Row]) -> str:
+    if not rows:
+        return "Sem dados"
+    ordered = ["Critico", "Crítico", "Alerta", "Atencao", "Atenção", "Sem dados", "Sem referencia", "Sem referência", "OK"]
+    statuses = {str(row["performance_status"] or "") for row in rows}
+    for status in ordered:
+        if status in statuses:
+            return status
+    return next(iter(statuses), "Sem dados") or "Sem dados"
+
+
+def build_production_report_rows(
+    conn: sqlite3.Connection,
+    filters: dict[str, str],
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    period = filters.get("period", "month")
+    if period not in {"month", "year"}:
+        period = "month"
+    start_date, end_date = report_period_dates(period, filters.get("report_month"), filters.get("report_year"))
+    source_filter = filters.get("source", "")
+
+    filter_sql = []
+    params: list[Any] = []
+    if filters.get("search"):
+        wildcard = f"%{filters['search']}%"
+        filter_sql.append("(a.project_name LIKE ? OR a.alias_blob LIKE ? OR a.company_name LIKE ? OR a.location LIKE ?)")
+        params.extend([wildcard, wildcard, wildcard, wildcard])
+    if filters.get("asset_id"):
+        filter_sql.append("a.id = ?")
+        params.append(filters["asset_id"])
+    if filters.get("om_only", "yes") == "yes":
+        filter_sql.append("a.active_contract = 'yes'")
+    where_sql = f"WHERE {' AND '.join(filter_sql)}" if filter_sql else ""
+
+    assets = query_all(
+        conn,
+        f"""
+        SELECT a.id, a.project_name, a.location, a.kwp, a.active_contract
+        FROM assets a
+        {where_sql}
+        ORDER BY
+            CASE a.active_contract WHEN 'yes' THEN 1 ELSE 2 END,
+            a.project_name COLLATE NOCASE
+        """,
+        params,
+    )
+
+    provider_sql = "AND provider = ?" if source_filter else ""
+    provider_params: list[Any] = [source_filter] if source_filter else []
+    rows: list[dict[str, Any]] = []
+    for asset in assets:
+        asset_id = int(asset["id"])
+        monthly_records = query_all(
+            conn,
+            f"""
+            SELECT *
+            FROM production_records
+            WHERE asset_id = ?
+              AND period_type = 'month'
+              AND period_date BETWEEN ? AND ?
+              {provider_sql}
+            ORDER BY period_date
+            """,
+            [asset_id, start_date, end_date] + provider_params,
+        )
+        daily_records = query_all(
+            conn,
+            f"""
+            SELECT *
+            FROM production_records
+            WHERE asset_id = ?
+              AND period_type = 'day'
+              AND period_date BETWEEN ? AND ?
+              {provider_sql}
+            ORDER BY period_date
+            """,
+            [asset_id, start_date, end_date] + provider_params,
+        )
+        source_records = monthly_records if monthly_records else daily_records
+        production_values = [float(row["production_kwh"]) for row in source_records if row["production_kwh"] is not None]
+        expected_values = [float(row["expected_kwh"]) for row in source_records if row["expected_kwh"] is not None]
+        production_kwh = sum(production_values) if production_values else None
+        expected_kwh = sum(expected_values) if expected_values else None
+        kwp = parse_kwp_value(asset["kwp"])
+        specific_yield = calculate_specific_yield(production_kwh, kwp)
+        deviation_pct = None
+        if production_kwh is not None and expected_kwh:
+            deviation_pct = ((production_kwh - expected_kwh) / expected_kwh) * 100
+        providers = sorted({str(row["provider"] or "") for row in source_records if row["provider"]})
+        last_update = max((str(row["updated_at"] or "") for row in source_records), default="")
+        if not source_records and filters.get("hide_empty") == "yes":
+            continue
+
+        rows.append(
+            {
+                "period": report_period_label(period, filters.get("report_month"), filters.get("report_year")),
+                "project_name": asset["project_name"],
+                "location": asset["location"] or "-",
+                "provider": ", ".join(providers) if providers else "-",
+                "production_kwh": round(production_kwh, 2) if production_kwh is not None else "",
+                "specific_yield": round(specific_yield, 2) if specific_yield is not None else "",
+                "expected_kwh": round(expected_kwh, 2) if expected_kwh is not None else "",
+                "deviation_pct": round(deviation_pct, 2) if deviation_pct is not None else "",
+                "performance_status": production_report_status(source_records),
+                "data_points": len(source_records),
+                "data_source": "KPI mensal API" if monthly_records else ("KPI diario API" if daily_records else "Sem dados API"),
+                "last_update": last_update or "-",
+                "notes": "" if source_records else "Sem producao sincronizada para o periodo.",
+            }
+        )
+
+    rows.sort(
+        key=lambda row: (
+            1 if row["data_points"] else 0,
+            row["performance_status"] == "OK",
+            row["project_name"].lower(),
+        )
+    )
     return rows[:limit] if limit else rows
 
 
@@ -5337,6 +5891,8 @@ def build_export_dataset(
         rows = build_executive_report_rows(conn, filters, limit=limit)
     elif dataset == "monitoring_report":
         rows = build_monitoring_report_rows(conn, filters, limit=limit)
+    elif dataset == "production_report":
+        rows = build_production_report_rows(conn, filters, limit=limit)
     else:
         filter_sql = []
         params = []
@@ -5387,6 +5943,537 @@ def build_export_dataset(
 
     normalized_rows = [dict(row) for row in rows]
     return normalized_rows, headers
+
+
+def get_fusionsolar_report_assets(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return query_all(
+        conn,
+        """
+        SELECT
+            a.id AS asset_id,
+            a.project_name,
+            a.location,
+            a.kwp,
+            ai.external_id,
+            ai.external_name
+        FROM asset_integrations ai
+        JOIN assets a ON a.id = ai.asset_id
+        WHERE ai.provider = ?
+          AND ai.enabled = 1
+          AND COALESCE(ai.external_id, '') != ''
+        ORDER BY a.project_name COLLATE NOCASE
+        """,
+        (INTEGRATION_PROVIDER_FUSIONSOLAR,),
+    )
+
+
+def first_numeric(data: dict[str, Any], keys: list[str]) -> float | None:
+    for key in keys:
+        value = parse_float_value(data.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def normalize_customer_kpi_row(row: dict[str, Any], fallback_date: date) -> dict[str, Any]:
+    data_item_map = row.get("dataItemMap") if isinstance(row, dict) else {}
+    if not isinstance(data_item_map, dict):
+        data_item_map = {}
+    production = first_numeric(data_item_map, ["PVYield", "inverterYield", "inverter_power"])
+    export = first_numeric(data_item_map, ["ongrid_power", "total_feed_in_to_grid"])
+    self_use = first_numeric(data_item_map, ["selfUsePower", "selfProvide"])
+    consumption = first_numeric(data_item_map, ["use_power", "day_use_energy"])
+    if self_use is None and production is not None:
+        self_use = max(production - (export or 0), 0)
+    if export is None and production is not None and self_use is not None:
+        export = max(production - self_use, 0)
+    return {
+        "date": parse_fusionsolar_collect_date(row, fallback_date) or fallback_date,
+        "production_kwh": production or 0.0,
+        "self_use_kwh": self_use or 0.0,
+        "export_kwh": export or 0.0,
+        "consumption_kwh": consumption,
+        "raw": row,
+    }
+
+
+def parse_production_record_payload(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        payload = json.loads(row["payload_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        payload = {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def normalize_customer_production_record(row: sqlite3.Row, fallback_date: date) -> dict[str, Any]:
+    payload = parse_production_record_payload(row)
+    normalized = normalize_customer_kpi_row(payload, fallback_date)
+    record_date = parse_date_value(row["period_date"]) or fallback_date
+    production_kwh = parse_float_value(row["production_kwh"])
+    if production_kwh is not None:
+        normalized["production_kwh"] = production_kwh
+    normalized["date"] = record_date
+    if normalized["production_kwh"] and not normalized["self_use_kwh"] and not normalized["export_kwh"]:
+        normalized["self_use_kwh"] = normalized["production_kwh"]
+    return normalized
+
+
+def build_local_customer_production_report(
+    conn: sqlite3.Connection,
+    *,
+    asset_id: int,
+    report_month: str,
+    electricity_price: float,
+    sell_price: float,
+) -> dict[str, Any] | None:
+    asset = conn.execute(
+        """
+        SELECT
+            a.id AS asset_id,
+            a.project_name,
+            a.location,
+            a.kwp,
+            ai.external_id,
+            ai.external_name
+        FROM asset_integrations ai
+        JOIN assets a ON a.id = ai.asset_id
+        WHERE a.id = ?
+          AND ai.provider = ?
+          AND ai.enabled = 1
+          AND COALESCE(ai.external_id, '') != ''
+        LIMIT 1
+        """,
+        (asset_id, INTEGRATION_PROVIDER_FUSIONSOLAR),
+    ).fetchone()
+    if asset is None:
+        raise ValueError("A instalacao nao tem mapeamento FusionSolar ativo.")
+
+    month_start = datetime.strptime(report_month, "%Y-%m").date()
+    _, last_day = calendar.monthrange(month_start.year, month_start.month)
+    month_end = month_start.replace(day=last_day)
+    daily_records = query_all(
+        conn,
+        """
+        SELECT *
+        FROM production_records
+        WHERE asset_id = ?
+          AND provider = ?
+          AND period_type = 'day'
+          AND period_date BETWEEN ? AND ?
+          AND production_kwh IS NOT NULL
+        ORDER BY period_date
+        """,
+        (asset_id, INTEGRATION_PROVIDER_FUSIONSOLAR, month_start.isoformat(), month_end.isoformat()),
+    )
+    monthly_record = conn.execute(
+        """
+        SELECT *
+        FROM production_records
+        WHERE asset_id = ?
+          AND provider = ?
+          AND period_type = 'month'
+          AND period_date = ?
+          AND production_kwh IS NOT NULL
+        LIMIT 1
+        """,
+        (asset_id, INTEGRATION_PROVIDER_FUSIONSOLAR, month_start.isoformat()),
+    ).fetchone()
+    if monthly_record is None and not daily_records:
+        return None
+
+    daily_rows = [normalize_customer_production_record(row, month_start) for row in daily_records]
+    daily_rows.sort(key=lambda item: item["date"])
+    monthly = normalize_customer_production_record(monthly_record, month_start) if monthly_record else None
+
+    production_kwh = monthly["production_kwh"] if monthly else sum(item["production_kwh"] for item in daily_rows)
+    self_use_kwh = monthly["self_use_kwh"] if monthly else sum(item["self_use_kwh"] for item in daily_rows)
+    export_kwh = monthly["export_kwh"] if monthly else sum(item["export_kwh"] for item in daily_rows)
+    if production_kwh and not self_use_kwh and not export_kwh:
+        self_use_kwh = production_kwh
+    savings_eur = self_use_kwh * electricity_price
+    export_revenue_eur = export_kwh * sell_price
+    total_benefit_eur = savings_eur + export_revenue_eur
+    autoconsumption_pct = (self_use_kwh / production_kwh * 100) if production_kwh else 0
+    export_pct = max(100 - autoconsumption_pct, 0) if production_kwh else 0
+
+    return {
+        "asset": dict(asset),
+        "station_code": str(asset["external_id"]),
+        "month_start": month_start,
+        "month_end": month_end,
+        "month_label": f"{MONTH_NAMES_PT[month_start.month]} {month_start.year}",
+        "daily_rows": daily_rows,
+        "production_kwh": production_kwh,
+        "self_use_kwh": self_use_kwh,
+        "export_kwh": export_kwh,
+        "savings_eur": savings_eur,
+        "export_revenue_eur": export_revenue_eur,
+        "total_benefit_eur": total_benefit_eur,
+        "autoconsumption_pct": autoconsumption_pct,
+        "export_pct": export_pct,
+        "electricity_price": electricity_price,
+        "sell_price": sell_price,
+        "data_source": "Dados locais",
+    }
+
+
+def build_fusionsolar_customer_production_report(
+    conn: sqlite3.Connection,
+    *,
+    asset_id: int,
+    report_month: str,
+    electricity_price: float,
+    sell_price: float,
+    force_api: bool = False,
+) -> dict[str, Any]:
+    if not force_api:
+        local_report = build_local_customer_production_report(
+            conn,
+            asset_id=asset_id,
+            report_month=report_month,
+            electricity_price=electricity_price,
+            sell_price=sell_price,
+        )
+        if local_report is not None:
+            return local_report
+
+    cooldown_reason = get_fusionsolar_performance_cooldown_reason(conn)
+    if cooldown_reason:
+        raise ValueError(cooldown_reason)
+
+    asset = conn.execute(
+        """
+        SELECT
+            a.id AS asset_id,
+            a.project_name,
+            a.location,
+            a.kwp,
+            ai.external_id,
+            ai.external_name
+        FROM asset_integrations ai
+        JOIN assets a ON a.id = ai.asset_id
+        WHERE a.id = ?
+          AND ai.provider = ?
+          AND ai.enabled = 1
+          AND COALESCE(ai.external_id, '') != ''
+        LIMIT 1
+        """,
+        (asset_id, INTEGRATION_PROVIDER_FUSIONSOLAR),
+    ).fetchone()
+    if asset is None:
+        raise ValueError("A instalacao nao tem mapeamento FusionSolar ativo.")
+
+    config = get_integration_config(conn, INTEGRATION_PROVIDER_FUSIONSOLAR)
+    if config is None or not config["enabled"]:
+        raise ValueError("Configuracao FusionSolar ativa nao encontrada.")
+    endpoints = get_fusionsolar_endpoint_config(config)
+    session_obj, _ = get_fusionsolar_session(config)
+    month_start = datetime.strptime(report_month, "%Y-%m").date()
+    _, last_day = calendar.monthrange(month_start.year, month_start.month)
+    month_end = month_start.replace(day=last_day)
+    station_code = str(asset["external_id"])
+
+    daily_rows_raw = fetch_fusionsolar_kpi_day_rows(
+        session_obj,
+        base_url=endpoints["base_url"],
+        endpoint=endpoints["day_kpi_endpoint"],
+        station_codes=[station_code],
+        collect_date=month_start,
+    )
+    daily_rows = []
+    for raw_row in daily_rows_raw:
+        if str(raw_row.get("stationCode") or raw_row.get("plantCode") or "").strip() != station_code:
+            continue
+        normalized = normalize_customer_kpi_row(raw_row, month_start)
+        if month_start <= normalized["date"] <= month_end:
+            daily_rows.append(normalized)
+    daily_rows.sort(key=lambda item: item["date"])
+
+    monthly_map = fetch_fusionsolar_kpi_month_map(
+        session_obj,
+        base_url=endpoints["base_url"],
+        endpoint=endpoints["month_kpi_endpoint"],
+        station_codes=[station_code],
+        collect_date=month_start,
+    )
+    monthly_row = monthly_map.get(station_code)
+    monthly = normalize_customer_kpi_row(monthly_row, month_start) if monthly_row else None
+
+    production_kwh = monthly["production_kwh"] if monthly else sum(item["production_kwh"] for item in daily_rows)
+    self_use_kwh = monthly["self_use_kwh"] if monthly else sum(item["self_use_kwh"] for item in daily_rows)
+    export_kwh = monthly["export_kwh"] if monthly else sum(item["export_kwh"] for item in daily_rows)
+    if production_kwh and not self_use_kwh and not export_kwh:
+        self_use_kwh = production_kwh
+    savings_eur = self_use_kwh * electricity_price
+    export_revenue_eur = export_kwh * sell_price
+    total_benefit_eur = savings_eur + export_revenue_eur
+    autoconsumption_pct = (self_use_kwh / production_kwh * 100) if production_kwh else 0
+    export_pct = max(100 - autoconsumption_pct, 0) if production_kwh else 0
+
+    return {
+        "asset": dict(asset),
+        "station_code": station_code,
+        "month_start": month_start,
+        "month_end": month_end,
+        "month_label": f"{MONTH_NAMES_PT[month_start.month]} {month_start.year}",
+        "daily_rows": daily_rows,
+        "production_kwh": production_kwh,
+        "self_use_kwh": self_use_kwh,
+        "export_kwh": export_kwh,
+        "savings_eur": savings_eur,
+        "export_revenue_eur": export_revenue_eur,
+        "total_benefit_eur": total_benefit_eur,
+        "autoconsumption_pct": autoconsumption_pct,
+        "export_pct": export_pct,
+        "electricity_price": electricity_price,
+        "sell_price": sell_price,
+        "data_source": "FusionSolar API",
+    }
+
+
+def draw_wrapped_text(pdf: canvas.Canvas, text: str, x: float, y: float, width: float, *, font: str = "Helvetica", size: int = 9, leading: int = 11) -> float:
+    words = str(text or "").split()
+    lines: list[str] = []
+    current = ""
+    pdf.setFont(font, size)
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if pdf.stringWidth(candidate, font, size) <= width:
+            current = candidate
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    for line in lines:
+        pdf.drawString(x, y, line)
+        y -= leading
+    return y
+
+
+def draw_scaled_text(pdf: canvas.Canvas, text: str, x: float, y: float, width: float, *, font: str = "Helvetica-Bold", size: int = 12, min_size: int = 8) -> int:
+    text = str(text or "")
+    current_size = size
+    while current_size > min_size and pdf.stringWidth(text, font, current_size) > width:
+        current_size -= 1
+    pdf.setFont(font, current_size)
+    if pdf.stringWidth(text, font, current_size) <= width:
+        pdf.drawString(x, y, text)
+        return current_size
+
+    ellipsis = "..."
+    available = max(width - pdf.stringWidth(ellipsis, font, current_size), 0)
+    trimmed = ""
+    for char in text:
+        candidate = trimmed + char
+        if pdf.stringWidth(candidate, font, current_size) > available:
+            break
+        trimmed = candidate
+    pdf.drawString(x, y, f"{trimmed.rstrip()}{ellipsis}")
+    return current_size
+
+
+def fmt_kwh(value: float) -> str:
+    return f"{value:,.0f}".replace(",", " ") + " kWh"
+
+
+def fmt_eur(value: float) -> str:
+    return f"{value:,.2f}".replace(",", " ").replace(".", ",") + " €"
+
+
+def draw_solcor_report_logo(pdf: canvas.Canvas, page_width: float, page_height: float, margin: float) -> None:
+    logo_path = BASE_DIR / "static" / "solcor-logo.png"
+    logo_w = 214
+    logo_h = 58
+    x = page_width - margin - logo_w
+    y = page_height - margin - logo_h + 4
+    if logo_path.exists():
+        pdf.drawImage(
+            ImageReader(str(logo_path)),
+            x,
+            y,
+            width=logo_w,
+            height=logo_h,
+            preserveAspectRatio=True,
+            mask="auto",
+        )
+        return
+
+    green_top = colors.HexColor("#35df2f")
+    green_bottom = colors.HexColor("#b8f000")
+    text_dark = colors.HexColor("#26313b")
+    accent_red = colors.HexColor("#e1302a")
+    accent_blue = colors.HexColor("#2777bd")
+    tile = 24
+    gap = 3
+    icon_x = x
+    icon_y = y + 5
+    for row in range(2):
+        for col in range(2):
+            pdf.setFillColor(green_top if row == 1 else green_bottom)
+            pdf.roundRect(icon_x + col * (tile + gap), icon_y + row * (tile + gap), tile, tile, 5, fill=1, stroke=0)
+    pdf.setFillColor(text_dark)
+    pdf.setFont("Helvetica-Bold", 39)
+    pdf.drawString(x + 66, y + 23, "SOLCOR")
+    pdf.setStrokeColor(accent_red)
+    pdf.setLineWidth(2)
+    pdf.line(x + 66, y + 18, x + 132, y + 18)
+    pdf.setStrokeColor(accent_blue)
+    pdf.line(x + 134, y + 18, x + 199, y + 18)
+    pdf.setFillColor(text_dark)
+    pdf.setFont("Helvetica-Bold", 14)
+    pdf.drawString(x + 150, y + 4, "PORTUGAL")
+
+
+def export_customer_production_pdf(report: dict[str, Any]):
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=landscape(A4))
+    width, height = landscape(A4)
+    margin = 42
+    dark = colors.HexColor("#1f2a24")
+    brand = colors.HexColor("#2f8f7b")
+    warning = colors.HexColor("#f0b44c")
+    light = colors.HexColor("#eef4f2")
+    muted = colors.HexColor("#6b7280")
+
+    pdf.setFillColor(dark)
+    draw_scaled_text(pdf, report["asset"]["project_name"], margin, height - 54, 500, size=24, min_size=14)
+    pdf.setFont("Helvetica", 11)
+    pdf.drawString(margin, height - 78, "Energia Solar")
+    pdf.setFont("Helvetica", 7)
+    pdf.setFillColor(muted)
+    price_note = f"*Cálculo da poupança com preço de eletricidade de {fmt_eur(report['electricity_price'])}/kWh"
+    pdf.drawString(margin + 78, height - 78, price_note)
+
+    draw_solcor_report_logo(pdf, width, height, margin)
+
+    pdf.setFillColor(dark)
+    pdf.setFont("Helvetica-Bold", 12)
+    pdf.drawRightString(width - margin, height - 104, report["month_label"])
+    pdf.setFont("Helvetica", 8)
+    pdf.setFillColor(muted)
+    pdf.drawRightString(width - margin, height - 120, f"Fonte: {report['data_source']}")
+
+    metric_y = height - 120
+    metrics = [
+        ("Redução da sua fatura de eletricidade:", fmt_eur(report["savings_eur"]), f"Pelo consumo direto de {fmt_kwh(report['self_use_kwh'])} de energia solar."),
+        ("Receitas da venda de excedente", fmt_eur(report["export_revenue_eur"]), f"Pela venda de {fmt_kwh(report['export_kwh'])} de energia solar."),
+        ("Benefício total", fmt_eur(report["total_benefit_eur"]), "A soma da poupança e da receita."),
+    ]
+    for label, value, detail in metrics:
+        pdf.setFillColor(dark)
+        draw_scaled_text(pdf, label, margin, metric_y, 238, size=13, min_size=10)
+        draw_scaled_text(pdf, value, margin + 250, metric_y - 2, 105, size=17, min_size=11)
+        pdf.setFont("Helvetica", 9)
+        pdf.setFillColor(muted)
+        draw_wrapped_text(pdf, detail, margin + 365, metric_y + 1, 330, size=9)
+        metric_y -= 38
+
+    chart_x = margin
+    chart_y = 112
+    chart_w = 470
+    chart_h = 220
+    pdf.setFillColor(dark)
+    pdf.setFont("Helvetica-Bold", 10)
+    pdf.drawCentredString(chart_x + chart_w / 2, chart_y + chart_h + 34, "DISTRIBUIÇÃO DIÁRIA DA ENERGIA SOLAR (kWh)")
+    pdf.setFont("Helvetica", 8)
+    pdf.setFillColor(brand)
+    pdf.rect(chart_x + chart_w - 120, chart_y + chart_h + 18, 9, 9, fill=1, stroke=0)
+    pdf.setFillColor(dark)
+    pdf.drawString(chart_x + chart_w - 106, chart_y + chart_h + 18, "AUTOCONSUMO")
+    pdf.setFillColor(warning)
+    pdf.rect(chart_x + chart_w - 120, chart_y + chart_h + 4, 9, 9, fill=1, stroke=0)
+    pdf.setFillColor(dark)
+    pdf.drawString(chart_x + chart_w - 106, chart_y + chart_h + 4, "EXCEDENTE")
+
+    pdf.setStrokeColor(colors.HexColor("#d8dee3"))
+    pdf.setLineWidth(0.5)
+    for i in range(6):
+        y = chart_y + (chart_h * i / 5)
+        pdf.line(chart_x, y, chart_x + chart_w, y)
+    daily_rows = report["daily_rows"]
+    has_daily_values = any((row["self_use_kwh"] + row["export_kwh"]) > 0 for row in daily_rows)
+    max_daily = max([row["self_use_kwh"] + row["export_kwh"] for row in daily_rows] + [1])
+    days_in_month = report["month_end"].day
+    gap = 3
+    bar_w = max((chart_w - (days_in_month - 1) * gap) / days_in_month, 4)
+    rows_by_day = {row["date"].day: row for row in report["daily_rows"]}
+    if has_daily_values:
+        for day in range(1, days_in_month + 1):
+            row = rows_by_day.get(day, {"self_use_kwh": 0, "export_kwh": 0})
+            x = chart_x + (day - 1) * (bar_w + gap)
+            self_h = chart_h * row["self_use_kwh"] / max_daily
+            export_h = chart_h * row["export_kwh"] / max_daily
+            pdf.setFillColor(brand)
+            pdf.rect(x, chart_y, bar_w, self_h, fill=1, stroke=0)
+            if export_h:
+                pdf.setFillColor(warning)
+                pdf.rect(x, chart_y + self_h, bar_w, export_h, fill=1, stroke=0)
+            if day == 1 or day == days_in_month or day % 2 == 0:
+                pdf.setFillColor(dark)
+                pdf.setFont("Helvetica", 6)
+                pdf.drawCentredString(x + bar_w / 2, chart_y - 12, str(day))
+    else:
+        pdf.setFillColor(muted)
+        pdf.setFont("Helvetica", 10)
+        pdf.drawCentredString(chart_x + chart_w / 2, chart_y + chart_h / 2, "Sem dados diários para este período.")
+    pdf.setFillColor(dark)
+    pdf.setFont("Helvetica", 8)
+    pdf.drawString(chart_x - 24, chart_y + chart_h - 4, f"{max_daily:.0f}")
+    pdf.drawString(chart_x - 12, chart_y - 2, "0")
+    pdf.drawString(chart_x, chart_y - 30, "kWh")
+
+    pie_x = 632
+    pie_y = 236
+    radius = 58
+    start_angle = 90
+    auto_extent = 360 * min(max(report["autoconsumption_pct"], 0), 100) / 100
+    pdf.setFillColor(warning)
+    pdf.wedge(pie_x - radius, pie_y - radius, pie_x + radius, pie_y + radius, start_angle, start_angle + 360, fill=1, stroke=0)
+    pdf.setFillColor(brand)
+    pdf.wedge(pie_x - radius, pie_y - radius, pie_x + radius, pie_y + radius, start_angle, start_angle + auto_extent, fill=1, stroke=0)
+    pdf.setFillColor(colors.white)
+    pdf.circle(pie_x, pie_y, 34, fill=1, stroke=0)
+    pdf.setFillColor(dark)
+    pdf.setFont("Helvetica-Bold", 18)
+    pdf.drawCentredString(pie_x, pie_y + 2, f"{report['autoconsumption_pct']:.0f}%")
+    pdf.setFont("Helvetica", 9)
+    pdf.drawCentredString(pie_x, pie_y - 15, f"{report['export_pct']:.0f}%")
+    pdf.setFont("Helvetica-Bold", 9)
+    pdf.drawCentredString(pie_x, pie_y - 84, "TAXA DE AUTOCONSUMO ESTIMADA")
+    pdf.setFont("Helvetica", 8)
+    pdf.setFillColor(brand)
+    pdf.rect(pie_x - 62, pie_y - 108, 8, 8, fill=1, stroke=0)
+    pdf.setFillColor(dark)
+    pdf.drawString(pie_x - 50, pie_y - 108, "Autoconsumo")
+    pdf.setFillColor(warning)
+    pdf.rect(pie_x + 28, pie_y - 108, 8, 8, fill=1, stroke=0)
+    pdf.setFillColor(dark)
+    pdf.drawString(pie_x + 40, pie_y - 108, "Excedente")
+
+    box_x = 548
+    box_y = 94
+    box_w = 250
+    box_h = 74
+    pdf.setFillColor(light)
+    pdf.roundRect(box_x, box_y, box_w, box_h, 6, fill=1, stroke=0)
+    pdf.setFillColor(dark)
+    pdf.setFont("Helvetica-Bold", 10)
+    pdf.drawString(box_x + 14, box_y + box_h - 22, "RESUMO MENSAL DE PRODUÇÃO E POUPANÇAS:")
+    pdf.setFont("Helvetica", 9)
+    pdf.drawString(box_x + 14, box_y + box_h - 42, f"Produção fotovoltaica: {fmt_kwh(report['production_kwh'])}")
+    pdf.drawString(box_x + 14, box_y + box_h - 58, f"Benefício total: {fmt_eur(report['total_benefit_eur'])}")
+
+    pdf.setFont("Helvetica", 9)
+    pdf.setFillColor(muted)
+    pdf.drawString(margin, 40, "Obrigado pela sua confiança!")
+    pdf.showPage()
+    pdf.save()
+    buffer.seek(0)
+    safe_name = normalize_name(report["asset"]["project_name"]).replace(" ", "_") or "relatorio"
+    filename = f"Relatorio_Mensal_{safe_name}_{report['month_start'].strftime('%m-%Y')}.pdf"
+    return send_file(buffer, as_attachment=True, download_name=filename, mimetype="application/pdf")
 
 
 def export_rows_file(
@@ -5441,6 +6528,118 @@ def build_visits_by_ticket(visits: list[sqlite3.Row]) -> dict[int, list[sqlite3.
     for visit in visits:
         visits_by_ticket.setdefault(visit["ticket_id"], []).append(visit)
     return visits_by_ticket
+
+
+def normalize_calendar_month(value: str | None) -> str:
+    if value:
+        try:
+            return datetime.strptime(value.strip(), "%Y-%m").strftime("%Y-%m")
+        except ValueError:
+            pass
+    return date.today().strftime("%Y-%m")
+
+
+def calendar_month_bounds(month_value: str) -> tuple[date, date, str, str]:
+    month_start = datetime.strptime(month_value, "%Y-%m").date().replace(day=1)
+    _, last_day = calendar.monthrange(month_start.year, month_start.month)
+    month_end = month_start.replace(day=last_day)
+    previous_month_date = (month_start - timedelta(days=1)).replace(day=1)
+    next_month_date = (month_end + timedelta(days=1)).replace(day=1)
+    return month_start, month_end, previous_month_date.strftime("%Y-%m"), next_month_date.strftime("%Y-%m")
+
+
+def build_error_calendar(month_value: str, records: list[sqlite3.Row]) -> dict[str, Any]:
+    month_start, month_end, _, _ = calendar_month_bounds(month_value)
+    records_by_day: dict[str, list[sqlite3.Row]] = {}
+    for record in records:
+        records_by_day.setdefault(record["record_date"], []).append(record)
+
+    weeks = []
+    week = []
+    for _ in range(month_start.weekday()):
+        week.append({"date": None, "records": []})
+
+    current_day = month_start
+    while current_day <= month_end:
+        iso_day = current_day.isoformat()
+        week.append({"date": current_day, "records": records_by_day.get(iso_day, [])})
+        if len(week) == 7:
+            weeks.append(week)
+            week = []
+        current_day += timedelta(days=1)
+
+    if week:
+        while len(week) < 7:
+            week.append({"date": None, "records": []})
+        weeks.append(week)
+
+    return {
+        "label": f"{MONTH_NAMES_PT[month_start.month]} {month_start.year}",
+        "weeks": weeks,
+        "record_count": sum(len(rows) for rows in records_by_day.values()),
+    }
+
+
+def build_asset_error_calendar(month_value: str, records: list[sqlite3.Row]) -> dict[str, Any]:
+    month_start, month_end, _, _ = calendar_month_bounds(month_value)
+    events_by_day: dict[str, list[dict[str, Any]]] = {}
+    previous_problem = False
+
+    for record in records:
+        record_date = record["record_date"]
+        status = record["status"]
+        is_problem = status in PROBLEM_MONITORING_STATUSES
+        event_type = ""
+        event_label = ""
+
+        if is_problem and not previous_problem:
+            event_type = "start"
+            event_label = "Apareceu"
+        elif is_problem:
+            event_type = "active"
+            event_label = "Mantem-se"
+        elif previous_problem:
+            event_type = "end"
+            event_label = "Desapareceu"
+
+        if month_start.isoformat() <= record_date <= month_end.isoformat() and event_type:
+            events_by_day.setdefault(record_date, []).append(
+                {
+                    "status": status,
+                    "label": event_label,
+                    "type": event_type,
+                    "notes": record["notes"],
+                    "source": record["source"],
+                    "record_id": record["id"],
+                }
+            )
+
+        previous_problem = is_problem
+
+    weeks = []
+    week = []
+    for _ in range(month_start.weekday()):
+        week.append({"date": None, "events": []})
+
+    current_day = month_start
+    while current_day <= month_end:
+        iso_day = current_day.isoformat()
+        week.append({"date": current_day, "events": events_by_day.get(iso_day, [])})
+        if len(week) == 7:
+            weeks.append(week)
+            week = []
+        current_day += timedelta(days=1)
+
+    if week:
+        while len(week) < 7:
+            week.append({"date": None, "events": []})
+        weeks.append(week)
+
+    return {
+        "label": f"{MONTH_NAMES_PT[month_start.month]} {month_start.year}",
+        "weeks": weeks,
+        "event_count": sum(len(rows) for rows in events_by_day.values()),
+    }
 
 
 def group_tickets_by_asset(tickets: list[sqlite3.Row]) -> list[dict[str, Any]]:
@@ -5562,7 +6761,57 @@ def ensure_predefined_export_templates(conn: sqlite3.Connection) -> None:
                 "period": "month",
                 "om_only": "yes",
             },
-        }
+        },
+        {
+            "name": "Relatorio producao - mensal",
+            "dataset": "production_report",
+            "export_format": "xlsx",
+            "columns": [
+                "period",
+                "project_name",
+                "location",
+                "provider",
+                "production_kwh",
+                "specific_yield",
+                "expected_kwh",
+                "deviation_pct",
+                "performance_status",
+                "data_points",
+                "data_source",
+                "last_update",
+                "notes",
+            ],
+            "filters": {
+                "period": "month",
+                "om_only": "yes",
+                "source": "FusionSolar",
+            },
+        },
+        {
+            "name": "Relatorio producao - anual",
+            "dataset": "production_report",
+            "export_format": "xlsx",
+            "columns": [
+                "period",
+                "project_name",
+                "location",
+                "provider",
+                "production_kwh",
+                "specific_yield",
+                "expected_kwh",
+                "deviation_pct",
+                "performance_status",
+                "data_points",
+                "data_source",
+                "last_update",
+                "notes",
+            ],
+            "filters": {
+                "period": "year",
+                "om_only": "yes",
+                "source": "FusionSolar",
+            },
+        },
     ]
 
     for template in predefined_templates:
@@ -5612,6 +6861,24 @@ def get_fusionsolar_env_config() -> dict[str, str]:
     }
 
 
+def get_sigenergy_env_config() -> dict[str, str]:
+    return {
+        "username": os.environ.get("SIGENERGY_APP_KEY", "").strip(),
+        "password": os.environ.get("SIGENERGY_APP_SECRET", "").strip(),
+        "base_url": os.environ.get("SIGENERGY_BASE_URL", DEFAULT_SIGENERGY_BASE_URL).strip(),
+        "login_endpoint": os.environ.get("SIGENERGY_AUTH_ENDPOINT", DEFAULT_SIGENERGY_AUTH_ENDPOINT).strip(),
+        "plants_endpoint": os.environ.get("SIGENERGY_SYSTEMS_ENDPOINT", DEFAULT_SIGENERGY_SYSTEMS_ENDPOINT).strip(),
+        "real_time_endpoint": os.environ.get("SIGENERGY_REALTIME_ENDPOINT", DEFAULT_SIGENERGY_REALTIME_ENDPOINT).strip(),
+        "alarms_endpoint": os.environ.get("SIGENERGY_ENERGY_FLOW_ENDPOINT", DEFAULT_SIGENERGY_ENERGY_FLOW_ENDPOINT).strip(),
+        "day_kpi_endpoint": "",
+        "month_kpi_endpoint": "",
+        "sync_hours": os.environ.get("SIGENERGY_SYNC_HOURS", DEFAULT_FUSIONSOLAR_SYNC_HOURS).strip(),
+        "region": os.environ.get("SIGENERGY_REGION", DEFAULT_SIGENERGY_REGION).strip() or DEFAULT_SIGENERGY_REGION,
+        "system_ids": os.environ.get("SIGENERGY_SYSTEM_IDS", os.environ.get("SIGENERGY_SYSTEM_ID", "")).strip(),
+        "enabled": os.environ.get("SIGENERGY_ENABLED", "").strip(),
+    }
+
+
 def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
     env_config = get_fusionsolar_env_config()
     existing = conn.execute(
@@ -5648,6 +6915,68 @@ def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
                 INTEGRATION_PROVIDER_FUSIONSOLAR,
             ),
         )
+    else:
+        conn.execute(
+            """
+            INSERT INTO integration_configs (
+                provider, username, password, base_url, login_endpoint, plants_endpoint, real_time_endpoint, alarms_endpoint,
+                day_kpi_endpoint, month_kpi_endpoint,
+                enabled, auto_sync_enabled, sync_hours, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                INTEGRATION_PROVIDER_FUSIONSOLAR,
+                env_config["username"],
+                "",
+                env_config["base_url"],
+                env_config["login_endpoint"],
+                env_config["plants_endpoint"],
+                env_config["real_time_endpoint"],
+                env_config["alarms_endpoint"],
+                env_config["day_kpi_endpoint"],
+                env_config["month_kpi_endpoint"],
+                0,
+                0,
+                env_config["sync_hours"],
+                datetime.now().isoformat(timespec="seconds"),
+                datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
+
+    sigenergy_env = get_sigenergy_env_config()
+    sigenergy_existing = conn.execute(
+        "SELECT * FROM integration_configs WHERE provider = ?",
+        (INTEGRATION_PROVIDER_SIGENERGY,),
+    ).fetchone()
+    sigenergy_enabled = 1 if sigenergy_env["enabled"].lower() in {"1", "true", "yes", "sim", "on"} else 0
+    if sigenergy_existing:
+        conn.execute(
+            """
+            UPDATE integration_configs
+            SET username = CASE WHEN COALESCE(username, '') = '' THEN ? ELSE username END,
+                base_url = CASE WHEN COALESCE(base_url, '') = '' THEN ? ELSE base_url END,
+                login_endpoint = CASE WHEN COALESCE(login_endpoint, '') = '' THEN ? ELSE login_endpoint END,
+                plants_endpoint = CASE WHEN COALESCE(plants_endpoint, '') = '' THEN ? ELSE plants_endpoint END,
+                real_time_endpoint = CASE WHEN COALESCE(real_time_endpoint, '') = '' THEN ? ELSE real_time_endpoint END,
+                alarms_endpoint = CASE WHEN COALESCE(alarms_endpoint, '') = '' THEN ? ELSE alarms_endpoint END,
+                sync_hours = CASE WHEN COALESCE(sync_hours, '') = '' THEN ? ELSE sync_hours END,
+                enabled = CASE WHEN ? = 1 THEN 1 ELSE enabled END,
+                updated_at = ?
+            WHERE provider = ?
+            """,
+            (
+                sigenergy_env["username"],
+                sigenergy_env["base_url"],
+                sigenergy_env["login_endpoint"],
+                sigenergy_env["plants_endpoint"],
+                sigenergy_env["real_time_endpoint"],
+                sigenergy_env["alarms_endpoint"],
+                sigenergy_env["sync_hours"],
+                sigenergy_enabled,
+                datetime.now().isoformat(timespec="seconds"),
+                INTEGRATION_PROVIDER_SIGENERGY,
+            ),
+        )
         return
 
     conn.execute(
@@ -5659,19 +6988,19 @@ def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            INTEGRATION_PROVIDER_FUSIONSOLAR,
-            env_config["username"],
+            INTEGRATION_PROVIDER_SIGENERGY,
+            sigenergy_env["username"],
             "",
-            env_config["base_url"],
-            env_config["login_endpoint"],
-            env_config["plants_endpoint"],
-            env_config["real_time_endpoint"],
-            env_config["alarms_endpoint"],
-            env_config["day_kpi_endpoint"],
-            env_config["month_kpi_endpoint"],
-            0,
-            0,
-            env_config["sync_hours"],
+            sigenergy_env["base_url"],
+            sigenergy_env["login_endpoint"],
+            sigenergy_env["plants_endpoint"],
+            sigenergy_env["real_time_endpoint"],
+            sigenergy_env["alarms_endpoint"],
+            "",
+            "",
+            sigenergy_enabled,
+            sigenergy_enabled,
+            sigenergy_env["sync_hours"],
             datetime.now().isoformat(timespec="seconds"),
             datetime.now().isoformat(timespec="seconds"),
         ),
@@ -5690,6 +7019,17 @@ def get_integration_config(conn: sqlite3.Connection, provider: str) -> dict[str,
                 config[key] = value
         config["password_configured"] = bool(config.get("password"))
         config["password_source"] = "env" if env_config["password"] else ("database" if config.get("password") else "")
+    if provider == INTEGRATION_PROVIDER_SIGENERGY:
+        env_config = get_sigenergy_env_config()
+        for key, value in env_config.items():
+            if value and key in config:
+                config[key] = value
+        config["region"] = env_config["region"]
+        config["system_ids"] = env_config["system_ids"]
+        config["password_configured"] = bool(config.get("password"))
+        config["password_source"] = "env" if env_config["password"] else ("database" if config.get("password") else "")
+        if env_config["enabled"].lower() in {"1", "true", "yes", "sim", "on"}:
+            config["enabled"] = 1
     return config
 
 
@@ -5700,6 +7040,7 @@ def start_integration_scheduler(app: Flask) -> None:
     SCHEDULER = BackgroundScheduler(timezone="Europe/Lisbon")
     SCHEDULER.start()
     refresh_integration_scheduler(app)
+    schedule_pending_background_jobs(app)
 
 
 def refresh_integration_scheduler(app: Flask) -> None:
@@ -5768,6 +7109,108 @@ def run_scheduled_integration_sync(app: Flask, provider: str) -> None:
 
 def run_scheduled_fusionsolar_sync(app: Flask) -> None:
     run_scheduled_integration_sync(app, INTEGRATION_PROVIDER_FUSIONSOLAR)
+
+
+def schedule_background_job(app: Flask, job_id: int) -> bool:
+    if SCHEDULER is None:
+        app.logger.error("Background job %s was queued but APScheduler is not running", job_id)
+        return False
+    SCHEDULER.add_job(
+        func=run_background_job,
+        trigger="date",
+        run_date=datetime.now(),
+        args=[app, job_id],
+        id=f"background-job-{job_id}",
+        replace_existing=True,
+        max_instances=1,
+    )
+    return True
+
+
+def schedule_pending_background_jobs(app: Flask) -> None:
+    with closing(get_db(app.config["DATABASE"])) as conn:
+        recovered_count = mark_stale_running_background_jobs_failed(conn)
+        if recovered_count:
+            app.logger.warning("Marked %s stale running background jobs as failed on startup", recovered_count)
+        pending_job_ids = fetch_pending_background_job_ids(conn)
+    for job_id in pending_job_ids:
+        schedule_background_job(app, job_id)
+
+
+def run_background_job(app: Flask, job_id: int) -> None:
+    with app.app_context():
+        with closing(get_db(app.config["DATABASE"])) as conn:
+            job = conn.execute("SELECT * FROM background_jobs WHERE id = ?", (job_id,)).fetchone()
+            if job is None:
+                current_app.logger.error("Background job %s not found", job_id)
+                return
+            if not mark_background_job_running(conn, job_id):
+                current_app.logger.info("Background job %s skipped because it is no longer pending", job_id)
+                return
+            try:
+                params = json.loads(job["params_json"] or "{}")
+                current_app.logger.info("Background job %s started: %s", job_id, job["job_type"])
+                result = run_background_job_payload(conn, str(job["job_type"]), params)
+                mark_background_job_success(conn, job_id, result)
+                current_app.logger.info("Background job %s completed: %s", job_id, job["job_type"])
+            except Exception as exc:
+                current_app.logger.exception("Background job %s failed: %s", job_id, job["job_type"])
+                mark_background_job_failed(conn, job_id, str(exc))
+
+
+def run_background_job_payload(conn: sqlite3.Connection, job_type: str, params: dict[str, Any]) -> dict[str, Any]:
+    if job_type == "fusionsolar_production_sync":
+        target_date = parse_date_value(str(params.get("target_date") or ""))
+        if target_date is None:
+            raise ValueError("Data invalida para sync de producao.")
+        return run_fusionsolar_production_sync(
+            conn,
+            provider=str(params.get("provider") or INTEGRATION_PROVIDER_FUSIONSOLAR),
+            target_date=target_date,
+            period_type=str(params.get("period_type") or "day"),
+        )
+
+    if job_type == "performance_reference_recalculation":
+        period_date = parse_date_value(str(params.get("period_date") or ""))
+        if period_date is None:
+            raise ValueError("Data invalida para recalculo de referencias.")
+        asset_id_value = params.get("asset_id")
+        return recalculate_performance_references(
+            conn,
+            period_type=str(params.get("period_type") or "day"),
+            period_date=period_date,
+            asset_id=int(asset_id_value) if asset_id_value else None,
+            provider=str(params.get("provider") or INTEGRATION_PROVIDER_FUSIONSOLAR),
+        )
+
+    if job_type == "fusionsolar_production_backfill":
+        date_from = parse_date_value(str(params.get("date_from") or ""))
+        date_to = parse_date_value(str(params.get("date_to") or ""))
+        asset_id_value = params.get("asset_id")
+        return run_fusionsolar_production_backfill(
+            conn,
+            provider=str(params.get("provider") or INTEGRATION_PROVIDER_FUSIONSOLAR),
+            period_type=str(params.get("period_type") or "day"),
+            from_year=int(params["from_year"]),
+            to_year=int(params["to_year"]),
+            asset_id=int(asset_id_value) if asset_id_value else None,
+            date_from=date_from,
+            date_to=date_to,
+            max_api_calls=int(params.get("max_api_calls") or FUSIONSOLAR_PERFORMANCE_MAX_API_CALLS),
+        )
+
+    if job_type == "fusionsolar_month_cycle":
+        raw_asset_ids = params.get("asset_ids") or []
+        asset_ids = [int(value) for value in raw_asset_ids if str(value).isdigit()]
+        return run_fusionsolar_month_cycle(
+            conn,
+            provider=str(params.get("provider") or INTEGRATION_PROVIDER_FUSIONSOLAR),
+            report_month=str(params.get("report_month") or date.today().strftime("%Y-%m")),
+            asset_ids=asset_ids,
+        )
+
+    raise ValueError(f"Tipo de job desconhecido: {job_type}")
+
 
 def get_fusionsolar_endpoint_config(config: sqlite3.Row | dict[str, Any]) -> dict[str, str]:
     return {
@@ -6168,7 +7611,14 @@ def is_fusionsolar_rate_limit_error(exc: Exception | str) -> bool:
     return "failCode=407" in message or "error code 407" in message or "código 407" in message
 
 
+def is_fusionsolar_session_expired_error(exc: Exception | str) -> bool:
+    message = str(exc)
+    return "failCode=305" in message or "USER_MUST_RELOGIN" in message
+
+
 FUSIONSOLAR_PERFORMANCE_COOLDOWN_KEY = "fusionsolar_performance_cooldown_until"
+FUSIONSOLAR_RATE_LIMIT_LAST_ALERT_KEY = "fusionsolar_rate_limit_last_alert_key"
+FUSIONSOLAR_RATE_LIMIT_LAST_ALERT_AT_KEY = "fusionsolar_rate_limit_last_alert_at"
 
 
 def get_app_state_value(conn: sqlite3.Connection, key: str) -> str:
@@ -6201,9 +7651,55 @@ def mark_fusionsolar_performance_rate_limited(
             FUSIONSOLAR_PERFORMANCE_COOLDOWN_KEY,
             FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL.isoformat(timespec="seconds"),
         )
-    return (
+    message = (
         "FusionSolar API temporariamente limitada. "
         f"Tenta novamente depois de {FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL.isoformat(timespec='minutes')}."
+    )
+    if conn is not None:
+        notify_fusionsolar_rate_limit(conn, FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL, message)
+    return message
+
+
+def notify_fusionsolar_rate_limit(conn: sqlite3.Connection, cooldown_until: datetime, message: str) -> None:
+    now_value = datetime.now()
+    recent_cutoff = (now_value - timedelta(minutes=FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_MINUTES)).isoformat(timespec="seconds")
+    recent_alert = conn.execute(
+        """
+        SELECT 1
+        FROM telegram_alerts
+        WHERE alert_type = 'fusionsolar_api_limit'
+          AND status IN ('sent', 'blocked', 'failed')
+          AND sent_at >= ?
+        LIMIT 1
+        """,
+        (recent_cutoff,),
+    ).fetchone()
+    if recent_alert is not None:
+        return
+    last_alert_at = get_app_state_value(conn, FUSIONSOLAR_RATE_LIMIT_LAST_ALERT_AT_KEY)
+    if last_alert_at:
+        try:
+            if datetime.fromisoformat(last_alert_at) >= now_value - timedelta(minutes=FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_MINUTES):
+                return
+        except ValueError:
+            pass
+
+    alert_key = f"fusionsolar_api_limit:{now_value.strftime('%Y%m%d%H%M')}"
+    set_app_state_value(conn, FUSIONSOLAR_RATE_LIMIT_LAST_ALERT_KEY, alert_key)
+    set_app_state_value(conn, FUSIONSOLAR_RATE_LIMIT_LAST_ALERT_AT_KEY, now_value.isoformat(timespec="seconds"))
+    conn.commit()
+    telegram_message = (
+        "<b>FusionSolar API limitada</b>\n\n"
+        "A API devolveu limite de chamadas/tokens esgotado para KPIs de produção.\n"
+        f"{message}\n\n"
+        "Os relatórios de produção e backfills podem falhar até o limite renovar."
+    )
+    send_and_record_telegram_alert(
+        conn,
+        None,
+        "fusionsolar_api_limit",
+        alert_key,
+        telegram_message,
     )
 
 
@@ -6230,6 +7726,26 @@ def get_fusionsolar_performance_cooldown_reason(
             f"Tenta novamente depois de {cooldown_until.isoformat(timespec='minutes')} ({remaining_minutes} min)."
         )
     return ""
+
+
+def fusionsolar_cooldown_sleep_seconds(
+    conn: sqlite3.Connection | None = None,
+    now_value: datetime | None = None,
+) -> int:
+    now_value = now_value or datetime.now()
+    cooldown_until = FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL
+    if conn is not None:
+        raw_value = get_app_state_value(conn, FUSIONSOLAR_PERFORMANCE_COOLDOWN_KEY)
+        if raw_value:
+            try:
+                persisted_until = datetime.fromisoformat(raw_value)
+                if cooldown_until is None or persisted_until > cooldown_until:
+                    cooldown_until = persisted_until
+            except ValueError:
+                pass
+    if cooldown_until and cooldown_until > now_value:
+        return max(1, int((cooldown_until - now_value).total_seconds()) + 5)
+    return 0
 
 
 def calculate_specific_yield(production_kwh: float | None, kwp: float | None) -> float | None:
@@ -6858,6 +8374,40 @@ def summarize_fusionsolar_alarms(alarms: list[dict[str, Any]], limit: int = 3) -
     }
 
 
+def fusionsolar_alarm_severity_rank(value: Any) -> int | None:
+    normalized = normalize_name(str(value or ""))
+    if not normalized:
+        return None
+    if normalized in {"1", "1.0", "critical", "critica", "critico"}:
+        return 1
+    if normalized in {"2", "2.0", "major", "alta", "maior"}:
+        return 2
+    if normalized in {"3", "3.0", "minor", "menor", "baixa"}:
+        return 3
+    if normalized in {"4", "4.0", "warning", "aviso", "alerta"}:
+        return 4
+    return None
+
+
+def derive_fusionsolar_monitoring_status(health_raw: Any, alarms: list[dict[str, Any]]) -> str:
+    status = map_fusionsolar_status(health_raw)
+    if status == "Desconectada":
+        return status
+
+    alarm_ranks = [
+        rank
+        for alarm in alarms
+        if isinstance(alarm, dict)
+        for rank in [fusionsolar_alarm_severity_rank(first_non_empty(alarm, ["lev", "level", "severity", "alarmLevel"]))]
+        if rank is not None
+    ]
+    if any(rank <= 2 for rank in alarm_ranks):
+        return "Erro"
+    if alarm_ranks:
+        return "Alerta"
+    return status
+
+
 def normalize_fusionsolar_plant_row(
     station_row: dict[str, Any],
     realtime_row: dict[str, Any] | None = None,
@@ -6871,9 +8421,9 @@ def normalize_fusionsolar_plant_row(
     data_item_map = (realtime_row or {}).get("dataItemMap") or {}
     health_raw = data_item_map.get("real_health_state")
     raw_status = describe_fusionsolar_health_state(health_raw)
-    status = map_fusionsolar_status(health_raw)
 
     active_alarms = alarms or []
+    status = derive_fusionsolar_monitoring_status(health_raw, active_alarms)
     alarm_summary = summarize_fusionsolar_alarms(active_alarms)
     alarm_levels = sorted({str(item.get("lev")) for item in active_alarms if item.get("lev") is not None})
     notes_parts = [f"health_state={raw_status}"]
@@ -6923,6 +8473,277 @@ def find_suggested_asset_id(conn: sqlite3.Connection, external_name: str) -> int
         (f"%{normalized_name.replace(' ', '')}%",),
     ).fetchone()
     return int(candidate["id"]) if candidate else None
+
+
+def parse_provider_payload_data(payload: dict[str, Any]) -> Any:
+    data = payload.get("data")
+    if isinstance(data, str):
+        try:
+            return json.loads(data)
+        except json.JSONDecodeError:
+            return data
+    return data
+
+
+def get_sigenergy_endpoint_config(config: sqlite3.Row | dict[str, Any]) -> dict[str, str]:
+    config_map = dict(config)
+    return {
+        "base_url": str(config_map.get("base_url") or DEFAULT_SIGENERGY_BASE_URL).strip() or DEFAULT_SIGENERGY_BASE_URL,
+        "login_endpoint": str(config_map.get("login_endpoint") or DEFAULT_SIGENERGY_AUTH_ENDPOINT).strip() or DEFAULT_SIGENERGY_AUTH_ENDPOINT,
+        "systems_endpoint": str(config_map.get("plants_endpoint") or DEFAULT_SIGENERGY_SYSTEMS_ENDPOINT).strip() or DEFAULT_SIGENERGY_SYSTEMS_ENDPOINT,
+        "real_time_endpoint": str(config_map.get("real_time_endpoint") or DEFAULT_SIGENERGY_REALTIME_ENDPOINT).strip() or DEFAULT_SIGENERGY_REALTIME_ENDPOINT,
+        "energy_flow_endpoint": str(config_map.get("alarms_endpoint") or DEFAULT_SIGENERGY_ENERGY_FLOW_ENDPOINT).strip() or DEFAULT_SIGENERGY_ENERGY_FLOW_ENDPOINT,
+        "region": str(config_map.get("region") or DEFAULT_SIGENERGY_REGION).strip() or DEFAULT_SIGENERGY_REGION,
+    }
+
+
+def sigenergy_configured_system_ids(config: sqlite3.Row | dict[str, Any]) -> list[str]:
+    raw_value = str(dict(config).get("system_ids") or "").strip()
+    return [item.strip() for item in re.split(r"[,;\s]+", raw_value) if item.strip()]
+
+
+def get_sigenergy_token(config: sqlite3.Row | dict[str, Any], *, force_login: bool = False) -> str:
+    endpoints = get_sigenergy_endpoint_config(config)
+    app_key = str(config["username"] or "").strip()
+    app_secret = str(config["password"] or "").strip()
+    if not app_key or not app_secret:
+        raise ValueError("Preenche App Key e App Secret da Sigenergy.")
+    if not endpoints["base_url"]:
+        raise ValueError("Falta a Base URL da Sigenergy.")
+
+    cache_key = f"{endpoints['base_url']}|{app_key}|{endpoints['region']}"
+    now = datetime.now()
+    with SIGENERGY_TOKEN_LOCK:
+        cached = SIGENERGY_TOKEN_CACHE.get(cache_key)
+        if cached and not force_login and cached["expires_at"] > now:
+            return str(cached["access_token"])
+
+        auth_key = base64.b64encode(f"{app_key}:{app_secret}".encode("utf-8")).decode("ascii")
+        response = requests.post(
+            build_provider_url(endpoints["base_url"], endpoints["login_endpoint"]),
+            json={"key": auth_key},
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if int(payload.get("code") or 0) != 0:
+            raise ValueError(f"{payload.get('msg') or 'Login Sigenergy falhou.'} (code={payload.get('code')})")
+        token_data = parse_provider_payload_data(payload)
+        if not isinstance(token_data, dict):
+            raise ValueError("A resposta Sigenergy de login nao trouxe data JSON valido.")
+        access_token = str(token_data.get("accessToken") or token_data.get("access_token") or "").strip()
+        if not access_token:
+            raise ValueError("A resposta Sigenergy de login nao trouxe accessToken.")
+        expires_in = int(float(str(token_data.get("expiresIn") or token_data.get("expires_in") or 43199)))
+        SIGENERGY_TOKEN_CACHE[cache_key] = {
+            "access_token": access_token,
+            "expires_at": now + timedelta(seconds=max(expires_in - 300, 300)),
+        }
+        return access_token
+
+
+def sigenergy_headers(token: str, region: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "sigen-region": region,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+
+def fetch_sigenergy_json(
+    method: str,
+    *,
+    base_url: str,
+    endpoint: str,
+    token: str,
+    region: str,
+    json_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    response = requests.request(
+        method,
+        build_provider_url(base_url, endpoint),
+        headers=sigenergy_headers(token, region),
+        json=json_payload,
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    code = payload.get("code")
+    if code not in (None, 0, "0"):
+        raise ValueError(f"{payload.get('msg') or 'Pedido Sigenergy falhou.'} (code={code})")
+    return payload
+
+
+def normalize_sigenergy_system_rows(data: Any) -> list[dict[str, Any]]:
+    if isinstance(data, list):
+        return [row for row in data if isinstance(row, dict)]
+    if isinstance(data, dict):
+        for key in ("list", "records", "systems", "systemList", "rows"):
+            rows = data.get(key)
+            if isinstance(rows, list):
+                return [row for row in rows if isinstance(row, dict)]
+        if any(key in data for key in ("systemId", "id", "systemName", "name")):
+            return [data]
+    return []
+
+
+def fetch_sigenergy_systems(config: sqlite3.Row | dict[str, Any], token: str) -> list[dict[str, Any]]:
+    configured_ids = sigenergy_configured_system_ids(config)
+    if configured_ids:
+        return [{"systemId": system_id, "systemName": system_id} for system_id in configured_ids]
+    endpoints = get_sigenergy_endpoint_config(config)
+    try:
+        payload = fetch_sigenergy_json(
+            "GET",
+            base_url=endpoints["base_url"],
+            endpoint=endpoints["systems_endpoint"],
+            token=token,
+            region=endpoints["region"],
+        )
+    except requests.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 404:
+            raise ValueError(
+                "A Sigenergy autenticou, mas nao disponibilizou a lista automatica de sistemas. "
+                "Preenche SIGENERGY_SYSTEM_IDS no .env com os systemId da app mySigen."
+            ) from exc
+        raise
+    rows = normalize_sigenergy_system_rows(parse_provider_payload_data(payload))
+    if not rows:
+        raise ValueError(
+            "A API Sigenergy respondeu com sucesso, mas sem sistemas. "
+            "Confirma no developer portal se a App Key tem sistemas onboarded/autorizados."
+        )
+    return rows
+
+
+def fetch_sigenergy_realtime_data(config: sqlite3.Row | dict[str, Any], token: str, system_id: str) -> dict[str, Any]:
+    endpoints = get_sigenergy_endpoint_config(config)
+    payload = fetch_sigenergy_json(
+        "POST",
+        base_url=endpoints["base_url"],
+        endpoint=endpoints["real_time_endpoint"],
+        token=token,
+        region=endpoints["region"],
+        json_payload={"systemId": system_id},
+    )
+    data = parse_provider_payload_data(payload)
+    return data if isinstance(data, dict) else {"raw_data": data}
+
+
+def fetch_sigenergy_energy_flow(config: sqlite3.Row | dict[str, Any], token: str, system_id: str) -> dict[str, Any]:
+    endpoints = get_sigenergy_endpoint_config(config)
+    endpoint = endpoints["energy_flow_endpoint"].replace("{system_id}", system_id).replace("{systemId}", system_id)
+    payload = fetch_sigenergy_json(
+        "GET",
+        base_url=endpoints["base_url"],
+        endpoint=endpoint,
+        token=token,
+        region=endpoints["region"],
+    )
+    data = parse_provider_payload_data(payload)
+    return data if isinstance(data, dict) else {"raw_data": data}
+
+
+def map_sigenergy_status(raw_status: Any, energy_flow: dict[str, Any] | None = None) -> str:
+    normalized = normalize_name(str(raw_status or ""))
+    if normalized in {"fault", "error", "alarm", "shutdown"}:
+        return "Erro"
+    if normalized in {"disconnected", "offline", "communication lost"}:
+        return "Desconectada"
+    if normalized in {"running", "normal", "online", "standby", "grid connected", "grid-connected"}:
+        return "Operacional"
+    if energy_flow and any(energy_flow.get(key) not in (None, "") for key in ("pvPower", "batterySoc", "loadPower", "gridPower")):
+        return "Operacional"
+    return normalize_status(str(raw_status or "Operacional"))
+
+
+def normalize_sigenergy_system_row(
+    system_row: dict[str, Any],
+    realtime_row: dict[str, Any] | None = None,
+    energy_flow: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    external_id = first_non_empty(system_row, ["systemId", "id", "stationId", "plantId"])
+    if not external_id:
+        raise ValueError("A resposta Sigenergy nao trouxe systemId numa das linhas.")
+    external_name = first_non_empty(system_row, ["systemName", "name", "stationName", "plantName"]) or external_id
+    realtime = realtime_row or {}
+    flow = energy_flow or {}
+    raw_status = first_non_empty(realtime, ["systemStatus", "status", "runningStatus", "state"]) or first_non_empty(
+        system_row,
+        ["systemStatus", "status", "runningStatus", "state"],
+    )
+    status = map_sigenergy_status(raw_status, flow)
+    notes_parts = [f"system_status={raw_status or 'unknown'}"]
+    for key in ("pvPower", "gridPower", "batteryPower", "batterySoc", "loadPower"):
+        if key in flow and flow[key] not in (None, ""):
+            notes_parts.append(f"{key}={flow[key]}")
+    return {
+        "external_id": external_id,
+        "external_name": external_name,
+        "status": status,
+        "raw_status": raw_status or "unknown",
+        "notes": "; ".join(notes_parts),
+        "payload": {
+            "system": system_row,
+            "realtime": realtime,
+            "energy_flow": flow,
+        },
+    }
+
+
+def run_sigenergy_check(conn: sqlite3.Connection, provider: str, dry_run: bool = False) -> dict[str, Any]:
+    config = get_integration_config(conn, provider)
+    if config is None:
+        raise ValueError("Configuracao Sigenergy nao encontrada.")
+    endpoints = get_sigenergy_endpoint_config(config)
+    token = get_sigenergy_token(config)
+    systems = fetch_sigenergy_systems(config, token)
+    normalized_rows: list[dict[str, Any]] = []
+    realtime_count = 0
+    energy_flow_count = 0
+    energy_flow_errors: list[str] = []
+    for system_row in systems:
+        system_id = first_non_empty(system_row, ["systemId", "id", "stationId", "plantId"])
+        if not system_id:
+            continue
+        realtime = fetch_sigenergy_realtime_data(config, token, system_id)
+        realtime_count += 1
+        energy_flow: dict[str, Any] = {}
+        try:
+            energy_flow = fetch_sigenergy_energy_flow(config, token, system_id)
+            energy_flow_count += 1
+        except Exception as exc:
+            energy_flow_errors.append(f"{system_id}: {exc}")
+        normalized_rows.append(normalize_sigenergy_system_row(system_row, realtime, energy_flow))
+        time.sleep(0.2)
+
+    if not dry_run:
+        conn.execute(
+            """
+            UPDATE integration_configs
+            SET last_sync_status = ?, last_error = ?, updated_at = ?
+            WHERE provider = ?
+            """,
+            ("success", "", datetime.now().isoformat(timespec="seconds"), provider),
+        )
+        conn.commit()
+    return {
+        "rows": normalized_rows,
+        "station_count": len(systems),
+        "realtime_count": realtime_count,
+        "alarm_count": 0,
+        "alarm_error": "; ".join(energy_flow_errors),
+        "energy_flow_count": energy_flow_count,
+        "base_url": endpoints["base_url"],
+    }
+
+
+def run_provider_check(conn: sqlite3.Connection, provider: str, dry_run: bool = False) -> dict[str, Any]:
+    if provider == INTEGRATION_PROVIDER_SIGENERGY:
+        return run_sigenergy_check(conn, provider, dry_run=dry_run)
+    return run_fusionsolar_check(conn, provider, dry_run=dry_run)
 
 
 def run_fusionsolar_check(conn: sqlite3.Connection, provider: str, dry_run: bool = False) -> dict[str, Any]:
@@ -7058,24 +8879,37 @@ def run_fusionsolar_production_sync(
 
         station_codes = [str(row["external_id"]).strip() for row in mapped_assets if str(row["external_id"] or "").strip()]
         session_obj, _ = get_fusionsolar_session(config)
-        if period_type == "month":
-            endpoint_used = endpoints["month_kpi_endpoint"]
-            kpi_map = fetch_fusionsolar_kpi_month_map(
-                session_obj,
-                endpoints["base_url"],
-                endpoint_used,
-                station_codes,
-                target_date,
-            )
-        else:
-            endpoint_used = endpoints["day_kpi_endpoint"]
-            kpi_map = fetch_fusionsolar_kpi_day_map(
-                session_obj,
-                endpoints["base_url"],
-                endpoint_used,
-                station_codes,
-                target_date,
-            )
+        try:
+            if period_type == "month":
+                endpoint_used = endpoints["month_kpi_endpoint"]
+                kpi_map = fetch_fusionsolar_kpi_month_map(
+                    session_obj,
+                    endpoints["base_url"],
+                    endpoint_used,
+                    station_codes,
+                    target_date,
+                )
+            else:
+                endpoint_used = endpoints["day_kpi_endpoint"]
+                kpi_map = fetch_fusionsolar_kpi_day_map(
+                    session_obj,
+                    endpoints["base_url"],
+                    endpoint_used,
+                    station_codes,
+                    target_date,
+                )
+        except Exception as exc:
+            if is_fusionsolar_rate_limit_error(exc):
+                reason = mark_fusionsolar_performance_rate_limited(conn)
+                conn.commit()
+                return {
+                    "processed": 0,
+                    "missing_data": 0,
+                    "no_reference": 0,
+                    "period_date": target_date.isoformat(),
+                    "stopped_reason": reason,
+                }
+            raise
 
         processed = 0
         missing_data = 0
@@ -7250,6 +9084,7 @@ def get_fusionsolar_performance_assets(
     conn: sqlite3.Connection,
     provider: str,
     asset_id: int | None = None,
+    asset_ids: list[int] | None = None,
 ) -> list[sqlite3.Row]:
     conditions = [
         "ai.provider = ?",
@@ -7262,6 +9097,10 @@ def get_fusionsolar_performance_assets(
     if asset_id:
         conditions.append("a.id = ?")
         params.append(asset_id)
+    if asset_ids:
+        placeholders = ", ".join("?" for _ in asset_ids)
+        conditions.append(f"a.id IN ({placeholders})")
+        params.extend(asset_ids)
     return query_all(
         conn,
         f"""
@@ -7601,6 +9440,7 @@ def run_fusionsolar_production_backfill(
     max_api_calls: int | None = None,
     kpi_call_delay_seconds: float | None = None,
     sleeper: Any | None = None,
+    max_wait_cycles: int = 24,
 ) -> dict[str, Any]:
     if period_type not in {"day", "month"}:
         raise ValueError("Tipo de periodo invalido.")
@@ -7641,6 +9481,7 @@ def run_fusionsolar_production_backfill(
         "still_without_reference": 0,
         "stopped_reason": "",
         "resume_hint": "",
+        "wait_cycles": 0,
     }
     logger = current_app.logger if has_app_context() else logging.getLogger(__name__)
     station_codes = [str(asset["external_id"] or "").strip() for asset in assets if str(asset["external_id"] or "").strip()]
@@ -7650,19 +9491,6 @@ def run_fusionsolar_production_backfill(
         if str(asset["external_id"] or "").strip()
     }
     summary["assets_processed"] = len(assets_by_external_id)
-    cooldown_reason = get_fusionsolar_performance_cooldown_reason(conn)
-    if cooldown_reason:
-        summary["api_errors"] = 1
-        summary["stopped_reason"] = cooldown_reason
-        logger.warning(
-            "FusionSolar performance backfill skipped by local cooldown: period_type=%s station_count=%s reason=%s",
-            period_type,
-            len(station_codes),
-            cooldown_reason,
-        )
-        return summary
-
-    session_obj, _ = get_fusionsolar_session(config)
     max_api_calls = max_api_calls if max_api_calls is not None else max_days
     max_api_calls = max_api_calls if max_api_calls is not None else FUSIONSOLAR_PERFORMANCE_MAX_API_CALLS
     kpi_call_delay_seconds = (
@@ -7672,6 +9500,44 @@ def run_fusionsolar_production_backfill(
     )
     sleep_func = sleeper or time.sleep
     processed_dates: list[date] = []
+
+    def wait_after_rate_limit(reason: str, resume_hint: date | None = None) -> bool:
+        summary["wait_cycles"] += 1
+        summary["resume_hint"] = resume_hint.isoformat() if resume_hint else summary["resume_hint"]
+        if summary["wait_cycles"] > max_wait_cycles:
+            summary["stopped_reason"] = f"Limite FusionSolar repetido demasiadas vezes. Ultimo estado: {reason}"
+            logger.warning(
+                "FusionSolar performance backfill stopped after repeated cooldowns: period_type=%s station_count=%s wait_cycles=%s reason=%s",
+                period_type,
+                len(station_codes),
+                summary["wait_cycles"],
+                reason,
+            )
+            return False
+        conn.commit()
+        seconds = fusionsolar_cooldown_sleep_seconds(conn)
+        logger.warning(
+            "FusionSolar performance backfill waiting for API cooldown: period_type=%s station_count=%s seconds=%s wait_cycle=%s",
+            period_type,
+            len(station_codes),
+            seconds,
+            summary["wait_cycles"],
+        )
+        sleep_func(seconds)
+        return True
+
+    cooldown_reason = get_fusionsolar_performance_cooldown_reason(conn)
+    if cooldown_reason and not wait_after_rate_limit(cooldown_reason):
+        summary["api_errors"] = 1
+        return summary
+
+    session_obj, _ = get_fusionsolar_session(config)
+
+    def refresh_session_after_expiry(exc: Exception, context: str) -> None:
+        nonlocal session_obj
+        invalidate_fusionsolar_session(config)
+        session_obj, _ = get_fusionsolar_session(config, force_login=True)
+        logger.warning("FusionSolar session refreshed after expired login: context=%s error=%s", context, exc)
 
     def store_kpi_map(period_date_value: date, kpi_map_value: dict[str, dict[str, Any]], record_type: str, notes_prefix: str) -> None:
         for external_id_value, asset in assets_by_external_id.items():
@@ -7701,104 +9567,115 @@ def run_fusionsolar_production_backfill(
             month_had_records = False
             station_chunks = chunked(station_codes, 100)
             for chunk_index, station_group in enumerate(station_chunks, start=1):
-                if summary["api_calls_used"] >= max_api_calls:
-                    summary["stopped_reason"] = (
-                        f"Limite local de {max_api_calls} chamadas API atingido. "
-                        f"Retoma a partir de {month_value.isoformat()}."
-                    )
-                    summary["resume_hint"] = month_value.isoformat()
-                    logger.info(
-                        "FusionSolar performance backfill stopped by max calls: period_type=%s month=%s api_calls_used=%s max_api_calls=%s",
-                        period_type,
-                        month_value.isoformat(),
-                        summary["api_calls_used"],
-                        max_api_calls,
-                    )
-                    break
-                if summary["api_calls_used"] > 0:
-                    wait_before_next_call()
-                try:
-                    logger.info(
-                        "FusionSolar daily performance backfill request: period_type=%s month=%s station_count=%s chunk_index=%s api_calls_used=%s",
-                        period_type,
-                        month_value.isoformat(),
-                        len(station_group),
-                        chunk_index,
-                        summary["api_calls_used"],
-                    )
-                    rows = fetch_fusionsolar_kpi_day_rows(
-                        session_obj,
-                        endpoints["base_url"],
-                        endpoints["day_kpi_endpoint"],
-                        station_group,
-                        month_value,
-                    )
-                    summary["api_calls_used"] += 1
-                    summary["chunks_processed"] += 1
-                    for row in rows:
-                        external_id_value = str(row.get("stationCode") or row.get("plantCode") or "").strip()
-                        asset = assets_by_external_id.get(external_id_value)
-                        if asset is None:
-                            continue
-                        row_date = parse_fusionsolar_collect_date(row, month_value)
-                        if row_date is None or row_date.replace(day=1) != month_value:
-                            continue
-                        if not date_in_backfill_window(
-                            row_date,
-                            from_year=from_year,
-                            to_year=to_year,
-                            today_value=today_value,
-                            date_from=date_from,
-                            date_to=date_to,
-                        ):
-                            continue
-                        result = store_production_kpi_record(
-                            conn,
-                            asset_row=asset,
-                            provider=provider,
-                            external_id=external_id_value,
-                            period_type="day",
-                            period_date=row_date,
-                            kpi_row=row,
-                            notes_prefix="Backfill historico mensal diario.",
+                session_retry_used = False
+                while True:
+                    if summary["api_calls_used"] >= max_api_calls:
+                        summary["stopped_reason"] = (
+                            f"Limite local de {max_api_calls} chamadas API atingido. "
+                            f"Retoma a partir de {month_value.isoformat()}."
                         )
-                        if result["upsert_status"] != "skipped_existing_valid":
-                            summary["records_updated"] += 1
-                            processed_dates.append(row_date)
-                            month_had_records = True
-                        if result["production_kwh"] is None:
-                            summary["missing_production"] += 1
-                    logger.info(
-                        "FusionSolar daily performance backfill response: month=%s chunk_index=%s rows=%s records_updated=%s api_calls_used=%s",
-                        month_value.isoformat(),
-                        chunk_index,
-                        len(rows),
-                        summary["records_updated"],
-                        summary["api_calls_used"],
-                    )
-                except Exception as exc:
-                    summary["api_errors"] += 1
-                    if is_fusionsolar_rate_limit_error(exc):
-                        summary["stopped_reason"] = mark_fusionsolar_performance_rate_limited(conn)
                         summary["resume_hint"] = month_value.isoformat()
-                        logger.warning(
-                            "FusionSolar performance backfill stopped by rate limit: period_type=%s month=%s station_count=%s chunk_index=%s api_calls_used=%s error=%s",
+                        logger.info(
+                            "FusionSolar performance backfill stopped by max calls: period_type=%s month=%s api_calls_used=%s max_api_calls=%s",
+                            period_type,
+                            month_value.isoformat(),
+                            summary["api_calls_used"],
+                            max_api_calls,
+                        )
+                        break
+                    if summary["api_calls_used"] > 0:
+                        wait_before_next_call()
+                    try:
+                        logger.info(
+                            "FusionSolar daily performance backfill request: period_type=%s month=%s station_count=%s chunk_index=%s api_calls_used=%s",
                             period_type,
                             month_value.isoformat(),
                             len(station_group),
                             chunk_index,
                             summary["api_calls_used"],
+                        )
+                        rows = fetch_fusionsolar_kpi_day_rows(
+                            session_obj,
+                            endpoints["base_url"],
+                            endpoints["day_kpi_endpoint"],
+                            station_group,
+                            month_value,
+                        )
+                        summary["api_calls_used"] += 1
+                        summary["chunks_processed"] += 1
+                        for row in rows:
+                            external_id_value = str(row.get("stationCode") or row.get("plantCode") or "").strip()
+                            asset = assets_by_external_id.get(external_id_value)
+                            if asset is None:
+                                continue
+                            row_date = parse_fusionsolar_collect_date(row, month_value)
+                            if row_date is None or row_date.replace(day=1) != month_value:
+                                continue
+                            if not date_in_backfill_window(
+                                row_date,
+                                from_year=from_year,
+                                to_year=to_year,
+                                today_value=today_value,
+                                date_from=date_from,
+                                date_to=date_to,
+                            ):
+                                continue
+                            result = store_production_kpi_record(
+                                conn,
+                                asset_row=asset,
+                                provider=provider,
+                                external_id=external_id_value,
+                                period_type="day",
+                                period_date=row_date,
+                                kpi_row=row,
+                                notes_prefix="Backfill historico mensal diario.",
+                            )
+                            if result["upsert_status"] != "skipped_existing_valid":
+                                summary["records_updated"] += 1
+                                processed_dates.append(row_date)
+                                month_had_records = True
+                            if result["production_kwh"] is None:
+                                summary["missing_production"] += 1
+                        logger.info(
+                            "FusionSolar daily performance backfill response: month=%s chunk_index=%s rows=%s records_updated=%s api_calls_used=%s",
+                            month_value.isoformat(),
+                            chunk_index,
+                            len(rows),
+                            summary["records_updated"],
+                            summary["api_calls_used"],
+                        )
+                        break
+                    except Exception as exc:
+                        summary["api_errors"] += 1
+                        if is_fusionsolar_rate_limit_error(exc):
+                            reason = mark_fusionsolar_performance_rate_limited(conn)
+                            logger.warning(
+                                "FusionSolar performance backfill rate limited: period_type=%s month=%s station_count=%s chunk_index=%s api_calls_used=%s error=%s",
+                                period_type,
+                                month_value.isoformat(),
+                                len(station_group),
+                                chunk_index,
+                                summary["api_calls_used"],
+                                exc,
+                            )
+                            if wait_after_rate_limit(reason, month_value):
+                                continue
+                            break
+                        if is_fusionsolar_session_expired_error(exc) and not session_retry_used:
+                            session_retry_used = True
+                            refresh_session_after_expiry(exc, f"daily:{month_value.isoformat()}:chunk:{chunk_index}")
+                            continue
+                        logger.warning(
+                            "FusionSolar daily performance backfill chunk failed: period_type=%s month=%s station_count=%s chunk_index=%s error=%s",
+                            period_type,
+                            month_value.isoformat(),
+                            len(station_group),
+                            chunk_index,
                             exc,
                         )
                         break
-                    logger.warning(
-                        "FusionSolar daily performance backfill chunk failed: period_type=%s month=%s station_count=%s chunk_index=%s error=%s",
-                        period_type,
-                        month_value.isoformat(),
-                        len(station_group),
-                        chunk_index,
-                        exc,
-                    )
+                if summary["stopped_reason"]:
+                    break
             if month_had_records:
                 summary["months_processed"] += 1
             if summary["stopped_reason"]:
@@ -7820,27 +9697,37 @@ def run_fusionsolar_production_backfill(
         selected_asset_ids = [int(asset["asset_id"]) for asset in assets]
         current_month = today_value.replace(day=1)
         if selected_asset_ids and not summary["stopped_reason"]:
-            try:
-                if summary["api_calls_used"] > 0:
-                    wait_before_next_call()
-                kpi_map = fetch_fusionsolar_kpi_month_map(
-                    session_obj,
-                    endpoints["base_url"],
-                    endpoints["month_kpi_endpoint"],
-                    station_codes,
-                    current_month,
-                )
-                summary["api_calls_used"] += max(1, len(chunked(station_codes, 100)))
-                store_kpi_map(current_month, kpi_map, "mtd", "MTD recalculado apos backfill.")
-            except Exception as exc:
-                summary["api_errors"] += 1
-                if is_fusionsolar_rate_limit_error(exc):
-                    summary["stopped_reason"] = mark_fusionsolar_performance_rate_limited(conn)
-                logger.warning(
-                    "FusionSolar MTD recalculation failed after backfill: station_count=%s error=%s",
-                    len(station_codes),
-                    exc,
-                )
+            session_retry_used = False
+            while True:
+                try:
+                    if summary["api_calls_used"] > 0:
+                        wait_before_next_call()
+                    kpi_map = fetch_fusionsolar_kpi_month_map(
+                        session_obj,
+                        endpoints["base_url"],
+                        endpoints["month_kpi_endpoint"],
+                        station_codes,
+                        current_month,
+                    )
+                    summary["api_calls_used"] += max(1, len(chunked(station_codes, 100)))
+                    store_kpi_map(current_month, kpi_map, "mtd", "MTD recalculado apos backfill.")
+                    break
+                except Exception as exc:
+                    summary["api_errors"] += 1
+                    if is_fusionsolar_rate_limit_error(exc):
+                        reason = mark_fusionsolar_performance_rate_limited(conn)
+                        if wait_after_rate_limit(reason, current_month):
+                            continue
+                    if is_fusionsolar_session_expired_error(exc) and not session_retry_used:
+                        session_retry_used = True
+                        refresh_session_after_expiry(exc, f"daily-mtd:{current_month.isoformat()}")
+                        continue
+                    logger.warning(
+                        "FusionSolar MTD recalculation failed after backfill: station_count=%s error=%s",
+                        len(station_codes),
+                        exc,
+                    )
+                    break
             recalc = recalculate_performance_references(
                 conn,
                 period_type="mtd",
@@ -7856,47 +9743,67 @@ def run_fusionsolar_production_backfill(
         return summary
 
     for period_date_value in dates:
-        try:
-            if summary["api_calls_used"] >= max_api_calls:
-                summary["stopped_reason"] = (
-                    f"Limite local de {max_api_calls} chamadas API atingido. "
-                    f"Retoma a partir de {period_date_value.isoformat()}."
+        stored_current_date = False
+        session_retry_used = False
+        while True:
+            try:
+                if summary["api_calls_used"] >= max_api_calls:
+                    summary["stopped_reason"] = (
+                        f"Limite local de {max_api_calls} chamadas API atingido. "
+                        f"Retoma a partir de {period_date_value.isoformat()}."
+                    )
+                    summary["resume_hint"] = period_date_value.isoformat()
+                    break
+                if summary["api_calls_used"] > 0:
+                    wait_before_next_call()
+                kpi_map = fetch_fusionsolar_kpi_month_map(
+                    session_obj,
+                    endpoints["base_url"],
+                    endpoints["month_kpi_endpoint"],
+                    station_codes,
+                    period_date_value,
                 )
-                summary["resume_hint"] = period_date_value.isoformat()
+                summary["api_calls_used"] += max(1, len(chunked(station_codes, 100)))
+                store_kpi_map(period_date_value, kpi_map, period_type, "Backfill historico.")
+                stored_current_date = True
                 break
-            if summary["api_calls_used"] > 0:
-                wait_before_next_call()
-            kpi_map = fetch_fusionsolar_kpi_month_map(
-                session_obj,
-                endpoints["base_url"],
-                endpoints["month_kpi_endpoint"],
-                station_codes,
-                period_date_value,
-            )
-            summary["api_calls_used"] += max(1, len(chunked(station_codes, 100)))
-            store_kpi_map(period_date_value, kpi_map, period_type, "Backfill historico.")
-            processed_dates.append(period_date_value)
-        except Exception as exc:
-            if is_fusionsolar_rate_limit_error(exc):
-                summary["api_errors"] += 1
-                summary["stopped_reason"] = mark_fusionsolar_performance_rate_limited(conn)
+            except Exception as exc:
+                if is_fusionsolar_rate_limit_error(exc):
+                    summary["api_errors"] += 1
+                    reason = mark_fusionsolar_performance_rate_limited(conn)
+                    logger.warning(
+                        "FusionSolar performance backfill rate limited: period_type=%s period_date=%s station_count=%s error=%s",
+                        period_type,
+                        period_date_value.isoformat(),
+                        len(station_codes),
+                        exc,
+                    )
+                    if wait_after_rate_limit(reason, period_date_value):
+                        continue
+                    break
+                if is_fusionsolar_session_expired_error(exc) and not session_retry_used:
+                    session_retry_used = True
+                    summary["api_errors"] += 1
+                    refresh_session_after_expiry(exc, f"month-group:{period_date_value.isoformat()}")
+                    continue
                 logger.warning(
-                    "FusionSolar performance backfill stopped by rate limit: period_type=%s period_date=%s station_count=%s error=%s",
+                    "FusionSolar grouped performance backfill failed, retrying per asset: period_type=%s period_date=%s station_count=%s error=%s",
                     period_type,
                     period_date_value.isoformat(),
                     len(station_codes),
                     exc,
                 )
                 break
-            logger.warning(
-                "FusionSolar grouped performance backfill failed, retrying per asset: period_type=%s period_date=%s station_count=%s error=%s",
-                period_type,
-                period_date_value.isoformat(),
-                len(station_codes),
-                exc,
-            )
-            stored_any_for_date = False
-            for external_id_value, asset in assets_by_external_id.items():
+        if summary["stopped_reason"]:
+            break
+        if stored_current_date:
+            processed_dates.append(period_date_value)
+            continue
+
+        stored_any_for_date = False
+        for external_id_value, asset in assets_by_external_id.items():
+            session_retry_used = False
+            while True:
                 try:
                     if summary["api_calls_used"] >= max_api_calls:
                         summary["stopped_reason"] = (
@@ -7917,19 +9824,26 @@ def run_fusionsolar_production_backfill(
                     summary["api_calls_used"] += 1
                     store_kpi_map(period_date_value, single_map, period_type, "Backfill historico.")
                     stored_any_for_date = True
+                    break
                 except Exception as asset_exc:
                     summary["api_errors"] += 1
                     if is_fusionsolar_rate_limit_error(asset_exc):
-                        summary["stopped_reason"] = mark_fusionsolar_performance_rate_limited(conn)
+                        reason = mark_fusionsolar_performance_rate_limited(conn)
                         logger.warning(
-                            "FusionSolar performance backfill stopped by rate limit: asset_id=%s stationCode=%s period_type=%s period_date=%s error=%s",
+                            "FusionSolar performance backfill rate limited: asset_id=%s stationCode=%s period_type=%s period_date=%s error=%s",
                             asset["asset_id"],
                             external_id_value,
                             period_type,
                             period_date_value.isoformat(),
                             asset_exc,
                         )
+                        if wait_after_rate_limit(reason, period_date_value):
+                            continue
                         break
+                    if is_fusionsolar_session_expired_error(asset_exc) and not session_retry_used:
+                        session_retry_used = True
+                        refresh_session_after_expiry(asset_exc, f"month-asset:{period_date_value.isoformat()}:{external_id_value}")
+                        continue
                     logger.warning(
                         "FusionSolar performance backfill failed: asset_id=%s stationCode=%s period_type=%s period_date=%s error=%s",
                         asset["asset_id"],
@@ -7938,10 +9852,13 @@ def run_fusionsolar_production_backfill(
                         period_date_value.isoformat(),
                         asset_exc,
                     )
+                    break
             if summary["stopped_reason"]:
                 break
-            if stored_any_for_date:
-                processed_dates.append(period_date_value)
+        if summary["stopped_reason"]:
+            break
+        if stored_any_for_date:
+            processed_dates.append(period_date_value)
 
     selected_asset_ids = [int(asset["asset_id"]) for asset in assets]
     recalc_targets = processed_dates
@@ -7960,27 +9877,37 @@ def run_fusionsolar_production_backfill(
 
     current_month = today_value.replace(day=1)
     if selected_asset_ids and not summary["stopped_reason"]:
-        try:
-            if summary["api_calls_used"] > 0:
-                wait_before_next_call()
-            kpi_map = fetch_fusionsolar_kpi_month_map(
-                session_obj,
-                endpoints["base_url"],
-                endpoints["month_kpi_endpoint"],
-                station_codes,
-                current_month,
-            )
-            summary["api_calls_used"] += max(1, len(chunked(station_codes, 100)))
-            store_kpi_map(current_month, kpi_map, "mtd", "MTD recalculado apos backfill.")
-        except Exception as exc:
-            summary["api_errors"] += 1
-            if is_fusionsolar_rate_limit_error(exc):
-                summary["stopped_reason"] = mark_fusionsolar_performance_rate_limited(conn)
-            logger.warning(
-                "FusionSolar MTD recalculation failed after backfill: station_count=%s error=%s",
-                len(station_codes),
-                exc,
-            )
+        session_retry_used = False
+        while True:
+            try:
+                if summary["api_calls_used"] > 0:
+                    wait_before_next_call()
+                kpi_map = fetch_fusionsolar_kpi_month_map(
+                    session_obj,
+                    endpoints["base_url"],
+                    endpoints["month_kpi_endpoint"],
+                    station_codes,
+                    current_month,
+                )
+                summary["api_calls_used"] += max(1, len(chunked(station_codes, 100)))
+                store_kpi_map(current_month, kpi_map, "mtd", "MTD recalculado apos backfill.")
+                break
+            except Exception as exc:
+                summary["api_errors"] += 1
+                if is_fusionsolar_rate_limit_error(exc):
+                    reason = mark_fusionsolar_performance_rate_limited(conn)
+                    if wait_after_rate_limit(reason, current_month):
+                        continue
+                if is_fusionsolar_session_expired_error(exc) and not session_retry_used:
+                    session_retry_used = True
+                    refresh_session_after_expiry(exc, f"month-mtd:{current_month.isoformat()}")
+                    continue
+                logger.warning(
+                    "FusionSolar MTD recalculation failed after backfill: station_count=%s error=%s",
+                    len(station_codes),
+                    exc,
+                )
+                break
         recalc = recalculate_performance_references(
             conn,
             period_type="mtd",
@@ -7993,6 +9920,203 @@ def run_fusionsolar_production_backfill(
         summary["references_created"] += recalc["references_created"]
         summary["still_without_reference"] += recalc["still_without_reference"]
     conn.commit()
+    return summary
+
+
+def run_fusionsolar_month_cycle(
+    conn: sqlite3.Connection,
+    *,
+    provider: str = "FusionSolar",
+    report_month: str,
+    asset_ids: list[int],
+    kpi_call_delay_seconds: float | None = None,
+    sleeper: Any | None = None,
+    max_wait_cycles: int = 24,
+) -> dict[str, Any]:
+    if not asset_ids:
+        raise ValueError("Escolhe pelo menos uma instalacao para o ciclo.")
+    month_start = datetime.strptime(normalize_report_month(report_month), "%Y-%m").date()
+    _, month_last_day = calendar.monthrange(month_start.year, month_start.month)
+    month_end = month_start.replace(day=month_last_day)
+    today_value = date.today()
+    date_to = min(month_end, today_value - timedelta(days=1))
+    if date_to < month_start:
+        raise ValueError("O mes escolhido ainda nao tem dias fechados para importar.")
+
+    config = get_integration_config(conn, provider)
+    if config is None:
+        raise ValueError("Configuracao FusionSolar nao encontrada.")
+    if not config["enabled"]:
+        raise ValueError("A integracao FusionSolar esta desativada.")
+    endpoints = get_fusionsolar_endpoint_config(config)
+    assets = get_fusionsolar_performance_assets(conn, provider, asset_ids=asset_ids)
+    if not assets:
+        raise ValueError("Nenhuma das instalacoes escolhidas tem mapeamento FusionSolar ativo.")
+
+    station_codes = [str(asset["external_id"] or "").strip() for asset in assets if str(asset["external_id"] or "").strip()]
+    assets_by_external_id = {str(asset["external_id"] or "").strip(): asset for asset in assets if str(asset["external_id"] or "").strip()}
+    station_chunks = chunked(station_codes, 100)
+    session_obj, _ = get_fusionsolar_session(config)
+    sleep_func = sleeper or time.sleep
+    kpi_call_delay_seconds = FUSIONSOLAR_PERFORMANCE_KPI_DELAY_SECONDS if kpi_call_delay_seconds is None else kpi_call_delay_seconds
+    logger = current_app.logger if has_app_context() else logging.getLogger(__name__)
+    summary = {
+        "assets_selected": len(asset_ids),
+        "assets_mapped": len(assets_by_external_id),
+        "month": month_start.strftime("%Y-%m"),
+        "daily_chunks_total": len(station_chunks),
+        "daily_chunks_completed": 0,
+        "monthly_chunks_completed": 0,
+        "records_updated": 0,
+        "monthly_records_updated": 0,
+        "missing_production": 0,
+        "api_calls_used": 0,
+        "api_errors": 0,
+        "wait_cycles": 0,
+        "status": "running",
+    }
+    processed_dates: set[date] = set()
+
+    def wait_after_rate_limit(reason: str) -> None:
+        summary["wait_cycles"] += 1
+        if summary["wait_cycles"] > max_wait_cycles:
+            raise ValueError(f"Limite FusionSolar repetido demasiadas vezes. Ultimo estado: {reason}")
+        conn.commit()
+        seconds = fusionsolar_cooldown_sleep_seconds(conn)
+        logger.warning(
+            "FusionSolar month cycle waiting for API cooldown: month=%s seconds=%s wait_cycle=%s",
+            month_start.isoformat(),
+            seconds,
+            summary["wait_cycles"],
+        )
+        sleep_func(seconds)
+
+    def wait_between_calls() -> None:
+        if summary["api_calls_used"] > 0 and kpi_call_delay_seconds and kpi_call_delay_seconds > 0:
+            sleep_func(kpi_call_delay_seconds)
+
+    def refresh_session_after_expiry(exc: Exception, context: str) -> None:
+        nonlocal session_obj
+        invalidate_fusionsolar_session(config)
+        session_obj, _ = get_fusionsolar_session(config, force_login=True)
+        logger.warning("FusionSolar session refreshed after expired login: context=%s error=%s", context, exc)
+
+    for chunk_index, station_group in enumerate(station_chunks, start=1):
+        session_retry_used = False
+        while True:
+            try:
+                wait_between_calls()
+                rows = fetch_fusionsolar_kpi_day_rows(
+                    session_obj,
+                    endpoints["base_url"],
+                    endpoints["day_kpi_endpoint"],
+                    station_group,
+                    month_start,
+                )
+                summary["api_calls_used"] += 1
+                for row in rows:
+                    external_id_value = str(row.get("stationCode") or row.get("plantCode") or "").strip()
+                    asset = assets_by_external_id.get(external_id_value)
+                    if asset is None:
+                        continue
+                    row_date = parse_fusionsolar_collect_date(row, month_start)
+                    if row_date is None or row_date < month_start or row_date > date_to:
+                        continue
+                    result = store_production_kpi_record(
+                        conn,
+                        asset_row=asset,
+                        provider=provider,
+                        external_id=external_id_value,
+                        period_type="day",
+                        period_date=row_date,
+                        kpi_row=row,
+                        notes_prefix="Ciclo mensal automatico.",
+                    )
+                    if result["upsert_status"] != "skipped_existing_valid":
+                        summary["records_updated"] += 1
+                        processed_dates.add(row_date)
+                    if result["production_kwh"] is None:
+                        summary["missing_production"] += 1
+                summary["daily_chunks_completed"] = chunk_index
+                conn.commit()
+                break
+            except Exception as exc:
+                summary["api_errors"] += 1
+                if is_fusionsolar_rate_limit_error(exc):
+                    wait_after_rate_limit(mark_fusionsolar_performance_rate_limited(conn))
+                    continue
+                if is_fusionsolar_session_expired_error(exc) and not session_retry_used:
+                    session_retry_used = True
+                    refresh_session_after_expiry(exc, f"month-cycle-day:{month_start.isoformat()}:chunk:{chunk_index}")
+                    continue
+                raise
+
+    for chunk_index, station_group in enumerate(station_chunks, start=1):
+        session_retry_used = False
+        while True:
+            try:
+                wait_between_calls()
+                kpi_map = fetch_fusionsolar_kpi_month_map(
+                    session_obj,
+                    endpoints["base_url"],
+                    endpoints["month_kpi_endpoint"],
+                    station_group,
+                    month_start,
+                )
+                summary["api_calls_used"] += 1
+                for external_id_value in station_group:
+                    asset = assets_by_external_id.get(external_id_value)
+                    if asset is None:
+                        continue
+                    result = store_production_kpi_record(
+                        conn,
+                        asset_row=asset,
+                        provider=provider,
+                        external_id=external_id_value,
+                        period_type="month",
+                        period_date=month_start,
+                        kpi_row=kpi_map.get(external_id_value, {}),
+                        notes_prefix="Ciclo mensal automatico.",
+                    )
+                    if result["upsert_status"] != "skipped_existing_valid":
+                        summary["monthly_records_updated"] += 1
+                    if result["production_kwh"] is None:
+                        summary["missing_production"] += 1
+                summary["monthly_chunks_completed"] = chunk_index
+                conn.commit()
+                break
+            except Exception as exc:
+                summary["api_errors"] += 1
+                if is_fusionsolar_rate_limit_error(exc):
+                    wait_after_rate_limit(mark_fusionsolar_performance_rate_limited(conn))
+                    continue
+                if is_fusionsolar_session_expired_error(exc) and not session_retry_used:
+                    session_retry_used = True
+                    refresh_session_after_expiry(exc, f"month-cycle-month:{month_start.isoformat()}:chunk:{chunk_index}")
+                    continue
+                raise
+
+    for target in sorted(processed_dates):
+        for selected_asset_id in asset_ids:
+            recalculate_performance_references(
+                conn,
+                period_type="day",
+                period_date=target,
+                asset_id=selected_asset_id,
+                provider=provider,
+                today_value=today_value,
+            )
+    for selected_asset_id in asset_ids:
+        recalculate_performance_references(
+            conn,
+            period_type="month",
+            period_date=month_start,
+            asset_id=selected_asset_id,
+            provider=provider,
+            today_value=today_value,
+        )
+    conn.commit()
+    summary["status"] = "completed"
     return summary
 
 
@@ -8167,21 +10291,21 @@ def run_fusionsolar_sync(conn: sqlite3.Connection, provider: str, trigger_type: 
     with FUSIONSOLAR_SYNC_LOCK:
         config = get_integration_config(conn, provider)
         if config is None:
-            raise ValueError("Configuracao FusionSolar nao encontrada.")
+            raise ValueError(f"Configuracao {provider} nao encontrada.")
         if not config["enabled"]:
-            raise ValueError("A integracao FusionSolar esta desativada.")
+            raise ValueError(f"A integracao {provider} esta desativada.")
 
         run_id = create_integration_run(conn, provider, trigger_type)
         batch_id = create_monitoring_batch(
             conn,
             record_date=date.today().isoformat(),
-            default_notes=f"Sync FusionSolar ({trigger_type})",
+            default_notes=f"Sync {provider} ({trigger_type})",
             raw_input="",
-            source="FusionSolar",
+            source=provider,
         )
 
         try:
-            result = run_fusionsolar_check(conn, provider, dry_run=True)
+            result = run_provider_check(conn, provider, dry_run=True)
             rows = result["rows"]
             matched = 0
             unresolved = 0
@@ -8220,17 +10344,14 @@ def run_fusionsolar_sync(conn: sqlite3.Connection, provider: str, trigger_type: 
 
                 if asset_id:
                     synced_asset_ids.add(asset_id)
-                    duplicate = conn.execute(
-                        """
-                        SELECT 1
-                        FROM monitoring_records
-                        WHERE asset_id = ? AND status = ? AND record_date = ? AND source = 'FusionSolar'
-                        LIMIT 1
-                        """,
-                        (asset_id, status, date.today().isoformat()),
-                    ).fetchone()
-                    if not duplicate:
-                        previous = get_latest_monitoring_row(conn, asset_id)
+                    previous = get_latest_monitoring_row(conn, asset_id)
+                    duplicate_latest = (
+                        previous is not None
+                        and previous["status"] == status
+                        and previous["record_date"] == date.today().isoformat()
+                        and previous["source"] == provider
+                    )
+                    if not duplicate_latest:
                         conn.execute(
                             """
                             INSERT INTO monitoring_records (asset_id, status, record_date, notes, source, batch_id)
@@ -8241,7 +10362,7 @@ def run_fusionsolar_sync(conn: sqlite3.Connection, provider: str, trigger_type: 
                                 status,
                                 date.today().isoformat(),
                                 f"Sync {provider}: {row['notes']}",
-                                "FusionSolar",
+                                provider,
                                 batch_id,
                             ),
                         )
@@ -8287,10 +10408,10 @@ def run_fusionsolar_sync(conn: sqlite3.Connection, provider: str, trigger_type: 
                     """
                     SELECT 1
                     FROM monitoring_records
-                    WHERE asset_id = ? AND record_date = ? AND source = 'FusionSolar'
+                    WHERE asset_id = ? AND record_date = ? AND source = ?
                     LIMIT 1
                     """,
-                    (asset_id, date.today().isoformat()),
+                    (asset_id, date.today().isoformat(), provider),
                 ).fetchone()
                 if existing_today:
                     continue
@@ -8304,8 +10425,8 @@ def run_fusionsolar_sync(conn: sqlite3.Connection, provider: str, trigger_type: 
                         asset_id,
                         "Resolvido",
                         date.today().isoformat(),
-                        "Resolvido automaticamente por ausencia no sync FusionSolar.",
-                        "FusionSolar",
+                        f"Resolvido automaticamente por ausencia no sync {provider}.",
+                        provider,
                         batch_id,
                     ),
                 )
@@ -8379,6 +10500,7 @@ def run_fusionsolar_sync(conn: sqlite3.Connection, provider: str, trigger_type: 
             conn.commit()
             raise
 
+
 def run_all_integration_syncs(conn: sqlite3.Connection, trigger_type: str = "manual") -> dict[str, Any]:
     results: dict[str, Any] = {}
     errors: dict[str, str] = {}
@@ -8393,6 +10515,7 @@ def run_all_integration_syncs(conn: sqlite3.Connection, trigger_type: str = "man
     if not results and errors:
         raise ValueError("; ".join(f"{provider}: {message}" for provider, message in errors.items()))
     return {"results": results, "errors": errors}
+
 
 def resolve_fusionsolar_unresolved(conn: sqlite3.Connection, unresolved_id: int, asset_id: int) -> None:
     row = conn.execute(
