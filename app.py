@@ -7127,14 +7127,27 @@ def schedule_background_job(app: Flask, job_id: int) -> bool:
     return True
 
 
-def schedule_pending_background_jobs(app: Flask) -> None:
+def schedule_pending_background_jobs(app: Flask) -> dict[str, Any]:
     with closing(get_db(app.config["DATABASE"])) as conn:
         recovered_count = mark_stale_running_background_jobs_failed(conn)
         if recovered_count:
             app.logger.warning("Marked %s stale running background jobs as failed on startup", recovered_count)
         pending_job_ids = fetch_pending_background_job_ids(conn)
+    failed_job_ids: list[int] = []
     for job_id in pending_job_ids:
-        schedule_background_job(app, job_id)
+        if not schedule_background_job(app, job_id):
+            failed_job_ids.append(job_id)
+    scheduled_count = len(pending_job_ids) - len(failed_job_ids)
+    if scheduled_count:
+        app.logger.info("Scheduled %s pending background jobs on startup", scheduled_count)
+    if failed_job_ids:
+        app.logger.warning("Could not schedule pending background jobs on startup: %s", failed_job_ids)
+    return {
+        "stale_running_failed": recovered_count,
+        "pending_found": len(pending_job_ids),
+        "pending_scheduled": scheduled_count,
+        "pending_schedule_failed_ids": failed_job_ids,
+    }
 
 
 def run_background_job(app: Flask, job_id: int) -> None:
