@@ -60,16 +60,206 @@ explicitamente `python app.py --host 0.0.0.0`.
 python -m pytest -q
 ```
 
+## Docker / Raspberry Pi
+
+Deployment previsto para Raspberry Pi 5 com Raspberry Pi OS 64-bit, Docker
+Compose e Cloudflare Tunnel. A app nao deve ser exposta diretamente a internet.
+O `docker-compose.yml` publica a porta apenas em `127.0.0.1:5000`, para ser
+usada como origem local do tunnel.
+
+Guia completo: [docs/raspberry-pi-deployment.md](docs/raspberry-pi-deployment.md).
+
+Criar a configuracao local, se ainda nao existir:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Construir a imagem:
+
+```powershell
+docker compose build
+```
+
+Arrancar:
+
+```powershell
+docker compose up -d
+```
+
+Parar:
+
+```powershell
+docker compose down
+```
+
+Ver logs:
+
+```powershell
+docker compose logs -f
+```
+
+Atualizar depois de `git pull`:
+
+```powershell
+git pull
+docker compose build
+docker compose up -d
+```
+
+O container corre com:
+
+```powershell
+gunicorn -w 1 --threads 4 -b 0.0.0.0:5000 app:app
+```
+
+Usa exatamente 1 worker porque o APScheduler corre dentro do processo da app;
+mais workers poderiam duplicar jobs agendados. As threads do Gunicorn sao
+aceitaveis neste deployment porque continuam dentro do mesmo processo worker.
+Enquanto o scheduler for in-process, nao aumentes `-w`, nao uses atalhos como
+`WEB_CONCURRENCY`, nao corras `docker compose up --scale monitoring-board=2` e
+nao arranques uma segunda instancia da app contra o mesmo `./data` sem
+redesenhar o agendamento.
+
+Os dados persistentes ficam na pasta local `./data`, montada no container como
+`/data`. O compose define `DATA_DIR=/data`, por isso a app usa:
+
+- `./data/monitoring_board.db`
+- `./data/uploads/`
+- `./data/backups/`
+- `./data/logs/`
+
+## Configuracao de producao
+
+Para acesso remoto interno, usa Cloudflare Tunnel com Cloudflare Access a
+frente da app. Mantem o Docker Compose a publicar apenas em
+`127.0.0.1:5000:5000`; nao abras port forwarding no router e nao publiques a
+porta Docker em `0.0.0.0`.
+
+No `.env` de producao:
+
+- Define `FLASK_SECRET_KEY` com um valor longo e aleatorio.
+- Define `APP_PASSWORD_HASH` ou `APP_PASSWORD`; `APP_PASSWORD_HASH` e preferivel.
+- Define as credenciais FusionSolar e Telegram apenas no `.env` ou em variaveis
+  de ambiente.
+- Mantem `SESSION_COOKIE_SECURE=true` quando o acesso dos utilizadores e por
+  HTTPS atraves do Cloudflare Tunnel.
+- Ajusta `MAX_UPLOAD_MB` se precisares de contratos PDF maiores que o limite
+  por defeito.
+
+Operacao segura:
+
+- Usa `docker compose up -d`; nao arranques Flask com `--debug` em producao.
+- Mantem exatamente um processo worker da app enquanto o APScheduler correr
+  dentro do Flask/Gunicorn.
+- Mantem Cloudflare Access a limitar os emails/utilizadores autorizados.
+- Faz backup da pasta `./data`, porque contem SQLite, uploads, backups e logs.
+- Nao envies `.env`, base de dados, PDFs, Excels ou logs para Git.
+- Roda periodicamente as passwords e tokens se alguem sair da equipa.
+
+## Backups e restore
+
+Os dados de runtime ficam em `DATA_DIR`. No Docker Compose deste projeto, isso
+corresponde a `./data` no host e `/data` dentro do container.
+
+O script [scripts/backup.sh](scripts/backup.sh) cria backups simples em
+`DATA_DIR/backups`:
+
+- `monitoring_board_YYYYMMDD_HHMMSS.db`
+- `uploads_YYYYMMDD_HHMMSS.tar.gz`, se `uploads/` existir e `INCLUDE_UPLOADS=1`
+
+O backup da base de dados usa `sqlite3 ".backup"` para criar uma copia
+consistente mesmo com WAL ativo. Por defeito, mantem os ultimos 14 backups e
+apaga ficheiros com mais de 30 dias.
+
+Backup manual no Raspberry Pi, a partir da pasta do projeto:
+
+```bash
+sudo apt install -y sqlite3 tar
+chmod +x scripts/backup.sh
+DATA_DIR=./data ./scripts/backup.sh
+```
+
+Para nao incluir `uploads/`:
+
+```bash
+DATA_DIR=./data INCLUDE_UPLOADS=0 ./scripts/backup.sh
+```
+
+Para alterar retencao:
+
+```bash
+DATA_DIR=./data KEEP_BACKUPS=30 DELETE_OLDER_THAN_DAYS=60 ./scripts/backup.sh
+```
+
+Cron diario, por exemplo todos os dias as 03:15:
+
+```bash
+crontab -e
+```
+
+Adicionar:
+
+```cron
+15 3 * * * cd /home/pi/Nem-sei && DATA_DIR=./data ./scripts/backup.sh >> ./data/logs/backup.log 2>&1
+```
+
+Verificar backups:
+
+```bash
+ls -lh ./data/backups
+sqlite3 ./data/backups/monitoring_board_YYYYMMDD_HHMMSS.db "PRAGMA integrity_check;"
+tar -tzf ./data/backups/uploads_YYYYMMDD_HHMMSS.tar.gz | head
+```
+
+Restore manual:
+
+1. Parar a app:
+
+```bash
+docker compose down
+```
+
+2. Fazer uma copia de seguranca do estado atual antes do restore:
+
+```bash
+cp ./data/monitoring_board.db ./data/monitoring_board.db.before_restore
+```
+
+3. Restaurar a base de dados:
+
+```bash
+cp ./data/backups/monitoring_board_YYYYMMDD_HHMMSS.db ./data/monitoring_board.db
+```
+
+4. Restaurar uploads, se necessario:
+
+```bash
+rm -rf ./data/uploads
+tar -C ./data -xzf ./data/backups/uploads_YYYYMMDD_HHMMSS.tar.gz
+```
+
+5. Arrancar novamente:
+
+```bash
+docker compose up -d
+docker compose logs -f
+```
+
+Este processo e apenas file-based. Ainda nao ha integracao com cloud backup.
+
 ## Ficheiros locais
 
 Estes ficheiros nao devem ir para Git:
 
 - `.env`
 - `monitoring_board.db`
+- sidecars SQLite como `monitoring_board.db-wal` e `monitoring_board.db-shm`
 - ficheiros Excel e PDF
 - `uploads/`
 - `backups/`
 - `logs/`
+- `data/`
 - `__pycache__/`
 - `SolarFusionAPI.txt`
 
