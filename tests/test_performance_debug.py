@@ -57,38 +57,9 @@ def test_performance_debug_route_renders_payload_safely(tmp_path) -> None:
     assert b"<script>alert(1)</script>" not in response.data
 
 
-def test_performance_list_query_uses_availability_fields(tmp_path, monkeypatch) -> None:
+def test_performance_page_hides_legacy_availability_ui(tmp_path) -> None:
     db_path = tmp_path / "performance-list.db"
     ensure_database(str(db_path))
-    captured_sql = ""
-
-    def fake_query_all(_conn, sql, _params=()):
-        nonlocal captured_sql
-        captured_sql = sql
-        return [
-            {
-                "asset_id": 1,
-                "project_name": "Central A",
-                "location": "Lisboa",
-                "active_contract": "yes",
-                "period_date": "2026-05-05",
-                "inverter_availability_pct": 80.0,
-                "capacity_availability_pct": 75.0,
-                "communication_availability_pct": 100.0,
-                "available_inverters": 4,
-                "total_inverters": 5,
-                "unavailable_inverters": 1,
-                "no_communication_devices": 0,
-                "string_availability_pct": 80.0,
-                "available_strings": 8,
-                "total_strings": 10,
-                "unavailable_strings": 2,
-                "affected_power_kw": 50.0,
-                "updated_at": "2026-05-06T10:00:00",
-            }
-        ]
-
-    monkeypatch.setattr(app_module, "query_all", fake_query_all)
     previous_db = flask_app.config["DATABASE"]
     flask_app.config["DATABASE"] = str(db_path)
     try:
@@ -101,12 +72,11 @@ def test_performance_list_query_uses_availability_fields(tmp_path, monkeypatch) 
         flask_app.config["DATABASE"] = previous_db
 
     assert response.status_code == 200
-    assert b"Central A" in response.data
-    assert "Disponibilidade por central".encode("utf-8") in response.data
-    assert "Producao kWh".encode("utf-8") not in response.data
-    assert "ad.*" not in captured_sql
-    assert "payload_json" not in captured_sql
-    assert "production_records" not in captured_sql
+    assert b"WAT" in response.data
+    assert "Disponibilidade por central".encode("utf-8") not in response.data
+    assert b"Disponibilidade strings" not in response.data
+    assert b"Sem comunicacao" not in response.data
+    assert b"Producao kWh" not in response.data
 
 
 def test_performance_post_runs_availability_sync(tmp_path, monkeypatch) -> None:

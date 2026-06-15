@@ -12,8 +12,9 @@
       <label>Base URL
         <input type="text" name="base_url" value="{{ config.base_url or '' }}" placeholder="https://xxx.fusionsolar.huawei.com">
       </label>
-      <label>Horarios do auto-sync
-        <input type="text" name="sync_hours" value="{{ config.sync_hours or '08:00,14:00' }}" placeholder="08:00,14:00">
+      <label>Auto-sync FusionSolar
+        <input type="text" value="De hora em hora" readonly>
+        <input type="hidden" name="sync_hours" value="00:00,01:00">
       </label>
     </div>
 
@@ -33,6 +34,9 @@
       <label>Device real-time endpoint
         <input type="text" name="device_real_time_endpoint" value="{{ config.device_real_time_endpoint or '/thirdData/getDevRealKpi' }}" placeholder="/thirdData/getDevRealKpi">
       </label>
+      <label>Device history endpoint
+        <input type="text" name="device_history_endpoint" value="{{ config.device_history_endpoint or '/thirdData/getDevHistoryKpi' }}" placeholder="/thirdData/getDevHistoryKpi">
+      </label>
       <label>Alarms endpoint
         <input type="text" name="alarms_endpoint" value="{{ config.alarms_endpoint or '/thirdData/getAlarmList' }}" placeholder="/thirdData/getAlarmList">
       </label>
@@ -45,16 +49,14 @@
     </div>
 
     <p class="muted">A password nao e mostrada. Deixa em branco para manter a atual; se estiver definida em `.env`, esse valor tem prioridade.</p>
-    <p class="muted">Defaults da documentacao: `/thirdData/login`, `/thirdData/stations`, `/thirdData/getStationRealKpi`, `/thirdData/getDevList`, `/thirdData/getDevRealKpi`, `/thirdData/getAlarmList`, `/thirdData/getKpiStationDay`, `/thirdData/getKpiStationMonth`.</p>
+    <p class="muted">Defaults da documentacao: `/thirdData/login`, `/thirdData/stations`, `/thirdData/getStationRealKpi`, `/thirdData/getDevList`, `/thirdData/getDevRealKpi`, `/thirdData/getDevHistoryKpi`, `/thirdData/getAlarmList`, `/thirdData/getKpiStationDay`, `/thirdData/getKpiStationMonth`.</p>
     <div class="hero-actions">
       <label class="checkbox-inline">
         <input type="checkbox" name="enabled" {{ 'checked' if config.enabled else '' }}>
         <span>Integracao ativa</span>
       </label>
-      <label class="checkbox-inline">
-        <input type="checkbox" name="auto_sync_enabled" {{ 'checked' if config.auto_sync_enabled else '' }}>
-        <span>Auto-sync 2x por dia</span>
-      </label>
+      <input type="hidden" name="auto_sync_enabled" value="on">
+      <span class="muted">Sync horario ativo; WAT diario as 00:05.</span>
     </div>
     <button class="button" type="submit">Guardar configuracao</button>
     {% if config.last_error %}

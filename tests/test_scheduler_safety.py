@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Any
 
 import app as app_module
@@ -77,13 +78,15 @@ def test_refresh_scheduler_registers_stable_single_instance_provider_jobs(tmp_pa
         assert len(second_ids) == len(set(second_ids))
         assert "fusionsolar-sync-1" not in second_ids
         assert "fusionsolar-sync-1" in fake_scheduler.remove_calls
-        assert any("fusionsolar" in job_id for job_id in second_ids)
+        assert "integration-sync-fusionsolar-hourly" in second_ids
+        assert "fusionsolar-wat-daily" in second_ids
         assert any("sigenergy" in job_id for job_id in second_ids)
 
         recurring_calls = [
             call
             for call in fake_scheduler.add_calls
-            if str(call["id"]).startswith("integration-sync-") or call["id"] == "telegram-daily-summary"
+            if str(call["id"]).startswith("integration-sync-")
+            or call["id"] in {"telegram-daily-summary", "fusionsolar-wat-daily"}
         ]
         assert recurring_calls
         for call in recurring_calls:
@@ -91,6 +94,18 @@ def test_refresh_scheduler_registers_stable_single_instance_provider_jobs(tmp_pa
             assert call["max_instances"] == 1
             assert call["coalesce"] is True
             assert call["misfire_grace_time"] == 1800
+
+        hourly_call = next(
+            call for call in fake_scheduler.add_calls if call["id"] == "integration-sync-fusionsolar-hourly"
+        )
+        assert hourly_call["trigger"] == "cron"
+        assert hourly_call["minute"] == 0
+        assert "hour" not in hourly_call
+
+        wat_call = next(call for call in fake_scheduler.add_calls if call["id"] == "fusionsolar-wat-daily")
+        assert wat_call["trigger"] == "cron"
+        assert wat_call["hour"] == 0
+        assert wat_call["minute"] == 5
     finally:
         flask_app.config["DATABASE"] = original_database
         app_module.SCHEDULER = original_scheduler
@@ -111,6 +126,36 @@ def test_scheduled_sigenergy_sync_uses_provider_neutral_wrapper(tmp_path, monkey
         flask_app.config["DATABASE"] = original_database
 
     assert calls == [(app_module.INTEGRATION_PROVIDER_SIGENERGY, "scheduled")]
+
+
+def test_scheduled_fusionsolar_wat_queues_previous_day(tmp_path, monkeypatch) -> None:
+    flask_app, original_database = _make_test_app(tmp_path)
+    scheduled: list[int] = []
+    monkeypatch.setattr(app_module, "schedule_background_job", lambda _app, job_id: scheduled.append(job_id) or True)
+    try:
+        with get_db(flask_app.config["DATABASE"]) as conn:
+            _insert_enabled_config(conn, app_module.INTEGRATION_PROVIDER_FUSIONSOLAR)
+
+        app_module.run_scheduled_fusionsolar_wat_backfill(flask_app)
+
+        with get_db(flask_app.config["DATABASE"]) as conn:
+            job = conn.execute(
+                "SELECT id, job_type, status, params_json FROM background_jobs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+    finally:
+        flask_app.config["DATABASE"] = original_database
+
+    params = json.loads(job["params_json"])
+    expected_date = (app_module.date.today() - app_module.timedelta(days=1)).isoformat()
+    assert job["job_type"] == "fusionsolar_inverter_availability_backfill"
+    assert job["status"] == "pending"
+    assert params == {
+        "from_date": expected_date,
+        "provider": app_module.INTEGRATION_PROVIDER_FUSIONSOLAR,
+        "to_date": expected_date,
+        "trigger_type": "scheduled",
+    }
+    assert scheduled == [job["id"]]
 
 
 def test_run_all_integration_syncs_dispatches_enabled_providers_through_wrapper(tmp_path, monkeypatch) -> None:

@@ -958,6 +958,89 @@ th {
   align-items: center;
 }
 
+.inverter-chart-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+  gap: 18px;
+}
+
+.inverter-chart-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.inverter-chart-header h3,
+.inverter-chart-header p {
+  margin: 0;
+}
+
+.inverter-chart-header strong {
+  font-size: 1.35rem;
+}
+
+.power-chart-scroll {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.power-chart {
+  display: block;
+  width: 100%;
+  min-width: 520px;
+  height: auto;
+}
+
+.power-chart-gridline {
+  stroke: var(--line);
+  stroke-width: 1;
+  stroke-dasharray: 4 4;
+}
+
+.power-chart-label {
+  fill: var(--muted);
+  font-size: 12px;
+}
+
+.power-chart-y-label {
+  text-anchor: end;
+}
+
+.power-chart-unit {
+  font-weight: 700;
+}
+
+.power-chart-area {
+  fill: color-mix(in srgb, var(--success) 30%, transparent);
+  stroke: none;
+}
+
+.power-chart-line {
+  fill: none;
+  stroke: var(--success);
+  stroke-width: 3;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.power-chart-empty {
+  display: grid;
+  place-items: center;
+  min-height: 220px;
+  border: 1px dashed var(--line);
+  border-radius: 14px;
+  color: var(--muted);
+  background: var(--row-bg);
+}
+
+@media (max-width: 700px) {
+  .inverter-chart-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 .installation-card {
   border: 1px solid var(--line);
   border-radius: 18px;

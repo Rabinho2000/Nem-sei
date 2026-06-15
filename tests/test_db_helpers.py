@@ -189,6 +189,9 @@ def test_ensure_database_creates_performance_indexes(tmp_path) -> None:
             "telegram_alerts": {"idx_telegram_alerts_alert_key_status"},
             "alert_blacklist": {"idx_alert_blacklist_asset_active"},
             "background_jobs": {"idx_background_jobs_type_status_created"},
+            "inverter_power_samples": {"idx_inverter_power_samples_asset_time"},
+            "inverter_availability_daily": {"idx_inverter_availability_daily_asset_date"},
+            "plant_availability_daily": {"idx_plant_availability_daily_date_asset"},
         }
 
         for table_name, index_names in expected_indexes.items():

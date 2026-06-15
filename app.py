@@ -78,6 +78,7 @@ INTEGRATION_PROVIDER_OPTIONS = [INTEGRATION_PROVIDER_FUSIONSOLAR, INTEGRATION_PR
 BACKGROUND_JOB_TYPES_PERFORMANCE = (
     "fusionsolar_production_sync",
     "fusionsolar_production_backfill",
+    "fusionsolar_inverter_availability_backfill",
     "fusionsolar_month_cycle",
     "performance_reference_recalculation",
 )
@@ -88,6 +89,7 @@ DEFAULT_FUSIONSOLAR_STATIONS_ENDPOINT = "/thirdData/stations"
 DEFAULT_FUSIONSOLAR_REALTIME_ENDPOINT = "/thirdData/getStationRealKpi"
 DEFAULT_FUSIONSOLAR_DEVICES_ENDPOINT = "/thirdData/getDevList"
 DEFAULT_FUSIONSOLAR_DEVICE_REALTIME_ENDPOINT = "/thirdData/getDevRealKpi"
+DEFAULT_FUSIONSOLAR_DEVICE_HISTORY_ENDPOINT = "/thirdData/getDevHistoryKpi"
 DEFAULT_FUSIONSOLAR_ALARMS_ENDPOINT = "/thirdData/getAlarmList"
 DEFAULT_FUSIONSOLAR_DAY_KPI_ENDPOINT = "/thirdData/getKpiStationDay"
 DEFAULT_FUSIONSOLAR_MONTH_KPI_ENDPOINT = "/thirdData/getKpiStationMonth"
@@ -104,6 +106,9 @@ FUSIONSOLAR_PERFORMANCE_MAX_API_CALLS = 20
 FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL: datetime | None = None
 DEFAULT_DEVICE_COMMUNICATION_THRESHOLD_MINUTES = 15
 FUSIONSOLAR_INVERTER_DEVICE_TYPE_IDS = {1, 38}
+INVERTER_AVAILABILITY_SLOT_MINUTES = 15
+INVERTER_AVAILABILITY_EDGE_TOLERANCE_MINUTES = 30
+LOW_INVERTER_AVAILABILITY_PCT = 90.0
 DEFAULT_STRING_PRESENT_VOLTAGE_THRESHOLD = 100.0
 DEFAULT_STRING_AUTO_LEARN_OBSERVATIONS = 2
 SIGENERGY_TOKEN_CACHE: dict[str, dict[str, Any]] = {}
@@ -720,96 +725,92 @@ def create_app() -> Flask:
                     "success",
                 )
                 return redirect(url_for("performance"))
+            if action == "sync_inverter_time_availability":
+                from_date = parse_date_value(request.form.get("from_date", ""))
+                to_date = parse_date_value(request.form.get("to_date", ""))
+                search = request.form.get("search", "").strip()
+                om_only = request.form.get("om_only", "yes").strip()
+                if not from_date or not to_date or from_date > to_date:
+                    flash("Intervalo invalido para disponibilidade dos inversores.", "error")
+                    return redirect(url_for("performance"))
+                if to_date >= date.today():
+                    flash("A disponibilidade temporal so pode ser calculada para dias fechados.", "error")
+                    return redirect(url_for("performance"))
+                if (to_date - from_date).days > 31:
+                    flash("Calcula no maximo 32 dias de cada vez.", "error")
+                    return redirect(url_for("performance"))
+                job_id, created = create_background_job(
+                    g.db,
+                    "fusionsolar_inverter_availability_backfill",
+                    {
+                        "provider": INTEGRATION_PROVIDER_FUSIONSOLAR,
+                        "from_date": from_date.isoformat(),
+                        "to_date": to_date.isoformat(),
+                    },
+                )
+                g.db.commit()
+                if created:
+                    schedule_background_job(current_app._get_current_object(), job_id)
+                    flash(f"Calculo WAT enviado para background (job #{job_id}).", "success")
+                else:
+                    flash(f"Ja existe um calculo WAT pendente/em execucao (job #{job_id}).", "warning")
+                return redirect(
+                    url_for(
+                        "performance",
+                        period="custom",
+                        from_date=from_date,
+                        to_date=to_date,
+                        search=search,
+                        om_only=om_only,
+                    )
+                )
             flash("Acao de disponibilidade invalida.", "error")
             return redirect(url_for("performance"))
 
+        asset_id = request.args.get("asset_id", "").strip()
         search = request.args.get("search", "").strip()
         om_only = request.args.get("om_only", "yes").strip()
-        asset_id = request.args.get("asset_id", "").strip()
-        issue_only = request.args.get("issue_only", "no").strip()
-
-        conditions = ["COALESCE(a.monitoring_status, 'active') != 'disabled'"]
-        params: list[Any] = []
-        if search:
-            conditions.append("(a.project_name LIKE ? OR a.location LIKE ? OR a.company_name LIKE ? OR a.alias_blob LIKE ?)")
-            wildcard = f"%{search}%"
-            params.extend([wildcard, wildcard, wildcard, wildcard])
-        if om_only == "yes":
-            conditions.append("a.active_contract = 'yes'")
-        if asset_id.isdigit():
-            conditions.append("a.id = ?")
-            params.append(int(asset_id))
-        if issue_only == "yes":
-            conditions.append("(COALESCE(ad.unavailable_inverters, 0) > 0 OR COALESCE(ad.no_communication_devices, 0) > 0)")
-        where_sql = " AND ".join(conditions)
-
-        records = query_all(
-            g.db,
-            f"""
-            SELECT
-                a.id AS asset_id,
-                a.project_name,
-                a.location,
-                a.active_contract,
-                ad.period_date,
-                ad.inverter_availability_pct,
-                ad.capacity_availability_pct,
-                ad.communication_availability_pct,
-                ad.string_availability_pct,
-                ad.available_inverters,
-                ad.total_inverters,
-                ad.unavailable_inverters,
-                ad.no_communication_devices,
-                ad.available_strings,
-                ad.total_strings,
-                ad.unavailable_strings,
-                ad.affected_power_kw,
-                ad.updated_at
-            FROM assets a
-            LEFT JOIN availability_daily ad
-              ON ad.id = (
-                  SELECT latest.id
-                  FROM availability_daily latest
-                  WHERE latest.asset_id = a.id
-                  ORDER BY latest.period_date DESC, latest.id DESC
-                  LIMIT 1
-              )
-            WHERE {where_sql}
-            ORDER BY
-                CASE
-                    WHEN COALESCE(ad.no_communication_devices, 0) > 0 THEN 1
-                    WHEN COALESCE(ad.unavailable_inverters, 0) > 0 THEN 2
-                    WHEN ad.inverter_availability_pct IS NULL THEN 3
-                    ELSE 4
-                END,
-                a.project_name COLLATE NOCASE
-            """,
-            params,
+        availability_period = request.args.get("period", "yesterday").strip()
+        availability_from, availability_to = resolve_inverter_availability_period(
+            availability_period,
+            request.args.get("from_date", ""),
+            request.args.get("to_date", ""),
         )
-        pct_values = [float(row["inverter_availability_pct"]) for row in records if row["inverter_availability_pct"] is not None]
-        affected_values = [float(row["affected_power_kw"]) for row in records if row["affected_power_kw"] is not None]
-        total_strings = sum(int(row["total_strings"] or 0) for row in records)
-        availability_summary = {
-            "assets_with_data": len(pct_values),
-            "average_inverter_availability_pct": round(sum(pct_values) / len(pct_values), 2) if pct_values else None,
-            "unavailable_inverters": sum(int(row["unavailable_inverters"] or 0) for row in records),
-            "no_communication_devices": sum(int(row["no_communication_devices"] or 0) for row in records),
-            "affected_power_kw": round(sum(affected_values), 2) if affected_values else None,
-            "string_availability_pct": (
-                round(sum(int(row["available_strings"] or 0) for row in records) / total_strings * 100, 2)
-                if total_strings
-                else None
-            ),
-            "unavailable_strings": sum(int(row["unavailable_strings"] or 0) for row in records),
-        }
+
+        inverter_time_report = get_inverter_availability_report(
+            g.db,
+            availability_from,
+            availability_to,
+            asset_id=int(asset_id) if asset_id.isdigit() else None,
+            om_only=om_only == "yes",
+            search=search,
+        )
+        inverter_chart_report = (
+            get_inverter_availability_chart_report(
+                g.db,
+                int(asset_id),
+                availability_from,
+                availability_to,
+            )
+            if asset_id.isdigit()
+            else None
+        )
         return render_template(
             "performance.html",
-            records=records,
+            selected_asset_id=asset_id,
             search=search,
             om_only=om_only,
-            selected_asset_id=asset_id,
-            issue_only=issue_only,
-            availability_summary=availability_summary,
+            inverter_time_report=inverter_time_report,
+            inverter_chart_report=inverter_chart_report,
+            availability_period=availability_period,
+            availability_from=availability_from,
+            availability_to=availability_to,
+            availability_closed_max=date.today() - timedelta(days=1),
+            background_jobs=fetch_latest_background_jobs(
+                g.db,
+                job_types=("fusionsolar_inverter_availability_backfill",),
+            ),
+            fusionsolar_api_warning=get_fusionsolar_performance_cooldown_reason(g.db),
         )
 
     @app.route("/performance/debug/<int:record_id>")
@@ -2417,7 +2418,8 @@ def create_app() -> Flask:
                     SET username = ?,
                         password = CASE WHEN ? != '' THEN ? ELSE password END,
                         base_url = ?, login_endpoint = ?, plants_endpoint = ?,
-                        real_time_endpoint = ?, device_list_endpoint = ?, device_real_time_endpoint = ?, alarms_endpoint = ?,
+                        real_time_endpoint = ?, device_list_endpoint = ?, device_real_time_endpoint = ?,
+                        device_history_endpoint = ?, alarms_endpoint = ?,
                         day_kpi_endpoint = ?, month_kpi_endpoint = ?,
                         enabled = ?, auto_sync_enabled = ?, sync_hours = ?, updated_at = ?
                     WHERE provider = ?
@@ -2432,6 +2434,7 @@ def create_app() -> Flask:
                         request.form.get("real_time_endpoint", "").strip(),
                         request.form.get("device_list_endpoint", "").strip(),
                         request.form.get("device_real_time_endpoint", "").strip(),
+                        request.form.get("device_history_endpoint", "").strip(),
                         request.form.get("alarms_endpoint", "").strip(),
                         request.form.get("day_kpi_endpoint", "").strip(),
                         request.form.get("month_kpi_endpoint", "").strip(),
@@ -3122,6 +3125,7 @@ def ensure_database(path: str) -> None:
                 real_time_endpoint TEXT,
                 device_list_endpoint TEXT,
                 device_real_time_endpoint TEXT,
+                device_history_endpoint TEXT,
                 alarms_endpoint TEXT,
                 day_kpi_endpoint TEXT,
                 month_kpi_endpoint TEXT,
@@ -3246,6 +3250,54 @@ def ensure_database(path: str) -> None:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(asset_id, provider, period_date),
+                FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS inverter_power_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset_id INTEGER NOT NULL,
+                provider TEXT NOT NULL,
+                external_station_id TEXT NOT NULL,
+                inverter_id TEXT NOT NULL,
+                inverter_name TEXT,
+                inverter_power_kw REAL,
+                sample_time TEXT NOT NULL,
+                active_power_kw REAL,
+                raw_payload TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(provider, inverter_id, sample_time),
+                FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS inverter_availability_daily (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset_id INTEGER NOT NULL,
+                provider TEXT NOT NULL,
+                availability_date TEXT NOT NULL,
+                inverter_id TEXT NOT NULL,
+                inverter_name TEXT,
+                inverter_power_kw REAL,
+                valid_slots INTEGER NOT NULL,
+                available_slots INTEGER NOT NULL,
+                unavailable_slots INTEGER NOT NULL,
+                availability_pct REAL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(provider, inverter_id, availability_date),
+                FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS plant_availability_daily (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset_id INTEGER NOT NULL,
+                provider TEXT NOT NULL,
+                availability_date TEXT NOT NULL,
+                valid_slots INTEGER NOT NULL,
+                weighted_availability_pct REAL,
+                inverter_count INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(provider, asset_id, availability_date),
                 FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE
             );
 
@@ -3417,11 +3469,14 @@ def ensure_database(path: str) -> None:
         ensure_column(conn, "integration_configs", "real_time_endpoint TEXT")
         ensure_column(conn, "integration_configs", "device_list_endpoint TEXT")
         ensure_column(conn, "integration_configs", "device_real_time_endpoint TEXT")
+        ensure_column(conn, "integration_configs", "device_history_endpoint TEXT")
         ensure_column(conn, "integration_configs", "day_kpi_endpoint TEXT")
         ensure_column(conn, "integration_configs", "month_kpi_endpoint TEXT")
         ensure_column(conn, "production_records", "selected_production_key TEXT")
         ensure_column(conn, "production_records", "selected_production_raw_value TEXT")
         ensure_column(conn, "production_records", "reference_diagnostic_json TEXT")
+        disable_removed_inverter_devices(conn)
+        populate_missing_inverter_rated_power(conn)
         populate_missing_installation_groups(conn)
         populate_missing_group_metadata(conn)
         ensure_predefined_export_templates(conn)
@@ -3485,6 +3540,15 @@ def ensure_database_indexes(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_availability_daily_asset_provider_period
             ON availability_daily(asset_id, provider, period_date DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_inverter_power_samples_asset_time
+            ON inverter_power_samples(asset_id, sample_time);
+
+        CREATE INDEX IF NOT EXISTS idx_inverter_availability_daily_asset_date
+            ON inverter_availability_daily(asset_id, availability_date);
+
+        CREATE INDEX IF NOT EXISTS idx_plant_availability_daily_date_asset
+            ON plant_availability_daily(availability_date, asset_id);
 
         CREATE INDEX IF NOT EXISTS idx_provider_device_expected_strings_device_index
             ON provider_device_expected_strings(provider_device_id, string_index);
@@ -7299,6 +7363,10 @@ def get_fusionsolar_env_config() -> dict[str, str]:
             "FUSIONSOLAR_DEVICE_REALTIME_ENDPOINT",
             DEFAULT_FUSIONSOLAR_DEVICE_REALTIME_ENDPOINT,
         ).strip(),
+        "device_history_endpoint": os.environ.get(
+            "FUSIONSOLAR_DEVICE_HISTORY_ENDPOINT",
+            DEFAULT_FUSIONSOLAR_DEVICE_HISTORY_ENDPOINT,
+        ).strip(),
         "alarms_endpoint": os.environ.get("FUSIONSOLAR_ALARMS_ENDPOINT", DEFAULT_FUSIONSOLAR_ALARMS_ENDPOINT).strip(),
         "day_kpi_endpoint": os.environ.get(
             "FUSIONSOLAR_DAY_KPI_ENDPOINT",
@@ -7347,6 +7415,7 @@ def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
                 real_time_endpoint = CASE WHEN COALESCE(real_time_endpoint, '') = '' THEN ? ELSE real_time_endpoint END,
                 device_list_endpoint = CASE WHEN COALESCE(device_list_endpoint, '') = '' THEN ? ELSE device_list_endpoint END,
                 device_real_time_endpoint = CASE WHEN COALESCE(device_real_time_endpoint, '') = '' THEN ? ELSE device_real_time_endpoint END,
+                device_history_endpoint = CASE WHEN COALESCE(device_history_endpoint, '') = '' THEN ? ELSE device_history_endpoint END,
                 alarms_endpoint = CASE WHEN COALESCE(alarms_endpoint, '') = '' THEN ? ELSE alarms_endpoint END,
                 day_kpi_endpoint = CASE WHEN COALESCE(day_kpi_endpoint, '') = '' THEN ? ELSE day_kpi_endpoint END,
                 month_kpi_endpoint = CASE WHEN COALESCE(month_kpi_endpoint, '') = '' THEN ? ELSE month_kpi_endpoint END,
@@ -7362,6 +7431,7 @@ def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
                 env_config["real_time_endpoint"],
                 env_config["device_list_endpoint"],
                 env_config["device_real_time_endpoint"],
+                env_config["device_history_endpoint"],
                 env_config["alarms_endpoint"],
                 env_config["day_kpi_endpoint"],
                 env_config["month_kpi_endpoint"],
@@ -7375,10 +7445,10 @@ def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
             """
             INSERT INTO integration_configs (
                 provider, username, password, base_url, login_endpoint, plants_endpoint, real_time_endpoint,
-                device_list_endpoint, device_real_time_endpoint, alarms_endpoint,
+                device_list_endpoint, device_real_time_endpoint, device_history_endpoint, alarms_endpoint,
                 day_kpi_endpoint, month_kpi_endpoint,
                 enabled, auto_sync_enabled, sync_hours, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 INTEGRATION_PROVIDER_FUSIONSOLAR,
@@ -7390,6 +7460,7 @@ def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
                 env_config["real_time_endpoint"],
                 env_config["device_list_endpoint"],
                 env_config["device_real_time_endpoint"],
+                env_config["device_history_endpoint"],
                 env_config["alarms_endpoint"],
                 env_config["day_kpi_endpoint"],
                 env_config["month_kpi_endpoint"],
@@ -7506,7 +7577,11 @@ def refresh_integration_scheduler(app: Flask) -> None:
     if SCHEDULER is None:
         return
     for job in list(SCHEDULER.get_jobs()):
-        if job.id.startswith("integration-sync-") or job.id.startswith("fusionsolar-sync-") or job.id == "telegram-daily-summary":
+        if (
+            job.id.startswith("integration-sync-")
+            or job.id.startswith("fusionsolar-sync-")
+            or job.id in {"telegram-daily-summary", "fusionsolar-wat-daily"}
+        ):
             SCHEDULER.remove_job(job.id)
 
     with closing(get_db(app.config["DATABASE"])) as conn:
@@ -7525,9 +7600,36 @@ def refresh_integration_scheduler(app: Flask) -> None:
             misfire_grace_time=1800,
         )
     for config in configs:
-        if config is None or not config["enabled"] or not config["auto_sync_enabled"]:
+        if config is None or not config["enabled"]:
             continue
         provider = str(config["provider"])
+        if provider == INTEGRATION_PROVIDER_FUSIONSOLAR:
+            SCHEDULER.add_job(
+                func=run_scheduled_integration_sync,
+                trigger="cron",
+                minute=0,
+                args=[app, provider],
+                id="integration-sync-fusionsolar-hourly",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=1800,
+            )
+            SCHEDULER.add_job(
+                func=run_scheduled_fusionsolar_wat_backfill,
+                trigger="cron",
+                hour=0,
+                minute=5,
+                args=[app],
+                id="fusionsolar-wat-daily",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=1800,
+            )
+            continue
+        if not config["auto_sync_enabled"]:
+            continue
         for index, item in enumerate(normalize_sync_hours(config["sync_hours"] or DEFAULT_FUSIONSOLAR_SYNC_HOURS).split(","), start=1):
             hour, minute = item.split(":")
             SCHEDULER.add_job(
@@ -7567,6 +7669,40 @@ def run_scheduled_integration_sync(app: Flask, provider: str) -> None:
 
 def run_scheduled_fusionsolar_sync(app: Flask) -> None:
     run_scheduled_integration_sync(app, INTEGRATION_PROVIDER_FUSIONSOLAR)
+
+
+def run_scheduled_fusionsolar_wat_backfill(app: Flask) -> None:
+    target_date = date.today() - timedelta(days=1)
+    with app.app_context():
+        with closing(get_db(app.config["DATABASE"])) as conn:
+            config = get_integration_config(conn, INTEGRATION_PROVIDER_FUSIONSOLAR)
+            if config is None or not config["enabled"]:
+                current_app.logger.info("Scheduled FusionSolar WAT skipped because integration is disabled")
+                return
+            job_id, created = create_background_job(
+                conn,
+                "fusionsolar_inverter_availability_backfill",
+                {
+                    "provider": INTEGRATION_PROVIDER_FUSIONSOLAR,
+                    "from_date": target_date.isoformat(),
+                    "to_date": target_date.isoformat(),
+                    "trigger_type": "scheduled",
+                },
+            )
+            conn.commit()
+            if created:
+                schedule_background_job(app, job_id)
+                current_app.logger.info(
+                    "Scheduled FusionSolar WAT queued: job_id=%s target_date=%s",
+                    job_id,
+                    target_date,
+                )
+            else:
+                current_app.logger.info(
+                    "Scheduled FusionSolar WAT reused existing job: job_id=%s target_date=%s",
+                    job_id,
+                    target_date,
+                )
 
 
 def schedule_background_job(app: Flask, job_id: int) -> bool:
@@ -7670,6 +7806,17 @@ def run_background_job_payload(conn: sqlite3.Connection, job_type: str, params: 
             max_api_calls=int(params.get("max_api_calls") or FUSIONSOLAR_PERFORMANCE_MAX_API_CALLS),
         )
 
+    if job_type == "fusionsolar_inverter_availability_backfill":
+        from_date = parse_date_value(str(params.get("from_date") or ""))
+        to_date = parse_date_value(str(params.get("to_date") or ""))
+        if from_date is None or to_date is None or from_date > to_date:
+            raise ValueError("Intervalo invalido para backfill WAT.")
+        return run_fusionsolar_inverter_availability_backfill(
+            conn,
+            from_date=from_date,
+            to_date=to_date,
+        )
+
     if job_type == "fusionsolar_month_cycle":
         raw_asset_ids = params.get("asset_ids") or []
         asset_ids = [int(value) for value in raw_asset_ids if str(value).isdigit()]
@@ -7691,6 +7838,7 @@ def get_fusionsolar_endpoint_config(config: sqlite3.Row | dict[str, Any]) -> dic
         "real_time_endpoint": str(config["real_time_endpoint"] or DEFAULT_FUSIONSOLAR_REALTIME_ENDPOINT).strip() or DEFAULT_FUSIONSOLAR_REALTIME_ENDPOINT,
         "device_list_endpoint": str(config["device_list_endpoint"] or DEFAULT_FUSIONSOLAR_DEVICES_ENDPOINT).strip() or DEFAULT_FUSIONSOLAR_DEVICES_ENDPOINT,
         "device_real_time_endpoint": str(config["device_real_time_endpoint"] or DEFAULT_FUSIONSOLAR_DEVICE_REALTIME_ENDPOINT).strip() or DEFAULT_FUSIONSOLAR_DEVICE_REALTIME_ENDPOINT,
+        "device_history_endpoint": str(config["device_history_endpoint"] or DEFAULT_FUSIONSOLAR_DEVICE_HISTORY_ENDPOINT).strip() or DEFAULT_FUSIONSOLAR_DEVICE_HISTORY_ENDPOINT,
         "alarms_endpoint": str(config["alarms_endpoint"] or DEFAULT_FUSIONSOLAR_ALARMS_ENDPOINT).strip() or DEFAULT_FUSIONSOLAR_ALARMS_ENDPOINT,
         "day_kpi_endpoint": str(config["day_kpi_endpoint"] or DEFAULT_FUSIONSOLAR_DAY_KPI_ENDPOINT).strip() or DEFAULT_FUSIONSOLAR_DAY_KPI_ENDPOINT,
         "month_kpi_endpoint": str(config["month_kpi_endpoint"] or DEFAULT_FUSIONSOLAR_MONTH_KPI_ENDPOINT).strip() or DEFAULT_FUSIONSOLAR_MONTH_KPI_ENDPOINT,
@@ -7896,6 +8044,99 @@ def fetch_fusionsolar_device_realtime_map(
                     if value:
                         real_time_map[value] = row
     return real_time_map
+
+
+def fetch_fusionsolar_device_history(
+    session: requests.Session,
+    *,
+    base_url: str,
+    endpoint: str,
+    devices: list[dict[str, Any]],
+    target_date: date,
+    call_delay_seconds: float = 0,
+    sleeper: Any = time.sleep,
+) -> list[dict[str, Any]]:
+    url = build_provider_url(base_url, endpoint)
+    start_time = int(datetime.combine(target_date, datetime.min.time()).timestamp() * 1000)
+    end_time = int(datetime.combine(target_date + timedelta(days=1), datetime.min.time()).timestamp() * 1000) - 1
+    rows: list[dict[str, Any]] = []
+    calls_made = 0
+    devices_by_type: dict[int, list[dict[str, Any]]] = {}
+    for device in devices:
+        if device.get("dev_type_id") is None or not device.get("external_device_id"):
+            continue
+        devices_by_type.setdefault(int(device["dev_type_id"]), []).append(device)
+    for dev_type_id, typed_devices in devices_by_type.items():
+        for group in [typed_devices[index : index + 10] for index in range(0, len(typed_devices), 10)]:
+            if calls_made and call_delay_seconds > 0:
+                sleeper(call_delay_seconds)
+            payload = post_fusionsolar_json(
+                session,
+                url,
+                {
+                    "devIds": ",".join(str(device["external_device_id"]) for device in group),
+                    "devTypeId": dev_type_id,
+                    "startTime": start_time,
+                    "endTime": end_time,
+                },
+                expected_message="Falha ao obter o historico dos inversores FusionSolar.",
+            )
+            calls_made += 1
+            rows.extend(normalize_fusionsolar_device_history_rows(payload.get("data"), group))
+    return rows
+
+
+def normalize_fusionsolar_device_history_rows(
+    data: Any,
+    devices: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    device_by_id: dict[str, dict[str, Any]] = {}
+    for device in devices:
+        for key in ("external_device_id", "dev_dn", "sn"):
+            value = str(device.get(key) or "").strip()
+            if value:
+                device_by_id[value] = device
+    fallback_device = devices[0] if len(devices) == 1 else None
+    normalized: list[dict[str, Any]] = []
+
+    def visit(value: Any, inherited_device: dict[str, Any] | None = None) -> None:
+        if isinstance(value, list):
+            for item in value:
+                visit(item, inherited_device)
+            return
+        if not isinstance(value, dict):
+            return
+        raw_device_id = first_non_empty(value, ["devId", "deviceId", "devDn", "deviceDn", "esnCode", "sn"])
+        device = device_by_id.get(str(raw_device_id or "").strip()) or inherited_device or fallback_device
+        data_map = value.get("dataItemMap") if isinstance(value.get("dataItemMap"), dict) else value
+        sample_time = parse_datetime_value(first_non_empty(value, ["collectTime", "sampleTime", "time", "timestamp"]))
+        if sample_time is None and data_map is not value:
+            sample_time = parse_datetime_value(first_non_empty(data_map, ["collectTime", "sampleTime", "time", "timestamp"]))
+        active_power = first_non_empty(data_map, ["active_power", "activePower", "active_power_kw", "power"])
+        if device and sample_time is not None and active_power not in (None, ""):
+            normalized.append(
+                {
+                    **device,
+                    "sample_time": sample_time,
+                    "active_power_kw": normalize_power_to_kw(active_power),
+                    "raw_payload": value,
+                }
+            )
+            return
+        nested_found = False
+        for key in ("list", "data", "historyData", "dataList", "records", "dataItemMap"):
+            nested = value.get(key)
+            if isinstance(nested, (list, dict)) and nested is not value:
+                nested_found = True
+                visit(nested, device)
+        if not nested_found:
+            for key, nested in value.items():
+                mapped_device = device_by_id.get(str(key))
+                if mapped_device and isinstance(nested, (list, dict)):
+                    visit(nested, mapped_device)
+
+    visit(data)
+    return normalized
 
 
 def fetch_fusionsolar_alarm_map(
@@ -8929,6 +9170,7 @@ def learn_expected_strings_from_voltage(
             """,
             (expected, observed_count, observed_at, now, existing["id"]),
         )
+
     rows = query_all(
         conn,
         """
@@ -8944,6 +9186,8 @@ def learn_expected_strings_from_voltage(
 
 def normalize_fusionsolar_device_identity(row: dict[str, Any]) -> dict[str, Any]:
     dev_type_id = parse_int_value(first_non_empty(row, ["devTypeId", "dev_type_id", "deviceTypeId"]))
+    model = first_non_empty(row, ["model", "devModel", "deviceModel", "invType"])
+    rated_power_kw = normalize_power_to_kw(first_non_empty(row, ["ratedPower", "rated_power", "capacity", "nominalPower"]))
     return {
         "station_code": first_non_empty(row, ["stationCode", "plantCode"]),
         "external_device_id": first_non_empty(row, ["devId", "id", "devDn", "deviceDn", "esnCode", "sn"]),
@@ -8951,8 +9195,8 @@ def normalize_fusionsolar_device_identity(row: dict[str, Any]) -> dict[str, Any]
         "sn": first_non_empty(row, ["esnCode", "sn"]),
         "device_name": first_non_empty(row, ["devName", "deviceName", "name"]),
         "dev_type_id": dev_type_id,
-        "model": first_non_empty(row, ["model", "devModel", "deviceModel"]),
-        "rated_power_kw": normalize_power_to_kw(first_non_empty(row, ["ratedPower", "rated_power", "capacity", "nominalPower"])),
+        "model": model,
+        "rated_power_kw": rated_power_kw if rated_power_kw is not None else infer_inverter_power_from_model(model),
     }
 
 
@@ -8961,6 +9205,471 @@ def normalize_power_to_kw(value: Any) -> float | None:
     if parsed is None:
         return None
     return parsed / 1000 if parsed > 1000 else parsed
+
+
+def infer_inverter_power_from_model(model: str | None) -> float | None:
+    normalized = str(model or "").upper().replace(" ", "")
+    match = re.search(r"(?:SUN2000-|^)(\d+(?:[.,]\d+)?)(?:KTL|K(?:-|$))", normalized)
+    if not match:
+        return None
+    return parse_float_value(match.group(1).replace(",", "."))
+
+
+def populate_missing_inverter_rated_power(conn: sqlite3.Connection) -> int:
+    rows = conn.execute(
+        """
+        SELECT id, external_device_id, model, payload_json
+        FROM provider_devices
+        WHERE rated_power_kw IS NULL OR rated_power_kw <= 0
+        """
+    ).fetchall()
+    updated = 0
+    for row in rows:
+        model = row["model"]
+        if not model and row["payload_json"]:
+            try:
+                payload = json.loads(row["payload_json"])
+                model = first_non_empty(payload, ["model", "devModel", "deviceModel", "invType"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                model = None
+        rated_power_kw = infer_inverter_power_from_model(model)
+        if rated_power_kw is None:
+            continue
+        conn.execute(
+            "UPDATE provider_devices SET rated_power_kw = ? WHERE id = ?",
+            (rated_power_kw, row["id"]),
+        )
+        conn.execute(
+            """
+            UPDATE inverter_availability_daily
+            SET inverter_power_kw = ?
+            WHERE provider = ? AND inverter_id = ?
+              AND (inverter_power_kw IS NULL OR inverter_power_kw <= 0)
+            """,
+            (rated_power_kw, INTEGRATION_PROVIDER_FUSIONSOLAR, row["external_device_id"]),
+        )
+        conn.execute(
+            """
+            UPDATE inverter_power_samples
+            SET inverter_power_kw = ?
+            WHERE provider = ? AND inverter_id = ?
+              AND (inverter_power_kw IS NULL OR inverter_power_kw <= 0)
+            """,
+            (rated_power_kw, INTEGRATION_PROVIDER_FUSIONSOLAR, row["external_device_id"]),
+        )
+        updated += 1
+    return updated
+
+
+def disable_removed_inverter_devices(conn: sqlite3.Connection) -> int:
+    rows = conn.execute(
+        "SELECT id, device_name FROM provider_devices WHERE enabled = 1"
+    ).fetchall()
+    removed_ids = [int(row["id"]) for row in rows if is_removed_inverter_name(row["device_name"])]
+    if removed_ids:
+        conn.executemany(
+            "UPDATE provider_devices SET enabled = 0 WHERE id = ?",
+            [(device_id,) for device_id in removed_ids],
+        )
+    return len(removed_ids)
+
+
+def is_removed_inverter_name(device_name: str | None) -> bool:
+    normalized = normalize_name(str(device_name or ""))
+    return any(marker in normalized for marker in ("removido", "removed"))
+
+
+def is_inverter_available(active_power_kw: float | None) -> bool:
+    return active_power_kw is not None and active_power_kw > 0
+
+
+def inverter_availability_slot(sample_time: datetime) -> datetime:
+    minute = sample_time.minute - (sample_time.minute % INVERTER_AVAILABILITY_SLOT_MINUTES)
+    return sample_time.replace(minute=minute, second=0, microsecond=0)
+
+
+def apply_inverter_edge_tolerance(
+    valid_slots: set[datetime],
+    tolerance_minutes: int = INVERTER_AVAILABILITY_EDGE_TOLERANCE_MINUTES,
+) -> set[datetime]:
+    slots_by_date: dict[date, list[datetime]] = {}
+    for slot in valid_slots:
+        slots_by_date.setdefault(slot.date(), []).append(slot)
+    considered: set[datetime] = set()
+    tolerance = timedelta(minutes=max(tolerance_minutes, 0))
+    for day_slots in slots_by_date.values():
+        ordered = sorted(day_slots)
+        if not ordered:
+            continue
+        first_slot = ordered[0]
+        last_slot = ordered[-1]
+        considered.update(
+            slot
+            for slot in ordered
+            if slot - first_slot >= tolerance and last_slot - slot >= tolerance
+        )
+    return considered
+
+
+def calculate_inverter_daily_availability(
+    samples: list[dict[str, Any]],
+    valid_slots: set[datetime] | None = None,
+    edge_tolerance_minutes: int = INVERTER_AVAILABILITY_EDGE_TOLERANCE_MINUTES,
+) -> dict[str, Any]:
+    available_slots = {
+        inverter_availability_slot(sample["sample_time"])
+        for sample in samples
+        if isinstance(sample.get("sample_time"), datetime) and is_inverter_available(sample.get("active_power_kw"))
+    }
+    raw_valid_slots = set(valid_slots) if valid_slots is not None else set(available_slots)
+    considered_slots = apply_inverter_edge_tolerance(raw_valid_slots, edge_tolerance_minutes)
+    available_count = len(available_slots & considered_slots)
+    valid_count = len(considered_slots)
+    return {
+        "valid_slots": valid_count,
+        "available_slots": available_count,
+        "unavailable_slots": max(valid_count - available_count, 0),
+        "availability_pct": round(available_count / valid_count * 100, 2) if valid_count else None,
+    }
+
+
+def calculate_weighted_plant_availability(inverter_rows: list[dict[str, Any]]) -> float | None:
+    rows = [row for row in inverter_rows if row.get("availability_pct") is not None]
+    if not rows:
+        return None
+    powers = [parse_float_value(row.get("inverter_power_kw")) for row in rows]
+    if all(power is not None and power > 0 for power in powers):
+        total_power = sum(float(power) for power in powers if power is not None)
+        return round(
+            sum(float(row["availability_pct"]) * float(power) for row, power in zip(rows, powers) if power is not None)
+            / total_power,
+            2,
+        )
+    return round(sum(float(row["availability_pct"]) for row in rows) / len(rows), 2)
+
+
+def resolve_inverter_availability_period(
+    period: str,
+    raw_from_date: str = "",
+    raw_to_date: str = "",
+) -> tuple[date, date]:
+    yesterday = date.today() - timedelta(days=1)
+    if period == "current_month":
+        return yesterday.replace(day=1), yesterday
+    if period == "previous_month":
+        current_month_start = date.today().replace(day=1)
+        previous_month_end = current_month_start - timedelta(days=1)
+        return previous_month_end.replace(day=1), previous_month_end
+    if period == "custom":
+        from_date = parse_date_value(raw_from_date) or yesterday
+        to_date = min(parse_date_value(raw_to_date) or yesterday, yesterday)
+        return from_date, to_date
+    return yesterday, yesterday
+
+
+def get_inverter_availability_report(
+    conn: sqlite3.Connection,
+    from_date: date,
+    to_date: date,
+    *,
+    asset_id: int | None = None,
+    om_only: bool = True,
+    search: str = "",
+) -> dict[str, Any]:
+    if from_date > to_date:
+        return {
+            "average_pct": None,
+            "plants": [],
+            "inverters": [],
+            "worst_plant": None,
+            "low_availability_count": 0,
+        }
+    conditions = [
+        "iad.provider = ?",
+        "iad.availability_date BETWEEN ? AND ?",
+        """EXISTS (
+            SELECT 1
+            FROM inverter_power_samples ips
+            WHERE ips.provider = iad.provider
+              AND ips.asset_id = iad.asset_id
+              AND ips.inverter_id = iad.inverter_id
+              AND ips.sample_time >= ? AND ips.sample_time < ?
+        )""",
+    ]
+    params: list[Any] = [
+        INTEGRATION_PROVIDER_FUSIONSOLAR,
+        from_date.isoformat(),
+        to_date.isoformat(),
+        datetime.combine(from_date, datetime.min.time()).isoformat(timespec="seconds"),
+        datetime.combine(to_date + timedelta(days=1), datetime.min.time()).isoformat(timespec="seconds"),
+    ]
+    if asset_id is not None:
+        conditions.append("iad.asset_id = ?")
+        params.append(asset_id)
+    if om_only:
+        conditions.append("a.active_contract = 'yes'")
+    if search:
+        conditions.append(
+            "(a.project_name LIKE ? OR a.location LIKE ? OR a.company_name LIKE ? OR a.alias_blob LIKE ?)"
+        )
+        wildcard = f"%{search}%"
+        params.extend([wildcard, wildcard, wildcard, wildcard])
+    rows = conn.execute(
+        f"""
+        SELECT
+            iad.asset_id,
+            a.project_name,
+            iad.inverter_id,
+            iad.inverter_name,
+            iad.inverter_power_kw,
+            MAX(pd.device_name) AS provider_device_name,
+            MAX(pd.rated_power_kw) AS provider_power_kw,
+            MAX(pd.model) AS provider_model,
+            MAX(pd.enabled) AS provider_enabled,
+            SUM(iad.valid_slots) AS valid_slots,
+            SUM(iad.available_slots) AS available_slots,
+            SUM(iad.unavailable_slots) AS unavailable_slots
+        FROM inverter_availability_daily iad
+        JOIN assets a ON a.id = iad.asset_id
+        LEFT JOIN provider_devices pd
+          ON pd.provider = iad.provider AND pd.external_device_id = iad.inverter_id
+        WHERE {' AND '.join(conditions)}
+        GROUP BY iad.asset_id, a.project_name, iad.inverter_id, iad.inverter_name, iad.inverter_power_kw
+        HAVING SUM(iad.valid_slots) > 0
+        """,
+        params,
+    ).fetchall()
+    inverter_rows: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        device_name = item.get("provider_device_name") or item.get("inverter_name")
+        if item.get("provider_enabled") == 0 or is_removed_inverter_name(device_name):
+            continue
+        item["inverter_name"] = device_name
+        item["inverter_power_kw"] = (
+            parse_float_value(item.get("inverter_power_kw"))
+            or parse_float_value(item.get("provider_power_kw"))
+            or infer_inverter_power_from_model(item.get("provider_model"))
+        )
+        item["availability_pct"] = round(item["available_slots"] / item["valid_slots"] * 100, 2)
+        inverter_rows.append(item)
+
+    plants_by_id: dict[int, dict[str, Any]] = {}
+    for row in inverter_rows:
+        plant = plants_by_id.setdefault(
+            int(row["asset_id"]),
+            {"asset_id": row["asset_id"], "project_name": row["project_name"], "inverters": []},
+        )
+        plant["inverters"].append(row)
+    plant_rows: list[dict[str, Any]] = []
+    for plant in plants_by_id.values():
+        plant_rows.append(
+            {
+                "asset_id": plant["asset_id"],
+                "project_name": plant["project_name"],
+                "inverter_count": len(plant["inverters"]),
+                "availability_pct": calculate_weighted_plant_availability(plant["inverters"]),
+            }
+        )
+    plant_rows.sort(key=lambda row: (row["availability_pct"] is None, row["availability_pct"] or 0, row["project_name"]))
+    inverter_rows.sort(key=lambda row: (row["availability_pct"], row["project_name"], row["inverter_name"] or row["inverter_id"]))
+    for rank, row in enumerate(plant_rows, start=1):
+        row["rank"] = rank
+    for rank, row in enumerate(inverter_rows, start=1):
+        row["rank"] = rank
+    percentages = [float(row["availability_pct"]) for row in plant_rows if row["availability_pct"] is not None]
+    return {
+        "average_pct": round(sum(percentages) / len(percentages), 2) if percentages else None,
+        "plants": plant_rows,
+        "inverters": inverter_rows,
+        "worst_plant": plant_rows[0] if plant_rows else None,
+        "low_availability_count": sum(
+            1 for row in inverter_rows if float(row["availability_pct"]) < LOW_INVERTER_AVAILABILITY_PCT
+        ),
+    }
+
+
+def get_inverter_availability_chart_report(
+    conn: sqlite3.Connection,
+    asset_id: int,
+    from_date: date,
+    to_date: date,
+) -> dict[str, Any] | None:
+    asset = conn.execute(
+        "SELECT id, project_name FROM assets WHERE id = ?",
+        (asset_id,),
+    ).fetchone()
+    if asset is None:
+        return None
+    device_rows = conn.execute(
+        """
+        SELECT
+            external_device_id AS inverter_id,
+            device_name AS inverter_name,
+            rated_power_kw AS inverter_power_kw,
+            model
+        FROM provider_devices
+        WHERE asset_id = ? AND provider = ? AND enabled = 1 AND dev_type_id IN (1, 38)
+        ORDER BY device_name COLLATE NOCASE, external_device_id
+        """,
+        (asset_id, INTEGRATION_PROVIDER_FUSIONSOLAR),
+    ).fetchall()
+    daily_rows = conn.execute(
+        """
+        SELECT inverter_id, inverter_name, inverter_power_kw, availability_pct
+        FROM inverter_availability_daily
+        WHERE asset_id = ? AND provider = ? AND availability_date BETWEEN ? AND ?
+        ORDER BY availability_date
+        """,
+        (asset_id, INTEGRATION_PROVIDER_FUSIONSOLAR, from_date.isoformat(), to_date.isoformat()),
+    ).fetchall()
+    inverters_by_id: dict[str, dict[str, Any]] = {}
+    for row in device_rows:
+        inverter_id = str(row["inverter_id"])
+        if is_removed_inverter_name(row["inverter_name"]):
+            continue
+        inverters_by_id[inverter_id] = {
+            "inverter_id": inverter_id,
+            "inverter_name": row["inverter_name"],
+            "inverter_power_kw": parse_float_value(row["inverter_power_kw"])
+            or infer_inverter_power_from_model(row["model"]),
+            "availability_values": [],
+        }
+    for row in daily_rows:
+        inverter_id = str(row["inverter_id"])
+        if is_removed_inverter_name(row["inverter_name"]):
+            continue
+        inverter = inverters_by_id.setdefault(
+            inverter_id,
+            {
+                "inverter_id": inverter_id,
+                "inverter_name": row["inverter_name"],
+                "inverter_power_kw": row["inverter_power_kw"],
+                "availability_values": [],
+            },
+        )
+        if row["availability_pct"] is not None:
+            inverter["availability_values"].append(float(row["availability_pct"]))
+
+    period_start = datetime.combine(from_date, datetime.min.time())
+    period_end = datetime.combine(to_date + timedelta(days=1), datetime.min.time())
+    sample_rows = conn.execute(
+        """
+        SELECT inverter_id, sample_time, active_power_kw
+        FROM inverter_power_samples
+        WHERE asset_id = ? AND provider = ? AND sample_time >= ? AND sample_time < ?
+        ORDER BY inverter_id, sample_time
+        """,
+        (
+            asset_id,
+            INTEGRATION_PROVIDER_FUSIONSOLAR,
+            period_start.isoformat(timespec="seconds"),
+            period_end.isoformat(timespec="seconds"),
+        ),
+    ).fetchall()
+    samples_by_inverter: dict[str, list[tuple[datetime, float]]] = {}
+    for row in sample_rows:
+        sample_time = parse_datetime_value(row["sample_time"])
+        active_power = parse_float_value(row["active_power_kw"])
+        if sample_time is None or active_power is None:
+            continue
+        samples_by_inverter.setdefault(str(row["inverter_id"]), []).append((sample_time, max(active_power, 0.0)))
+
+    inverters = list(inverters_by_id.values())
+    for inverter in inverters:
+        percentages = inverter.pop("availability_values")
+        inverter["average_pct"] = round(sum(percentages) / len(percentages), 2) if percentages else None
+        inverter["chart"] = build_inverter_power_chart(
+            samples_by_inverter.get(inverter["inverter_id"], []),
+            period_start,
+            period_end,
+            parse_float_value(inverter["inverter_power_kw"]),
+        )
+    inverters.sort(key=lambda row: (row["average_pct"] is None, row["average_pct"] or 0, row["inverter_name"] or row["inverter_id"]))
+    return {
+        "asset_id": int(asset["id"]),
+        "project_name": asset["project_name"],
+        "inverters": inverters,
+    }
+
+
+def build_inverter_power_chart(
+    samples: list[tuple[datetime, float]],
+    period_start: datetime,
+    period_end: datetime,
+    rated_power_kw: float | None,
+) -> dict[str, Any]:
+    chart_width = 760.0
+    chart_height = 260.0
+    plot_left = 52.0
+    plot_right = 16.0
+    plot_top = 16.0
+    plot_bottom = 36.0
+    plot_width = chart_width - plot_left - plot_right
+    plot_height = chart_height - plot_top - plot_bottom
+    total_seconds = max((period_end - period_start).total_seconds(), 1.0)
+    sorted_samples = sorted(samples, key=lambda item: item[0])
+    if len(sorted_samples) > 600:
+        step = max(len(sorted_samples) // 600, 1)
+        reduced = sorted_samples[::step]
+        if reduced[-1] != sorted_samples[-1]:
+            reduced.append(sorted_samples[-1])
+        sorted_samples = reduced
+    observed_max = max((power for _, power in sorted_samples), default=0.0)
+    y_max = max(observed_max, rated_power_kw or 0.0, 1.0)
+    if y_max > 10:
+        y_max = float((int(y_max + 4.999) // 5) * 5)
+    else:
+        y_max = float(int(y_max + 0.999))
+    coordinates: list[tuple[float, float]] = []
+    for sample_time, power in sorted_samples:
+        elapsed = min(max((sample_time - period_start).total_seconds(), 0.0), total_seconds)
+        x = plot_left + elapsed / total_seconds * plot_width
+        y = plot_top + (1 - min(power / y_max, 1.0)) * plot_height
+        coordinates.append((round(x, 2), round(y, 2)))
+    line_path = " ".join(
+        ("M" if index == 0 else "L") + f" {x} {y}"
+        for index, (x, y) in enumerate(coordinates)
+    )
+    baseline = plot_top + plot_height
+    area_path = ""
+    if coordinates:
+        area_path = (
+            f"M {coordinates[0][0]} {baseline} "
+            + " ".join(f"L {x} {y}" for x, y in coordinates)
+            + f" L {coordinates[-1][0]} {baseline} Z"
+        )
+    x_ticks = []
+    for index in range(5):
+        ratio = index / 4
+        tick_time = period_start + timedelta(seconds=total_seconds * ratio)
+        x_ticks.append(
+            {
+                "x": round(plot_left + plot_width * ratio, 2),
+                "label": tick_time.strftime("%H:%M") if (period_end - period_start).days <= 1 else tick_time.strftime("%d/%m"),
+            }
+        )
+    y_ticks = [
+        {
+            "y": round(plot_top + plot_height * index / 4, 2),
+            "label": round(y_max * (1 - index / 4), 1),
+        }
+        for index in range(5)
+    ]
+    return {
+        "width": int(chart_width),
+        "height": int(chart_height),
+        "plot_left": plot_left,
+        "plot_right": chart_width - plot_right,
+        "plot_top": plot_top,
+        "plot_bottom": baseline,
+        "line_path": line_path,
+        "area_path": area_path,
+        "x_ticks": x_ticks,
+        "y_ticks": y_ticks,
+        "sample_count": len(samples),
+        "max_power_kw": round(y_max, 1),
+    }
 
 
 def parse_datetime_value(value: Any) -> datetime | None:
@@ -8974,7 +9683,15 @@ def parse_datetime_value(value: Any) -> datetime | None:
             return datetime.fromtimestamp(timestamp)
         except (OSError, OverflowError, ValueError):
             return None
-    raw = str(value).strip().replace("Z", "+00:00")
+    raw = str(value).strip()
+    try:
+        timestamp = float(raw)
+        if timestamp > 10_000_000_000:
+            timestamp /= 1000
+        return datetime.fromtimestamp(timestamp)
+    except (OSError, OverflowError, ValueError):
+        pass
+    raw = raw.replace("Z", "+00:00")
     try:
         parsed = datetime.fromisoformat(raw)
         return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
@@ -11095,6 +11812,7 @@ def get_latest_device_rows_for_asset(conn: sqlite3.Connection, asset_id: int) ->
 
 def upsert_provider_device(conn: sqlite3.Connection, asset_id: int, provider: str, row: dict[str, Any]) -> int:
     now = datetime.now().isoformat(timespec="seconds")
+    enabled = int(row.get("enabled", 1))
     existing = conn.execute(
         "SELECT id FROM provider_devices WHERE provider = ? AND external_device_id = ?",
         (provider, row["external_device_id"]),
@@ -11105,7 +11823,7 @@ def upsert_provider_device(conn: sqlite3.Connection, asset_id: int, provider: st
             """
             UPDATE provider_devices
             SET asset_id = ?, station_code = ?, dev_dn = ?, sn = ?, device_name = ?, dev_type_id = ?,
-                model = ?, rated_power_kw = ?, enabled = 1, payload_json = ?, updated_at = ?
+                model = ?, rated_power_kw = ?, enabled = ?, payload_json = ?, updated_at = ?
             WHERE id = ?
             """,
             (
@@ -11117,6 +11835,7 @@ def upsert_provider_device(conn: sqlite3.Connection, asset_id: int, provider: st
                 row["dev_type_id"],
                 row["model"],
                 row["rated_power_kw"],
+                enabled,
                 payload_json,
                 now,
                 existing["id"],
@@ -11128,7 +11847,7 @@ def upsert_provider_device(conn: sqlite3.Connection, asset_id: int, provider: st
         INSERT INTO provider_devices (
             asset_id, provider, station_code, external_device_id, dev_dn, sn, device_name, dev_type_id,
             model, rated_power_kw, enabled, payload_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             asset_id,
@@ -11141,12 +11860,542 @@ def upsert_provider_device(conn: sqlite3.Connection, asset_id: int, provider: st
             row["dev_type_id"],
             row["model"],
             row["rated_power_kw"],
+            enabled,
             payload_json,
             now,
             now,
         ),
     )
     return int(cursor.lastrowid)
+
+
+def prepare_fusionsolar_inverter_history_context(
+    conn: sqlite3.Connection,
+    *,
+    force_login: bool = False,
+    history_call_delay_seconds: float = 0,
+    sleeper: Any = time.sleep,
+) -> dict[str, Any]:
+    provider = INTEGRATION_PROVIDER_FUSIONSOLAR
+    config = get_integration_config(conn, provider)
+    if config is None or not config["enabled"]:
+        raise ValueError("Configuracao FusionSolar indisponivel.")
+    endpoints = get_fusionsolar_endpoint_config(config)
+    mappings = query_all(
+        conn,
+        """
+        SELECT asset_id, external_id
+        FROM asset_integrations
+        WHERE provider = ? AND enabled = 1 AND COALESCE(external_id, '') != ''
+        """,
+        (provider,),
+    )
+    station_to_asset = {str(row["external_id"]): int(row["asset_id"]) for row in mappings}
+    if not station_to_asset:
+        return {"provider": provider, "config": config, "endpoints": endpoints, "session": None, "devices": []}
+    session, _ = get_fusionsolar_session(config, force_login=force_login)
+    raw_devices = fetch_fusionsolar_device_list(
+        session,
+        base_url=endpoints["base_url"],
+        endpoint=endpoints["device_list_endpoint"],
+        station_codes=sorted(station_to_asset),
+    )
+    devices: list[dict[str, Any]] = []
+    for raw_row in raw_devices:
+        device = normalize_fusionsolar_device_identity(raw_row)
+        if device["dev_type_id"] not in FUSIONSOLAR_INVERTER_DEVICE_TYPE_IDS:
+            continue
+        asset_id = station_to_asset.get(str(device["station_code"] or ""))
+        if not asset_id or not device["external_device_id"]:
+            continue
+        device["asset_id"] = asset_id
+        device["enabled"] = 0 if is_removed_inverter_name(device["device_name"]) else 1
+        device["payload"] = raw_row
+        device["provider_device_id"] = upsert_provider_device(conn, asset_id, provider, device)
+        if not device["enabled"]:
+            logging.info(
+                "FusionSolar inverter excluded because it is marked as removed: asset_id=%s inverter_id=%s name=%s",
+                asset_id,
+                device["external_device_id"],
+                device["device_name"],
+            )
+            continue
+        devices.append(device)
+    conn.commit()
+    return {
+        "provider": provider,
+        "config": config,
+        "endpoints": endpoints,
+        "session": session,
+        "devices": devices,
+        "history_call_delay_seconds": history_call_delay_seconds,
+        "sleeper": sleeper,
+    }
+
+
+def sync_fusionsolar_inverter_availability_for_date(
+    conn: sqlite3.Connection,
+    target_date: date,
+    *,
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if target_date >= date.today():
+        raise ValueError("A disponibilidade temporal requer um dia fechado.")
+    sync_context = context or prepare_fusionsolar_inverter_history_context(conn)
+    devices = sync_context["devices"]
+    if not devices:
+        return {"date": target_date.isoformat(), "samples": 0, "plants": 0, "inverters": 0}
+    try:
+        history_rows = fetch_fusionsolar_device_history(
+            sync_context["session"],
+            base_url=sync_context["endpoints"]["base_url"],
+            endpoint=sync_context["endpoints"]["device_history_endpoint"],
+            devices=devices,
+            target_date=target_date,
+            call_delay_seconds=float(sync_context.get("history_call_delay_seconds") or 0),
+            sleeper=sync_context.get("sleeper") or time.sleep,
+        )
+    except Exception:
+        logging.exception(
+            "FusionSolar device history request failed: target_date=%s endpoint=%s inverter_count=%s",
+            target_date,
+            sync_context["endpoints"]["device_history_endpoint"],
+            len(devices),
+        )
+        raise
+
+    now = datetime.now().isoformat(timespec="seconds")
+    for sample in history_rows:
+        conn.execute(
+            """
+            INSERT INTO inverter_power_samples (
+                asset_id, provider, external_station_id, inverter_id, inverter_name, inverter_power_kw,
+                sample_time, active_power_kw, raw_payload, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider, inverter_id, sample_time) DO UPDATE SET
+                asset_id = excluded.asset_id,
+                external_station_id = excluded.external_station_id,
+                inverter_name = excluded.inverter_name,
+                inverter_power_kw = excluded.inverter_power_kw,
+                active_power_kw = excluded.active_power_kw,
+                raw_payload = excluded.raw_payload
+            """,
+            (
+                sample["asset_id"],
+                sync_context["provider"],
+                sample["station_code"],
+                sample["external_device_id"],
+                sample["device_name"],
+                sample["rated_power_kw"],
+                sample["sample_time"].isoformat(timespec="seconds"),
+                sample["active_power_kw"],
+                json.dumps(sample["raw_payload"], ensure_ascii=True),
+                now,
+            ),
+        )
+
+    plants_written = 0
+    devices_by_asset: dict[int, list[dict[str, Any]]] = {}
+    for device in devices:
+        devices_by_asset.setdefault(int(device["asset_id"]), []).append(device)
+    for asset_id, plant_devices in devices_by_asset.items():
+        stored_samples = query_all(
+            conn,
+            """
+            SELECT inverter_id, sample_time, active_power_kw
+            FROM inverter_power_samples
+            WHERE asset_id = ? AND provider = ? AND sample_time >= ? AND sample_time < ?
+            """,
+            (
+                asset_id,
+                sync_context["provider"],
+                datetime.combine(target_date, datetime.min.time()).isoformat(timespec="seconds"),
+                datetime.combine(target_date + timedelta(days=1), datetime.min.time()).isoformat(timespec="seconds"),
+            ),
+        )
+        samples_by_inverter: dict[str, list[dict[str, Any]]] = {}
+        valid_slots: set[datetime] = set()
+        for row in stored_samples:
+            sample_time = parse_datetime_value(row["sample_time"])
+            if sample_time is None:
+                continue
+            sample = {"sample_time": sample_time, "active_power_kw": row["active_power_kw"]}
+            samples_by_inverter.setdefault(str(row["inverter_id"]), []).append(sample)
+            if is_inverter_available(row["active_power_kw"]):
+                valid_slots.add(inverter_availability_slot(sample_time))
+
+        conn.execute(
+            "DELETE FROM inverter_availability_daily WHERE asset_id = ? AND provider = ? AND availability_date = ?",
+            (asset_id, sync_context["provider"], target_date.isoformat()),
+        )
+        inverter_results: list[dict[str, Any]] = []
+        for device in plant_devices:
+            device_samples = samples_by_inverter.get(str(device["external_device_id"]), [])
+            if not device_samples:
+                logging.info(
+                    "FusionSolar inverter excluded because it has no samples: target_date=%s asset_id=%s inverter_id=%s name=%s",
+                    target_date,
+                    asset_id,
+                    device["external_device_id"],
+                    device["device_name"],
+                )
+                continue
+            result = calculate_inverter_daily_availability(
+                device_samples,
+                valid_slots,
+            )
+            result.update(
+                {
+                    "asset_id": asset_id,
+                    "inverter_id": device["external_device_id"],
+                    "inverter_name": device["device_name"],
+                    "inverter_power_kw": device["rated_power_kw"],
+                }
+            )
+            inverter_results.append(result)
+            conn.execute(
+                """
+                INSERT INTO inverter_availability_daily (
+                    asset_id, provider, availability_date, inverter_id, inverter_name, inverter_power_kw,
+                    valid_slots, available_slots, unavailable_slots, availability_pct, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider, inverter_id, availability_date) DO UPDATE SET
+                    asset_id = excluded.asset_id,
+                    inverter_name = excluded.inverter_name,
+                    inverter_power_kw = excluded.inverter_power_kw,
+                    valid_slots = excluded.valid_slots,
+                    available_slots = excluded.available_slots,
+                    unavailable_slots = excluded.unavailable_slots,
+                    availability_pct = excluded.availability_pct,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    asset_id,
+                    sync_context["provider"],
+                    target_date.isoformat(),
+                    device["external_device_id"],
+                    device["device_name"],
+                    device["rated_power_kw"],
+                    result["valid_slots"],
+                    result["available_slots"],
+                    result["unavailable_slots"],
+                    result["availability_pct"],
+                    now,
+                    now,
+                ),
+            )
+        weighted_pct = calculate_weighted_plant_availability(inverter_results)
+        tolerated_valid_slots = apply_inverter_edge_tolerance(valid_slots)
+        conn.execute(
+            """
+            INSERT INTO plant_availability_daily (
+                asset_id, provider, availability_date, valid_slots, weighted_availability_pct,
+                inverter_count, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider, asset_id, availability_date) DO UPDATE SET
+                valid_slots = excluded.valid_slots,
+                weighted_availability_pct = excluded.weighted_availability_pct,
+                inverter_count = excluded.inverter_count,
+                updated_at = excluded.updated_at
+            """,
+            (
+                asset_id,
+                sync_context["provider"],
+                target_date.isoformat(),
+                len(tolerated_valid_slots),
+                weighted_pct,
+                len(inverter_results),
+                now,
+                now,
+            ),
+        )
+        plants_written += 1
+        logging.info(
+            "FusionSolar inverter availability calculated: target_date=%s asset_id=%s inverters=%s valid_slots=%s availability_pct=%s",
+            target_date,
+            asset_id,
+            len(inverter_results),
+            len(tolerated_valid_slots),
+            weighted_pct,
+        )
+    conn.commit()
+    return {
+        "date": target_date.isoformat(),
+        "samples": len(history_rows),
+        "plants": plants_written,
+        "inverters": len(devices),
+    }
+
+
+def sync_fusionsolar_inverter_availability_range(
+    conn: sqlite3.Connection,
+    from_date: date,
+    to_date: date,
+) -> dict[str, Any]:
+    context = prepare_fusionsolar_inverter_history_context(conn)
+    totals = {"days": 0, "samples": 0, "plants": 0, "inverters": len(context["devices"])}
+    current = from_date
+    while current <= to_date:
+        result = sync_fusionsolar_inverter_availability_for_date(conn, current, context=context)
+        totals["days"] += 1
+        totals["samples"] += int(result["samples"])
+        totals["plants"] += int(result["plants"])
+        current += timedelta(days=1)
+    return totals
+
+
+def run_fusionsolar_inverter_availability_backfill(
+    conn: sqlite3.Connection,
+    *,
+    from_date: date,
+    to_date: date,
+    sleeper: Any = time.sleep,
+    history_call_delay_seconds: float = FUSIONSOLAR_PERFORMANCE_KPI_DELAY_SECONDS,
+    max_wait_cycles: int = 24,
+) -> dict[str, Any]:
+    if from_date > to_date or to_date >= date.today():
+        raise ValueError("O backfill WAT requer um intervalo valido de dias fechados.")
+    summary: dict[str, Any] = {
+        "days": 0,
+        "samples": 0,
+        "plants": 0,
+        "inverters": 0,
+        "api_errors": 0,
+        "wait_cycles": 0,
+        "resume_hint": from_date.isoformat(),
+        "stopped_reason": "",
+    }
+
+    def wait_after_rate_limit(reason: str, resume_date: date) -> bool:
+        summary["wait_cycles"] += 1
+        summary["resume_hint"] = resume_date.isoformat()
+        if summary["wait_cycles"] > max_wait_cycles:
+            summary["stopped_reason"] = f"Limite FusionSolar repetido demasiadas vezes. Ultimo estado: {reason}"
+            logging.warning(
+                "FusionSolar WAT backfill stopped after repeated cooldowns: resume_date=%s wait_cycles=%s reason=%s",
+                resume_date,
+                summary["wait_cycles"],
+                reason,
+            )
+            return False
+        conn.commit()
+        seconds = fusionsolar_cooldown_sleep_seconds(conn)
+        logging.warning(
+            "FusionSolar WAT backfill waiting for API cooldown: resume_date=%s seconds=%s wait_cycle=%s",
+            resume_date,
+            seconds,
+            summary["wait_cycles"],
+        )
+        sleeper(seconds)
+        return True
+
+    def prepare_context(force_login: bool = False) -> dict[str, Any] | None:
+        while True:
+            try:
+                return prepare_fusionsolar_inverter_history_context(
+                    conn,
+                    force_login=force_login,
+                    history_call_delay_seconds=history_call_delay_seconds,
+                    sleeper=sleeper,
+                )
+            except Exception as exc:
+                summary["api_errors"] += 1
+                if is_fusionsolar_rate_limit_error(exc):
+                    reason = mark_fusionsolar_performance_rate_limited(conn)
+                    if not wait_after_rate_limit(reason, from_date):
+                        return None
+                    force_login = True
+                    continue
+                if is_fusionsolar_session_expired_error(exc):
+                    force_login = True
+                    continue
+                raise
+
+    cooldown_reason = get_fusionsolar_performance_cooldown_reason(conn)
+    if cooldown_reason and not wait_after_rate_limit(cooldown_reason, from_date):
+        return summary
+    context = prepare_context()
+    if context is None:
+        return summary
+    summary["inverters"] = len(context["devices"])
+
+    current = from_date
+    while current <= to_date:
+        session_retry_used = False
+        while True:
+            try:
+                result = sync_fusionsolar_inverter_availability_for_date(conn, current, context=context)
+                summary["days"] += 1
+                summary["samples"] += int(result["samples"])
+                summary["plants"] += int(result["plants"])
+                summary["resume_hint"] = (current + timedelta(days=1)).isoformat()
+                conn.commit()
+                break
+            except Exception as exc:
+                summary["api_errors"] += 1
+                if is_fusionsolar_rate_limit_error(exc):
+                    reason = mark_fusionsolar_performance_rate_limited(conn)
+                    if not wait_after_rate_limit(reason, current):
+                        return summary
+                    refreshed = prepare_context(force_login=True)
+                    if refreshed is None:
+                        return summary
+                    context = refreshed
+                    continue
+                if is_fusionsolar_session_expired_error(exc) and not session_retry_used:
+                    session_retry_used = True
+                    invalidate_fusionsolar_session(context["config"])
+                    refreshed = prepare_context(force_login=True)
+                    if refreshed is None:
+                        return summary
+                    context = refreshed
+                    continue
+                raise
+        current += timedelta(days=1)
+    summary["resume_hint"] = ""
+    return summary
+
+
+def recalculate_stored_inverter_availability(
+    conn: sqlite3.Connection,
+    from_date: date,
+    to_date: date,
+    *,
+    asset_id: int | None = None,
+) -> dict[str, int]:
+    provider = INTEGRATION_PROVIDER_FUSIONSOLAR
+    conditions = ["provider = ?", "sample_time >= ?", "sample_time < ?"]
+    params: list[Any] = [
+        provider,
+        datetime.combine(from_date, datetime.min.time()).isoformat(timespec="seconds"),
+        datetime.combine(to_date + timedelta(days=1), datetime.min.time()).isoformat(timespec="seconds"),
+    ]
+    if asset_id is not None:
+        conditions.append("asset_id = ?")
+        params.append(asset_id)
+    sample_dates = conn.execute(
+        f"""
+        SELECT DISTINCT asset_id, substr(sample_time, 1, 10) AS sample_date
+        FROM inverter_power_samples
+        WHERE {' AND '.join(conditions)}
+        ORDER BY sample_date, asset_id
+        """,
+        params,
+    ).fetchall()
+    now = datetime.now().isoformat(timespec="seconds")
+    totals = {"days": 0, "plants": 0, "inverters": 0}
+    for date_row in sample_dates:
+        current_asset_id = int(date_row["asset_id"])
+        target_date = parse_date_value(date_row["sample_date"])
+        if target_date is None:
+            continue
+        devices = query_all(
+            conn,
+            """
+            SELECT external_device_id, device_name, rated_power_kw, model
+            FROM provider_devices
+            WHERE asset_id = ? AND provider = ? AND enabled = 1 AND dev_type_id IN (1, 38)
+            ORDER BY device_name COLLATE NOCASE, external_device_id
+            """,
+            (current_asset_id, provider),
+        )
+        samples = query_all(
+            conn,
+            """
+            SELECT inverter_id, sample_time, active_power_kw
+            FROM inverter_power_samples
+            WHERE asset_id = ? AND provider = ? AND sample_time >= ? AND sample_time < ?
+            ORDER BY sample_time
+            """,
+            (
+                current_asset_id,
+                provider,
+                datetime.combine(target_date, datetime.min.time()).isoformat(timespec="seconds"),
+                datetime.combine(target_date + timedelta(days=1), datetime.min.time()).isoformat(timespec="seconds"),
+            ),
+        )
+        samples_by_inverter: dict[str, list[dict[str, Any]]] = {}
+        valid_slots: set[datetime] = set()
+        for sample_row in samples:
+            sample_time = parse_datetime_value(sample_row["sample_time"])
+            if sample_time is None:
+                continue
+            sample = {"sample_time": sample_time, "active_power_kw": sample_row["active_power_kw"]}
+            samples_by_inverter.setdefault(str(sample_row["inverter_id"]), []).append(sample)
+            if is_inverter_available(sample_row["active_power_kw"]):
+                valid_slots.add(inverter_availability_slot(sample_time))
+
+        conn.execute(
+            "DELETE FROM inverter_availability_daily WHERE asset_id = ? AND provider = ? AND availability_date = ?",
+            (current_asset_id, provider, target_date.isoformat()),
+        )
+        inverter_results: list[dict[str, Any]] = []
+        for device in devices:
+            if is_removed_inverter_name(device["device_name"]):
+                continue
+            inverter_id = str(device["external_device_id"] or "")
+            device_samples = samples_by_inverter.get(inverter_id, [])
+            if not inverter_id or not device_samples:
+                continue
+            inverter_power_kw = (
+                parse_float_value(device["rated_power_kw"])
+                or infer_inverter_power_from_model(device["model"])
+            )
+            result = calculate_inverter_daily_availability(device_samples, valid_slots)
+            result["inverter_power_kw"] = inverter_power_kw
+            inverter_results.append(result)
+            conn.execute(
+                """
+                INSERT INTO inverter_availability_daily (
+                    asset_id, provider, availability_date, inverter_id, inverter_name, inverter_power_kw,
+                    valid_slots, available_slots, unavailable_slots, availability_pct, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    current_asset_id,
+                    provider,
+                    target_date.isoformat(),
+                    inverter_id,
+                    device["device_name"],
+                    inverter_power_kw,
+                    result["valid_slots"],
+                    result["available_slots"],
+                    result["unavailable_slots"],
+                    result["availability_pct"],
+                    now,
+                    now,
+                ),
+            )
+        weighted_pct = calculate_weighted_plant_availability(inverter_results)
+        tolerated_valid_slots = apply_inverter_edge_tolerance(valid_slots)
+        conn.execute(
+            """
+            INSERT INTO plant_availability_daily (
+                asset_id, provider, availability_date, valid_slots, weighted_availability_pct,
+                inverter_count, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider, asset_id, availability_date) DO UPDATE SET
+                valid_slots = excluded.valid_slots,
+                weighted_availability_pct = excluded.weighted_availability_pct,
+                inverter_count = excluded.inverter_count,
+                updated_at = excluded.updated_at
+            """,
+            (
+                current_asset_id,
+                provider,
+                target_date.isoformat(),
+                len(tolerated_valid_slots),
+                weighted_pct,
+                len(inverter_results),
+                now,
+                now,
+            ),
+        )
+        totals["plants"] += 1
+        totals["inverters"] += len(inverter_results)
+        totals["days"] += 1
+    conn.commit()
+    return totals
 
 
 def run_fusionsolar_device_availability_sync(
@@ -11202,7 +12451,10 @@ def run_fusionsolar_device_availability_sync(
         if not asset_id:
             continue
         normalized["payload"] = raw_row
+        normalized["enabled"] = 0 if is_removed_inverter_name(normalized["device_name"]) else 1
         normalized["provider_device_id"] = upsert_provider_device(conn, asset_id, provider, normalized)
+        if not normalized["enabled"]:
+            continue
         normalized["asset_id"] = asset_id
         tracked.append(normalized)
 

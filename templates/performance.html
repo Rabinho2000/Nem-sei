@@ -2,54 +2,24 @@
 {% block content %}
 <section class="hero">
   <div>
-    <p class="eyebrow">Disponibilidade</p>
-    <h2>Disponibilidade de inversores</h2>
-    <p class="muted">Estado operacional por central com base nos dispositivos FusionSolar recolhidos.</p>
-  </div>
-  <div class="hero-actions">
-    <form method="post">
-      <input type="hidden" name="action" value="sync_availability">
-      <button class="button" type="submit">Sincronizar disponibilidade</button>
-    </form>
+    <p class="eyebrow">Performance</p>
+    <h2>WAT — Disponibilidade Ponderada dos Inversores</h2>
+    <p class="muted">Disponibilidade temporal em slots de 15 minutos, ponderada pela potencia nominal dos inversores.</p>
   </div>
 </section>
 
-<section class="cards dashboard-kpis">
-  <article class="card stat-card">
-    <span>Centrais com dados</span>
-    <strong>{{ availability_summary.assets_with_data }}</strong>
-  </article>
-  <article class="card stat-card">
-    <span>Disponibilidade media</span>
-    <strong>{{ "%.1f%%"|format(availability_summary.average_inverter_availability_pct) if availability_summary.average_inverter_availability_pct is not none else "Sem dados" }}</strong>
-  </article>
-  <article class="card stat-card">
-    <span>Inversores indisponiveis</span>
-    <strong>{{ availability_summary.unavailable_inverters }}</strong>
-  </article>
-  <article class="card stat-card">
-    <span>Sem comunicacao</span>
-    <strong>{{ availability_summary.no_communication_devices }}</strong>
-  </article>
-  <article class="card stat-card">
-    <span>Potencia afetada</span>
-    <strong>{{ "%.1f kW"|format(availability_summary.affected_power_kw) if availability_summary.affected_power_kw is not none else "Sem dados" }}</strong>
-  </article>
-  <article class="card stat-card">
-    <span>Disponibilidade strings</span>
-    <strong>{{ "%.1f%%"|format(availability_summary.string_availability_pct) if availability_summary.string_availability_pct is not none else "Sem dados" }}</strong>
-  </article>
-  <article class="card stat-card">
-    <span>Strings indisponiveis</span>
-    <strong>{{ availability_summary.unavailable_strings }}</strong>
-  </article>
+{% if fusionsolar_api_warning %}
+<section class="card warning-card">
+  <div class="section-title"><h3>FusionSolar em cooldown</h3></div>
+  <p class="muted">{{ fusionsolar_api_warning }}</p>
 </section>
+{% endif %}
 
 <section class="card">
-  <form class="filters js-auto-submit" method="get">
-    <input type="hidden" name="asset_id" value="{{ selected_asset_id }}">
-    <label>Pesquisar
-      <input type="text" name="search" value="{{ search }}" placeholder="Central, localizacao ou empresa">
+  <form class="filters" method="get">
+    {% if selected_asset_id %}<input type="hidden" name="asset_id" value="{{ selected_asset_id }}">{% endif %}
+    <label>Pesquisar instalacao
+      <input type="text" name="search" value="{{ search }}" placeholder="Nome, localizacao ou empresa">
     </label>
     <label>O&amp;M
       <select name="om_only">
@@ -57,56 +27,202 @@
         <option value="no" {{ 'selected' if om_only == 'no' else '' }}>Todas</option>
       </select>
     </label>
-    <label>Vista
-      <select name="issue_only">
-        <option value="no" {{ 'selected' if issue_only == 'no' else '' }}>Todas</option>
-        <option value="yes" {{ 'selected' if issue_only == 'yes' else '' }}>Com indisponibilidade</option>
+    <label>Periodo
+      <select name="period">
+        <option value="yesterday" {{ 'selected' if availability_period == 'yesterday' else '' }}>Ontem</option>
+        <option value="current_month" {{ 'selected' if availability_period == 'current_month' else '' }}>Mes atual</option>
+        <option value="previous_month" {{ 'selected' if availability_period == 'previous_month' else '' }}>Mes passado</option>
+        <option value="custom" {{ 'selected' if availability_period == 'custom' else '' }}>Personalizado</option>
       </select>
     </label>
+    <label>De
+      <input type="date" name="from_date" value="{{ availability_from.isoformat() }}">
+    </label>
+    <label>Ate
+      <input type="date" name="to_date" value="{{ availability_to.isoformat() }}" max="{{ availability_closed_max.isoformat() }}">
+    </label>
+    <button class="button secondary" type="submit">Aplicar</button>
   </form>
 </section>
 
+<section class="cards dashboard-kpis">
+  <article class="card stat-card">
+    <span>WAT medio do periodo</span>
+    <strong>{{ "%.1f%%"|format(inverter_time_report.average_pct) if inverter_time_report.average_pct is not none else "Sem dados" }}</strong>
+  </article>
+  <article class="card stat-card">
+    <span>Centrais analisadas</span>
+    <strong>{{ inverter_time_report.plants|length }}</strong>
+  </article>
+  <article class="card stat-card">
+    <span>Pior central</span>
+    {% if inverter_time_report.worst_plant %}
+      <strong>{{ "%.1f%%"|format(inverter_time_report.worst_plant.availability_pct) }}</strong>
+      <small>{{ inverter_time_report.worst_plant.project_name }}</small>
+    {% else %}
+      <strong>Sem dados</strong>
+    {% endif %}
+  </article>
+  <article class="card stat-card">
+    <span>Inversores abaixo de 90%</span>
+    <strong>{{ inverter_time_report.low_availability_count }}</strong>
+  </article>
+</section>
+
+{% if selected_asset_id %}
+<section class="card inverter-detail-heading">
+  <div class="section-title">
+    <div>
+      <p class="eyebrow">Detalhe da instalacao</p>
+      <h3>{{ inverter_chart_report.project_name if inverter_chart_report else "Instalacao sem dados" }}</h3>
+      <p class="muted">Curva de potencia ativa de todos os inversores no periodo selecionado.</p>
+    </div>
+    <a class="button secondary" href="{{ url_for('performance', period=availability_period, from_date=availability_from.isoformat(), to_date=availability_to.isoformat(), search=search, om_only=om_only) }}">Voltar a todas</a>
+  </div>
+</section>
+
+{% if inverter_chart_report and inverter_chart_report.inverters %}
+<section class="inverter-chart-grid">
+  {% for inverter in inverter_chart_report.inverters %}
+    <article class="card inverter-chart-card">
+      <div class="inverter-chart-header">
+        <div>
+          <h3>{{ inverter.inverter_name or inverter.inverter_id }}</h3>
+          <p class="muted">{{ "%.1f kW"|format(inverter.inverter_power_kw) if inverter.inverter_power_kw is not none else "Potencia desconhecida" }}</p>
+        </div>
+        <strong>{{ "%.1f%%"|format(inverter.average_pct) if inverter.average_pct is not none else "Sem dados" }}</strong>
+      </div>
+      {% if inverter.chart.sample_count %}
+        <div class="power-chart-scroll">
+          <svg class="power-chart" viewBox="0 0 {{ inverter.chart.width }} {{ inverter.chart.height }}" role="img" aria-label="Potencia ativa de {{ inverter.inverter_name or inverter.inverter_id }}">
+            <title>{{ inverter.chart.sample_count }} amostras; escala maxima {{ inverter.chart.max_power_kw }} kW</title>
+            {% for tick in inverter.chart.y_ticks %}
+              <line class="power-chart-gridline" x1="{{ inverter.chart.plot_left }}" y1="{{ tick.y }}" x2="{{ inverter.chart.plot_right }}" y2="{{ tick.y }}"></line>
+              <text class="power-chart-label power-chart-y-label" x="{{ inverter.chart.plot_left - 8 }}" y="{{ tick.y + 4 }}">{{ tick.label }}</text>
+            {% endfor %}
+            {% for tick in inverter.chart.x_ticks %}
+              <text class="power-chart-label" x="{{ tick.x }}" y="{{ inverter.chart.height - 10 }}" text-anchor="middle">{{ tick.label }}</text>
+            {% endfor %}
+            <text class="power-chart-label power-chart-unit" x="8" y="14">kW</text>
+            <path class="power-chart-area" d="{{ inverter.chart.area_path }}"></path>
+            <path class="power-chart-line" d="{{ inverter.chart.line_path }}"></path>
+          </svg>
+        </div>
+      {% else %}
+        <div class="power-chart-empty">Sem amostras de potencia ativa neste periodo.</div>
+      {% endif %}
+    </article>
+  {% endfor %}
+</section>
+{% else %}
+<section class="card"><p class="muted">Sem inversores registados para esta instalacao.</p></section>
+{% endif %}
+{% endif %}
+
+{% if inverter_time_report.inverters %}
 <section class="card">
-  <div class="section-title"><h3>Disponibilidade por central</h3></div>
+  <div class="section-title">
+    <div>
+      <h3>Ranking de centrais por WAT</h3>
+      <p class="muted">Ordenado da menor para a maior disponibilidade.</p>
+    </div>
+  </div>
   <div class="table-wrap">
     <table>
       <thead>
         <tr>
+          <th>Ranking</th>
           <th>Central</th>
-          <th>Localizacao</th>
-          <th>Disponibilidade</th>
-          <th>Capacidade</th>
-          <th>Comunicacao</th>
-          <th>Inversores OK / total</th>
-          <th>Indisponiveis</th>
-          <th>Sem comunicacao</th>
-          <th>Potencia afetada</th>
-          <th>Strings</th>
-          <th>Strings indisponiveis</th>
-          <th>Atualizado em</th>
+          <th>Inversores</th>
+          <th>WAT</th>
         </tr>
       </thead>
       <tbody>
-        {% for row in records %}
+        {% for row in inverter_time_report.plants %}
           <tr>
-            <td><a class="table-link" href="{{ url_for('asset_detail', asset_id=row.asset_id) }}">{{ row.project_name }}</a></td>
-            <td>{{ row.location or "-" }}</td>
-            <td>{{ "%.1f%%"|format(row.inverter_availability_pct) if row.inverter_availability_pct is not none else "Sem dados" }}</td>
-            <td>{{ "%.1f%%"|format(row.capacity_availability_pct) if row.capacity_availability_pct is not none else "-" }}</td>
-            <td>{{ "%.1f%%"|format(row.communication_availability_pct) if row.communication_availability_pct is not none else "-" }}</td>
-            <td>{{ row.available_inverters ~ " / " ~ row.total_inverters if row.total_inverters is not none else "-" }}</td>
-            <td>{{ row.unavailable_inverters if row.unavailable_inverters is not none else "-" }}</td>
-            <td>{{ row.no_communication_devices if row.no_communication_devices is not none else "-" }}</td>
-            <td>{{ "%.1f kW"|format(row.affected_power_kw) if row.affected_power_kw is not none else "-" }}</td>
-            <td>{{ "%.1f%%"|format(row.string_availability_pct) if row.string_availability_pct is not none else "-" }}</td>
-            <td>{{ row.unavailable_strings if row.unavailable_strings is not none else "-" }}</td>
-            <td>{{ row.updated_at or "-" }}</td>
+            <td>#{{ row.rank }}</td>
+            <td><a class="table-link" href="{{ url_for('performance', asset_id=row.asset_id, period=availability_period, from_date=availability_from.isoformat(), to_date=availability_to.isoformat(), search=search, om_only=om_only) }}">{{ row.project_name }}</a></td>
+            <td>{{ row.inverter_count }}</td>
+            <td><strong>{{ "%.1f%%"|format(row.availability_pct) }}</strong></td>
           </tr>
-        {% else %}
-          <tr><td colspan="12" class="muted">Sem centrais para estes filtros.</td></tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
 </section>
+
+<section class="card">
+  <div class="section-title">
+    <div>
+      <h3>Ranking de inversores por WAT</h3>
+      <p class="muted">Slots validos incluem apenas periodos em que pelo menos um inversor da central produziu.</p>
+    </div>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Ranking</th>
+          <th>Central</th>
+          <th>Inversor</th>
+          <th>Potencia</th>
+          <th>Slots validos</th>
+          <th>Slots indisponiveis</th>
+          <th>WAT</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in inverter_time_report.inverters %}
+          <tr>
+            <td>#{{ row.rank }}</td>
+            <td><a class="table-link" href="{{ url_for('performance', asset_id=row.asset_id, period=availability_period, from_date=availability_from.isoformat(), to_date=availability_to.isoformat(), search=search, om_only=om_only) }}">{{ row.project_name }}</a></td>
+            <td>{{ row.inverter_name or row.inverter_id }}</td>
+            <td>{{ "%.1f kW"|format(row.inverter_power_kw) if row.inverter_power_kw is not none else "-" }}</td>
+            <td>{{ row.valid_slots }}</td>
+            <td>{{ row.unavailable_slots }}</td>
+            <td><strong>{{ "%.1f%%"|format(row.availability_pct) }}</strong></td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="card">
+  <div class="section-title"><h3>Calcular dias fechados</h3></div>
+  <form class="filters" method="post">
+    <input type="hidden" name="action" value="sync_inverter_time_availability">
+    <input type="hidden" name="search" value="{{ search }}">
+    <input type="hidden" name="om_only" value="{{ om_only }}">
+    <label>Desde
+      <input type="date" name="from_date" value="{{ availability_from.isoformat() }}" max="{{ availability_closed_max.isoformat() }}" required>
+    </label>
+    <label>Ate
+      <input type="date" name="to_date" value="{{ availability_to.isoformat() }}" max="{{ availability_closed_max.isoformat() }}" required>
+    </label>
+    <button class="button" type="submit">Calcular WAT</button>
+  </form>
+</section>
+{% else %}
+<section class="card">
+  <div class="empty-state">
+    <h3>Sem dados WAT para este periodo</h3>
+    <p class="muted">Calcula dias fechados para preencher a disponibilidade ponderada dos inversores.</p>
+  </div>
+  <form class="filters top-space" method="post">
+    <input type="hidden" name="action" value="sync_inverter_time_availability">
+    <input type="hidden" name="search" value="{{ search }}">
+    <input type="hidden" name="om_only" value="{{ om_only }}">
+    <label>Desde
+      <input type="date" name="from_date" value="{{ availability_from.isoformat() }}" max="{{ availability_closed_max.isoformat() }}" required>
+    </label>
+    <label>Ate
+      <input type="date" name="to_date" value="{{ availability_to.isoformat() }}" max="{{ availability_closed_max.isoformat() }}" required>
+    </label>
+    <button class="button" type="submit">Calcular WAT</button>
+  </form>
+</section>
+{% endif %}
+
+{% include "_background_jobs.html" %}
 {% endblock %}
