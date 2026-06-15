@@ -1,0 +1,43 @@
+{% if background_jobs %}
+<section class="card">
+  <div class="section-title"><h3>Jobs em background</h3></div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Tipo</th>
+          <th>Estado</th>
+          <th>Criado</th>
+          <th>Inicio</th>
+          <th>Fim</th>
+          <th>Resultado</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for job in background_jobs %}
+          <tr>
+            <td>#{{ job.id }}</td>
+            <td>{{ job.job_type }}</td>
+            <td><span class="chip {{ 'success' if job.status == 'success' else 'danger' if job.status == 'failed' else 'warning' if job.status == 'running' else 'accent' }}">{{ job.status }}</span></td>
+            <td>{{ job.created_at }}</td>
+            <td>{{ job.started_at or "-" }}</td>
+            <td>{{ job.finished_at or "-" }}</td>
+            <td>
+              {% if job.error_message %}
+                {{ job.error_message }}
+              {% elif job.result_summary %}
+                {{ job.result_summary }}
+              {% elif job.result_json %}
+                <code>{{ job.result_json[:180] }}{{ "..." if job.result_json|length > 180 else "" }}</code>
+              {% else %}
+                -
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}

@@ -2,9 +2,13 @@
 {% block content %}
 <section class="hero">
   <div>
-    <p class="eyebrow">Corretivas</p>
-    <h2>Tickets organizados por central</h2>
-    <p class="muted">A central aparece primeiro. Dentro de cada central ves os varios tickets, visitas e historico.</p>
+    <p class="eyebrow">Intervencoes</p>
+    <h2>Gestao de corretivas</h2>
+    <p class="muted">Cria a acao, decide prioridade, agenda a visita e fecha com historico por central.</p>
+  </div>
+  <div class="hero-actions">
+    <a class="button" href="{{ url_for('operation') }}">Centro O&amp;M</a>
+    <a class="button secondary" href="{{ url_for('field_routes.field_routes', scope='open_tickets') }}">Mapa e rotas</a>
   </div>
 </section>
 
@@ -20,73 +24,131 @@
     <strong>{{ ticket_stats.centrals }}</strong>
   </article>
   <article class="card stat-card">
-    <span>Tickets no filtro</span>
+    <span>Intervencoes no filtro</span>
     <strong>{{ ticket_stats.tickets }}</strong>
   </article>
   <article class="card stat-card">
-    <span>Tickets abertos</span>
+    <span>Intervencoes abertas</span>
     <strong>{{ ticket_stats.open }}</strong>
   </article>
   <article class="card stat-card">
-    <span>Criticos abertos</span>
+    <span>Criticas abertas</span>
     <strong>{{ ticket_stats.critical }}</strong>
   </article>
 </section>
 
-<section class="card">
-  <div class="section-title"><h3>Filtros de corretivas</h3></div>
-  <form class="filters monitoring-filters js-auto-submit" method="get">
-    <input type="text" name="search" value="{{ search }}" placeholder="Pesquisar por central, alias, ticket ou notas">
-    <div class="asset-picker" data-autosubmit="true">
-      <input class="asset-picker-input" type="text" list="ticket-asset-options" placeholder="Escrever instalacao ou central">
-      <input type="hidden" name="asset_id" value="{{ asset_filter or '' }}">
-      <small class="asset-picker-hint">Comeca a escrever para escolher.</small>
-    </div>
-    <select name="status">
-      <option value="">Todos os estados</option>
-      {% for status in ticket_statuses %}
-        <option value="{{ status }}" {{ 'selected' if status_filter == status else '' }}>{{ status }}</option>
-      {% endfor %}
-    </select>
-    <select name="urgency">
-      <option value="">Todas as urgencias</option>
-      {% for urgency in ticket_urgencies %}
-        <option value="{{ urgency }}" {{ 'selected' if urgency_filter == urgency else '' }}>{{ urgency }}</option>
-      {% endfor %}
-    </select>
-    <select name="om_only">
-      <option value="yes" {{ 'selected' if om_only == 'yes' else '' }}>So O&amp;M ativo</option>
-      <option value="no" {{ 'selected' if om_only == 'no' else '' }}>Todas as centrais</option>
-    </select>
-    <button class="button" type="submit">Aplicar</button>
-    <a class="button secondary" href="{{ url_for('tickets') }}">Limpar</a>
-  </form>
+<section class="workflow-strip">
+  <a href="#create-intervention" class="workflow-step">
+    <span>1</span>
+    <strong>Criar</strong>
+    <small>Registar problema ou pedido.</small>
+  </a>
+  <a href="#intervention-list" class="workflow-step">
+    <span>2</span>
+    <strong>Planear</strong>
+    <small>Definir prioridade, material e data.</small>
+  </a>
+  <a href="{{ url_for('field_routes.field_routes', scope='open_tickets') }}" class="workflow-step">
+    <span>3</span>
+    <strong>Executar</strong>
+    <small>Transformar prontas em rota.</small>
+  </a>
+  <a href="#error-calendar" class="workflow-step">
+    <span>4</span>
+    <strong>Validar</strong>
+    <small>Consultar erros que originaram a acao.</small>
+  </a>
 </section>
 
-<section class="card">
-  <div class="section-title"><h3>Criar ticket</h3></div>
-  <form method="post" class="ticket-form">
-    <div class="asset-picker">
-      <input class="asset-picker-input" type="text" list="ticket-asset-options" placeholder="Escrever instalacao ou central" required>
-      <input type="hidden" name="asset_id" value="{{ asset_filter or '' }}">
-      <small class="asset-picker-hint">Escolhe a central antes de criar.</small>
+<section class="grid two intervention-command-grid">
+  <article class="card" id="create-intervention">
+    <div class="section-title">
+      <div>
+        <h3>Criar intervencao</h3>
+        <p class="muted">Campos minimos primeiro; planeamento pode ser afinado na lista.</p>
+      </div>
     </div>
-    <input type="text" name="title" placeholder="Titulo do ticket" required>
-    <select name="urgency">
-      {% for urgency in ticket_urgencies %}
-        <option value="{{ urgency }}">{{ urgency }}</option>
-      {% endfor %}
-    </select>
-    <select name="status">
-      {% for status in ticket_statuses %}
-        <option value="{{ status }}">{{ status }}</option>
-      {% endfor %}
-    </select>
-    <input type="text" name="installation_ref" placeholder="Inversor, zona, referencia">
-    <input type="text" name="next_action" placeholder="Proxima acao">
-    <textarea name="notes" rows="3" placeholder="Notas do problema"></textarea>
-    <button class="button" type="submit">Criar</button>
-  </form>
+    <form method="post" class="ticket-form compact-ticket-form">
+      <div class="asset-picker">
+        <input class="asset-picker-input" type="text" list="ticket-asset-options" placeholder="Escrever instalacao ou central" required>
+        <input type="hidden" name="asset_id" value="{{ asset_filter or '' }}">
+        <small class="asset-picker-hint">Escolhe a central antes de criar.</small>
+      </div>
+      <input type="text" name="title" placeholder="Titulo da intervencao" required>
+      <input type="text" name="next_action" placeholder="Proxima acao">
+      <select name="urgency">
+        {% for urgency in ticket_urgencies %}
+          <option value="{{ urgency }}">{{ urgency }}</option>
+        {% endfor %}
+      </select>
+      <select name="work_type">
+        {% for work_type in ticket_work_types %}
+          <option value="{{ work_type }}">{{ work_type }}</option>
+        {% endfor %}
+      </select>
+      <select name="material_status">
+        {% for material_status in ticket_material_statuses %}
+          <option value="{{ material_status }}">{{ material_status }}</option>
+        {% endfor %}
+      </select>
+      <input type="date" name="planned_date" title="Data planeada">
+      <input type="text" name="assigned_to" placeholder="Tecnico ou equipa">
+      <details class="inline-details">
+        <summary>Mais detalhe</summary>
+        <div class="ticket-form-extra">
+          <select name="status">
+            {% for status in ticket_statuses %}
+              <option value="{{ status }}">{{ status }}</option>
+            {% endfor %}
+          </select>
+          <input type="text" name="installation_ref" placeholder="Inversor, zona, referencia">
+          <input type="date" name="due_date" title="Data limite">
+          <input type="number" name="estimated_minutes" min="0" step="15" value="60" placeholder="Minutos previstos">
+          <textarea name="notes" rows="3" placeholder="Notas do problema"></textarea>
+          <textarea name="planning_notes" rows="3" placeholder="Notas de planeamento, material ou acesso"></textarea>
+        </div>
+      </details>
+      <button class="button" type="submit">Criar intervencao</button>
+    </form>
+  </article>
+
+  <article class="card">
+    <div class="section-title">
+      <div>
+        <h3>Encontrar intervencoes</h3>
+        <p class="muted">Filtra a fila antes de abrir detalhes.</p>
+      </div>
+    </div>
+    <form class="filters monitoring-filters intervention-filter-form js-auto-submit" method="get">
+      <input type="hidden" name="calendar_month" value="{{ calendar_month }}">
+      <input type="text" name="search" value="{{ search }}" placeholder="Pesquisar por central, alias, intervencao ou notas">
+      <div class="asset-picker" data-autosubmit="true">
+        <input class="asset-picker-input" type="text" list="ticket-asset-options" placeholder="Escrever instalacao ou central">
+        <input type="hidden" name="asset_id" value="{{ asset_filter or '' }}">
+        <small class="asset-picker-hint">Comeca a escrever para escolher.</small>
+      </div>
+      <select name="status">
+        <option value="">Todos os estados</option>
+        {% for status in ticket_statuses %}
+          <option value="{{ status }}" {{ 'selected' if status_filter == status else '' }}>{{ status }}</option>
+        {% endfor %}
+      </select>
+      <select name="urgency">
+        <option value="">Todas as urgencias</option>
+        {% for urgency in ticket_urgencies %}
+          <option value="{{ urgency }}" {{ 'selected' if urgency_filter == urgency else '' }}>{{ urgency }}</option>
+        {% endfor %}
+      </select>
+      <select name="om_only">
+        <option value="yes" {{ 'selected' if om_only == 'yes' else '' }}>So O&amp;M ativo</option>
+        <option value="no" {{ 'selected' if om_only == 'no' else '' }}>Todas as centrais</option>
+      </select>
+      <div class="hero-actions filter-actions">
+        <button class="button" type="submit">Aplicar</button>
+        <a class="button secondary" href="{{ url_for('tickets') }}">Limpar</a>
+      </div>
+    </form>
+  </article>
 </section>
 
 {% if selected_asset %}
@@ -100,7 +162,7 @@
       {% if central_summary %}
         <div class="chips">
           <span class="chip {{ 'om-active' if selected_asset.active_contract == 'yes' else 'om-inactive' }}">{{ om_status_label(selected_asset.active_contract) }}</span>
-          <span class="chip">{{ central_summary.total }} tickets</span>
+          <span class="chip">{{ central_summary.total }} intervencoes</span>
           <span class="chip">{{ central_summary.open }} abertos</span>
           <span class="chip">{{ central_summary.visits }} visitas</span>
           {% if central_summary.critical %}
@@ -132,7 +194,7 @@
               <td>{{ ticket.next_action or "-" }}</td>
             </tr>
           {% else %}
-            <tr><td colspan="6" class="muted">Sem tickets para esta central.</td></tr>
+            <tr><td colspan="6" class="muted">Sem intervencoes para esta central.</td></tr>
           {% endfor %}
         </tbody>
       </table>
@@ -140,7 +202,13 @@
   </section>
 {% endif %}
 
-<section class="list ticket-stack">
+<section class="list ticket-stack" id="intervention-list">
+  <div class="section-title">
+    <div>
+      <h3>Fila por central</h3>
+      <p class="muted">Abre uma central e depois uma intervencao para editar apenas o necessario.</p>
+    </div>
+  </div>
   {% for group in grouped_tickets %}
     <details class="card central-ticket-card central-ticket-details" {% if asset_filter|string == group.asset_id|string or group.critical_count %}open{% endif %}>
       <summary class="ticket-summary">
@@ -150,7 +218,7 @@
         </div>
         <div class="chips">
           <span class="chip {{ 'om-active' if group.active_contract == 'yes' else 'om-inactive' }}">{{ om_status_label(group.active_contract) }}</span>
-          <span class="chip">{{ group.tickets|length }} tickets</span>
+          <span class="chip">{{ group.tickets|length }} intervencoes</span>
           <span class="chip">{{ group.open_count }} abertos</span>
           {% if group.critical_count %}
             <span class="chip danger">{{ group.critical_count }} criticos</span>
@@ -160,20 +228,29 @@
 
       <div class="central-ticket-list">
         {% for ticket in group.tickets %}
-          <div class="ticket-item">
-            <div class="ticket-item-head">
+          <details class="ticket-item ticket-item-details" {% if asset_filter|string == group.asset_id|string and loop.first %}open{% endif %}>
+            <summary class="ticket-item-summary">
               <div>
                 <strong>{{ ticket.title }}</strong>
                 <p class="muted">
                   {% if ticket.installation_ref %}{{ ticket.installation_ref }} | {% endif %}
                   criado {{ ticket.created_at }} | atualizado {{ ticket.updated_at }}
+                  {% if ticket.planned_date %} | planeado {{ ticket.planned_date }}{% endif %}
                 </p>
+                {% if ticket.next_action %}
+                  <small>Proxima acao: {{ ticket.next_action }}</small>
+                {% endif %}
               </div>
               <div class="chips">
                 <span class="chip {{ status_colors.get(ticket.status, 'muted') }}">{{ ticket.status }}</span>
                 <span class="chip">{{ ticket.urgency }}</span>
+                {% if ticket.material_status == 'Bloqueado' %}
+                  <span class="chip danger">Bloqueado</span>
+                {% elif ticket.material_status and ticket.material_status != 'Nao definido' %}
+                  <span class="chip">{{ ticket.material_status }}</span>
+                {% endif %}
               </div>
-            </div>
+            </summary>
 
             <div class="ticket-grid">
               <form method="post" action="{{ url_for('update_ticket', ticket_id=ticket.id) }}" class="stack-form">
@@ -194,12 +271,41 @@
                 <label>Proxima acao
                   <input type="text" name="next_action" value="{{ ticket.next_action or '' }}">
                 </label>
+                <label>Tipo de trabalho
+                  <select name="work_type">
+                    {% for work_type in ticket_work_types %}
+                      <option value="{{ work_type }}" {{ 'selected' if ticket.work_type == work_type else '' }}>{{ work_type }}</option>
+                    {% endfor %}
+                  </select>
+                </label>
+                <label>Material
+                  <select name="material_status">
+                    {% for material_status in ticket_material_statuses %}
+                      <option value="{{ material_status }}" {{ 'selected' if ticket.material_status == material_status else '' }}>{{ material_status }}</option>
+                    {% endfor %}
+                  </select>
+                </label>
+                <label>Data planeada
+                  <input type="date" name="planned_date" value="{{ ticket.planned_date or '' }}">
+                </label>
+                <label>Data limite
+                  <input type="date" name="due_date" value="{{ ticket.due_date or '' }}">
+                </label>
+                <label>Duracao prevista (min)
+                  <input type="number" name="estimated_minutes" min="0" step="15" value="{{ ticket.estimated_minutes or 60 }}">
+                </label>
+                <label>Tecnico/equipa
+                  <input type="text" name="assigned_to" value="{{ ticket.assigned_to or '' }}">
+                </label>
                 <label>Notas
                   <textarea name="notes" rows="4">{{ ticket.notes or '' }}</textarea>
                 </label>
+                <label>Notas de planeamento
+                  <textarea name="planning_notes" rows="3">{{ ticket.planning_notes or '' }}</textarea>
+                </label>
                 <div class="hero-actions">
-                  <button class="button secondary" type="submit">Atualizar ticket</button>
-                  <button class="button danger-button" type="submit" formaction="{{ url_for('delete_ticket', ticket_id=ticket.id) }}">Apagar ticket</button>
+                  <button class="button secondary" type="submit">Atualizar intervencao</button>
+                  <button class="button danger-button" type="submit" formaction="{{ url_for('delete_ticket', ticket_id=ticket.id) }}">Apagar intervencao</button>
                 </div>
               </form>
 
@@ -237,12 +343,72 @@
                 </div>
               </div>
             </div>
-          </div>
+          </details>
         {% endfor %}
       </div>
     </details>
   {% else %}
-    <article class="card"><p class="muted">Sem tickets para estes filtros.</p></article>
+    <article class="card"><p class="muted">Sem intervencoes para estes filtros.</p></article>
   {% endfor %}
 </section>
+
+<details class="card maintenance-calendar-card" id="error-calendar">
+  <summary class="panel-summary">
+    <div>
+      <h3>Calendario de erros</h3>
+      <p class="muted">Consulta de registos de monitorizacao com estado Erro ou Desconectada.</p>
+    </div>
+    <span class="chip">{{ error_calendar.record_count }} ocorrencias</span>
+  </summary>
+  <div class="section-title calendar-controls">
+    <div></div>
+    <div class="hero-actions">
+      <a class="button secondary" href="{{ url_for('tickets', calendar_month=previous_month, search=search, asset_id=asset_filter, status=status_filter, urgency=urgency_filter, scope=scope, om_only=om_only) }}">Mes anterior</a>
+      <a class="button secondary" href="{{ url_for('tickets', calendar_month=next_month, search=search, asset_id=asset_filter, status=status_filter, urgency=urgency_filter, scope=scope, om_only=om_only) }}">Mes seguinte</a>
+    </div>
+  </div>
+  <form class="calendar-month-form js-auto-submit" method="get">
+    <input type="hidden" name="search" value="{{ search }}">
+    <input type="hidden" name="asset_id" value="{{ asset_filter or '' }}">
+    <input type="hidden" name="status" value="{{ status_filter or '' }}">
+    <input type="hidden" name="urgency" value="{{ urgency_filter or '' }}">
+    <input type="hidden" name="scope" value="{{ scope or '' }}">
+    <input type="hidden" name="om_only" value="{{ om_only }}">
+    <label>Mes
+      <input type="month" name="calendar_month" value="{{ calendar_month }}">
+    </label>
+    <button class="button secondary" type="submit">Ver mes</button>
+  </form>
+  <div class="maintenance-calendar" aria-label="Calendario {{ error_calendar.label }}">
+    <div class="calendar-weekdays">
+      <span>Seg</span>
+      <span>Ter</span>
+      <span>Qua</span>
+      <span>Qui</span>
+      <span>Sex</span>
+      <span>Sab</span>
+      <span>Dom</span>
+    </div>
+    {% for week in error_calendar.weeks %}
+      <div class="calendar-week">
+        {% for day in week %}
+          <div class="calendar-day {{ 'is-empty' if not day.date else '' }} {{ 'is-today' if day.date and day.date.isoformat() == today_iso else '' }}">
+            {% if day.date %}
+              <div class="calendar-day-number">{{ day.date.day }}</div>
+              <div class="calendar-ticket-list">
+                {% for record in day.records %}
+                  <a class="calendar-ticket {{ status_colors.get(record.status, 'muted') }}" href="{{ url_for('monitoring', asset_id=record.asset_id, start_date=record.record_date, end_date=record.record_date, issue_only='yes') }}">
+                    <strong>{{ record.project_name }}</strong>
+                    <span>{{ record.status }}</span>
+                    <small>{{ record.source or '-' }}{% if record.notes %} | {{ record.notes }}{% endif %}</small>
+                  </a>
+                {% endfor %}
+              </div>
+            {% endif %}
+          </div>
+        {% endfor %}
+      </div>
+    {% endfor %}
+  </div>
+</details>
 {% endblock %}

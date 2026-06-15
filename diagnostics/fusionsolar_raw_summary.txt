@@ -1,0 +1,34 @@
+FusionSolar raw station export
+=============================
+Total recebido pela API: 134
+
+Paginação:
+- pageNo=1 pageCount=2 pageSize=100 total=134 rows=100
+- pageNo=2 pageCount=2 pageSize=100 total=134 rows=34
+
+Primeiras 10 centrais:
+- Bombeiros Rio Maior
+- Presuntos Lourenço 2
+- Moviportas Sede
+- Centro Social Alferrarede - Creche
+- EBI Boa Água
+- Museu do Caramulo
+- Maryasa 1
+- ARIPSI
+- Colégio Nossa Senhora da Apresentação
+- Intermarché da Moita
+
+Últimas 10 centrais:
+- Entre Vinhas e Mar - Paula Cunha Monteiro
+- Protecnil
+- Queijaria Lourenço e Filhos
+- BV Sintra
+- Colvi 3
+- APPACDM Portalegre
+- SCM Benavente
+- Fravizel
+- António Evaristo Goncalves - Projeto 3
+- Ignoramus - Herdade da Adema
+
+JSON: C:\Users\Sérgio\Documents\Projetos\Nem-sei\diagnostics\fusionsolar_raw_stations.json
+CSV: C:\Users\Sérgio\Documents\Projetos\Nem-sei\diagnostics\fusionsolar_raw_stations.csv

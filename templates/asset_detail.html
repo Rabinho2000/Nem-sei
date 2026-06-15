@@ -12,6 +12,57 @@
   </div>
 </section>
 
+<section class="card maintenance-calendar-card">
+  <div class="section-title">
+    <div>
+      <h3>Calendario de erros da instalacao</h3>
+      <p class="muted">Mostra quando um erro/desconexao aparece, se continua e quando desaparece.</p>
+    </div>
+    <div class="hero-actions">
+      <a class="button secondary" href="{{ url_for('asset_detail', asset_id=asset.id, calendar_month=previous_month) }}">Mes anterior</a>
+      <a class="button secondary" href="{{ url_for('asset_detail', asset_id=asset.id, calendar_month=next_month) }}">Mes seguinte</a>
+    </div>
+  </div>
+  <form class="calendar-month-form js-auto-submit" method="get">
+    <label>Mes
+      <input type="month" name="calendar_month" value="{{ calendar_month }}">
+    </label>
+    <button class="button secondary" type="submit">Ver mes</button>
+    <span class="chip">{{ asset_error_calendar.event_count }} eventos</span>
+  </form>
+  <div class="maintenance-calendar" aria-label="Calendario {{ asset_error_calendar.label }}">
+    <div class="calendar-weekdays">
+      <span>Seg</span>
+      <span>Ter</span>
+      <span>Qua</span>
+      <span>Qui</span>
+      <span>Sex</span>
+      <span>Sab</span>
+      <span>Dom</span>
+    </div>
+    {% for week in asset_error_calendar.weeks %}
+      <div class="calendar-week">
+        {% for day in week %}
+          <div class="calendar-day {{ 'is-empty' if not day.date else '' }} {{ 'is-today' if day.date and day.date.isoformat() == today_iso else '' }}">
+            {% if day.date %}
+              <div class="calendar-day-number">{{ day.date.day }}</div>
+              <div class="calendar-ticket-list">
+                {% for event in day.events %}
+                  <div class="calendar-ticket asset-calendar-event event-{{ event.type }} {{ status_colors.get(event.status, 'muted') }}">
+                    <strong>{{ event.label }}</strong>
+                    <span>{{ event.status }}</span>
+                    <small>{{ event.source or '-' }}{% if event.notes %} | {{ event.notes }}{% endif %}</small>
+                  </div>
+                {% endfor %}
+              </div>
+            {% endif %}
+          </div>
+        {% endfor %}
+      </div>
+    {% endfor %}
+  </div>
+</section>
+
 <section class="grid two">
   <details class="card asset-edit-details" id="asset-edit">
     <summary class="asset-edit-summary">Editar informacoes da instalacao</summary>
@@ -177,76 +228,85 @@
   </article>
 
   <article class="card">
-    <div class="section-title">
-      <h3>Performance</h3>
-      <a class="button secondary" href="{{ url_for('performance', asset_id=asset.id, om_only='no') }}">Abrir</a>
-    </div>
-    <div class="list compact-list">
-      <div class="list-row">
-        <div>
-          <strong>Último dia</strong>
-          <p>{{ latest_daily_performance.period_date if latest_daily_performance else "Sem dados" }}</p>
-        </div>
-        {% if latest_daily_performance %}
-          <div class="chips">
-            <span class="chip {{ status_colors.get(latest_daily_performance.performance_status, 'muted') }}">{{ latest_daily_performance.performance_status }}</span>
-            <span class="chip">{{ "%.1f"|format(latest_daily_performance.deviation_pct) if latest_daily_performance.deviation_pct is not none else "-" }}%</span>
-          </div>
-          {% with record=latest_daily_performance %}{% include "_performance_bar.html" %}{% endwith %}
-        {% endif %}
+    <div class="section-title"><h3>Disponibilidade de dispositivos</h3></div>
+    {% if latest_availability %}
+      <div class="cards">
+        <article class="card stat-card nested-card">
+          <span>Disponibilidade inversores</span>
+          <strong>{{ "%.1f%%"|format(latest_availability.inverter_availability_pct) if latest_availability.inverter_availability_pct is not none else "Sem dados" }}</strong>
+        </article>
+        <article class="card stat-card nested-card">
+          <span>Disponibilidade capacidade</span>
+          <strong>{{ "%.1f%%"|format(latest_availability.capacity_availability_pct) if latest_availability.capacity_availability_pct is not none else "Sem dados" }}</strong>
+        </article>
+        <article class="card stat-card nested-card">
+          <span>Disponibilidade comunicacao</span>
+          <strong>{{ "%.1f%%"|format(latest_availability.communication_availability_pct) if latest_availability.communication_availability_pct is not none else "Sem dados" }}</strong>
+        </article>
+        <article class="card stat-card nested-card">
+          <span>Disponibilidade strings</span>
+          <strong>{{ "%.1f%%"|format(latest_availability.string_availability_pct) if latest_availability.string_availability_pct is not none else "Sem dados" }}</strong>
+        </article>
       </div>
-      <div class="list-row performance-summary-row">
-        <div>
-          <strong>MTD</strong>
-          <p>{{ latest_mtd_performance.period_date if latest_mtd_performance else "Sem dados" }}</p>
-        </div>
-        {% if latest_mtd_performance %}
-          {% with record=latest_mtd_performance %}{% include "_performance_bar.html" %}{% endwith %}
-        {% endif %}
+      <div class="table-wrap compact-top-space">
+        <table>
+          <thead>
+            <tr>
+              <th>Dispositivo</th>
+              <th>Estado</th>
+              <th>inverter_state</th>
+              <th>Pot. ativa</th>
+              <th>Pot. nominal</th>
+              <th>Strings OK / total</th>
+              <th>Ultima comunicacao</th>
+              <th>Recolhido em</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for device in latest_device_rows %}
+              <tr>
+                <td>{{ device.device_name or "-" }}</td>
+                <td>{{ device.availability_status or "-" }}</td>
+                <td>{{ device.inverter_state if device.inverter_state is not none else "-" }}</td>
+                <td>{{ "%.1f kW"|format(device.active_power_kw) if device.active_power_kw is not none else "-" }}</td>
+                <td>{{ "%.1f kW"|format(device.rated_power_kw) if device.rated_power_kw is not none else "-" }}</td>
+                <td>{{ device.string_available_count ~ " / " ~ device.string_total_count if device.string_total_count is not none else "-" }}</td>
+                <td>{{ device.last_seen_at or "-" }}</td>
+                <td>{{ device.collected_at or "-" }}</td>
+              </tr>
+            {% else %}
+              <tr><td colspan="8" class="muted">Sem dispositivos recolhidos.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
       </div>
-      <div class="list-row">
-        <div>
-          <strong>Último mês</strong>
-          <p>{{ latest_monthly_performance.period_date if latest_monthly_performance else "Sem dados" }}</p>
-        </div>
-        {% if latest_monthly_performance %}
-          <div class="chips">
-            <span class="chip {{ status_colors.get(latest_monthly_performance.performance_status, 'muted') }}">{{ latest_monthly_performance.performance_status }}</span>
-            <span class="chip">{{ "%.1f"|format(latest_monthly_performance.deviation_pct) if latest_monthly_performance.deviation_pct is not none else "-" }}%</span>
-          </div>
-          {% with record=latest_monthly_performance %}{% include "_performance_bar.html" %}{% endwith %}
-        {% endif %}
+      <div class="top-space">
+        {% for device in latest_device_rows %}
+          <form class="card nested-card stack-form" method="post" action="{{ url_for('update_asset_expected_strings', asset_id=asset.id) }}">
+            <input type="hidden" name="provider_device_id" value="{{ device.provider_device_id }}">
+            <div class="section-title">
+              <h3>{{ device.device_name or "Inversor" }} — strings esperadas</h3>
+            </div>
+            <div class="chips">
+              {% set configured = expected_strings_by_device.get(device.provider_device_id, []) %}
+              {% for index in range(1, 37) %}
+                {% set item = (configured | selectattr('string_index', 'equalto', index) | list | first) %}
+                <label class="checkbox-inline">
+                  <input type="checkbox" name="expected_strings" value="{{ index }}" {{ 'checked' if item and item.expected else '' }}>
+                  <span>PV{{ index }}</span>
+                </label>
+              {% endfor %}
+            </div>
+            <p class="muted">A app aprende automaticamente quando ve tensao &gt; 100 V em pelo menos 2 snapshots. Uma alteracao manual passa a ter prioridade sobre o automatico.</p>
+            <button class="button secondary" type="submit">Guardar strings esperadas</button>
+          </form>
+        {% endfor %}
       </div>
-    </div>
+    {% else %}
+      <p class="muted">Sem dados de disponibilidade por dispositivo.</p>
+    {% endif %}
   </article>
 
-  <article class="card">
-    <div class="section-title"><h3>Definições performance</h3></div>
-    <form class="stack-form" method="post" action="{{ url_for('update_asset_performance_settings', asset_id=asset.id) }}">
-      <label class="checkbox-inline">
-        <input type="checkbox" name="enabled" {{ 'checked' if performance_settings.enabled else '' }}>
-        <span>Performance ativa</span>
-      </label>
-      <div class="grid two">
-        <label>Atenção %
-          <input type="number" step="0.1" name="warning_deviation_pct" value="{{ performance_settings.warning_deviation_pct }}">
-        </label>
-        <label>Alerta %
-          <input type="number" step="0.1" name="alert_deviation_pct" value="{{ performance_settings.alert_deviation_pct }}">
-        </label>
-        <label>Crítico %
-          <input type="number" step="0.1" name="critical_deviation_pct" value="{{ performance_settings.critical_deviation_pct }}">
-        </label>
-        <label>Anos histórico
-          <input type="number" min="1" name="baseline_years" value="{{ performance_settings.baseline_years }}">
-        </label>
-      </div>
-      <label>Orçamento mensal kWh/kWp
-        <textarea name="monthly_budget_json" rows="6" placeholder='{"01": 80, "02": 95, "03": 125}'>{{ performance_settings.monthly_budget_json or '' }}</textarea>
-      </label>
-      <button class="button" type="submit">Guardar performance</button>
-    </form>
-  </article>
 </section>
 
 <section class="grid two">

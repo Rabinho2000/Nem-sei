@@ -5,7 +5,7 @@
       <div class="list-row unresolved-row">
         <div>
           <strong>{{ row.external_name }}</strong>
-          <p>ID externo: {{ row.external_id or '-' }} | Estado: {{ row.external_status or '-' }}</p>
+          <p>{{ row.provider }} | ID externo: {{ row.external_id or '-' }} | Estado: {{ row.external_status or '-' }}</p>
         </div>
         <form method="post" class="inline-form unresolved-action-form">
           <input type="hidden" name="action" value="resolve_unresolved">

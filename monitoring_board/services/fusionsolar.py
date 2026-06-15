@@ -5,6 +5,9 @@ from typing import Any
 
 
 DEFAULT_SYNC_HOURS = "08:00,14:00"
+AVAILABLE_INVERTER_STATES = {512, 513, 514, 1025, 1026, 2048}
+UNAVAILABLE_INVERTER_STATES = {768, 769, 770, 771, 772, 773, 774}
+STANDBY_INVERTER_STATES = {0, 1, 2, 3, 7, 256, 1280, 1281, 1536, 1792}
 
 
 def normalize_sync_hours(raw_value: str) -> str:
@@ -56,6 +59,29 @@ def describe_fusionsolar_health_state(raw_status: Any) -> str:
     if raw_value in {"3", "3.0"}:
         return "healthy"
     return raw_value or "unknown"
+
+
+def classify_fusionsolar_inverter_availability(
+    row: dict[str, Any],
+    has_recent_data: bool = True,
+    has_critical_alarm: bool = False,
+) -> str:
+    if not has_recent_data:
+        return "no_communication"
+    if has_critical_alarm:
+        return "unavailable"
+    raw_state = row.get("inverter_state")
+    try:
+        inverter_state = int(float(str(raw_state)))
+    except (TypeError, ValueError):
+        return "unknown"
+    if inverter_state in AVAILABLE_INVERTER_STATES:
+        return "available"
+    if inverter_state in UNAVAILABLE_INVERTER_STATES:
+        return "unavailable"
+    if inverter_state in STANDBY_INVERTER_STATES:
+        return "standby"
+    return "unknown"
 
 
 def normalize_name(value: str) -> str:

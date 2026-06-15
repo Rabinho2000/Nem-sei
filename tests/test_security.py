@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import os
+from io import BytesIO
 
 import pytest
 
@@ -9,7 +10,8 @@ os.environ["FLASK_SECRET_KEY"] = "test-secret"
 os.environ["APP_USERNAME"] = "admin"
 os.environ["APP_PASSWORD"] = "test-password"
 
-from app import app
+from app import app, ensure_database
+from monitoring_board.db import get_db, query_scalar
 from monitoring_board.routes.auth import safe_local_next_url
 from monitoring_board.security import flask_secret_key
 
@@ -40,6 +42,12 @@ def test_login_and_csrf_flow() -> None:
     assert login_response.status_code == 302
     assert client.get("/").status_code == 200
     assert client.post("/logout").status_code == 400
+
+
+def test_session_cookie_defaults_are_hardened() -> None:
+    assert app.config["SESSION_COOKIE_HTTPONLY"] is True
+    assert app.config["SESSION_COOKIE_SAMESITE"] == "Lax"
+    assert app.config["MAX_CONTENT_LENGTH"] > 0
 
 
 def test_login_rejects_external_next_redirect() -> None:
@@ -80,3 +88,73 @@ def test_invalid_post_has_friendly_error_page() -> None:
 
     assert response.status_code == 400
     assert b"Pedido invalido" in response.data
+
+
+def test_contract_upload_rejects_non_pdf_content(tmp_path) -> None:
+    db_path = tmp_path / "security.db"
+    ensure_database(str(db_path))
+    conn = get_db(str(db_path))
+    try:
+        cursor = conn.execute("INSERT INTO assets (project_name) VALUES (?)", ("Central A",))
+        asset_id = int(cursor.lastrowid)
+        conn.commit()
+    finally:
+        conn.close()
+
+    previous_db = app.config["DATABASE"]
+    app.config["DATABASE"] = str(db_path)
+    try:
+        client = app.test_client()
+        with client.session_transaction() as sess:
+            sess["authenticated"] = True
+            sess["username"] = "admin"
+            sess["csrf_token"] = "token"
+        response = client.post(
+            f"/asset/{asset_id}/contract",
+            data={
+                "csrf_token": "token",
+                "contract_pdf": (BytesIO(b"not a pdf"), "contract.pdf"),
+            },
+            content_type="multipart/form-data",
+        )
+    finally:
+        app.config["DATABASE"] = previous_db
+
+    conn = get_db(str(db_path))
+    try:
+        assert response.status_code == 302
+        assert query_scalar(conn, "SELECT COUNT(*) FROM om_contracts") == 0
+    finally:
+        conn.close()
+
+
+def test_contract_open_blocks_paths_outside_contract_directory(tmp_path) -> None:
+    db_path = tmp_path / "security.db"
+    ensure_database(str(db_path))
+    conn = get_db(str(db_path))
+    try:
+        cursor = conn.execute("INSERT INTO assets (project_name) VALUES (?)", ("Central A",))
+        asset_id = int(cursor.lastrowid)
+        conn.execute(
+            """
+            INSERT INTO om_contracts (asset_id, pdf_path, original_filename, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (asset_id, "../.env", ".env", "2026-05-06T10:00:00", "2026-05-06T10:00:00"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    previous_db = app.config["DATABASE"]
+    app.config["DATABASE"] = str(db_path)
+    try:
+        client = app.test_client()
+        with client.session_transaction() as sess:
+            sess["authenticated"] = True
+            sess["username"] = "admin"
+        response = client.get(f"/asset/{asset_id}/contract/open")
+    finally:
+        app.config["DATABASE"] = previous_db
+
+    assert response.status_code == 404

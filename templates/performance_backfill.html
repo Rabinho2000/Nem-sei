@@ -11,6 +11,15 @@
   </div>
 </section>
 
+{% include "_background_jobs.html" %}
+
+{% if fusionsolar_api_warning %}
+<section class="card">
+  <div class="section-title"><h3>Aviso FusionSolar</h3></div>
+  <p class="muted">{{ fusionsolar_api_warning }}</p>
+</section>
+{% endif %}
+
 <section class="card">
   <div class="section-title"><h3>Backfill historico</h3></div>
   <form class="stack-form" method="post">
@@ -46,8 +55,27 @@
       </label>
     </div>
     <p class="muted">No modo diario, a FusionSolar devolve meses completos: uma chamada por mes e por cada 100 centrais. Estimativa atual: {{ estimated_api_calls }} chamadas API para {{ estimated_station_count }} centrais.</p>
-    <p class="muted">A API suporta apenas uma chamada KPI por minuto. Evita backfills anuais para todas as centrais; usa intervalos curtos e retoma pelo mes indicado se houver limite.</p>
+    <p class="muted">A API suporta apenas uma chamada KPI por minuto. Se a FusionSolar devolver limite/tokens esgotados, o job espera pelo cooldown e continua; se atingir o limite local de chamadas, mostra o mes para retomar.</p>
     <button class="button" type="submit">Executar backfill</button>
+  </form>
+</section>
+
+<section class="card">
+  <div class="section-title"><h3>Ciclo mensal automatico</h3></div>
+  <form class="stack-form" method="post">
+    <input type="hidden" name="action" value="month_cycle">
+    <label>Mes
+      <input type="month" name="cycle_month" value="{{ cycle_month }}" required>
+    </label>
+    <label>Instalacoes
+      <select name="cycle_asset_ids" multiple size="10" required>
+        {% for asset in assets_for_backfill %}
+          <option value="{{ asset.asset_id }}">{{ asset.project_name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <p class="muted">Este ciclo corre em background. Se a FusionSolar esgotar os tokens/limite, o job espera pelo cooldown e continua na mesma tarefa.</p>
+    <button class="button" type="submit">Iniciar ciclo mensal</button>
   </form>
 </section>
 

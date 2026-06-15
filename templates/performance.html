@@ -2,44 +2,46 @@
 {% block content %}
 <section class="hero">
   <div>
-    <p class="eyebrow">Producao</p>
-    <h2>Performance</h2>
-    <p class="muted">Producao FusionSolar comparada com historico ou orcamento mensal kWh/kWp.</p>
+    <p class="eyebrow">Disponibilidade</p>
+    <h2>Disponibilidade de inversores</h2>
+    <p class="muted">Estado operacional por central com base nos dispositivos FusionSolar recolhidos.</p>
   </div>
   <div class="hero-actions">
-    <a class="button secondary" href="{{ url_for('performance_backfill') }}">Backfill historico</a>
     <form method="post">
-      <input type="hidden" name="action" value="recalculate_references">
-      <input type="hidden" name="asset_id" value="{{ selected_asset_id }}">
-      <input type="hidden" name="period_type" value="{{ period_type }}">
-      <input type="hidden" name="period_date" value="{{ period_date }}">
-      <button class="button secondary" type="submit">Recalcular referências</button>
-    </form>
-    <form method="post">
-      <input type="hidden" name="action" value="sync">
-      <input type="hidden" name="period_type" value="{{ period_type }}">
-      <input type="hidden" name="period_date" value="{{ period_date }}">
-      <button class="button" type="submit">Sincronizar periodo</button>
+      <input type="hidden" name="action" value="sync_availability">
+      <button class="button" type="submit">Sincronizar disponibilidade</button>
     </form>
   </div>
 </section>
 
 <section class="cards dashboard-kpis">
   <article class="card stat-card">
-    <span>Registos com referência</span>
-    <strong>{{ reference_summary.with_reference }}</strong>
+    <span>Centrais com dados</span>
+    <strong>{{ availability_summary.assets_with_data }}</strong>
   </article>
   <article class="card stat-card">
-    <span>Registos sem referência</span>
-    <strong>{{ reference_summary.without_reference }}</strong>
+    <span>Disponibilidade media</span>
+    <strong>{{ "%.1f%%"|format(availability_summary.average_inverter_availability_pct) if availability_summary.average_inverter_availability_pct is not none else "Sem dados" }}</strong>
   </article>
   <article class="card stat-card">
-    <span>Com produção mas sem referência</span>
-    <strong>{{ reference_summary.production_without_reference }}</strong>
+    <span>Inversores indisponiveis</span>
+    <strong>{{ availability_summary.unavailable_inverters }}</strong>
   </article>
   <article class="card stat-card">
-    <span>Sem produção</span>
-    <strong>{{ reference_summary.missing_production }}</strong>
+    <span>Sem comunicacao</span>
+    <strong>{{ availability_summary.no_communication_devices }}</strong>
+  </article>
+  <article class="card stat-card">
+    <span>Potencia afetada</span>
+    <strong>{{ "%.1f kW"|format(availability_summary.affected_power_kw) if availability_summary.affected_power_kw is not none else "Sem dados" }}</strong>
+  </article>
+  <article class="card stat-card">
+    <span>Disponibilidade strings</span>
+    <strong>{{ "%.1f%%"|format(availability_summary.string_availability_pct) if availability_summary.string_availability_pct is not none else "Sem dados" }}</strong>
+  </article>
+  <article class="card stat-card">
+    <span>Strings indisponiveis</span>
+    <strong>{{ availability_summary.unavailable_strings }}</strong>
   </article>
 </section>
 
@@ -49,53 +51,39 @@
     <label>Pesquisar
       <input type="text" name="search" value="{{ search }}" placeholder="Central, localizacao ou empresa">
     </label>
-    <label>Estado
-      <select name="status">
-        <option value="">Todos</option>
-        {% for item in performance_statuses %}
-          <option value="{{ item }}" {{ 'selected' if status == item else '' }}>{{ item }}</option>
-        {% endfor %}
-      </select>
-    </label>
     <label>O&amp;M
       <select name="om_only">
         <option value="yes" {{ 'selected' if om_only == 'yes' else '' }}>Apenas O&amp;M</option>
         <option value="no" {{ 'selected' if om_only == 'no' else '' }}>Todas</option>
       </select>
     </label>
-    <label>Periodo
-      <select name="period_type">
-        <option value="day" {{ 'selected' if period_type == 'day' else '' }}>Dia</option>
-        <option value="month" {{ 'selected' if period_type == 'month' else '' }}>Mes</option>
+    <label>Vista
+      <select name="issue_only">
+        <option value="no" {{ 'selected' if issue_only == 'no' else '' }}>Todas</option>
+        <option value="yes" {{ 'selected' if issue_only == 'yes' else '' }}>Com indisponibilidade</option>
       </select>
     </label>
-    {% if period_type == 'month' %}
-      <label>Mes
-        <input type="month" name="period_date" value="{{ month_value }}">
-      </label>
-    {% else %}
-      <label>Data
-        <input type="date" name="period_date" value="{{ period_date }}">
-      </label>
-    {% endif %}
   </form>
 </section>
 
 <section class="card">
-  <div class="section-title"><h3>Producao esperada</h3></div>
+  <div class="section-title"><h3>Disponibilidade por central</h3></div>
   <div class="table-wrap">
-    <table class="performance-table">
+    <table>
       <thead>
         <tr>
           <th>Central</th>
           <th>Localizacao</th>
-          <th>kWp</th>
-          <th>Producao kWh</th>
-          <th>kWh/kWp</th>
-          <th>Performance</th>
-          <th>Estado</th>
-          <th>Ultima atualizacao</th>
-          <th>Payload</th>
+          <th>Disponibilidade</th>
+          <th>Capacidade</th>
+          <th>Comunicacao</th>
+          <th>Inversores OK / total</th>
+          <th>Indisponiveis</th>
+          <th>Sem comunicacao</th>
+          <th>Potencia afetada</th>
+          <th>Strings</th>
+          <th>Strings indisponiveis</th>
+          <th>Atualizado em</th>
         </tr>
       </thead>
       <tbody>
@@ -103,22 +91,19 @@
           <tr>
             <td><a class="table-link" href="{{ url_for('asset_detail', asset_id=row.asset_id) }}">{{ row.project_name }}</a></td>
             <td>{{ row.location or "-" }}</td>
-            <td>{{ format_number(row.kwp, 2) }}</td>
-            <td>{{ format_number(row.production_kwh, 2) }}</td>
-            <td>{{ format_number(row.specific_yield, 2) }}</td>
-            <td class="performance-cell">{% with record=row %}{% include "_performance_bar.html" %}{% endwith %}</td>
-            <td><span class="chip {{ status_colors.get(row.performance_status, 'muted') }}">{{ row.performance_status or "Sem dados" }}</span></td>
+            <td>{{ "%.1f%%"|format(row.inverter_availability_pct) if row.inverter_availability_pct is not none else "Sem dados" }}</td>
+            <td>{{ "%.1f%%"|format(row.capacity_availability_pct) if row.capacity_availability_pct is not none else "-" }}</td>
+            <td>{{ "%.1f%%"|format(row.communication_availability_pct) if row.communication_availability_pct is not none else "-" }}</td>
+            <td>{{ row.available_inverters ~ " / " ~ row.total_inverters if row.total_inverters is not none else "-" }}</td>
+            <td>{{ row.unavailable_inverters if row.unavailable_inverters is not none else "-" }}</td>
+            <td>{{ row.no_communication_devices if row.no_communication_devices is not none else "-" }}</td>
+            <td>{{ "%.1f kW"|format(row.affected_power_kw) if row.affected_power_kw is not none else "-" }}</td>
+            <td>{{ "%.1f%%"|format(row.string_availability_pct) if row.string_availability_pct is not none else "-" }}</td>
+            <td>{{ row.unavailable_strings if row.unavailable_strings is not none else "-" }}</td>
             <td>{{ row.updated_at or "-" }}</td>
-            <td>
-              {% if row.id %}
-                <a class="button secondary" href="{{ url_for('performance_debug', record_id=row.id) }}">Ver payload</a>
-              {% else %}
-                -
-              {% endif %}
-            </td>
           </tr>
         {% else %}
-          <tr><td colspan="9" class="muted">Sem centrais para estes filtros.</td></tr>
+          <tr><td colspan="12" class="muted">Sem centrais para estes filtros.</td></tr>
         {% endfor %}
       </tbody>
     </table>

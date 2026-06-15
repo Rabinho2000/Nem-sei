@@ -1,0 +1,194 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">Operacao</p>
+    <h2>Centro O&amp;M</h2>
+    <p class="muted">Detetar, decidir, planear e fechar intervencoes a partir do mesmo sitio.</p>
+  </div>
+  <div class="hero-actions">
+    <a class="button" href="{{ url_for('tickets') }}">Nova intervencao</a>
+    <a class="button secondary" href="{{ url_for('field_routes.field_routes', scope='open_tickets') }}">Mapa e rotas</a>
+  </div>
+</section>
+
+<section class="cards">
+  <article class="card stat-card">
+    <span>Intervencoes abertas</span>
+    <strong>{{ operation_stats.open }}</strong>
+  </article>
+  <article class="card stat-card">
+    <span>Sem data</span>
+    <strong>{{ operation_stats.unplanned }}</strong>
+  </article>
+  <article class="card stat-card">
+    <span>Esta semana</span>
+    <strong>{{ operation_stats.this_week }}</strong>
+  </article>
+  <article class="card stat-card">
+    <span>Sem acao criada</span>
+    <strong>{{ operation_stats.without_action }}</strong>
+  </article>
+</section>
+
+<section class="card">
+  <form class="filters monitoring-filters js-auto-submit" method="get">
+    <input type="hidden" name="calendar_month" value="{{ calendar_month }}">
+    <input type="text" name="search" value="{{ search }}" placeholder="Pesquisar central, localizacao, acao ou morada">
+    <select name="om_only">
+      <option value="yes" {{ 'selected' if om_only == 'yes' else '' }}>So O&amp;M ativo</option>
+      <option value="no" {{ 'selected' if om_only == 'no' else '' }}>Todas as centrais</option>
+    </select>
+    <button class="button" type="submit">Aplicar</button>
+    <a class="button secondary" href="{{ url_for('operation') }}">Limpar</a>
+  </form>
+</section>
+
+<section class="grid two operation-grid">
+  <article class="card">
+    <div class="section-title">
+      <div>
+        <h3>Fila de trabalho</h3>
+        <p class="muted">Intervencoes abertas, ordenadas por urgencia e falta de planeamento.</p>
+      </div>
+      <span class="chip">{{ operation_stats.ready_for_route }} prontas para rota</span>
+    </div>
+    <div class="operation-worklist">
+      {% for item in interventions[:14] %}
+        <div class="operation-item">
+          <div>
+            <strong><a class="table-link" href="{{ url_for('tickets', asset_id=item.asset_id) }}">{{ item.project_name }}</a></strong>
+            <p>{{ item.title }}</p>
+            <small>{{ item.location or item.address or "Sem localizacao" }} | {{ item.work_type or "Diagnostico" }}</small>
+          </div>
+          <div class="chips">
+            <span class="chip {{ status_colors.get(item.status, 'muted') }}">{{ item.status }}</span>
+            <span class="chip {{ 'danger' if item.urgency == 'Critica' else 'warning' if item.urgency == 'Alta' else '' }}">{{ item.urgency }}</span>
+            {% if item.planned_date %}
+              <span class="chip">{{ item.planned_date }}</span>
+            {% else %}
+              <span class="chip warning">Sem data</span>
+            {% endif %}
+            {% if item.material_status == 'Bloqueado' %}
+              <span class="chip danger">Bloqueado</span>
+            {% elif item.material_status %}
+              <span class="chip">{{ item.material_status }}</span>
+            {% endif %}
+          </div>
+        </div>
+      {% else %}
+        <p class="muted">Sem intervencoes abertas neste filtro.</p>
+      {% endfor %}
+    </div>
+  </article>
+
+  <article class="card">
+    <div class="section-title">
+      <div>
+        <h3>Problemas sem acao</h3>
+        <p class="muted">Centrais em erro/desconectadas sem intervencao aberta.</p>
+      </div>
+      <span class="chip warning">{{ problems_without_action|length }}</span>
+    </div>
+    <div class="operation-worklist compact-list">
+      {% for asset in problems_without_action %}
+        <a class="list-row card-link" href="{{ url_for('monitoring', asset_id=asset.asset_id, issue_only='yes') }}">
+          <div>
+            <strong>{{ asset.project_name }}</strong>
+            <small>{{ asset.location or asset.address or "Sem localizacao" }} | {{ asset.record_date or "-" }}</small>
+          </div>
+          <span class="chip {{ status_colors.get(asset.status, 'muted') }}">{{ asset.status }}</span>
+        </a>
+      {% else %}
+        <p class="muted">Todos os problemas filtrados ja tem acao aberta.</p>
+      {% endfor %}
+    </div>
+  </article>
+</section>
+
+<section class="card maintenance-calendar-card">
+  <div class="section-title">
+    <div>
+      <h3>Calendario de intervencoes</h3>
+      <p class="muted">Planeamento mensal com base na data planeada de cada intervencao.</p>
+    </div>
+    <div class="hero-actions">
+      <a class="button secondary" href="{{ url_for('operation', calendar_month=previous_month, search=search, om_only=om_only) }}">Mes anterior</a>
+      <a class="button secondary" href="{{ url_for('operation', calendar_month=next_month, search=search, om_only=om_only) }}">Mes seguinte</a>
+    </div>
+  </div>
+  <form class="calendar-month-form js-auto-submit" method="get">
+    <input type="hidden" name="search" value="{{ search }}">
+    <input type="hidden" name="om_only" value="{{ om_only }}">
+    <label>Mes
+      <input type="month" name="calendar_month" value="{{ calendar_month }}">
+    </label>
+    <button class="button secondary" type="submit">Ver mes</button>
+    <span class="chip">{{ planning_calendar.record_count }} intervencoes</span>
+  </form>
+  <div class="maintenance-calendar" aria-label="Calendario {{ planning_calendar.label }}">
+    <div class="calendar-weekdays">
+      <span>Seg</span>
+      <span>Ter</span>
+      <span>Qua</span>
+      <span>Qui</span>
+      <span>Sex</span>
+      <span>Sab</span>
+      <span>Dom</span>
+    </div>
+    {% for week in planning_calendar.weeks %}
+      <div class="calendar-week">
+        {% for day in week %}
+          <div class="calendar-day {{ 'is-empty' if not day.date else '' }} {{ 'is-today' if day.date and day.date.isoformat() == today_iso else '' }}">
+            {% if day.date %}
+              <div class="calendar-day-number">{{ day.date.day }}</div>
+              <div class="calendar-ticket-list">
+                {% for record in day.records %}
+                  <a class="calendar-ticket {{ status_colors.get(record.status, 'muted') }}" href="{{ url_for('tickets', asset_id=record.asset_id) }}">
+                    <strong>{{ record.project_name }}</strong>
+                    <span>{{ record.title }}</span>
+                    <small>{{ record.assigned_to or "Sem equipa" }} | {{ record.estimated_minutes or 0 }} min</small>
+                  </a>
+                {% endfor %}
+              </div>
+            {% endif %}
+          </div>
+        {% endfor %}
+      </div>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="grid two">
+  <article class="card">
+    <div class="section-title"><h3>Planeamento rapido</h3></div>
+    <div class="operation-buckets">
+      <div>
+        <strong>Sem data</strong>
+        <span class="chip warning">{{ operation_stats.unplanned }}</span>
+      </div>
+      <div>
+        <strong>Esta semana</strong>
+        <span class="chip">{{ operation_stats.this_week }}</span>
+      </div>
+      <div>
+        <strong>Bloqueadas</strong>
+        <span class="chip danger">{{ operation_stats.blocked }}</span>
+      </div>
+      <div>
+        <strong>Criticas</strong>
+        <span class="chip danger">{{ operation_stats.critical }}</span>
+      </div>
+    </div>
+  </article>
+
+  <article class="card">
+    <div class="section-title"><h3>Proximo passo natural</h3></div>
+    <p class="muted">Usa esta pagina para decidir prioridade. Usa Corretivas para editar detalhe. Usa Mapa e rotas para transformar intervencoes prontas em visitas.</p>
+    <div class="hero-actions">
+      <a class="button" href="{{ url_for('tickets', scope='open') }}">Editar intervencoes</a>
+      <a class="button secondary" href="{{ url_for('field_routes.field_routes', scope='open_tickets') }}">Abrir mapa</a>
+    </div>
+  </article>
+</section>
+{% endblock %}

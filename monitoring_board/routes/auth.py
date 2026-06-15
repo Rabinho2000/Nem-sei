@@ -28,6 +28,7 @@ def login() -> str:
             return render_template("login.html", title="Login", expected_username=app_username())
         if username == app_username() and check_app_password(password):
             session.clear()
+            session.permanent = True
             session["authenticated"] = True
             session["username"] = username
             csrf_token()

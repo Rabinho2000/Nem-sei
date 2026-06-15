@@ -50,6 +50,7 @@ from monitoring_board.runtime import (
 from monitoring_board.security import app_password_configured, csrf_token, flask_secret_key
 from monitoring_board.services.fusionsolar import (
     build_provider_url,
+    classify_fusionsolar_inverter_availability,
     describe_fusionsolar_health_state,
     map_fusionsolar_status,
     normalize_sync_hours,
@@ -85,6 +86,8 @@ DEFAULT_FUSIONSOLAR_SYNC_HOURS = "08:00,14:00"
 DEFAULT_FUSIONSOLAR_LOGIN_ENDPOINT = "/thirdData/login"
 DEFAULT_FUSIONSOLAR_STATIONS_ENDPOINT = "/thirdData/stations"
 DEFAULT_FUSIONSOLAR_REALTIME_ENDPOINT = "/thirdData/getStationRealKpi"
+DEFAULT_FUSIONSOLAR_DEVICES_ENDPOINT = "/thirdData/getDevList"
+DEFAULT_FUSIONSOLAR_DEVICE_REALTIME_ENDPOINT = "/thirdData/getDevRealKpi"
 DEFAULT_FUSIONSOLAR_ALARMS_ENDPOINT = "/thirdData/getAlarmList"
 DEFAULT_FUSIONSOLAR_DAY_KPI_ENDPOINT = "/thirdData/getKpiStationDay"
 DEFAULT_FUSIONSOLAR_MONTH_KPI_ENDPOINT = "/thirdData/getKpiStationMonth"
@@ -99,6 +102,10 @@ FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_MINUTES = 60
 FUSIONSOLAR_PERFORMANCE_KPI_DELAY_SECONDS = 65
 FUSIONSOLAR_PERFORMANCE_MAX_API_CALLS = 20
 FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL: datetime | None = None
+DEFAULT_DEVICE_COMMUNICATION_THRESHOLD_MINUTES = 15
+FUSIONSOLAR_INVERTER_DEVICE_TYPE_IDS = {1, 38}
+DEFAULT_STRING_PRESENT_VOLTAGE_THRESHOLD = 100.0
+DEFAULT_STRING_AUTO_LEARN_OBSERVATIONS = 2
 SIGENERGY_TOKEN_CACHE: dict[str, dict[str, Any]] = {}
 SIGENERGY_TOKEN_LOCK = threading.Lock()
 
@@ -122,6 +129,8 @@ STATUS_COLORS = {
 
 TICKET_STATUSES = ["Aberto", "Em analise", "Agendado", "Em visita", "Resolvido", "Fechado"]
 TICKET_URGENCIES = ["Baixa", "Media", "Alta", "Critica"]
+TICKET_MATERIAL_STATUSES = ["Nao definido", "Sem material", "Necessario", "Pronto", "Bloqueado"]
+TICKET_WORK_TYPES = ["Diagnostico", "Comunicacao", "Inversor", "String", "Estrutura", "Limpeza", "Preventiva", "Outro"]
 MONTH_NAMES_PT = [
     "",
     "Janeiro",
@@ -199,7 +208,7 @@ EXPORT_DATASETS = {
         ],
     },
     "tickets": {
-        "label": "Tickets / corretivas",
+        "label": "Intervencoes O&M",
         "columns": [
             ("project_name", "Central"),
             ("location", "Localizacao"),
@@ -210,6 +219,13 @@ EXPORT_DATASETS = {
             ("urgency", "Urgencia"),
             ("installation_ref", "Referencia"),
             ("next_action", "Proxima acao"),
+            ("work_type", "Tipo de trabalho"),
+            ("material_status", "Material"),
+            ("planned_date", "Data planeada"),
+            ("due_date", "Data limite"),
+            ("estimated_minutes", "Minutos previstos"),
+            ("assigned_to", "Equipa"),
+            ("planning_notes", "Notas planeamento"),
             ("notes", "Notas"),
             ("created_at", "Criado em"),
             ("updated_at", "Atualizado em"),
@@ -347,6 +363,8 @@ def create_app() -> Flask:
             "today_iso": date.today().isoformat(),
             "ticket_statuses": TICKET_STATUSES,
             "ticket_urgencies": TICKET_URGENCIES,
+            "ticket_material_statuses": TICKET_MATERIAL_STATUSES,
+            "ticket_work_types": TICKET_WORK_TYPES,
             "status_colors": STATUS_COLORS,
             "monitoring_sources": MONITORING_SOURCES,
             "asset_monitoring_statuses": ASSET_MONITORING_STATUSES,
@@ -400,9 +418,156 @@ def create_app() -> Flask:
             message="O ficheiro enviado excede o limite configurado para uploads.",
         ), 413
 
+    @app.route("/operation")
+    def operation() -> str:
+        search = request.args.get("search", "").strip()
+        om_only = request.args.get("om_only", "yes").strip()
+        calendar_month = normalize_calendar_month(request.args.get("calendar_month", ""))
+        calendar_start, calendar_end, previous_month, next_month = calendar_month_bounds(calendar_month)
+
+        intervention_conditions = ["t.status != 'Fechado'"]
+        intervention_params: list[Any] = []
+        if om_only == "yes":
+            intervention_conditions.append("a.active_contract = 'yes'")
+        if search:
+            wildcard = f"%{search}%"
+            intervention_conditions.append(
+                "(a.project_name LIKE ? OR a.location LIKE ? OR a.address LIKE ? OR t.title LIKE ? OR COALESCE(t.next_action, '') LIKE ?)"
+            )
+            intervention_params.extend([wildcard, wildcard, wildcard, wildcard, wildcard])
+        intervention_where = " AND ".join(intervention_conditions)
+        interventions = query_all(
+            g.db,
+            f"""
+            SELECT
+                t.*,
+                a.project_name,
+                a.installation_group,
+                a.location,
+                a.address,
+                a.active_contract,
+                a.latitude,
+                a.longitude,
+                a.coordinates_confidence,
+                lm.status AS latest_status,
+                lm.record_date AS latest_status_date
+            FROM tickets t
+            JOIN assets a ON a.id = t.asset_id
+            LEFT JOIN latest_monitoring_view lm ON lm.asset_id = a.id
+            WHERE {intervention_where}
+            ORDER BY
+                CASE t.urgency WHEN 'Critica' THEN 1 WHEN 'Alta' THEN 2 WHEN 'Media' THEN 3 ELSE 4 END,
+                CASE WHEN COALESCE(t.planned_date, '') = '' THEN 0 ELSE 1 END,
+                COALESCE(t.planned_date, '9999-12-31') ASC,
+                t.updated_at DESC
+            """,
+            intervention_params,
+        )
+
+        problem_conditions = [
+            "COALESCE(a.monitoring_status, 'active') != 'disabled'",
+            "lm.status IN ('Erro', 'Desconectada')",
+            "COALESCE(t.open_tickets, 0) = 0",
+        ]
+        problem_params: list[Any] = []
+        if om_only == "yes":
+            problem_conditions.append("a.active_contract = 'yes'")
+        if search:
+            wildcard = f"%{search}%"
+            problem_conditions.append("(a.project_name LIKE ? OR a.location LIKE ? OR a.address LIKE ?)")
+            problem_params.extend([wildcard, wildcard, wildcard])
+        problems_without_action = enrich_operational_rows(
+            g.db,
+            query_all(
+                g.db,
+                f"""
+                SELECT
+                    a.id AS asset_id,
+                    a.project_name,
+                    a.installation_group,
+                    a.location,
+                    a.address,
+                    a.active_contract,
+                    a.latitude,
+                    a.longitude,
+                    a.coordinates_confidence,
+                    lm.status,
+                    lm.record_date,
+                    0 AS open_tickets
+                FROM assets a
+                JOIN latest_monitoring_view lm ON lm.asset_id = a.id
+                LEFT JOIN (
+                    SELECT asset_id, COUNT(*) AS open_tickets
+                    FROM tickets
+                    WHERE status != 'Fechado'
+                    GROUP BY asset_id
+                ) t ON t.asset_id = a.id
+                WHERE {" AND ".join(problem_conditions)}
+                ORDER BY
+                    CASE lm.status WHEN 'Erro' THEN 1 WHEN 'Desconectada' THEN 2 ELSE 3 END,
+                    lm.record_date ASC,
+                    a.project_name COLLATE NOCASE
+                LIMIT 20
+                """,
+                problem_params,
+            ),
+        )
+
+        planned_rows = query_all(
+            g.db,
+            f"""
+            SELECT
+                t.*,
+                a.project_name,
+                a.location,
+                a.latitude,
+                a.longitude,
+                a.coordinates_confidence,
+                lm.status AS latest_status
+            FROM tickets t
+            JOIN assets a ON a.id = t.asset_id
+            LEFT JOIN latest_monitoring_view lm ON lm.asset_id = a.id
+            WHERE t.status != 'Fechado'
+              AND COALESCE(t.planned_date, '') BETWEEN ? AND ?
+              {"AND a.active_contract = 'yes'" if om_only == "yes" else ""}
+            ORDER BY t.planned_date ASC, t.urgency DESC, a.project_name COLLATE NOCASE
+            """,
+            [calendar_start.isoformat(), calendar_end.isoformat()],
+        )
+        planning_calendar = build_intervention_calendar(calendar_month, planned_rows)
+
+        today = date.today().isoformat()
+        week_end = (date.today() + timedelta(days=7)).isoformat()
+        operation_stats = {
+            "open": len(interventions),
+            "critical": sum(1 for row in interventions if row["urgency"] == "Critica"),
+            "unplanned": sum(1 for row in interventions if not row["planned_date"]),
+            "blocked": sum(1 for row in interventions if row["material_status"] == "Bloqueado"),
+            "this_week": sum(1 for row in interventions if today <= (row["planned_date"] or "") <= week_end),
+            "without_action": len(problems_without_action),
+            "ready_for_route": sum(1 for row in interventions if intervention_ready_for_route(row)),
+        }
+
+        return render_template(
+            "operation.html",
+            title="Operacao O&M",
+            search=search,
+            om_only=om_only,
+            interventions=interventions,
+            problems_without_action=problems_without_action,
+            operation_stats=operation_stats,
+            planning_calendar=planning_calendar,
+            calendar_month=calendar_month,
+            previous_month=previous_month,
+            next_month=next_month,
+            today=today,
+            week_end=week_end,
+        )
+
     @app.route("/")
     def dashboard() -> str:
         stats = fetch_dashboard_stats(g.db)
+        availability_summary = get_dashboard_availability_summary(g.db)
         monitoring_by_day = query_all(
             g.db,
             """
@@ -513,16 +678,16 @@ def create_app() -> Flask:
             g.db,
             """
             SELECT COUNT(*)
-            FROM production_records pr
+            FROM availability_daily ad
             JOIN (
                 SELECT asset_id, MAX(period_date || 'T' || printf('%09d', id)) AS marker
-                FROM production_records
-                WHERE period_type = 'day'
+                FROM availability_daily
                 GROUP BY asset_id
             ) latest
-              ON latest.asset_id = pr.asset_id
-             AND latest.marker = pr.period_date || 'T' || printf('%09d', pr.id)
-            WHERE pr.performance_status IN ('Atenção', 'Alerta', 'Crítico')
+              ON latest.asset_id = ad.asset_id
+             AND latest.marker = ad.period_date || 'T' || printf('%09d', ad.id)
+            WHERE COALESCE(ad.unavailable_inverters, 0) > 0
+               OR COALESCE(ad.no_communication_devices, 0) > 0
             """,
         )
         return render_template(
@@ -531,6 +696,7 @@ def create_app() -> Flask:
             executive_stats=executive_stats,
             executive_priorities=executive_priorities,
             integration_summary=integration_summary,
+            availability_summary=availability_summary,
             monitoring_by_day=monitoring_by_day,
             critical_assets=critical_assets,
             potential_assets=potential_assets,
@@ -541,65 +707,26 @@ def create_app() -> Flask:
 
     @app.route("/performance", methods=["GET", "POST"])
     def performance() -> str:
-        period_type = request.values.get("period_type", "day").strip()
-        if period_type not in {"day", "month"}:
-            period_type = "day"
-
-        raw_date = request.values.get("period_date", "").strip()
-        if not raw_date:
-            target = date.today() - timedelta(days=1)
-        elif period_type == "month" and re.fullmatch(r"\d{4}-\d{2}", raw_date):
-            target = date.fromisoformat(f"{raw_date}-01")
-        else:
-            parsed = parse_date_value(raw_date)
-            target = parsed or (date.today() - timedelta(days=1))
-        if period_type == "month":
-            target = target.replace(day=1)
-
         if request.method == "POST":
-            action = request.form.get("action", "sync").strip()
-            if action == "recalculate_references":
-                job_id, created = create_background_job(
+            action = request.form.get("action", "sync_availability").strip()
+            if action == "sync_availability":
+                result = run_fusionsolar_device_availability_sync(
                     g.db,
-                    "performance_reference_recalculation",
-                    {
-                        "provider": INTEGRATION_PROVIDER_FUSIONSOLAR,
-                        "period_type": period_type,
-                        "period_date": target.isoformat(),
-                        "asset_id": int(request.form["asset_id"]) if request.form.get("asset_id", "").isdigit() else None,
-                    },
+                    INTEGRATION_PROVIDER_FUSIONSOLAR,
+                    trigger_type="manual",
                 )
-                g.db.commit()
-                if created:
-                    schedule_background_job(current_app._get_current_object(), job_id)
-                    flash(f"Recalculo de referencias enviado para background (job #{job_id}).", "success")
-                else:
-                    flash(f"Ja existe um recalculo de referencias pendente/em execucao (job #{job_id}).", "warning")
-                return redirect(url_for("performance", period_type=period_type, period_date=target.isoformat()))
-            if action == "sync":
-                job_id, created = create_background_job(
-                    g.db,
-                    "fusionsolar_production_sync",
-                    {
-                        "provider": INTEGRATION_PROVIDER_FUSIONSOLAR,
-                        "period_type": period_type,
-                        "target_date": target.isoformat(),
-                    },
+                flash(
+                    f"Disponibilidade sincronizada: {result['devices']} dispositivos, {result['assets']} centrais.",
+                    "success",
                 )
-                g.db.commit()
-                if created:
-                    schedule_background_job(current_app._get_current_object(), job_id)
-                    flash(f"Sync de producao enviado para background (job #{job_id}).", "success")
-                else:
-                    flash(f"Ja existe um sync de producao pendente/em execucao (job #{job_id}).", "warning")
-                return redirect(url_for("performance", period_type=period_type, period_date=target.isoformat()))
-            flash("Acao de performance invalida.", "error")
-            return redirect(url_for("performance", period_type=period_type, period_date=target.isoformat()))
+                return redirect(url_for("performance"))
+            flash("Acao de disponibilidade invalida.", "error")
+            return redirect(url_for("performance"))
 
         search = request.args.get("search", "").strip()
-        status = request.args.get("status", "").strip()
         om_only = request.args.get("om_only", "yes").strip()
         asset_id = request.args.get("asset_id", "").strip()
+        issue_only = request.args.get("issue_only", "no").strip()
 
         conditions = ["COALESCE(a.monitoring_status, 'active') != 'disabled'"]
         params: list[Any] = []
@@ -607,14 +734,13 @@ def create_app() -> Flask:
             conditions.append("(a.project_name LIKE ? OR a.location LIKE ? OR a.company_name LIKE ? OR a.alias_blob LIKE ?)")
             wildcard = f"%{search}%"
             params.extend([wildcard, wildcard, wildcard, wildcard])
-        if status:
-            conditions.append("pr.performance_status = ?")
-            params.append(status)
         if om_only == "yes":
             conditions.append("a.active_contract = 'yes'")
         if asset_id.isdigit():
             conditions.append("a.id = ?")
             params.append(int(asset_id))
+        if issue_only == "yes":
+            conditions.append("(COALESCE(ad.unavailable_inverters, 0) > 0 OR COALESCE(ad.no_communication_devices, 0) > 0)")
         where_sql = " AND ".join(conditions)
 
         records = query_all(
@@ -624,70 +750,66 @@ def create_app() -> Flask:
                 a.id AS asset_id,
                 a.project_name,
                 a.location,
-                a.kwp,
                 a.active_contract,
-                pr.id,
-                pr.external_id,
-                pr.period_type,
-                pr.period_date,
-                pr.production_kwh,
-                pr.specific_yield,
-                pr.expected_kwh,
-                pr.expected_specific_yield,
-                pr.deviation_pct,
-                pr.performance_status,
-                pr.expected_source,
-                pr.data_quality,
-                pr.notes,
-                pr.selected_production_key,
-                pr.selected_production_raw_value,
-                pr.created_at,
-                pr.updated_at
+                ad.period_date,
+                ad.inverter_availability_pct,
+                ad.capacity_availability_pct,
+                ad.communication_availability_pct,
+                ad.string_availability_pct,
+                ad.available_inverters,
+                ad.total_inverters,
+                ad.unavailable_inverters,
+                ad.no_communication_devices,
+                ad.available_strings,
+                ad.total_strings,
+                ad.unavailable_strings,
+                ad.affected_power_kw,
+                ad.updated_at
             FROM assets a
-            LEFT JOIN production_records pr
-              ON pr.asset_id = a.id
-             AND pr.provider = ?
-             AND pr.period_type = ?
-             AND pr.period_date = ?
+            LEFT JOIN availability_daily ad
+              ON ad.id = (
+                  SELECT latest.id
+                  FROM availability_daily latest
+                  WHERE latest.asset_id = a.id
+                  ORDER BY latest.period_date DESC, latest.id DESC
+                  LIMIT 1
+              )
             WHERE {where_sql}
             ORDER BY
-                CASE pr.performance_status
-                    WHEN 'Crítico' THEN 1
-                    WHEN 'Alerta' THEN 2
-                    WHEN 'Atenção' THEN 3
-                    WHEN 'Sem dados' THEN 4
-                    WHEN 'Sem referência' THEN 5
-                    WHEN 'OK' THEN 6
-                    ELSE 7
+                CASE
+                    WHEN COALESCE(ad.no_communication_devices, 0) > 0 THEN 1
+                    WHEN COALESCE(ad.unavailable_inverters, 0) > 0 THEN 2
+                    WHEN ad.inverter_availability_pct IS NULL THEN 3
+                    ELSE 4
                 END,
                 a.project_name COLLATE NOCASE
             """,
-            [INTEGRATION_PROVIDER_FUSIONSOLAR, period_type, target.isoformat(), *params],
+            params,
         )
-        reference_summary = {
-            "with_reference": sum(1 for row in records if row["expected_kwh"] is not None and row["expected_specific_yield"] is not None),
-            "without_reference": sum(1 for row in records if row["expected_kwh"] is None or row["expected_specific_yield"] is None),
-            "production_without_reference": sum(
-                1
-                for row in records
-                if row["production_kwh"] is not None and (row["expected_kwh"] is None or row["expected_specific_yield"] is None)
+        pct_values = [float(row["inverter_availability_pct"]) for row in records if row["inverter_availability_pct"] is not None]
+        affected_values = [float(row["affected_power_kw"]) for row in records if row["affected_power_kw"] is not None]
+        total_strings = sum(int(row["total_strings"] or 0) for row in records)
+        availability_summary = {
+            "assets_with_data": len(pct_values),
+            "average_inverter_availability_pct": round(sum(pct_values) / len(pct_values), 2) if pct_values else None,
+            "unavailable_inverters": sum(int(row["unavailable_inverters"] or 0) for row in records),
+            "no_communication_devices": sum(int(row["no_communication_devices"] or 0) for row in records),
+            "affected_power_kw": round(sum(affected_values), 2) if affected_values else None,
+            "string_availability_pct": (
+                round(sum(int(row["available_strings"] or 0) for row in records) / total_strings * 100, 2)
+                if total_strings
+                else None
             ),
-            "missing_production": sum(1 for row in records if row["production_kwh"] is None),
+            "unavailable_strings": sum(int(row["unavailable_strings"] or 0) for row in records),
         }
         return render_template(
             "performance.html",
             records=records,
             search=search,
-            status=status,
             om_only=om_only,
-            period_type=period_type,
-            period_date=target.isoformat(),
-            month_value=target.strftime("%Y-%m"),
             selected_asset_id=asset_id,
-            background_jobs=fetch_latest_background_jobs(g.db, job_types=BACKGROUND_JOB_TYPES_PERFORMANCE),
-            fusionsolar_api_warning=get_fusionsolar_performance_cooldown_reason(g.db),
-            reference_summary=reference_summary,
-            performance_statuses=["OK", "Atenção", "Alerta", "Crítico", "Sem referência", "Sem dados"],
+            issue_only=issue_only,
+            availability_summary=availability_summary,
         )
 
     @app.route("/performance/debug/<int:record_id>")
@@ -1062,6 +1184,24 @@ def create_app() -> Flask:
             (asset_id, date.today().replace(day=1).isoformat()),
         )
         performance_settings = get_performance_settings(g.db, asset_id)
+        latest_availability = get_latest_availability_by_asset(g.db, asset_id)
+        latest_device_rows = get_latest_device_rows_for_asset(g.db, asset_id)
+        expected_string_rows = query_all(
+            g.db,
+            """
+            SELECT pd.id AS provider_device_id, pes.string_index, pes.expected, pes.source
+            FROM provider_devices pd
+            LEFT JOIN provider_device_expected_strings pes ON pes.provider_device_id = pd.id
+            WHERE pd.asset_id = ? AND pd.enabled = 1
+            ORDER BY pd.device_name COLLATE NOCASE, pd.id, pes.string_index
+            """,
+            (asset_id,),
+        )
+        expected_strings_by_device: dict[int, list[dict[str, Any]]] = {}
+        for row in expected_string_rows:
+            if row["string_index"] is None:
+                continue
+            expected_strings_by_device.setdefault(int(row["provider_device_id"]), []).append(row)
         visits_by_ticket = build_visits_by_ticket(
             query_all(
                 g.db,
@@ -1092,6 +1232,9 @@ def create_app() -> Flask:
             latest_mtd_performance=latest_mtd_performance,
             latest_monthly_performance=latest_monthly_performance,
             performance_settings=performance_settings,
+            latest_availability=latest_availability,
+            latest_device_rows=latest_device_rows,
+            expected_strings_by_device=expected_strings_by_device,
         )
 
     @app.route("/asset/<int:asset_id>/performance-settings", methods=["POST"])
@@ -1148,6 +1291,55 @@ def create_app() -> Flask:
         )
         g.db.commit()
         flash("Definições de performance guardadas.", "success")
+        return redirect(url_for("asset_detail", asset_id=asset_id))
+
+    @app.route("/asset/<int:asset_id>/expected-strings", methods=["POST"])
+    def update_asset_expected_strings(asset_id: int):
+        device_id_raw = request.form.get("provider_device_id", "").strip()
+        if not device_id_raw.isdigit():
+            flash("Dispositivo invalido.", "error")
+            return redirect(url_for("asset_detail", asset_id=asset_id))
+        device_id = int(device_id_raw)
+        device = query_one(
+            "SELECT id FROM provider_devices WHERE id = ? AND asset_id = ?",
+            (device_id, asset_id),
+        )
+        if device is None:
+            flash("Dispositivo nao encontrado.", "error")
+            return redirect(url_for("asset_detail", asset_id=asset_id))
+        selected = {int(value) for value in request.form.getlist("expected_strings") if value.isdigit()}
+        now = datetime.now().isoformat(timespec="seconds")
+        for index in range(1, 37):
+            existing = query_one(
+                """
+                SELECT *
+                FROM provider_device_expected_strings
+                WHERE provider_device_id = ? AND string_index = ?
+                """,
+                (device_id, index),
+            )
+            expected = 1 if index in selected else 0
+            if existing:
+                g.db.execute(
+                    """
+                    UPDATE provider_device_expected_strings
+                    SET expected = ?, source = 'manual', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (expected, now, existing["id"]),
+                )
+            elif expected:
+                g.db.execute(
+                    """
+                    INSERT INTO provider_device_expected_strings (
+                        provider_device_id, string_index, expected, source, observed_count,
+                        created_at, updated_at
+                    ) VALUES (?, ?, 1, 'manual', 0, ?, ?)
+                    """,
+                    (device_id, index, now, now),
+                )
+        g.db.commit()
+        flash("Perfil de strings atualizado.", "success")
         return redirect(url_for("asset_detail", asset_id=asset_id))
 
     @app.route("/asset/<int:asset_id>/installation-group", methods=["POST"])
@@ -1562,6 +1754,25 @@ def create_app() -> Flask:
             """,
             latest_params,
         ))
+        latest_availability_rows = {
+            int(row["asset_id"]): row
+            for row in query_all(
+                g.db,
+                """
+                SELECT ad.*
+                FROM availability_daily ad
+                JOIN (
+                    SELECT asset_id, MAX(period_date || 'T' || printf('%09d', id)) AS marker
+                    FROM availability_daily
+                    GROUP BY asset_id
+                ) latest
+                  ON latest.asset_id = ad.asset_id
+                 AND latest.marker = ad.period_date || 'T' || printf('%09d', ad.id)
+                """,
+            )
+        }
+        for row in latest_rows:
+            row["availability"] = latest_availability_rows.get(int(row["asset_id"]))
 
         filter_sql = []
         params: list[Any] = []
@@ -1826,15 +2037,28 @@ def create_app() -> Flask:
             installation_ref = request.form.get("installation_ref", "").strip()
             notes = request.form.get("notes", "").strip()
             next_action = request.form.get("next_action", "").strip()
+            planned_date = normalize_optional_date(request.form.get("planned_date"))
+            due_date = normalize_optional_date(request.form.get("due_date"))
+            estimated_minutes = parse_positive_int(request.form.get("estimated_minutes"), default=60)
+            assigned_to = request.form.get("assigned_to", "").strip()
+            material_status = normalize_choice(
+                request.form.get("material_status", "Nao definido"),
+                TICKET_MATERIAL_STATUSES,
+                "Nao definido",
+            )
+            work_type = normalize_choice(request.form.get("work_type", "Diagnostico"), TICKET_WORK_TYPES, "Diagnostico")
+            planning_notes = request.form.get("planning_notes", "").strip()
             if not title:
-                flash("O ticket precisa de um titulo.", "error")
+                flash("A intervencao precisa de um titulo.", "error")
                 return redirect(url_for("tickets"))
 
             g.db.execute(
                 """
                 INSERT INTO tickets (
-                    asset_id, title, urgency, status, installation_ref, notes, next_action, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    asset_id, title, urgency, status, installation_ref, notes, next_action,
+                    planned_date, due_date, estimated_minutes, assigned_to, material_status,
+                    work_type, planning_notes, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     asset_id,
@@ -1844,12 +2068,19 @@ def create_app() -> Flask:
                     installation_ref,
                     notes,
                     next_action,
+                    planned_date,
+                    due_date,
+                    estimated_minutes,
+                    assigned_to,
+                    material_status,
+                    work_type,
+                    planning_notes,
                     datetime.now().isoformat(timespec="seconds"),
                     datetime.now().isoformat(timespec="seconds"),
                 ),
             )
             g.db.commit()
-            flash("Ticket criado.", "success")
+            flash("Intervencao criada.", "success")
             return redirect(url_for("tickets", asset_id=asset_id))
 
         search = request.args.get("search", "").strip()
@@ -2044,16 +2275,43 @@ def create_app() -> Flask:
         urgency = request.form.get("urgency", "Media")
         next_action = request.form.get("next_action", "").strip()
         notes = request.form.get("notes", "").strip()
+        planned_date = normalize_optional_date(request.form.get("planned_date"))
+        due_date = normalize_optional_date(request.form.get("due_date"))
+        estimated_minutes = parse_positive_int(request.form.get("estimated_minutes"), default=60)
+        assigned_to = request.form.get("assigned_to", "").strip()
+        material_status = normalize_choice(
+            request.form.get("material_status", "Nao definido"),
+            TICKET_MATERIAL_STATUSES,
+            "Nao definido",
+        )
+        work_type = normalize_choice(request.form.get("work_type", "Diagnostico"), TICKET_WORK_TYPES, "Diagnostico")
+        planning_notes = request.form.get("planning_notes", "").strip()
         g.db.execute(
             """
             UPDATE tickets
-            SET status = ?, urgency = ?, next_action = ?, notes = ?, updated_at = ?
+            SET status = ?, urgency = ?, next_action = ?, notes = ?,
+                planned_date = ?, due_date = ?, estimated_minutes = ?, assigned_to = ?,
+                material_status = ?, work_type = ?, planning_notes = ?, updated_at = ?
             WHERE id = ?
             """,
-            (status, urgency, next_action, notes, datetime.now().isoformat(timespec="seconds"), ticket_id),
+            (
+                status,
+                urgency,
+                next_action,
+                notes,
+                planned_date,
+                due_date,
+                estimated_minutes,
+                assigned_to,
+                material_status,
+                work_type,
+                planning_notes,
+                datetime.now().isoformat(timespec="seconds"),
+                ticket_id,
+            ),
         )
         g.db.commit()
-        flash("Ticket atualizado.", "success")
+        flash("Intervencao atualizada.", "success")
         if ticket:
             return redirect(url_for("tickets", asset_id=ticket["asset_id"]))
         return redirect(url_for("tickets"))
@@ -2089,12 +2347,12 @@ def create_app() -> Flask:
     def delete_ticket(ticket_id: int):
         ticket = query_one("SELECT asset_id FROM tickets WHERE id = ?", (ticket_id,))
         if ticket is None:
-            flash("Ticket nao encontrado.", "error")
+            flash("Intervencao nao encontrada.", "error")
             return redirect(url_for("tickets"))
 
         g.db.execute("DELETE FROM tickets WHERE id = ?", (ticket_id,))
         g.db.commit()
-        flash("Ticket apagado.", "success")
+        flash("Intervencao apagada.", "success")
         return redirect(url_for("tickets", asset_id=ticket["asset_id"]))
 
     @app.route("/exports", methods=["GET", "POST"])
@@ -2159,7 +2417,7 @@ def create_app() -> Flask:
                     SET username = ?,
                         password = CASE WHEN ? != '' THEN ? ELSE password END,
                         base_url = ?, login_endpoint = ?, plants_endpoint = ?,
-                        real_time_endpoint = ?, alarms_endpoint = ?,
+                        real_time_endpoint = ?, device_list_endpoint = ?, device_real_time_endpoint = ?, alarms_endpoint = ?,
                         day_kpi_endpoint = ?, month_kpi_endpoint = ?,
                         enabled = ?, auto_sync_enabled = ?, sync_hours = ?, updated_at = ?
                     WHERE provider = ?
@@ -2172,6 +2430,8 @@ def create_app() -> Flask:
                         request.form.get("login_endpoint", "").strip(),
                         request.form.get("plants_endpoint", "").strip(),
                         request.form.get("real_time_endpoint", "").strip(),
+                        request.form.get("device_list_endpoint", "").strip(),
+                        request.form.get("device_real_time_endpoint", "").strip(),
                         request.form.get("alarms_endpoint", "").strip(),
                         request.form.get("day_kpi_endpoint", "").strip(),
                         request.form.get("month_kpi_endpoint", "").strip(),
@@ -2860,6 +3120,8 @@ def ensure_database(path: str) -> None:
                 login_endpoint TEXT,
                 plants_endpoint TEXT,
                 real_time_endpoint TEXT,
+                device_list_endpoint TEXT,
+                device_real_time_endpoint TEXT,
                 alarms_endpoint TEXT,
                 day_kpi_endpoint TEXT,
                 month_kpi_endpoint TEXT,
@@ -2917,6 +3179,89 @@ def ensure_database(path: str) -> None:
                 resolution_notes TEXT,
                 FOREIGN KEY (sync_run_id) REFERENCES integration_sync_runs(id) ON DELETE CASCADE,
                 FOREIGN KEY (suggested_asset_id) REFERENCES assets(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS provider_devices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset_id INTEGER NOT NULL,
+                provider TEXT NOT NULL,
+                station_code TEXT NOT NULL,
+                external_device_id TEXT,
+                dev_dn TEXT,
+                sn TEXT,
+                device_name TEXT,
+                dev_type_id INTEGER,
+                model TEXT,
+                rated_power_kw REAL,
+                enabled INTEGER DEFAULT 1,
+                last_seen_at TEXT,
+                payload_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(provider, external_device_id),
+                FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS device_realtime_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider_device_id INTEGER NOT NULL,
+                asset_id INTEGER NOT NULL,
+                provider TEXT NOT NULL,
+                station_code TEXT NOT NULL,
+                collected_at TEXT NOT NULL,
+                inverter_state INTEGER,
+                active_power_kw REAL,
+                day_energy_kwh REAL,
+                availability_status TEXT NOT NULL,
+                communication_status TEXT NOT NULL,
+                string_available_count INTEGER,
+                string_total_count INTEGER,
+                pv_current_json TEXT,
+                pv_voltage_json TEXT,
+                payload_json TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (provider_device_id) REFERENCES provider_devices(id) ON DELETE CASCADE,
+                FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS availability_daily (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset_id INTEGER NOT NULL,
+                provider TEXT NOT NULL,
+                period_date TEXT NOT NULL,
+                inverter_availability_pct REAL,
+                capacity_availability_pct REAL,
+                communication_availability_pct REAL,
+                string_availability_pct REAL,
+                available_inverters INTEGER,
+                total_inverters INTEGER,
+                unavailable_inverters INTEGER,
+                no_communication_devices INTEGER,
+                available_strings INTEGER,
+                total_strings INTEGER,
+                unavailable_strings INTEGER,
+                affected_power_kw REAL,
+                unavailable_minutes INTEGER,
+                payload_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(asset_id, provider, period_date),
+                FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS provider_device_expected_strings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider_device_id INTEGER NOT NULL,
+                string_index INTEGER NOT NULL,
+                expected INTEGER NOT NULL DEFAULT 1,
+                source TEXT NOT NULL,
+                observed_count INTEGER DEFAULT 0,
+                first_observed_at TEXT,
+                last_observed_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(provider_device_id, string_index),
+                FOREIGN KEY (provider_device_id) REFERENCES provider_devices(id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS production_records (
@@ -3057,12 +3402,21 @@ def ensure_database(path: str) -> None:
         ensure_column(conn, "assets", "monitoring_status TEXT DEFAULT 'active'")
         ensure_column(conn, "assets", "silenced_until TEXT")
         ensure_column(conn, "assets", "silence_reason TEXT")
+        ensure_column(conn, "tickets", "planned_date TEXT")
+        ensure_column(conn, "tickets", "due_date TEXT")
+        ensure_column(conn, "tickets", "estimated_minutes INTEGER DEFAULT 60")
+        ensure_column(conn, "tickets", "assigned_to TEXT")
+        ensure_column(conn, "tickets", "material_status TEXT DEFAULT 'Nao definido'")
+        ensure_column(conn, "tickets", "planning_notes TEXT")
+        ensure_column(conn, "tickets", "work_type TEXT")
         ensure_column(conn, "assets", "selected_for_alerts INTEGER DEFAULT 0")
         ensure_column(conn, "telegram_alerts", "blocked_reason TEXT")
         ensure_column(conn, "om_contracts", "renewal_status TEXT")
         ensure_column(conn, "om_contracts", "last_contact_date TEXT")
         ensure_column(conn, "om_contracts", "renewal_notes TEXT")
         ensure_column(conn, "integration_configs", "real_time_endpoint TEXT")
+        ensure_column(conn, "integration_configs", "device_list_endpoint TEXT")
+        ensure_column(conn, "integration_configs", "device_real_time_endpoint TEXT")
         ensure_column(conn, "integration_configs", "day_kpi_endpoint TEXT")
         ensure_column(conn, "integration_configs", "month_kpi_endpoint TEXT")
         ensure_column(conn, "production_records", "selected_production_key TEXT")
@@ -3113,6 +3467,27 @@ def ensure_database_indexes(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_background_jobs_type_status_created
             ON background_jobs(job_type, status, created_at);
+
+        CREATE INDEX IF NOT EXISTS idx_provider_devices_provider_station
+            ON provider_devices(provider, station_code);
+
+        CREATE INDEX IF NOT EXISTS idx_provider_devices_provider_external_id
+            ON provider_devices(provider, external_device_id);
+
+        CREATE INDEX IF NOT EXISTS idx_provider_devices_asset_enabled
+            ON provider_devices(asset_id, enabled);
+
+        CREATE INDEX IF NOT EXISTS idx_device_realtime_snapshots_asset_collected
+            ON device_realtime_snapshots(asset_id, collected_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_device_realtime_snapshots_device_collected
+            ON device_realtime_snapshots(provider_device_id, collected_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_availability_daily_asset_provider_period
+            ON availability_daily(asset_id, provider, period_date DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_provider_device_expected_strings_device_index
+            ON provider_device_expected_strings(provider_device_id, string_index);
         """
     )
 
@@ -6539,6 +6914,28 @@ def normalize_calendar_month(value: str | None) -> str:
     return date.today().strftime("%Y-%m")
 
 
+def normalize_optional_date(value: str | None) -> str:
+    if not value:
+        return ""
+    try:
+        return datetime.strptime(value.strip(), "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        return ""
+
+
+def parse_positive_int(value: str | None, default: int = 0) -> int:
+    try:
+        parsed = int(float(value or ""))
+    except (TypeError, ValueError):
+        return default
+    return max(parsed, 0)
+
+
+def normalize_choice(value: str | None, choices: list[str], default: str) -> str:
+    value = (value or "").strip()
+    return value if value in choices else default
+
+
 def calendar_month_bounds(month_value: str) -> tuple[date, date, str, str]:
     month_start = datetime.strptime(month_value, "%Y-%m").date().replace(day=1)
     _, last_day = calendar.monthrange(month_start.year, month_start.month)
@@ -6578,6 +6975,52 @@ def build_error_calendar(month_value: str, records: list[sqlite3.Row]) -> dict[s
         "weeks": weeks,
         "record_count": sum(len(rows) for rows in records_by_day.values()),
     }
+
+
+def build_intervention_calendar(month_value: str, records: list[sqlite3.Row]) -> dict[str, Any]:
+    month_start, month_end, _, _ = calendar_month_bounds(month_value)
+    records_by_day: dict[str, list[sqlite3.Row]] = {}
+    for record in records:
+        planned_date = record["planned_date"]
+        if planned_date:
+            records_by_day.setdefault(planned_date, []).append(record)
+
+    weeks = []
+    week = []
+    for _ in range(month_start.weekday()):
+        week.append({"date": None, "records": []})
+
+    current_day = month_start
+    while current_day <= month_end:
+        iso_day = current_day.isoformat()
+        week.append({"date": current_day, "records": records_by_day.get(iso_day, [])})
+        if len(week) == 7:
+            weeks.append(week)
+            week = []
+        current_day += timedelta(days=1)
+
+    if week:
+        while len(week) < 7:
+            week.append({"date": None, "records": []})
+        weeks.append(week)
+
+    return {
+        "label": f"{MONTH_NAMES_PT[month_start.month]} {month_start.year}",
+        "weeks": weeks,
+        "record_count": sum(len(rows) for rows in records_by_day.values()),
+    }
+
+
+def intervention_ready_for_route(row: sqlite3.Row | dict[str, Any]) -> bool:
+    if row["status"] == "Fechado":
+        return False
+    if row["material_status"] == "Bloqueado":
+        return False
+    if row["latitude"] is None or row["longitude"] is None:
+        return False
+    if row["coordinates_confidence"] in {"suspect", "review"}:
+        return False
+    return True
 
 
 def build_asset_error_calendar(month_value: str, records: list[sqlite3.Row]) -> dict[str, Any]:
@@ -6848,6 +7291,14 @@ def get_fusionsolar_env_config() -> dict[str, str]:
             "FUSIONSOLAR_REALTIME_ENDPOINT",
             DEFAULT_FUSIONSOLAR_REALTIME_ENDPOINT,
         ).strip(),
+        "device_list_endpoint": os.environ.get(
+            "FUSIONSOLAR_DEVICES_ENDPOINT",
+            DEFAULT_FUSIONSOLAR_DEVICES_ENDPOINT,
+        ).strip(),
+        "device_real_time_endpoint": os.environ.get(
+            "FUSIONSOLAR_DEVICE_REALTIME_ENDPOINT",
+            DEFAULT_FUSIONSOLAR_DEVICE_REALTIME_ENDPOINT,
+        ).strip(),
         "alarms_endpoint": os.environ.get("FUSIONSOLAR_ALARMS_ENDPOINT", DEFAULT_FUSIONSOLAR_ALARMS_ENDPOINT).strip(),
         "day_kpi_endpoint": os.environ.get(
             "FUSIONSOLAR_DAY_KPI_ENDPOINT",
@@ -6894,6 +7345,8 @@ def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
                 login_endpoint = CASE WHEN COALESCE(login_endpoint, '') = '' THEN ? ELSE login_endpoint END,
                 plants_endpoint = CASE WHEN COALESCE(plants_endpoint, '') = '' THEN ? ELSE plants_endpoint END,
                 real_time_endpoint = CASE WHEN COALESCE(real_time_endpoint, '') = '' THEN ? ELSE real_time_endpoint END,
+                device_list_endpoint = CASE WHEN COALESCE(device_list_endpoint, '') = '' THEN ? ELSE device_list_endpoint END,
+                device_real_time_endpoint = CASE WHEN COALESCE(device_real_time_endpoint, '') = '' THEN ? ELSE device_real_time_endpoint END,
                 alarms_endpoint = CASE WHEN COALESCE(alarms_endpoint, '') = '' THEN ? ELSE alarms_endpoint END,
                 day_kpi_endpoint = CASE WHEN COALESCE(day_kpi_endpoint, '') = '' THEN ? ELSE day_kpi_endpoint END,
                 month_kpi_endpoint = CASE WHEN COALESCE(month_kpi_endpoint, '') = '' THEN ? ELSE month_kpi_endpoint END,
@@ -6907,6 +7360,8 @@ def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
                 env_config["login_endpoint"],
                 env_config["plants_endpoint"],
                 env_config["real_time_endpoint"],
+                env_config["device_list_endpoint"],
+                env_config["device_real_time_endpoint"],
                 env_config["alarms_endpoint"],
                 env_config["day_kpi_endpoint"],
                 env_config["month_kpi_endpoint"],
@@ -6919,10 +7374,11 @@ def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
         conn.execute(
             """
             INSERT INTO integration_configs (
-                provider, username, password, base_url, login_endpoint, plants_endpoint, real_time_endpoint, alarms_endpoint,
+                provider, username, password, base_url, login_endpoint, plants_endpoint, real_time_endpoint,
+                device_list_endpoint, device_real_time_endpoint, alarms_endpoint,
                 day_kpi_endpoint, month_kpi_endpoint,
                 enabled, auto_sync_enabled, sync_hours, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 INTEGRATION_PROVIDER_FUSIONSOLAR,
@@ -6932,6 +7388,8 @@ def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
                 env_config["login_endpoint"],
                 env_config["plants_endpoint"],
                 env_config["real_time_endpoint"],
+                env_config["device_list_endpoint"],
+                env_config["device_real_time_endpoint"],
                 env_config["alarms_endpoint"],
                 env_config["day_kpi_endpoint"],
                 env_config["month_kpi_endpoint"],
@@ -7231,6 +7689,8 @@ def get_fusionsolar_endpoint_config(config: sqlite3.Row | dict[str, Any]) -> dic
         "login_endpoint": str(config["login_endpoint"] or DEFAULT_FUSIONSOLAR_LOGIN_ENDPOINT).strip() or DEFAULT_FUSIONSOLAR_LOGIN_ENDPOINT,
         "plants_endpoint": str(config["plants_endpoint"] or DEFAULT_FUSIONSOLAR_STATIONS_ENDPOINT).strip() or DEFAULT_FUSIONSOLAR_STATIONS_ENDPOINT,
         "real_time_endpoint": str(config["real_time_endpoint"] or DEFAULT_FUSIONSOLAR_REALTIME_ENDPOINT).strip() or DEFAULT_FUSIONSOLAR_REALTIME_ENDPOINT,
+        "device_list_endpoint": str(config["device_list_endpoint"] or DEFAULT_FUSIONSOLAR_DEVICES_ENDPOINT).strip() or DEFAULT_FUSIONSOLAR_DEVICES_ENDPOINT,
+        "device_real_time_endpoint": str(config["device_real_time_endpoint"] or DEFAULT_FUSIONSOLAR_DEVICE_REALTIME_ENDPOINT).strip() or DEFAULT_FUSIONSOLAR_DEVICE_REALTIME_ENDPOINT,
         "alarms_endpoint": str(config["alarms_endpoint"] or DEFAULT_FUSIONSOLAR_ALARMS_ENDPOINT).strip() or DEFAULT_FUSIONSOLAR_ALARMS_ENDPOINT,
         "day_kpi_endpoint": str(config["day_kpi_endpoint"] or DEFAULT_FUSIONSOLAR_DAY_KPI_ENDPOINT).strip() or DEFAULT_FUSIONSOLAR_DAY_KPI_ENDPOINT,
         "month_kpi_endpoint": str(config["month_kpi_endpoint"] or DEFAULT_FUSIONSOLAR_MONTH_KPI_ENDPOINT).strip() or DEFAULT_FUSIONSOLAR_MONTH_KPI_ENDPOINT,
@@ -7374,6 +7834,67 @@ def fetch_fusionsolar_realtime_map(
             if station_code:
                 real_time_map[station_code] = row
 
+    return real_time_map
+
+
+def fetch_fusionsolar_device_list(
+    session: requests.Session,
+    *,
+    base_url: str,
+    endpoint: str,
+    station_codes: list[str],
+) -> list[dict[str, Any]]:
+    url = build_provider_url(base_url, endpoint)
+    devices: list[dict[str, Any]] = []
+    for group in chunked(station_codes, 100):
+        payload = post_fusionsolar_json(
+            session,
+            url,
+            {"stationCodes": ",".join(group)},
+            expected_message="Falha ao obter a lista de dispositivos FusionSolar.",
+        )
+        data = payload.get("data") or []
+        rows = data.get("list") if isinstance(data, dict) else data
+        if not isinstance(rows, list):
+            raise ValueError("A resposta FusionSolar de dispositivos nao trouxe uma lista em data.")
+        devices.extend([row for row in rows if isinstance(row, dict)])
+    return devices
+
+
+def fetch_fusionsolar_device_realtime_map(
+    session: requests.Session,
+    *,
+    base_url: str,
+    endpoint: str,
+    devices: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    url = build_provider_url(base_url, endpoint)
+    real_time_map: dict[str, dict[str, Any]] = {}
+    devices_by_type: dict[int, list[str]] = {}
+    for device in devices:
+        dev_type_id = device.get("dev_type_id")
+        external_device_id = str(device.get("external_device_id") or "").strip()
+        if dev_type_id is None or not external_device_id:
+            continue
+        devices_by_type.setdefault(int(dev_type_id), []).append(external_device_id)
+    for dev_type_id, device_ids in devices_by_type.items():
+        for group in chunked(device_ids, 100):
+            payload = post_fusionsolar_json(
+                session,
+                url,
+                {"devIds": ",".join(group), "devTypeId": dev_type_id},
+                expected_message="Falha ao obter os dados realtime dos dispositivos FusionSolar.",
+            )
+            rows = payload.get("data") or []
+            if not isinstance(rows, list):
+                raise ValueError("A resposta FusionSolar realtime de dispositivos nao trouxe uma lista em data.")
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                for key in ("devId", "id", "devDn", "deviceDn", "esnCode", "sn"):
+                    value = str(row.get(key) or "").strip()
+                    if value:
+                        real_time_map[value] = row
     return real_time_map
 
 
@@ -7588,6 +8109,11 @@ def parse_float_value(value: Any) -> float | None:
         return float(str(value).strip().replace(",", "."))
     except (TypeError, ValueError):
         return None
+
+
+def parse_int_value(value: Any) -> int | None:
+    parsed = parse_float_value(value)
+    return int(parsed) if parsed is not None else None
 
 
 def select_production_value(data_item_map: dict[str, Any] | None) -> tuple[float | None, str, str]:
@@ -8310,6 +8836,202 @@ def first_non_empty(payload: dict[str, Any], keys: list[str]) -> str:
         if value not in (None, ""):
             return str(value).strip()
     return ""
+
+
+def parse_fusionsolar_pv_inputs(row: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    currents: dict[str, Any] = {}
+    voltages: dict[str, Any] = {}
+    source = row.get("dataItemMap") if isinstance(row.get("dataItemMap"), dict) else row
+    for index in range(1, 37):
+        current_key = f"pv{index}_i"
+        voltage_key = f"pv{index}_u"
+        if current_key in source and source[current_key] not in (None, ""):
+            currents[current_key] = source[current_key]
+        if voltage_key in source and source[voltage_key] not in (None, ""):
+            voltages[voltage_key] = source[voltage_key]
+    return currents, voltages
+
+
+def calculate_pv_input_health(
+    currents: dict[str, Any],
+    voltages: dict[str, Any],
+    *,
+    expected_string_indexes: set[int],
+) -> dict[str, Any]:
+    expected_inputs = sorted(expected_string_indexes)
+    available_inputs = 0
+    unavailable_inputs = 0
+    voltage_values: dict[str, float] = {}
+    for index in expected_inputs:
+        voltage = parse_float_value(voltages.get(f"pv{index}_u"))
+        voltage_values[str(index)] = voltage or 0.0
+        if voltage is not None and voltage > DEFAULT_STRING_PRESENT_VOLTAGE_THRESHOLD:
+            available_inputs += 1
+        else:
+            unavailable_inputs += 1
+    total_inputs = len(expected_inputs)
+    return {
+        "available_strings": available_inputs,
+        "total_strings": total_inputs,
+        "unavailable_strings": unavailable_inputs,
+        "string_availability_pct": round(available_inputs / total_inputs * 100, 2) if total_inputs else None,
+        "pv_input_diagnostics": {
+            "expected_inputs": expected_inputs,
+            "voltages_v": voltage_values,
+        },
+    }
+
+
+def learn_expected_strings_from_voltage(
+    conn: sqlite3.Connection,
+    provider_device_id: int,
+    voltages: dict[str, Any],
+    observed_at: str,
+) -> set[int]:
+    learned_indexes: set[int] = set()
+    for key, raw_voltage in voltages.items():
+        voltage = parse_float_value(raw_voltage)
+        if voltage is None or voltage <= DEFAULT_STRING_PRESENT_VOLTAGE_THRESHOLD:
+            continue
+        index = parse_int_value(key.removeprefix("pv").removesuffix("_u"))
+        if index is None:
+            continue
+        existing = conn.execute(
+            """
+            SELECT *
+            FROM provider_device_expected_strings
+            WHERE provider_device_id = ? AND string_index = ?
+            """,
+            (provider_device_id, index),
+        ).fetchone()
+        now = datetime.now().isoformat(timespec="seconds")
+        if existing is None:
+            conn.execute(
+                """
+                INSERT INTO provider_device_expected_strings (
+                    provider_device_id, string_index, expected, source, observed_count,
+                    first_observed_at, last_observed_at, created_at, updated_at
+                ) VALUES (?, ?, 0, 'auto', 1, ?, ?, ?, ?)
+                """,
+                (provider_device_id, index, observed_at, observed_at, now, now),
+            )
+            continue
+        observed_count = int(existing["observed_count"] or 0) + 1
+        expected = int(existing["expected"] or 0)
+        source = existing["source"]
+        if source == "auto" and observed_count >= DEFAULT_STRING_AUTO_LEARN_OBSERVATIONS:
+            expected = 1
+        conn.execute(
+            """
+            UPDATE provider_device_expected_strings
+            SET expected = ?, observed_count = ?, last_observed_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (expected, observed_count, observed_at, now, existing["id"]),
+        )
+    rows = query_all(
+        conn,
+        """
+        SELECT string_index
+        FROM provider_device_expected_strings
+        WHERE provider_device_id = ? AND expected = 1
+        """,
+        (provider_device_id,),
+    )
+    learned_indexes.update(int(row["string_index"]) for row in rows)
+    return learned_indexes
+
+
+def normalize_fusionsolar_device_identity(row: dict[str, Any]) -> dict[str, Any]:
+    dev_type_id = parse_int_value(first_non_empty(row, ["devTypeId", "dev_type_id", "deviceTypeId"]))
+    return {
+        "station_code": first_non_empty(row, ["stationCode", "plantCode"]),
+        "external_device_id": first_non_empty(row, ["devId", "id", "devDn", "deviceDn", "esnCode", "sn"]),
+        "dev_dn": first_non_empty(row, ["devDn", "deviceDn"]),
+        "sn": first_non_empty(row, ["esnCode", "sn"]),
+        "device_name": first_non_empty(row, ["devName", "deviceName", "name"]),
+        "dev_type_id": dev_type_id,
+        "model": first_non_empty(row, ["model", "devModel", "deviceModel"]),
+        "rated_power_kw": normalize_power_to_kw(first_non_empty(row, ["ratedPower", "rated_power", "capacity", "nominalPower"])),
+    }
+
+
+def normalize_power_to_kw(value: Any) -> float | None:
+    parsed = parse_float_value(value)
+    if parsed is None:
+        return None
+    return parsed / 1000 if parsed > 1000 else parsed
+
+
+def parse_datetime_value(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+        if timestamp > 10_000_000_000:
+            timestamp /= 1000
+        try:
+            return datetime.fromtimestamp(timestamp)
+        except (OSError, OverflowError, ValueError):
+            return None
+    raw = str(value).strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(raw)
+        return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+    except ValueError:
+        return None
+
+
+def calculate_asset_availability(device_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    enabled_rows = [row for row in device_rows if int(row.get("enabled", 1) or 0) == 1]
+    total = len(enabled_rows)
+    available = sum(1 for row in enabled_rows if row.get("availability_status") == "available")
+    unavailable = sum(
+        1 for row in enabled_rows if row.get("availability_status") in {"unavailable", "no_communication"}
+    )
+    no_communication = sum(1 for row in enabled_rows if row.get("availability_status") == "no_communication")
+    recent = sum(1 for row in enabled_rows if row.get("communication_status") == "recent")
+    rated_values = [row.get("rated_power_kw") for row in enabled_rows]
+    known_rated = [float(value) for value in rated_values if value is not None]
+    affected_rows = [
+        row for row in enabled_rows if row.get("availability_status") in {"unavailable", "no_communication"}
+    ]
+    affected_power_kw = (
+        sum(float(row["rated_power_kw"]) for row in affected_rows)
+        if affected_rows and all(row.get("rated_power_kw") is not None for row in affected_rows)
+        else None
+    )
+    capacity_availability_pct = None
+    if total and len(known_rated) == total and sum(known_rated) > 0:
+        capacity_availability_pct = round(
+            sum(float(row["rated_power_kw"]) for row in enabled_rows if row.get("availability_status") == "available")
+            / sum(known_rated)
+            * 100,
+            2,
+        )
+    return {
+        "inverter_availability_pct": round(available / total * 100, 2) if total else None,
+        "capacity_availability_pct": capacity_availability_pct,
+        "communication_availability_pct": round(recent / total * 100, 2) if total else None,
+        "available_inverters": available,
+        "total_inverters": total,
+        "unavailable_inverters": unavailable,
+        "no_communication_devices": no_communication,
+        "affected_power_kw": affected_power_kw,
+        "available_strings": sum(int(row.get("available_strings") or 0) for row in enabled_rows),
+        "total_strings": sum(int(row.get("total_strings") or 0) for row in enabled_rows),
+        "unavailable_strings": sum(int(row.get("unavailable_strings") or 0) for row in enabled_rows),
+        "string_availability_pct": (
+            round(
+                sum(int(row.get("available_strings") or 0) for row in enabled_rows)
+                / sum(int(row.get("total_strings") or 0) for row in enabled_rows)
+                * 100,
+                2,
+            )
+            if sum(int(row.get("total_strings") or 0) for row in enabled_rows)
+            else None
+        ),
+    }
 
 
 def format_fusionsolar_alarm_time(value: Any) -> str:
@@ -10296,6 +11018,322 @@ def upsert_integration_unresolved(
     )
 
 
+def get_latest_availability_by_asset(conn: sqlite3.Connection, asset_id: int) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT *
+        FROM availability_daily
+        WHERE asset_id = ?
+        ORDER BY period_date DESC, id DESC
+        LIMIT 1
+        """,
+        (asset_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_dashboard_availability_summary(conn: sqlite3.Connection) -> dict[str, Any]:
+    rows = query_all(
+        conn,
+        """
+        SELECT ad.*
+        FROM availability_daily ad
+        JOIN (
+            SELECT asset_id, MAX(period_date || 'T' || printf('%09d', id)) AS marker
+            FROM availability_daily
+            GROUP BY asset_id
+        ) latest
+          ON latest.asset_id = ad.asset_id
+         AND latest.marker = ad.period_date || 'T' || printf('%09d', ad.id)
+        """
+    )
+    pct_values = [row["inverter_availability_pct"] for row in rows if row["inverter_availability_pct"] is not None]
+    affected_values = [row["affected_power_kw"] for row in rows if row["affected_power_kw"] is not None]
+    return {
+        "average_inverter_availability_pct": round(sum(pct_values) / len(pct_values), 2) if pct_values else None,
+        "unavailable_inverters": sum(int(row["unavailable_inverters"] or 0) for row in rows),
+        "no_communication_devices": sum(int(row["no_communication_devices"] or 0) for row in rows),
+        "affected_power_kw": round(sum(float(value) for value in affected_values), 2) if affected_values else None,
+        "string_availability_pct": (
+            round(
+                sum(int(row["available_strings"] or 0) for row in rows)
+                / sum(int(row["total_strings"] or 0) for row in rows)
+                * 100,
+                2,
+            )
+            if sum(int(row["total_strings"] or 0) for row in rows)
+            else None
+        ),
+        "unavailable_strings": sum(int(row["unavailable_strings"] or 0) for row in rows),
+    }
+
+
+def get_latest_device_rows_for_asset(conn: sqlite3.Connection, asset_id: int) -> list[dict[str, Any]]:
+    return query_all(
+        conn,
+        """
+        SELECT
+            pd.device_name,
+            pd.rated_power_kw,
+            pd.last_seen_at,
+            drs.*
+        FROM provider_devices pd
+        LEFT JOIN device_realtime_snapshots drs
+          ON drs.id = (
+              SELECT latest.id
+              FROM device_realtime_snapshots latest
+              WHERE latest.provider_device_id = pd.id
+              ORDER BY latest.collected_at DESC, latest.id DESC
+              LIMIT 1
+          )
+        WHERE pd.asset_id = ? AND pd.enabled = 1
+        ORDER BY pd.device_name COLLATE NOCASE, pd.id
+        """,
+        (asset_id,),
+    )
+
+
+def upsert_provider_device(conn: sqlite3.Connection, asset_id: int, provider: str, row: dict[str, Any]) -> int:
+    now = datetime.now().isoformat(timespec="seconds")
+    existing = conn.execute(
+        "SELECT id FROM provider_devices WHERE provider = ? AND external_device_id = ?",
+        (provider, row["external_device_id"]),
+    ).fetchone()
+    payload_json = json.dumps(row["payload"], ensure_ascii=True)
+    if existing:
+        conn.execute(
+            """
+            UPDATE provider_devices
+            SET asset_id = ?, station_code = ?, dev_dn = ?, sn = ?, device_name = ?, dev_type_id = ?,
+                model = ?, rated_power_kw = ?, enabled = 1, payload_json = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                asset_id,
+                row["station_code"],
+                row["dev_dn"],
+                row["sn"],
+                row["device_name"],
+                row["dev_type_id"],
+                row["model"],
+                row["rated_power_kw"],
+                payload_json,
+                now,
+                existing["id"],
+            ),
+        )
+        return int(existing["id"])
+    cursor = conn.execute(
+        """
+        INSERT INTO provider_devices (
+            asset_id, provider, station_code, external_device_id, dev_dn, sn, device_name, dev_type_id,
+            model, rated_power_kw, enabled, payload_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+        """,
+        (
+            asset_id,
+            provider,
+            row["station_code"],
+            row["external_device_id"],
+            row["dev_dn"],
+            row["sn"],
+            row["device_name"],
+            row["dev_type_id"],
+            row["model"],
+            row["rated_power_kw"],
+            payload_json,
+            now,
+            now,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def run_fusionsolar_device_availability_sync(
+    conn: sqlite3.Connection,
+    provider: str,
+    trigger_type: str = "manual",
+) -> dict[str, Any]:
+    config = get_integration_config(conn, provider)
+    if config is None or not config["enabled"]:
+        raise ValueError(f"Configuracao {provider} indisponivel.")
+    endpoints = get_fusionsolar_endpoint_config(config)
+    mappings = query_all(
+        conn,
+        """
+        SELECT asset_id, external_id
+        FROM asset_integrations
+        WHERE provider = ? AND enabled = 1 AND COALESCE(external_id, '') != ''
+        """,
+        (provider,),
+    )
+    station_to_asset = {str(row["external_id"]): int(row["asset_id"]) for row in mappings}
+    station_codes = sorted(station_to_asset)
+    if not station_codes:
+        return {"devices": 0, "snapshots": 0, "assets": 0}
+
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            session, _ = get_fusionsolar_session(config, force_login=attempt == 1)
+            device_rows = fetch_fusionsolar_device_list(
+                session,
+                base_url=endpoints["base_url"],
+                endpoint=endpoints["device_list_endpoint"],
+                station_codes=station_codes,
+            )
+            break
+        except Exception as exc:
+            invalidate_fusionsolar_session(config)
+            last_error = exc
+            if attempt == 1:
+                raise
+    else:
+        raise last_error or ValueError("Falha desconhecida no FusionSolar.")
+
+    tracked: list[dict[str, Any]] = []
+    for raw_row in device_rows:
+        normalized = normalize_fusionsolar_device_identity(raw_row)
+        if normalized["dev_type_id"] not in FUSIONSOLAR_INVERTER_DEVICE_TYPE_IDS:
+            continue
+        if not normalized["station_code"] or not normalized["external_device_id"]:
+            continue
+        asset_id = station_to_asset.get(normalized["station_code"])
+        if not asset_id:
+            continue
+        normalized["payload"] = raw_row
+        normalized["provider_device_id"] = upsert_provider_device(conn, asset_id, provider, normalized)
+        normalized["asset_id"] = asset_id
+        tracked.append(normalized)
+
+    realtime_map = fetch_fusionsolar_device_realtime_map(
+        session,
+        base_url=endpoints["base_url"],
+        endpoint=endpoints["device_real_time_endpoint"],
+        devices=tracked,
+    )
+    collected_at_dt = datetime.now()
+    collected_at = collected_at_dt.isoformat(timespec="seconds")
+    snapshots_by_asset: dict[int, list[dict[str, Any]]] = {}
+    for device in tracked:
+        realtime = next(
+            (realtime_map[key] for key in (device["external_device_id"], device["dev_dn"], device["sn"]) if key and key in realtime_map),
+            {},
+        )
+        data_map = realtime.get("dataItemMap") if isinstance(realtime.get("dataItemMap"), dict) else realtime
+        seen_dt = parse_datetime_value(first_non_empty(realtime, ["collectTime", "collectedAt", "lastSeen", "last_seen_at"]))
+        has_recent_data = True if realtime and seen_dt is None else bool(
+            seen_dt and collected_at_dt - seen_dt <= timedelta(minutes=DEFAULT_DEVICE_COMMUNICATION_THRESHOLD_MINUTES)
+        )
+        availability_status = classify_fusionsolar_inverter_availability(
+            {"inverter_state": first_non_empty(data_map, ["inverter_state", "inverterState"])},
+            has_recent_data=has_recent_data,
+        )
+        communication_status = "recent" if has_recent_data else "stale"
+        currents, voltages = parse_fusionsolar_pv_inputs(realtime)
+        expected_string_indexes = learn_expected_strings_from_voltage(
+            conn,
+            device["provider_device_id"],
+            voltages,
+            collected_at,
+        )
+        pv_health = calculate_pv_input_health(
+            currents,
+            voltages,
+            expected_string_indexes=expected_string_indexes,
+        )
+        snapshot = {
+            **device,
+            "availability_status": availability_status,
+            "communication_status": communication_status,
+            "rated_power_kw": device["rated_power_kw"],
+            **pv_health,
+        }
+        conn.execute(
+            """
+            INSERT INTO device_realtime_snapshots (
+                provider_device_id, asset_id, provider, station_code, collected_at, inverter_state,
+                active_power_kw, day_energy_kwh, availability_status, communication_status,
+                string_available_count, string_total_count, pv_current_json, pv_voltage_json, payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                device["provider_device_id"],
+                device["asset_id"],
+                provider,
+                device["station_code"],
+                collected_at,
+                parse_int_value(first_non_empty(data_map, ["inverter_state", "inverterState"])),
+                normalize_power_to_kw(first_non_empty(data_map, ["active_power", "activePower"])),
+                parse_float_value(first_non_empty(data_map, ["day_cap", "dayEnergy", "day_energy"])),
+                availability_status,
+                communication_status,
+                pv_health["available_strings"],
+                pv_health["total_strings"],
+                json.dumps(currents, ensure_ascii=True) if currents else None,
+                json.dumps(voltages, ensure_ascii=True) if voltages else None,
+                json.dumps(realtime, ensure_ascii=True),
+                collected_at,
+            ),
+        )
+        conn.execute(
+            "UPDATE provider_devices SET last_seen_at = COALESCE(?, last_seen_at), updated_at = ? WHERE id = ?",
+            (seen_dt.isoformat(timespec="seconds") if seen_dt else collected_at if realtime else None, collected_at, device["provider_device_id"]),
+        )
+        snapshots_by_asset.setdefault(device["asset_id"], []).append(snapshot)
+
+    for asset_id, rows in snapshots_by_asset.items():
+        summary = calculate_asset_availability(rows)
+        now = datetime.now().isoformat(timespec="seconds")
+        conn.execute(
+            """
+            INSERT INTO availability_daily (
+                asset_id, provider, period_date, inverter_availability_pct, capacity_availability_pct,
+                communication_availability_pct, string_availability_pct, available_inverters, total_inverters, unavailable_inverters,
+                no_communication_devices, available_strings, total_strings, unavailable_strings, affected_power_kw,
+                payload_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(asset_id, provider, period_date) DO UPDATE SET
+                inverter_availability_pct = excluded.inverter_availability_pct,
+                capacity_availability_pct = excluded.capacity_availability_pct,
+                communication_availability_pct = excluded.communication_availability_pct,
+                string_availability_pct = excluded.string_availability_pct,
+                available_inverters = excluded.available_inverters,
+                total_inverters = excluded.total_inverters,
+                unavailable_inverters = excluded.unavailable_inverters,
+                no_communication_devices = excluded.no_communication_devices,
+                available_strings = excluded.available_strings,
+                total_strings = excluded.total_strings,
+                unavailable_strings = excluded.unavailable_strings,
+                affected_power_kw = excluded.affected_power_kw,
+                payload_json = excluded.payload_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                asset_id,
+                provider,
+                date.today().isoformat(),
+                summary["inverter_availability_pct"],
+                summary["capacity_availability_pct"],
+                summary["communication_availability_pct"],
+                summary["string_availability_pct"],
+                summary["available_inverters"],
+                summary["total_inverters"],
+                summary["unavailable_inverters"],
+                summary["no_communication_devices"],
+                summary["available_strings"],
+                summary["total_strings"],
+                summary["unavailable_strings"],
+                summary["affected_power_kw"],
+                json.dumps(summary, ensure_ascii=True),
+                now,
+                now,
+            ),
+        )
+    conn.commit()
+    return {"devices": len(tracked), "snapshots": sum(len(rows) for rows in snapshots_by_asset.values()), "assets": len(snapshots_by_asset)}
+
+
 def run_integration_sync(conn: sqlite3.Connection, provider: str, trigger_type: str = "manual") -> dict[str, Any]:
     return run_fusionsolar_sync(conn, provider, trigger_type=trigger_type)
 
@@ -10491,7 +11529,18 @@ def run_fusionsolar_sync(conn: sqlite3.Connection, provider: str, trigger_type: 
             )
             process_monitoring_alerts(conn, alert_events, batch_id, now)
             conn.commit()
-            return {"matched": matched, "unresolved": unresolved, "auto_resolved": auto_resolved}
+            device_availability: dict[str, Any] | None = None
+            if provider == INTEGRATION_PROVIDER_FUSIONSOLAR:
+                try:
+                    device_availability = run_fusionsolar_device_availability_sync(conn, provider, trigger_type=trigger_type)
+                except Exception as exc:
+                    logging.getLogger(__name__).warning("FusionSolar device availability sync failed: %s", exc)
+            return {
+                "matched": matched,
+                "unresolved": unresolved,
+                "auto_resolved": auto_resolved,
+                "device_availability": device_availability,
+            }
         except Exception as exc:
             conn.execute(
                 """

@@ -52,20 +52,24 @@
             <td>{{ row.last_sync_at or '-' }}</td>
             <td>{{ row.reason }}</td>
             <td>
-              <form method="post" class="inline-form compact-action-form">
-                {% if row.integration_id %}
-                  <input type="hidden" name="action" value="update_fusionsolar_mapping">
-                  <input type="hidden" name="integration_id" value="{{ row.integration_id }}">
-                {% else %}
-                  <input type="hidden" name="action" value="resolve_unresolved">
-                  <input type="hidden" name="unresolved_id" value="{{ row.unresolved_id }}">
-                {% endif %}
-                <div class="asset-picker">
-                  <input class="asset-picker-input" type="text" list="integration-asset-options" placeholder="Escolher central" required>
-                  <input type="hidden" name="asset_id" value="{{ row.asset_id or '' }}">
-                </div>
-                <button class="button secondary" type="submit">Guardar</button>
-              </form>
+              {% if row.integration_id or row.unresolved_id %}
+                <form method="post" class="inline-form compact-action-form">
+                  {% if row.integration_id %}
+                    <input type="hidden" name="action" value="update_fusionsolar_mapping">
+                    <input type="hidden" name="integration_id" value="{{ row.integration_id }}">
+                  {% else %}
+                    <input type="hidden" name="action" value="resolve_unresolved">
+                    <input type="hidden" name="unresolved_id" value="{{ row.unresolved_id }}">
+                  {% endif %}
+                  <div class="asset-picker">
+                    <input class="asset-picker-input" type="text" list="integration-asset-options" placeholder="Escolher central" required>
+                    <input type="hidden" name="asset_id" value="{{ row.asset_id or '' }}">
+                  </div>
+                  <button class="button secondary" type="submit">Guardar</button>
+                </form>
+              {% else %}
+                <span class="muted">Sem entrada FusionSolar</span>
+              {% endif %}
             </td>
           </tr>
         {% else %}

@@ -1,0 +1,116 @@
+{
+  "login": "OK",
+  "systems_before": {
+    "status_code": 200,
+    "response": {
+      "code": 0,
+      "msg": "success",
+      "timestamp": 1778776173,
+      "data": {}
+    }
+  },
+  "onboard_results": [
+    {
+      "systemId": "MJYXD1768407286",
+      "status_code": 200,
+      "success": true,
+      "response": {
+        "code": 0,
+        "msg": "success",
+        "timestamp": 1778776175,
+        "data": [
+          {
+            "systemId": "MJYXD1768407286",
+            "result": false,
+            "codeList": [
+              1116
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "systemId": "GPUWR1768406327",
+      "status_code": 200,
+      "success": true,
+      "response": {
+        "code": 0,
+        "msg": "success",
+        "timestamp": 1778776176,
+        "data": [
+          {
+            "systemId": "GPUWR1768406327",
+            "result": false,
+            "codeList": [
+              1116
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "systemId": "QLJFU1767031039",
+      "status_code": 200,
+      "success": false,
+      "response": {
+        "code": 1201,
+        "msg": "Access restriction",
+        "timestamp": 1778776177,
+        "data": {}
+      }
+    },
+    {
+      "systemId": "CNRFD1778681332",
+      "status_code": 200,
+      "success": false,
+      "response": {
+        "code": 1201,
+        "msg": "Access restriction",
+        "timestamp": 1778776179,
+        "data": {}
+      }
+    },
+    {
+      "systemId": "BFQUJ1765885925",
+      "status_code": 200,
+      "success": false,
+      "response": {
+        "code": 1201,
+        "msg": "Access restriction",
+        "timestamp": 1778776180,
+        "data": {}
+      }
+    },
+    {
+      "systemId": "LZJQH1754913915",
+      "status_code": 200,
+      "success": false,
+      "response": {
+        "code": 1201,
+        "msg": "Access restriction",
+        "timestamp": 1778776181,
+        "data": {}
+      }
+    },
+    {
+      "systemId": "GTFHU1750782621",
+      "status_code": 200,
+      "success": false,
+      "response": {
+        "code": 1201,
+        "msg": "Access restriction",
+        "timestamp": 1778776182,
+        "data": {}
+      }
+    }
+  ],
+  "systems_after": {
+    "status_code": 200,
+    "response": {
+      "code": 0,
+      "msg": "success",
+      "timestamp": 1778776183,
+      "data": {}
+    }
+  }
+}

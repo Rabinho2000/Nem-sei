@@ -6,6 +6,7 @@
         <tr>
           <th>Central local</th>
           <th>Instalacao</th>
+          <th>Integracao</th>
           <th>External ID</th>
           <th>External name</th>
           <th>Ultimo estado</th>
@@ -16,12 +17,13 @@
           <tr>
             <td><a class="table-link" href="{{ url_for('asset_detail', asset_id=row.asset_id) }}">{{ row.project_name }}</a></td>
             <td>{{ row.installation_group or row.project_name }}</td>
+            <td>{{ row.provider }}</td>
             <td>{{ row.external_id or '-' }}</td>
             <td>{{ row.external_name or '-' }}</td>
             <td>{{ row.last_status or '-' }}</td>
           </tr>
         {% else %}
-          <tr><td colspan="5" class="muted">Ainda nao existem centrais mapeadas ao FusionSolar.</td></tr>
+          <tr><td colspan="6" class="muted">Ainda nao existem centrais mapeadas a APIs.</td></tr>
         {% endfor %}
       </tbody>
     </table>

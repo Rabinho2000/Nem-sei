@@ -1,177 +1,118 @@
 {% extends "base.html" %}
+
 {% block content %}
 <section class="hero">
   <div>
-    <p class="eyebrow">Exportacoes</p>
-    <h2>Area de exportacao</h2>
-    <p class="muted">Escolhe os dados, as colunas, o formato e guarda templates para reutilizar depois.</p>
+    <p class="eyebrow">Relatórios</p>
+    <h2>Produção mensal</h2>
+    <p class="muted">Gera o PDF mensal de produção com dados locais quando existem, usando a FusionSolar como fallback.</p>
+  </div>
+  <div class="hero-actions">
+    <a class="button secondary" href="{{ url_for('integrations') }}">Integrações</a>
   </div>
 </section>
 
-<datalist id="export-asset-options">
-  {% for asset in assets_for_mapping %}
-    <option value="{{ asset.project_name }}" data-id="{{ asset.id }}"></option>
-  {% endfor %}
-</datalist>
+{% if fusionsolar_api_warning %}
+<section class="card">
+  <div class="section-title"><h3>Aviso FusionSolar</h3></div>
+  <p class="muted">{{ fusionsolar_api_warning }}</p>
+</section>
+{% endif %}
 
 <section class="grid two">
   <article class="card">
-    <div class="section-title"><h3>Configurar exportacao</h3></div>
-    <form method="post" class="stack-form">
-      <label>Tabela
-        <select name="dataset">
-          {% for key, config in datasets.items() %}
-            <option value="{{ key }}" {{ 'selected' if selected_dataset == key else '' }}>{{ config.label }}</option>
+    <div class="section-title">
+      <div>
+        <h3>Novo relatório</h3>
+        <p class="muted">O PDF segue o modelo mensal: poupança, excedente, benefício, gráfico diário e taxa de autoconsumo.</p>
+      </div>
+    </div>
+
+    <form class="stack-form" method="post">
+      <label>Instalação FusionSolar
+        <select name="asset_id" required>
+          <option value="">Escolher instalação</option>
+          {% for asset in report_assets %}
+            <option value="{{ asset.asset_id }}" {{ 'selected' if selected_asset_id|string == asset.asset_id|string else '' }}>
+              {{ asset.project_name }}{% if asset.external_name and asset.external_name != asset.project_name %} · {{ asset.external_name }}{% endif %}
+            </option>
           {% endfor %}
         </select>
       </label>
-      <label>Formato
-        <select name="export_format">
-          <option value="xlsx" {{ 'selected' if template_format == 'xlsx' else '' }}>Excel</option>
-          <option value="pdf" {{ 'selected' if template_format == 'pdf' else '' }}>PDF</option>
-        </select>
-      </label>
-      <label>Pesquisa
-        <input type="text" name="search" value="{{ template_filters.get('search', request.args.get('search', '')) }}" placeholder="Central, alias, notas">
-      </label>
-      <label>Central
-        {% set current_asset = template_filters.get('asset_id', request.args.get('asset_id', '')) %}
-        <div class="asset-picker">
-          <input class="asset-picker-input" type="text" list="export-asset-options" placeholder="Todas ou escrever central">
-          <input type="hidden" name="asset_id" value="{{ current_asset or '' }}">
-        </div>
-      </label>
-      <label>Filtro O&amp;M
-        {% set current_om_only = template_filters.get('om_only', request.args.get('om_only', 'yes')) %}
-        <select name="om_only">
-          <option value="yes" {{ 'selected' if current_om_only == 'yes' else '' }}>So O&amp;M ativo</option>
-          <option value="no" {{ 'selected' if current_om_only == 'no' else '' }}>Todas as centrais</option>
-        </select>
-      </label>
 
-      {% if selected_dataset == 'monitoring' %}
-        <label>Estado
-          <select name="status">
-            {% set current_status = template_filters.get('status', request.args.get('status', '')) %}
-            <option value="">Todos</option>
-            {% for status in ['Erro','Desconectada','Resolvido','Operacional'] %}
-              <option value="{{ status }}" {{ 'selected' if current_status == status else '' }}>{{ status }}</option>
-            {% endfor %}
-          </select>
+      <div class="grid two">
+        <label>Mês do relatório
+          <input type="month" name="report_month" value="{{ report_month }}" required>
         </label>
-        <label>Origem
-          <select name="source">
-            {% set current_source = template_filters.get('source', request.args.get('source', '')) %}
-            <option value="">Todas</option>
-            {% for source in monitoring_sources %}
-              <option value="{{ source }}" {{ 'selected' if current_source == source else '' }}>{{ source }}</option>
-            {% endfor %}
-          </select>
+        <label>Preço eletricidade EUR/kWh
+          <input type="number" step="0.00001" min="0" name="electricity_price" value="{{ electricity_price }}" required>
         </label>
-        <label>Data inicial
-          <input type="date" name="start_date" value="{{ template_filters.get('start_date', request.args.get('start_date', '')) }}">
+        <label>Venda excedente EUR/kWh
+          <input type="number" step="0.00001" min="0" name="sell_price" value="{{ sell_price }}" required>
         </label>
-        <label>Data final
-          <input type="date" name="end_date" value="{{ template_filters.get('end_date', request.args.get('end_date', '')) }}">
-        </label>
-      {% elif selected_dataset in ['executive_report', 'monitoring_report'] %}
-        <label>Periodo
-          {% set current_period = template_filters.get('period', request.args.get('period', 'week')) %}
-          <select name="period">
-            <option value="day" {{ 'selected' if current_period == 'day' else '' }}>Diario</option>
-            <option value="week" {{ 'selected' if current_period == 'week' else '' }}>Semanal</option>
-            <option value="month" {{ 'selected' if current_period == 'month' else '' }}>Mensal</option>
-          </select>
-        </label>
-        <label>Origem
-          {% set current_source = template_filters.get('source', request.args.get('source', '')) %}
-          <select name="source">
-            <option value="">Todas</option>
-            {% for source in monitoring_sources %}
-              <option value="{{ source }}" {{ 'selected' if current_source == source else '' }}>{{ source }}</option>
-            {% endfor %}
-          </select>
-        </label>
-      {% elif selected_dataset == 'tickets' %}
-        <label>Estado
-          <select name="status">
-            {% set current_status = template_filters.get('status', request.args.get('status', '')) %}
-            <option value="">Todos</option>
-            {% for status in ticket_statuses %}
-              <option value="{{ status }}" {{ 'selected' if current_status == status else '' }}>{{ status }}</option>
-            {% endfor %}
-          </select>
-        </label>
-        <label>Urgencia
-          <select name="urgency">
-            {% set current_urgency = template_filters.get('urgency', request.args.get('urgency', '')) %}
-            <option value="">Todas</option>
-            {% for urgency in ticket_urgencies %}
-              <option value="{{ urgency }}" {{ 'selected' if current_urgency == urgency else '' }}>{{ urgency }}</option>
-            {% endfor %}
-          </select>
-        </label>
-      {% endif %}
-
-      <div class="section-title"><h3>Colunas</h3></div>
-      <div class="checkbox-grid">
-        {% for column_key, column_label in datasets[selected_dataset]['columns'] %}
-          <label class="checkbox-item">
-            <input type="checkbox" name="columns" value="{{ column_key }}" {{ 'checked' if column_key in selected_columns else '' }}>
-            <span>{{ column_label }}</span>
-          </label>
-        {% endfor %}
       </div>
+      <label class="check-row">
+        <input type="checkbox" name="force_api">
+        <span>Atualizar diretamente da FusionSolar</span>
+      </label>
 
-      <div class="hero-actions">
-        <button class="button" type="submit" name="action" value="download">Exportar</button>
-        <button class="button secondary" type="submit" formaction="{{ url_for('exports') }}" formmethod="get">Atualizar preview</button>
-      </div>
-
-      <div class="inline-form">
-        <input type="text" name="template_name" placeholder="Nome do template">
-        <button class="button secondary" type="submit" name="action" value="save_template">Guardar template</button>
-      </div>
+      <button class="button" type="submit">Gerar PDF</button>
     </form>
   </article>
 
-  <article class="card">
-    <div class="section-title"><h3>Templates guardados</h3></div>
+  <aside class="card">
+    <div class="section-title"><h3>Dados usados</h3></div>
     <div class="list compact-list">
-      {% for template in templates_rows %}
-        <div class="list-row">
-          <div>
-            <strong><a class="table-link" href="{{ url_for('exports', template_id=template.id) }}">{{ template.name }}</a></strong>
-            <p>{{ datasets[template.dataset]['label'] }} | {{ template.export_format|upper }} | {{ template.created_at }}</p>
-          </div>
+      <div class="list-row">
+        <div>
+          <strong>Dados locais</strong>
+          <small>Quando existem registos importados por backfill ou ciclo mensal, o PDF usa esses dados sem chamar a API.</small>
         </div>
-      {% else %}
-        <p class="muted">Ainda nao existem templates guardados.</p>
-      {% endfor %}
+      </div>
+      <div class="list-row">
+        <div>
+          <strong>KPIs diários</strong>
+          <small>Produção diária, autoconsumo e excedente para o gráfico.</small>
+        </div>
+      </div>
+      <div class="list-row">
+        <div>
+          <strong>KPI mensal</strong>
+          <small>Total mensal de produção, energia autoconsumida, excedente e consumo quando a API devolve esses campos.</small>
+        </div>
+      </div>
+      <div class="list-row">
+        <div>
+          <strong>Cálculos</strong>
+          <small>Poupança = autoconsumo x preço de eletricidade. Receita = excedente x preço de venda.</small>
+        </div>
+      </div>
     </div>
-  </article>
+  </aside>
 </section>
 
 <section class="card">
-  <div class="section-title"><h3>Preview</h3></div>
+  <div class="section-title"><h3>Instalações disponíveis</h3></div>
   <div class="table-wrap">
     <table>
       <thead>
         <tr>
-          {% for _, label in preview_headers %}
-            <th>{{ label }}</th>
-          {% endfor %}
+          <th>Instalação</th>
+          <th>FusionSolar</th>
+          <th>Station code</th>
+          <th>Localização</th>
         </tr>
       </thead>
       <tbody>
-        {% for row in preview_rows %}
+        {% for asset in report_assets %}
           <tr>
-            {% for key, _ in preview_headers %}
-              <td>{{ row.get(key, '-') or '-' }}</td>
-            {% endfor %}
+            <td>{{ asset.project_name }}</td>
+            <td>{{ asset.external_name or "-" }}</td>
+            <td>{{ asset.external_id }}</td>
+            <td>{{ asset.location or "-" }}</td>
           </tr>
         {% else %}
-          <tr><td colspan="{{ preview_headers|length or 1 }}" class="muted">Sem dados para este preview.</td></tr>
+          <tr><td colspan="4" class="muted">Sem instalações FusionSolar mapeadas. Faz primeiro o mapeamento em Integrações.</td></tr>
         {% endfor %}
       </tbody>
     </table>

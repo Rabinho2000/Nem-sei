@@ -5,6 +5,7 @@
       <thead>
         <tr>
           <th>Inicio</th>
+          <th>Integracao</th>
           <th>Fim</th>
           <th>Trigger</th>
           <th>Estado</th>
@@ -18,6 +19,7 @@
         {% for run in sync_runs %}
           <tr>
             <td>{{ run.started_at }}</td>
+            <td>{{ run.provider }}</td>
             <td>{{ run.finished_at or '-' }}</td>
             <td>{{ run.trigger_type or '-' }}</td>
             <td><span class="chip {{ integration_status_colors.get(run.status or 'pending', 'muted') }}">{{ run.status or 'pending' }}</span></td>
@@ -27,7 +29,7 @@
             <td>{{ run.error_message or '-' }}</td>
           </tr>
         {% else %}
-          <tr><td colspan="8" class="muted">Ainda nao houve syncs FusionSolar.</td></tr>
+          <tr><td colspan="9" class="muted">Ainda nao houve syncs API.</td></tr>
         {% endfor %}
       </tbody>
     </table>

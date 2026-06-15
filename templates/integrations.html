@@ -3,6 +3,13 @@
 {% include "integrations/_hero.html" %}
 {% include "integrations/_asset_options.html" %}
 
+{% if fusionsolar_api_warning %}
+<section class="card">
+  <div class="section-title"><h3>Aviso FusionSolar</h3></div>
+  <p class="muted">{{ fusionsolar_api_warning }}</p>
+</section>
+{% endif %}
+
 <section class="tab-shell" id="integrations-tabs">
   <div class="tab-bar integration-tab-bar">
     <button class="tab-button active" type="button" data-tab-target="integrations-summary">Resumo</button>

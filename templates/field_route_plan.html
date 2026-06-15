@@ -1,0 +1,174 @@
+{% extends "base.html" %}
+{% block content %}
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+
+<section class="hero">
+  <div>
+    <p class="eyebrow">Rota</p>
+    <h2>{{ plan.name }}</h2>
+    <p class="muted">{{ plan.team_name or "Sem equipa" }} · {{ plan.work_date or "Sem data" }} · {{ plan.origin_name or "Origem" }} · {{ "%.1f"|format(plan.total_distance_km or 0) }} km</p>
+  </div>
+  <div class="hero-actions">
+    <a class="button secondary" href="{{ url_for('field_routes.export_route_plan_csv', plan_id=plan.id) }}">Exportar CSV</a>
+    {% if maps_url %}
+      <a class="button" href="{{ maps_url }}" target="_blank" rel="noopener">Abrir no Google Maps</a>
+    {% endif %}
+    <a class="button secondary" href="{{ url_for('field_routes.field_routes') }}">Voltar</a>
+  </div>
+</section>
+
+<section class="route-summary-grid">
+  <article class="card stat-card"><span>Conducao</span><strong>{{ "%.0f"|format(plan.total_drive_minutes or 0) }} min</strong></article>
+  <article class="card stat-card"><span>Intervencao</span><strong>{{ "%.0f"|format(plan.total_work_minutes or 0) }} min</strong></article>
+  <article class="card stat-card"><span>Missao</span><strong>{{ "%.0f"|format(plan.total_mission_minutes or 0) }} min</strong></article>
+  <article class="card stat-card"><span>Regresso</span><strong>{{ "Sim" if plan.return_to_origin else "Nao" }}</strong></article>
+</section>
+
+<section class="card">
+  <div class="section-title">
+    <h3>Resumo</h3>
+    <span class="chip {{ 'warning' if (plan.total_mission_minutes or 0) > 600 else 'success' }}">
+      {% if (plan.total_mission_minutes or 0) > 600 %}
+        Recomendacao: considerar viagem de 2 dias
+      {% else %}
+        Viagem possivel num dia, sujeito a transito e condicoes no local
+      {% endif %}
+    </span>
+  </div>
+  <dl class="details">
+    <div><dt>Origem</dt><dd>{{ plan.origin_name or "-" }}</dd></div>
+    <div><dt>Morada origem</dt><dd>{{ plan.origin_address or "-" }}</dd></div>
+    <div><dt>Distancia total</dt><dd>{{ "%.1f"|format(plan.total_distance_km or 0) }} km</dd></div>
+    <div><dt>Fonte</dt><dd>{{ "OpenRouteService" if plan.route_provider == "openrouteservice" else "Aproximado" }}</dd></div>
+  </dl>
+  {% if plan.route_warning %}
+    <p class="muted">{{ plan.route_warning }}</p>
+  {% endif %}
+</section>
+
+<section class="grid two route-layout">
+  <article class="card route-map-card">
+    <div id="route-plan-map" class="field-map"></div>
+  </article>
+
+  <article class="card">
+    <div class="section-title">
+      <h3>Paragens</h3>
+      <span class="chip">{{ stops|length }}</span>
+    </div>
+    <div class="list">
+      {% for stop in stops %}
+        <a class="list-row card-link" href="{{ url_for('asset_detail', asset_id=stop.asset_id) }}">
+          <div>
+            <strong>{{ stop.stop_order }}. {{ stop.project_name }}</strong>
+            <small>{{ stop.intervention_notes or "Intervencao tecnica" }} · {{ stop.location or stop.address or "Sem localizacao" }}</small>
+          </div>
+          <span class="chip">{{ stop.work_minutes or 0 }} min</span>
+        </a>
+      {% else %}
+        <p class="muted">Sem paragens nesta rota.</p>
+      {% endfor %}
+    </div>
+  </article>
+</section>
+
+<section class="card">
+  <div class="section-title">
+    <h3>Segmentos</h3>
+    <span class="chip">{{ segments|length }}</span>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Ordem</th>
+          <th>De</th>
+          <th>Para</th>
+          <th>Km</th>
+          <th>Conducao</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for segment in segments %}
+          <tr>
+            <td>{{ segment.sequence_order }}</td>
+            <td>{{ segment.from_label }}</td>
+            <td>{{ segment.to_label }}</td>
+            <td>{{ "%.1f"|format(segment.distance_km or 0) }}</td>
+            <td>{{ "%.0f"|format(segment.duration_minutes or 0) }} min</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="5" class="muted">Sem segmentos.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="card">
+  <div class="section-title">
+    <h3>Custos</h3>
+    <span class="chip">Margem {{ "%.2f"|format(plan.estimated_margin or 0) }} EUR</span>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Item</th>
+          <th>Custo interno</th>
+          <th>Preco cliente</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in cost_rows %}
+          <tr>
+            <td>{{ row.label }}</td>
+            <td>{{ row.internal if row.internal == "" else "%.2f"|format(row.internal or 0) }}</td>
+            <td>{{ "%.2f"|format(row.client or 0) }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+{% if plan.notes %}
+  <section class="card">
+    <h3>Notas</h3>
+    <p>{{ plan.notes }}</p>
+  </section>
+{% endif %}
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  (function () {
+    const stops = {{ map_payload|tojson }};
+    const routeGeometry = {{ route_geometry|tojson }};
+    const map = L.map("route-plan-map");
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap"
+    }).addTo(map);
+
+    const linePoints = routeGeometry.length ? routeGeometry : stops.map(function (stop) { return [stop.lat, stop.lng]; });
+    if (!linePoints.length) {
+      map.setView([39.5, -8.0], 7);
+      return;
+    }
+
+    function escapeHtml(value) {
+      return String(value || "").replace(/[&<>"']/g, function (char) {
+        return {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"}[char];
+      });
+    }
+
+    stops.forEach(function (stop, index) {
+      L.marker([stop.lat, stop.lng]).addTo(map).bindPopup(
+        '<div class="field-map-popup"><strong>' + (index + 1) + ". " + escapeHtml(stop.name) + "</strong></div>"
+      );
+    });
+    L.polyline(linePoints, { color: "#1f6b5c", weight: 4 }).addTo(map);
+    map.fitBounds(linePoints, { padding: [24, 24], maxZoom: 12 });
+  })();
+</script>
+{% endblock %}

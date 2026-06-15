@@ -26,14 +26,38 @@
       <span>O&amp;M ativo</span>
       <strong>{{ stats.active_om_assets }}</strong>
     </a>
-    <a class="card stat-card card-link" href="{{ url_for('performance', om_only='yes') }}">
-      <span>Centrais abaixo do esperado</span>
+    <a class="card stat-card card-link" href="{{ url_for('performance', om_only='yes', issue_only='yes') }}">
+      <span>Centrais com disponibilidade afetada</span>
       <strong>{{ performance_risk_count or 0 }}</strong>
     </a>
     <a class="card stat-card card-link" href="{{ url_for('renewals', focus='90') }}">
       <span>A terminar em 90 dias</span>
       <strong>{{ stats.renewals_next_90_days }}</strong>
     </a>
+    <article class="card stat-card">
+      <span>Disponibilidade inversores</span>
+      <strong>{{ "%.1f"|format(availability_summary.average_inverter_availability_pct) ~ "%" if availability_summary.average_inverter_availability_pct is not none else "Sem dados" }}</strong>
+    </article>
+    <article class="card stat-card">
+      <span>Inversores indisponiveis</span>
+      <strong>{{ availability_summary.unavailable_inverters if availability_summary.average_inverter_availability_pct is not none else "Sem dados" }}</strong>
+    </article>
+    <article class="card stat-card">
+      <span>Sem comunicacao</span>
+      <strong>{{ availability_summary.no_communication_devices if availability_summary.average_inverter_availability_pct is not none else "Sem dados" }}</strong>
+    </article>
+    <article class="card stat-card">
+      <span>Potencia afetada</span>
+      <strong>{{ "%.1f kW"|format(availability_summary.affected_power_kw) if availability_summary.affected_power_kw is not none else "Sem dados" }}</strong>
+    </article>
+    <article class="card stat-card">
+      <span>Disponibilidade strings</span>
+      <strong>{{ "%.1f"|format(availability_summary.string_availability_pct) ~ "%" if availability_summary.string_availability_pct is not none else "Sem dados" }}</strong>
+    </article>
+    <article class="card stat-card">
+      <span>Strings indisponiveis</span>
+      <strong>{{ availability_summary.unavailable_strings if availability_summary.string_availability_pct is not none else "Sem dados" }}</strong>
+    </article>
   </section>
 
   <section class="dashboard-main">

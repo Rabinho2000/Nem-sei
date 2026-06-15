@@ -1,9 +1,10 @@
 {% set perf_pct = compute_performance_percentage(record) %}
 {% set perf_status = record.performance_status or "Sem dados" %}
+{% set perf_status_key = performance_status_class(perf_status) %}
 {% set no_data = perf_status == "Sem dados" or record.production_kwh is none %}
-{% set no_reference = perf_status == "Sem referência" or perf_pct is none %}
+{% set no_reference = perf_status_key == "sem-referencia" or perf_pct is none %}
 {% set diagnostic = reference_diagnostic(record) %}
-<div class="performance-meter status-{{ performance_status_class(perf_status) }}" title="Produção kWh: {{ format_number(record.production_kwh, 2) }} | Esperado kWh: {{ format_number(record.expected_kwh, 2) }} | Produção específica: {{ format_number(record.specific_yield, 2) }} | Esperado específico: {{ format_number(record.expected_specific_yield, 2) }} | Desvio: {{ format_number(record.deviation_pct, 1) }}% | Fonte referência: {{ record.expected_source or '-' }} | Qualidade dos dados: {{ record.data_quality or '-' }} | Histórico: {{ diagnostic.get('historical_records_found', '-') }}/{{ diagnostic.get('min_baseline_points', '-') }} | Motivo: {{ diagnostic.get('no_reference_reason', '-') }}">
+<div class="performance-meter status-{{ perf_status_key }}" title="Produção kWh: {{ format_number(record.production_kwh, 2) }} | Esperado kWh: {{ format_number(record.expected_kwh, 2) }} | Produção específica: {{ format_number(record.specific_yield, 2) }} | Esperado específico: {{ format_number(record.expected_specific_yield, 2) }} | Desvio: {{ format_number(record.deviation_pct, 1) }}% | Fonte referência: {{ record.expected_source or '-' }} | Qualidade dos dados: {{ record.data_quality or '-' }}{% if diagnostic %} | Histórico: {{ diagnostic.get('historical_records_found', '-') }}/{{ diagnostic.get('min_baseline_points', '-') }} | Motivo: {{ diagnostic.get('no_reference_reason', '-') }}{% endif %}">
   <div class="performance-main">
     <div class="performance-track {{ 'is-dashed' if no_data else '' }}">
       <span class="performance-fill" style="width: {{ performance_bar_width(record) }}"></span>
@@ -31,12 +32,14 @@
       <div><dt>Desvio %</dt><dd>{{ format_number(record.deviation_pct, 1) }}</dd></div>
       <div><dt>Fonte referência</dt><dd>{{ record.expected_source or "-" }}</dd></div>
       <div><dt>Qualidade dos dados</dt><dd>{{ record.data_quality or "-" }}</dd></div>
-      <div><dt>Histórico encontrado</dt><dd>{{ diagnostic.get("historical_records_found", "-") }}</dd></div>
-      <div><dt>Anos baseline</dt><dd>{{ diagnostic.get("baseline_years", "-") }}</dd></div>
-      <div><dt>Mínimo pontos</dt><dd>{{ diagnostic.get("min_baseline_points", "-") }}</dd></div>
-      <div><dt>Fonte tentada</dt><dd>{{ diagnostic.get("expected_source_attempted", "-") }}</dd></div>
-      <div><dt>Candidatos histórico</dt><dd>{{ diagnostic.get("candidate_historical_dates", [])|join(", ") if diagnostic.get("candidate_historical_dates") else "-" }}</dd></div>
-      <div><dt>Motivo sem referência</dt><dd>{{ diagnostic.get("no_reference_reason") or "-" }}</dd></div>
+      {% if diagnostic %}
+        <div><dt>Histórico encontrado</dt><dd>{{ diagnostic.get("historical_records_found", "-") }}</dd></div>
+        <div><dt>Anos baseline</dt><dd>{{ diagnostic.get("baseline_years", "-") }}</dd></div>
+        <div><dt>Mínimo pontos</dt><dd>{{ diagnostic.get("min_baseline_points", "-") }}</dd></div>
+        <div><dt>Fonte tentada</dt><dd>{{ diagnostic.get("expected_source_attempted", "-") }}</dd></div>
+        <div><dt>Candidatos histórico</dt><dd>{{ diagnostic.get("candidate_historical_dates", [])|join(", ") if diagnostic.get("candidate_historical_dates") else "-" }}</dd></div>
+        <div><dt>Motivo sem referência</dt><dd>{{ diagnostic.get("no_reference_reason") or "-" }}</dd></div>
+      {% endif %}
     </dl>
   </details>
 </div>

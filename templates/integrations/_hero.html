@@ -1,18 +1,18 @@
 <section class="hero">
   <div>
     <p class="eyebrow">Integracoes</p>
-    <h2>FusionSolar</h2>
+    <h2>Monitorizacao API</h2>
     <p class="muted">Sincronizacao automatica duas vezes por dia, check manual e lista de centrais por resolver.</p>
-    <p class="muted">Configurado para API Account Mode da documentacao SmartPVMS: login por XSRF-TOKEN, lista de centrais, realtime por planta e alarmes ativos.</p>
+    <p class="muted">O botao sincroniza todas as integracoes ativas: FusionSolar e Sigenergy.</p>
   </div>
   <div class="hero-actions">
     <form method="post">
       <input type="hidden" name="action" value="test_connection">
-      <button class="button secondary" type="submit">Testar ligacao</button>
+      <button class="button secondary" type="submit">Testar ligacoes</button>
     </form>
     <form method="post">
       <input type="hidden" name="action" value="sync_now">
-      <button class="button" type="submit">Sincronizar agora</button>
+      <button class="button" type="submit">Sincronizar tudo</button>
     </form>
   </div>
 </section>

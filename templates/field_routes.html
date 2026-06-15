@@ -1,0 +1,407 @@
+{% extends "base.html" %}
+{% block content %}
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+
+<section class="hero">
+  <div>
+    <p class="eyebrow">Mapa e rotas</p>
+    <h2>Planeador de visitas O&amp;M</h2>
+    <p class="muted">Filtra instalações, escolhe só as centrais necessárias e cria uma rota com origem, tempos e custos.</p>
+  </div>
+</section>
+
+<section class="card">
+  <form class="filters monitoring-filters js-auto-submit" method="get">
+    <select name="scope">
+      <option value="problems" {{ 'selected' if filters.scope == 'problems' else '' }}>Com erro ou desconectadas</option>
+      <option value="open_tickets" {{ 'selected' if filters.scope == 'open_tickets' else '' }}>Com tickets abertos</option>
+      <option value="all" {{ 'selected' if filters.scope == 'all' else '' }}>Todas</option>
+    </select>
+    <select name="om_only">
+      <option value="yes" {{ 'selected' if filters.om_only == 'yes' else '' }}>Só O&amp;M ativo</option>
+      <option value="no" {{ 'selected' if filters.om_only == 'no' else '' }}>Incluir todas</option>
+    </select>
+    <select name="status">
+      <option value="">Qualquer estado</option>
+      <option value="Erro" {{ 'selected' if filters.status == 'Erro' else '' }}>Erro</option>
+      <option value="Desconectada" {{ 'selected' if filters.status == 'Desconectada' else '' }}>Desconectada</option>
+      <option value="Operacional" {{ 'selected' if filters.status == 'Operacional' else '' }}>Operacional</option>
+      <option value="Resolvido" {{ 'selected' if filters.status == 'Resolvido' else '' }}>Resolvido</option>
+    </select>
+    <input type="text" name="search" value="{{ filters.search }}" placeholder="Pesquisar instalação, localização ou morada">
+    <button class="button" type="submit">Aplicar</button>
+  </form>
+</section>
+
+<section class="grid two route-layout">
+  <article class="card route-map-card">
+    <div class="section-title">
+      <h3>Mapa</h3>
+      <span class="chip">{{ mappable_assets|length }} com coordenadas</span>
+    </div>
+    <div id="field-map" class="field-map"></div>
+  </article>
+
+  <article class="card route-planner">
+    <div class="section-title">
+      <h3>Nova rota</h3>
+      <span class="chip">{{ mappable_assets|length }} disponíveis</span>
+    </div>
+
+    <form class="route-plan-form" method="post">
+      <input type="hidden" name="scope" value="{{ filters.scope }}">
+      <input type="hidden" name="om_only" value="{{ filters.om_only }}">
+      <input type="hidden" name="status" value="{{ filters.status }}">
+      <input type="hidden" name="search" value="{{ filters.search }}">
+
+      <section class="route-step">
+        <div class="route-step-head">
+          <span class="metric-badge">1</span>
+          <div>
+            <h4>Dados da viagem</h4>
+            <p class="muted">A origem já vem preenchida com a Solcor.</p>
+          </div>
+        </div>
+        <div class="route-form-grid">
+          <label>Nome da rota
+            <input type="text" name="name" placeholder="Ex. Rota Norte">
+          </label>
+          <label>Equipa
+            <input type="text" name="team_name" placeholder="Equipa ou técnico">
+          </label>
+          <label>Data
+            <input type="date" name="work_date" value="{{ today_iso }}">
+          </label>
+          <label class="checkbox-inline route-return-toggle">
+            <input type="checkbox" name="return_to_origin" checked>
+            <span>Regressar à origem</span>
+          </label>
+        </div>
+        <details class="route-inline-details">
+          <summary>Alterar origem</summary>
+          <div class="route-form-grid">
+            <label>Origem
+              <input type="text" name="origin_name" value="{{ default_depot.name }}">
+            </label>
+            <label>Morada origem
+              <input type="text" name="origin_address" value="{{ default_depot.address }}">
+            </label>
+            <label>Latitude
+              <input type="number" name="origin_latitude" step="0.000001" value="{{ default_depot.lat }}">
+            </label>
+            <label>Longitude
+              <input type="number" name="origin_longitude" step="0.000001" value="{{ default_depot.lng }}">
+            </label>
+          </div>
+        </details>
+      </section>
+
+      <section class="route-step">
+        <div class="route-step-head">
+          <span class="metric-badge">2</span>
+          <div>
+            <h4>Centrais a visitar</h4>
+            <p class="muted">Nada fica selecionado por defeito para evitar rotas acidentais.</p>
+          </div>
+        </div>
+        <div class="route-toolbar">
+          <button class="button secondary route-small-button" type="button" data-route-select="all">Selecionar visíveis</button>
+          <button class="button secondary route-small-button" type="button" data-route-select="none">Limpar seleção</button>
+        </div>
+        <div class="route-select-list route-stop-list">
+          {% for asset in mappable_assets %}
+            <div class="route-stop-row">
+              <label class="checkbox-inline route-stop-main">
+                <input type="checkbox" name="asset_ids" value="{{ asset.id }}">
+                <span>
+                  <strong>{{ asset.project_name }}</strong>
+                  <small>{{ asset.location or asset.address or "Sem localização" }} · {{ asset.latest_status or "Sem estado" }} · {{ asset.open_tickets }} tickets</small>
+                </span>
+              </label>
+              <div class="route-stop-time">
+                <label>Horas
+                  <input type="number" name="work_hours_{{ asset.id }}" min="0" step="0.25" value="1">
+                </label>
+                <label>Min
+                  <input type="number" name="work_minutes_{{ asset.id }}" min="0" step="5" value="0">
+                </label>
+              </div>
+              <label class="route-intervention-field">Intervenção
+                <input type="text" name="intervention_notes_{{ asset.id }}" placeholder="Ex. trocar disjuntor">
+              </label>
+            </div>
+          {% else %}
+            <p class="muted">Sem instalações com coordenadas neste filtro.</p>
+          {% endfor %}
+        </div>
+      </section>
+
+      <section class="route-step">
+        <div class="route-step-head">
+          <span class="metric-badge">3</span>
+          <div>
+            <h4>Tempos e custos</h4>
+            <p class="muted">Define o tempo base e ajusta custos só quando precisares.</p>
+          </div>
+        </div>
+        <div class="route-form-grid">
+          <label>Horas por defeito
+            <input type="number" name="default_work_hours" min="0" step="0.25" value="1">
+          </label>
+          <label>Minutos adicionais
+            <input type="number" name="default_work_minutes" min="0" step="5" value="0">
+          </label>
+        </div>
+        <label>Notas para a equipa
+          <textarea name="notes" rows="3" placeholder="Material, prioridade ou restrições"></textarea>
+        </label>
+        <details class="route-inline-details">
+          <summary>Ajustar custos</summary>
+          <div class="route-cost-grid">
+            <label>Custo EUR/km interno
+              <input type="number" name="internal_km_cost" min="0" step="0.01" value="0.35">
+            </label>
+            <label>Preço EUR/km cliente
+              <input type="number" name="client_km_price" min="0" step="0.01" value="0.60">
+            </label>
+            <label>Engenheiros
+              <input type="number" name="engineer_count" min="0" step="1" value="0">
+            </label>
+            <label>Técnicos
+              <input type="number" name="technician_count" min="0" step="1" value="1">
+            </label>
+            <label>Custo interno EUR/h engenheiro
+              <input type="number" name="engineer_internal_hourly" min="0" step="0.01" value="0">
+            </label>
+            <label>Custo interno EUR/h técnico
+              <input type="number" name="technician_internal_hourly" min="0" step="0.01" value="0">
+            </label>
+            <label>Preço cliente EUR/h engenheiro
+              <input type="number" name="engineer_client_hourly" min="0" step="0.01" value="0">
+            </label>
+            <label>Preço cliente EUR/h técnico
+              <input type="number" name="technician_client_hourly" min="0" step="0.01" value="0">
+            </label>
+            <label>Portagens
+              <input type="number" name="tolls_cost" min="0" step="0.01" value="0">
+            </label>
+            <label>Alojamento
+              <input type="number" name="lodging_cost" min="0" step="0.01" value="0">
+            </label>
+            <label>Refeições
+              <input type="number" name="meals_cost" min="0" step="0.01" value="0">
+            </label>
+            <label>Outros custos
+              <input type="number" name="other_costs" min="0" step="0.01" value="0">
+            </label>
+            <label>Margem extra %
+              <input type="number" name="extra_margin_pct" min="0" step="0.1" value="0">
+            </label>
+          </div>
+        </details>
+      </section>
+
+      <button class="button route-submit-button" type="submit" {{ 'disabled' if not mappable_assets else '' }}>Otimizar e criar rota</button>
+    </form>
+  </article>
+</section>
+
+{% if suspicious_assets %}
+  <section class="card">
+    <div class="section-title">
+      <h3>Coordenadas a rever</h3>
+      <span class="chip warning">{{ suspicious_assets|length }}</span>
+    </div>
+    {% if review_map_payload %}
+      <div id="review-map" class="field-map review-map"></div>
+    {% endif %}
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Central</th>
+            <th>Morada/localização</th>
+            <th>Resultado geocoding</th>
+            <th>Coordenadas</th>
+            <th>Ação</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for asset in suspicious_assets %}
+            <tr>
+              <td>{{ asset.project_name }}</td>
+              <td>{{ asset.address or asset.location or "-" }}</td>
+              <td>{{ asset.route_notes or "-" }}</td>
+              <td>{{ asset.latitude }}, {{ asset.longitude }}</td>
+              <td>
+                <div class="route-review-actions">
+                  {% if asset.latitude is not none and asset.longitude is not none %}
+                    <form method="post" action="{{ url_for('field_routes.confirm_asset_location', asset_id=asset.id) }}">
+                      <input type="hidden" name="scope" value="{{ filters.scope }}">
+                      <input type="hidden" name="om_only" value="{{ filters.om_only }}">
+                      <input type="hidden" name="status" value="{{ filters.status }}">
+                      <input type="hidden" name="search" value="{{ filters.search }}">
+                      <button class="button secondary route-small-button" type="submit">Confirmar</button>
+                    </form>
+                  {% endif %}
+                  <form class="route-review-correction" method="post" action="{{ url_for('field_routes.update_asset_location', asset_id=asset.id) }}">
+                    <input type="hidden" name="scope" value="{{ filters.scope }}">
+                    <input type="hidden" name="om_only" value="{{ filters.om_only }}">
+                    <input type="hidden" name="status" value="{{ filters.status }}">
+                    <input type="hidden" name="search" value="{{ filters.search }}">
+                    <input type="number" name="latitude" step="0.000001" value="{{ asset.latitude or '' }}" placeholder="Latitude">
+                    <input type="number" name="longitude" step="0.000001" value="{{ asset.longitude or '' }}" placeholder="Longitude">
+                    <input type="hidden" name="route_notes" value="{{ asset.route_notes or '' }}">
+                    <button class="button secondary route-small-button" type="submit">Corrigir</button>
+                  </form>
+                </div>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endif %}
+
+<section class="grid two">
+  <article class="card">
+    <div class="section-title">
+      <h3>Instalações sem coordenadas</h3>
+      <span class="chip">{{ missing_location_assets|length }}</span>
+    </div>
+    {% if missing_location_assets %}
+      <form class="inline-form" method="post" action="{{ url_for('field_routes.geocode_missing_assets') }}">
+        <input type="hidden" name="scope" value="{{ filters.scope }}">
+        <input type="hidden" name="om_only" value="{{ filters.om_only }}">
+        <input type="hidden" name="status" value="{{ filters.status }}">
+        <input type="hidden" name="search" value="{{ filters.search }}">
+        <button class="button" type="submit">Preencher coordenadas</button>
+      </form>
+    {% endif %}
+    <div class="route-location-list">
+      {% for asset in missing_location_assets[:12] %}
+        <form class="route-location-form" method="post" action="{{ url_for('field_routes.update_asset_location', asset_id=asset.id) }}">
+          <input type="hidden" name="scope" value="{{ filters.scope }}">
+          <input type="hidden" name="om_only" value="{{ filters.om_only }}">
+          <input type="hidden" name="status" value="{{ filters.status }}">
+          <input type="hidden" name="search" value="{{ filters.search }}">
+          <div>
+            <strong>{{ asset.project_name }}</strong>
+            <small>{{ asset.address or asset.location or "Sem morada" }}</small>
+          </div>
+          <input type="number" name="latitude" step="0.000001" placeholder="Latitude">
+          <input type="number" name="longitude" step="0.000001" placeholder="Longitude">
+          <input type="text" name="route_notes" placeholder="Notas rota">
+          <button class="button secondary" type="submit">Guardar</button>
+        </form>
+      {% else %}
+        <p class="muted">Todas as instalações filtradas têm coordenadas.</p>
+      {% endfor %}
+    </div>
+  </article>
+
+  <article class="card">
+    <div class="section-title">
+      <h3>Importar My Maps</h3>
+    </div>
+    <form class="stack-form compact-top-space" method="post" action="{{ url_for('field_routes.import_mymaps') }}">
+      <input type="hidden" name="scope" value="{{ filters.scope }}">
+      <input type="hidden" name="om_only" value="{{ filters.om_only }}">
+      <input type="hidden" name="status" value="{{ filters.status }}">
+      <input type="hidden" name="search" value="{{ filters.search }}">
+      <label>Link Google My Maps
+        <input type="url" name="mymaps_url" placeholder="https://www.google.com/maps/d/u/0/viewer?mid=...">
+      </label>
+      <label class="checkbox-inline">
+        <input type="checkbox" name="overwrite_coordinates">
+        <span>Substituir coordenadas manuais existentes</span>
+      </label>
+      <button class="button" type="submit">Importar coordenadas</button>
+    </form>
+  </article>
+</section>
+
+<section class="grid two">
+  <article class="card">
+    <div class="section-title">
+      <h3>Rotas recentes</h3>
+    </div>
+    <div class="list">
+      {% for plan in latest_plans %}
+        <a class="list-row card-link" href="{{ url_for('field_routes.route_plan_detail', plan_id=plan.id) }}">
+          <div>
+            <strong>{{ plan.name }}</strong>
+            <small>{{ plan.team_name or "Sem equipa" }} · {{ plan.work_date or "Sem data" }}</small>
+          </div>
+          <span class="chip">{{ plan.stop_count }} paragens · {{ "%.1f"|format(plan.total_distance_km or 0) }} km</span>
+        </a>
+      {% else %}
+        <p class="muted">Ainda sem rotas criadas.</p>
+      {% endfor %}
+    </div>
+  </article>
+</section>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  (function () {
+    const assets = {{ map_payload|tojson }};
+    const map = L.map("field-map");
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap"
+    }).addTo(map);
+
+    if (!assets.length) {
+      map.setView([39.5, -8.0], 7);
+      return;
+    }
+
+    const bounds = [];
+    function escapeHtml(value) {
+      return String(value || "").replace(/[&<>"']/g, function (char) {
+        return {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"}[char];
+      });
+    }
+
+    assets.forEach(function (asset) {
+      const marker = L.marker([asset.lat, asset.lng]).addTo(map);
+      marker.bindPopup(
+        '<div class="field-map-popup"><strong>' + escapeHtml(asset.name) + '</strong><span>' +
+        escapeHtml(asset.status) + '</span><small>' + escapeHtml(asset.location || asset.address || "") + "</small></div>"
+      );
+      bounds.push([asset.lat, asset.lng]);
+    });
+    map.fitBounds(bounds, { padding: [24, 24], maxZoom: 12 });
+  })();
+
+  (function () {
+    document.querySelectorAll("[data-route-select]").forEach(function (button) {
+      button.addEventListener("click", function () {
+        const checked = button.dataset.routeSelect === "all";
+        document.querySelectorAll(".route-stop-list input[type='checkbox'][name='asset_ids']").forEach(function (input) {
+          input.checked = checked;
+        });
+      });
+    });
+  })();
+
+  (function () {
+    const assets = {{ review_map_payload|tojson }};
+    const container = document.getElementById("review-map");
+    if (!container || !assets.length) return;
+    const map = L.map(container);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap"
+    }).addTo(map);
+    const bounds = [];
+    assets.forEach(function (asset) {
+      L.marker([asset.lat, asset.lng]).addTo(map).bindPopup(asset.name);
+      bounds.push([asset.lat, asset.lng]);
+    });
+    map.fitBounds(bounds, { padding: [24, 24], maxZoom: 12 });
+  })();
+</script>
+{% endblock %}

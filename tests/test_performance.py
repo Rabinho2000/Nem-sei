@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 from datetime import date
 
 import pytest
 
 from app import (
+    build_fusionsolar_customer_production_report,
+    build_production_report_rows,
     build_missing_production_note,
     calculate_expected_production,
     calculate_specific_yield,
@@ -88,6 +91,155 @@ def test_format_number_trims_float_artifacts() -> None:
     assert format_number(61.6000, 2) == "61.6"
     assert format_number(12.345, 2) == "12.35"
     assert format_number(None, 2) == "-"
+
+
+def test_monthly_production_report_uses_monthly_api_records(conn) -> None:
+    conn.execute(
+        """
+        INSERT INTO assets (project_name, installation_group, active_contract, kwp, location)
+        VALUES ('Central Producao', 'Central Producao', 'yes', '50', 'Lisboa')
+        """
+    )
+    asset_id = conn.execute("SELECT id FROM assets WHERE project_name = 'Central Producao'").fetchone()["id"]
+    upsert_production_record(
+        conn,
+        asset_id=asset_id,
+        provider="FusionSolar",
+        external_id="S1",
+        period_type="month",
+        period_date=date(2026, 1, 1),
+        production_kwh=1000,
+        specific_yield=20,
+        expected_kwh=900,
+        expected_specific_yield=18,
+        deviation_pct=11.11,
+        performance_status="OK",
+        expected_source="budget",
+        data_quality="ok",
+        notes="",
+        payload_json="{}",
+    )
+    conn.commit()
+
+    rows = build_production_report_rows(
+        conn,
+        {"period": "month", "report_month": "2026-01", "source": "FusionSolar", "om_only": "yes"},
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["project_name"] == "Central Producao"
+    assert rows[0]["production_kwh"] == 1000
+    assert rows[0]["specific_yield"] == 20
+    assert rows[0]["data_source"] == "KPI mensal API"
+
+
+def test_annual_production_report_falls_back_to_daily_records(conn) -> None:
+    conn.execute(
+        """
+        INSERT INTO assets (project_name, installation_group, active_contract, kwp)
+        VALUES ('Central Diaria', 'Central Diaria', 'yes', '10')
+        """
+    )
+    asset_id = conn.execute("SELECT id FROM assets WHERE project_name = 'Central Diaria'").fetchone()["id"]
+    for day, production in [(1, 10), (2, 15)]:
+        upsert_production_record(
+            conn,
+            asset_id=asset_id,
+            provider="FusionSolar",
+            external_id="S2",
+            period_type="day",
+            period_date=date(2026, 2, day),
+            production_kwh=production,
+            specific_yield=production / 10,
+            expected_kwh=10,
+            expected_specific_yield=1,
+            deviation_pct=0,
+            performance_status="OK",
+            expected_source="history",
+            data_quality="ok",
+            notes="",
+            payload_json="{}",
+        )
+    conn.commit()
+
+    rows = build_production_report_rows(
+        conn,
+        {"period": "year", "report_year": "2026", "source": "FusionSolar", "om_only": "yes"},
+    )
+
+    assert rows[0]["project_name"] == "Central Diaria"
+    assert rows[0]["production_kwh"] == 25
+    assert rows[0]["data_points"] == 2
+    assert rows[0]["data_source"] == "KPI diario API"
+
+
+def test_customer_pdf_report_uses_local_production_records(conn, monkeypatch: pytest.MonkeyPatch) -> None:
+    conn.execute(
+        """
+        INSERT INTO assets (project_name, installation_group, active_contract, kwp, location)
+        VALUES ('Central Cliente', 'Central Cliente', 'yes', '50', 'Porto')
+        """
+    )
+    asset_id = conn.execute("SELECT id FROM assets WHERE project_name = 'Central Cliente'").fetchone()["id"]
+    conn.execute(
+        """
+        INSERT INTO asset_integrations (asset_id, provider, external_id, external_name, enabled)
+        VALUES (?, 'FusionSolar', 'S1', 'Central Cliente FS', 1)
+        """,
+        (asset_id,),
+    )
+    upsert_production_record(
+        conn,
+        asset_id=asset_id,
+        provider="FusionSolar",
+        external_id="S1",
+        period_type="day",
+        period_date=date(2026, 1, 1),
+        production_kwh=10,
+        specific_yield=0.2,
+        expected_kwh=None,
+        expected_specific_yield=None,
+        deviation_pct=None,
+        performance_status="OK",
+        expected_source="none",
+        data_quality="ok",
+        notes="",
+        payload_json=json.dumps({"collectTime": 1767225600000, "dataItemMap": {"PVYield": "10", "selfUsePower": "6", "ongrid_power": "4"}}),
+    )
+    upsert_production_record(
+        conn,
+        asset_id=asset_id,
+        provider="FusionSolar",
+        external_id="S1",
+        period_type="month",
+        period_date=date(2026, 1, 1),
+        production_kwh=100,
+        specific_yield=2,
+        expected_kwh=None,
+        expected_specific_yield=None,
+        deviation_pct=None,
+        performance_status="OK",
+        expected_source="none",
+        data_quality="ok",
+        notes="",
+        payload_json=json.dumps({"collectTime": 1767225600000, "dataItemMap": {"PVYield": "100", "selfUsePower": "60", "ongrid_power": "40"}}),
+    )
+    conn.commit()
+    monkeypatch.setattr("app.get_fusionsolar_session", lambda _config: pytest.fail("API should not be called"))
+
+    report = build_fusionsolar_customer_production_report(
+        conn,
+        asset_id=asset_id,
+        report_month="2026-01",
+        electricity_price=0.2,
+        sell_price=0.05,
+    )
+
+    assert report["data_source"] == "Dados locais"
+    assert report["production_kwh"] == 100
+    assert report["self_use_kwh"] == 60
+    assert report["export_kwh"] == 40
+    assert report["daily_rows"][0]["production_kwh"] == 10
 
 
 def test_deviation_classification_with_thresholds() -> None:

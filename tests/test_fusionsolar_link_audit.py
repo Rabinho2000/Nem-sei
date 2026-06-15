@@ -44,3 +44,20 @@ def test_link_audit_warns_when_two_fusionsolar_rows_share_same_asset(tmp_path) -
         assert all("2 entradas FusionSolar" in row["reason"] for row in rows)
     finally:
         conn.close()
+
+
+def test_link_audit_shows_active_oem_assets_missing_from_fusionsolar(tmp_path) -> None:
+    conn = make_conn(tmp_path)
+    try:
+        asset_id = add_asset(conn, "AHBV Lagos (EPC)")
+        conn.execute("UPDATE assets SET active_contract = 'yes' WHERE id = ?", (asset_id,))
+        conn.commit()
+
+        rows = app_module.get_fusionsolar_link_audit_rows(conn, app_module.INTEGRATION_PROVIDER_FUSIONSOLAR)
+
+        missing = [row for row in rows if row["asset_id"] == asset_id]
+        assert len(missing) == 1
+        assert missing[0]["verdict"] == "Rever"
+        assert "sem entrada devolvida pelo FusionSolar" in missing[0]["reason"]
+    finally:
+        conn.close()

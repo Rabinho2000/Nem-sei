@@ -1,0 +1,14 @@
+services:
+  monitoring-board:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /data
+      SESSION_COOKIE_SECURE: "true"
+    volumes:
+      - ./data:/data
+    ports:
+      - "127.0.0.1:5000:5000"
+    command: gunicorn -w 1 --threads 4 -b 0.0.0.0:5000 app:app

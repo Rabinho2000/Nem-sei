@@ -1,18 +1,9 @@
 <section class="cards">
-  <article class="card stat-card">
-    <span>Ultimo sync</span>
-    <strong>{{ config.last_sync_at or '-' }}</strong>
-  </article>
-  <article class="card stat-card">
-    <span>Estado</span>
-    <strong>{{ config.last_sync_status or 'sem sync' }}</strong>
-  </article>
-  <article class="card stat-card">
-    <span>Auto-sync</span>
-    <strong>{{ 'ativo' if config.auto_sync_enabled else 'desligado' }}</strong>
-  </article>
-  <article class="card stat-card">
-    <span>Horarios</span>
-    <strong>{{ config.sync_hours or '-' }}</strong>
-  </article>
+  {% for item in integration_configs %}
+    <article class="card stat-card">
+      <span>{{ item.provider }}</span>
+      <strong>{{ item.last_sync_status or 'sem sync' }}</strong>
+      <p class="muted">{{ item.last_sync_at or '-' }} | auto-sync {{ 'ativo' if item.auto_sync_enabled else 'desligado' }} | {{ item.sync_hours or '-' }}</p>
+    </article>
+  {% endfor %}
 </section>

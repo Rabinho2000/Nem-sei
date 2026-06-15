@@ -155,6 +155,10 @@
               <th>Dias</th>
               <th>Rec.</th>
               <th>Historico</th>
+              <th>Disponibilidade</th>
+              <th>Inversores</th>
+              <th>Sem com.</th>
+              <th>Pot. afetada</th>
             </tr>
           </thead>
           <tbody>
@@ -171,9 +175,13 @@
                 <td>{{ row.problem_days }}</td>
                 <td>{{ row.recurrence_count }}</td>
                 <td><a class="table-link" href="{{ url_for('monitoring', asset_id=row.asset_id) }}">{{ row.history_count }} registos</a></td>
+                <td>{{ "%.1f%%"|format(row.availability.inverter_availability_pct) if row.availability and row.availability.inverter_availability_pct is not none else "-" }}</td>
+                <td>{{ row.availability.available_inverters ~ " / " ~ row.availability.total_inverters if row.availability else "-" }}</td>
+                <td>{{ row.availability.no_communication_devices if row.availability else "-" }}</td>
+                <td>{{ "%.1f kW"|format(row.availability.affected_power_kw) if row.availability and row.availability.affected_power_kw is not none else "-" }}</td>
               </tr>
             {% else %}
-              <tr><td colspan="11" class="muted">Sem monitorizacao ainda.</td></tr>
+              <tr><td colspan="15" class="muted">Sem monitorizacao ainda.</td></tr>
             {% endfor %}
           </tbody>
         </table>

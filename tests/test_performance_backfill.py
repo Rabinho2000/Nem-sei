@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 
 import app as app_module
-from app import ensure_database, run_fusionsolar_production_backfill
+from app import ensure_database, run_fusionsolar_month_cycle, run_fusionsolar_production_backfill
 from monitoring_board.db import get_db
 
 
@@ -48,7 +48,7 @@ def add_asset(conn, name: str, station_code: str, kwp: str = "50") -> int:
 
 
 def fake_session(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(app_module, "get_fusionsolar_session", lambda _config: (object(), "token"))
+    monkeypatch.setattr(app_module, "get_fusionsolar_session", lambda _config, force_login=False: (object(), "token"))
 
 
 def kpi_row(station_code: str, collect_date: date, value: float = 100) -> dict[str, Any]:
@@ -257,7 +257,7 @@ def test_backfill_upsert_avoids_duplicates(conn, monkeypatch: pytest.MonkeyPatch
     assert count == 2
 
 
-def test_rate_limit_stops_backfill_without_repeating_requests(conn, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_rate_limit_backfill_stops_after_repeated_wait_cycles(conn, monkeypatch: pytest.MonkeyPatch) -> None:
     add_asset(conn, "Central A", "S1")
     add_asset(conn, "Central B", "S2")
     fake_session(monkeypatch)
@@ -277,28 +277,73 @@ def test_rate_limit_stops_backfill_without_repeating_requests(conn, monkeypatch:
         to_year=2026,
         today_value=date(2026, 2, 1),
         kpi_call_delay_seconds=0,
+        sleeper=lambda _seconds: None,
+        max_wait_cycles=1,
     )
 
-    assert calls["total"] == 1
-    assert result["api_errors"] == 1
-    assert "temporariamente limitada" in result["stopped_reason"]
+    assert calls["total"] == 2
+    assert result["api_errors"] == 2
+    assert result["wait_cycles"] == 2
+    assert "repetido demasiadas vezes" in result["stopped_reason"]
     assert result["baselines_recalculated"] == 0
     assert conn.execute("SELECT COUNT(*) FROM production_records WHERE period_type = 'day'").fetchone()[0] == 0
 
 
-def test_rate_limit_cooldown_skips_next_backfill_without_api_call(conn, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_rate_limit_backfill_waits_and_continues(conn, monkeypatch: pytest.MonkeyPatch) -> None:
     add_asset(conn, "Central A", "S1")
     fake_session(monkeypatch)
     calls = {"total": 0}
+    sleeps: list[float] = []
 
     def fetch_day_rows(_session, _base_url, _endpoint, station_codes, collect_date):
         calls["total"] += 1
-        raise ValueError("Falha ao obter os KPIs diarios FusionSolar. (failCode=407)")
+        if calls["total"] == 1:
+            raise ValueError("Falha ao obter os KPIs diarios FusionSolar. (failCode=407)")
+        return [kpi_row("S1", date(2026, 1, 1), 10)]
 
     monkeypatch.setattr(app_module, "fetch_fusionsolar_kpi_day_rows", fetch_day_rows)
     install_month_mtd(monkeypatch)
 
-    first = run_fusionsolar_production_backfill(
+    result = run_fusionsolar_production_backfill(
+        conn,
+        period_type="day",
+        from_year=2026,
+        to_year=2026,
+        today_value=date(2026, 2, 1),
+        kpi_call_delay_seconds=0,
+        sleeper=sleeps.append,
+    )
+
+    assert calls["total"] == 2
+    assert result["wait_cycles"] == 1
+    assert result["stopped_reason"] == ""
+    assert result["records_updated"] == 1
+    assert sleeps and sleeps[0] > 0
+
+
+def test_backfill_refreshes_session_after_relogin_error(conn, monkeypatch: pytest.MonkeyPatch) -> None:
+    add_asset(conn, "Central A", "S1")
+    sessions: list[str] = []
+    calls = {"total": 0}
+
+    def get_session(_config, force_login=False):
+        token = "forced" if force_login else "cached"
+        sessions.append(token)
+        return token, "token"
+
+    def fetch_day_rows(session_obj, _base_url, _endpoint, station_codes, collect_date):
+        calls["total"] += 1
+        if calls["total"] == 1:
+            raise ValueError("USER_MUST_RELOGIN (failCode=305)")
+        assert session_obj == "forced"
+        return [kpi_row("S1", date(2026, 1, 1), 10)]
+
+    monkeypatch.setattr(app_module, "get_fusionsolar_session", get_session)
+    monkeypatch.setattr(app_module, "invalidate_fusionsolar_session", lambda _config: None)
+    monkeypatch.setattr(app_module, "fetch_fusionsolar_kpi_day_rows", fetch_day_rows)
+    install_month_mtd(monkeypatch)
+
+    result = run_fusionsolar_production_backfill(
         conn,
         period_type="day",
         from_year=2026,
@@ -306,22 +351,14 @@ def test_rate_limit_cooldown_skips_next_backfill_without_api_call(conn, monkeypa
         today_value=date(2026, 2, 1),
         kpi_call_delay_seconds=0,
     )
-    second = run_fusionsolar_production_backfill(
-        conn,
-        period_type="day",
-        from_year=2026,
-        to_year=2026,
-        today_value=date(2026, 2, 1),
-        kpi_call_delay_seconds=0,
-    )
 
-    assert calls["total"] == 1
-    assert "temporariamente limitada" in first["stopped_reason"]
-    assert "temporariamente limitada" in second["stopped_reason"]
-    assert second["records_updated"] == 0
+    assert sessions == ["cached", "forced"]
+    assert calls["total"] == 2
+    assert result["records_updated"] == 1
+    assert result["stopped_reason"] == ""
 
 
-def test_rate_limit_cooldown_is_persisted_in_database(conn, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_rate_limit_cooldown_is_persisted_and_waited(conn, monkeypatch: pytest.MonkeyPatch) -> None:
     add_asset(conn, "Central A", "S1")
     fake_session(monkeypatch)
     calls = {"total": 0}
@@ -340,6 +377,8 @@ def test_rate_limit_cooldown_is_persisted_in_database(conn, monkeypatch: pytest.
         to_year=2026,
         today_value=date(2026, 2, 1),
         kpi_call_delay_seconds=0,
+        sleeper=lambda _seconds: None,
+        max_wait_cycles=1,
     )
     app_module.FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL = None
     second = run_fusionsolar_production_backfill(
@@ -349,10 +388,59 @@ def test_rate_limit_cooldown_is_persisted_in_database(conn, monkeypatch: pytest.
         to_year=2026,
         today_value=date(2026, 2, 1),
         kpi_call_delay_seconds=0,
+        sleeper=lambda _seconds: None,
+        max_wait_cycles=1,
     )
 
-    assert calls["total"] == 1
-    assert "temporariamente limitada" in second["stopped_reason"]
+    assert calls["total"] == 3
+    assert second["wait_cycles"] == 2
+    assert "repetido demasiadas vezes" in second["stopped_reason"]
+
+
+def test_rate_limit_records_single_api_limit_alert(conn, monkeypatch: pytest.MonkeyPatch) -> None:
+    add_asset(conn, "Central A", "S1")
+    fake_session(monkeypatch)
+
+    def fetch_day_rows(_session, _base_url, _endpoint, station_codes, collect_date):
+        raise ValueError("Falha ao obter os KPIs diarios FusionSolar. (failCode=407)")
+
+    monkeypatch.setattr(app_module, "fetch_fusionsolar_kpi_day_rows", fetch_day_rows)
+    install_month_mtd(monkeypatch)
+
+    run_fusionsolar_production_backfill(
+        conn,
+        period_type="day",
+        from_year=2026,
+        to_year=2026,
+        today_value=date(2026, 2, 1),
+        kpi_call_delay_seconds=0,
+        sleeper=lambda _seconds: None,
+        max_wait_cycles=1,
+    )
+    run_fusionsolar_production_backfill(
+        conn,
+        period_type="day",
+        from_year=2026,
+        to_year=2026,
+        today_value=date(2026, 2, 1),
+        kpi_call_delay_seconds=0,
+        sleeper=lambda _seconds: None,
+        max_wait_cycles=1,
+    )
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM telegram_alerts WHERE alert_type = 'fusionsolar_api_limit'"
+    ).fetchone()[0] == 1
+
+
+def test_rate_limit_alert_is_throttled_for_repeated_marks(conn) -> None:
+    app_module.mark_fusionsolar_performance_rate_limited(conn)
+    app_module.mark_fusionsolar_performance_rate_limited(conn)
+    app_module.mark_fusionsolar_performance_rate_limited(conn)
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM telegram_alerts WHERE alert_type = 'fusionsolar_api_limit'"
+    ).fetchone()[0] == 1
 
 
 def test_no_real_sleep_happens_when_sleeper_is_injected(conn, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -377,6 +465,62 @@ def test_no_real_sleep_happens_when_sleeper_is_injected(conn, monkeypatch: pytes
     )
 
     assert sleeps == [65, 65]
+
+
+def test_month_cycle_imports_selected_assets_for_month(conn, monkeypatch: pytest.MonkeyPatch) -> None:
+    asset_id = add_asset(conn, "Central A", "S1")
+    fake_session(monkeypatch)
+
+    monkeypatch.setattr(
+        app_module,
+        "fetch_fusionsolar_kpi_day_rows",
+        lambda _session, _base_url, _endpoint, station_codes, collect_date: [
+            kpi_row("S1", date(2026, 1, 1), 10),
+            kpi_row("S1", date(2026, 1, 2), 20),
+        ],
+    )
+    install_month_mtd(monkeypatch, 30)
+
+    result = run_fusionsolar_month_cycle(
+        conn,
+        report_month="2026-01",
+        asset_ids=[asset_id],
+        kpi_call_delay_seconds=0,
+    )
+
+    assert result["status"] == "completed"
+    assert result["records_updated"] == 2
+    assert result["monthly_records_updated"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM production_records WHERE asset_id = ?", (asset_id,)).fetchone()[0] == 3
+
+
+def test_month_cycle_waits_and_continues_after_rate_limit(conn, monkeypatch: pytest.MonkeyPatch) -> None:
+    asset_id = add_asset(conn, "Central A", "S1")
+    fake_session(monkeypatch)
+    calls = {"day": 0}
+    sleeps: list[float] = []
+
+    def fetch_day_rows(_session, _base_url, _endpoint, station_codes, collect_date):
+        calls["day"] += 1
+        if calls["day"] == 1:
+            raise ValueError("Falha ao obter os KPIs diarios FusionSolar. (failCode=407)")
+        return [kpi_row("S1", date(2026, 1, 1), 10)]
+
+    monkeypatch.setattr(app_module, "fetch_fusionsolar_kpi_day_rows", fetch_day_rows)
+    install_month_mtd(monkeypatch, 10)
+
+    result = run_fusionsolar_month_cycle(
+        conn,
+        report_month="2026-01",
+        asset_ids=[asset_id],
+        kpi_call_delay_seconds=0,
+        sleeper=sleeps.append,
+    )
+
+    assert calls["day"] == 2
+    assert result["wait_cycles"] == 1
+    assert result["status"] == "completed"
+    assert sleeps and sleeps[0] > 0
 
 
 def test_reference_recalculation_only_runs_for_imported_dates(conn, monkeypatch: pytest.MonkeyPatch) -> None:
