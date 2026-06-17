@@ -24,21 +24,24 @@
     <div class="section-title">
       <div>
         <h3>Novo relatório</h3>
-        <p class="muted">O PDF segue o modelo mensal: poupança, excedente, benefício, gráfico diário e taxa de autoconsumo.</p>
+        <p class="muted">O sistema deteta automaticamente o modelo ESCO ou EPC e gera o PDF correspondente.</p>
       </div>
     </div>
 
     <form class="stack-form" method="post">
       <label>Instalação FusionSolar
-        <select name="asset_id" required>
+        <select name="asset_id" id="report-asset" required>
           <option value="">Escolher instalação</option>
           {% for asset in report_assets %}
-            <option value="{{ asset.asset_id }}" {{ 'selected' if selected_asset_id|string == asset.asset_id|string else '' }}>
-              {{ asset.project_name }}{% if asset.external_name and asset.external_name != asset.project_name %} · {{ asset.external_name }}{% endif %}
+            <option value="{{ asset.asset_id }}" data-report-type="{{ asset.report_type }}" {{ 'selected' if selected_asset_id|string == asset.asset_id|string else '' }}>
+              {{ asset.project_name }}{% if asset.external_name and asset.external_name != asset.project_name %} · {{ asset.external_name }}{% endif %} ({{ asset.report_type|upper }})
             </option>
           {% endfor %}
         </select>
       </label>
+      <p class="muted" id="detected-report-model">
+        {% if selected_report_type %}Modelo detetado: <strong>{{ selected_report_type|upper }}</strong>{% else %}Seleciona uma instalação para detetar o modelo.{% endif %}
+      </p>
 
       <div class="grid two">
         <label>Mês do relatório
@@ -49,6 +52,10 @@
         </label>
         <label>Venda excedente EUR/kWh
           <input type="number" step="0.00001" min="0" name="sell_price" value="{{ sell_price }}" required>
+        </label>
+        <label id="solcor-price-field">Preço Solcor EUR/kWh
+          <input type="number" step="0.00001" min="0" name="solcor_price_per_kwh" value="{{ solcor_price_per_kwh }}">
+          <small class="muted">Usado apenas em instalações ESCO.</small>
         </label>
       </div>
       <label class="check-row">
@@ -99,6 +106,7 @@
         <tr>
           <th>Instalação</th>
           <th>FusionSolar</th>
+          <th>Modelo</th>
           <th>Station code</th>
           <th>Localização</th>
         </tr>
@@ -108,14 +116,29 @@
           <tr>
             <td>{{ asset.project_name }}</td>
             <td>{{ asset.external_name or "-" }}</td>
+            <td>{{ asset.report_type|upper }}</td>
             <td>{{ asset.external_id }}</td>
             <td>{{ asset.location or "-" }}</td>
           </tr>
         {% else %}
-          <tr><td colspan="4" class="muted">Sem instalações FusionSolar mapeadas. Faz primeiro o mapeamento em Integrações.</td></tr>
+          <tr><td colspan="5" class="muted">Sem instalações FusionSolar mapeadas. Faz primeiro o mapeamento em Integrações.</td></tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
 </section>
+<script>
+  (() => {
+    const select = document.getElementById("report-asset");
+    const model = document.getElementById("detected-report-model");
+    const solcorField = document.getElementById("solcor-price-field");
+    const updateModel = () => {
+      const type = select.options[select.selectedIndex]?.dataset.reportType || "";
+      model.innerHTML = type ? `Modelo detetado: <strong>${type.toUpperCase()}</strong>` : "Seleciona uma instalação para detetar o modelo.";
+      solcorField.hidden = type !== "esco";
+    };
+    select.addEventListener("change", updateModel);
+    updateModel();
+  })();
+</script>
 {% endblock %}

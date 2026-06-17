@@ -105,7 +105,7 @@ def test_refresh_scheduler_registers_stable_single_instance_provider_jobs(tmp_pa
         wat_call = next(call for call in fake_scheduler.add_calls if call["id"] == "fusionsolar-wat-daily")
         assert wat_call["trigger"] == "cron"
         assert wat_call["hour"] == 0
-        assert wat_call["minute"] == 5
+        assert wat_call["minute"] == 30
     finally:
         flask_app.config["DATABASE"] = original_database
         app_module.SCHEDULER = original_scheduler
@@ -131,6 +131,7 @@ def test_scheduled_sigenergy_sync_uses_provider_neutral_wrapper(tmp_path, monkey
 def test_scheduled_fusionsolar_wat_queues_previous_day(tmp_path, monkeypatch) -> None:
     flask_app, original_database = _make_test_app(tmp_path)
     scheduled: list[int] = []
+    monkeypatch.setattr(app_module, "current_lisbon_date", lambda: app_module.date(2026, 6, 15))
     monkeypatch.setattr(app_module, "schedule_background_job", lambda _app, job_id: scheduled.append(job_id) or True)
     try:
         with get_db(flask_app.config["DATABASE"]) as conn:
@@ -146,7 +147,7 @@ def test_scheduled_fusionsolar_wat_queues_previous_day(tmp_path, monkeypatch) ->
         flask_app.config["DATABASE"] = original_database
 
     params = json.loads(job["params_json"])
-    expected_date = (app_module.date.today() - app_module.timedelta(days=1)).isoformat()
+    expected_date = "2026-06-14"
     assert job["job_type"] == "fusionsolar_inverter_availability_backfill"
     assert job["status"] == "pending"
     assert params == {
@@ -156,6 +157,30 @@ def test_scheduled_fusionsolar_wat_queues_previous_day(tmp_path, monkeypatch) ->
         "trigger_type": "scheduled",
     }
     assert scheduled == [job["id"]]
+
+
+def test_scheduled_fusionsolar_wat_reuses_pending_job(tmp_path, monkeypatch) -> None:
+    flask_app, original_database = _make_test_app(tmp_path)
+    scheduled: list[int] = []
+    monkeypatch.setattr(app_module, "current_lisbon_date", lambda: app_module.date(2026, 6, 15))
+    monkeypatch.setattr(app_module, "schedule_background_job", lambda _app, job_id: scheduled.append(job_id) or True)
+    try:
+        with get_db(flask_app.config["DATABASE"]) as conn:
+            _insert_enabled_config(conn, app_module.INTEGRATION_PROVIDER_FUSIONSOLAR)
+
+        app_module.run_scheduled_fusionsolar_wat_backfill(flask_app)
+        app_module.run_scheduled_fusionsolar_wat_backfill(flask_app)
+
+        with get_db(flask_app.config["DATABASE"]) as conn:
+            jobs = conn.execute(
+                "SELECT id FROM background_jobs WHERE job_type = ?",
+                ("fusionsolar_inverter_availability_backfill",),
+            ).fetchall()
+    finally:
+        flask_app.config["DATABASE"] = original_database
+
+    assert len(jobs) == 1
+    assert scheduled == [jobs[0]["id"]]
 
 
 def test_run_all_integration_syncs_dispatches_enabled_providers_through_wrapper(tmp_path, monkeypatch) -> None:

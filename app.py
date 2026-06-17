@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -48,6 +49,11 @@ from monitoring_board.runtime import (
     store_runtime_relative_path,
 )
 from monitoring_board.security import app_password_configured, csrf_token, flask_secret_key
+from monitoring_board.customer_reports import (
+    build_customer_report_pdf,
+    detect_report_type,
+    prepare_customer_report,
+)
 from monitoring_board.services.fusionsolar import (
     build_provider_url,
     classify_fusionsolar_inverter_availability,
@@ -67,9 +73,7 @@ from openpyxl import Workbook
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib.utils import ImageReader
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
-from reportlab.pdfgen import canvas
 
 
 INTEGRATION_PROVIDER_FUSIONSOLAR = "FusionSolar"
@@ -109,6 +113,7 @@ FUSIONSOLAR_INVERTER_DEVICE_TYPE_IDS = {1, 38}
 INVERTER_AVAILABILITY_SLOT_MINUTES = 15
 INVERTER_AVAILABILITY_EDGE_TOLERANCE_MINUTES = 30
 LOW_INVERTER_AVAILABILITY_PCT = 90.0
+LISBON_TIMEZONE = ZoneInfo("Europe/Lisbon")
 DEFAULT_STRING_PRESENT_VOLTAGE_THRESHOLD = 100.0
 DEFAULT_STRING_AUTO_LEARN_OBSERVATIONS = 2
 SIGENERGY_TOKEN_CACHE: dict[str, dict[str, Any]] = {}
@@ -2361,8 +2366,10 @@ def create_app() -> Flask:
         if request.method == "POST":
             asset_id_raw = request.form.get("asset_id", "").strip()
             report_month = normalize_report_month(request.form.get("report_month", ""))
-            electricity_price = parse_float_value(request.form.get("electricity_price")) or 0.20725
-            sell_price = parse_float_value(request.form.get("sell_price")) or 0.0
+            electricity_price_value = parse_float_value(request.form.get("electricity_price"))
+            electricity_price = 0.20725 if electricity_price_value is None else max(electricity_price_value, 0.0)
+            sell_price = max(parse_float_value(request.form.get("sell_price")) or 0.0, 0.0)
+            solcor_price_per_kwh = max(parse_float_value(request.form.get("solcor_price_per_kwh")) or 0.0, 0.0)
             force_api = request.form.get("force_api") == "on"
             if not asset_id_raw.isdigit():
                 flash("Escolhe uma instalacao FusionSolar para gerar o relatorio.", "error")
@@ -2374,6 +2381,7 @@ def create_app() -> Flask:
                     report_month=report_month,
                     electricity_price=electricity_price,
                     sell_price=sell_price,
+                    solcor_price_per_kwh=solcor_price_per_kwh,
                     force_api=force_api,
                 )
                 return export_customer_production_pdf(report)
@@ -2391,14 +2399,25 @@ def create_app() -> Flask:
 
         selected_asset_id = request.args.get("asset_id", "").strip()
         report_month = normalize_report_month(request.args.get("report_month", ""))
+        report_assets = get_fusionsolar_report_assets(g.db)
+        selected_report_type = next(
+            (
+                asset["report_type"]
+                for asset in report_assets
+                if selected_asset_id.isdigit() and int(asset["asset_id"]) == int(selected_asset_id)
+            ),
+            "",
+        )
 
         return render_template(
             "exports.html",
-            report_assets=get_fusionsolar_report_assets(g.db),
+            report_assets=report_assets,
             selected_asset_id=selected_asset_id,
+            selected_report_type=selected_report_type,
             report_month=report_month,
             electricity_price=request.args.get("electricity_price", "0.20725"),
             sell_price=request.args.get("sell_price", "0.00"),
+            solcor_price_per_kwh=request.args.get("solcor_price_per_kwh", "0.00"),
             fusionsolar_api_warning=get_fusionsolar_performance_cooldown_reason(g.db),
         )
 
@@ -6384,8 +6403,8 @@ def build_export_dataset(
     return normalized_rows, headers
 
 
-def get_fusionsolar_report_assets(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    return query_all(
+def get_fusionsolar_report_assets(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = query_all(
         conn,
         """
         SELECT
@@ -6393,6 +6412,10 @@ def get_fusionsolar_report_assets(conn: sqlite3.Connection) -> list[sqlite3.Row]
             a.project_name,
             a.location,
             a.kwp,
+            a.contract_type,
+            a.asset_type,
+            a.coverage_type,
+            a.sell_to,
             ai.external_id,
             ai.external_name
         FROM asset_integrations ai
@@ -6404,6 +6427,10 @@ def get_fusionsolar_report_assets(conn: sqlite3.Connection) -> list[sqlite3.Row]
         """,
         (INTEGRATION_PROVIDER_FUSIONSOLAR,),
     )
+    assets = [dict(row) for row in rows]
+    for asset in assets:
+        asset["report_type"] = detect_report_type(asset)
+    return assets
 
 
 def first_numeric(data: dict[str, Any], keys: list[str]) -> float | None:
@@ -6444,6 +6471,19 @@ def parse_production_record_payload(row: sqlite3.Row) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def extract_customer_tariff_values(row: dict[str, Any] | None) -> dict[str, float]:
+    data_item_map = row.get("dataItemMap") if isinstance(row, dict) else {}
+    if not isinstance(data_item_map, dict):
+        data_item_map = {}
+    aliases = {
+        "self_use_cheia_kwh": ["self_use_cheia_kwh", "selfUsePeak", "selfUseCheia"],
+        "self_use_ponta_kwh": ["self_use_ponta_kwh", "selfUseHighPeak", "selfUsePonta"],
+        "self_use_vazio_kwh": ["self_use_vazio_kwh", "selfUseOffPeak", "selfUseVazio"],
+        "self_use_super_vazio_kwh": ["self_use_super_vazio_kwh", "selfUseSuperOffPeak", "selfUseSuperVazio"],
+    }
+    return {key: first_numeric(data_item_map, keys) or 0.0 for key, keys in aliases.items()}
+
+
 def normalize_customer_production_record(row: sqlite3.Row, fallback_date: date) -> dict[str, Any]:
     payload = parse_production_record_payload(row)
     normalized = normalize_customer_kpi_row(payload, fallback_date)
@@ -6464,6 +6504,7 @@ def build_local_customer_production_report(
     report_month: str,
     electricity_price: float,
     sell_price: float,
+    solcor_price_per_kwh: float = 0.0,
 ) -> dict[str, Any] | None:
     asset = conn.execute(
         """
@@ -6472,6 +6513,10 @@ def build_local_customer_production_report(
             a.project_name,
             a.location,
             a.kwp,
+            a.contract_type,
+            a.asset_type,
+            a.coverage_type,
+            a.sell_to,
             ai.external_id,
             ai.external_name
         FROM asset_integrations ai
@@ -6529,13 +6574,12 @@ def build_local_customer_production_report(
     export_kwh = monthly["export_kwh"] if monthly else sum(item["export_kwh"] for item in daily_rows)
     if production_kwh and not self_use_kwh and not export_kwh:
         self_use_kwh = production_kwh
-    savings_eur = self_use_kwh * electricity_price
-    export_revenue_eur = export_kwh * sell_price
-    total_benefit_eur = savings_eur + export_revenue_eur
-    autoconsumption_pct = (self_use_kwh / production_kwh * 100) if production_kwh else 0
-    export_pct = max(100 - autoconsumption_pct, 0) if production_kwh else 0
-
-    return {
+    consumption_kwh = (
+        monthly["consumption_kwh"]
+        if monthly and monthly.get("consumption_kwh") is not None
+        else sum((item.get("consumption_kwh") or 0.0) for item in daily_rows)
+    )
+    report = {
         "asset": dict(asset),
         "station_code": str(asset["external_id"]),
         "month_start": month_start,
@@ -6545,15 +6589,13 @@ def build_local_customer_production_report(
         "production_kwh": production_kwh,
         "self_use_kwh": self_use_kwh,
         "export_kwh": export_kwh,
-        "savings_eur": savings_eur,
-        "export_revenue_eur": export_revenue_eur,
-        "total_benefit_eur": total_benefit_eur,
-        "autoconsumption_pct": autoconsumption_pct,
-        "export_pct": export_pct,
+        "consumption_kwh": consumption_kwh,
         "electricity_price": electricity_price,
         "sell_price": sell_price,
         "data_source": "Dados locais",
     }
+    report.update(extract_customer_tariff_values(parse_production_record_payload(monthly_record) if monthly_record else None))
+    return prepare_customer_report(report, solcor_price_per_kwh=solcor_price_per_kwh)
 
 
 def build_fusionsolar_customer_production_report(
@@ -6563,6 +6605,7 @@ def build_fusionsolar_customer_production_report(
     report_month: str,
     electricity_price: float,
     sell_price: float,
+    solcor_price_per_kwh: float = 0.0,
     force_api: bool = False,
 ) -> dict[str, Any]:
     if not force_api:
@@ -6572,6 +6615,7 @@ def build_fusionsolar_customer_production_report(
             report_month=report_month,
             electricity_price=electricity_price,
             sell_price=sell_price,
+            solcor_price_per_kwh=solcor_price_per_kwh,
         )
         if local_report is not None:
             return local_report
@@ -6587,6 +6631,10 @@ def build_fusionsolar_customer_production_report(
             a.project_name,
             a.location,
             a.kwp,
+            a.contract_type,
+            a.asset_type,
+            a.coverage_type,
+            a.sell_to,
             ai.external_id,
             ai.external_name
         FROM asset_integrations ai
@@ -6643,13 +6691,12 @@ def build_fusionsolar_customer_production_report(
     export_kwh = monthly["export_kwh"] if monthly else sum(item["export_kwh"] for item in daily_rows)
     if production_kwh and not self_use_kwh and not export_kwh:
         self_use_kwh = production_kwh
-    savings_eur = self_use_kwh * electricity_price
-    export_revenue_eur = export_kwh * sell_price
-    total_benefit_eur = savings_eur + export_revenue_eur
-    autoconsumption_pct = (self_use_kwh / production_kwh * 100) if production_kwh else 0
-    export_pct = max(100 - autoconsumption_pct, 0) if production_kwh else 0
-
-    return {
+    consumption_kwh = (
+        monthly["consumption_kwh"]
+        if monthly and monthly.get("consumption_kwh") is not None
+        else sum((item.get("consumption_kwh") or 0.0) for item in daily_rows)
+    )
+    report = {
         "asset": dict(asset),
         "station_code": station_code,
         "month_start": month_start,
@@ -6659,259 +6706,21 @@ def build_fusionsolar_customer_production_report(
         "production_kwh": production_kwh,
         "self_use_kwh": self_use_kwh,
         "export_kwh": export_kwh,
-        "savings_eur": savings_eur,
-        "export_revenue_eur": export_revenue_eur,
-        "total_benefit_eur": total_benefit_eur,
-        "autoconsumption_pct": autoconsumption_pct,
-        "export_pct": export_pct,
+        "consumption_kwh": consumption_kwh,
         "electricity_price": electricity_price,
         "sell_price": sell_price,
         "data_source": "FusionSolar API",
     }
-
-
-def draw_wrapped_text(pdf: canvas.Canvas, text: str, x: float, y: float, width: float, *, font: str = "Helvetica", size: int = 9, leading: int = 11) -> float:
-    words = str(text or "").split()
-    lines: list[str] = []
-    current = ""
-    pdf.setFont(font, size)
-    for word in words:
-        candidate = f"{current} {word}".strip()
-        if pdf.stringWidth(candidate, font, size) <= width:
-            current = candidate
-        else:
-            if current:
-                lines.append(current)
-            current = word
-    if current:
-        lines.append(current)
-    for line in lines:
-        pdf.drawString(x, y, line)
-        y -= leading
-    return y
-
-
-def draw_scaled_text(pdf: canvas.Canvas, text: str, x: float, y: float, width: float, *, font: str = "Helvetica-Bold", size: int = 12, min_size: int = 8) -> int:
-    text = str(text or "")
-    current_size = size
-    while current_size > min_size and pdf.stringWidth(text, font, current_size) > width:
-        current_size -= 1
-    pdf.setFont(font, current_size)
-    if pdf.stringWidth(text, font, current_size) <= width:
-        pdf.drawString(x, y, text)
-        return current_size
-
-    ellipsis = "..."
-    available = max(width - pdf.stringWidth(ellipsis, font, current_size), 0)
-    trimmed = ""
-    for char in text:
-        candidate = trimmed + char
-        if pdf.stringWidth(candidate, font, current_size) > available:
-            break
-        trimmed = candidate
-    pdf.drawString(x, y, f"{trimmed.rstrip()}{ellipsis}")
-    return current_size
-
-
-def fmt_kwh(value: float) -> str:
-    return f"{value:,.0f}".replace(",", " ") + " kWh"
-
-
-def fmt_eur(value: float) -> str:
-    return f"{value:,.2f}".replace(",", " ").replace(".", ",") + " €"
-
-
-def draw_solcor_report_logo(pdf: canvas.Canvas, page_width: float, page_height: float, margin: float) -> None:
-    logo_path = BASE_DIR / "static" / "solcor-logo.png"
-    logo_w = 214
-    logo_h = 58
-    x = page_width - margin - logo_w
-    y = page_height - margin - logo_h + 4
-    if logo_path.exists():
-        pdf.drawImage(
-            ImageReader(str(logo_path)),
-            x,
-            y,
-            width=logo_w,
-            height=logo_h,
-            preserveAspectRatio=True,
-            mask="auto",
-        )
-        return
-
-    green_top = colors.HexColor("#35df2f")
-    green_bottom = colors.HexColor("#b8f000")
-    text_dark = colors.HexColor("#26313b")
-    accent_red = colors.HexColor("#e1302a")
-    accent_blue = colors.HexColor("#2777bd")
-    tile = 24
-    gap = 3
-    icon_x = x
-    icon_y = y + 5
-    for row in range(2):
-        for col in range(2):
-            pdf.setFillColor(green_top if row == 1 else green_bottom)
-            pdf.roundRect(icon_x + col * (tile + gap), icon_y + row * (tile + gap), tile, tile, 5, fill=1, stroke=0)
-    pdf.setFillColor(text_dark)
-    pdf.setFont("Helvetica-Bold", 39)
-    pdf.drawString(x + 66, y + 23, "SOLCOR")
-    pdf.setStrokeColor(accent_red)
-    pdf.setLineWidth(2)
-    pdf.line(x + 66, y + 18, x + 132, y + 18)
-    pdf.setStrokeColor(accent_blue)
-    pdf.line(x + 134, y + 18, x + 199, y + 18)
-    pdf.setFillColor(text_dark)
-    pdf.setFont("Helvetica-Bold", 14)
-    pdf.drawString(x + 150, y + 4, "PORTUGAL")
+    report.update(extract_customer_tariff_values(monthly_row))
+    return prepare_customer_report(report, solcor_price_per_kwh=solcor_price_per_kwh)
 
 
 def export_customer_production_pdf(report: dict[str, Any]):
-    buffer = io.BytesIO()
-    pdf = canvas.Canvas(buffer, pagesize=landscape(A4))
-    width, height = landscape(A4)
-    margin = 42
-    dark = colors.HexColor("#1f2a24")
-    brand = colors.HexColor("#2f8f7b")
-    warning = colors.HexColor("#f0b44c")
-    light = colors.HexColor("#eef4f2")
-    muted = colors.HexColor("#6b7280")
-
-    pdf.setFillColor(dark)
-    draw_scaled_text(pdf, report["asset"]["project_name"], margin, height - 54, 500, size=24, min_size=14)
-    pdf.setFont("Helvetica", 11)
-    pdf.drawString(margin, height - 78, "Energia Solar")
-    pdf.setFont("Helvetica", 7)
-    pdf.setFillColor(muted)
-    price_note = f"*Cálculo da poupança com preço de eletricidade de {fmt_eur(report['electricity_price'])}/kWh"
-    pdf.drawString(margin + 78, height - 78, price_note)
-
-    draw_solcor_report_logo(pdf, width, height, margin)
-
-    pdf.setFillColor(dark)
-    pdf.setFont("Helvetica-Bold", 12)
-    pdf.drawRightString(width - margin, height - 104, report["month_label"])
-    pdf.setFont("Helvetica", 8)
-    pdf.setFillColor(muted)
-    pdf.drawRightString(width - margin, height - 120, f"Fonte: {report['data_source']}")
-
-    metric_y = height - 120
-    metrics = [
-        ("Redução da sua fatura de eletricidade:", fmt_eur(report["savings_eur"]), f"Pelo consumo direto de {fmt_kwh(report['self_use_kwh'])} de energia solar."),
-        ("Receitas da venda de excedente", fmt_eur(report["export_revenue_eur"]), f"Pela venda de {fmt_kwh(report['export_kwh'])} de energia solar."),
-        ("Benefício total", fmt_eur(report["total_benefit_eur"]), "A soma da poupança e da receita."),
-    ]
-    for label, value, detail in metrics:
-        pdf.setFillColor(dark)
-        draw_scaled_text(pdf, label, margin, metric_y, 238, size=13, min_size=10)
-        draw_scaled_text(pdf, value, margin + 250, metric_y - 2, 105, size=17, min_size=11)
-        pdf.setFont("Helvetica", 9)
-        pdf.setFillColor(muted)
-        draw_wrapped_text(pdf, detail, margin + 365, metric_y + 1, 330, size=9)
-        metric_y -= 38
-
-    chart_x = margin
-    chart_y = 112
-    chart_w = 470
-    chart_h = 220
-    pdf.setFillColor(dark)
-    pdf.setFont("Helvetica-Bold", 10)
-    pdf.drawCentredString(chart_x + chart_w / 2, chart_y + chart_h + 34, "DISTRIBUIÇÃO DIÁRIA DA ENERGIA SOLAR (kWh)")
-    pdf.setFont("Helvetica", 8)
-    pdf.setFillColor(brand)
-    pdf.rect(chart_x + chart_w - 120, chart_y + chart_h + 18, 9, 9, fill=1, stroke=0)
-    pdf.setFillColor(dark)
-    pdf.drawString(chart_x + chart_w - 106, chart_y + chart_h + 18, "AUTOCONSUMO")
-    pdf.setFillColor(warning)
-    pdf.rect(chart_x + chart_w - 120, chart_y + chart_h + 4, 9, 9, fill=1, stroke=0)
-    pdf.setFillColor(dark)
-    pdf.drawString(chart_x + chart_w - 106, chart_y + chart_h + 4, "EXCEDENTE")
-
-    pdf.setStrokeColor(colors.HexColor("#d8dee3"))
-    pdf.setLineWidth(0.5)
-    for i in range(6):
-        y = chart_y + (chart_h * i / 5)
-        pdf.line(chart_x, y, chart_x + chart_w, y)
-    daily_rows = report["daily_rows"]
-    has_daily_values = any((row["self_use_kwh"] + row["export_kwh"]) > 0 for row in daily_rows)
-    max_daily = max([row["self_use_kwh"] + row["export_kwh"] for row in daily_rows] + [1])
-    days_in_month = report["month_end"].day
-    gap = 3
-    bar_w = max((chart_w - (days_in_month - 1) * gap) / days_in_month, 4)
-    rows_by_day = {row["date"].day: row for row in report["daily_rows"]}
-    if has_daily_values:
-        for day in range(1, days_in_month + 1):
-            row = rows_by_day.get(day, {"self_use_kwh": 0, "export_kwh": 0})
-            x = chart_x + (day - 1) * (bar_w + gap)
-            self_h = chart_h * row["self_use_kwh"] / max_daily
-            export_h = chart_h * row["export_kwh"] / max_daily
-            pdf.setFillColor(brand)
-            pdf.rect(x, chart_y, bar_w, self_h, fill=1, stroke=0)
-            if export_h:
-                pdf.setFillColor(warning)
-                pdf.rect(x, chart_y + self_h, bar_w, export_h, fill=1, stroke=0)
-            if day == 1 or day == days_in_month or day % 2 == 0:
-                pdf.setFillColor(dark)
-                pdf.setFont("Helvetica", 6)
-                pdf.drawCentredString(x + bar_w / 2, chart_y - 12, str(day))
-    else:
-        pdf.setFillColor(muted)
-        pdf.setFont("Helvetica", 10)
-        pdf.drawCentredString(chart_x + chart_w / 2, chart_y + chart_h / 2, "Sem dados diários para este período.")
-    pdf.setFillColor(dark)
-    pdf.setFont("Helvetica", 8)
-    pdf.drawString(chart_x - 24, chart_y + chart_h - 4, f"{max_daily:.0f}")
-    pdf.drawString(chart_x - 12, chart_y - 2, "0")
-    pdf.drawString(chart_x, chart_y - 30, "kWh")
-
-    pie_x = 632
-    pie_y = 236
-    radius = 58
-    start_angle = 90
-    auto_extent = 360 * min(max(report["autoconsumption_pct"], 0), 100) / 100
-    pdf.setFillColor(warning)
-    pdf.wedge(pie_x - radius, pie_y - radius, pie_x + radius, pie_y + radius, start_angle, start_angle + 360, fill=1, stroke=0)
-    pdf.setFillColor(brand)
-    pdf.wedge(pie_x - radius, pie_y - radius, pie_x + radius, pie_y + radius, start_angle, start_angle + auto_extent, fill=1, stroke=0)
-    pdf.setFillColor(colors.white)
-    pdf.circle(pie_x, pie_y, 34, fill=1, stroke=0)
-    pdf.setFillColor(dark)
-    pdf.setFont("Helvetica-Bold", 18)
-    pdf.drawCentredString(pie_x, pie_y + 2, f"{report['autoconsumption_pct']:.0f}%")
-    pdf.setFont("Helvetica", 9)
-    pdf.drawCentredString(pie_x, pie_y - 15, f"{report['export_pct']:.0f}%")
-    pdf.setFont("Helvetica-Bold", 9)
-    pdf.drawCentredString(pie_x, pie_y - 84, "TAXA DE AUTOCONSUMO ESTIMADA")
-    pdf.setFont("Helvetica", 8)
-    pdf.setFillColor(brand)
-    pdf.rect(pie_x - 62, pie_y - 108, 8, 8, fill=1, stroke=0)
-    pdf.setFillColor(dark)
-    pdf.drawString(pie_x - 50, pie_y - 108, "Autoconsumo")
-    pdf.setFillColor(warning)
-    pdf.rect(pie_x + 28, pie_y - 108, 8, 8, fill=1, stroke=0)
-    pdf.setFillColor(dark)
-    pdf.drawString(pie_x + 40, pie_y - 108, "Excedente")
-
-    box_x = 548
-    box_y = 94
-    box_w = 250
-    box_h = 74
-    pdf.setFillColor(light)
-    pdf.roundRect(box_x, box_y, box_w, box_h, 6, fill=1, stroke=0)
-    pdf.setFillColor(dark)
-    pdf.setFont("Helvetica-Bold", 10)
-    pdf.drawString(box_x + 14, box_y + box_h - 22, "RESUMO MENSAL DE PRODUÇÃO E POUPANÇAS:")
-    pdf.setFont("Helvetica", 9)
-    pdf.drawString(box_x + 14, box_y + box_h - 42, f"Produção fotovoltaica: {fmt_kwh(report['production_kwh'])}")
-    pdf.drawString(box_x + 14, box_y + box_h - 58, f"Benefício total: {fmt_eur(report['total_benefit_eur'])}")
-
-    pdf.setFont("Helvetica", 9)
-    pdf.setFillColor(muted)
-    pdf.drawString(margin, 40, "Obrigado pela sua confiança!")
-    pdf.showPage()
-    pdf.save()
-    buffer.seek(0)
+    pdf_bytes = build_customer_report_pdf(report, logo_path=BASE_DIR / "static" / "solcor-logo.png")
+    buffer = io.BytesIO(pdf_bytes)
     safe_name = normalize_name(report["asset"]["project_name"]).replace(" ", "_") or "relatorio"
-    filename = f"Relatorio_Mensal_{safe_name}_{report['month_start'].strftime('%m-%Y')}.pdf"
+    model = str(report.get("report_type") or "epc").upper()
+    filename = f"Relatorio_Mensal_{model}_{safe_name}_{report['month_start'].strftime('%m-%Y')}.pdf"
     return send_file(buffer, as_attachment=True, download_name=filename, mimetype="application/pdf")
 
 
@@ -7619,7 +7428,7 @@ def refresh_integration_scheduler(app: Flask) -> None:
                 func=run_scheduled_fusionsolar_wat_backfill,
                 trigger="cron",
                 hour=0,
-                minute=5,
+                minute=30,
                 args=[app],
                 id="fusionsolar-wat-daily",
                 replace_existing=True,
@@ -7671,13 +7480,26 @@ def run_scheduled_fusionsolar_sync(app: Flask) -> None:
     run_scheduled_integration_sync(app, INTEGRATION_PROVIDER_FUSIONSOLAR)
 
 
+def current_lisbon_date() -> date:
+    return datetime.now(LISBON_TIMEZONE).date()
+
+
 def run_scheduled_fusionsolar_wat_backfill(app: Flask) -> None:
-    target_date = date.today() - timedelta(days=1)
+    scheduler_date = current_lisbon_date()
+    target_date = scheduler_date - timedelta(days=1)
     with app.app_context():
         with closing(get_db(app.config["DATABASE"])) as conn:
+            current_app.logger.info(
+                "Scheduled FusionSolar WAT preparing previous closed day: scheduler_date=%s target_date=%s",
+                scheduler_date,
+                target_date,
+            )
             config = get_integration_config(conn, INTEGRATION_PROVIDER_FUSIONSOLAR)
             if config is None or not config["enabled"]:
-                current_app.logger.info("Scheduled FusionSolar WAT skipped because integration is disabled")
+                current_app.logger.info(
+                    "Scheduled FusionSolar WAT skipped because integration is disabled: target_date=%s",
+                    target_date,
+                )
                 return
             job_id, created = create_background_job(
                 conn,
@@ -7693,13 +7515,14 @@ def run_scheduled_fusionsolar_wat_backfill(app: Flask) -> None:
             if created:
                 schedule_background_job(app, job_id)
                 current_app.logger.info(
-                    "Scheduled FusionSolar WAT queued: job_id=%s target_date=%s",
+                    "Scheduled FusionSolar WAT queued: job_id=%s target_date=%s job_type=%s",
                     job_id,
                     target_date,
+                    "fusionsolar_inverter_availability_backfill",
                 )
             else:
                 current_app.logger.info(
-                    "Scheduled FusionSolar WAT reused existing job: job_id=%s target_date=%s",
+                    "Scheduled FusionSolar WAT reused existing pending/running job: job_id=%s target_date=%s",
                     job_id,
                     target_date,
                 )
@@ -9486,6 +9309,220 @@ def get_inverter_availability_report(
         "low_availability_count": sum(
             1 for row in inverter_rows if float(row["availability_pct"]) < LOW_INVERTER_AVAILABILITY_PCT
         ),
+    }
+
+
+def get_monthly_wat_report_data(
+    conn: sqlite3.Connection,
+    from_date: date,
+    to_date: date,
+    asset_id: int | None = None,
+) -> dict[str, Any]:
+    if from_date > to_date:
+        raise ValueError("O intervalo WAT e invalido.")
+
+    provider = INTEGRATION_PROVIDER_FUSIONSOLAR
+    from_iso = from_date.isoformat()
+    to_iso = to_date.isoformat()
+    sample_from = datetime.combine(from_date, datetime.min.time()).isoformat(timespec="seconds")
+    sample_to = datetime.combine(to_date + timedelta(days=1), datetime.min.time()).isoformat(timespec="seconds")
+    expected_days = (to_date - from_date).days + 1
+
+    asset_params: list[Any] = []
+    if asset_id is not None:
+        asset_filter = "a.id = ?"
+        asset_params.append(asset_id)
+    else:
+        asset_filter = """
+            EXISTS (
+                SELECT 1 FROM provider_devices pd
+                WHERE pd.asset_id = a.id AND pd.provider = ? AND pd.enabled = 1 AND pd.dev_type_id IN (1, 38)
+            )
+            OR EXISTS (
+                SELECT 1 FROM inverter_availability_daily iad
+                WHERE iad.asset_id = a.id AND iad.provider = ? AND iad.availability_date BETWEEN ? AND ?
+            )
+            OR EXISTS (
+                SELECT 1 FROM plant_availability_daily pad
+                WHERE pad.asset_id = a.id AND pad.provider = ? AND pad.availability_date BETWEEN ? AND ?
+            )
+            OR EXISTS (
+                SELECT 1 FROM inverter_power_samples ips
+                WHERE ips.asset_id = a.id AND ips.provider = ? AND ips.sample_time >= ? AND ips.sample_time < ?
+            )
+        """
+        asset_params.extend(
+            [provider, provider, from_iso, to_iso, provider, from_iso, to_iso, provider, sample_from, sample_to]
+        )
+    assets = conn.execute(
+        f"SELECT a.id, a.project_name FROM assets a WHERE {asset_filter} ORDER BY a.project_name COLLATE NOCASE",
+        asset_params,
+    ).fetchall()
+
+    plants: list[dict[str, Any]] = []
+    for asset in assets:
+        current_asset_id = int(asset["id"])
+        configured_devices = query_all(
+            conn,
+            """
+            SELECT external_device_id, device_name
+            FROM provider_devices
+            WHERE asset_id = ? AND provider = ? AND enabled = 1 AND dev_type_id IN (1, 38)
+            """,
+            (current_asset_id, provider),
+        )
+        configured_inverter_count = sum(
+            1 for row in configured_devices if not is_removed_inverter_name(row["device_name"])
+        )
+        inverter_rows = query_all(
+            conn,
+            """
+            SELECT
+                iad.inverter_id,
+                COALESCE(MAX(pd.device_name), MAX(iad.inverter_name), iad.inverter_id) AS inverter_name,
+                MAX(iad.inverter_power_kw) AS stored_power_kw,
+                MAX(pd.rated_power_kw) AS provider_power_kw,
+                MAX(pd.model) AS provider_model,
+                MAX(pd.enabled) AS provider_enabled,
+                COUNT(DISTINCT iad.availability_date) AS data_days,
+                SUM(iad.valid_slots) AS valid_slots,
+                SUM(iad.available_slots) AS available_slots,
+                SUM(iad.unavailable_slots) AS unavailable_slots
+            FROM inverter_availability_daily iad
+            LEFT JOIN provider_devices pd
+              ON pd.provider = iad.provider AND pd.external_device_id = iad.inverter_id
+            WHERE iad.asset_id = ? AND iad.provider = ? AND iad.availability_date BETWEEN ? AND ?
+            GROUP BY iad.inverter_id
+            ORDER BY inverter_name COLLATE NOCASE, iad.inverter_id
+            """,
+            (current_asset_id, provider, from_iso, to_iso),
+        )
+        report_inverters: list[dict[str, Any]] = []
+        for stored_row in inverter_rows:
+            row = dict(stored_row)
+            if row.get("provider_enabled") == 0 or is_removed_inverter_name(row.get("inverter_name")):
+                continue
+            valid_slots = int(row.get("valid_slots") or 0)
+            available_slots = int(row.get("available_slots") or 0)
+            report_inverters.append(
+                {
+                    "inverter_id": str(row["inverter_id"]),
+                    "inverter_name": str(row.get("inverter_name") or row["inverter_id"]),
+                    "inverter_power_kw": (
+                        parse_float_value(row.get("stored_power_kw"))
+                        or parse_float_value(row.get("provider_power_kw"))
+                        or infer_inverter_power_from_model(row.get("provider_model"))
+                    ),
+                    "data_days": int(row.get("data_days") or 0),
+                    "valid_slots": valid_slots,
+                    "available_slots": available_slots,
+                    "unavailable_slots": int(row.get("unavailable_slots") or 0),
+                    "availability_pct": round(available_slots / valid_slots * 100, 2) if valid_slots else None,
+                }
+            )
+
+        plant_days = conn.execute(
+            """
+            SELECT availability_date, valid_slots, weighted_availability_pct, inverter_count
+            FROM plant_availability_daily
+            WHERE asset_id = ? AND provider = ? AND availability_date BETWEEN ? AND ?
+            ORDER BY availability_date
+            """,
+            (current_asset_id, provider, from_iso, to_iso),
+        ).fetchall()
+        sample_summary = conn.execute(
+            """
+            SELECT COUNT(*) AS sample_count, COUNT(DISTINCT substr(sample_time, 1, 10)) AS sample_days
+            FROM inverter_power_samples
+            WHERE asset_id = ? AND provider = ? AND sample_time >= ? AND sample_time < ?
+            """,
+            (current_asset_id, provider, sample_from, sample_to),
+        ).fetchone()
+
+        sample_count = int(sample_summary["sample_count"] or 0)
+        sample_days = int(sample_summary["sample_days"] or 0)
+        plant_day_count = len(plant_days)
+        has_any_data = bool(report_inverters or plant_day_count or sample_count)
+        if not has_any_data:
+            data_status = "sem dados"
+        else:
+            daily_counts = conn.execute(
+                """
+                SELECT availability_date, COUNT(*) AS inverter_count,
+                       SUM(CASE WHEN valid_slots > 0 AND availability_pct IS NOT NULL THEN 1 ELSE 0 END) AS valid_inverters
+                FROM inverter_availability_daily
+                WHERE asset_id = ? AND provider = ? AND availability_date BETWEEN ? AND ?
+                GROUP BY availability_date
+                """,
+                (current_asset_id, provider, from_iso, to_iso),
+            ).fetchall()
+            expected_inverter_count = configured_inverter_count or max(
+                (int(row["inverter_count"] or 0) for row in daily_counts),
+                default=0,
+            )
+            complete_inverter_days = (
+                len(daily_counts) == expected_days
+                and expected_inverter_count > 0
+                and all(
+                    int(row["inverter_count"] or 0) == expected_inverter_count
+                    and int(row["valid_inverters"] or 0) == expected_inverter_count
+                    for row in daily_counts
+                )
+            )
+            complete_plant_days = (
+                plant_day_count == expected_days
+                and all(
+                    int(row["valid_slots"] or 0) > 0
+                    and row["weighted_availability_pct"] is not None
+                    and int(row["inverter_count"] or 0) == expected_inverter_count
+                    for row in plant_days
+                )
+            )
+            data_status = (
+                "ok"
+                if complete_inverter_days and complete_plant_days and sample_days == expected_days
+                else "parcial"
+            )
+
+        ranked_inverters = [row for row in report_inverters if row["availability_pct"] is not None]
+        ranked_inverters.sort(
+            key=lambda row: (float(row["availability_pct"]), row["inverter_name"].lower(), row["inverter_id"])
+        )
+        worst_inverter = ranked_inverters[0] if ranked_inverters else None
+        weighted_wat = calculate_weighted_plant_availability(report_inverters)
+        plants.append(
+            {
+                "asset_id": current_asset_id,
+                "project_name": str(asset["project_name"]),
+                "weighted_wat_pct": weighted_wat,
+                "inverter_count": len(report_inverters) or configured_inverter_count,
+                "inverters_below_90_count": sum(
+                    1
+                    for row in report_inverters
+                    if row["availability_pct"] is not None
+                    and float(row["availability_pct"]) < LOW_INVERTER_AVAILABILITY_PCT
+                ),
+                "worst_inverter": worst_inverter["inverter_name"] if worst_inverter else None,
+                "worst_inverter_id": worst_inverter["inverter_id"] if worst_inverter else None,
+                "worst_inverter_wat_pct": worst_inverter["availability_pct"] if worst_inverter else None,
+                "valid_slots": sum(int(row["valid_slots"]) for row in report_inverters),
+                "unavailable_slots": sum(int(row["unavailable_slots"]) for row in report_inverters),
+                "data_status": data_status,
+            }
+        )
+
+    return {
+        "from_date": from_iso,
+        "to_date": to_iso,
+        "plants": plants,
+    }
+
+
+def get_daily_wat_report_data(conn: sqlite3.Connection, target_date: date) -> dict[str, Any]:
+    report = get_monthly_wat_report_data(conn, target_date, target_date)
+    return {
+        "target_date": target_date.isoformat(),
+        "plants": report["plants"],
     }
 
 
@@ -12224,12 +12261,44 @@ def run_fusionsolar_inverter_availability_backfill(
         session_retry_used = False
         while True:
             try:
+                logging.info("FusionSolar WAT backfill day started: target_date=%s", current)
                 result = sync_fusionsolar_inverter_availability_for_date(conn, current, context=context)
+                stored_counts = conn.execute(
+                    """
+                    SELECT
+                        (SELECT COUNT(*) FROM inverter_power_samples
+                         WHERE provider = ? AND sample_time >= ? AND sample_time < ?) AS power_samples,
+                        (SELECT COUNT(*) FROM inverter_availability_daily
+                         WHERE provider = ? AND availability_date = ?) AS inverter_daily_rows,
+                        (SELECT COUNT(*) FROM plant_availability_daily
+                         WHERE provider = ? AND availability_date = ?) AS plant_daily_rows
+                    """,
+                    (
+                        INTEGRATION_PROVIDER_FUSIONSOLAR,
+                        datetime.combine(current, datetime.min.time()).isoformat(timespec="seconds"),
+                        datetime.combine(current + timedelta(days=1), datetime.min.time()).isoformat(timespec="seconds"),
+                        INTEGRATION_PROVIDER_FUSIONSOLAR,
+                        current.isoformat(),
+                        INTEGRATION_PROVIDER_FUSIONSOLAR,
+                        current.isoformat(),
+                    ),
+                ).fetchone()
                 summary["days"] += 1
                 summary["samples"] += int(result["samples"])
                 summary["plants"] += int(result["plants"])
                 summary["resume_hint"] = (current + timedelta(days=1)).isoformat()
                 conn.commit()
+                logging.info(
+                    "FusionSolar WAT backfill day completed: target_date=%s fetched_samples=%s "
+                    "stored_power_samples=%s stored_inverter_daily=%s stored_plant_daily=%s plants=%s inverters=%s",
+                    current,
+                    result["samples"],
+                    stored_counts["power_samples"],
+                    stored_counts["inverter_daily_rows"],
+                    stored_counts["plant_daily_rows"],
+                    result["plants"],
+                    result["inverters"],
+                )
                 break
             except Exception as exc:
                 summary["api_errors"] += 1

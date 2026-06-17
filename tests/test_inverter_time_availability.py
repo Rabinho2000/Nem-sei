@@ -127,6 +127,8 @@ def test_sync_excludes_all_zero_slots_and_is_idempotent(tmp_path, monkeypatch) -
         plant_row = conn.execute("SELECT * FROM plant_availability_daily").fetchone()
 
         assert conn.execute("SELECT COUNT(*) FROM inverter_power_samples").fetchone()[0] == 16
+        assert conn.execute("SELECT COUNT(*) FROM inverter_availability_daily").fetchone()[0] == 2
+        assert conn.execute("SELECT COUNT(*) FROM plant_availability_daily").fetchone()[0] == 1
         assert len(inverter_rows) == 2
         assert inverter_rows[0]["valid_slots"] == 4
         assert inverter_rows[0]["availability_pct"] == 100.0
@@ -135,6 +137,170 @@ def test_sync_excludes_all_zero_slots_and_is_idempotent(tmp_path, monkeypatch) -
         assert plant_row["weighted_availability_pct"] == 75.0
     finally:
         conn.close()
+
+
+def test_daily_wat_report_data_returns_ok_partial_and_no_data(tmp_path) -> None:
+    db_path = tmp_path / "daily-wat-report.db"
+    app_module.ensure_database(str(db_path))
+    conn = get_db(str(db_path))
+    target_date = date(2026, 6, 14)
+    now = datetime.now().isoformat(timespec="seconds")
+    try:
+        asset_ok = conn.execute("INSERT INTO assets (project_name) VALUES ('Central OK')").lastrowid
+        asset_partial = conn.execute("INSERT INTO assets (project_name) VALUES ('Central Parcial')").lastrowid
+        asset_empty = conn.execute("INSERT INTO assets (project_name) VALUES ('Central Sem Dados')").lastrowid
+        conn.executemany(
+            """
+            INSERT INTO provider_devices (
+                asset_id, provider, station_code, external_device_id, device_name, dev_type_id,
+                rated_power_kw, enabled, created_at, updated_at
+            ) VALUES (?, 'FusionSolar', ?, ?, ?, 1, ?, 1, ?, ?)
+            """,
+            [
+                (asset_ok, "S1", "OK-1", "OK Inversor 1", 60, now, now),
+                (asset_ok, "S1", "OK-2", "OK Inversor 2", 40, now, now),
+                (asset_partial, "S2", "P-1", "Parcial Inversor", 50, now, now),
+                (asset_empty, "S3", "E-1", "Sem Dados Inversor", 50, now, now),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO inverter_availability_daily (
+                asset_id, provider, availability_date, inverter_id, inverter_name, inverter_power_kw,
+                valid_slots, available_slots, unavailable_slots, availability_pct, created_at, updated_at
+            ) VALUES (?, 'FusionSolar', ?, ?, ?, ?, 10, ?, ?, ?, ?, ?)
+            """,
+            [
+                (asset_ok, target_date.isoformat(), "OK-1", "OK Inversor 1", 60, 10, 0, 100, now, now),
+                (asset_ok, target_date.isoformat(), "OK-2", "OK Inversor 2", 40, 8, 2, 80, now, now),
+                (asset_partial, target_date.isoformat(), "P-1", "Parcial Inversor", 50, 5, 5, 50, now, now),
+            ],
+        )
+        conn.execute(
+            """
+            INSERT INTO plant_availability_daily (
+                asset_id, provider, availability_date, valid_slots, weighted_availability_pct,
+                inverter_count, created_at, updated_at
+            ) VALUES (?, 'FusionSolar', ?, 10, 92, 2, ?, ?)
+            """,
+            (asset_ok, target_date.isoformat(), now, now),
+        )
+        conn.executemany(
+            """
+            INSERT INTO inverter_power_samples (
+                asset_id, provider, external_station_id, inverter_id, inverter_name,
+                sample_time, active_power_kw, created_at
+            ) VALUES (?, 'FusionSolar', ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (asset_ok, "S1", "OK-1", "OK Inversor 1", f"{target_date}T12:00:00", 10, now),
+                (asset_ok, "S1", "OK-2", "OK Inversor 2", f"{target_date}T12:00:00", 0, now),
+                (asset_partial, "S2", "P-1", "Parcial Inversor", f"{target_date}T12:00:00", 5, now),
+            ],
+        )
+        conn.commit()
+
+        report = app_module.get_daily_wat_report_data(conn, target_date)
+    finally:
+        conn.close()
+
+    assert report["target_date"] == "2026-06-14"
+    plants = {row["project_name"]: row for row in report["plants"]}
+    assert plants["Central OK"] == {
+        "asset_id": asset_ok,
+        "project_name": "Central OK",
+        "weighted_wat_pct": 92.0,
+        "inverter_count": 2,
+        "inverters_below_90_count": 1,
+        "worst_inverter": "OK Inversor 2",
+        "worst_inverter_id": "OK-2",
+        "worst_inverter_wat_pct": 80.0,
+        "valid_slots": 20,
+        "unavailable_slots": 2,
+        "data_status": "ok",
+    }
+    assert plants["Central Parcial"]["data_status"] == "parcial"
+    assert plants["Central Parcial"]["weighted_wat_pct"] == 50.0
+    assert plants["Central Sem Dados"]["data_status"] == "sem dados"
+    assert plants["Central Sem Dados"]["inverter_count"] == 1
+
+
+def test_monthly_wat_report_data_aggregates_range_and_filters_asset(tmp_path) -> None:
+    db_path = tmp_path / "monthly-wat-report.db"
+    app_module.ensure_database(str(db_path))
+    conn = get_db(str(db_path))
+    from_date = date(2026, 6, 13)
+    to_date = date(2026, 6, 14)
+    now = datetime.now().isoformat(timespec="seconds")
+    try:
+        asset_id = conn.execute("INSERT INTO assets (project_name) VALUES ('Central Mensal')").lastrowid
+        other_asset_id = conn.execute("INSERT INTO assets (project_name) VALUES ('Outra Central')").lastrowid
+        conn.executemany(
+            """
+            INSERT INTO provider_devices (
+                asset_id, provider, station_code, external_device_id, device_name, dev_type_id,
+                rated_power_kw, enabled, created_at, updated_at
+            ) VALUES (?, 'FusionSolar', ?, ?, ?, 1, ?, 1, ?, ?)
+            """,
+            [
+                (asset_id, "S1", "M-1", "Mensal 1", 75, now, now),
+                (asset_id, "S1", "M-2", "Mensal 2", 25, now, now),
+                (other_asset_id, "S2", "O-1", "Outro 1", 50, now, now),
+            ],
+        )
+        for current_date in (from_date, to_date):
+            conn.executemany(
+                """
+                INSERT INTO inverter_availability_daily (
+                    asset_id, provider, availability_date, inverter_id, inverter_name, inverter_power_kw,
+                    valid_slots, available_slots, unavailable_slots, availability_pct, created_at, updated_at
+                ) VALUES (?, 'FusionSolar', ?, ?, ?, ?, 10, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (asset_id, current_date.isoformat(), "M-1", "Mensal 1", 75, 9, 1, 90, now, now),
+                    (asset_id, current_date.isoformat(), "M-2", "Mensal 2", 25, 8, 2, 80, now, now),
+                ],
+            )
+            conn.execute(
+                """
+                INSERT INTO plant_availability_daily (
+                    asset_id, provider, availability_date, valid_slots, weighted_availability_pct,
+                    inverter_count, created_at, updated_at
+                ) VALUES (?, 'FusionSolar', ?, 10, 87.5, 2, ?, ?)
+                """,
+                (asset_id, current_date.isoformat(), now, now),
+            )
+            conn.executemany(
+                """
+                INSERT INTO inverter_power_samples (
+                    asset_id, provider, external_station_id, inverter_id, inverter_name,
+                    sample_time, active_power_kw, created_at
+                ) VALUES (?, 'FusionSolar', 'S1', ?, ?, ?, ?, ?)
+                """,
+                [
+                    (asset_id, "M-1", "Mensal 1", f"{current_date}T12:00:00", 10, now),
+                    (asset_id, "M-2", "Mensal 2", f"{current_date}T12:00:00", 5, now),
+                ],
+            )
+        conn.commit()
+
+        report = app_module.get_monthly_wat_report_data(conn, from_date, to_date, asset_id=asset_id)
+    finally:
+        conn.close()
+
+    assert report["from_date"] == "2026-06-13"
+    assert report["to_date"] == "2026-06-14"
+    assert len(report["plants"]) == 1
+    plant = report["plants"][0]
+    assert plant["asset_id"] == asset_id
+    assert plant["weighted_wat_pct"] == 87.5
+    assert plant["inverter_count"] == 2
+    assert plant["inverters_below_90_count"] == 1
+    assert plant["worst_inverter"] == "Mensal 2"
+    assert plant["worst_inverter_wat_pct"] == 80.0
+    assert plant["valid_slots"] == 40
+    assert plant["unavailable_slots"] == 6
+    assert plant["data_status"] == "ok"
 
 
 def test_performance_page_renders_time_availability_and_empty_state(tmp_path) -> None:
