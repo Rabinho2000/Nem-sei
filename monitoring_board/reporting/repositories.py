@@ -177,6 +177,56 @@ def get_monthly_production_record(conn: sqlite3.Connection, asset_id: int | None
     ).fetchone()
 
 
+def list_monthly_production_records(
+    conn: sqlite3.Connection,
+    *,
+    asset_id: int | None,
+    start: date,
+    end: date,
+) -> list[sqlite3.Row]:
+    if asset_id is None:
+        return []
+    return query_all(
+        conn,
+        """
+        SELECT *
+        FROM production_records
+        WHERE asset_id = ?
+          AND provider = 'FusionSolar'
+          AND period_type = 'month'
+          AND period_date BETWEEN ? AND ?
+          AND production_kwh IS NOT NULL
+        ORDER BY period_date
+        """,
+        (asset_id, start.isoformat(), end.isoformat()),
+    )
+
+
+def list_daily_production_records(
+    conn: sqlite3.Connection,
+    *,
+    asset_id: int | None,
+    start: date,
+    end: date,
+) -> list[sqlite3.Row]:
+    if asset_id is None:
+        return []
+    return query_all(
+        conn,
+        """
+        SELECT *
+        FROM production_records
+        WHERE asset_id = ?
+          AND provider = 'FusionSolar'
+          AND period_type = 'day'
+          AND period_date BETWEEN ? AND ?
+          AND production_kwh IS NOT NULL
+        ORDER BY period_date
+        """,
+        (asset_id, start.isoformat(), end.isoformat()),
+    )
+
+
 def get_latest_helioscope_expected(conn: sqlite3.Connection, asset_id: int | None, month: int) -> sqlite3.Row | None:
     if asset_id is None:
         return None

@@ -20,7 +20,7 @@ from monitoring_board.reporting.billing import (
     detect_report_type_value,
     infer_self_use_kwh,
 )
-from monitoring_board.reporting.models import BillingConfig, EnergyBreakdown, ReportType
+from monitoring_board.reporting.models import BillingConfig, BillingEnergyBase, BillingMode, EnergyBreakdown, ReportType
 
 
 LOGGER = logging.getLogger(__name__)
@@ -133,10 +133,14 @@ def prepare_customer_report(
     if production_decimal and not self_use_decimal and export_decimal < production_decimal:
         self_use_decimal = production_decimal - export_decimal
     consumption_decimal = decimal_from_value(report.get("consumption_kwh"))
+    months_count = int(report.get("months_count") or report.get("month_count") or months_count or 1)
     fallback_solcor_price = decimal_from_value(solcor_price_per_kwh)
     config = billing_config or BillingConfig(
         report_type=ReportType(prepared["report_type"]),
+        billing_mode=BillingMode(str(report.get("billing_mode") or BillingMode.ENERGY.value)),
+        billing_energy_base=BillingEnergyBase(str(report.get("billing_energy_base") or BillingEnergyBase.SELF_CONSUMPTION.value)),
         solcor_price_per_kwh=fallback_solcor_price,
+        fixed_monthly_fee_eur=decimal_from_value(report.get("fixed_monthly_fee_eur")),
         electricity_price_eur_kwh=decimal_from_value(report.get("electricity_price")),
         export_price_eur_kwh=decimal_from_value(report.get("sell_price")),
     )
@@ -162,6 +166,15 @@ def prepare_customer_report(
     )
 
     prepared.update(
+        period_type=str(report.get("period_type") or "monthly"),
+        period_start=report.get("period_start") or report.get("month_start"),
+        period_end=report.get("period_end") or report.get("month_end"),
+        period_label=report.get("period_label") or report.get("month_label"),
+        included_months=list(report.get("included_months") or []),
+        months_with_data=list(report.get("months_with_data") or []),
+        missing_months=list(report.get("missing_months") or []),
+        coverage_pct=_number(report.get("coverage_pct")),
+        chart_granularity=str(report.get("chart_granularity") or "daily"),
         production_kwh=decimal_to_float(production_decimal),
         self_use_kwh=decimal_to_float(self_use_decimal),
         export_kwh=decimal_to_float(export_decimal),
@@ -202,6 +215,9 @@ def prepare_customer_report(
         ("Vazio", _number(report.get("self_use_vazio_kwh")), MID_GRAY),
         ("Super vazio", _number(report.get("self_use_super_vazio_kwh")), GREEN),
     ]
+    prepared["month_label"] = prepared["period_label"]
+    prepared["month_start"] = prepared["period_start"]
+    prepared["month_end"] = prepared["period_end"]
     return prepared
 
 
@@ -308,7 +324,9 @@ def draw_report_header(pdf: canvas.Canvas, report: dict[str, Any], logo_path: Pa
     _scaled_text(pdf, str(report["asset"].get("project_name") or "Instalacao"), x, page_height - 31, 430, size=22)
     pdf.setFont("Helvetica", 10)
     pdf.setFillColor(NAVY)
-    pdf.drawString(x, page_height - 47, "Relatório Mensal - Energia Solar")
+    months_count = int(report.get("months_count") or 1)
+    title = "Relatório Mensal - Energia Solar" if months_count == 1 else f"Relatório {report.get('period_label')} - Energia Solar"
+    pdf.drawString(x, page_height - 47, title)
     pdf.setFont("Helvetica-Bold", 9)
     pdf.drawString(x, page_height - 62, str(report.get("month_label") or ""))
     config = REPORT_TYPES[report["report_type"]]
@@ -396,11 +414,62 @@ def draw_daily_chart(pdf: canvas.Canvas, report: dict[str, Any], x: float, y: fl
         legend_x += 112
 
 
+def draw_monthly_chart(pdf: canvas.Canvas, report: dict[str, Any], x: float, y: float, width: float, height: float) -> None:
+    _card(pdf, x, y, width, height)
+    pdf.setFillColor(NAVY)
+    pdf.setFont("Helvetica-Bold", 9)
+    pdf.drawString(x + 12, y + height - 17, "Produção Mensal de Eletricidade (kWh)")
+    plot_x, plot_y = x + 36, y + 28
+    plot_w, plot_h = width - 52, height - 55
+    rows = report.get("monthly_rows") or []
+    max_value = max([_number(row.get("consumption_kwh")) for row in rows] + [_number(row.get("production_kwh")) for row in rows] + [1])
+    pdf.setStrokeColor(MID_GRAY)
+    for step in range(5):
+        line_y = plot_y + plot_h * step / 4
+        pdf.line(plot_x, line_y, plot_x + plot_w, line_y)
+        pdf.setFillColor(TEXT_GRAY)
+        pdf.setFont("Helvetica", 5.5)
+        pdf.drawRightString(plot_x - 4, line_y - 2, f"{max_value * step / 4:.0f}")
+    if not rows:
+        pdf.setFillColor(TEXT_GRAY)
+        pdf.setFont("Helvetica", 8)
+        pdf.drawCentredString(plot_x + plot_w / 2, plot_y + plot_h / 2, "Sem dados suficientes")
+        return
+    gap = 8
+    bar_w = max((plot_w - gap * (len(rows) - 1)) / len(rows), 10)
+    for index, row in enumerate(rows):
+        self_use = _number(row.get("self_use_kwh"))
+        export = _number(row.get("export_kwh"))
+        consumption = _number(row.get("consumption_kwh"))
+        x_bar = plot_x + index * (bar_w + gap)
+        if consumption:
+            pdf.setFillColor(MID_GRAY)
+            pdf.rect(x_bar, plot_y, bar_w, plot_h * consumption / max_value, fill=1, stroke=0)
+        pdf.setFillColor(ORANGE)
+        self_h = plot_h * self_use / max_value
+        pdf.rect(x_bar, plot_y, bar_w, self_h, fill=1, stroke=0)
+        if export:
+            pdf.setFillColor(NAVY)
+            pdf.rect(x_bar, plot_y + self_h, bar_w, plot_h * export / max_value, fill=1, stroke=0)
+        pdf.setFillColor(TEXT_GRAY)
+        pdf.setFont("Helvetica", 5.5)
+        pdf.drawCentredString(x_bar + bar_w / 2, plot_y - 9, str(row.get("label") or ""))
+    legend = ((MID_GRAY, "Consumo da empresa"), (ORANGE, "Solar autoconsumida"), (NAVY, "Solar excedente"))
+    legend_x = x + 150
+    for color, label in legend:
+        pdf.setFillColor(color)
+        pdf.rect(legend_x, y + 8, 6, 6, fill=1, stroke=0)
+        pdf.setFillColor(NAVY)
+        pdf.setFont("Helvetica", 6)
+        pdf.drawString(legend_x + 9, y + 8, label)
+        legend_x += 112
+
+
 def draw_highlights(pdf: canvas.Canvas, report: dict[str, Any], x: float, y: float, width: float, height: float) -> None:
     _card(pdf, x, y, width, height, fill=LIGHT_GRAY)
     pdf.setFillColor(NAVY)
     pdf.setFont("Helvetica-Bold", 9)
-    pdf.drawString(x + 12, y + height - 17, "Destaques do Mes")
+    pdf.drawString(x + 12, y + height - 17, "Destaques do Periodo")
     items = (
         ("Poupança na Fatura", format_eur(report["savings_eur"]), LIGHT_GREEN, "money"),
         ("Receita de Excedente", format_eur(report["export_revenue_eur"]), LIGHT_GREEN, "wallet"),
@@ -424,7 +493,7 @@ def draw_monthly_summary(pdf: canvas.Canvas, report: dict[str, Any], x: float, y
     _card(pdf, x, y, width, height)
     pdf.setFillColor(NAVY)
     pdf.setFont("Helvetica-Bold", 9)
-    pdf.drawString(x + 12, y + height - 16, "Resumo Mensal")
+    pdf.drawString(x + 12, y + height - 16, "Resumo do Periodo")
     rows = REPORT_TYPES[report["report_type"]]["summary"]
     row_h = (height - 22) / len(rows)
     for index, (label, key, kind) in enumerate(rows):
@@ -533,7 +602,10 @@ def build_customer_report_pdf(report: dict[str, Any], *, logo_path: Path | None 
     page_width, page_height = landscape(A4)
     draw_report_header(pdf, report, logo_path, page_width, page_height)
     draw_kpi_cards(pdf, report, page_width, page_height)
-    draw_daily_chart(pdf, report, 20, 236, 604, 216)
+    if report.get("chart_granularity") == "monthly":
+        draw_monthly_chart(pdf, report, 20, 236, 604, 216)
+    else:
+        draw_daily_chart(pdf, report, 20, 236, 604, 216)
     draw_highlights(pdf, report, 632, 236, page_width - 652, 216)
     draw_monthly_summary(pdf, report, 20, 146, 604, 82)
     draw_donut_charts(pdf, report, 20, 26, page_width - 40, 112)

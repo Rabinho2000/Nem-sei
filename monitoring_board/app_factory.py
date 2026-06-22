@@ -75,12 +75,21 @@ from monitoring_board.reporting.availability import (
     inverter_availability_slot as reporting_inverter_availability_slot,
     is_inverter_available as reporting_is_inverter_available,
 )
-from monitoring_board.reporting.models import BillingConfig, ReportType
+from monitoring_board.reporting.models import BillingConfig, ReportPeriodType, ReportType, ReportingPeriod
+from monitoring_board.reporting.periods import (
+    ReportingPeriodError,
+    month_bounds,
+    monthly_period,
+    normalize_report_month as reporting_normalize_report_month,
+    period_from_form,
+)
 from monitoring_board.reporting.repositories import (
     billing_config_to_form_values,
     ensure_billing_config_schema,
     get_asset_billing_config,
     get_asset_billing_config_row,
+    list_daily_production_records,
+    list_monthly_production_records,
     upsert_asset_billing_config,
 )
 from monitoring_board.reporting.validation import (
@@ -2402,9 +2411,36 @@ def create_app() -> Flask:
 
     @app.route("/exports", methods=["GET", "POST"])
     def exports() -> str:
+        def period_redirect_params(period: ReportingPeriod) -> dict[str, str]:
+            params = {
+                "report_month": period.start.strftime("%Y-%m"),
+                "period_type": period.period_type.value,
+                "report_year": str(period.start.year),
+            }
+            if period.period_type == ReportPeriodType.QUARTERLY:
+                params["report_quarter"] = str(((period.start.month - 1) // 3) + 1)
+            if period.period_type == ReportPeriodType.SEMIANNUAL:
+                params["report_semester"] = "1" if period.start.month == 1 else "2"
+            return params
+
         if request.method == "POST":
             asset_id_raw = request.form.get("asset_id", "").strip()
-            report_month = normalize_report_month(request.form.get("report_month", ""))
+            try:
+                report_period = period_from_form(request.form)
+            except ReportingPeriodError as exc:
+                flash(str(exc), "error")
+                redirect_values = request.form.to_dict(flat=True)
+                if asset_id_raw:
+                    redirect_values["asset_id"] = asset_id_raw
+                return redirect(url_for("exports", **redirect_values))
+            if report_period.start > date.today():
+                flash("Periodo futuro sem dados disponiveis.", "error")
+                redirect_values = request.form.to_dict(flat=True)
+                if asset_id_raw:
+                    redirect_values["asset_id"] = asset_id_raw
+                return redirect(url_for("exports", **redirect_values))
+
+            report_month = report_period.start.strftime("%Y-%m")
             force_api = request.form.get("force_api") == "on"
             report_assets = get_fusionsolar_report_assets(g.db)
             try:
@@ -2420,16 +2456,19 @@ def create_app() -> Flask:
                 )
             except BillingValidationError as exc:
                 flash(str(exc), "error")
-                return redirect(url_for("exports", report_month=report_month))
+                redirect_values = period_redirect_params(report_period)
+                if asset_id_raw:
+                    redirect_values["asset_id"] = asset_id_raw
+                return redirect(url_for("exports", **redirect_values))
             asset_id = selection.asset_id
             if action == "save_billing_config":
                 if manual_config is None:
                     flash("Configuracao de cobranca invalida.", "error")
-                    return redirect(url_for("exports", asset_id=asset_id, report_month=report_month))
+                    return redirect(url_for("exports", asset_id=asset_id, **period_redirect_params(report_period)))
                 upsert_asset_billing_config(g.db, asset_id=asset_id, config=manual_config)
                 g.db.commit()
                 flash("Configuracao de cobranca guardada.", "success")
-                return redirect(url_for("exports", asset_id=asset_id, report_month=report_month))
+                return redirect(url_for("exports", asset_id=asset_id, **period_redirect_params(report_period)))
             billing_config = (
                 get_asset_billing_config(g.db, asset_id, selection.report_type)
                 if source == "saved"
@@ -2437,7 +2476,7 @@ def create_app() -> Flask:
             )
             if billing_config is None:
                 flash("Configuracao de cobranca invalida.", "error")
-                return redirect(url_for("exports", asset_id=asset_id, report_month=report_month))
+                return redirect(url_for("exports", asset_id=asset_id, **period_redirect_params(report_period)))
             try:
                 report = build_fusionsolar_customer_production_report(
                     g.db,
@@ -2448,29 +2487,55 @@ def create_app() -> Flask:
                     solcor_price_per_kwh=float(billing_config.solcor_price_per_kwh),
                     billing_config=billing_config,
                     force_api=force_api,
+                    period=report_period,
                 )
                 return export_customer_production_pdf(report)
             except Exception as exc:
+                redirect_params = {
+                    "asset_id": str(asset_id),
+                    "electricity_price": str(billing_config.electricity_price_eur_kwh),
+                    "sell_price": str(billing_config.export_price_eur_kwh),
+                    "solcor_price_per_kwh": str(billing_config.solcor_price_per_kwh),
+                    "fixed_monthly_fee_eur": str(billing_config.fixed_monthly_fee_eur),
+                    "billing_mode": billing_config.billing_mode.value,
+                    "billing_energy_base": billing_config.billing_energy_base.value,
+                    **period_redirect_params(report_period),
+                }
                 if is_fusionsolar_rate_limit_error(exc):
                     flash(mark_fusionsolar_performance_rate_limited(g.db), "warning")
                     g.db.commit()
-                    return redirect(url_for("exports", asset_id=asset_id_raw, report_month=report_month))
+                    return redirect(url_for("exports", **redirect_params))
                 if "FusionSolar API temporariamente limitada" in str(exc):
                     flash(str(exc), "warning")
-                    return redirect(url_for("exports", asset_id=asset_id_raw, report_month=report_month))
+                    return redirect(url_for("exports", **redirect_params))
                 current_app.logger.exception("Falha ao gerar relatorio de producao")
                 flash(f"Falha ao gerar relatorio de producao: {exc}", "error")
-                return redirect(url_for("exports", asset_id=asset_id_raw, report_month=report_month))
+                return redirect(url_for("exports", **redirect_params))
 
         selected_asset_id = request.args.get("asset_id", "").strip()
-        report_month = normalize_report_month(request.args.get("report_month", ""))
+        period_type = request.args.get("period_type") or request.args.get("report_period_type") or ReportPeriodType.MONTHLY.value
+        raw_report_month = request.args.get("report_month", "")
+        report_month = reporting_normalize_report_month(raw_report_month)
+        try:
+            report_period = period_from_form(
+                {
+                    "period_type": period_type,
+                    "report_month": report_month,
+                    "report_year": request.args.get("report_year") or report_month[:4],
+                    "report_quarter": request.args.get("report_quarter") or "1",
+                    "report_semester": request.args.get("report_semester") or "1",
+                }
+            )
+        except ReportingPeriodError as exc:
+            flash(str(exc), "error")
+            report_period = monthly_period(report_month) if period_type == ReportPeriodType.MONTHLY.value and raw_report_month else monthly_period(date.today().strftime("%Y-%m"))
         report_assets = get_fusionsolar_report_assets(g.db)
         if selected_asset_id:
             try:
                 validate_report_asset_selection(report_assets, selected_asset_id)
             except BillingValidationError as exc:
                 flash(str(exc), "error")
-                return redirect(url_for("exports", report_month=report_month))
+                return redirect(url_for("exports", **period_redirect_params(report_period)))
         selected_report_type = next(
             (
                 asset["report_type"]
@@ -2496,7 +2561,11 @@ def create_app() -> Flask:
             report_assets=report_assets,
             selected_asset_id=selected_asset_id,
             selected_report_type=selected_report_type,
-            report_month=report_month,
+            period_type=report_period.period_type.value,
+            report_month=report_period.start.strftime("%Y-%m"),
+            report_year=str(report_period.start.year),
+            report_quarter=str(((report_period.start.month - 1) // 3) + 1),
+            report_semester="1" if report_period.start.month == 1 else "2",
             electricity_price=request.args.get("electricity_price", billing_form["electricity_price"]),
             sell_price=request.args.get("sell_price", billing_form["sell_price"]),
             solcor_price_per_kwh=request.args.get("solcor_price_per_kwh", billing_form["solcor_price_per_kwh"]),
@@ -7122,16 +7191,7 @@ def normalize_customer_production_record(row: sqlite3.Row, fallback_date: date) 
     return normalized
 
 
-def build_local_customer_production_report(
-    conn: sqlite3.Connection,
-    *,
-    asset_id: int,
-    report_month: str,
-    electricity_price: float,
-    sell_price: float,
-    solcor_price_per_kwh: float = 0.0,
-    billing_config: BillingConfig | None = None,
-) -> dict[str, Any] | None:
+def _get_fusionsolar_report_asset(conn: sqlite3.Connection, asset_id: int) -> sqlite3.Row:
     asset = conn.execute(
         """
         SELECT
@@ -7157,70 +7217,188 @@ def build_local_customer_production_report(
     ).fetchone()
     if asset is None:
         raise ValueError("A instalacao nao tem mapeamento FusionSolar ativo.")
+    return asset
 
-    month_start = datetime.strptime(report_month, "%Y-%m").date()
-    _, last_day = calendar.monthrange(month_start.year, month_start.month)
-    month_end = month_start.replace(day=last_day)
-    daily_records = query_all(
-        conn,
-        """
-        SELECT *
-        FROM production_records
-        WHERE asset_id = ?
-          AND provider = ?
-          AND period_type = 'day'
-          AND period_date BETWEEN ? AND ?
-          AND production_kwh IS NOT NULL
-        ORDER BY period_date
-        """,
-        (asset_id, INTEGRATION_PROVIDER_FUSIONSOLAR, month_start.isoformat(), month_end.isoformat()),
-    )
-    monthly_record = conn.execute(
-        """
-        SELECT *
-        FROM production_records
-        WHERE asset_id = ?
-          AND provider = ?
-          AND period_type = 'month'
-          AND period_date = ?
-          AND production_kwh IS NOT NULL
-        LIMIT 1
-        """,
-        (asset_id, INTEGRATION_PROVIDER_FUSIONSOLAR, month_start.isoformat()),
-    ).fetchone()
-    if monthly_record is None and not daily_records:
-        return None
 
-    daily_rows = [normalize_customer_production_record(row, month_start) for row in daily_records]
-    daily_rows.sort(key=lambda item: item["date"])
-    monthly = normalize_customer_production_record(monthly_record, month_start) if monthly_record else None
+def _resolve_customer_reporting_period(report_month: str, period: ReportingPeriod | None) -> ReportingPeriod:
+    return period or monthly_period(report_month)
 
-    production_kwh = monthly["production_kwh"] if monthly else sum(item["production_kwh"] for item in daily_rows)
-    self_use_kwh = monthly["self_use_kwh"] if monthly else sum(item["self_use_kwh"] for item in daily_rows)
-    export_kwh = monthly["export_kwh"] if monthly else sum(item["export_kwh"] for item in daily_rows)
+
+def _month_key(value: date) -> date:
+    return value.replace(day=1)
+
+
+def _empty_month_row(month_start: date) -> dict[str, Any]:
+    return {
+        "date": month_start,
+        "label": f"{month_start.month:02d}/{str(month_start.year)[2:]}",
+        "production_kwh": 0.0,
+        "self_use_kwh": 0.0,
+        "export_kwh": 0.0,
+        "consumption_kwh": 0.0,
+        "source": "Sem dados",
+    }
+
+
+def _aggregate_customer_rows_for_period(
+    period: ReportingPeriod,
+    monthly_rows: list[dict[str, Any]],
+    daily_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    monthly_by_month = {_month_key(row["date"]): row for row in monthly_rows}
+    daily_by_month: dict[date, list[dict[str, Any]]] = {}
+    for row in daily_rows:
+        daily_by_month.setdefault(_month_key(row["date"]), []).append(row)
+
+    selected_month_rows: list[dict[str, Any]] = []
+    months_with_data: list[str] = []
+    missing_months: list[str] = []
+    report_notes: list[str] = []
+    tariff_totals = {
+        "self_use_cheia_kwh": 0.0,
+        "self_use_ponta_kwh": 0.0,
+        "self_use_vazio_kwh": 0.0,
+        "self_use_super_vazio_kwh": 0.0,
+    }
+
+    for month_start in period.included_months:
+        if month_start in monthly_by_month:
+            row = dict(monthly_by_month[month_start])
+            row["source"] = "Mensal local"
+            selected_month_rows.append(row)
+            months_with_data.append(month_start.strftime("%Y-%m"))
+            for key in tariff_totals:
+                tariff_totals[key] += float(row.get(key) or 0.0)
+            continue
+
+        month_daily = daily_by_month.get(month_start, [])
+        if month_daily:
+            row = _empty_month_row(month_start)
+            row.update(
+                production_kwh=sum(item["production_kwh"] for item in month_daily),
+                self_use_kwh=sum(item["self_use_kwh"] for item in month_daily),
+                export_kwh=sum(item["export_kwh"] for item in month_daily),
+                consumption_kwh=sum((item.get("consumption_kwh") or 0.0) for item in month_daily),
+                source="Diario local",
+            )
+            selected_month_rows.append(row)
+            months_with_data.append(month_start.strftime("%Y-%m"))
+            expected_days = month_bounds(month_start.strftime("%Y-%m"))[1].day
+            if len({item["date"] for item in month_daily}) < expected_days:
+                report_notes.append(f"{month_start:%Y-%m}: dados diarios incompletos.")
+            continue
+
+        selected_month_rows.append(_empty_month_row(month_start))
+        missing_months.append(month_start.strftime("%Y-%m"))
+
+    production_kwh = sum(item["production_kwh"] for item in selected_month_rows)
+    self_use_kwh = sum(item["self_use_kwh"] for item in selected_month_rows)
+    export_kwh = sum(item["export_kwh"] for item in selected_month_rows)
     if production_kwh and not self_use_kwh and not export_kwh:
         self_use_kwh = production_kwh
-    consumption_kwh = (
-        monthly["consumption_kwh"]
-        if monthly and monthly.get("consumption_kwh") is not None
-        else sum((item.get("consumption_kwh") or 0.0) for item in daily_rows)
-    )
-    report = {
-        "asset": dict(asset),
-        "station_code": str(asset["external_id"]),
-        "month_start": month_start,
-        "month_end": month_end,
-        "month_label": f"{MONTH_NAMES_PT[month_start.month]} {month_start.year}",
-        "daily_rows": daily_rows,
+        for row in selected_month_rows:
+            if row["production_kwh"] and not row["self_use_kwh"] and not row["export_kwh"]:
+                row["self_use_kwh"] = row["production_kwh"]
+    consumption_kwh = sum((item.get("consumption_kwh") or 0.0) for item in selected_month_rows)
+    coverage_pct = round(len(months_with_data) / period.month_count * 100, 2) if period.month_count else 0.0
+    if missing_months:
+        report_notes.append("Meses sem dados: " + ", ".join(missing_months) + ".")
+
+    return {
+        "monthly_rows": selected_month_rows,
         "production_kwh": production_kwh,
         "self_use_kwh": self_use_kwh,
         "export_kwh": export_kwh,
         "consumption_kwh": consumption_kwh,
+        "months_with_data": months_with_data,
+        "missing_months": missing_months,
+        "coverage_pct": coverage_pct,
+        "report_notes": report_notes,
+        **tariff_totals,
+    }
+
+
+def _report_payload_for_period(
+    *,
+    asset: sqlite3.Row,
+    period: ReportingPeriod,
+    station_code: str,
+    daily_rows: list[dict[str, Any]],
+    aggregate: dict[str, Any],
+    electricity_price: float,
+    sell_price: float,
+    data_source: str,
+) -> dict[str, Any]:
+    return {
+        "asset": dict(asset),
+        "station_code": station_code,
+        "month_start": period.start,
+        "month_end": period.end,
+        "month_label": period.label,
+        "period_type": period.period_type.value,
+        "period_start": period.start,
+        "period_end": period.end,
+        "period_label": period.label,
+        "months_count": period.month_count,
+        "included_months": [month.strftime("%Y-%m") for month in period.included_months],
+        "months_with_data": aggregate["months_with_data"],
+        "missing_months": aggregate["missing_months"],
+        "coverage_pct": aggregate["coverage_pct"],
+        "daily_rows": daily_rows,
+        "monthly_rows": aggregate["monthly_rows"],
+        "chart_granularity": "daily" if period.period_type == ReportPeriodType.MONTHLY else "monthly",
+        "production_kwh": aggregate["production_kwh"],
+        "self_use_kwh": aggregate["self_use_kwh"],
+        "export_kwh": aggregate["export_kwh"],
+        "consumption_kwh": aggregate["consumption_kwh"],
         "electricity_price": electricity_price,
         "sell_price": sell_price,
-        "data_source": "Dados locais",
+        "data_source": data_source,
+        "report_notes": aggregate["report_notes"],
+        "self_use_cheia_kwh": aggregate["self_use_cheia_kwh"],
+        "self_use_ponta_kwh": aggregate["self_use_ponta_kwh"],
+        "self_use_vazio_kwh": aggregate["self_use_vazio_kwh"],
+        "self_use_super_vazio_kwh": aggregate["self_use_super_vazio_kwh"],
     }
-    report.update(extract_customer_tariff_values(parse_production_record_payload(monthly_record) if monthly_record else None))
+
+
+def build_local_customer_production_report(
+    conn: sqlite3.Connection,
+    *,
+    asset_id: int,
+    report_month: str,
+    electricity_price: float,
+    sell_price: float,
+    solcor_price_per_kwh: float = 0.0,
+    billing_config: BillingConfig | None = None,
+    period: ReportingPeriod | None = None,
+) -> dict[str, Any] | None:
+    period = _resolve_customer_reporting_period(report_month, period)
+    asset = _get_fusionsolar_report_asset(conn, asset_id)
+    daily_records = list_daily_production_records(conn, asset_id=asset_id, start=period.start, end=period.end)
+    monthly_records = list_monthly_production_records(conn, asset_id=asset_id, start=period.start, end=period.end)
+    if not monthly_records and not daily_records:
+        return None
+
+    daily_rows = [normalize_customer_production_record(row, parse_date_value(row["period_date"]) or period.start) for row in daily_records]
+    daily_rows.sort(key=lambda item: item["date"])
+    monthly_rows = []
+    for row in monthly_records:
+        fallback_date = parse_date_value(row["period_date"]) or period.start
+        normalized = normalize_customer_production_record(row, fallback_date)
+        normalized.update(extract_customer_tariff_values(parse_production_record_payload(row)))
+        monthly_rows.append(normalized)
+    aggregate = _aggregate_customer_rows_for_period(period, monthly_rows, daily_rows)
+    report = _report_payload_for_period(
+        asset=asset,
+        period=period,
+        station_code=str(asset["external_id"]),
+        daily_rows=daily_rows,
+        aggregate=aggregate,
+        electricity_price=electricity_price,
+        sell_price=sell_price,
+        data_source="Dados locais",
+    )
     return prepare_customer_report(
         report,
         solcor_price_per_kwh=solcor_price_per_kwh,
@@ -7238,7 +7416,9 @@ def build_fusionsolar_customer_production_report(
     solcor_price_per_kwh: float = 0.0,
     billing_config: BillingConfig | None = None,
     force_api: bool = False,
+    period: ReportingPeriod | None = None,
 ) -> dict[str, Any]:
+    period = _resolve_customer_reporting_period(report_month, period)
     if not force_api:
         local_report = build_local_customer_production_report(
             conn,
@@ -7248,102 +7428,86 @@ def build_fusionsolar_customer_production_report(
             sell_price=sell_price,
             solcor_price_per_kwh=solcor_price_per_kwh,
             billing_config=billing_config,
+            period=period,
         )
-        if local_report is not None:
+        if local_report is not None and not local_report.get("missing_months"):
             return local_report
 
     cooldown_reason = get_fusionsolar_performance_cooldown_reason(conn)
     if cooldown_reason:
         raise ValueError(cooldown_reason)
 
-    asset = conn.execute(
-        """
-        SELECT
-            a.id AS asset_id,
-            a.project_name,
-            a.location,
-            a.kwp,
-            a.contract_type,
-            a.asset_type,
-            a.coverage_type,
-            a.sell_to,
-            ai.external_id,
-            ai.external_name
-        FROM asset_integrations ai
-        JOIN assets a ON a.id = ai.asset_id
-        WHERE a.id = ?
-          AND ai.provider = ?
-          AND ai.enabled = 1
-          AND COALESCE(ai.external_id, '') != ''
-        LIMIT 1
-        """,
-        (asset_id, INTEGRATION_PROVIDER_FUSIONSOLAR),
-    ).fetchone()
-    if asset is None:
-        raise ValueError("A instalacao nao tem mapeamento FusionSolar ativo.")
-
+    asset = _get_fusionsolar_report_asset(conn, asset_id)
     config = get_integration_config(conn, INTEGRATION_PROVIDER_FUSIONSOLAR)
     if config is None or not config["enabled"]:
         raise ValueError("Configuracao FusionSolar ativa nao encontrada.")
     endpoints = get_fusionsolar_endpoint_config(config)
     session_obj, _ = get_fusionsolar_session(config)
-    month_start = datetime.strptime(report_month, "%Y-%m").date()
-    _, last_day = calendar.monthrange(month_start.year, month_start.month)
-    month_end = month_start.replace(day=last_day)
     station_code = str(asset["external_id"])
 
-    daily_rows_raw = fetch_fusionsolar_kpi_day_rows(
-        session_obj,
-        base_url=endpoints["base_url"],
-        endpoint=endpoints["day_kpi_endpoint"],
-        station_codes=[station_code],
-        collect_date=month_start,
-    )
-    daily_rows = []
-    for raw_row in daily_rows_raw:
-        if str(raw_row.get("stationCode") or raw_row.get("plantCode") or "").strip() != station_code:
+    daily_rows: list[dict[str, Any]] = []
+    monthly_rows: list[dict[str, Any]] = []
+    local_months_with_data: set[str] = set()
+    if not force_api:
+        local_daily_records = list_daily_production_records(conn, asset_id=asset_id, start=period.start, end=period.end)
+        local_monthly_records = list_monthly_production_records(conn, asset_id=asset_id, start=period.start, end=period.end)
+        local_daily_rows = [normalize_customer_production_record(row, parse_date_value(row["period_date"]) or period.start) for row in local_daily_records]
+        local_monthly_rows = []
+        for row in local_monthly_records:
+            fallback_date = parse_date_value(row["period_date"]) or period.start
+            normalized = normalize_customer_production_record(row, fallback_date)
+            normalized.update(extract_customer_tariff_values(parse_production_record_payload(row)))
+            local_monthly_rows.append(normalized)
+        local_aggregate = _aggregate_customer_rows_for_period(period, local_monthly_rows, local_daily_rows)
+        local_months_with_data = set(local_aggregate["months_with_data"])
+        daily_rows.extend(local_daily_rows)
+        monthly_rows.extend(local_monthly_rows)
+
+    for month_start in period.included_months:
+        if not force_api and month_start.strftime("%Y-%m") in local_months_with_data:
             continue
-        normalized = normalize_customer_kpi_row(raw_row, month_start)
-        if month_start <= normalized["date"] <= month_end:
-            daily_rows.append(normalized)
+        _, month_end = month_bounds(month_start.strftime("%Y-%m"))
+        daily_rows_raw = fetch_fusionsolar_kpi_day_rows(
+            session_obj,
+            base_url=endpoints["base_url"],
+            endpoint=endpoints["day_kpi_endpoint"],
+            station_codes=[station_code],
+            collect_date=month_start,
+        )
+        for raw_row in daily_rows_raw:
+            if str(raw_row.get("stationCode") or raw_row.get("plantCode") or "").strip() != station_code:
+                continue
+            normalized = normalize_customer_kpi_row(raw_row, month_start)
+            if month_start <= normalized["date"] <= month_end:
+                daily_rows.append(normalized)
+
+        monthly_map = fetch_fusionsolar_kpi_month_map(
+            session_obj,
+            base_url=endpoints["base_url"],
+            endpoint=endpoints["month_kpi_endpoint"],
+            station_codes=[station_code],
+            collect_date=month_start,
+        )
+        monthly_row = monthly_map.get(station_code)
+        if monthly_row:
+            normalized = normalize_customer_kpi_row(monthly_row, month_start)
+            normalized.update(extract_customer_tariff_values(monthly_row))
+            monthly_rows.append(normalized)
+
     daily_rows.sort(key=lambda item: item["date"])
-
-    monthly_map = fetch_fusionsolar_kpi_month_map(
-        session_obj,
-        base_url=endpoints["base_url"],
-        endpoint=endpoints["month_kpi_endpoint"],
-        station_codes=[station_code],
-        collect_date=month_start,
+    monthly_rows.sort(key=lambda item: item["date"])
+    aggregate = _aggregate_customer_rows_for_period(period, monthly_rows, daily_rows)
+    source = "FusionSolar API" if force_api or not local_months_with_data else "Dados locais + FusionSolar API"
+    report = _report_payload_for_period(
+        asset=asset,
+        period=period,
+        station_code=station_code,
+        daily_rows=daily_rows,
+        aggregate=aggregate,
+        electricity_price=electricity_price,
+        sell_price=sell_price,
+        data_source=source,
     )
-    monthly_row = monthly_map.get(station_code)
-    monthly = normalize_customer_kpi_row(monthly_row, month_start) if monthly_row else None
-
-    production_kwh = monthly["production_kwh"] if monthly else sum(item["production_kwh"] for item in daily_rows)
-    self_use_kwh = monthly["self_use_kwh"] if monthly else sum(item["self_use_kwh"] for item in daily_rows)
-    export_kwh = monthly["export_kwh"] if monthly else sum(item["export_kwh"] for item in daily_rows)
-    if production_kwh and not self_use_kwh and not export_kwh:
-        self_use_kwh = production_kwh
-    consumption_kwh = (
-        monthly["consumption_kwh"]
-        if monthly and monthly.get("consumption_kwh") is not None
-        else sum((item.get("consumption_kwh") or 0.0) for item in daily_rows)
-    )
-    report = {
-        "asset": dict(asset),
-        "station_code": station_code,
-        "month_start": month_start,
-        "month_end": month_end,
-        "month_label": f"{MONTH_NAMES_PT[month_start.month]} {month_start.year}",
-        "daily_rows": daily_rows,
-        "production_kwh": production_kwh,
-        "self_use_kwh": self_use_kwh,
-        "export_kwh": export_kwh,
-        "consumption_kwh": consumption_kwh,
-        "electricity_price": electricity_price,
-        "sell_price": sell_price,
-        "data_source": "FusionSolar API",
-    }
-    report.update(extract_customer_tariff_values(monthly_row))
     return prepare_customer_report(
         report,
         solcor_price_per_kwh=solcor_price_per_kwh,
@@ -7356,7 +7520,8 @@ def export_customer_production_pdf(report: dict[str, Any]):
     buffer = io.BytesIO(pdf_bytes)
     safe_name = normalize_name(report["asset"]["project_name"]).replace(" ", "_") or "relatorio"
     model = str(report.get("report_type") or "epc").upper()
-    filename = f"Relatorio_Mensal_{model}_{safe_name}_{report['month_start'].strftime('%m-%Y')}.pdf"
+    period_slug = str(report.get("period_label") or report["month_start"].strftime("%m-%Y")).replace(" ", "_").replace("/", "-")
+    filename = f"Relatorio_{model}_{safe_name}_{period_slug}.pdf"
     return send_file(buffer, as_attachment=True, download_name=filename, mimetype="application/pdf")
 
 

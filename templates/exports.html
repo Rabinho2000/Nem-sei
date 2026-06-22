@@ -4,8 +4,8 @@
 <section class="hero">
   <div>
     <p class="eyebrow">Relatorios</p>
-    <h2>Producao mensal</h2>
-    <p class="muted">Gera o PDF mensal de producao com dados locais quando existem, usando a FusionSolar como fallback.</p>
+    <h2>Producao por periodo</h2>
+    <p class="muted">Gera o PDF mensal, trimestral, semestral ou anual com dados locais quando existem, usando a FusionSolar como fallback.</p>
   </div>
   <div class="hero-actions">
     <a class="button secondary" href="{{ url_for('integrations') }}">Integracoes</a>
@@ -44,8 +44,33 @@
       </p>
 
       <div class="grid two">
-        <label>Mes do relatorio
-          <input type="month" name="report_month" value="{{ report_month }}" required>
+        <label>Tipo de periodo
+          <select name="period_type" id="period-type" required>
+            <option value="monthly" {{ 'selected' if period_type == 'monthly' else '' }}>Mensal</option>
+            <option value="quarterly" {{ 'selected' if period_type == 'quarterly' else '' }}>Trimestral</option>
+            <option value="semiannual" {{ 'selected' if period_type == 'semiannual' else '' }}>Semestral</option>
+            <option value="annual" {{ 'selected' if period_type == 'annual' else '' }}>Anual</option>
+          </select>
+        </label>
+        <label data-period-field="monthly">Mes do relatorio
+          <input type="month" name="report_month" value="{{ report_month }}">
+        </label>
+        <label data-period-field="quarterly semiannual annual">Ano
+          <input type="number" name="report_year" min="2000" max="2100" value="{{ report_year }}">
+        </label>
+        <label data-period-field="quarterly">Trimestre
+          <select name="report_quarter">
+            <option value="1" {{ 'selected' if report_quarter == '1' else '' }}>T1 - janeiro a marco</option>
+            <option value="2" {{ 'selected' if report_quarter == '2' else '' }}>T2 - abril a junho</option>
+            <option value="3" {{ 'selected' if report_quarter == '3' else '' }}>T3 - julho a setembro</option>
+            <option value="4" {{ 'selected' if report_quarter == '4' else '' }}>T4 - outubro a dezembro</option>
+          </select>
+        </label>
+        <label data-period-field="semiannual">Semestre
+          <select name="report_semester">
+            <option value="1" {{ 'selected' if report_semester == '1' else '' }}>S1 - janeiro a junho</option>
+            <option value="2" {{ 'selected' if report_semester == '2' else '' }}>S2 - julho a dezembro</option>
+          </select>
         </label>
         <label>Fonte dos valores
           <select name="billing_values_source">
@@ -101,20 +126,20 @@
       </div>
       <div class="list-row">
         <div>
-          <strong>KPIs diarios</strong>
-          <small>Producao diaria, autoconsumo e excedente para o grafico.</small>
+          <strong>KPIs do periodo</strong>
+          <small>Grafico diario no mensal; grafico mensal em trimestres, semestres e anos.</small>
         </div>
       </div>
       <div class="list-row">
         <div>
           <strong>KPI mensal</strong>
-          <small>Total mensal de producao, energia autoconsumida, excedente e consumo quando a API devolve esses campos.</small>
+          <small>Registos mensais tem prioridade; dados diarios preenchem apenas meses sem registo mensal.</small>
         </div>
       </div>
       <div class="list-row">
         <div>
           <strong>Calculos</strong>
-          <small>Os valores financeiros sao calculados no servico de billing e apresentados no PDF.</small>
+          <small>Os valores financeiros sao validados e calculados no servico de billing.</small>
         </div>
       </div>
     </div>
@@ -160,7 +185,8 @@
     const totalProductionField = document.getElementById("charge-total-production-field");
     const totalProductionCheckbox = totalProductionField.querySelector("input[type='checkbox']");
     const billingEnergyBase = document.getElementById("billing-energy-base");
-    const reportMonth = document.querySelector("input[name='report_month']");
+    const periodType = document.getElementById("period-type");
+    const periodFields = [...document.querySelectorAll("[data-period-field]")];
     const syncBillingEnergyBase = () => {
       billingEnergyBase.value = totalProductionCheckbox.checked ? "total_production" : "self_consumption";
     };
@@ -174,22 +200,38 @@
       totalProductionField.hidden = !isEsco || isFixed;
       syncBillingEnergyBase();
     };
+    const updatePeriodFields = () => {
+      const type = periodType.value;
+      periodFields.forEach((field) => {
+        field.hidden = !field.dataset.periodField.split(" ").includes(type);
+      });
+    };
+    const preservePeriodParams = (params) => {
+      params.set("period_type", periodType.value);
+      const reportMonth = document.querySelector("input[name='report_month']").value;
+      const reportYear = document.querySelector("input[name='report_year']").value;
+      const reportQuarter = document.querySelector("select[name='report_quarter']").value;
+      const reportSemester = document.querySelector("select[name='report_semester']").value;
+      if (reportMonth) params.set("report_month", reportMonth);
+      if (reportYear) params.set("report_year", reportYear);
+      if (reportQuarter) params.set("report_quarter", reportQuarter);
+      if (reportSemester) params.set("report_semester", reportSemester);
+    };
     select.addEventListener("change", () => {
-      const assetId = select.value;
       const params = new URLSearchParams(window.location.search);
-      if (assetId) {
-        params.set("asset_id", assetId);
+      if (select.value) {
+        params.set("asset_id", select.value);
       } else {
         params.delete("asset_id");
       }
-      if (reportMonth.value) {
-        params.set("report_month", reportMonth.value);
-      }
+      preservePeriodParams(params);
       window.location.href = `${window.location.pathname}?${params.toString()}`;
     });
     billingMode.addEventListener("change", updateModel);
     totalProductionCheckbox.addEventListener("change", syncBillingEnergyBase);
+    periodType.addEventListener("change", updatePeriodFields);
     updateModel();
+    updatePeriodFields();
   })();
 </script>
 {% endblock %}
