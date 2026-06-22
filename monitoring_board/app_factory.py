@@ -75,14 +75,19 @@ from monitoring_board.reporting.availability import (
     inverter_availability_slot as reporting_inverter_availability_slot,
     is_inverter_available as reporting_is_inverter_available,
 )
-from monitoring_board.reporting.billing import decimal_from_value
-from monitoring_board.reporting.models import BillingConfig, BillingEnergyBase, BillingMode, ReportType
+from monitoring_board.reporting.models import BillingConfig, ReportType
 from monitoring_board.reporting.repositories import (
     billing_config_to_form_values,
     ensure_billing_config_schema,
     get_asset_billing_config,
     get_asset_billing_config_row,
     upsert_asset_billing_config,
+)
+from monitoring_board.reporting.validation import (
+    BillingValidationError,
+    parse_billing_config_form,
+    parse_billing_values_source,
+    validate_report_asset_selection,
 )
 from monitoring_board.services.fusionsolar import (
     build_provider_url,
@@ -2395,54 +2400,44 @@ def create_app() -> Flask:
         flash("Intervencao apagada.", "success")
         return redirect(url_for("tickets", asset_id=ticket["asset_id"]))
 
-    def report_type_for_asset_id(asset_id: int) -> ReportType:
-        for asset in get_fusionsolar_report_assets(g.db):
-            if int(asset["asset_id"]) == asset_id:
-                return ReportType(str(asset["report_type"]))
-        return ReportType.EPC
-
-    def billing_config_from_form(report_type: ReportType) -> BillingConfig:
-        billing_mode_raw = request.form.get("billing_mode", BillingMode.ENERGY.value).strip()
-        billing_mode = BillingMode.FIXED_MONTHLY_FEE if billing_mode_raw == BillingMode.FIXED_MONTHLY_FEE.value else BillingMode.ENERGY
-        billing_energy_base = (
-            BillingEnergyBase.TOTAL_PRODUCTION
-            if request.form.get("charge_total_production") == "on"
-            else BillingEnergyBase.SELF_CONSUMPTION
-        )
-        return BillingConfig(
-            report_type=report_type,
-            billing_mode=billing_mode,
-            billing_energy_base=billing_energy_base,
-            solcor_price_per_kwh=decimal_from_value(request.form.get("solcor_price_per_kwh")),
-            fixed_monthly_fee_eur=decimal_from_value(request.form.get("fixed_monthly_fee_eur")),
-            electricity_price_eur_kwh=decimal_from_value(request.form.get("electricity_price")),
-            export_price_eur_kwh=decimal_from_value(request.form.get("sell_price")),
-        )
-
     @app.route("/exports", methods=["GET", "POST"])
     def exports() -> str:
         if request.method == "POST":
             asset_id_raw = request.form.get("asset_id", "").strip()
             report_month = normalize_report_month(request.form.get("report_month", ""))
             force_api = request.form.get("force_api") == "on"
-            if not asset_id_raw.isdigit():
-                flash("Escolhe uma instalacao FusionSolar para gerar o relatorio.", "error")
+            report_assets = get_fusionsolar_report_assets(g.db)
+            try:
+                selection = validate_report_asset_selection(report_assets, asset_id_raw)
+                action = request.form.get("action", "generate_report").strip()
+                source = parse_billing_values_source(request.form.get("billing_values_source", "saved"))
+                if action not in {"generate_report", "save_billing_config"}:
+                    raise BillingValidationError("Acao invalida.")
+                manual_config = (
+                    parse_billing_config_form(dict(request.form), selection.report_type)
+                    if action == "save_billing_config" or source == "manual"
+                    else None
+                )
+            except BillingValidationError as exc:
+                flash(str(exc), "error")
                 return redirect(url_for("exports", report_month=report_month))
-            asset_id = int(asset_id_raw)
-            report_type = report_type_for_asset_id(asset_id)
-            manual_config = billing_config_from_form(report_type)
-            action = request.form.get("action", "generate_report").strip()
+            asset_id = selection.asset_id
             if action == "save_billing_config":
+                if manual_config is None:
+                    flash("Configuracao de cobranca invalida.", "error")
+                    return redirect(url_for("exports", asset_id=asset_id, report_month=report_month))
                 upsert_asset_billing_config(g.db, asset_id=asset_id, config=manual_config)
                 g.db.commit()
                 flash("Configuracao de cobranca guardada.", "success")
                 return redirect(url_for("exports", asset_id=asset_id, report_month=report_month))
-            source = request.form.get("billing_values_source", "saved").strip()
             billing_config = (
-                get_asset_billing_config(g.db, asset_id, report_type)
+                get_asset_billing_config(g.db, asset_id, selection.report_type)
                 if source == "saved"
                 else manual_config
             )
+            if billing_config is None:
+                flash("Configuracao de cobranca invalida.", "error")
+                return redirect(url_for("exports", asset_id=asset_id, report_month=report_month))
             try:
                 report = build_fusionsolar_customer_production_report(
                     g.db,
@@ -2470,6 +2465,12 @@ def create_app() -> Flask:
         selected_asset_id = request.args.get("asset_id", "").strip()
         report_month = normalize_report_month(request.args.get("report_month", ""))
         report_assets = get_fusionsolar_report_assets(g.db)
+        if selected_asset_id:
+            try:
+                validate_report_asset_selection(report_assets, selected_asset_id)
+            except BillingValidationError as exc:
+                flash(str(exc), "error")
+                return redirect(url_for("exports", report_month=report_month))
         selected_report_type = next(
             (
                 asset["report_type"]

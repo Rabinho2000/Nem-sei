@@ -75,6 +75,7 @@
       </div>
       <label class="check-row" id="charge-total-production-field">
         <input type="checkbox" name="charge_total_production" {{ 'checked' if billing_energy_base == 'total_production' else '' }}>
+        <input type="hidden" name="billing_energy_base" id="billing-energy-base" value="{{ billing_energy_base }}">
         <span>Cobrar tambem o excedente</span>
       </label>
       <label class="check-row">
@@ -157,6 +158,12 @@
     const billingMode = document.getElementById("billing-mode");
     const fixedField = document.getElementById("fixed-monthly-fee-field");
     const totalProductionField = document.getElementById("charge-total-production-field");
+    const totalProductionCheckbox = totalProductionField.querySelector("input[type='checkbox']");
+    const billingEnergyBase = document.getElementById("billing-energy-base");
+    const reportMonth = document.querySelector("input[name='report_month']");
+    const syncBillingEnergyBase = () => {
+      billingEnergyBase.value = totalProductionCheckbox.checked ? "total_production" : "self_consumption";
+    };
     const updateModel = () => {
       const type = select.options[select.selectedIndex]?.dataset.reportType || "";
       model.innerHTML = type ? `Modelo detetado: <strong>${type.toUpperCase()}</strong>` : "Seleciona uma instalacao para detetar o modelo.";
@@ -165,9 +172,23 @@
       solcorField.hidden = !isEsco || isFixed;
       fixedField.hidden = !isEsco || !isFixed;
       totalProductionField.hidden = !isEsco || isFixed;
+      syncBillingEnergyBase();
     };
-    select.addEventListener("change", updateModel);
+    select.addEventListener("change", () => {
+      const assetId = select.value;
+      const params = new URLSearchParams(window.location.search);
+      if (assetId) {
+        params.set("asset_id", assetId);
+      } else {
+        params.delete("asset_id");
+      }
+      if (reportMonth.value) {
+        params.set("report_month", reportMonth.value);
+      }
+      window.location.href = `${window.location.pathname}?${params.toString()}`;
+    });
     billingMode.addEventListener("change", updateModel);
+    totalProductionCheckbox.addEventListener("change", syncBillingEnergyBase);
     updateModel();
   })();
 </script>

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from app import app as flask_app
 from app import build_fusionsolar_customer_production_report, ensure_database, upsert_production_record
 from monitoring_board.customer_reports import build_customer_report_pdf
 from monitoring_board.reporting.models import BillingConfig, BillingEnergyBase, BillingMode, ReportType
@@ -79,6 +80,16 @@ def billing_config(
         electricity_price_eur_kwh=Decimal(electricity_price),
         export_price_eur_kwh=Decimal(export_price),
     )
+
+
+def csrf_client(db_path: Path):
+    flask_app.config["DATABASE"] = str(db_path)
+    flask_app.config["TESTING"] = True
+    client = flask_app.test_client()
+    with client.session_transaction() as session:
+        session["authenticated"] = True
+        session["csrf_token"] = "test-token"
+    return client
 
 
 def test_billing_config_schema_is_idempotent(tmp_path: Path) -> None:
@@ -224,3 +235,202 @@ def test_report_supports_total_production_fixed_fee_warnings_epc_and_pdf(tmp_pat
     assert "missing_solcor_price" in missing_prices["billing_warnings"]
     assert epc["solcor_payment_eur"] == 0
     assert build_customer_report_pdf(total_production).startswith(b"%PDF-")
+
+
+def test_exports_selection_loads_selected_asset_billing_config_and_keeps_isolation(tmp_path: Path) -> None:
+    db_path = tmp_path / "route-billing.db"
+    ensure_database(str(db_path))
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    asset_a = add_report_asset(conn, name="Asset A")
+    asset_b = add_report_asset(conn, name="Asset B")
+    upsert_asset_billing_config(conn, asset_id=asset_a, config=billing_config(solcor_price="0.11", electricity_price="0.21", export_price="0.04"))
+    upsert_asset_billing_config(
+        conn,
+        asset_id=asset_b,
+        config=billing_config(
+            mode=BillingMode.FIXED_MONTHLY_FEE,
+            base=BillingEnergyBase.TOTAL_PRODUCTION,
+            solcor_price="0.22",
+            fixed_fee="77",
+            electricity_price="0.31",
+            export_price="0.08",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    client = csrf_client(db_path)
+    response = client.get(f"/exports?asset_id={asset_b}&report_month=2026-01")
+    html = response.data.decode()
+
+    assert response.status_code == 200
+    assert 'value="0.22"' in html
+    assert 'value="77"' in html
+    assert 'value="0.31"' in html
+    assert 'value="0.08"' in html
+    assert '<option value="fixed_monthly_fee" selected>' in html
+    assert 'name="asset_id" id="report-asset"' in html
+
+    save_b = client.post(
+        "/exports",
+        data={
+            "csrf_token": "test-token",
+            "action": "save_billing_config",
+            "asset_id": str(asset_b),
+            "report_month": "2026-01",
+            "billing_values_source": "manual",
+            "billing_mode": "energy",
+            "billing_energy_base": "self_consumption",
+            "solcor_price_per_kwh": "0.44",
+            "fixed_monthly_fee_eur": "0",
+            "electricity_price": "0.55",
+            "sell_price": "0.09",
+        },
+    )
+    assert save_b.status_code in {302, 303}
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    config_a = get_asset_billing_config(conn, asset_a, ReportType.ESCO)
+    config_b = get_asset_billing_config(conn, asset_b, ReportType.ESCO)
+    conn.close()
+    assert config_a.solcor_price_per_kwh == Decimal("0.11")
+    assert config_b.solcor_price_per_kwh == Decimal("0.44")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"asset_id": "99999"},
+        {"billing_mode": "bad-mode"},
+        {"billing_energy_base": "bad-base"},
+        {"billing_values_source": "bad-source"},
+        {"solcor_price_per_kwh": "abc"},
+        {"solcor_price_per_kwh": "NaN"},
+        {"solcor_price_per_kwh": "-1"},
+    ],
+)
+def test_exports_rejects_invalid_billing_inputs(tmp_path: Path, payload: dict[str, str]) -> None:
+    db_path = tmp_path / "invalid-billing.db"
+    ensure_database(str(db_path))
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    asset_id = add_report_asset(conn)
+    conn.close()
+    data = {
+        "csrf_token": "test-token",
+        "action": "save_billing_config",
+        "asset_id": str(asset_id),
+        "report_month": "2026-01",
+        "billing_values_source": "manual",
+        "billing_mode": "energy",
+        "billing_energy_base": "self_consumption",
+        "solcor_price_per_kwh": "0.10",
+        "fixed_monthly_fee_eur": "0",
+        "electricity_price": "0.20",
+        "sell_price": "0.05",
+    }
+    data.update(payload)
+
+    response = csrf_client(db_path).post("/exports", data=data)
+
+    assert response.status_code in {302, 303}
+    conn = sqlite3.connect(db_path)
+    count = conn.execute("SELECT COUNT(*) FROM asset_billing_configs").fetchone()[0]
+    conn.close()
+    assert count == 0
+
+
+def test_exports_rejects_unknown_asset_before_generating_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_path = tmp_path / "unknown-asset-generate.db"
+    ensure_database(str(db_path))
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    add_report_asset(conn)
+    conn.close()
+    monkeypatch.setattr("app.build_fusionsolar_customer_production_report", lambda *args, **kwargs: pytest.fail("Report should not be generated"))
+
+    response = csrf_client(db_path).post(
+        "/exports",
+        data={
+            "csrf_token": "test-token",
+            "action": "generate_report",
+            "asset_id": "99999",
+            "report_month": "2026-01",
+            "billing_values_source": "saved",
+            "billing_mode": "energy",
+            "billing_energy_base": "self_consumption",
+            "solcor_price_per_kwh": "0.10",
+            "fixed_monthly_fee_eur": "0",
+            "electricity_price": "0.20",
+            "sell_price": "0.05",
+        },
+    )
+
+    assert response.status_code in {302, 303}
+
+
+def test_exports_rejects_asset_without_report_integration(tmp_path: Path) -> None:
+    db_path = tmp_path / "no-integration.db"
+    ensure_database(str(db_path))
+    conn = sqlite3.connect(db_path)
+    conn.execute("INSERT INTO assets (project_name, contract_type) VALUES ('No Integration', 'ESCO')")
+    asset_id = int(conn.execute("SELECT id FROM assets").fetchone()[0])
+    conn.commit()
+    conn.close()
+
+    response = csrf_client(db_path).post(
+        "/exports",
+        data={
+            "csrf_token": "test-token",
+            "action": "save_billing_config",
+            "asset_id": str(asset_id),
+            "report_month": "2026-01",
+            "billing_values_source": "manual",
+            "billing_mode": "energy",
+            "billing_energy_base": "self_consumption",
+            "solcor_price_per_kwh": "0.10",
+            "fixed_monthly_fee_eur": "0",
+            "electricity_price": "0.20",
+            "sell_price": "0.05",
+        },
+    )
+
+    assert response.status_code in {302, 303}
+    conn = sqlite3.connect(db_path)
+    count = conn.execute("SELECT COUNT(*) FROM asset_billing_configs").fetchone()[0]
+    conn.close()
+    assert count == 0
+
+
+def test_exports_accepts_valid_manual_input(tmp_path: Path) -> None:
+    db_path = tmp_path / "valid-billing.db"
+    ensure_database(str(db_path))
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    asset_id = add_report_asset(conn)
+    conn.close()
+
+    response = csrf_client(db_path).post(
+        "/exports",
+        data={
+            "csrf_token": "test-token",
+            "action": "save_billing_config",
+            "asset_id": str(asset_id),
+            "report_month": "2026-01",
+            "billing_values_source": "manual",
+            "billing_mode": "energy",
+            "billing_energy_base": "self_consumption",
+            "solcor_price_per_kwh": "0.10",
+            "fixed_monthly_fee_eur": "",
+            "electricity_price": "0.20",
+            "sell_price": "0.05",
+        },
+    )
+
+    assert response.status_code in {302, 303}
+    conn = sqlite3.connect(db_path)
+    assert conn.execute("SELECT COUNT(*) FROM asset_billing_configs").fetchone()[0] == 1
+    conn.close()
