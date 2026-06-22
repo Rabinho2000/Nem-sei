@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 
 from openpyxl import Workbook
@@ -41,9 +41,9 @@ def add_asset(conn: sqlite3.Connection, name: str = "Solar One", nif: str = "123
     return asset_id
 
 
-def test_degradation_factor_uses_fractional_years() -> None:
+def test_degradation_factor_uses_helioscope_phase_2_rule() -> None:
     factor = calculate_degradation_factor(date(2024, 1, 1), date(2025, 7, 1))
-    assert round(factor, 5) == 0.96675
+    assert round(factor, 5) == 0.97225
 
 
 def test_helioscope_monthly_parser_reads_month_columns(tmp_path: Path) -> None:
@@ -127,16 +127,18 @@ def test_report_flags_missing_data(tmp_path: Path) -> None:
 
 def test_portfolio_total_aggregates_and_weights_availability() -> None:
     rows = [
-        {"actual_production_kwh": 100, "adjusted_expected_kwh": 100, "availability_pct": 90, "estimated_value_eur": 10, "production_ponta_kwh": 1, "production_cheia_kwh": 2, "production_vazio_kwh": 3, "production_super_vazio_kwh": 0, "helioscope_expected_kwh": 110, "warnings": []},
-        {"actual_production_kwh": 50, "adjusted_expected_kwh": 300, "availability_pct": 80, "estimated_value_eur": 5, "production_ponta_kwh": 4, "production_cheia_kwh": 5, "production_vazio_kwh": 6, "production_super_vazio_kwh": 0, "helioscope_expected_kwh": 330, "warnings": ["missing_hourly_production"]},
+        {"actual_production_kwh": 100, "adjusted_expected_kwh": 100, "installed_power_kwp": 100, "availability_pct": 90, "estimated_value_eur": 10, "production_ponta_kwh": 1, "production_cheia_kwh": 2, "production_vazio_kwh": 3, "production_super_vazio_kwh": 0, "helioscope_expected_kwh": 110, "warnings": []},
+        {"actual_production_kwh": 50, "adjusted_expected_kwh": 300, "installed_power_kwp": 900, "availability_pct": 80, "estimated_value_eur": 5, "production_ponta_kwh": 4, "production_cheia_kwh": 5, "production_vazio_kwh": 6, "production_super_vazio_kwh": 0, "helioscope_expected_kwh": 330, "warnings": ["missing_hourly_production"]},
+        {"actual_production_kwh": 25, "adjusted_expected_kwh": 100, "installed_power_kwp": None, "availability_pct": 10, "estimated_value_eur": 2, "production_ponta_kwh": 0, "production_cheia_kwh": 0, "production_vazio_kwh": 0, "production_super_vazio_kwh": 0, "helioscope_expected_kwh": 100, "warnings": []},
     ]
 
     total = aggregate_portfolio_total(rows)
 
-    assert total["actual_production_kwh"] == 150
-    assert total["availability_pct"] == 82.5
-    assert total["deviation_pct"] == -62.5
-    assert total["warnings"] == ["missing_hourly_production"]
+    assert total["actual_production_kwh"] == 175
+    assert total["installed_power_kwp"] == 1000
+    assert total["availability_pct"] == 81.0
+    assert total["deviation_pct"] == -65.0
+    assert total["warnings"] == ["missing_hourly_production", "missing_installed_power"]
 
 
 def test_mapping_by_nif_then_name(tmp_path: Path) -> None:

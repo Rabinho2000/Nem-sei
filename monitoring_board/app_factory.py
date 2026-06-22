@@ -71,6 +71,7 @@ from monitoring_board.reporting.availability import (
     apply_inverter_edge_tolerance as reporting_apply_inverter_edge_tolerance,
     calculate_inverter_daily_availability as reporting_calculate_inverter_daily_availability,
     calculate_weighted_plant_availability as reporting_calculate_weighted_plant_availability,
+    invalid_power_warnings as reporting_invalid_power_warnings,
     inverter_availability_slot as reporting_inverter_availability_slot,
     is_inverter_available as reporting_is_inverter_available,
 )
@@ -9741,21 +9742,11 @@ def get_inverter_availability_report(
     conditions = [
         "iad.provider = ?",
         "iad.availability_date BETWEEN ? AND ?",
-        """EXISTS (
-            SELECT 1
-            FROM inverter_power_samples ips
-            WHERE ips.provider = iad.provider
-              AND ips.asset_id = iad.asset_id
-              AND ips.inverter_id = iad.inverter_id
-              AND ips.sample_time >= ? AND ips.sample_time < ?
-        )""",
     ]
     params: list[Any] = [
         INTEGRATION_PROVIDER_FUSIONSOLAR,
         from_date.isoformat(),
         to_date.isoformat(),
-        datetime.combine(from_date, datetime.min.time()).isoformat(timespec="seconds"),
-        datetime.combine(to_date + timedelta(days=1), datetime.min.time()).isoformat(timespec="seconds"),
     ]
     if asset_id is not None:
         conditions.append("iad.asset_id = ?")
@@ -9823,6 +9814,11 @@ def get_inverter_availability_report(
                 "project_name": plant["project_name"],
                 "inverter_count": len(plant["inverters"]),
                 "availability_pct": calculate_weighted_plant_availability(plant["inverters"]),
+                "warnings": reporting_invalid_power_warnings(
+                    plant["inverters"],
+                    power_key="inverter_power_kw",
+                    warning_code="missing_inverter_power",
+                ),
             }
         )
     plant_rows.sort(key=lambda row: (row["availability_pct"] is None, row["availability_pct"] or 0, row["project_name"]))
@@ -10021,6 +10017,11 @@ def get_monthly_wat_report_data(
         )
         worst_inverter = ranked_inverters[0] if ranked_inverters else None
         weighted_wat = calculate_weighted_plant_availability(report_inverters)
+        warnings = reporting_invalid_power_warnings(
+            report_inverters,
+            power_key="inverter_power_kw",
+            warning_code="missing_inverter_power",
+        )
         plants.append(
             {
                 "asset_id": current_asset_id,
@@ -10039,6 +10040,7 @@ def get_monthly_wat_report_data(
                 "valid_slots": sum(int(row["valid_slots"]) for row in report_inverters),
                 "unavailable_slots": sum(int(row["unavailable_slots"]) for row in report_inverters),
                 "data_status": data_status,
+                "warnings": warnings,
             }
         )
 
@@ -12599,15 +12601,6 @@ def sync_fusionsolar_inverter_availability_for_date(
         inverter_results: list[dict[str, Any]] = []
         for device in plant_devices:
             device_samples = samples_by_inverter.get(str(device["external_device_id"]), [])
-            if not device_samples:
-                logging.info(
-                    "FusionSolar inverter excluded because it has no samples: target_date=%s asset_id=%s inverter_id=%s name=%s",
-                    target_date,
-                    asset_id,
-                    device["external_device_id"],
-                    device["device_name"],
-                )
-                continue
             result = calculate_inverter_daily_availability(
                 device_samples,
                 valid_slots,
@@ -12934,9 +12927,9 @@ def recalculate_stored_inverter_availability(
             if is_removed_inverter_name(device["device_name"]):
                 continue
             inverter_id = str(device["external_device_id"] or "")
-            device_samples = samples_by_inverter.get(inverter_id, [])
-            if not inverter_id or not device_samples:
+            if not inverter_id:
                 continue
+            device_samples = samples_by_inverter.get(inverter_id, [])
             inverter_power_kw = (
                 parse_float_value(device["rated_power_kw"])
                 or infer_inverter_power_from_model(device["model"])

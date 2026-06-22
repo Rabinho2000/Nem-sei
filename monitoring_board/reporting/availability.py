@@ -82,13 +82,33 @@ def calculate_weighted_plant_availability(inverter_rows: list[dict[str, Any]]) -
     rows = [row for row in inverter_rows if row.get("availability_pct") is not None]
     if not rows:
         return None
-    powers = [parse_nonnegative_float(row.get("inverter_power_kw")) for row in rows]
-    if all(power is not None and power > 0 for power in powers):
-        total_power = sum(float(power) for power in powers if power is not None)
-        return round(
-            sum(float(row["availability_pct"]) * float(power) for row, power in zip(rows, powers) if power is not None)
-            / total_power,
-            2,
-        )
-    return round(sum(float(row["availability_pct"]) for row in rows) / len(rows), 2)
+    weighted_rows = [
+        (row, power)
+        for row in rows
+        if (power := parse_nonnegative_float(row.get("inverter_power_kw"))) is not None and power > 0
+    ]
+    if not weighted_rows:
+        return None
+    total_power = sum(power for _, power in weighted_rows)
+    return round(sum(float(row["availability_pct"]) * power for row, power in weighted_rows) / total_power, 2)
+
+
+def invalid_power_warnings(rows: list[dict[str, Any]], *, power_key: str, warning_code: str) -> list[str]:
+    if any(parse_nonnegative_float(row.get(power_key)) is None or parse_nonnegative_float(row.get(power_key)) <= 0 for row in rows):
+        return [warning_code]
+    return []
+
+
+def calculate_weighted_portfolio_availability(rows: list[dict[str, Any]]) -> float | None:
+    weighted_rows = [
+        (row, power)
+        for row in rows
+        if row.get("availability_pct") is not None
+        and (power := parse_nonnegative_float(row.get("installed_power_kwp"))) is not None
+        and power > 0
+    ]
+    if not weighted_rows:
+        return None
+    total_power = sum(power for _, power in weighted_rows)
+    return round(sum(float(row["availability_pct"]) * power for row, power in weighted_rows) / total_power, 2)
 

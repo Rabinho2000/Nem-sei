@@ -122,6 +122,7 @@ def test_characterizes_current_portfolio_total_and_excel_shape() -> None:
             "production_super_vazio_kwh": 4,
             "helioscope_expected_kwh": 110,
             "adjusted_expected_kwh": 100,
+            "installed_power_kwp": 50,
             "degradation_factor": 0.97,
             "deviation_kwh": 0,
             "deviation_pct": 0,
@@ -145,7 +146,7 @@ def test_characterizes_current_portfolio_total_and_excel_shape() -> None:
     assert sheet["F1"].value == "Producao real mensal kWh"
 
 
-def test_characterizes_current_wat_edge_tolerance_and_power_fallback() -> None:
+def test_wat_uses_valid_slots_and_ignores_invalid_power_in_denominator() -> None:
     valid_slots = {datetime(2026, 6, 1, 8, 0) + timedelta(minutes=15 * index) for index in range(8)}
     result = app_module.calculate_inverter_daily_availability(
         [
@@ -162,13 +163,56 @@ def test_characterizes_current_wat_edge_tolerance_and_power_fallback() -> None:
             {"availability_pct": 100.0, "inverter_power_kw": None},
             {"availability_pct": 50.0, "inverter_power_kw": 50.0},
         ]
-    ) == 75.0
+    ) == 50.0
 
 
-def test_characterizes_current_degradation_formula() -> None:
+def test_wat_counts_missing_communication_only_during_valid_slots() -> None:
+    valid_slots = {datetime(2026, 6, 1, 10, 0), datetime(2026, 6, 1, 10, 15)}
+
+    missing_during_production = availability.calculate_inverter_daily_availability([], valid_slots, edge_tolerance_minutes=0)
+    missing_outside_production = availability.calculate_inverter_daily_availability([], set(), edge_tolerance_minutes=0)
+
+    assert missing_during_production == {
+        "valid_slots": 2,
+        "available_slots": 0,
+        "unavailable_slots": 2,
+        "availability_pct": 0.0,
+    }
+    assert missing_outside_production == {
+        "valid_slots": 0,
+        "available_slots": 0,
+        "unavailable_slots": 0,
+        "availability_pct": None,
+    }
+
+
+def test_degradation_formula_uses_phase_2_helioscope_rule() -> None:
     assert calculate_degradation_factor(None, date(2026, 1, 1)) == 1.0
     assert calculate_degradation_factor(date(2026, 1, 1), date(2026, 1, 1)) == 0.975
-    assert round(calculate_degradation_factor(date(2025, 1, 1), date(2026, 1, 1)), 4) == 0.9695
+    assert calculate_degradation_factor(date(2025, 7, 1), date(2026, 1, 1)) == 0.975
+    assert calculate_degradation_factor(date(2025, 1, 1), date(2026, 1, 1)) == 0.975
+    assert round(calculate_degradation_factor(date(2025, 1, 1), date(2026, 2, 1)), 6) == 0.974542
+
+
+@pytest.mark.parametrize(
+    ("mounting_date", "report_month", "expected"),
+    [
+        (None, date(2026, 1, 1), 1.0),
+        (date(2026, 1, 1), date(2026, 1, 1), 0.975),
+        (date(2025, 7, 1), date(2026, 1, 1), 0.975),
+        (date(2025, 1, 1), date(2026, 1, 1), 0.975),
+        (date(2025, 1, 1), date(2026, 2, 1), 0.9745416667),
+        (date(2025, 1, 1), date(2026, 7, 1), 0.97225),
+        (date(2025, 1, 1), date(2027, 1, 1), 0.9695),
+        (date(2026, 7, 1), date(2026, 1, 1), 0.975),
+    ],
+)
+def test_degradation_phase_2_boundary_cases(
+    mounting_date: date | None,
+    report_month: date,
+    expected: float,
+) -> None:
+    assert degradation.calculate_degradation_factor(mounting_date, report_month) == pytest.approx(expected)
 
 
 def test_reporting_models_and_periods_are_explicit_and_typed() -> None:
@@ -239,6 +283,7 @@ def test_availability_and_degradation_foundations_preserve_edge_cases() -> None:
     ) == 83.33
     assert degradation.calculate_degradation_factor(None, date(2026, 1, 1)) == 1.0
     assert degradation.calculate_degradation_factor(date(2027, 1, 1), date(2026, 1, 1)) == 0.975
+    assert round(degradation.calculate_degradation_factor(date(2024, 1, 1), date(2026, 1, 1)), 4) == 0.9695
 
 
 def test_reporting_repositories_read_existing_sqlite_schema(tmp_path: Path) -> None:
