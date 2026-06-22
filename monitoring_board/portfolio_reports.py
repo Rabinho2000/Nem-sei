@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import calendar
 import json
 import re
 import sqlite3
@@ -12,6 +11,18 @@ from typing import Any
 from openpyxl import Workbook, load_workbook
 
 from monitoring_board.db import query_all
+from monitoring_board.reporting.degradation import calculate_degradation_factor
+from monitoring_board.reporting.periods import month_bounds
+from monitoring_board.reporting.repositories import (
+    get_latest_helioscope_expected,
+    get_latest_tariff,
+    get_monthly_availability,
+    get_monthly_production_record,
+    has_expired_tariff,
+    list_hourly_production_records,
+    list_portfolio_report_assets,
+    list_tariff_period_rules,
+)
 
 
 MONTH_LABELS = {
@@ -172,14 +183,6 @@ def parse_float(value: Any) -> float | None:
     except ValueError:
         return None
     return parsed if parsed >= 0 else None
-
-
-def calculate_degradation_factor(mounting_date: date | None, report_month: date) -> float:
-    if mounting_date is None:
-        return 1.0
-    months = (report_month.year - mounting_date.year) * 12 + (report_month.month - mounting_date.month)
-    years_since_mounting = max(0, months) / 12
-    return max(0.0, 1 - 0.025 - years_since_mounting * 0.0055)
 
 
 def parse_helioscope_monthly_expected(path: Path) -> dict[int, float]:
@@ -476,70 +479,9 @@ def calculate_tariff_value(
     return {"estimated_value_eur": round(total, 2) if hourly_records and not any(w.startswith("missing_") for w in warnings if w != "missing_super_vazio_price") else None, "period_kwh": periods, "warnings": sorted(set(warnings))}
 
 
-def month_bounds(report_month: str) -> tuple[date, date]:
-    start = datetime.strptime(report_month, "%Y-%m").date()
-    _, last_day = calendar.monthrange(start.year, start.month)
-    return start, start.replace(day=last_day)
-
-
-def get_latest_tariff(conn: sqlite3.Connection, asset_id: int, report_start: date) -> sqlite3.Row | None:
-    return conn.execute(
-        """
-        SELECT *
-        FROM asset_tariffs
-        WHERE asset_id = ?
-          AND (valid_from IS NULL OR valid_from = '' OR valid_from <= ?)
-          AND (valid_to IS NULL OR valid_to = '' OR valid_to >= ?)
-        ORDER BY COALESCE(valid_from, '') DESC, id DESC
-        LIMIT 1
-        """,
-        (asset_id, report_start.isoformat(), report_start.isoformat()),
-    ).fetchone()
-
-
-def has_expired_tariff(conn: sqlite3.Connection, asset_id: int, report_start: date) -> bool:
-    row = conn.execute(
-        """
-        SELECT 1
-        FROM asset_tariffs
-        WHERE asset_id = ?
-          AND valid_to IS NOT NULL
-          AND valid_to != ''
-          AND valid_to < ?
-        LIMIT 1
-        """,
-        (asset_id, report_start.isoformat()),
-    ).fetchone()
-    return row is not None
-
-
-def get_monthly_availability(conn: sqlite3.Connection, asset_id: int, start: date, end: date) -> float | None:
-    row = conn.execute(
-        """
-        SELECT SUM(weighted_availability_pct * valid_slots) AS weighted_sum, SUM(valid_slots) AS slots
-        FROM plant_availability_daily
-        WHERE asset_id = ? AND provider = 'FusionSolar' AND availability_date BETWEEN ? AND ?
-        """,
-        (asset_id, start.isoformat(), end.isoformat()),
-    ).fetchone()
-    if row and row["slots"]:
-        return round(float(row["weighted_sum"]) / float(row["slots"]), 2)
-    return None
-
-
 def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, report_month: str) -> list[dict[str, Any]]:
     start, end = month_bounds(report_month)
-    assets = query_all(
-        conn,
-        """
-        SELECT pa.*, a.project_name, a.nif AS asset_nif, a.start_contract, a.mounting_date, a.kwp
-        FROM portfolio_assets pa
-        LEFT JOIN assets a ON a.id = pa.asset_id
-        WHERE pa.portfolio_id = ? AND pa.active = 1
-        ORDER BY COALESCE(pa.external_name, a.project_name) COLLATE NOCASE
-        """,
-        (portfolio_id,),
-    )
+    assets = list_portfolio_report_assets(conn, portfolio_id)
     rows: list[dict[str, Any]] = []
     for asset in assets:
         asset_id = int(asset["asset_id"]) if asset["asset_id"] is not None else None
@@ -549,28 +491,11 @@ def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, rep
             warnings.append("mapping_pending")
         if mapping_status == "mapping_conflict":
             warnings.append("mapping_conflict")
-        prod = conn.execute(
-            """
-            SELECT production_kwh
-            FROM production_records
-            WHERE asset_id = ? AND provider = 'FusionSolar' AND period_type = 'month' AND period_date = ?
-            LIMIT 1
-            """,
-            (asset_id, start.isoformat()),
-        ).fetchone() if asset_id is not None else None
+        prod = get_monthly_production_record(conn, asset_id, start)
         actual = float(prod["production_kwh"]) if prod and prod["production_kwh"] is not None else None
         if actual is None:
             warnings.append("missing_monthly_production")
-        expected = conn.execute(
-            """
-            SELECT expected_kwh
-            FROM helioscope_expected_production
-            WHERE asset_id = ? AND month = ?
-            ORDER BY imported_at DESC, id DESC
-            LIMIT 1
-            """,
-            (asset_id, start.month),
-        ).fetchone() if asset_id is not None else None
+        expected = get_latest_helioscope_expected(conn, asset_id, start.month)
         expected_kwh = float(expected["expected_kwh"]) if expected else None
         if expected_kwh is None:
             warnings.append("missing_helioscope_expected")
@@ -593,16 +518,13 @@ def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, rep
         tariff = get_latest_tariff(conn, asset_id, start) if asset_id is not None else None
         if tariff is None and asset_id is not None and has_expired_tariff(conn, asset_id, start):
             warnings.append("expired_tariff")
-        rules = query_all(conn, "SELECT * FROM tariff_period_rules WHERE tariff_id = ? ORDER BY weekday_type, start_time", (tariff["id"],)) if tariff else []
-        hourly = query_all(
+        rules = list_tariff_period_rules(conn, int(tariff["id"])) if tariff else []
+        hourly = list_hourly_production_records(
             conn,
-            """
-            SELECT * FROM production_hourly_records
-            WHERE asset_id = ? AND provider = 'FusionSolar' AND period_start >= ? AND period_start < ?
-            ORDER BY period_start
-            """,
-            (asset_id, start.isoformat(), datetime(end.year, end.month, end.day, 23, 59, 59).isoformat()),
-        ) if asset_id is not None else []
+            asset_id=asset_id,
+            start_iso=start.isoformat(),
+            end_iso=datetime(end.year, end.month, end.day, 23, 59, 59).isoformat(),
+        )
         tariff_result = calculate_tariff_value(tariff, monthly_kwh=actual, hourly_records=hourly, rules=rules)
         warnings.extend(tariff_result["warnings"])
         invoice_status = "ok" if tariff and tariff["invoice_file_id"] else "missing_invoice"

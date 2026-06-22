@@ -5,6 +5,7 @@ import logging
 import re
 import unicodedata
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,15 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
+
+from monitoring_board.reporting.billing import (
+    calculate_customer_billing,
+    decimal_from_value,
+    decimal_to_float,
+    detect_report_type_value,
+    infer_self_use_kwh,
+)
+from monitoring_board.reporting.models import BillingConfig, EnergyBreakdown, ReportType
 
 
 LOGGER = logging.getLogger(__name__)
@@ -83,64 +93,74 @@ def _normalized_text(value: Any) -> str:
 
 
 def detect_report_type(asset: Any) -> str:
+    report_type = detect_report_type_value(asset)
+    if report_type != ReportType.EPC:
+        return report_type.value
     fields = ("contract_type", "asset_type", "coverage_type", "sell_to", "project_name")
     for field in fields:
         value = _normalized_text(_asset_value(asset, field))
-        if re.search(r"(^|\W)esco($|\W)", value):
-            return "esco"
         if re.search(r"(^|\W)epc($|\W)", value):
-            return "epc"
+            return report_type.value
     LOGGER.warning(
         "Customer report type not detected for asset_id=%s; defaulting to EPC",
         _asset_value(asset, "asset_id") or _asset_value(asset, "id"),
     )
-    return "epc"
+    return report_type.value
 
 
 def _number(value: Any) -> float:
-    try:
-        return max(float(value or 0), 0.0)
-    except (TypeError, ValueError):
-        return 0.0
+    return decimal_to_float(decimal_from_value(value))
 
 
 def prepare_customer_report(report: dict[str, Any], *, solcor_price_per_kwh: float = 0.0) -> dict[str, Any]:
     prepared = dict(report)
     prepared["asset"] = dict(report.get("asset") or {})
     prepared["report_type"] = detect_report_type(prepared["asset"])
-    production = _number(report.get("production_kwh"))
-    export = min(_number(report.get("export_kwh")), production) if production else _number(report.get("export_kwh"))
+    production_decimal = decimal_from_value(report.get("production_kwh"))
+    export_decimal = decimal_from_value(report.get("export_kwh"))
+    export_decimal = min(export_decimal, production_decimal) if production_decimal else export_decimal
     raw_self_use = report.get("self_use_kwh")
-    self_use = _number(raw_self_use) if raw_self_use is not None else max(production - export, 0.0)
-    if production and not self_use and export < production:
-        self_use = max(production - export, 0.0)
-    consumption = _number(report.get("consumption_kwh"))
-    electricity_price = _number(report.get("electricity_price"))
-    sell_price = _number(report.get("sell_price"))
-    solcor_price = _number(solcor_price_per_kwh)
-
-    savings = self_use * electricity_price
-    export_revenue = export * sell_price
-    total_benefit = savings + export_revenue
-    solcor_payment = production * solcor_price if prepared["report_type"] == "esco" else 0.0
+    self_use_decimal = infer_self_use_kwh(
+        production_kwh=production_decimal,
+        export_kwh=export_decimal,
+        raw_self_use=raw_self_use,
+    )
+    if production_decimal and not self_use_decimal and export_decimal < production_decimal:
+        self_use_decimal = production_decimal - export_decimal
+    consumption_decimal = decimal_from_value(report.get("consumption_kwh"))
+    solcor_price_decimal = decimal_from_value(solcor_price_per_kwh)
+    billing = calculate_customer_billing(
+        EnergyBreakdown(
+            production_kwh=production_decimal,
+            self_use_kwh=self_use_decimal,
+            export_kwh=export_decimal,
+            consumption_kwh=consumption_decimal,
+        ),
+        BillingConfig(
+            report_type=ReportType(prepared["report_type"]),
+            solcor_price_per_kwh=solcor_price_decimal,
+            electricity_price_eur_kwh=decimal_from_value(report.get("electricity_price")),
+            export_price_eur_kwh=decimal_from_value(report.get("sell_price")),
+        ),
+    )
 
     prepared.update(
-        production_kwh=production,
-        self_use_kwh=self_use,
-        export_kwh=export,
-        consumption_kwh=consumption,
-        savings_eur=savings,
-        export_revenue_eur=export_revenue,
-        total_benefit_eur=total_benefit,
-        solcor_price_per_kwh=solcor_price,
-        solcor_payment_eur=solcor_payment,
-        net_benefit_eur=total_benefit - solcor_payment,
-        autoconsumption_pct=(self_use / production * 100) if production else 0.0,
-        export_pct=(export / production * 100) if production else 0.0,
-        self_sufficiency_pct=(self_use / consumption * 100) if consumption else 0.0,
+        production_kwh=decimal_to_float(production_decimal),
+        self_use_kwh=decimal_to_float(self_use_decimal),
+        export_kwh=decimal_to_float(export_decimal),
+        consumption_kwh=decimal_to_float(consumption_decimal),
+        savings_eur=decimal_to_float(billing.savings_eur),
+        export_revenue_eur=decimal_to_float(billing.export_revenue_eur),
+        total_benefit_eur=decimal_to_float(billing.total_benefit_eur),
+        solcor_price_per_kwh=decimal_to_float(solcor_price_decimal),
+        solcor_payment_eur=decimal_to_float(billing.solcor_payment_eur),
+        net_benefit_eur=decimal_to_float(billing.net_benefit_eur),
+        autoconsumption_pct=decimal_to_float(billing.autoconsumption_pct),
+        export_pct=decimal_to_float(billing.export_pct),
+        self_sufficiency_pct=decimal_to_float(billing.self_sufficiency_pct),
     )
     prepared["report_notes"] = list(report.get("report_notes") or [])
-    if prepared["report_type"] == "esco" and solcor_price == 0:
+    if prepared["report_type"] == "esco" and solcor_price_decimal == Decimal("0"):
         prepared["report_notes"].append("Preço Solcor não indicado; pagamento calculado a 0 EUR/kWh.")
     prepared["tariff_rows"] = [
         ("Cheia", _number(report.get("self_use_cheia_kwh")), NAVY),
