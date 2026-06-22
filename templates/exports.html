@@ -3,12 +3,12 @@
 {% block content %}
 <section class="hero">
   <div>
-    <p class="eyebrow">Relatórios</p>
-    <h2>Produção mensal</h2>
-    <p class="muted">Gera o PDF mensal de produção com dados locais quando existem, usando a FusionSolar como fallback.</p>
+    <p class="eyebrow">Relatorios</p>
+    <h2>Producao mensal</h2>
+    <p class="muted">Gera o PDF mensal de producao com dados locais quando existem, usando a FusionSolar como fallback.</p>
   </div>
   <div class="hero-actions">
-    <a class="button secondary" href="{{ url_for('integrations') }}">Integrações</a>
+    <a class="button secondary" href="{{ url_for('integrations') }}">Integracoes</a>
   </div>
 </section>
 
@@ -23,47 +23,69 @@
   <article class="card">
     <div class="section-title">
       <div>
-        <h3>Novo relatório</h3>
+        <h3>Novo relatorio</h3>
         <p class="muted">O sistema deteta automaticamente o modelo ESCO ou EPC e gera o PDF correspondente.</p>
       </div>
     </div>
 
     <form class="stack-form" method="post">
-      <label>Instalação FusionSolar
+      <label>Instalacao FusionSolar
         <select name="asset_id" id="report-asset" required>
-          <option value="">Escolher instalação</option>
+          <option value="">Escolher instalacao</option>
           {% for asset in report_assets %}
             <option value="{{ asset.asset_id }}" data-report-type="{{ asset.report_type }}" {{ 'selected' if selected_asset_id|string == asset.asset_id|string else '' }}>
-              {{ asset.project_name }}{% if asset.external_name and asset.external_name != asset.project_name %} · {{ asset.external_name }}{% endif %} ({{ asset.report_type|upper }})
+              {{ asset.project_name }}{% if asset.external_name and asset.external_name != asset.project_name %} - {{ asset.external_name }}{% endif %} ({{ asset.report_type|upper }})
             </option>
           {% endfor %}
         </select>
       </label>
       <p class="muted" id="detected-report-model">
-        {% if selected_report_type %}Modelo detetado: <strong>{{ selected_report_type|upper }}</strong>{% else %}Seleciona uma instalação para detetar o modelo.{% endif %}
+        {% if selected_report_type %}Modelo detetado: <strong>{{ selected_report_type|upper }}</strong>{% else %}Seleciona uma instalacao para detetar o modelo.{% endif %}
       </p>
 
       <div class="grid two">
-        <label>Mês do relatório
+        <label>Mes do relatorio
           <input type="month" name="report_month" value="{{ report_month }}" required>
         </label>
-        <label>Preço eletricidade EUR/kWh
+        <label>Fonte dos valores
+          <select name="billing_values_source">
+            <option value="saved" selected>Usar configuracao guardada{% if not selected_billing_config_exists %} (defaults){% endif %}</option>
+            <option value="manual">Introduzir valores manualmente</option>
+          </select>
+        </label>
+        <label>Modelo de cobranca
+          <select name="billing_mode" id="billing-mode">
+            <option value="energy" {{ 'selected' if billing_mode == 'energy' else '' }}>Tarifa por energia</option>
+            <option value="fixed_monthly_fee" {{ 'selected' if billing_mode == 'fixed_monthly_fee' else '' }}>Mensalidade fixa</option>
+          </select>
+        </label>
+        <label>Preco eletricidade EUR/kWh
           <input type="number" step="0.00001" min="0" name="electricity_price" value="{{ electricity_price }}" required>
         </label>
         <label>Venda excedente EUR/kWh
           <input type="number" step="0.00001" min="0" name="sell_price" value="{{ sell_price }}" required>
         </label>
-        <label id="solcor-price-field">Preço Solcor EUR/kWh
+        <label id="solcor-price-field">Preco Solcor EUR/kWh
           <input type="number" step="0.00001" min="0" name="solcor_price_per_kwh" value="{{ solcor_price_per_kwh }}">
-          <small class="muted">Usado apenas em instalações ESCO.</small>
+          <small class="muted">Usado apenas em instalacoes ESCO com tarifa por energia.</small>
+        </label>
+        <label id="fixed-monthly-fee-field">Mensalidade fixa EUR
+          <input type="number" step="0.01" min="0" name="fixed_monthly_fee_eur" value="{{ fixed_monthly_fee_eur }}">
         </label>
       </div>
+      <label class="check-row" id="charge-total-production-field">
+        <input type="checkbox" name="charge_total_production" {{ 'checked' if billing_energy_base == 'total_production' else '' }}>
+        <span>Cobrar tambem o excedente</span>
+      </label>
       <label class="check-row">
         <input type="checkbox" name="force_api">
         <span>Atualizar diretamente da FusionSolar</span>
       </label>
 
-      <button class="button" type="submit">Gerar PDF</button>
+      <div class="hero-actions">
+        <button class="button" type="submit" name="action" value="generate_report">Gerar PDF</button>
+        <button class="button secondary" type="submit" name="action" value="save_billing_config">Guardar configuracao</button>
+      </div>
     </form>
   </article>
 
@@ -78,20 +100,20 @@
       </div>
       <div class="list-row">
         <div>
-          <strong>KPIs diários</strong>
-          <small>Produção diária, autoconsumo e excedente para o gráfico.</small>
+          <strong>KPIs diarios</strong>
+          <small>Producao diaria, autoconsumo e excedente para o grafico.</small>
         </div>
       </div>
       <div class="list-row">
         <div>
           <strong>KPI mensal</strong>
-          <small>Total mensal de produção, energia autoconsumida, excedente e consumo quando a API devolve esses campos.</small>
+          <small>Total mensal de producao, energia autoconsumida, excedente e consumo quando a API devolve esses campos.</small>
         </div>
       </div>
       <div class="list-row">
         <div>
-          <strong>Cálculos</strong>
-          <small>Poupança = autoconsumo x preço de eletricidade. Receita = excedente x preço de venda.</small>
+          <strong>Calculos</strong>
+          <small>Os valores financeiros sao calculados no servico de billing e apresentados no PDF.</small>
         </div>
       </div>
     </div>
@@ -99,16 +121,16 @@
 </section>
 
 <section class="card">
-  <div class="section-title"><h3>Instalações disponíveis</h3></div>
+  <div class="section-title"><h3>Instalacoes disponiveis</h3></div>
   <div class="table-wrap">
     <table>
       <thead>
         <tr>
-          <th>Instalação</th>
+          <th>Instalacao</th>
           <th>FusionSolar</th>
           <th>Modelo</th>
           <th>Station code</th>
-          <th>Localização</th>
+          <th>Localizacao</th>
         </tr>
       </thead>
       <tbody>
@@ -121,7 +143,7 @@
             <td>{{ asset.location or "-" }}</td>
           </tr>
         {% else %}
-          <tr><td colspan="5" class="muted">Sem instalações FusionSolar mapeadas. Faz primeiro o mapeamento em Integrações.</td></tr>
+          <tr><td colspan="5" class="muted">Sem instalacoes FusionSolar mapeadas. Faz primeiro o mapeamento em Integracoes.</td></tr>
         {% endfor %}
       </tbody>
     </table>
@@ -132,12 +154,20 @@
     const select = document.getElementById("report-asset");
     const model = document.getElementById("detected-report-model");
     const solcorField = document.getElementById("solcor-price-field");
+    const billingMode = document.getElementById("billing-mode");
+    const fixedField = document.getElementById("fixed-monthly-fee-field");
+    const totalProductionField = document.getElementById("charge-total-production-field");
     const updateModel = () => {
       const type = select.options[select.selectedIndex]?.dataset.reportType || "";
-      model.innerHTML = type ? `Modelo detetado: <strong>${type.toUpperCase()}</strong>` : "Seleciona uma instalação para detetar o modelo.";
-      solcorField.hidden = type !== "esco";
+      model.innerHTML = type ? `Modelo detetado: <strong>${type.toUpperCase()}</strong>` : "Seleciona uma instalacao para detetar o modelo.";
+      const isEsco = type === "esco";
+      const isFixed = billingMode.value === "fixed_monthly_fee";
+      solcorField.hidden = !isEsco || isFixed;
+      fixedField.hidden = !isEsco || !isFixed;
+      totalProductionField.hidden = !isEsco || isFixed;
     };
     select.addEventListener("change", updateModel);
+    billingMode.addEventListener("change", updateModel);
     updateModel();
   })();
 </script>

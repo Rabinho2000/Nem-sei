@@ -58,8 +58,8 @@ def test_characterizes_current_esco_and_epc_financial_report_values() -> None:
     assert esco["savings_eur"] == 16
     assert esco["export_revenue_eur"] == 1
     assert esco["total_benefit_eur"] == 17
-    assert esco["solcor_payment_eur"] == 9
-    assert esco["net_benefit_eur"] == 8
+    assert esco["solcor_payment_eur"] == 7.2
+    assert esco["net_benefit_eur"] == 9.8
     assert epc["solcor_payment_eur"] == 0
     assert epc["net_benefit_eur"] == epc["total_benefit_eur"]
 
@@ -256,7 +256,7 @@ def test_billing_foundation_uses_decimal_and_distinguishes_esco_from_epc() -> No
 
     assert esco.savings_eur == Decimal("16.00")
     assert esco.export_revenue_eur == Decimal("1.00")
-    assert esco.solcor_payment_eur == Decimal("9.00")
+    assert esco.solcor_payment_eur == Decimal("7.20")
     assert epc.solcor_payment_eur == Decimal("0")
     assert billing.decimal_from_value(None) == Decimal("0")
     assert billing.decimal_from_value("-4.2") == Decimal("0")

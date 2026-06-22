@@ -75,6 +75,15 @@ from monitoring_board.reporting.availability import (
     inverter_availability_slot as reporting_inverter_availability_slot,
     is_inverter_available as reporting_is_inverter_available,
 )
+from monitoring_board.reporting.billing import decimal_from_value
+from monitoring_board.reporting.models import BillingConfig, BillingEnergyBase, BillingMode, ReportType
+from monitoring_board.reporting.repositories import (
+    billing_config_to_form_values,
+    ensure_billing_config_schema,
+    get_asset_billing_config,
+    get_asset_billing_config_row,
+    upsert_asset_billing_config,
+)
 from monitoring_board.services.fusionsolar import (
     build_provider_url,
     classify_fusionsolar_inverter_availability,
@@ -2386,27 +2395,63 @@ def create_app() -> Flask:
         flash("Intervencao apagada.", "success")
         return redirect(url_for("tickets", asset_id=ticket["asset_id"]))
 
+    def report_type_for_asset_id(asset_id: int) -> ReportType:
+        for asset in get_fusionsolar_report_assets(g.db):
+            if int(asset["asset_id"]) == asset_id:
+                return ReportType(str(asset["report_type"]))
+        return ReportType.EPC
+
+    def billing_config_from_form(report_type: ReportType) -> BillingConfig:
+        billing_mode_raw = request.form.get("billing_mode", BillingMode.ENERGY.value).strip()
+        billing_mode = BillingMode.FIXED_MONTHLY_FEE if billing_mode_raw == BillingMode.FIXED_MONTHLY_FEE.value else BillingMode.ENERGY
+        billing_energy_base = (
+            BillingEnergyBase.TOTAL_PRODUCTION
+            if request.form.get("charge_total_production") == "on"
+            else BillingEnergyBase.SELF_CONSUMPTION
+        )
+        return BillingConfig(
+            report_type=report_type,
+            billing_mode=billing_mode,
+            billing_energy_base=billing_energy_base,
+            solcor_price_per_kwh=decimal_from_value(request.form.get("solcor_price_per_kwh")),
+            fixed_monthly_fee_eur=decimal_from_value(request.form.get("fixed_monthly_fee_eur")),
+            electricity_price_eur_kwh=decimal_from_value(request.form.get("electricity_price")),
+            export_price_eur_kwh=decimal_from_value(request.form.get("sell_price")),
+        )
+
     @app.route("/exports", methods=["GET", "POST"])
     def exports() -> str:
         if request.method == "POST":
             asset_id_raw = request.form.get("asset_id", "").strip()
             report_month = normalize_report_month(request.form.get("report_month", ""))
-            electricity_price_value = parse_float_value(request.form.get("electricity_price"))
-            electricity_price = 0.20725 if electricity_price_value is None else max(electricity_price_value, 0.0)
-            sell_price = max(parse_float_value(request.form.get("sell_price")) or 0.0, 0.0)
-            solcor_price_per_kwh = max(parse_float_value(request.form.get("solcor_price_per_kwh")) or 0.0, 0.0)
             force_api = request.form.get("force_api") == "on"
             if not asset_id_raw.isdigit():
                 flash("Escolhe uma instalacao FusionSolar para gerar o relatorio.", "error")
                 return redirect(url_for("exports", report_month=report_month))
+            asset_id = int(asset_id_raw)
+            report_type = report_type_for_asset_id(asset_id)
+            manual_config = billing_config_from_form(report_type)
+            action = request.form.get("action", "generate_report").strip()
+            if action == "save_billing_config":
+                upsert_asset_billing_config(g.db, asset_id=asset_id, config=manual_config)
+                g.db.commit()
+                flash("Configuracao de cobranca guardada.", "success")
+                return redirect(url_for("exports", asset_id=asset_id, report_month=report_month))
+            source = request.form.get("billing_values_source", "saved").strip()
+            billing_config = (
+                get_asset_billing_config(g.db, asset_id, report_type)
+                if source == "saved"
+                else manual_config
+            )
             try:
                 report = build_fusionsolar_customer_production_report(
                     g.db,
-                    asset_id=int(asset_id_raw),
+                    asset_id=asset_id,
                     report_month=report_month,
-                    electricity_price=electricity_price,
-                    sell_price=sell_price,
-                    solcor_price_per_kwh=solcor_price_per_kwh,
+                    electricity_price=float(billing_config.electricity_price_eur_kwh),
+                    sell_price=float(billing_config.export_price_eur_kwh),
+                    solcor_price_per_kwh=float(billing_config.solcor_price_per_kwh),
+                    billing_config=billing_config,
                     force_api=force_api,
                 )
                 return export_customer_production_pdf(report)
@@ -2433,6 +2478,17 @@ def create_app() -> Flask:
             ),
             "",
         )
+        selected_billing_config = (
+            get_asset_billing_config(g.db, int(selected_asset_id), ReportType(selected_report_type))
+            if selected_asset_id.isdigit() and selected_report_type
+            else BillingConfig(report_type=ReportType.EPC)
+        )
+        selected_billing_config_exists = (
+            get_asset_billing_config_row(g.db, int(selected_asset_id)) is not None
+            if selected_asset_id.isdigit()
+            else False
+        )
+        billing_form = billing_config_to_form_values(selected_billing_config)
 
         return render_template(
             "exports.html",
@@ -2440,9 +2496,13 @@ def create_app() -> Flask:
             selected_asset_id=selected_asset_id,
             selected_report_type=selected_report_type,
             report_month=report_month,
-            electricity_price=request.args.get("electricity_price", "0.20725"),
-            sell_price=request.args.get("sell_price", "0.00"),
-            solcor_price_per_kwh=request.args.get("solcor_price_per_kwh", "0.00"),
+            electricity_price=request.args.get("electricity_price", billing_form["electricity_price"]),
+            sell_price=request.args.get("sell_price", billing_form["sell_price"]),
+            solcor_price_per_kwh=request.args.get("solcor_price_per_kwh", billing_form["solcor_price_per_kwh"]),
+            fixed_monthly_fee_eur=billing_form["fixed_monthly_fee_eur"],
+            billing_mode=billing_form["billing_mode"],
+            billing_energy_base=billing_form["billing_energy_base"],
+            selected_billing_config_exists=selected_billing_config_exists,
             fusionsolar_api_warning=get_fusionsolar_performance_cooldown_reason(g.db),
         )
 
@@ -4039,6 +4099,7 @@ def ensure_database(path: str) -> None:
         ensure_predefined_export_templates(conn)
         ensure_portfolio_seed_data(conn)
         ensure_alert_settings_defaults(conn)
+        ensure_billing_config_schema(conn)
         conn.commit()
 
 
@@ -7068,6 +7129,7 @@ def build_local_customer_production_report(
     electricity_price: float,
     sell_price: float,
     solcor_price_per_kwh: float = 0.0,
+    billing_config: BillingConfig | None = None,
 ) -> dict[str, Any] | None:
     asset = conn.execute(
         """
@@ -7158,7 +7220,11 @@ def build_local_customer_production_report(
         "data_source": "Dados locais",
     }
     report.update(extract_customer_tariff_values(parse_production_record_payload(monthly_record) if monthly_record else None))
-    return prepare_customer_report(report, solcor_price_per_kwh=solcor_price_per_kwh)
+    return prepare_customer_report(
+        report,
+        solcor_price_per_kwh=solcor_price_per_kwh,
+        billing_config=billing_config,
+    )
 
 
 def build_fusionsolar_customer_production_report(
@@ -7169,6 +7235,7 @@ def build_fusionsolar_customer_production_report(
     electricity_price: float,
     sell_price: float,
     solcor_price_per_kwh: float = 0.0,
+    billing_config: BillingConfig | None = None,
     force_api: bool = False,
 ) -> dict[str, Any]:
     if not force_api:
@@ -7179,6 +7246,7 @@ def build_fusionsolar_customer_production_report(
             electricity_price=electricity_price,
             sell_price=sell_price,
             solcor_price_per_kwh=solcor_price_per_kwh,
+            billing_config=billing_config,
         )
         if local_report is not None:
             return local_report
@@ -7275,7 +7343,11 @@ def build_fusionsolar_customer_production_report(
         "data_source": "FusionSolar API",
     }
     report.update(extract_customer_tariff_values(monthly_row))
-    return prepare_customer_report(report, solcor_price_per_kwh=solcor_price_per_kwh)
+    return prepare_customer_report(
+        report,
+        solcor_price_per_kwh=solcor_price_per_kwh,
+        billing_config=billing_config,
+    )
 
 
 def export_customer_production_pdf(report: dict[str, Any]):
