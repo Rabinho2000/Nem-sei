@@ -1,0 +1,157 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">Relatorios internos</p>
+    <h2>Portfolio mensal</h2>
+    <p class="muted">Producao FusionSolar, Helioscope ajustado, disponibilidade, tarifas e alertas de dados.</p>
+  </div>
+  <div class="hero-actions">
+    <a class="button secondary" href="{{ url_for('portfolios') }}">Gerir portfolios</a>
+  </div>
+</section>
+
+<section class="card">
+  <form class="stack-form js-auto-submit" method="get">
+    <div class="grid three">
+      <label>Portfolio
+        <select name="portfolio_id">
+          {% for group in groups %}
+            <option value="{{ group.id }}" {{ 'selected' if selected_portfolio_id == group.id }}>{{ group.name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Mes
+        <input type="month" name="report_month" value="{{ report_month }}" required>
+      </label>
+      <div class="field-actions">
+        <a class="button secondary" href="{{ url_for('export_portfolio_report', portfolio_id=selected_portfolio_id, report_month=report_month) }}">Exportar Excel</a>
+      </div>
+    </div>
+  </form>
+  <form method="post" action="{{ url_for('generate_portfolio_report') }}" class="inline-form">
+    <input type="hidden" name="portfolio_id" value="{{ selected_portfolio_id }}">
+    <input type="hidden" name="report_month" value="{{ report_month }}">
+    <button class="button" type="submit">Gerar snapshot</button>
+  </form>
+</section>
+
+<section class="card">
+  <div class="section-title">
+    <h3>Relatorio</h3>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Portfolio</th>
+          <th>Instalacao</th>
+          <th>NIF</th>
+          <th>Sub-account</th>
+          <th>Actual kWh</th>
+          <th>Ponta</th>
+          <th>Cheia</th>
+          <th>Vazio</th>
+          <th>Super vazio</th>
+          <th>Helioscope kWh</th>
+          <th>Ajustado kWh</th>
+          <th>Degradacao</th>
+          <th>Desvio kWh</th>
+          <th>Desvio %</th>
+          <th>Disponibilidade %</th>
+          <th>Tarifa</th>
+          <th>Valor EUR</th>
+          <th>Fatura</th>
+          <th>Estado</th>
+          <th>Avisos</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+          <tr>
+            <td>{{ row.portfolio }}</td>
+            <td>{{ row.installation }}</td>
+            <td>{{ row.nif or "-" }}</td>
+            <td>{{ row.sub_account or "-" }}</td>
+            <td>{{ format_number(row.actual_production_kwh, 2) }}</td>
+            <td>{{ format_number(row.production_ponta_kwh, 2) }}</td>
+            <td>{{ format_number(row.production_cheia_kwh, 2) }}</td>
+            <td>{{ format_number(row.production_vazio_kwh, 2) }}</td>
+            <td>{{ format_number(row.production_super_vazio_kwh, 2) }}</td>
+            <td>{{ format_number(row.helioscope_expected_kwh, 2) }}</td>
+            <td>{{ format_number(row.adjusted_expected_kwh, 2) }}</td>
+            <td>{{ format_number(row.degradation_factor, 4) }}</td>
+            <td>{{ format_number(row.deviation_kwh, 2) }}</td>
+            <td>{{ format_number(row.deviation_pct, 2) }}</td>
+            <td>{{ format_number(row.availability_pct, 2) }}</td>
+            <td>{{ row.tariff_type or "-" }}</td>
+            <td>{{ format_number(row.estimated_value_eur, 2) }}</td>
+            <td>{{ row.invoice_status }}</td>
+            <td>{{ row.data_status }}</td>
+            <td>{{ row.warnings|join("; ") if row.warnings else "-" }}</td>
+          </tr>
+        {% endfor %}
+        {% if total_row %}
+          <tr>
+            <td>{{ total_row.portfolio }}</td>
+            <td><strong>{{ total_row.installation }}</strong></td>
+            <td></td>
+            <td></td>
+            <td><strong>{{ format_number(total_row.actual_production_kwh, 2) }}</strong></td>
+            <td><strong>{{ format_number(total_row.production_ponta_kwh, 2) }}</strong></td>
+            <td><strong>{{ format_number(total_row.production_cheia_kwh, 2) }}</strong></td>
+            <td><strong>{{ format_number(total_row.production_vazio_kwh, 2) }}</strong></td>
+            <td><strong>{{ format_number(total_row.production_super_vazio_kwh, 2) }}</strong></td>
+            <td><strong>{{ format_number(total_row.helioscope_expected_kwh, 2) }}</strong></td>
+            <td><strong>{{ format_number(total_row.adjusted_expected_kwh, 2) }}</strong></td>
+            <td></td>
+            <td><strong>{{ format_number(total_row.deviation_kwh, 2) }}</strong></td>
+            <td><strong>{{ format_number(total_row.deviation_pct, 2) }}</strong></td>
+            <td><strong>{{ format_number(total_row.availability_pct, 2) }}</strong></td>
+            <td></td>
+            <td><strong>{{ format_number(total_row.estimated_value_eur, 2) }}</strong></td>
+            <td></td>
+            <td>{{ total_row.data_status }}</td>
+            <td>{{ total_row.warnings|join("; ") if total_row.warnings else "-" }}</td>
+          </tr>
+        {% elif not rows %}
+          <tr><td colspan="20" class="muted">Sem instalacoes ativas mapeadas para este portfolio.</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="card">
+  <div class="section-title">
+    <h3>Snapshots recentes</h3>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Portfolio</th>
+          <th>Mes</th>
+          <th>Criado em</th>
+          <th>Notas</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for run in runs %}
+          <tr>
+            <td>{{ run.id }}</td>
+            <td>{{ run.portfolio_name }}</td>
+            <td>{{ run.report_month }}</td>
+            <td>{{ run.created_at }}</td>
+            <td>{{ run.notes or "-" }}</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="5" class="muted">Ainda sem snapshots.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

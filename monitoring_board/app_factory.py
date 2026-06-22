@@ -27,6 +27,19 @@ from flask import current_app
 from flask import Flask, abort, flash, g, has_app_context, redirect, render_template, request, send_file, session, url_for
 from monitoring_board.db import configure_database_for_runtime, create_database_backup, ensure_column, get_db, query_all, query_scalar
 from monitoring_board.logging_config import configure_logging
+from monitoring_board.portfolio_reports import (
+    aggregate_portfolio_total,
+    auto_map_portfolio_assets,
+    build_portfolio_kpis,
+    build_portfolio_report_rows,
+    export_portfolio_report_workbook,
+    filter_report_rows,
+    import_helioscope_file,
+    map_external_portfolio_entity,
+    seed_external_portfolio_rows,
+    snapshot_portfolio_report,
+    store_source_file,
+)
 from monitoring_board.routes.auth import auth_bp
 from monitoring_board.routes.field_routes import field_routes_bp
 from monitoring_board.runtime import (
@@ -2425,6 +2438,398 @@ def create_app() -> Flask:
             fusionsolar_api_warning=get_fusionsolar_performance_cooldown_reason(g.db),
         )
 
+    @app.route("/portfolios", methods=["GET", "POST"])
+    def portfolios() -> str:
+        if request.method == "POST":
+            action = request.form.get("action", "").strip()
+            report_month_redirect = normalize_report_month(request.form.get("report_month", ""))
+            portfolio_id_redirect = request.form.get("portfolio_id", "").strip()
+            try:
+                if action == "auto_map":
+                    portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
+                    result = auto_map_portfolio_assets(g.db, portfolio_id=portfolio_id or None)
+                    g.db.commit()
+                    flash(
+                        f"Auto-mapping concluido: {result['mapped']} mapeadas, {result['pending']} pendentes, {result['conflicts']} conflitos.",
+                        "success",
+                    )
+                    return redirect(url_for("portfolios", tab="config", portfolio_id=portfolio_id, report_month=report_month_redirect))
+                if action == "seed_external":
+                    seed_external_portfolio_rows(g.db)
+                    g.db.commit()
+                    flash("Lista externa do portfolio importada/atualizada.", "success")
+                    return redirect(url_for("portfolios", tab="config", portfolio_id=portfolio_id_redirect, report_month=report_month_redirect))
+                if action == "add_asset":
+                    portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
+                    asset_id_raw = request.form.get("asset_id", "").strip()
+                    external_name = request.form.get("external_name", "").strip()
+                    nif = request.form.get("nif", "").strip()
+                    sub_account = request.form.get("sub_account", "").strip()
+                    mapping = (
+                        {"asset_id": int(asset_id_raw), "mapping_status": "manual", "mapping_confidence": 1.0}
+                        if asset_id_raw
+                        else map_external_portfolio_entity(g.db, nif=nif, external_name=external_name)
+                    )
+                    if not mapping["asset_id"]:
+                        flash("Nao foi possivel mapear automaticamente. Escolhe uma instalacao manualmente.", "error")
+                    else:
+                        g.db.execute(
+                            """
+                            INSERT INTO portfolio_assets (
+                                portfolio_id, asset_id, external_name, nif, sub_account, active, mapping_status, mapping_confidence, notes
+                            ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+                            ON CONFLICT(portfolio_id, asset_id) DO UPDATE SET
+                                external_name = excluded.external_name,
+                                nif = excluded.nif,
+                                sub_account = excluded.sub_account,
+                                active = 1,
+                                mapping_status = excluded.mapping_status,
+                                mapping_confidence = excluded.mapping_confidence,
+                                notes = excluded.notes
+                            """,
+                            (
+                                portfolio_id,
+                                mapping["asset_id"],
+                                external_name,
+                                nif,
+                                sub_account,
+                                mapping["mapping_status"],
+                                mapping["mapping_confidence"],
+                                request.form.get("notes", "").strip(),
+                            ),
+                        )
+                        g.db.commit()
+                        flash("Instalacao adicionada ao portfolio.", "success")
+                    portfolio_id_redirect = str(portfolio_id)
+                elif action == "update_asset":
+                    portfolio_asset_id = int(request.form.get("portfolio_asset_id", "0") or 0)
+                    asset_id_raw = request.form.get("asset_id", "").strip()
+                    g.db.execute(
+                        """
+                        UPDATE portfolio_assets
+                        SET asset_id = ?, external_name = ?, nif = ?, sub_account = ?, active = ?,
+                            mapping_status = ?, mapping_confidence = ?, notes = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            int(asset_id_raw) if asset_id_raw.isdigit() else None,
+                            request.form.get("external_name", "").strip(),
+                            request.form.get("nif", "").strip(),
+                            request.form.get("sub_account", "").strip(),
+                            1 if request.form.get("active") == "on" else 0,
+                            "manual" if asset_id_raw.isdigit() else "mapping_pending",
+                            1.0 if asset_id_raw.isdigit() else 0.0,
+                            request.form.get("notes", "").strip(),
+                            portfolio_asset_id,
+                        ),
+                    )
+                    g.db.commit()
+                    flash("Mapeamento atualizado.", "success")
+                elif action == "save_tariff":
+                    asset_id = int(request.form.get("asset_id", "0") or 0)
+                    invoice_file_id_raw = request.form.get("invoice_file_id", "").strip()
+                    g.db.execute(
+                        """
+                        INSERT INTO asset_tariffs (
+                            asset_id, tariff_type, cycle_type, simple_price_eur_kwh, ponta_price_eur_kwh,
+                            cheia_price_eur_kwh, vazio_price_eur_kwh, super_vazio_price_eur_kwh,
+                            invoice_file_id, valid_from, valid_to, notes
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            asset_id,
+                            request.form.get("tariff_type", "simple").strip(),
+                            request.form.get("cycle_type", "").strip(),
+                            parse_float_value(request.form.get("simple_price_eur_kwh")),
+                            parse_float_value(request.form.get("ponta_price_eur_kwh")),
+                            parse_float_value(request.form.get("cheia_price_eur_kwh")),
+                            parse_float_value(request.form.get("vazio_price_eur_kwh")),
+                            parse_float_value(request.form.get("super_vazio_price_eur_kwh")),
+                            int(invoice_file_id_raw) if invoice_file_id_raw.isdigit() else None,
+                            request.form.get("valid_from", "").strip(),
+                            request.form.get("valid_to", "").strip(),
+                            request.form.get("notes", "").strip(),
+                        ),
+                    )
+                    g.db.commit()
+                    flash("Tarifa guardada.", "success")
+                elif action == "add_tariff_rule":
+                    g.db.execute(
+                        """
+                        INSERT INTO tariff_period_rules (tariff_id, weekday_type, start_time, end_time, period_name)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            int(request.form.get("tariff_id", "0") or 0),
+                            request.form.get("weekday_type", "all").strip(),
+                            request.form.get("start_time", "").strip(),
+                            request.form.get("end_time", "").strip(),
+                            request.form.get("period_name", "").strip(),
+                        ),
+                    )
+                    g.db.commit()
+                    flash("Regra horaria adicionada.", "success")
+            except Exception as exc:
+                g.db.rollback()
+                flash(f"Falha ao guardar portfolio: {exc}", "error")
+            return redirect(url_for("portfolios", tab="config", portfolio_id=portfolio_id_redirect, report_month=report_month_redirect))
+
+        groups = query_all(g.db, "SELECT * FROM portfolio_groups ORDER BY name COLLATE NOCASE")
+        selected_portfolio_id = int(request.args.get("portfolio_id", groups[0]["id"] if groups else 0) or 0)
+        report_month = normalize_report_month(request.args.get("report_month", ""))
+        active_tab = request.args.get("tab", "report").strip()
+        warning_filter = request.args.get("warning_filter", "all").strip()
+        config_filter = request.args.get("config_filter", "all").strip()
+        report_rows_all = build_portfolio_report_rows(g.db, selected_portfolio_id, report_month) if selected_portfolio_id else []
+        portfolio_name = next((row["name"] for row in groups if int(row["id"]) == selected_portfolio_id), "")
+        for row in report_rows_all:
+            row["portfolio"] = portfolio_name
+        total_row = aggregate_portfolio_total(report_rows_all) if report_rows_all else None
+        if total_row:
+            total_row["portfolio"] = portfolio_name
+        report_rows = filter_report_rows(report_rows_all, warning_filter)
+        kpis = build_portfolio_kpis(report_rows_all, total_row)
+        portfolio_assets = query_all(
+            g.db,
+            """
+            SELECT pa.*, pg.name AS portfolio_name, a.project_name, a.nif AS asset_nif, a.mounting_date,
+                   sf.original_filename AS latest_helioscope_file,
+                   inv.original_filename AS latest_invoice_file,
+                   at.id AS tariff_id, at.tariff_type, at.simple_price_eur_kwh, at.ponta_price_eur_kwh,
+                   at.cheia_price_eur_kwh, at.vazio_price_eur_kwh, at.super_vazio_price_eur_kwh
+            FROM portfolio_assets pa
+            JOIN portfolio_groups pg ON pg.id = pa.portfolio_id
+            LEFT JOIN assets a ON a.id = pa.asset_id
+            LEFT JOIN source_files sf ON sf.id = (
+                SELECT id FROM source_files
+                WHERE asset_id = pa.asset_id AND file_type = 'helioscope'
+                ORDER BY uploaded_at DESC, id DESC LIMIT 1
+            )
+            LEFT JOIN source_files inv ON inv.id = (
+                SELECT id FROM source_files
+                WHERE asset_id = pa.asset_id AND file_type = 'invoice'
+                ORDER BY uploaded_at DESC, id DESC LIMIT 1
+            )
+            LEFT JOIN asset_tariffs at ON at.id = (
+                SELECT id FROM asset_tariffs
+                WHERE asset_id = pa.asset_id
+                ORDER BY COALESCE(valid_from, '') DESC, id DESC LIMIT 1
+            )
+            ORDER BY pg.name COLLATE NOCASE, COALESCE(pa.external_name, a.project_name) COLLATE NOCASE
+            """,
+        )
+        assets = query_all(g.db, "SELECT id, project_name, nif FROM assets ORDER BY project_name COLLATE NOCASE")
+        invoices = query_all(g.db, "SELECT id, asset_id, original_filename FROM source_files WHERE file_type = 'invoice' ORDER BY uploaded_at DESC")
+        tariff_rules = query_all(g.db, "SELECT * FROM tariff_period_rules ORDER BY tariff_id, weekday_type, start_time")
+        config_assets = [row for row in portfolio_assets if int(row["portfolio_id"]) == selected_portfolio_id]
+        if config_filter == "pending":
+            config_assets = [row for row in config_assets if not row["asset_id"] or row["mapping_status"] == "mapping_pending"]
+        elif config_filter == "conflicts":
+            config_assets = [row for row in config_assets if row["mapping_status"] == "mapping_conflict"]
+        return render_template(
+            "portfolios.html",
+            title="Portfolios",
+            groups=groups,
+            selected_portfolio_id=selected_portfolio_id,
+            report_month=report_month,
+            active_tab=active_tab if active_tab in {"report", "config"} else "report",
+            warning_filter=warning_filter,
+            config_filter=config_filter,
+            rows=report_rows,
+            total_row=total_row,
+            kpis=kpis,
+            portfolio_assets=portfolio_assets,
+            config_assets=config_assets,
+            assets=assets,
+            invoices=invoices,
+            tariff_rules=tariff_rules,
+        )
+
+    @app.route("/portfolios/export-mapping")
+    def export_portfolio_mapping():
+        portfolio_id = int(request.args.get("portfolio_id", "0") or 0)
+        group = g.db.execute("SELECT * FROM portfolio_groups WHERE id = ?", (portfolio_id,)).fetchone()
+        rows = query_all(
+            g.db,
+            """
+            SELECT pg.name AS portfolio_name, pa.sub_account, pa.nif, pa.external_name,
+                   a.project_name AS local_installation, pa.mapping_confidence, pa.mapping_status,
+                   sf.original_filename AS helioscope_file, inv.original_filename AS invoice_file,
+                   at.tariff_type
+            FROM portfolio_assets pa
+            JOIN portfolio_groups pg ON pg.id = pa.portfolio_id
+            LEFT JOIN assets a ON a.id = pa.asset_id
+            LEFT JOIN source_files sf ON sf.id = (
+                SELECT id FROM source_files
+                WHERE asset_id = pa.asset_id AND file_type = 'helioscope'
+                ORDER BY uploaded_at DESC, id DESC LIMIT 1
+            )
+            LEFT JOIN source_files inv ON inv.id = (
+                SELECT id FROM source_files
+                WHERE asset_id = pa.asset_id AND file_type = 'invoice'
+                ORDER BY uploaded_at DESC, id DESC LIMIT 1
+            )
+            LEFT JOIN asset_tariffs at ON at.id = (
+                SELECT id FROM asset_tariffs
+                WHERE asset_id = pa.asset_id
+                ORDER BY COALESCE(valid_from, '') DESC, id DESC LIMIT 1
+            )
+            WHERE pa.portfolio_id = ?
+            ORDER BY pa.sub_account
+            """,
+            (portfolio_id,),
+        )
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Mapping"
+        headers = ["Portfolio", "Subconta", "NIF", "Nome externo", "Instalacao local", "Confianca", "Estado", "Helioscope", "Fatura", "Tarifa"]
+        sheet.append(headers)
+        for row in rows:
+            sheet.append([
+                row["portfolio_name"],
+                row["sub_account"],
+                row["nif"],
+                row["external_name"],
+                row["local_installation"] or "",
+                row["mapping_confidence"],
+                row["mapping_status"],
+                row["helioscope_file"] or "",
+                row["invoice_file"] or "",
+                row["tariff_type"] or "",
+            ])
+        for column in sheet.columns:
+            width = max(len(str(cell.value or "")) for cell in column)
+            sheet.column_dimensions[column[0].column_letter].width = min(max(width + 2, 12), 42)
+        buffer = io.BytesIO()
+        workbook.save(buffer)
+        buffer.seek(0)
+        name = (group["name"] if group else f"portfolio_{portfolio_id}").replace(" ", "_")
+        return send_file(
+            buffer,
+            as_attachment=True,
+            download_name=f"{name}_mapping.xlsx",
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    @app.route("/portfolios/upload-helioscope", methods=["POST"])
+    def upload_portfolio_helioscope():
+        asset_id = int(request.form.get("asset_id", "0") or 0)
+        portfolio_id_raw = request.form.get("portfolio_id", "").strip()
+        upload = request.files.get("file")
+        if not asset_id or upload is None or not upload.filename:
+            flash("Escolhe a instalacao e o ficheiro Helioscope.", "error")
+            return redirect(url_for("portfolios"))
+        try:
+            result = import_helioscope_file(
+                g.db,
+                upload_dir=UPLOAD_DIR,
+                file_storage=upload,
+                asset_id=asset_id,
+                portfolio_id=int(portfolio_id_raw) if portfolio_id_raw.isdigit() else None,
+            )
+            g.db.commit()
+            flash(f"Helioscope importado: {result['months']} meses.", "success")
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao importar Helioscope: {exc}", "error")
+        return redirect(url_for("portfolios"))
+
+    @app.route("/portfolios/upload-invoice", methods=["POST"])
+    def upload_portfolio_invoice():
+        asset_id = int(request.form.get("asset_id", "0") or 0)
+        portfolio_id_raw = request.form.get("portfolio_id", "").strip()
+        upload = request.files.get("file")
+        if not asset_id or upload is None or not upload.filename:
+            flash("Escolhe a instalacao e o ficheiro fonte da fatura.", "error")
+            return redirect(url_for("portfolios"))
+        try:
+            store_source_file(
+                g.db,
+                upload_dir=UPLOAD_DIR,
+                file_storage=upload,
+                asset_id=asset_id,
+                portfolio_id=int(portfolio_id_raw) if portfolio_id_raw.isdigit() else None,
+                file_type="invoice",
+            )
+            g.db.commit()
+            flash("Fatura/ficheiro fonte guardado.", "success")
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao guardar fatura: {exc}", "error")
+        return redirect(url_for("portfolios"))
+
+    @app.route("/portfolio-reports")
+    def portfolio_reports() -> str:
+        groups = query_all(g.db, "SELECT * FROM portfolio_groups ORDER BY name COLLATE NOCASE")
+        selected_portfolio_id = int(request.args.get("portfolio_id", groups[0]["id"] if groups else 0) or 0)
+        report_month = normalize_report_month(request.args.get("report_month", ""))
+        rows = build_portfolio_report_rows(g.db, selected_portfolio_id, report_month) if selected_portfolio_id else []
+        portfolio_name = next((row["name"] for row in groups if int(row["id"]) == selected_portfolio_id), "")
+        for row in rows:
+            row["portfolio"] = portfolio_name
+        total_row = aggregate_portfolio_total(rows) if rows else None
+        if total_row:
+            total_row["portfolio"] = portfolio_name
+        runs = query_all(
+            g.db,
+            """
+            SELECT prr.*, pg.name AS portfolio_name
+            FROM portfolio_report_runs prr
+            JOIN portfolio_groups pg ON pg.id = prr.portfolio_id
+            ORDER BY prr.created_at DESC
+            LIMIT 20
+            """,
+        )
+        return render_template(
+            "portfolio_reports.html",
+            title="Relatorios de portfolio",
+            groups=groups,
+            selected_portfolio_id=selected_portfolio_id,
+            report_month=report_month,
+            rows=rows,
+            total_row=total_row,
+            runs=runs,
+        )
+
+    @app.route("/portfolio-reports/generate", methods=["POST"])
+    def generate_portfolio_report():
+        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
+        report_month = normalize_report_month(request.form.get("report_month", ""))
+        return_to = request.form.get("return_to", "").strip()
+        try:
+            report_id = snapshot_portfolio_report(g.db, portfolio_id, report_month, request.form.get("notes", "").strip())
+            g.db.commit()
+            flash(f"Relatorio snapshot #{report_id} gerado.", "success")
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao gerar relatorio: {exc}", "error")
+        if return_to == "portfolios":
+            return redirect(url_for("portfolios", portfolio_id=portfolio_id, report_month=report_month, tab="report"))
+        return redirect(url_for("portfolio_reports", portfolio_id=portfolio_id, report_month=report_month))
+
+    @app.route("/portfolio-reports/export")
+    def export_portfolio_report():
+        portfolio_id = int(request.args.get("portfolio_id", "0") or 0)
+        report_month = normalize_report_month(request.args.get("report_month", ""))
+        group = g.db.execute("SELECT * FROM portfolio_groups WHERE id = ?", (portfolio_id,)).fetchone()
+        rows = build_portfolio_report_rows(g.db, portfolio_id, report_month) if group else []
+        for row in rows:
+            row["portfolio"] = group["name"] if group else ""
+        if rows:
+            total = aggregate_portfolio_total(rows)
+            total["portfolio"] = group["name"] if group else ""
+            rows.append(total)
+        workbook = export_portfolio_report_workbook(rows)
+        buffer = io.BytesIO()
+        workbook.save(buffer)
+        buffer.seek(0)
+        return send_file(
+            buffer,
+            as_attachment=True,
+            download_name=f"portfolio_{portfolio_id}_{report_month}.xlsx",
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
     @app.route("/integrations", methods=["GET", "POST"])
     def integrations() -> str:
         provider = INTEGRATION_PROVIDER_FUSIONSOLAR
@@ -3365,6 +3770,126 @@ def ensure_database(path: str) -> None:
                 FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS portfolio_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                notes TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS portfolio_assets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                portfolio_id INTEGER NOT NULL,
+                asset_id INTEGER,
+                external_name TEXT,
+                nif TEXT,
+                sub_account TEXT,
+                active INTEGER DEFAULT 1,
+                mapping_status TEXT,
+                mapping_confidence REAL,
+                notes TEXT,
+                UNIQUE(portfolio_id, asset_id),
+                FOREIGN KEY (portfolio_id) REFERENCES portfolio_groups(id) ON DELETE CASCADE,
+                FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS source_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset_id INTEGER NOT NULL,
+                portfolio_id INTEGER,
+                file_type TEXT NOT NULL,
+                original_filename TEXT NOT NULL,
+                stored_path TEXT NOT NULL,
+                uploaded_at TEXT NOT NULL,
+                notes TEXT,
+                FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE,
+                FOREIGN KEY (portfolio_id) REFERENCES portfolio_groups(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS helioscope_expected_production (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset_id INTEGER NOT NULL,
+                source_file_id INTEGER NOT NULL,
+                base_year INTEGER,
+                month INTEGER NOT NULL,
+                expected_kwh REAL NOT NULL,
+                imported_at TEXT NOT NULL,
+                notes TEXT,
+                FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE,
+                FOREIGN KEY (source_file_id) REFERENCES source_files(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS asset_tariffs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset_id INTEGER NOT NULL,
+                tariff_type TEXT NOT NULL,
+                cycle_type TEXT,
+                simple_price_eur_kwh REAL,
+                ponta_price_eur_kwh REAL,
+                cheia_price_eur_kwh REAL,
+                vazio_price_eur_kwh REAL,
+                super_vazio_price_eur_kwh REAL,
+                invoice_file_id INTEGER,
+                valid_from TEXT,
+                valid_to TEXT,
+                notes TEXT,
+                FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE,
+                FOREIGN KEY (invoice_file_id) REFERENCES source_files(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS tariff_period_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tariff_id INTEGER NOT NULL,
+                weekday_type TEXT NOT NULL,
+                start_time TEXT NOT NULL,
+                end_time TEXT NOT NULL,
+                period_name TEXT NOT NULL,
+                FOREIGN KEY (tariff_id) REFERENCES asset_tariffs(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS production_hourly_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset_id INTEGER NOT NULL,
+                provider TEXT NOT NULL,
+                period_start TEXT NOT NULL,
+                period_end TEXT NOT NULL,
+                production_kwh REAL,
+                payload_json TEXT,
+                imported_at TEXT NOT NULL,
+                UNIQUE(asset_id, provider, period_start),
+                FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS portfolio_report_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                portfolio_id INTEGER NOT NULL,
+                report_month TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                notes TEXT,
+                FOREIGN KEY (portfolio_id) REFERENCES portfolio_groups(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS portfolio_report_rows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                report_id INTEGER NOT NULL,
+                asset_id INTEGER,
+                actual_production_kwh REAL,
+                production_ponta_kwh REAL,
+                production_cheia_kwh REAL,
+                production_vazio_kwh REAL,
+                production_super_vazio_kwh REAL,
+                helioscope_expected_kwh REAL,
+                adjusted_expected_kwh REAL,
+                degradation_factor REAL,
+                deviation_kwh REAL,
+                deviation_pct REAL,
+                availability_pct REAL,
+                estimated_value_eur REAL,
+                data_status TEXT,
+                warnings_json TEXT,
+                FOREIGN KEY (report_id) REFERENCES portfolio_report_runs(id) ON DELETE CASCADE,
+                FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE SET NULL
+            );
+
             CREATE TABLE IF NOT EXISTS performance_settings (
                 asset_id INTEGER PRIMARY KEY,
                 enabled INTEGER DEFAULT 1,
@@ -3477,6 +4002,7 @@ def ensure_database(path: str) -> None:
         ensure_column(conn, "assets", "monitoring_status TEXT DEFAULT 'active'")
         ensure_column(conn, "assets", "silenced_until TEXT")
         ensure_column(conn, "assets", "silence_reason TEXT")
+        ensure_column(conn, "assets", "mounting_date TEXT")
         ensure_column(conn, "tickets", "planned_date TEXT")
         ensure_column(conn, "tickets", "due_date TEXT")
         ensure_column(conn, "tickets", "estimated_minutes INTEGER DEFAULT 60")
@@ -3503,6 +4029,7 @@ def ensure_database(path: str) -> None:
         populate_missing_installation_groups(conn)
         populate_missing_group_metadata(conn)
         ensure_predefined_export_templates(conn)
+        ensure_portfolio_seed_data(conn)
         ensure_alert_settings_defaults(conn)
         conn.commit()
 
@@ -3575,8 +4102,32 @@ def ensure_database_indexes(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_provider_device_expected_strings_device_index
             ON provider_device_expected_strings(provider_device_id, string_index);
+
+        CREATE INDEX IF NOT EXISTS idx_portfolio_assets_portfolio_active
+            ON portfolio_assets(portfolio_id, active);
+
+        CREATE INDEX IF NOT EXISTS idx_helioscope_expected_asset_month
+            ON helioscope_expected_production(asset_id, month, imported_at);
+
+        CREATE INDEX IF NOT EXISTS idx_asset_tariffs_asset_validity
+            ON asset_tariffs(asset_id, valid_from, valid_to);
+
+        CREATE INDEX IF NOT EXISTS idx_production_hourly_asset_period
+            ON production_hourly_records(asset_id, provider, period_start);
+
+        CREATE INDEX IF NOT EXISTS idx_portfolio_report_runs_portfolio_month
+            ON portfolio_report_runs(portfolio_id, report_month, created_at);
         """
     )
+
+
+def ensure_portfolio_seed_data(conn: sqlite3.Connection) -> None:
+    for name in ("Solcorelios I", "Solcorelios II"):
+        conn.execute(
+            "INSERT OR IGNORE INTO portfolio_groups (name, notes) VALUES (?, '')",
+            (name,),
+        )
+    seed_external_portfolio_rows(conn)
 
 
 def encode_job_params(params: dict[str, Any]) -> str:

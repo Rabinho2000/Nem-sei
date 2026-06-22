@@ -1,0 +1,314 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">Portefolios internos</p>
+    <h2>Relatorios de Portefolio</h2>
+    <p class="muted">Solcorelios I e Solcorelios II.</p>
+  </div>
+  <div class="hero-actions">
+    <form method="post" action="{{ url_for('generate_portfolio_report') }}" class="inline-form">
+      <input type="hidden" name="return_to" value="portfolios">
+      <input type="hidden" name="portfolio_id" value="{{ selected_portfolio_id }}">
+      <input type="hidden" name="report_month" value="{{ report_month }}">
+      <button class="button" type="submit">Gerar relatorio</button>
+    </form>
+    <a class="button secondary" href="{{ url_for('export_portfolio_report', portfolio_id=selected_portfolio_id, report_month=report_month) }}">Exportar Excel</a>
+    <button class="button secondary" type="button" disabled>Exportar PDF interno</button>
+  </div>
+</section>
+
+<section class="card">
+  <form class="filters js-auto-submit" method="get">
+    <input type="hidden" name="tab" value="{{ active_tab }}">
+    <label>Portfolio
+      <select name="portfolio_id">
+        {% for group in groups %}
+          <option value="{{ group.id }}" {{ 'selected' if selected_portfolio_id == group.id }}>{{ group.name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Mes
+      <input type="month" name="report_month" value="{{ report_month }}" required>
+    </label>
+    <label>Filtro dados
+      <select name="warning_filter">
+        <option value="all" {{ 'selected' if warning_filter == 'all' }}>Mostrar todos</option>
+        <option value="warnings" {{ 'selected' if warning_filter == 'warnings' }}>So avisos</option>
+        <option value="helioscope" {{ 'selected' if warning_filter == 'helioscope' }}>Sem Helioscope</option>
+        <option value="invoice" {{ 'selected' if warning_filter == 'invoice' }}>Sem fatura</option>
+        <option value="mapping" {{ 'selected' if warning_filter == 'mapping' }}>Mapping pendente</option>
+      </select>
+    </label>
+  </form>
+</section>
+
+<nav class="tab-nav" aria-label="Portfolios">
+  <a class="{{ 'active' if active_tab == 'report' else '' }}" href="{{ url_for('portfolios', tab='report', portfolio_id=selected_portfolio_id, report_month=report_month, warning_filter=warning_filter) }}">Relatorio</a>
+  <a class="{{ 'active' if active_tab == 'config' else '' }}" href="{{ url_for('portfolios', tab='config', portfolio_id=selected_portfolio_id, report_month=report_month, warning_filter=warning_filter) }}">Configuracao</a>
+</nav>
+
+{% if active_tab == 'report' %}
+  <section class="cards dashboard-kpis">
+    <article class="card stat-card"><span>Producao real kWh</span><strong>{{ format_number(kpis.actual_production_kwh, 2) }}</strong></article>
+    <article class="card stat-card"><span>Esperado ajustado kWh</span><strong>{{ format_number(kpis.adjusted_expected_kwh, 2) }}</strong></article>
+    <article class="card stat-card"><span>Desvio kWh</span><strong>{{ format_number(kpis.deviation_kwh, 2) }}</strong></article>
+    <article class="card stat-card"><span>Desvio %</span><strong>{{ format_number(kpis.deviation_pct, 2) }}</strong></article>
+    <article class="card stat-card"><span>Availability time %</span><strong>{{ format_number(kpis.availability_pct, 2) }}</strong></article>
+    <article class="card stat-card"><span>Valor estimado EUR</span><strong>{{ format_number(kpis.estimated_value_eur, 2) }}</strong></article>
+    <article class="card stat-card"><span>Instalacoes com dados em falta</span><strong>{{ kpis.missing_data_installations }}</strong></article>
+  </section>
+
+  <section class="card">
+    <div class="section-title">
+      <h3>Relatorio mensal</h3>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Subconta</th>
+            <th>NIF</th>
+            <th>Instalacao externa</th>
+            <th>Instalacao local</th>
+            <th>Producao real mensal kWh</th>
+            <th>Ponta kWh</th>
+            <th>Cheia kWh</th>
+            <th>Vazio kWh</th>
+            <th>Super vazio kWh</th>
+            <th>Helioscope base kWh</th>
+            <th>Esperada ajustada kWh</th>
+            <th>Fator degradacao</th>
+            <th>Desvio kWh</th>
+            <th>Desvio %</th>
+            <th>Availability time %</th>
+            <th>Tipo tarifa</th>
+            <th>Valor EUR</th>
+            <th>Estado dados</th>
+            <th>Avisos</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+            <tr>
+              <td>{{ row.sub_account or "-" }}</td>
+              <td>{{ row.nif or "-" }}</td>
+              <td>{{ row.external_installation or row.installation or "-" }}</td>
+              <td>{{ row.local_installation or "-" }}</td>
+              <td>{{ format_number(row.actual_production_kwh, 2) }}</td>
+              <td>{{ format_number(row.production_ponta_kwh, 2) }}</td>
+              <td>{{ format_number(row.production_cheia_kwh, 2) }}</td>
+              <td>{{ format_number(row.production_vazio_kwh, 2) }}</td>
+              <td>{{ format_number(row.production_super_vazio_kwh, 2) }}</td>
+              <td>{{ format_number(row.helioscope_expected_kwh, 2) }}</td>
+              <td>{{ format_number(row.adjusted_expected_kwh, 2) }}</td>
+              <td>{{ format_number(row.degradation_factor, 4) }}</td>
+              <td>{{ format_number(row.deviation_kwh, 2) }}</td>
+              <td>{{ format_number(row.deviation_pct, 2) }}</td>
+              <td>{{ format_number(row.availability_pct, 2) }}</td>
+              <td>{{ row.tariff_type or "-" }}</td>
+              <td>{{ format_number(row.estimated_value_eur, 2) }}</td>
+              <td><span class="chip {{ 'success' if row.status_label == 'OK' else 'warning' }}">{{ row.status_label }}</span></td>
+              <td>{{ row.warning_labels|join("; ") if row.warning_labels else "-" }}</td>
+            </tr>
+          {% endfor %}
+          {% if total_row %}
+            <tr class="total-row">
+              <td></td>
+              <td></td>
+              <td><strong>Total</strong></td>
+              <td></td>
+              <td><strong>{{ format_number(total_row.actual_production_kwh, 2) }}</strong></td>
+              <td><strong>{{ format_number(total_row.production_ponta_kwh, 2) }}</strong></td>
+              <td><strong>{{ format_number(total_row.production_cheia_kwh, 2) }}</strong></td>
+              <td><strong>{{ format_number(total_row.production_vazio_kwh, 2) }}</strong></td>
+              <td><strong>{{ format_number(total_row.production_super_vazio_kwh, 2) }}</strong></td>
+              <td><strong>{{ format_number(total_row.helioscope_expected_kwh, 2) }}</strong></td>
+              <td><strong>{{ format_number(total_row.adjusted_expected_kwh, 2) }}</strong></td>
+              <td></td>
+              <td><strong>{{ format_number(total_row.deviation_kwh, 2) }}</strong></td>
+              <td><strong>{{ format_number(total_row.deviation_pct, 2) }}</strong></td>
+              <td><strong>{{ format_number(total_row.availability_pct, 2) }}</strong></td>
+              <td></td>
+              <td><strong>{{ format_number(total_row.estimated_value_eur, 2) }}</strong></td>
+              <td>{{ total_row.status_label }}</td>
+              <td>{{ total_row.missing_data_count }} instalacoes com avisos</td>
+            </tr>
+          {% elif not rows %}
+            <tr><td colspan="19" class="muted">Sem linhas para estes filtros.</td></tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% else %}
+  <section class="card">
+    <div class="section-title">
+      <h3>Configuracao</h3>
+      <div class="hero-actions">
+        <form method="post" class="inline-form">
+          <input type="hidden" name="action" value="seed_external">
+          <input type="hidden" name="portfolio_id" value="{{ selected_portfolio_id }}">
+          <input type="hidden" name="report_month" value="{{ report_month }}">
+          <button class="button secondary" type="submit">Importar lista do portefolio</button>
+        </form>
+        <form method="post" class="inline-form">
+          <input type="hidden" name="action" value="auto_map">
+          <input type="hidden" name="portfolio_id" value="{{ selected_portfolio_id }}">
+          <input type="hidden" name="report_month" value="{{ report_month }}">
+          <button class="button secondary" type="submit">Auto-mapear por NIF/nome</button>
+        </form>
+        <a class="button secondary" href="{{ url_for('portfolios', tab='config', portfolio_id=selected_portfolio_id, report_month=report_month, config_filter='pending') }}">Mostrar so pendentes</a>
+        <a class="button secondary" href="{{ url_for('portfolios', tab='config', portfolio_id=selected_portfolio_id, report_month=report_month, config_filter='conflicts') }}">Mostrar conflitos</a>
+        <a class="button secondary" href="{{ url_for('export_portfolio_mapping', portfolio_id=selected_portfolio_id) }}">Exportar mapping</a>
+      </div>
+    </div>
+    <details class="asset-edit-details">
+      <summary class="button secondary">Adicionar manualmente</summary>
+      <form class="stack-form top-space" method="post">
+        <input type="hidden" name="action" value="add_asset">
+        <input type="hidden" name="report_month" value="{{ report_month }}">
+        <div class="grid four">
+          <label>Portfolio
+            <select name="portfolio_id" required>
+              {% for group in groups %}
+                <option value="{{ group.id }}" {{ 'selected' if selected_portfolio_id == group.id }}>{{ group.name }}</option>
+              {% endfor %}
+            </select>
+          </label>
+          <label>Instalacao local
+            <select name="asset_id">
+              <option value="">Sem mapping</option>
+              {% for asset in assets %}
+                <option value="{{ asset.id }}">{{ asset.project_name }}</option>
+              {% endfor %}
+            </select>
+          </label>
+          <label>Nome externo <input type="text" name="external_name"></label>
+          <label>NIF <input type="text" name="nif"></label>
+          <label>Subconta <input type="text" name="sub_account"></label>
+          <label>Notas <input type="text" name="notes"></label>
+        </div>
+        <button class="button" type="submit">Guardar</button>
+      </form>
+    </details>
+  </section>
+
+  <section class="card">
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Portfolio</th>
+            <th>Subconta</th>
+            <th>NIF</th>
+            <th>Nome externo</th>
+            <th>Instalacao local mapeada</th>
+            <th>Confianca</th>
+            <th>Estado mapping</th>
+            <th>Helioscope</th>
+            <th>Fatura</th>
+            <th>Tarifa</th>
+            <th>Acoes</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for item in config_assets %}
+            <tr>
+              <td>{{ item.portfolio_name }}</td>
+              <td>{{ item.sub_account or "-" }}</td>
+              <td>{{ item.nif or item.asset_nif or "-" }}</td>
+              <td>{{ item.external_name or "-" }}</td>
+              <td>
+                <form method="post" class="stack-form">
+                  <input type="hidden" name="action" value="update_asset">
+                  <input type="hidden" name="portfolio_id" value="{{ selected_portfolio_id }}">
+                  <input type="hidden" name="report_month" value="{{ report_month }}">
+                  <input type="hidden" name="portfolio_asset_id" value="{{ item.id }}">
+                  <input type="hidden" name="external_name" value="{{ item.external_name or '' }}">
+                  <input type="hidden" name="nif" value="{{ item.nif or '' }}">
+                  <input type="hidden" name="sub_account" value="{{ item.sub_account or '' }}">
+                  <input type="hidden" name="notes" value="{{ item.notes or '' }}">
+                  <label class="sr-only">Instalacao local</label>
+                  <select name="asset_id">
+                    <option value="">Sem mapping</option>
+                    {% for asset in assets %}
+                      <option value="{{ asset.id }}" {{ 'selected' if item.asset_id == asset.id }}>{{ asset.project_name }}</option>
+                    {% endfor %}
+                  </select>
+                  <label class="check-row">
+                    <input type="checkbox" name="active" {{ 'checked' if item.active }}>
+                    <span>Ativo</span>
+                  </label>
+                  <button class="button secondary" type="submit">Guardar mapping</button>
+                </form>
+              </td>
+              <td>{{ "%.0f%%"|format((item.mapping_confidence or 0) * 100) }}</td>
+              <td>{{ item.mapping_status or "-" }}</td>
+              <td>{{ item.latest_helioscope_file or "Em falta" }}</td>
+              <td>{{ item.latest_invoice_file or "Em falta" }}</td>
+              <td>{{ item.tariff_type or "Em falta" }}</td>
+              <td>
+                {% if item.asset_id %}
+                  <div class="grid two">
+                    <form method="post" action="{{ url_for('upload_portfolio_helioscope') }}" enctype="multipart/form-data" class="stack-form">
+                      <input type="hidden" name="portfolio_id" value="{{ item.portfolio_id }}">
+                      <input type="hidden" name="asset_id" value="{{ item.asset_id }}">
+                      <input type="file" name="file" accept=".xlsx,.xlsm,.xltx,.xltm" required>
+                      <button class="button secondary" type="submit">Upload Helioscope</button>
+                    </form>
+                    <form method="post" action="{{ url_for('upload_portfolio_invoice') }}" enctype="multipart/form-data" class="stack-form">
+                      <input type="hidden" name="portfolio_id" value="{{ item.portfolio_id }}">
+                      <input type="hidden" name="asset_id" value="{{ item.asset_id }}">
+                      <input type="file" name="file" required>
+                      <button class="button secondary" type="submit">Upload fatura</button>
+                    </form>
+                  </div>
+                  <details>
+                    <summary class="button secondary">Editar tarifa</summary>
+                    <form method="post" class="stack-form top-space">
+                      <input type="hidden" name="action" value="save_tariff">
+                      <input type="hidden" name="portfolio_id" value="{{ selected_portfolio_id }}">
+                      <input type="hidden" name="report_month" value="{{ report_month }}">
+                      <input type="hidden" name="asset_id" value="{{ item.asset_id }}">
+                      <div class="grid two">
+                        <label>Tipo
+                          <select name="tariff_type">
+                            <option value="simple">Simples</option>
+                            <option value="bi-hourly">Bi-horaria</option>
+                            <option value="tri-hourly">Tri-horaria</option>
+                          </select>
+                        </label>
+                        <label>Fatura fonte
+                          <select name="invoice_file_id">
+                            <option value="">Escolher</option>
+                            {% for invoice in invoices if invoice.asset_id == item.asset_id %}
+                              <option value="{{ invoice.id }}">{{ invoice.original_filename }}</option>
+                            {% endfor %}
+                          </select>
+                        </label>
+                        <label>Simples EUR/kWh <input type="number" step="0.00001" name="simple_price_eur_kwh"></label>
+                        <label>Ponta EUR/kWh <input type="number" step="0.00001" name="ponta_price_eur_kwh"></label>
+                        <label>Cheia EUR/kWh <input type="number" step="0.00001" name="cheia_price_eur_kwh"></label>
+                        <label>Vazio EUR/kWh <input type="number" step="0.00001" name="vazio_price_eur_kwh"></label>
+                        <label>Super vazio EUR/kWh <input type="number" step="0.00001" name="super_vazio_price_eur_kwh"></label>
+                        <label>Valida desde <input type="date" name="valid_from"></label>
+                      </div>
+                      <button class="button secondary" type="submit">Guardar tarifa</button>
+                    </form>
+                  </details>
+                {% else %}
+                  <span class="muted">Mapear primeiro</span>
+                {% endif %}
+              </td>
+            </tr>
+          {% else %}
+            <tr><td colspan="11" class="muted">Sem entradas para este portfolio.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endif %}
+{% endblock %}

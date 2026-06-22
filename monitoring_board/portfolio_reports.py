@@ -1,0 +1,793 @@
+from __future__ import annotations
+
+import calendar
+import json
+import re
+import sqlite3
+import unicodedata
+from datetime import date, datetime, time
+from pathlib import Path
+from typing import Any
+
+from openpyxl import Workbook, load_workbook
+
+from monitoring_board.db import query_all
+
+
+MONTH_LABELS = {
+    1: ("jan", "janeiro", "january"),
+    2: ("fev", "fevereiro", "feb", "february"),
+    3: ("mar", "marco", "março", "march"),
+    4: ("abr", "abril", "apr", "april"),
+    5: ("mai", "maio", "may"),
+    6: ("jun", "junho", "june"),
+    7: ("jul", "julho", "july"),
+    8: ("ago", "agosto", "aug", "august"),
+    9: ("set", "setembro", "sep", "september"),
+    10: ("out", "outubro", "oct", "october"),
+    11: ("nov", "novembro", "november"),
+    12: ("dez", "dezembro", "dec", "december"),
+}
+PERIOD_NAMES = ("ponta", "cheia", "vazio", "super_vazio")
+WARNING_LABELS = {
+    "ok": "OK",
+    "missing_monthly_production": "Sem producao real FusionSolar",
+    "missing_hourly_production": "Sem producao horaria FusionSolar",
+    "missing_helioscope_expected": "Sem Helioscope",
+    "missing_mounting_date": "Sem data de montagem",
+    "invalid_mounting_date": "Sem data de montagem",
+    "missing_tariff": "Sem tarifa",
+    "missing_tariff_rules": "Sem tarifa",
+    "missing_simple_tariff_price": "Sem tarifa",
+    "missing_invoice": "Sem fatura",
+    "missing_availability": "Sem availability",
+    "mapping_pending": "Mapping pendente",
+    "mapping_conflict": "Mapping conflito",
+    "expired_tariff": "Tarifa expirada",
+    "unclassified_hourly_production": "Dados incompletos",
+}
+
+PORTFOLIO_EXTERNAL_ROWS = {
+    "Solcorelios I": [
+        ("001", "500001022", "A COLMEIA DO MINHO SA"),
+        ("002", "510912974", "FLORINEVE - PRODUCAO E COMERCIO DE FLORES LDA"),
+        ("003", "510731570", "DIALOGOS DO BOSQUE UNIPESSOAL LDA"),
+        ("004", "502265906", "A PIRES LOURENCO E FILHOS SA"),
+        ("005", "505435748", "USINAGE MAQUINACAO E PORTA MOLDES LDA"),
+        ("006", "500792640", "FUNDACAO ABEL E JOAO DE LACERDA"),
+        ("007", "501754679", "MARMORES GRANJA LDA"),
+        ("008", "514968044", "AH PINHAL DO REI LDA"),
+        ("009", "503722170", "LUSOBATATA PRODUTOS IV GAMA LDA"),
+        ("010", "505030896", "SOLIDUS - SOLUCOES PARA FERRAMENTAS E MOLDES LD"),
+        ("011", "503995762", "MARMO J - EXPORTACAO, IMPORTACAO, MARMORES UNIPESSOAL LDA"),
+        ("012", "501782265", "ROUFIMAR INDUSTRIA DE MARMORES, S.A."),
+        ("013", "500751722", "VIARCO INDUSTRIA LAPIS LDA"),
+        ("014", "513203524", "GADELHO DE CASTRO S A"),
+        ("015", "502480335", "AMADOIS CALCADO LDA"),
+        ("016", "500269203", "SOC TRANSPORTES POIARENSE LDA"),
+        ("017", "501150617", "GRANETOS-MARMORES E GRANITOS,S.A."),
+        ("018", "502882514", "MULTIAVES AVICOLA INTERNACIONAL LDA"),
+        ("019", "513018590", "INTERVEDROS - SUPERMERCADOS LDA"),
+        ("020", "501258060", "SERRALHARIA VIEIRA LDA"),
+        ("021", "502786078", "COLEGIO DE NOSSA SENHORA DA APRESENTACAO"),
+        ("022", "507685733", "RAS RECYCLING, Lda."),
+        ("023", "501277676", "SICOBRITA - EXTRACCAO E BRITAGEM DE PEDRA S.A"),
+        ("024", "501416382", "COOPERATIVA AGRO-PECUARIA MIRANDESA CRL"),
+        ("025", "500876746", "FERRAZ E FERREIRA LDA"),
+        ("026", "502605545", "ARDAVI MAQUINACAO E COMERCIALIZACAO ARTEFACTOS METALICOS LDA"),
+        ("027", "502247185", "GRANITOS GALRAO NORTE LDA"),
+        ("028", "503194387", "JETESETECAR EQUIPAMENTOS AUTO LDA"),
+        ("029", "502099666", "DIAMANTINO COELHO FILHO SA"),
+        ("030", "513239731", "PH Energia, Lda (Prod)"),
+        ("031", "515346306", "SOLCORACTION, LDA"),
+        ("032", "980763703", "Simples Energia de Espana, SL-Sucursal de Portugal"),
+        ("033", "506178374", "RAP - INDUSTRIAL LDA"),
+        ("034", "509090990", "LICOFRUTOS UNIPESSOAL LDA"),
+        ("035", "510504965", "HOMEUPDATE LDA"),
+        ("036", "501137092", "ASSOC HUMANITARIA DOS BOMBEIROS VOLUNTARIOS ARRUDA VINHOS"),
+        ("037", "500280614", "TECNISATA INDUSTRIA METALOMECANICA SA"),
+        ("038", "501493603", "ITECMO INDUSTRIA FABRICACAO MOLDES LDA"),
+        ("039", "502930942", "ENCONTRUS SOC HOTELEIRA LDA"),
+        ("040", "999999990", "Consumidor Final"),
+        ("041", "501084819", "Real Sport Clube"),
+        ("042", "510352855", "MARYASA - IMPORTACAO E EXPORTACAO UNIPESSOAL LDA"),
+        ("043", "502680296", "PANCRISP-INDUSTRIA DE PANIFICACAO LDA"),
+        ("044", "500091161", "MARMORES GALRAO - EDUARDO GALRAO JORGE & FILHOS S A"),
+        ("045", "516250779", "RUMOS VIRTUOSOS, LDA"),
+        ("046", "517295890", "SOLCORELIOS II, UNIPESSOAL, LDA"),
+        ("047", "510091490", "Negocios.Doc - Produtos e Servicos de Gestao Integrada, Lda"),
+    ],
+    "Solcorelios II": [
+        ("001", "", "Subconta 001 - importar mais tarde"),
+        ("002", "", "Subconta 002 - importar mais tarde"),
+        ("003", "", "Subconta 003 - importar mais tarde"),
+        ("004", "", "Subconta 004 - importar mais tarde"),
+        ("005", "", "Subconta 005 - importar mais tarde"),
+        ("006", "502312254", "Casa da Divina Providencia e de Maria Auxiliadora"),
+        ("007", "504646788", "APPACDM DE LISBOA - ASSOCIACAO PORTUGUESA DE PAIS"),
+        ("008", "500878684", "ASESM - Associacao de Solidariedade e Educacao de Salir de ..."),
+        ("009", "600083780", "Agrupamento de Escolas da Boa Agua"),
+        ("010", "503780774", "O CASARAO HOTELARIA E TURISMO LDA"),
+        ("011", "501426892", "Fundacao Irene Rolo"),
+        ("012", "501130179", "Associacao Humanitaria de Bombeiro Voluntarios de Alcoentre"),
+        ("013", "501379550", "FUTEBOL CLUBE DE ALVERCA"),
+        ("014", "513983511", "EZU Energia, Lda"),
+        ("015", "501512071", "ALVARSOL SOC LAVANDARIAS ALGARVE LDA"),
+        ("016", "508619041", "NEUTRIPURO - LAVAGENS INDUSTRIAIS , LDA"),
+        ("017", "508776597", "Antonio Evaristo Goncalves - Sociedade Agricola, Unipessoal ..."),
+        ("018", "502962801", "LAREIRAS SOUSA LDA"),
+        ("019", "501440623", "Associacao Humanitaria de Bombeiro Voluntarios de Montela..."),
+        ("020", "501358331", "SANTOS E FERREIRA LDA"),
+        ("021", "508546192", "LUIS BAPTISTA GONCALVES - SOCIEDADE AGRICOLA UNIPE..."),
+        ("022", "501237089", "ASSOCIACAO HUMANITARIA DE BOMBEIROS DO PINHAL NO..."),
+        ("023", "502377380", "Centro de Solidariedade Social Padre Jose Filipe Rodrigues"),
+        ("024", "500827540", "MANUEL BARBOSA E FILHOS LDA"),
+        ("025", "501137092", "ASSOC HUMANITARIA DOS BOMBEIROS VOLUNTARIOS ARR..."),
+        ("026", "500877386", "Legado do Caixeiro Alentejano - Associacao Mutualista"),
+        ("027", "501241230", "ASSOCIACAO HUMANITARIA DE BOMBEIROS VOLUNTARIOS ..."),
+        ("028", "503194387", "JETESETECAR EQUIPAMENTOS AUTO LDA"),
+        ("029", "509090990", "LICOFRUTOS UNIPESSOAL LDA"),
+        ("030", "510091490", "Negocios.Doc - Produtos e Servicos de Gestao Integrada, Lda"),
+        ("031", "501131981", "ASSOCIACAO HUMANITARIA DOS BOMBEIROS VOLUNTARIO..."),
+        ("032", "500731179", "PROVINCIA PORTUGUESA INSTITUTO IRMAS SANTA DOROT..."),
+    ],
+}
+
+
+def normalize_text(value: Any) -> str:
+    normalized = unicodedata.normalize("NFKD", str(value or ""))
+    ascii_value = "".join(char for char in normalized if not unicodedata.combining(char))
+    return re.sub(r"\s+", " ", ascii_value.strip().lower())
+
+
+def normalize_nif(value: Any) -> str:
+    return re.sub(r"\D+", "", str(value or ""))
+
+
+def parse_month(value: Any) -> int | None:
+    if isinstance(value, datetime):
+        return value.month
+    if isinstance(value, date):
+        return value.month
+    raw = normalize_text(value)
+    if not raw:
+        return None
+    if raw.isdigit() and 1 <= int(raw) <= 12:
+        return int(raw)
+    for month, labels in MONTH_LABELS.items():
+        if raw in labels:
+            return month
+    return None
+
+
+def parse_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    raw = str(value).strip().replace(" ", "").replace(",", ".")
+    raw = re.sub(r"[^0-9.\-]", "", raw)
+    if raw in {"", "-", "."}:
+        return None
+    try:
+        parsed = float(raw)
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def calculate_degradation_factor(mounting_date: date | None, report_month: date) -> float:
+    if mounting_date is None:
+        return 1.0
+    months = (report_month.year - mounting_date.year) * 12 + (report_month.month - mounting_date.month)
+    years_since_mounting = max(0, months) / 12
+    return max(0.0, 1 - 0.025 - years_since_mounting * 0.0055)
+
+
+def parse_helioscope_monthly_expected(path: Path) -> dict[int, float]:
+    workbook = load_workbook(path, data_only=True)
+    candidates: list[dict[int, float]] = []
+    for sheet in workbook.worksheets:
+        rows = list(sheet.iter_rows(values_only=True))
+        for row_index, row in enumerate(rows):
+            month_columns: dict[int, int] = {}
+            for col_index, value in enumerate(row):
+                month = parse_month(value)
+                if month:
+                    month_columns[month] = col_index
+            if len(month_columns) < 10:
+                continue
+            for values_row in rows[row_index + 1 : min(row_index + 8, len(rows))]:
+                parsed: dict[int, float] = {}
+                for month, col_index in month_columns.items():
+                    value = parse_float(values_row[col_index] if col_index < len(values_row) else None)
+                    if value is not None:
+                        parsed[month] = value
+                if len(parsed) >= 10:
+                    candidates.append(parsed)
+    if not candidates:
+        raise ValueError("Nao foi possivel identificar valores mensais no ficheiro Helioscope.")
+    best = max(candidates, key=len)
+    if len(best) != 12:
+        raise ValueError("O ficheiro Helioscope nao contem 12 valores mensais confiaveis.")
+    return {month: float(best[month]) for month in range(1, 13)}
+
+
+def store_source_file(
+    conn: sqlite3.Connection,
+    *,
+    upload_dir: Path,
+    file_storage: Any,
+    asset_id: int,
+    portfolio_id: int | None,
+    file_type: str,
+    notes: str = "",
+) -> int:
+    original = Path(file_storage.filename or f"{file_type}.bin").name
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    target_dir = upload_dir / "portfolio_sources" / str(asset_id)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    stored_path = target_dir / f"{timestamp}_{original}"
+    file_storage.save(stored_path)
+    cursor = conn.execute(
+        """
+        INSERT INTO source_files (asset_id, portfolio_id, file_type, original_filename, stored_path, uploaded_at, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (asset_id, portfolio_id, file_type, original, str(stored_path), datetime.now().isoformat(timespec="seconds"), notes),
+    )
+    return int(cursor.lastrowid)
+
+
+def import_helioscope_file(
+    conn: sqlite3.Connection,
+    *,
+    upload_dir: Path,
+    file_storage: Any,
+    asset_id: int,
+    portfolio_id: int | None,
+    base_year: int | None = None,
+) -> dict[str, Any]:
+    source_id = store_source_file(
+        conn,
+        upload_dir=upload_dir,
+        file_storage=file_storage,
+        asset_id=asset_id,
+        portfolio_id=portfolio_id,
+        file_type="helioscope",
+    )
+    stored = conn.execute("SELECT stored_path FROM source_files WHERE id = ?", (source_id,)).fetchone()
+    monthly = parse_helioscope_monthly_expected(Path(stored["stored_path"]))
+    year = base_year or date.today().year
+    conn.execute("DELETE FROM helioscope_expected_production WHERE asset_id = ? AND source_file_id != ?", (asset_id, source_id))
+    for month, expected_kwh in monthly.items():
+        conn.execute(
+            """
+            INSERT INTO helioscope_expected_production (asset_id, source_file_id, base_year, month, expected_kwh, imported_at, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (asset_id, source_id, year, month, expected_kwh, datetime.now().isoformat(timespec="seconds"), ""),
+        )
+    return {"source_file_id": source_id, "months": len(monthly)}
+
+
+def map_external_portfolio_entity(conn: sqlite3.Connection, *, nif: str = "", external_name: str = "") -> dict[str, Any]:
+    normalized_nif = normalize_nif(nif)
+    if normalized_nif:
+        row = conn.execute("SELECT id FROM assets WHERE REPLACE(REPLACE(COALESCE(nif, ''), ' ', ''), '-', '') = ? LIMIT 1", (normalized_nif,)).fetchone()
+        if row:
+            return {"asset_id": int(row["id"]), "mapping_status": "auto_nif", "mapping_confidence": 1.0}
+    normalized_name = normalize_text(external_name)
+    if normalized_name:
+        row = conn.execute("SELECT asset_id FROM asset_aliases WHERE normalized_alias = ? LIMIT 1", (normalized_name,)).fetchone()
+        if row:
+            return {"asset_id": int(row["asset_id"]), "mapping_status": "auto_name", "mapping_confidence": 0.9}
+        row = conn.execute("SELECT id FROM assets WHERE LOWER(project_name) = ? LIMIT 1", (external_name.strip().lower(),)).fetchone()
+        if row:
+            return {"asset_id": int(row["id"]), "mapping_status": "auto_name", "mapping_confidence": 0.85}
+    return {"asset_id": None, "mapping_status": "unmapped", "mapping_confidence": 0.0}
+
+
+def repeated_portfolio_nifs(conn: sqlite3.Connection) -> set[str]:
+    rows = query_all(
+        conn,
+        """
+        SELECT nif
+        FROM portfolio_assets
+        WHERE COALESCE(nif, '') != ''
+        GROUP BY nif
+        HAVING COUNT(DISTINCT portfolio_id) > 1
+        """,
+    )
+    return {str(row["nif"]) for row in rows}
+
+
+def seed_external_portfolio_rows(conn: sqlite3.Connection) -> None:
+    for portfolio_name, rows in PORTFOLIO_EXTERNAL_ROWS.items():
+        group = conn.execute("SELECT id FROM portfolio_groups WHERE name = ?", (portfolio_name,)).fetchone()
+        if group is None:
+            continue
+        portfolio_id = int(group["id"])
+        for sub_account, nif, external_name in rows:
+            existing = conn.execute(
+                """
+                SELECT id
+                FROM portfolio_assets
+                WHERE portfolio_id = ? AND sub_account = ?
+                LIMIT 1
+                """,
+                (portfolio_id, sub_account),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE portfolio_assets
+                    SET external_name = COALESCE(NULLIF(external_name, ''), ?),
+                        nif = COALESCE(NULLIF(nif, ''), ?),
+                        active = 1
+                    WHERE id = ?
+                    """,
+                    (external_name, nif, existing["id"]),
+                )
+                continue
+            mapping_status = "mapping_pending" if nif else "missing_source"
+            notes = "Subconta em falta na fonte original; importar mais tarde." if not nif else ""
+            conn.execute(
+                """
+                INSERT INTO portfolio_assets (
+                    portfolio_id, asset_id, external_name, nif, sub_account, active,
+                    mapping_status, mapping_confidence, notes
+                ) VALUES (?, NULL, ?, ?, ?, 1, ?, 0, ?)
+                """,
+                (portfolio_id, external_name, nif, sub_account, mapping_status, notes),
+            )
+    mark_repeated_nif_conflicts(conn)
+
+
+def mark_repeated_nif_conflicts(conn: sqlite3.Connection) -> None:
+    repeated = repeated_portfolio_nifs(conn)
+    if not repeated:
+        return
+    for nif in repeated:
+        conn.execute(
+            """
+            UPDATE portfolio_assets
+            SET mapping_status = 'mapping_conflict',
+                notes = TRIM(COALESCE(notes, '') || ' NIF repetido entre portfolios; confirmar mapping.')
+            WHERE nif = ?
+            """,
+            (nif,),
+        )
+
+
+def auto_map_portfolio_assets(conn: sqlite3.Connection, portfolio_id: int | None = None) -> dict[str, int]:
+    conditions = ["active = 1"]
+    params: list[Any] = []
+    if portfolio_id:
+        conditions.append("portfolio_id = ?")
+        params.append(portfolio_id)
+    rows = query_all(conn, f"SELECT * FROM portfolio_assets WHERE {' AND '.join(conditions)}", params)
+    repeated = repeated_portfolio_nifs(conn)
+    mapped = 0
+    pending = 0
+    conflicts = 0
+    for row in rows:
+        result = map_external_portfolio_entity(conn, nif=row["nif"] or "", external_name=row["external_name"] or "")
+        status = result["mapping_status"]
+        confidence = result["mapping_confidence"]
+        asset_id = result["asset_id"]
+        if row["nif"] and row["nif"] in repeated:
+            status = "mapping_conflict"
+            conflicts += 1
+        elif not asset_id:
+            status = "mapping_pending"
+            pending += 1
+        else:
+            mapped += 1
+        conn.execute(
+            """
+            UPDATE portfolio_assets
+            SET asset_id = ?, mapping_status = ?, mapping_confidence = ?
+            WHERE id = ?
+            """,
+            (asset_id, status, confidence, row["id"]),
+        )
+    return {"mapped": mapped, "pending": pending, "conflicts": conflicts}
+
+
+def warning_label(code: str) -> str:
+    return WARNING_LABELS.get(code, "Dados incompletos")
+
+
+def label_warnings(warnings: list[str]) -> list[str]:
+    if not warnings:
+        return ["OK"]
+    return [warning_label(code) for code in warnings]
+
+
+def data_status_label(warnings: list[str]) -> str:
+    if not warnings:
+        return "OK"
+    if "mapping_pending" in warnings:
+        return "Mapping pendente"
+    if "mapping_conflict" in warnings:
+        return "Mapping conflito"
+    if "expired_tariff" in warnings:
+        return "Tarifa expirada"
+    return "Dados incompletos"
+
+
+def time_in_rule(sample_time: time, start: time, end: time) -> bool:
+    if start == end:
+        return True
+    if start < end:
+        return start <= sample_time < end
+    return sample_time >= start or sample_time < end
+
+
+def classify_tariff_period(moment: datetime, rules: list[sqlite3.Row | dict[str, Any]]) -> str | None:
+    weekday_type = "weekend" if moment.weekday() >= 5 else "weekday"
+    for row in rules:
+        rule_type = str(row["weekday_type"] or "all")
+        if rule_type not in {"all", weekday_type}:
+            continue
+        start = datetime.strptime(str(row["start_time"]), "%H:%M").time()
+        end = datetime.strptime(str(row["end_time"]), "%H:%M").time()
+        if time_in_rule(moment.time(), start, end):
+            return str(row["period_name"])
+    return None
+
+
+def calculate_tariff_value(
+    tariff: sqlite3.Row | dict[str, Any] | None,
+    *,
+    monthly_kwh: float | None,
+    hourly_records: list[sqlite3.Row | dict[str, Any]],
+    rules: list[sqlite3.Row | dict[str, Any]],
+) -> dict[str, Any]:
+    periods = {name: 0.0 for name in PERIOD_NAMES}
+    warnings: list[str] = []
+    if tariff is None:
+        return {"estimated_value_eur": None, "period_kwh": periods, "warnings": ["missing_tariff"]}
+    tariff_type = str(tariff["tariff_type"] or "simple")
+    if tariff_type == "simple":
+        price = parse_float(tariff["simple_price_eur_kwh"])
+        if price is None:
+            warnings.append("missing_simple_tariff_price")
+            return {"estimated_value_eur": None, "period_kwh": periods, "warnings": warnings}
+        return {"estimated_value_eur": round((monthly_kwh or 0) * price, 2), "period_kwh": periods, "warnings": warnings}
+    if not rules:
+        warnings.append("missing_tariff_rules")
+    if not hourly_records:
+        warnings.append("missing_hourly_production")
+    total = 0.0
+    for record in hourly_records:
+        start = datetime.fromisoformat(str(record["period_start"]))
+        period = classify_tariff_period(start, rules)
+        kwh = float(record["production_kwh"] or 0)
+        if not period:
+            warnings.append("unclassified_hourly_production")
+            continue
+        if period in periods:
+            periods[period] += kwh
+        price = parse_float(tariff[f"{period}_price_eur_kwh"]) if f"{period}_price_eur_kwh" in tariff.keys() else None
+        if price is None:
+            warnings.append(f"missing_{period}_price")
+            continue
+        total += kwh * price
+    return {"estimated_value_eur": round(total, 2) if hourly_records and not any(w.startswith("missing_") for w in warnings if w != "missing_super_vazio_price") else None, "period_kwh": periods, "warnings": sorted(set(warnings))}
+
+
+def month_bounds(report_month: str) -> tuple[date, date]:
+    start = datetime.strptime(report_month, "%Y-%m").date()
+    _, last_day = calendar.monthrange(start.year, start.month)
+    return start, start.replace(day=last_day)
+
+
+def get_latest_tariff(conn: sqlite3.Connection, asset_id: int, report_start: date) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT *
+        FROM asset_tariffs
+        WHERE asset_id = ?
+          AND (valid_from IS NULL OR valid_from = '' OR valid_from <= ?)
+          AND (valid_to IS NULL OR valid_to = '' OR valid_to >= ?)
+        ORDER BY COALESCE(valid_from, '') DESC, id DESC
+        LIMIT 1
+        """,
+        (asset_id, report_start.isoformat(), report_start.isoformat()),
+    ).fetchone()
+
+
+def has_expired_tariff(conn: sqlite3.Connection, asset_id: int, report_start: date) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM asset_tariffs
+        WHERE asset_id = ?
+          AND valid_to IS NOT NULL
+          AND valid_to != ''
+          AND valid_to < ?
+        LIMIT 1
+        """,
+        (asset_id, report_start.isoformat()),
+    ).fetchone()
+    return row is not None
+
+
+def get_monthly_availability(conn: sqlite3.Connection, asset_id: int, start: date, end: date) -> float | None:
+    row = conn.execute(
+        """
+        SELECT SUM(weighted_availability_pct * valid_slots) AS weighted_sum, SUM(valid_slots) AS slots
+        FROM plant_availability_daily
+        WHERE asset_id = ? AND provider = 'FusionSolar' AND availability_date BETWEEN ? AND ?
+        """,
+        (asset_id, start.isoformat(), end.isoformat()),
+    ).fetchone()
+    if row and row["slots"]:
+        return round(float(row["weighted_sum"]) / float(row["slots"]), 2)
+    return None
+
+
+def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, report_month: str) -> list[dict[str, Any]]:
+    start, end = month_bounds(report_month)
+    assets = query_all(
+        conn,
+        """
+        SELECT pa.*, a.project_name, a.nif AS asset_nif, a.start_contract, a.mounting_date, a.kwp
+        FROM portfolio_assets pa
+        LEFT JOIN assets a ON a.id = pa.asset_id
+        WHERE pa.portfolio_id = ? AND pa.active = 1
+        ORDER BY COALESCE(pa.external_name, a.project_name) COLLATE NOCASE
+        """,
+        (portfolio_id,),
+    )
+    rows: list[dict[str, Any]] = []
+    for asset in assets:
+        asset_id = int(asset["asset_id"]) if asset["asset_id"] is not None else None
+        warnings: list[str] = []
+        mapping_status = str(asset["mapping_status"] or "")
+        if asset_id is None:
+            warnings.append("mapping_pending")
+        if mapping_status == "mapping_conflict":
+            warnings.append("mapping_conflict")
+        prod = conn.execute(
+            """
+            SELECT production_kwh
+            FROM production_records
+            WHERE asset_id = ? AND provider = 'FusionSolar' AND period_type = 'month' AND period_date = ?
+            LIMIT 1
+            """,
+            (asset_id, start.isoformat()),
+        ).fetchone() if asset_id is not None else None
+        actual = float(prod["production_kwh"]) if prod and prod["production_kwh"] is not None else None
+        if actual is None:
+            warnings.append("missing_monthly_production")
+        expected = conn.execute(
+            """
+            SELECT expected_kwh
+            FROM helioscope_expected_production
+            WHERE asset_id = ? AND month = ?
+            ORDER BY imported_at DESC, id DESC
+            LIMIT 1
+            """,
+            (asset_id, start.month),
+        ).fetchone() if asset_id is not None else None
+        expected_kwh = float(expected["expected_kwh"]) if expected else None
+        if expected_kwh is None:
+            warnings.append("missing_helioscope_expected")
+        mount_raw = asset["mounting_date"] or asset["start_contract"]
+        mounting = None
+        if mount_raw:
+            try:
+                mounting = datetime.fromisoformat(str(mount_raw)[:10]).date()
+            except ValueError:
+                warnings.append("invalid_mounting_date")
+        else:
+            warnings.append("missing_mounting_date")
+        factor = calculate_degradation_factor(mounting, start)
+        adjusted = expected_kwh * factor if expected_kwh is not None else None
+        deviation = actual - adjusted if actual is not None and adjusted is not None else None
+        deviation_pct = (deviation / adjusted * 100) if deviation is not None and adjusted else None
+        availability = get_monthly_availability(conn, asset_id, start, end) if asset_id is not None else None
+        if availability is None:
+            warnings.append("missing_availability")
+        tariff = get_latest_tariff(conn, asset_id, start) if asset_id is not None else None
+        if tariff is None and asset_id is not None and has_expired_tariff(conn, asset_id, start):
+            warnings.append("expired_tariff")
+        rules = query_all(conn, "SELECT * FROM tariff_period_rules WHERE tariff_id = ? ORDER BY weekday_type, start_time", (tariff["id"],)) if tariff else []
+        hourly = query_all(
+            conn,
+            """
+            SELECT * FROM production_hourly_records
+            WHERE asset_id = ? AND provider = 'FusionSolar' AND period_start >= ? AND period_start < ?
+            ORDER BY period_start
+            """,
+            (asset_id, start.isoformat(), datetime(end.year, end.month, end.day, 23, 59, 59).isoformat()),
+        ) if asset_id is not None else []
+        tariff_result = calculate_tariff_value(tariff, monthly_kwh=actual, hourly_records=hourly, rules=rules)
+        warnings.extend(tariff_result["warnings"])
+        invoice_status = "ok" if tariff and tariff["invoice_file_id"] else "missing_invoice"
+        if invoice_status != "ok":
+            warnings.append(invoice_status)
+        data_status = "ok" if not warnings else ("missing_data" if any(w.startswith("missing") for w in warnings) else "warning")
+        period_kwh = tariff_result["period_kwh"]
+        rows.append(
+            {
+                "portfolio_id": portfolio_id,
+                "asset_id": asset_id,
+                "portfolio": "",
+                "installation": asset["external_name"] or asset["project_name"] or "",
+                "external_installation": asset["external_name"] or "",
+                "local_installation": asset["project_name"] or "",
+                "nif": asset["nif"] or asset["asset_nif"] or "",
+                "sub_account": asset["sub_account"] or "",
+                "actual_production_kwh": round(actual, 2) if actual is not None else None,
+                "production_ponta_kwh": round(period_kwh["ponta"], 2),
+                "production_cheia_kwh": round(period_kwh["cheia"], 2),
+                "production_vazio_kwh": round(period_kwh["vazio"], 2),
+                "production_super_vazio_kwh": round(period_kwh["super_vazio"], 2),
+                "helioscope_expected_kwh": round(expected_kwh, 2) if expected_kwh is not None else None,
+                "adjusted_expected_kwh": round(adjusted, 2) if adjusted is not None else None,
+                "degradation_factor": round(factor, 6),
+                "deviation_kwh": round(deviation, 2) if deviation is not None else None,
+                "deviation_pct": round(deviation_pct, 2) if deviation_pct is not None else None,
+                "availability_pct": availability,
+                "tariff_type": tariff["tariff_type"] if tariff else "",
+                "estimated_value_eur": tariff_result["estimated_value_eur"],
+                "invoice_status": invoice_status,
+                "data_status": data_status,
+                "warnings": sorted(set(warnings)),
+                "warning_labels": label_warnings(sorted(set(warnings))),
+                "status_label": data_status_label(sorted(set(warnings))),
+            }
+        )
+    return rows
+
+
+def aggregate_portfolio_total(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    def total(key: str) -> float | None:
+        values = [row[key] for row in rows if row.get(key) is not None]
+        return round(sum(float(value) for value in values), 2) if values else None
+
+    adjusted_total = total("adjusted_expected_kwh")
+    deviation = None
+    deviation_pct = None
+    actual_total = total("actual_production_kwh")
+    if actual_total is not None and adjusted_total:
+        deviation = round(actual_total - adjusted_total, 2)
+        deviation_pct = round(deviation / adjusted_total * 100, 2)
+    weights = [float(row["adjusted_expected_kwh"]) for row in rows if row.get("adjusted_expected_kwh") and row.get("availability_pct") is not None]
+    availability = None
+    if weights:
+        availability = round(
+            sum(float(row["availability_pct"]) * float(row["adjusted_expected_kwh"]) for row in rows if row.get("adjusted_expected_kwh") and row.get("availability_pct") is not None)
+            / sum(weights),
+            2,
+        )
+    warnings = sorted({warning for row in rows for warning in row.get("warnings", [])})
+    return {
+        "portfolio": "",
+        "installation": "TOTAL",
+        "external_installation": "TOTAL",
+        "local_installation": "",
+        "nif": "",
+        "sub_account": "",
+        "actual_production_kwh": actual_total,
+        "production_ponta_kwh": total("production_ponta_kwh"),
+        "production_cheia_kwh": total("production_cheia_kwh"),
+        "production_vazio_kwh": total("production_vazio_kwh"),
+        "production_super_vazio_kwh": total("production_super_vazio_kwh"),
+        "helioscope_expected_kwh": total("helioscope_expected_kwh"),
+        "adjusted_expected_kwh": adjusted_total,
+        "degradation_factor": "",
+        "deviation_kwh": deviation,
+        "deviation_pct": deviation_pct,
+        "availability_pct": availability,
+        "tariff_type": "",
+        "estimated_value_eur": total("estimated_value_eur"),
+        "invoice_status": "",
+        "data_status": "ok" if not warnings else "warning",
+        "warnings": warnings,
+        "warning_labels": label_warnings(warnings),
+        "status_label": "OK" if not warnings else "Dados incompletos",
+        "missing_data_count": sum(1 for row in rows if row.get("warnings")),
+    }
+
+
+def build_portfolio_kpis(rows: list[dict[str, Any]], total_row: dict[str, Any] | None) -> dict[str, Any]:
+    total = total_row or aggregate_portfolio_total(rows)
+    return {
+        "actual_production_kwh": total.get("actual_production_kwh"),
+        "adjusted_expected_kwh": total.get("adjusted_expected_kwh"),
+        "deviation_kwh": total.get("deviation_kwh"),
+        "deviation_pct": total.get("deviation_pct"),
+        "availability_pct": total.get("availability_pct"),
+        "estimated_value_eur": total.get("estimated_value_eur"),
+        "missing_data_installations": sum(1 for row in rows if row.get("warnings")),
+        "installations": len(rows),
+    }
+
+
+def filter_report_rows(rows: list[dict[str, Any]], warning_filter: str) -> list[dict[str, Any]]:
+    if warning_filter == "warnings":
+        return [row for row in rows if row.get("warnings")]
+    if warning_filter == "helioscope":
+        return [row for row in rows if "missing_helioscope_expected" in row.get("warnings", [])]
+    if warning_filter == "invoice":
+        return [row for row in rows if "missing_invoice" in row.get("warnings", [])]
+    if warning_filter == "mapping":
+        return [row for row in rows if any(item in row.get("warnings", []) for item in {"mapping_pending", "mapping_conflict"})]
+    return rows
+
+
+def snapshot_portfolio_report(conn: sqlite3.Connection, portfolio_id: int, report_month: str, notes: str = "") -> int:
+    rows = build_portfolio_report_rows(conn, portfolio_id, report_month)
+    cursor = conn.execute(
+        "INSERT INTO portfolio_report_runs (portfolio_id, report_month, created_at, notes) VALUES (?, ?, ?, ?)",
+        (portfolio_id, report_month, datetime.now().isoformat(timespec="seconds"), notes),
+    )
+    report_id = int(cursor.lastrowid)
+    for row in rows:
+        conn.execute(
+            """
+            INSERT INTO portfolio_report_rows (
+                report_id, asset_id, actual_production_kwh, production_ponta_kwh, production_cheia_kwh,
+                production_vazio_kwh, production_super_vazio_kwh, helioscope_expected_kwh,
+                adjusted_expected_kwh, degradation_factor, deviation_kwh, deviation_pct,
+                availability_pct, estimated_value_eur, data_status, warnings_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                report_id,
+                row["asset_id"],
+                row["actual_production_kwh"],
+                row["production_ponta_kwh"],
+                row["production_cheia_kwh"],
+                row["production_vazio_kwh"],
+                row["production_super_vazio_kwh"],
+                row["helioscope_expected_kwh"],
+                row["adjusted_expected_kwh"],
+                row["degradation_factor"],
+                row["deviation_kwh"],
+                row["deviation_pct"],
+                row["availability_pct"],
+                row["estimated_value_eur"],
+                row["data_status"],
+                json.dumps(row["warnings"], ensure_ascii=True),
+            ),
+        )
+    return report_id
+
+
+def export_portfolio_report_workbook(rows: list[dict[str, Any]]) -> Workbook:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Portfolio report"
+    headers = [
+        ("portfolio", "Portfolio"),
+        ("sub_account", "Subconta"),
+        ("nif", "NIF"),
+        ("external_installation", "Instalacao externa"),
+        ("local_installation", "Instalacao local"),
+        ("actual_production_kwh", "Producao real mensal kWh"),
+        ("production_ponta_kwh", "Producao ponta kWh"),
+        ("production_cheia_kwh", "Producao cheia kWh"),
+        ("production_vazio_kwh", "Producao vazio kWh"),
+        ("production_super_vazio_kwh", "Producao super vazio kWh"),
+        ("helioscope_expected_kwh", "Producao Helioscope base kWh"),
+        ("adjusted_expected_kwh", "Producao esperada ajustada kWh"),
+        ("degradation_factor", "Fator degradacao"),
+        ("deviation_kwh", "Desvio kWh"),
+        ("deviation_pct", "Desvio %"),
+        ("availability_pct", "Availability time %"),
+        ("tariff_type", "Tipo de tarifa"),
+        ("estimated_value_eur", "Valor estimado EUR"),
+        ("status_label", "Estado dos dados"),
+        ("warning_labels", "Avisos"),
+    ]
+    sheet.append([label for _, label in headers])
+    for row in rows:
+        sheet.append(["; ".join(row[key]) if key == "warning_labels" and isinstance(row.get(key), list) else row.get(key, "") for key, _ in headers])
+    for column in sheet.columns:
+        width = max(len(str(cell.value or "")) for cell in column)
+        sheet.column_dimensions[column[0].column_letter].width = min(max(width + 2, 12), 42)
+    return workbook
