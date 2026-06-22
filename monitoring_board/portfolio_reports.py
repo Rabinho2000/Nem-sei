@@ -11,6 +11,7 @@ from typing import Any
 from openpyxl import Workbook, load_workbook
 
 from monitoring_board.db import query_all
+from monitoring_board.reporting.availability import calculate_weighted_portfolio_availability
 from monitoring_board.reporting.degradation import calculate_degradation_factor
 from monitoring_board.reporting.periods import month_bounds
 from monitoring_board.reporting.repositories import (
@@ -55,6 +56,7 @@ WARNING_LABELS = {
     "mapping_pending": "Mapping pendente",
     "mapping_conflict": "Mapping conflito",
     "expired_tariff": "Tarifa expirada",
+    "missing_installed_power": "Sem potencia instalada",
     "unclassified_hourly_production": "Dados incompletos",
 }
 
@@ -542,6 +544,7 @@ def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, rep
                 "local_installation": asset["project_name"] or "",
                 "nif": asset["nif"] or asset["asset_nif"] or "",
                 "sub_account": asset["sub_account"] or "",
+                "installed_power_kwp": parse_float(asset["kwp"]),
                 "actual_production_kwh": round(actual, 2) if actual is not None else None,
                 "production_ponta_kwh": round(period_kwh["ponta"], 2),
                 "production_cheia_kwh": round(period_kwh["cheia"], 2),
@@ -567,7 +570,7 @@ def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, rep
 
 def aggregate_portfolio_total(rows: list[dict[str, Any]]) -> dict[str, Any]:
     def total(key: str) -> float | None:
-        values = [row[key] for row in rows if row.get(key) is not None]
+        values = [row.get(key) for row in rows if row.get(key) is not None]
         return round(sum(float(value) for value in values), 2) if values else None
 
     adjusted_total = total("adjusted_expected_kwh")
@@ -577,15 +580,10 @@ def aggregate_portfolio_total(rows: list[dict[str, Any]]) -> dict[str, Any]:
     if actual_total is not None and adjusted_total:
         deviation = round(actual_total - adjusted_total, 2)
         deviation_pct = round(deviation / adjusted_total * 100, 2)
-    weights = [float(row["adjusted_expected_kwh"]) for row in rows if row.get("adjusted_expected_kwh") and row.get("availability_pct") is not None]
-    availability = None
-    if weights:
-        availability = round(
-            sum(float(row["availability_pct"]) * float(row["adjusted_expected_kwh"]) for row in rows if row.get("adjusted_expected_kwh") and row.get("availability_pct") is not None)
-            / sum(weights),
-            2,
-        )
+    availability = calculate_weighted_portfolio_availability(rows)
     warnings = sorted({warning for row in rows for warning in row.get("warnings", [])})
+    if rows and any(row.get("availability_pct") is not None and not row.get("installed_power_kwp") for row in rows):
+        warnings = sorted({*warnings, "missing_installed_power"})
     return {
         "portfolio": "",
         "installation": "TOTAL",
@@ -593,6 +591,7 @@ def aggregate_portfolio_total(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "local_installation": "",
         "nif": "",
         "sub_account": "",
+        "installed_power_kwp": total("installed_power_kwp"),
         "actual_production_kwh": actual_total,
         "production_ponta_kwh": total("production_ponta_kwh"),
         "production_cheia_kwh": total("production_cheia_kwh"),

@@ -89,6 +89,16 @@ def test_sync_excludes_all_zero_slots_and_is_idempotent(tmp_path, monkeypatch) -
             "dev_type_id": 1,
             "rated_power_kw": 50.0,
         },
+        {
+            "asset_id": 1,
+            "station_code": "S1",
+            "external_device_id": "I3",
+            "dev_dn": "I3",
+            "sn": "SN3",
+            "device_name": "Inversor 3",
+            "dev_type_id": 1,
+            "rated_power_kw": 100.0,
+        },
     ]
     context = {
         "provider": "FusionSolar",
@@ -127,14 +137,17 @@ def test_sync_excludes_all_zero_slots_and_is_idempotent(tmp_path, monkeypatch) -
         plant_row = conn.execute("SELECT * FROM plant_availability_daily").fetchone()
 
         assert conn.execute("SELECT COUNT(*) FROM inverter_power_samples").fetchone()[0] == 16
-        assert conn.execute("SELECT COUNT(*) FROM inverter_availability_daily").fetchone()[0] == 2
+        assert conn.execute("SELECT COUNT(*) FROM inverter_availability_daily").fetchone()[0] == 3
         assert conn.execute("SELECT COUNT(*) FROM plant_availability_daily").fetchone()[0] == 1
-        assert len(inverter_rows) == 2
+        assert len(inverter_rows) == 3
         assert inverter_rows[0]["valid_slots"] == 4
         assert inverter_rows[0]["availability_pct"] == 100.0
         assert inverter_rows[1]["availability_pct"] == 50.0
+        assert inverter_rows[2]["valid_slots"] == 4
+        assert inverter_rows[2]["available_slots"] == 0
+        assert inverter_rows[2]["availability_pct"] == 0.0
         assert plant_row["valid_slots"] == 4
-        assert plant_row["weighted_availability_pct"] == 75.0
+        assert plant_row["weighted_availability_pct"] == 37.5
     finally:
         conn.close()
 
@@ -218,6 +231,7 @@ def test_daily_wat_report_data_returns_ok_partial_and_no_data(tmp_path) -> None:
         "valid_slots": 20,
         "unavailable_slots": 2,
         "data_status": "ok",
+        "warnings": [],
     }
     assert plants["Central Parcial"]["data_status"] == "parcial"
     assert plants["Central Parcial"]["weighted_wat_pct"] == 50.0
