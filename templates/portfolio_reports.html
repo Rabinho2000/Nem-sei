@@ -4,8 +4,8 @@
 <section class="hero">
   <div>
     <p class="eyebrow">Relatorios internos</p>
-    <h2>Portfolio mensal</h2>
-    <p class="muted">Producao FusionSolar, Helioscope ajustado, disponibilidade, tarifas e alertas de dados.</p>
+    <h2>Portfolio configuravel</h2>
+    <p class="muted">Preview, snapshots e Excel usam o mesmo resultado canonico.</p>
   </div>
   <div class="hero-actions">
     <a class="button secondary" href="{{ url_for('portfolios') }}">Gerir portfolios</a>
@@ -22,114 +22,198 @@
           {% endfor %}
         </select>
       </label>
+      <label>Perfil
+        <select name="profile_id">
+          {% for profile in profiles %}
+            <option value="{{ profile.id }}" {{ 'selected' if selected_profile_id == profile.id }}>{{ profile.name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Periodo
+        <select name="period_type">
+          <option value="monthly" {{ 'selected' if period_type == 'monthly' }}>Mensal</option>
+          <option value="quarterly" {{ 'selected' if period_type == 'quarterly' }}>Trimestral</option>
+          <option value="semiannual" {{ 'selected' if period_type == 'semiannual' }}>Semestral</option>
+          <option value="annual" {{ 'selected' if period_type == 'annual' }}>Anual</option>
+        </select>
+      </label>
       <label>Mes
         <input type="month" name="report_month" value="{{ report_month }}" required>
       </label>
+      <label>Ano
+        <input type="number" name="report_year" value="{{ report_year }}" min="2000" max="2100">
+      </label>
+      <label>Trimestre
+        <select name="report_quarter">
+          {% for quarter in [1, 2, 3, 4] %}
+            <option value="{{ quarter }}" {{ 'selected' if report_quarter|string == quarter|string }}>T{{ quarter }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Semestre
+        <select name="report_semester">
+          <option value="1" {{ 'selected' if report_semester|string == '1' }}>S1</option>
+          <option value="2" {{ 'selected' if report_semester|string == '2' }}>S2</option>
+        </select>
+      </label>
+      <label>Comparacao
+        <select name="comparison">
+          <option value="" {{ 'selected' if not comparison }}>Sem comparacao</option>
+          <option value="previous_period" {{ 'selected' if comparison == 'previous_period' }}>Periodo anterior</option>
+          <option value="previous_year" {{ 'selected' if comparison == 'previous_year' }}>Mesmo periodo do ano anterior</option>
+        </select>
+      </label>
       <div class="field-actions">
-        <a class="button secondary" href="{{ url_for('export_portfolio_report', portfolio_id=selected_portfolio_id, report_month=report_month) }}">Exportar Excel</a>
+        <button class="button secondary" type="submit">Preview</button>
+        <a class="button secondary" href="{{ url_for('export_portfolio_report', portfolio_id=selected_portfolio_id, profile_id=selected_profile_id, period_type=period_type, report_month=report_month, report_year=report_year, report_quarter=report_quarter, report_semester=report_semester, comparison=comparison) }}">Exportar Excel</a>
       </div>
     </div>
   </form>
   <form method="post" action="{{ url_for('generate_portfolio_report') }}" class="inline-form">
     <input type="hidden" name="portfolio_id" value="{{ selected_portfolio_id }}">
+    <input type="hidden" name="profile_id" value="{{ selected_profile_id }}">
+    <input type="hidden" name="period_type" value="{{ period_type }}">
     <input type="hidden" name="report_month" value="{{ report_month }}">
+    <input type="hidden" name="report_year" value="{{ report_year }}">
+    <input type="hidden" name="report_quarter" value="{{ report_quarter }}">
+    <input type="hidden" name="report_semester" value="{{ report_semester }}">
+    <input type="hidden" name="comparison" value="{{ comparison }}">
+    <label>Notas
+      <input name="notes" placeholder="Opcional">
+    </label>
     <button class="button" type="submit">Gerar snapshot</button>
   </form>
 </section>
 
 <section class="card">
   <div class="section-title">
-    <h3>Relatorio</h3>
+    <h3>Configurador de perfil</h3>
   </div>
-  <div class="table-wrap">
+  <form method="post" action="{{ url_for('save_portfolio_report_profile_route') }}" class="stack-form">
+    <input type="hidden" name="portfolio_id" value="{{ selected_portfolio_id }}">
+    <input type="hidden" name="profile_id" value="{{ selected_profile_id }}">
+    <div class="grid three">
+      <label>Nome
+        <input name="name" value="{{ selected_profile.name if selected_profile else '' }}">
+      </label>
+      <label>Descricao
+        <input name="description" value="{{ selected_profile.description if selected_profile else '' }}">
+      </label>
+      <label>Periodo predefinido
+        <select name="default_period_type">
+          {% for option in ['monthly', 'quarterly', 'semiannual', 'annual'] %}
+            <option value="{{ option }}" {{ 'selected' if selected_profile and selected_profile.period_type == option }}>{{ option }}</option>
+          {% endfor %}
+        </select>
+      </label>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Ativa</th>
+            <th>Ordem</th>
+            <th>Metrica</th>
+            <th>Categoria</th>
+            <th>Label</th>
+            <th>Casas</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% set selected_keys = selected_profile.columns|map(attribute='metric_key')|list if selected_profile else [] %}
+          {% for key, definition in metric_catalog.items() %}
+            {% set current = (selected_profile.columns|selectattr('metric_key', 'equalto', key)|list|first) if selected_profile else none %}
+            <tr draggable="true" data-profile-column-row>
+              <td><input type="checkbox" name="metric_key" value="{{ key }}" {{ 'checked' if key in selected_keys }}></td>
+              <td><input class="column-order-input" name="order_{{ key }}" value="{{ current.display_order if current else loop.index * 10 }}" inputmode="numeric"></td>
+              <td>{{ definition.label }}</td>
+              <td>{{ definition.category }}</td>
+              <td><input name="label_{{ key }}" value="{{ current.label if current else definition.label }}"></td>
+              <td><input name="decimals_{{ key }}" value="{{ current.decimals if current and current.decimals is not none else definition.decimals }}" inputmode="numeric"></td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="inline-form">
+      <button class="button" type="submit" name="action" value="save">Guardar perfil</button>
+      <button class="button secondary" type="submit" name="action" value="duplicate">Duplicar</button>
+      <button class="button danger" type="submit" name="action" value="archive">Arquivar</button>
+    </div>
+  </form>
+</section>
+
+{% if portfolio_result %}
+<section class="card">
+  <div class="section-title">
+    <h3>{{ portfolio_result.period.label }}</h3>
+    <p class="muted">Cobertura global {{ portfolio_result.coverage.global_pct }}% · {{ portfolio_result.rows|length }} instalacoes · {{ portfolio_result.engine_version }}</p>
+  </div>
+  <div class="grid four">
+    {% for key, value in portfolio_result.summary.values.items() %}
+      <div class="metric">
+        <span>{{ metric_catalog[key].label if key in metric_catalog else key }}</span>
+        <strong>{{ format_number(value, metric_catalog[key].decimals if key in metric_catalog else 2) if value is not none else '-' }}</strong>
+      </div>
+    {% endfor %}
+  </div>
+  {% if portfolio_result.comparison %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Metrica</th><th>Atual</th><th>Anterior</th><th>Diferenca</th><th>Diferenca %</th></tr></thead>
+        <tbody>
+          {% for key, item in portfolio_result.comparison.values.items() %}
+            <tr>
+              <td>{{ metric_catalog[key].label if key in metric_catalog else key }}</td>
+              <td>{{ item.current }}</td>
+              <td>{{ item.previous }}</td>
+              <td>{{ item.delta if item.delta is not none else '-' }}</td>
+              <td>{{ item.delta_pct if item.delta_pct is not none else '-' }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+</section>
+
+<section class="card">
+  <div class="section-title">
+    <h3>Instalacoes</h3>
+    <input class="table-search" type="search" placeholder="Pesquisar">
+  </div>
+  <div class="table-wrap sticky-table">
     <table>
       <thead>
         <tr>
-          <th>Portfolio</th>
-          <th>Instalacao</th>
-          <th>NIF</th>
-          <th>Sub-account</th>
-          <th>Actual kWh</th>
-          <th>Ponta</th>
-          <th>Cheia</th>
-          <th>Vazio</th>
-          <th>Super vazio</th>
-          <th>Autoc. ponta</th>
-          <th>Autoc. cheia</th>
-          <th>Autoc. vazio</th>
-          <th>Autoc. super vazio</th>
-          <th>Helioscope kWh</th>
-          <th>Ajustado kWh</th>
-          <th>Degradacao</th>
-          <th>Desvio kWh</th>
-          <th>Desvio %</th>
-          <th>Disponibilidade %</th>
-          <th>Tarifa</th>
-          <th>Valor EUR</th>
-          <th>Fatura</th>
-          <th>Estado</th>
-          <th>Avisos</th>
+          {% for column in portfolio_result.columns %}
+            <th>{{ column.label }}</th>
+          {% endfor %}
+          <th>Badges</th>
         </tr>
       </thead>
       <tbody>
-        {% for row in rows %}
-          <tr>
-            <td>{{ row.portfolio }}</td>
-            <td>{{ row.installation }}</td>
-            <td>{{ row.nif or "-" }}</td>
-            <td>{{ row.sub_account or "-" }}</td>
-            <td>{{ format_number(row.actual_production_kwh, 2) }}</td>
-            <td>{{ format_number(row.production_ponta_kwh, 2) }}</td>
-            <td>{{ format_number(row.production_cheia_kwh, 2) }}</td>
-            <td>{{ format_number(row.production_vazio_kwh, 2) }}</td>
-            <td>{{ format_number(row.production_super_vazio_kwh, 2) }}</td>
-            <td>{{ format_number(row.self_use_ponta_kwh, 2) }}</td>
-            <td>{{ format_number(row.self_use_cheia_kwh, 2) }}</td>
-            <td>{{ format_number(row.self_use_vazio_kwh, 2) }}</td>
-            <td>{{ format_number(row.self_use_super_vazio_kwh, 2) }}</td>
-            <td>{{ format_number(row.helioscope_expected_kwh, 2) }}</td>
-            <td>{{ format_number(row.adjusted_expected_kwh, 2) }}</td>
-            <td>{{ format_number(row.degradation_factor, 4) }}</td>
-            <td>{{ format_number(row.deviation_kwh, 2) }}</td>
-            <td>{{ format_number(row.deviation_pct, 2) }}</td>
-            <td>{{ format_number(row.availability_pct, 2) }}</td>
-            <td>{{ row.tariff_type or "-" }}</td>
-            <td>{{ format_number(row.estimated_value_eur, 2) }}</td>
-            <td>{{ row.invoice_status }}</td>
-            <td>{{ row.data_status }}</td>
-            <td>{{ row.warnings|join("; ") if row.warnings else "-" }}</td>
+        {% for row in portfolio_result.rows %}
+          <tr class="severity-{{ row.severity }}">
+            {% for column in portfolio_result.columns %}
+              {% set value = row.values.get(column.metric_key) %}
+              <td>
+                {% if loop.first and row.asset_id %}
+                  <a href="{{ url_for('asset_detail', asset_id=row.asset_id) }}">{{ value }}</a>
+                {% elif value is iterable and value is not string %}
+                  {{ value|join('; ') }}
+                {% elif value is number %}
+                  {{ format_number(value, column.decimals if column.decimals is not none else 2) }}
+                {% else %}
+                  {{ value if value is not none else '-' }}
+                {% endif %}
+              </td>
+            {% endfor %}
+            <td>{{ row.warnings|join('; ') if row.warnings else row.severity }}</td>
           </tr>
+        {% else %}
+          <tr><td colspan="{{ portfolio_result.columns|length + 1 }}" class="muted">Sem instalacoes ativas mapeadas para este portfolio.</td></tr>
         {% endfor %}
-        {% if total_row %}
-          <tr>
-            <td>{{ total_row.portfolio }}</td>
-            <td><strong>{{ total_row.installation }}</strong></td>
-            <td></td>
-            <td></td>
-            <td><strong>{{ format_number(total_row.actual_production_kwh, 2) }}</strong></td>
-            <td><strong>{{ format_number(total_row.production_ponta_kwh, 2) }}</strong></td>
-            <td><strong>{{ format_number(total_row.production_cheia_kwh, 2) }}</strong></td>
-            <td><strong>{{ format_number(total_row.production_vazio_kwh, 2) }}</strong></td>
-            <td><strong>{{ format_number(total_row.production_super_vazio_kwh, 2) }}</strong></td>
-            <td><strong>{{ format_number(total_row.self_use_ponta_kwh, 2) }}</strong></td>
-            <td><strong>{{ format_number(total_row.self_use_cheia_kwh, 2) }}</strong></td>
-            <td><strong>{{ format_number(total_row.self_use_vazio_kwh, 2) }}</strong></td>
-            <td><strong>{{ format_number(total_row.self_use_super_vazio_kwh, 2) }}</strong></td>
-            <td><strong>{{ format_number(total_row.helioscope_expected_kwh, 2) }}</strong></td>
-            <td><strong>{{ format_number(total_row.adjusted_expected_kwh, 2) }}</strong></td>
-            <td></td>
-            <td><strong>{{ format_number(total_row.deviation_kwh, 2) }}</strong></td>
-            <td><strong>{{ format_number(total_row.deviation_pct, 2) }}</strong></td>
-            <td><strong>{{ format_number(total_row.availability_pct, 2) }}</strong></td>
-            <td></td>
-            <td><strong>{{ format_number(total_row.estimated_value_eur, 2) }}</strong></td>
-            <td></td>
-            <td>{{ total_row.data_status }}</td>
-            <td>{{ total_row.warnings|join("; ") if total_row.warnings else "-" }}</td>
-          </tr>
-        {% elif not rows %}
-          <tr><td colspan="20" class="muted">Sem instalacoes ativas mapeadas para este portfolio.</td></tr>
-        {% endif %}
       </tbody>
     </table>
   </div>
@@ -137,7 +221,26 @@
 
 <section class="card">
   <div class="section-title">
-    <h3>Snapshots recentes</h3>
+    <h3>Qualidade dos dados</h3>
+    <p class="muted">{{ portfolio_result.coverage.complete_installations }} completas · {{ portfolio_result.coverage.incomplete_installations }} incompletas</p>
+  </div>
+  <div class="grid four">
+    {% for source, value in portfolio_result.coverage.by_source.items() %}
+      <div class="metric">
+        <span>{{ source }}</span>
+        <strong>{{ value }}%</strong>
+      </div>
+    {% endfor %}
+  </div>
+  {% if portfolio_result.coverage.missing_months %}
+    <p class="muted">Meses em falta: {{ portfolio_result.coverage.missing_months|join(', ') }}</p>
+  {% endif %}
+</section>
+{% endif %}
+
+<section class="card">
+  <div class="section-title">
+    <h3>Historico</h3>
   </div>
   <div class="table-wrap">
     <table>
@@ -145,9 +248,11 @@
         <tr>
           <th>ID</th>
           <th>Portfolio</th>
-          <th>Mes</th>
+          <th>Perfil</th>
+          <th>Periodo</th>
           <th>Criado em</th>
-          <th>Notas</th>
+          <th>Estado</th>
+          <th>Acoes</th>
         </tr>
       </thead>
       <tbody>
@@ -155,15 +260,45 @@
           <tr>
             <td>{{ run.id }}</td>
             <td>{{ run.portfolio_name }}</td>
-            <td>{{ run.report_month }}</td>
+            <td>{{ run.profile_name or 'Legacy' }}</td>
+            <td>{{ run.period_type or 'monthly' }} {{ run.period_start or run.report_month }}</td>
             <td>{{ run.created_at }}</td>
-            <td>{{ run.notes or "-" }}</td>
+            <td>{{ run.status or 'legacy' }}</td>
+            <td>
+              {% if run.rows_json %}
+                <a class="button secondary small" href="{{ url_for('export_portfolio_report', snapshot_id=run.id) }}">Excel snapshot</a>
+              {% else %}
+                <span class="muted">Legacy</span>
+              {% endif %}
+            </td>
           </tr>
         {% else %}
-          <tr><td colspan="5" class="muted">Ainda sem snapshots.</td></tr>
+          <tr><td colspan="7" class="muted">Ainda sem snapshots.</td></tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
 </section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  document.querySelectorAll("[data-profile-column-row]").forEach((row) => {
+    row.addEventListener("dragstart", (event) => {
+      event.dataTransfer.setData("text/plain", Array.from(row.parentElement.children).indexOf(row));
+    });
+    row.addEventListener("dragover", (event) => event.preventDefault());
+    row.addEventListener("drop", (event) => {
+      event.preventDefault();
+      const tbody = row.parentElement;
+      const from = Number(event.dataTransfer.getData("text/plain"));
+      const dragged = tbody.children[from];
+      if (!dragged || dragged === row) return;
+      tbody.insertBefore(dragged, row);
+      tbody.querySelectorAll(".column-order-input").forEach((input, index) => {
+        input.value = String((index + 1) * 10);
+      });
+    });
+  });
+</script>
 {% endblock %}

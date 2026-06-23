@@ -39,7 +39,6 @@ from monitoring_board.portfolio_reports import (
     import_helioscope_file,
     map_external_portfolio_entity,
     seed_external_portfolio_rows,
-    snapshot_portfolio_report,
 )
 from monitoring_board.routes.auth import auth_bp
 from monitoring_board.routes.field_routes import field_routes_bp
@@ -100,6 +99,21 @@ from monitoring_board.portfolio_repository import (
     update_portfolio,
     upsert_alias,
 )
+from monitoring_board.portfolio_report_repository import (
+    archive_profile as archive_portfolio_report_profile,
+    duplicate_profile as duplicate_portfolio_report_profile,
+    ensure_portfolio_reporting_schema,
+    get_default_profile as get_default_portfolio_report_profile,
+    get_profile as get_portfolio_report_profile,
+    get_snapshot_result as get_portfolio_snapshot_result,
+    latest_profile_version as latest_portfolio_report_profile_version,
+    list_profiles as list_portfolio_report_profiles,
+    list_report_history as list_portfolio_report_history,
+    save_profile as save_portfolio_report_profile,
+    snapshot_portfolio_result,
+)
+from monitoring_board.reporting.portfolio import METRIC_CATALOG, profile_from_config, profile_to_config
+from monitoring_board.services.portfolio_reporting import export_portfolio_result_workbook, prepare_portfolio_report
 from monitoring_board.reporting.billing import decimal_from_value
 from monitoring_board.reporting.invoices import normalize_date, is_supported_invoice_extension, validate_invoice_values, warnings_require_override
 from monitoring_board.reporting.availability import (
@@ -3408,41 +3422,138 @@ def create_app() -> Flask:
         groups = query_all(g.db, "SELECT * FROM portfolio_groups ORDER BY name COLLATE NOCASE")
         selected_portfolio_id = int(request.args.get("portfolio_id", groups[0]["id"] if groups else 0) or 0)
         report_month = normalize_report_month(request.args.get("report_month", ""))
-        rows = build_portfolio_report_rows(g.db, selected_portfolio_id, report_month) if selected_portfolio_id else []
         portfolio_name = next((row["name"] for row in groups if int(row["id"]) == selected_portfolio_id), "")
-        for row in rows:
-            row["portfolio"] = portfolio_name
-        total_row = aggregate_portfolio_total(rows) if rows else None
-        if total_row:
-            total_row["portfolio"] = portfolio_name
-        runs = query_all(
-            g.db,
-            """
-            SELECT prr.*, pg.name AS portfolio_name
-            FROM portfolio_report_runs prr
-            JOIN portfolio_groups pg ON pg.id = prr.portfolio_id
-            ORDER BY prr.created_at DESC
-            LIMIT 20
-            """,
-        )
+        period_type = request.args.get("period_type", "monthly").strip() or "monthly"
+        report_year = request.args.get("report_year") or report_month[:4]
+        report_quarter = request.args.get("report_quarter") or str(((int(report_month[5:7]) - 1) // 3) + 1)
+        report_semester = request.args.get("report_semester") or ("1" if int(report_month[5:7]) <= 6 else "2")
+        comparison = request.args.get("comparison", "").strip()
+        profiles = list_portfolio_report_profiles(g.db, selected_portfolio_id)
+        selected_profile_id = int(request.args.get("profile_id", "0") or 0)
+        profile = get_portfolio_report_profile(g.db, selected_profile_id) if selected_profile_id else None
+        if profile is None:
+            profile = get_default_portfolio_report_profile(g.db, selected_portfolio_id)
+            selected_profile_id = int(profile.id or 0)
+        portfolio_result = None
+        rows = []
+        total_row = None
+        if selected_portfolio_id:
+            try:
+                portfolio_result = prepare_portfolio_report(
+                    g.db,
+                    portfolio_id=selected_portfolio_id,
+                    portfolio_name=portfolio_name,
+                    profile=profile,
+                    period_type=period_type,
+                    report_month=report_month,
+                    year=report_year,
+                    quarter=report_quarter,
+                    semester=report_semester,
+                    comparison=comparison,
+                    profile_version=latest_portfolio_report_profile_version(g.db, profile.id),
+                )
+            except Exception as exc:
+                flash(f"Falha ao preparar relatorio configuravel: {exc}", "error")
+                portfolio_result = None
+            rows = build_portfolio_report_rows(g.db, selected_portfolio_id, report_month)
+            for row in rows:
+                row["portfolio"] = portfolio_name
+            total_row = aggregate_portfolio_total(rows) if rows else None
+            if total_row:
+                total_row["portfolio"] = portfolio_name
+        runs = list_portfolio_report_history(g.db, selected_portfolio_id, limit=20)
         return render_template(
             "portfolio_reports.html",
             title="Relatorios de portfolio",
             groups=groups,
             selected_portfolio_id=selected_portfolio_id,
             report_month=report_month,
+            report_year=report_year,
+            report_quarter=report_quarter,
+            report_semester=report_semester,
+            period_type=period_type,
+            comparison=comparison,
+            profiles=profiles,
+            selected_profile_id=selected_profile_id,
+            selected_profile=profile,
+            metric_catalog=METRIC_CATALOG,
+            portfolio_result=portfolio_result,
             rows=rows,
             total_row=total_row,
             runs=runs,
         )
 
+    @app.route("/portfolio-reports/profiles", methods=["POST"])
+    def save_portfolio_report_profile_route():
+        action = request.form.get("action", "save").strip()
+        portfolio_id = int(request.form.get("portfolio_id", "0") or 0) or None
+        profile_id = int(request.form.get("profile_id", "0") or 0)
+        try:
+            if action == "archive" and profile_id:
+                archive_portfolio_report_profile(g.db, profile_id)
+                flash("Perfil arquivado.", "success")
+            elif action == "duplicate" and profile_id:
+                duplicate_portfolio_report_profile(g.db, profile_id, request.form.get("name", "").strip() or "Copia")
+                flash("Perfil duplicado.", "success")
+            else:
+                base = get_portfolio_report_profile(g.db, profile_id) if profile_id else get_default_portfolio_report_profile(g.db, portfolio_id)
+                selected_metrics = request.form.getlist("metric_key") or [column.metric_key for column in base.columns if column.visible]
+                config = profile_to_config(base)
+                config["name"] = request.form.get("name", "").strip() or base.name
+                config["description"] = request.form.get("description", "").strip()
+                config["portfolio_id"] = portfolio_id
+                config["period_type"] = request.form.get("default_period_type", "monthly")
+                config["comparison"] = request.form.get("default_comparison", "")
+                selected_metrics = sorted(
+                    selected_metrics,
+                    key=lambda metric_key: int(request.form.get(f"order_{metric_key}", "9999") or 9999),
+                )
+                config["columns"] = [
+                    {
+                        "metric_key": metric_key,
+                        "label": request.form.get(f"label_{metric_key}", "").strip() or metric_key,
+                        "decimals": request.form.get(f"decimals_{metric_key}", ""),
+                        "visible": True,
+                        "display_order": index * 10,
+                    }
+                    for index, metric_key in enumerate(selected_metrics, start=1)
+                ]
+                profile = profile_from_config(config, profile_id=profile_id or None, portfolio_id=portfolio_id)
+                profile_id = save_portfolio_report_profile(g.db, profile)
+                flash("Perfil guardado.", "success")
+            g.db.commit()
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao guardar perfil: {exc}", "error")
+        return redirect(url_for("portfolio_reports", portfolio_id=portfolio_id or 0, profile_id=profile_id))
+
     @app.route("/portfolio-reports/generate", methods=["POST"])
     def generate_portfolio_report():
         portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
         report_month = normalize_report_month(request.form.get("report_month", ""))
+        period_type = request.form.get("period_type", "monthly").strip() or "monthly"
+        profile_id = int(request.form.get("profile_id", "0") or 0)
+        comparison = request.form.get("comparison", "").strip()
         return_to = request.form.get("return_to", "").strip()
         try:
-            report_id = snapshot_portfolio_report(g.db, portfolio_id, report_month, request.form.get("notes", "").strip())
+            group = g.db.execute("SELECT * FROM portfolio_groups WHERE id = ?", (portfolio_id,)).fetchone()
+            if not group:
+                raise ValueError("Portfolio invalido.")
+            profile = get_portfolio_report_profile(g.db, profile_id) if profile_id else get_default_portfolio_report_profile(g.db, portfolio_id)
+            result = prepare_portfolio_report(
+                g.db,
+                portfolio_id=portfolio_id,
+                portfolio_name=group["name"],
+                profile=profile,
+                period_type=period_type,
+                report_month=report_month,
+                year=request.form.get("report_year") or report_month[:4],
+                quarter=request.form.get("report_quarter"),
+                semester=request.form.get("report_semester"),
+                comparison=comparison,
+                profile_version=latest_portfolio_report_profile_version(g.db, profile.id),
+            )
+            report_id = snapshot_portfolio_result(g.db, result, request.form.get("notes", "").strip())
             g.db.commit()
             flash(f"Relatorio snapshot #{report_id} gerado.", "success")
         except Exception as exc:
@@ -3450,21 +3561,53 @@ def create_app() -> Flask:
             flash(f"Falha ao gerar relatorio: {exc}", "error")
         if return_to == "portfolios":
             return redirect(url_for("portfolios", portfolio_id=portfolio_id, report_month=report_month, tab="report"))
-        return redirect(url_for("portfolio_reports", portfolio_id=portfolio_id, report_month=report_month))
+        return redirect(url_for("portfolio_reports", portfolio_id=portfolio_id, report_month=report_month, profile_id=profile_id, period_type=period_type, comparison=comparison))
 
     @app.route("/portfolio-reports/export")
     def export_portfolio_report():
+        snapshot_id = int(request.args.get("snapshot_id", "0") or 0)
+        if snapshot_id:
+            result = get_portfolio_snapshot_result(g.db, snapshot_id)
+            if result:
+                workbook = export_portfolio_result_workbook(result)
+                buffer = io.BytesIO()
+                workbook.save(buffer)
+                buffer.seek(0)
+                return send_file(
+                    buffer,
+                    as_attachment=True,
+                    download_name=f"portfolio_snapshot_{snapshot_id}.xlsx",
+                    mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
         portfolio_id = int(request.args.get("portfolio_id", "0") or 0)
         report_month = normalize_report_month(request.args.get("report_month", ""))
         group = g.db.execute("SELECT * FROM portfolio_groups WHERE id = ?", (portfolio_id,)).fetchone()
-        rows = build_portfolio_report_rows(g.db, portfolio_id, report_month) if group else []
-        for row in rows:
-            row["portfolio"] = group["name"] if group else ""
-        if rows:
-            total = aggregate_portfolio_total(rows)
-            total["portfolio"] = group["name"] if group else ""
-            rows.append(total)
-        workbook = export_portfolio_report_workbook(rows)
+        profile_id = int(request.args.get("profile_id", "0") or 0)
+        if group and (profile_id or request.args.get("period_type") or request.args.get("comparison")):
+            profile = get_portfolio_report_profile(g.db, profile_id) if profile_id else get_default_portfolio_report_profile(g.db, portfolio_id)
+            result = prepare_portfolio_report(
+                g.db,
+                portfolio_id=portfolio_id,
+                portfolio_name=group["name"],
+                profile=profile,
+                period_type=request.args.get("period_type", "monthly"),
+                report_month=report_month,
+                year=request.args.get("report_year") or report_month[:4],
+                quarter=request.args.get("report_quarter"),
+                semester=request.args.get("report_semester"),
+                comparison=request.args.get("comparison", ""),
+                profile_version=latest_portfolio_report_profile_version(g.db, profile.id),
+            )
+            workbook = export_portfolio_result_workbook(result)
+        else:
+            rows = build_portfolio_report_rows(g.db, portfolio_id, report_month) if group else []
+            for row in rows:
+                row["portfolio"] = group["name"] if group else ""
+            if rows:
+                total = aggregate_portfolio_total(rows)
+                total["portfolio"] = group["name"] if group else ""
+                rows.append(total)
+            workbook = export_portfolio_report_workbook(rows)
         buffer = io.BytesIO()
         workbook.save(buffer)
         buffer.seek(0)
@@ -4735,6 +4878,7 @@ def ensure_database(path: str) -> None:
         populate_missing_group_metadata(conn)
         ensure_predefined_export_templates(conn)
         ensure_portfolio_management_schema(conn)
+        ensure_portfolio_reporting_schema(conn)
         ensure_portfolio_seed_data(conn)
         ensure_alert_settings_defaults(conn)
         ensure_billing_config_schema(conn)
