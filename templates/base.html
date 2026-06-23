@@ -26,7 +26,8 @@
           <a href="{{ url_for('field_routes.field_routes') }}" class="{{ 'active' if request.endpoint and request.endpoint.startswith('field_routes.') else '' }}">Mapa e rotas</a>
           <a href="{{ url_for('integrations') }}" class="{{ 'active' if request.endpoint in ['integrations', 'telegram_alerts'] else '' }}">Integracoes</a>
           <a href="{{ url_for('renewals') }}" class="{{ 'active' if request.endpoint == 'renewals' else '' }}">Renovacoes</a>
-          <a href="{{ url_for('portfolios') }}" class="{{ 'active' if (request.endpoint and request.endpoint.startswith('portfolio')) or request.endpoint in ['portfolios', 'upload_portfolio_helioscope', 'upload_portfolio_invoice'] else '' }}">Portfolios</a>
+          <a href="{{ url_for('portfolio_manager') }}" class="{{ 'active' if request.endpoint and request.endpoint.startswith('portfolio_manager') else '' }}">Gestor portfolios</a>
+          <a href="{{ url_for('portfolios') }}" class="{{ 'active' if request.endpoint in ['portfolios', 'upload_portfolio_helioscope', 'upload_portfolio_invoice'] else '' }}">Portfolios</a>
           <a href="{{ url_for('exports') }}" class="{{ 'active' if request.endpoint == 'exports' else '' }}">Exportacoes</a>
           <a href="{{ url_for('settings') }}" class="{{ 'active' if request.endpoint == 'settings' else '' }}">Importacao</a>
         </nav>

@@ -10,7 +10,10 @@ from typing import Any
 
 from openpyxl import Workbook, load_workbook
 
-from monitoring_board.db import query_all
+from monitoring_board.portfolio_repository import (
+    auto_map_portfolio_assets as repository_auto_map_portfolio_assets,
+    suggest_mapping,
+)
 from monitoring_board.reporting.availability import calculate_weighted_portfolio_availability
 from monitoring_board.reporting.billing import decimal_from_value
 from monitoring_board.reporting.degradation import calculate_degradation_factor
@@ -294,34 +297,16 @@ def import_helioscope_file(
 
 
 def map_external_portfolio_entity(conn: sqlite3.Connection, *, nif: str = "", external_name: str = "") -> dict[str, Any]:
-    normalized_nif = normalize_nif(nif)
-    if normalized_nif:
-        row = conn.execute("SELECT id FROM assets WHERE REPLACE(REPLACE(COALESCE(nif, ''), ' ', ''), '-', '') = ? LIMIT 1", (normalized_nif,)).fetchone()
-        if row:
-            return {"asset_id": int(row["id"]), "mapping_status": "auto_nif", "mapping_confidence": 1.0}
-    normalized_name = normalize_text(external_name)
-    if normalized_name:
-        row = conn.execute("SELECT asset_id FROM asset_aliases WHERE normalized_alias = ? LIMIT 1", (normalized_name,)).fetchone()
-        if row:
-            return {"asset_id": int(row["asset_id"]), "mapping_status": "auto_name", "mapping_confidence": 0.9}
-        row = conn.execute("SELECT id FROM assets WHERE LOWER(project_name) = ? LIMIT 1", (external_name.strip().lower(),)).fetchone()
-        if row:
-            return {"asset_id": int(row["id"]), "mapping_status": "auto_name", "mapping_confidence": 0.85}
-    return {"asset_id": None, "mapping_status": "unmapped", "mapping_confidence": 0.0}
+    decision = suggest_mapping(conn, nif=nif, external_name=external_name)
+    return {
+        "asset_id": decision.asset_id if decision.auto_mappable else None,
+        "mapping_status": decision.status if decision.auto_mappable else ("mapping_conflict" if decision.status == "mapping_conflict" else "unmapped"),
+        "mapping_confidence": decision.score,
+    }
 
 
-def repeated_portfolio_nifs(conn: sqlite3.Connection) -> set[str]:
-    rows = query_all(
-        conn,
-        """
-        SELECT nif
-        FROM portfolio_assets
-        WHERE COALESCE(nif, '') != ''
-        GROUP BY nif
-        HAVING COUNT(DISTINCT portfolio_id) > 1
-        """,
-    )
-    return {str(row["nif"]) for row in rows}
+def auto_map_portfolio_assets(conn: sqlite3.Connection, portfolio_id: int | None = None) -> dict[str, int]:
+    return repository_auto_map_portfolio_assets(conn, portfolio_id)
 
 
 def seed_external_portfolio_rows(conn: sqlite3.Connection) -> None:
@@ -330,7 +315,7 @@ def seed_external_portfolio_rows(conn: sqlite3.Connection) -> None:
         if group is None:
             continue
         portfolio_id = int(group["id"])
-        for sub_account, nif, external_name in rows:
+        for index, (sub_account, nif, external_name) in enumerate(rows, start=1):
             existing = conn.execute(
                 """
                 SELECT id
@@ -346,10 +331,11 @@ def seed_external_portfolio_rows(conn: sqlite3.Connection) -> None:
                     UPDATE portfolio_assets
                     SET external_name = COALESCE(NULLIF(external_name, ''), ?),
                         nif = COALESCE(NULLIF(nif, ''), ?),
+                        display_order = COALESCE(NULLIF(display_order, 0), ?),
                         active = 1
                     WHERE id = ?
                     """,
-                    (external_name, nif, existing["id"]),
+                    (external_name, nif, index * 10, existing["id"]),
                 )
                 continue
             mapping_status = "mapping_pending" if nif else "missing_source"
@@ -358,63 +344,11 @@ def seed_external_portfolio_rows(conn: sqlite3.Connection) -> None:
                 """
                 INSERT INTO portfolio_assets (
                     portfolio_id, asset_id, external_name, nif, sub_account, active,
-                    mapping_status, mapping_confidence, notes
-                ) VALUES (?, NULL, ?, ?, ?, 1, ?, 0, ?)
+                    mapping_status, mapping_confidence, notes, display_order, mapping_method, updated_at
+                ) VALUES (?, NULL, ?, ?, ?, 1, ?, 0, ?, ?, 'unmapped', ?)
                 """,
-                (portfolio_id, external_name, nif, sub_account, mapping_status, notes),
+                (portfolio_id, external_name, nif, sub_account, mapping_status, notes, index * 10, datetime.now().isoformat(timespec="seconds")),
             )
-    mark_repeated_nif_conflicts(conn)
-
-
-def mark_repeated_nif_conflicts(conn: sqlite3.Connection) -> None:
-    repeated = repeated_portfolio_nifs(conn)
-    if not repeated:
-        return
-    for nif in repeated:
-        conn.execute(
-            """
-            UPDATE portfolio_assets
-            SET mapping_status = 'mapping_conflict',
-                notes = TRIM(COALESCE(notes, '') || ' NIF repetido entre portfolios; confirmar mapping.')
-            WHERE nif = ?
-            """,
-            (nif,),
-        )
-
-
-def auto_map_portfolio_assets(conn: sqlite3.Connection, portfolio_id: int | None = None) -> dict[str, int]:
-    conditions = ["active = 1"]
-    params: list[Any] = []
-    if portfolio_id:
-        conditions.append("portfolio_id = ?")
-        params.append(portfolio_id)
-    rows = query_all(conn, f"SELECT * FROM portfolio_assets WHERE {' AND '.join(conditions)}", params)
-    repeated = repeated_portfolio_nifs(conn)
-    mapped = 0
-    pending = 0
-    conflicts = 0
-    for row in rows:
-        result = map_external_portfolio_entity(conn, nif=row["nif"] or "", external_name=row["external_name"] or "")
-        status = result["mapping_status"]
-        confidence = result["mapping_confidence"]
-        asset_id = result["asset_id"]
-        if row["nif"] and row["nif"] in repeated:
-            status = "mapping_conflict"
-            conflicts += 1
-        elif not asset_id:
-            status = "mapping_pending"
-            pending += 1
-        else:
-            mapped += 1
-        conn.execute(
-            """
-            UPDATE portfolio_assets
-            SET asset_id = ?, mapping_status = ?, mapping_confidence = ?
-            WHERE id = ?
-            """,
-            (asset_id, status, confidence, row["id"]),
-        )
-    return {"mapped": mapped, "pending": pending, "conflicts": conflicts}
 
 
 def warning_label(code: str) -> str:

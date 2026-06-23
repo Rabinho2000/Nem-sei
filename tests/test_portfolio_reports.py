@@ -164,7 +164,7 @@ def test_seed_external_portfolio_rows_includes_missing_subaccounts(tmp_path: Pat
     assert all(row["mapping_status"] == "missing_source" for row in rows)
 
 
-def test_repeated_nif_is_marked_as_mapping_conflict(tmp_path: Path) -> None:
+def test_repeated_nif_across_portfolios_is_not_false_conflict(tmp_path: Path) -> None:
     conn = connect(tmp_path)
     asset_id = add_asset(conn, name="JETESETECAR EQUIPAMENTOS AUTO LDA", nif="503194387")
 
@@ -173,6 +173,6 @@ def test_repeated_nif_is_marked_as_mapping_conflict(tmp_path: Path) -> None:
         "SELECT asset_id, mapping_status FROM portfolio_assets WHERE nif = '503194387' ORDER BY portfolio_id"
     ).fetchall()
 
-    assert result["conflicts"] >= 2
-    assert {row["mapping_status"] for row in rows} == {"mapping_conflict"}
+    assert result["conflicts"] == 0
+    assert {row["mapping_status"] for row in rows} == {"mapped"}
     assert {row["asset_id"] for row in rows} == {asset_id}

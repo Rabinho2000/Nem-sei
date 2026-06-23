@@ -1152,7 +1152,6 @@ def import_mymaps_points(conn: sqlite3.Connection, points: list[dict[str, Any]],
 
 def classify_geocode_confidence(row: sqlite3.Row, label: str, latitude: float, longitude: float) -> str:
     label_normalized = normalize_text(label)
-    address = normalize_text(row["address"] or "")
     postcode = extract_portuguese_postcode(row["address"] or "")
     locality_candidates = extract_locality_candidates(row)
     street_tokens = relevant_tokens(strip_postcode(row["address"] or ""))
