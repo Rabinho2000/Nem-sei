@@ -275,11 +275,33 @@
                     </form>
                     <form method="post" action="{{ url_for('upload_portfolio_invoice') }}" enctype="multipart/form-data" class="stack-form">
                       <input type="hidden" name="portfolio_id" value="{{ item.portfolio_id }}">
+                      <input type="hidden" name="report_month" value="{{ report_month }}">
                       <input type="hidden" name="asset_id" value="{{ item.asset_id }}">
-                      <input type="file" name="file" required>
+                      <input type="file" name="file" accept=".pdf,.xlsx,.xlsm,.csv,.txt" required>
                       <button class="button secondary" type="submit">Upload fatura</button>
                     </form>
                   </div>
+                  <details>
+                    <summary class="button secondary">Faturas</summary>
+                    <div class="list compact-list top-space">
+                      {% for invoice in invoice_documents if invoice.asset_id == item.asset_id %}
+                        <div class="list-row">
+                          <div>
+                            <strong>{{ invoice.invoice_number or invoice.original_filename }}</strong>
+                            <small>{{ invoice.status }}{% if invoice.billing_period_start or invoice.billing_period_end %} · {{ invoice.billing_period_start or "?" }} a {{ invoice.billing_period_end or "?" }}{% endif %}{% if invoice.extraction_confidence %} · conf. {{ invoice.extraction_confidence }}{% endif %}</small>
+                          </div>
+                          <div class="hero-actions">
+                            <form method="post" action="{{ url_for('extract_invoice_document_route', invoice_document_id=invoice.id) }}" class="inline-form">
+                              <button class="button secondary" type="submit">Extrair</button>
+                            </form>
+                            <a class="button secondary" href="{{ url_for('review_invoice_document', invoice_document_id=invoice.id) }}">Rever</a>
+                          </div>
+                        </div>
+                      {% else %}
+                        <p class="muted">Sem faturas registadas.</p>
+                      {% endfor %}
+                    </div>
+                  </details>
                   <details>
                     <summary class="button secondary">Editar tarifa</summary>
                     <form method="post" class="stack-form top-space">

@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">Fatura</p>
+    <h2>{{ invoice.invoice_number or invoice.original_filename }}</h2>
+    <p class="muted">{{ asset.project_name if asset else "Instalacao" }} · {{ invoice.status }}</p>
+  </div>
+  <div class="hero-actions">
+    <form method="post" action="{{ url_for('extract_invoice_document_route', invoice_document_id=invoice.id) }}" class="inline-form">
+      <button class="button secondary" type="submit">Repetir extracao</button>
+    </form>
+    <a class="button secondary" href="{{ url_for('portfolios', tab='config') }}">Voltar</a>
+  </div>
+</section>
+
+<section class="grid two">
+  <article class="card">
+    <div class="section-title"><h3>Revisao</h3></div>
+    <form method="post" class="stack-form">
+      <div class="grid two">
+        <label>Numero <input name="invoice_number" value="{{ invoice.invoice_number or '' }}"></label>
+        <label>Moeda <input name="currency" value="{{ invoice.currency or 'EUR' }}"></label>
+        <label>Fornecedor <input name="supplier_name" value="{{ invoice.supplier_name or '' }}"></label>
+        <label>NIF fornecedor <input name="supplier_nif" value="{{ invoice.supplier_nif or '' }}"></label>
+        <label>Cliente <input name="customer_name" value="{{ invoice.customer_name or '' }}"></label>
+        <label>NIF cliente <input name="customer_nif" value="{{ invoice.customer_nif or '' }}"></label>
+        <label>Data emissao <input name="issue_date" value="{{ invoice.issue_date or '' }}"></label>
+        <label>Inicio periodo <input name="billing_period_start" value="{{ invoice.billing_period_start or '' }}"></label>
+        <label>Fim periodo <input name="billing_period_end" value="{{ invoice.billing_period_end or '' }}"></label>
+        <label>Total EUR <input name="total_amount" value="{{ invoice.total_amount or '' }}"></label>
+        <label>Total kWh <input name="total_energy_kwh" value="{{ invoice.total_energy_kwh or '' }}"></label>
+        <label>Tipo tarifa
+          <select name="tariff_type_candidate">
+            <option value="">Nao indicado</option>
+            <option value="simple" {{ 'selected' if invoice.tariff_type_candidate == 'simple' }}>Simples</option>
+            <option value="bi-hourly" {{ 'selected' if invoice.tariff_type_candidate == 'bi-hourly' }}>Bi-horaria</option>
+            <option value="tri-hourly" {{ 'selected' if invoice.tariff_type_candidate == 'tri-hourly' }}>Tri-horaria</option>
+            <option value="tetra-hourly" {{ 'selected' if invoice.tariff_type_candidate == 'tetra-hourly' }}>Tetra-horaria</option>
+          </select>
+        </label>
+        <label>Simples EUR/kWh <input name="simple_price_eur_kwh" value="{{ invoice.simple_price_eur_kwh or '' }}"></label>
+        <label>Ponta EUR/kWh <input name="ponta_price_eur_kwh" value="{{ invoice.ponta_price_eur_kwh or '' }}"></label>
+        <label>Cheia EUR/kWh <input name="cheia_price_eur_kwh" value="{{ invoice.cheia_price_eur_kwh or '' }}"></label>
+        <label>Vazio EUR/kWh <input name="vazio_price_eur_kwh" value="{{ invoice.vazio_price_eur_kwh or '' }}"></label>
+        <label>Super vazio EUR/kWh <input name="super_vazio_price_eur_kwh" value="{{ invoice.super_vazio_price_eur_kwh or '' }}"></label>
+      </div>
+      <div class="hero-actions">
+        <button class="button secondary" type="submit" name="action" value="save_invoice_review">Guardar revisao</button>
+        <button class="button" type="submit" name="action" value="confirm_invoice">Confirmar fatura</button>
+        <button class="button secondary" type="submit" name="action" value="use_invoice_tariff">Usar na tarifa</button>
+        <button class="button secondary" type="submit" name="action" value="reject_invoice">Rejeitar</button>
+        <button class="button secondary" type="submit" name="action" value="archive_invoice">Arquivar</button>
+      </div>
+    </form>
+  </article>
+  <aside class="card">
+    <div class="section-title"><h3>Extracoes</h3></div>
+    <div class="list compact-list">
+      {% for run in runs %}
+        <div class="list-row">
+          <div>
+            <strong>{{ run.parser_name }} {{ run.parser_version }}</strong>
+            <small>{{ run.status }} · {{ run.created_at }}</small>
+            <small>{{ run.warnings_json or "[]" }}</small>
+          </div>
+        </div>
+      {% else %}
+        <p class="muted">Ainda sem extracoes.</p>
+      {% endfor %}
+    </div>
+  </aside>
+</section>
+{% endblock %}

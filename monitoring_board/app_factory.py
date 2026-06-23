@@ -7,6 +7,7 @@ import html
 import io
 import json
 import logging
+import mimetypes
 import os
 import re
 import secrets
@@ -25,6 +26,7 @@ import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import current_app
 from flask import Flask, abort, flash, g, has_app_context, redirect, render_template, request, send_file, session, url_for
+from werkzeug.utils import secure_filename
 from monitoring_board.db import configure_database_for_runtime, create_database_backup, ensure_column, get_db, query_all, query_scalar
 from monitoring_board.logging_config import configure_logging
 from monitoring_board.portfolio_reports import (
@@ -68,6 +70,7 @@ from monitoring_board.customer_reports import (
     prepare_customer_report,
 )
 from monitoring_board.reporting.billing import decimal_from_value
+from monitoring_board.reporting.invoices import normalize_date, is_supported_invoice_extension, validate_invoice_values
 from monitoring_board.reporting.availability import (
     apply_inverter_edge_tolerance as reporting_apply_inverter_edge_tolerance,
     calculate_inverter_daily_availability as reporting_calculate_inverter_daily_availability,
@@ -76,7 +79,7 @@ from monitoring_board.reporting.availability import (
     inverter_availability_slot as reporting_inverter_availability_slot,
     is_inverter_available as reporting_is_inverter_available,
 )
-from monitoring_board.reporting.models import BillingConfig, ReportPeriodType, ReportType, ReportingPeriod, TariffType
+from monitoring_board.reporting.models import BillingConfig, InvoiceCandidate, InvoiceStatus, ReportPeriodType, ReportType, ReportingPeriod, TariffType
 from monitoring_board.reporting.periods import (
     ReportingPeriodError,
     month_bounds,
@@ -86,20 +89,33 @@ from monitoring_board.reporting.periods import (
 )
 from monitoring_board.reporting.repositories import (
     add_tariff_period_rule,
+    archive_invoice_document,
     billing_config_to_form_values,
+    confirm_invoice_document,
+    create_invoice_document,
+    create_invoice_extraction_run,
+    create_source_file_record,
     delete_tariff_period_rule,
     detect_tariff_validity_warnings,
     ensure_billing_config_schema,
     get_asset_billing_config,
     get_asset_billing_config_row,
+    get_invoice_document,
     get_tariff_config_for_date,
     get_tariff_resolution_warnings,
-    list_tariffs_intersecting_period,
     list_daily_production_records,
+    list_asset_invoice_documents,
+    list_invoice_extraction_runs,
+    list_portfolio_invoice_documents,
     list_hourly_production_records,
     list_monthly_production_records,
+    list_tariffs_intersecting_period,
     row_to_hourly_energy_record,
     save_asset_tariff,
+    find_invoice_by_hash,
+    reject_invoice_document,
+    update_invoice_from_candidates,
+    update_invoice_review,
     upsert_asset_billing_config,
 )
 from monitoring_board.reporting.validation import (
@@ -109,6 +125,7 @@ from monitoring_board.reporting.validation import (
     validate_report_asset_selection,
 )
 from monitoring_board.reporting.tariffs import result_to_legacy_dict, value_tariff_energy, with_billing_fallback
+from monitoring_board.services.invoice_extraction import extract_invoice_file, sha256_file
 from monitoring_board.services.fusionsolar import (
     build_provider_url,
     classify_fusionsolar_inverter_availability,
@@ -2766,6 +2783,7 @@ def create_app() -> Flask:
         )
         assets = query_all(g.db, "SELECT id, project_name, nif FROM assets ORDER BY project_name COLLATE NOCASE")
         invoices = query_all(g.db, "SELECT id, asset_id, original_filename FROM source_files WHERE file_type = 'invoice' ORDER BY uploaded_at DESC")
+        invoice_documents = list_portfolio_invoice_documents(g.db, selected_portfolio_id) if selected_portfolio_id else []
         tariff_rules = query_all(g.db, "SELECT * FROM tariff_period_rules ORDER BY tariff_id, weekday_type, start_time")
         config_assets = [row for row in portfolio_assets if int(row["portfolio_id"]) == selected_portfolio_id]
         if config_filter == "pending":
@@ -2788,6 +2806,7 @@ def create_app() -> Flask:
             config_assets=config_assets,
             assets=assets,
             invoices=invoices,
+            invoice_documents=invoice_documents,
             tariff_rules=tariff_rules,
         )
 
@@ -2884,25 +2903,87 @@ def create_app() -> Flask:
     def upload_portfolio_invoice():
         asset_id = int(request.form.get("asset_id", "0") or 0)
         portfolio_id_raw = request.form.get("portfolio_id", "").strip()
+        report_month = normalize_report_month(request.form.get("report_month", ""))
         upload = request.files.get("file")
         if not asset_id or upload is None or not upload.filename:
             flash("Escolhe a instalacao e o ficheiro fonte da fatura.", "error")
             return redirect(url_for("portfolios"))
         try:
-            store_source_file(
+            document_id, warnings = store_invoice_upload(
                 g.db,
                 upload_dir=UPLOAD_DIR,
                 file_storage=upload,
                 asset_id=asset_id,
                 portfolio_id=int(portfolio_id_raw) if portfolio_id_raw.isdigit() else None,
-                file_type="invoice",
             )
             g.db.commit()
-            flash("Fatura/ficheiro fonte guardado.", "success")
+            suffix = " Avisos: " + ", ".join(warnings) if warnings else ""
+            flash(f"Fatura guardada para revisao (doc {document_id}).{suffix}", "success")
         except Exception as exc:
             g.db.rollback()
             flash(f"Falha ao guardar fatura: {exc}", "error")
-        return redirect(url_for("portfolios"))
+        return redirect(url_for("portfolios", tab="config", portfolio_id=portfolio_id_raw, report_month=report_month))
+
+    @app.route("/invoices/<int:invoice_document_id>/extract", methods=["POST"])
+    def extract_invoice_document_route(invoice_document_id: int):
+        invoice = get_invoice_document(g.db, invoice_document_id)
+        if invoice is None:
+            abort(404)
+        try:
+            result = extract_invoice_file(Path(invoice["stored_path"]))
+            persist_invoice_extraction_result(g.db, invoice, result)
+            g.db.commit()
+            flash("Extracao assistida concluida. Revê os valores antes de usar.", "success")
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha na extracao: {exc}", "error")
+        return redirect(url_for("review_invoice_document", invoice_document_id=invoice_document_id))
+
+    @app.route("/invoices/<int:invoice_document_id>/review", methods=["GET", "POST"])
+    def review_invoice_document(invoice_document_id: int):
+        invoice = get_invoice_document(g.db, invoice_document_id)
+        if invoice is None:
+            abort(404)
+        asset = g.db.execute("SELECT id, project_name, nif FROM assets WHERE id = ?", (invoice["asset_id"],)).fetchone()
+        if request.method == "POST":
+            action = request.form.get("action", "").strip()
+            try:
+                if action == "reject_invoice":
+                    reject_invoice_document(g.db, invoice_document_id)
+                    flash("Fatura rejeitada.", "success")
+                elif action == "archive_invoice":
+                    archive_invoice_document(g.db, invoice_document_id)
+                    flash("Fatura arquivada.", "success")
+                elif action in {"save_invoice_review", "confirm_invoice"}:
+                    values = invoice_values_from_form(request.form)
+                    validation = validate_invoice_values(values, asset_nif=asset["nif"] if asset else None)
+                    if not validation.valid:
+                        raise ValueError("; ".join(validation.errors))
+                    update_invoice_review(
+                        g.db,
+                        invoice_document_id=invoice_document_id,
+                        values=values,
+                        warnings=validation.warnings,
+                        status=InvoiceStatus.CONFIRMED.value if action == "confirm_invoice" and not validation.warnings else InvoiceStatus.REVIEW_REQUIRED.value,
+                    )
+                    if action == "confirm_invoice" and validation.warnings:
+                        flash("Valores guardados, mas a fatura continua por rever devido aos avisos.", "warning")
+                    elif action == "confirm_invoice":
+                        flash("Fatura confirmada.", "success")
+                    else:
+                        flash("Revisao guardada.", "success")
+                elif action == "use_invoice_tariff":
+                    apply_invoice_to_tariff(g.db, invoice_document_id)
+                    flash("Tarifa criada a partir da fatura confirmada.", "success")
+                else:
+                    raise ValueError("Acao invalida.")
+                g.db.commit()
+            except Exception as exc:
+                g.db.rollback()
+                flash(f"Falha na revisao da fatura: {exc}", "error")
+            return redirect(url_for("review_invoice_document", invoice_document_id=invoice_document_id))
+        runs = list_invoice_extraction_runs(g.db, invoice_document_id)
+        return render_template("invoice_review.html", invoice=invoice, asset=asset, runs=runs, title="Revisao de fatura")
 
     @app.route("/portfolio-reports")
     def portfolio_reports() -> str:
@@ -3951,6 +4032,56 @@ def ensure_database(path: str) -> None:
                 FOREIGN KEY (portfolio_id) REFERENCES portfolio_groups(id) ON DELETE SET NULL
             );
 
+            CREATE TABLE IF NOT EXISTS invoice_documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_file_id INTEGER NOT NULL UNIQUE,
+                asset_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                sha256 TEXT,
+                mime_type TEXT,
+                size_bytes INTEGER,
+                supplier_name TEXT,
+                supplier_nif TEXT,
+                customer_name TEXT,
+                customer_nif TEXT,
+                invoice_number TEXT,
+                issue_date TEXT,
+                billing_period_start TEXT,
+                billing_period_end TEXT,
+                currency TEXT,
+                total_amount TEXT,
+                total_energy_kwh TEXT,
+                tariff_type_candidate TEXT,
+                simple_price_eur_kwh TEXT,
+                ponta_price_eur_kwh TEXT,
+                cheia_price_eur_kwh TEXT,
+                vazio_price_eur_kwh TEXT,
+                super_vazio_price_eur_kwh TEXT,
+                extraction_method TEXT,
+                extraction_confidence TEXT,
+                warnings_json TEXT,
+                reviewed_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (source_file_id) REFERENCES source_files(id) ON DELETE CASCADE,
+                FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS invoice_extraction_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invoice_document_id INTEGER NOT NULL,
+                parser_name TEXT NOT NULL,
+                parser_version TEXT NOT NULL,
+                status TEXT NOT NULL,
+                extracted_values_json TEXT,
+                confidence_json TEXT,
+                evidence_json TEXT,
+                warnings_json TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (invoice_document_id) REFERENCES invoice_documents(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS helioscope_expected_production (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 asset_id INTEGER NOT NULL,
@@ -4176,6 +4307,10 @@ def ensure_database(path: str) -> None:
         ensure_column(conn, "production_hourly_records", "grid_import_kwh REAL")
         ensure_column(conn, "production_hourly_records", "data_quality TEXT")
         ensure_column(conn, "production_hourly_records", "source_fields_json TEXT")
+        ensure_column(conn, "source_files", "sha256 TEXT")
+        ensure_column(conn, "source_files", "mime_type TEXT")
+        ensure_column(conn, "source_files", "size_bytes INTEGER")
+        ensure_column(conn, "source_files", "archived_at TEXT")
         disable_removed_inverter_devices(conn)
         populate_missing_inverter_rated_power(conn)
         populate_missing_installation_groups(conn)
@@ -7810,6 +7945,136 @@ def export_rows_file(
         as_attachment=True,
         download_name=f"{filename}.xlsx",
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+def store_invoice_upload(
+    conn: sqlite3.Connection,
+    *,
+    upload_dir: Path,
+    file_storage: Any,
+    asset_id: int,
+    portfolio_id: int | None,
+) -> tuple[int, tuple[str, ...]]:
+    if conn.execute("SELECT id FROM assets WHERE id = ?", (asset_id,)).fetchone() is None:
+        raise ValueError("Instalacao inexistente.")
+    original_filename = Path(file_storage.filename or "invoice").name
+    safe_name = secure_filename(original_filename) or "invoice"
+    if not is_supported_invoice_extension(safe_name):
+        raise ValueError("Formato de fatura nao suportado.")
+    target_dir = upload_dir / "portfolio_sources" / str(asset_id)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_name}"
+    file_storage.save(target)
+    size_bytes = target.stat().st_size
+    if size_bytes <= 0:
+        target.unlink(missing_ok=True)
+        raise ValueError("Ficheiro vazio.")
+    if size_bytes > max_upload_bytes():
+        target.unlink(missing_ok=True)
+        raise ValueError("Ficheiro excede o limite de upload.")
+    digest = sha256_file(target)
+    same_asset = find_invoice_by_hash(conn, asset_id=asset_id, sha256=digest)
+    if same_asset is not None:
+        target.unlink(missing_ok=True)
+        return int(same_asset["id"]), ("duplicate_invoice",)
+    warnings: list[str] = []
+    if find_invoice_by_hash(conn, asset_id=None, sha256=digest) is not None:
+        warnings.append("possible_duplicate_invoice")
+    mime_type = mimetypes.guess_type(safe_name)[0] or str(getattr(file_storage, "mimetype", "") or "")
+    source_id = create_source_file_record(
+        conn,
+        asset_id=asset_id,
+        portfolio_id=portfolio_id,
+        file_type="invoice",
+        original_filename=original_filename,
+        stored_path=str(target),
+        sha256=digest,
+        mime_type=mime_type,
+        size_bytes=size_bytes,
+    )
+    document_id = create_invoice_document(
+        conn,
+        source_file_id=source_id,
+        asset_id=asset_id,
+        sha256=digest,
+        mime_type=mime_type,
+        size_bytes=size_bytes,
+        status=InvoiceStatus.REVIEW_REQUIRED.value if warnings else InvoiceStatus.UPLOADED.value,
+        warnings=tuple(warnings),
+    )
+    return document_id, tuple(warnings)
+
+
+def persist_invoice_extraction_result(conn: sqlite3.Connection, invoice: sqlite3.Row, result: Any) -> None:
+    create_invoice_extraction_run(conn, invoice_document_id=int(invoice["id"]), result=result)
+    candidates = list(result.candidates)
+    if result.tariff_candidate.tariff_type is not None:
+        candidates.append(
+            InvoiceCandidate(
+                "tariff_type_candidate",
+                result.tariff_candidate.tariff_type.value,
+                result.confidence,
+                evidence="inferido dos precos extraidos",
+                source=result.method,
+            )
+        )
+    values = {candidate.field_name: candidate.value for candidate in candidates}
+    asset = conn.execute("SELECT nif FROM assets WHERE id = ?", (invoice["asset_id"],)).fetchone()
+    validation = validate_invoice_values(values, asset_nif=asset["nif"] if asset else None)
+    warnings = tuple(sorted({*result.warnings, *validation.warnings}))
+    status = InvoiceStatus.EXTRACTION_FAILED.value if result.errors or validation.errors else validation.status.value
+    update_invoice_from_candidates(
+        conn,
+        invoice_document_id=int(invoice["id"]),
+        candidates=tuple(candidates),
+        status=status,
+        confidence=result.confidence,
+        warnings=warnings,
+    )
+
+
+def invoice_values_from_form(form: Any) -> dict[str, str]:
+    fields = (
+        "supplier_name",
+        "supplier_nif",
+        "customer_name",
+        "customer_nif",
+        "invoice_number",
+        "issue_date",
+        "billing_period_start",
+        "billing_period_end",
+        "currency",
+        "total_amount",
+        "total_energy_kwh",
+        "tariff_type_candidate",
+        "simple_price_eur_kwh",
+        "ponta_price_eur_kwh",
+        "cheia_price_eur_kwh",
+        "vazio_price_eur_kwh",
+        "super_vazio_price_eur_kwh",
+    )
+    return {field: str(form.get(field, "")).strip() for field in fields}
+
+
+def apply_invoice_to_tariff(conn: sqlite3.Connection, invoice_document_id: int) -> int:
+    invoice = get_invoice_document(conn, invoice_document_id)
+    if invoice is None:
+        raise ValueError("Fatura inexistente.")
+    if invoice["status"] != InvoiceStatus.CONFIRMED.value:
+        raise ValueError("A fatura tem de estar confirmada antes de ser usada na tarifa.")
+    tariff_type = str(invoice["tariff_type_candidate"] or "simple")
+    if tariff_type != TariffType.SIMPLE.value:
+        raise ValueError("Tarifas multi-horarias exigem regras horarias manuais antes de guardar.")
+    return save_asset_tariff(
+        conn,
+        asset_id=int(invoice["asset_id"]),
+        tariff_type=tariff_type,
+        simple_price_eur_kwh=invoice["simple_price_eur_kwh"],
+        invoice_file_id=int(invoice["source_file_id"]),
+        valid_from=normalize_date(invoice["billing_period_start"]).isoformat() if invoice["billing_period_start"] else "",
+        valid_to=normalize_date(invoice["billing_period_end"]).isoformat() if invoice["billing_period_end"] else "",
+        notes=f"Criada a partir da fatura {invoice['invoice_number'] or invoice_document_id}",
     )
 
 

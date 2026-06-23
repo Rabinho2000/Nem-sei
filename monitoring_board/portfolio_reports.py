@@ -63,6 +63,9 @@ WARNING_LABELS = {
     "missing_tariff_rules": "Sem tarifa",
     "missing_simple_tariff_price": "Sem tarifa",
     "missing_invoice": "Sem fatura",
+    "review_required": "Fatura por rever",
+    "extraction_failed": "Extracao falhou",
+    "incompatible_invoice": "Fatura nao compativel",
     "missing_availability": "Sem availability",
     "mapping_pending": "Mapping pendente",
     "mapping_conflict": "Mapping conflito",
@@ -517,7 +520,19 @@ def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, rep
             monthly_self_use = float(prod["self_use_kwh"])
         tariff_result = calculate_tariff_value(tariff, monthly_kwh=monthly_self_use, hourly_records=hourly, rules=rules)
         warnings.extend(tariff_result["warnings"])
-        invoice_status = "ok" if tariff and tariff["invoice_file_id"] else "missing_invoice"
+        invoice_status = "missing_invoice"
+        if tariff and tariff["invoice_file_id"]:
+            invoice_doc = conn.execute("SELECT status FROM invoice_documents WHERE source_file_id = ?", (tariff["invoice_file_id"],)).fetchone()
+            if invoice_doc is None:
+                invoice_status = "review_required"
+            elif invoice_doc["status"] == "confirmed":
+                invoice_status = "ok"
+            elif invoice_doc["status"] == "extraction_failed":
+                invoice_status = "extraction_failed"
+            elif invoice_doc["status"] in {"rejected", "archived"}:
+                invoice_status = "incompatible_invoice"
+            else:
+                invoice_status = "review_required"
         if invoice_status != "ok":
             warnings.append(invoice_status)
         data_status = "ok" if not warnings else ("missing_data" if any(w.startswith("missing") for w in warnings) else "warning")
