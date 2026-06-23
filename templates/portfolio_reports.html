@@ -54,6 +54,10 @@
           <th>Cheia</th>
           <th>Vazio</th>
           <th>Super vazio</th>
+          <th>Autoc. ponta</th>
+          <th>Autoc. cheia</th>
+          <th>Autoc. vazio</th>
+          <th>Autoc. super vazio</th>
           <th>Helioscope kWh</th>
           <th>Ajustado kWh</th>
           <th>Degradacao</th>
@@ -79,6 +83,10 @@
             <td>{{ format_number(row.production_cheia_kwh, 2) }}</td>
             <td>{{ format_number(row.production_vazio_kwh, 2) }}</td>
             <td>{{ format_number(row.production_super_vazio_kwh, 2) }}</td>
+            <td>{{ format_number(row.self_use_ponta_kwh, 2) }}</td>
+            <td>{{ format_number(row.self_use_cheia_kwh, 2) }}</td>
+            <td>{{ format_number(row.self_use_vazio_kwh, 2) }}</td>
+            <td>{{ format_number(row.self_use_super_vazio_kwh, 2) }}</td>
             <td>{{ format_number(row.helioscope_expected_kwh, 2) }}</td>
             <td>{{ format_number(row.adjusted_expected_kwh, 2) }}</td>
             <td>{{ format_number(row.degradation_factor, 4) }}</td>
@@ -103,6 +111,10 @@
             <td><strong>{{ format_number(total_row.production_cheia_kwh, 2) }}</strong></td>
             <td><strong>{{ format_number(total_row.production_vazio_kwh, 2) }}</strong></td>
             <td><strong>{{ format_number(total_row.production_super_vazio_kwh, 2) }}</strong></td>
+            <td><strong>{{ format_number(total_row.self_use_ponta_kwh, 2) }}</strong></td>
+            <td><strong>{{ format_number(total_row.self_use_cheia_kwh, 2) }}</strong></td>
+            <td><strong>{{ format_number(total_row.self_use_vazio_kwh, 2) }}</strong></td>
+            <td><strong>{{ format_number(total_row.self_use_super_vazio_kwh, 2) }}</strong></td>
             <td><strong>{{ format_number(total_row.helioscope_expected_kwh, 2) }}</strong></td>
             <td><strong>{{ format_number(total_row.adjusted_expected_kwh, 2) }}</strong></td>
             <td></td>

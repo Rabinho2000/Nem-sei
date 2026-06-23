@@ -104,7 +104,8 @@ def test_tri_hourly_calculation_uses_hourly_records() -> None:
     assert result["period_kwh"]["ponta"] == 10
     assert result["period_kwh"]["cheia"] == 10
     assert result["period_kwh"]["vazio"] == 10
-    assert result["estimated_value_eur"] == 6
+    assert result["estimated_value_eur"] is None
+    assert "missing_hourly_self_use" in result["warnings"]
 
 
 def test_report_flags_missing_data(tmp_path: Path) -> None:
