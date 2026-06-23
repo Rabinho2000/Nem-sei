@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -339,6 +340,88 @@ def test_reporting_repositories_read_existing_sqlite_schema(tmp_path: Path) -> N
     assert repositories.list_tariff_period_rules(conn, tariff_id)[0]["period_name"] == "cheia"
     assert repositories.get_monthly_production_record(conn, asset_id, date(2026, 1, 1))["production_kwh"] == 123
     assert repositories.get_monthly_production_record(conn, None, date(2026, 1, 1)) is None
+
+
+def test_tariff_validity_boundaries_gap_overlap_and_open_ends(tmp_path: Path) -> None:
+    conn = connect(tmp_path)
+    conn.execute("INSERT INTO assets (project_name, active_contract, kwp) VALUES ('Central Validity', 'yes', '10')")
+    asset_id = int(conn.execute("SELECT id FROM assets").fetchone()["id"])
+
+    repositories.save_asset_tariff(conn, asset_id=asset_id, tariff_type="simple", simple_price_eur_kwh="0.10", valid_to="2026-01-31")
+    repositories.save_asset_tariff(conn, asset_id=asset_id, tariff_type="simple", simple_price_eur_kwh="0.20", valid_from="2026-02-01", valid_to="2026-12-31")
+    assert repositories.detect_tariff_validity_warnings(conn, asset_id=asset_id, start=date(2026, 1, 1), end=date(2026, 12, 31)) == ()
+
+    conn.execute("DELETE FROM asset_tariffs WHERE asset_id = ?", (asset_id,))
+    repositories.save_asset_tariff(conn, asset_id=asset_id, tariff_type="simple", simple_price_eur_kwh="0.10", valid_from="2026-01-01", valid_to="2026-01-30")
+    repositories.save_asset_tariff(conn, asset_id=asset_id, tariff_type="simple", simple_price_eur_kwh="0.20", valid_from="2026-02-01", valid_to="2026-12-31")
+    assert "tariff_validity_gap" in repositories.detect_tariff_validity_warnings(conn, asset_id=asset_id, start=date(2026, 1, 1), end=date(2026, 12, 31))
+
+    conn.execute("DELETE FROM asset_tariffs WHERE asset_id = ?", (asset_id,))
+    repositories.save_asset_tariff(conn, asset_id=asset_id, tariff_type="simple", simple_price_eur_kwh="0.10", valid_from="2026-01-01", valid_to="2026-02-01")
+    repositories.save_asset_tariff(conn, asset_id=asset_id, tariff_type="simple", simple_price_eur_kwh="0.20", valid_from="2026-02-01", valid_to="2026-12-31")
+    assert "overlapping_tariffs" in repositories.detect_tariff_validity_warnings(conn, asset_id=asset_id, start=date(2026, 1, 1), end=date(2026, 12, 31))
+
+    conn.execute("DELETE FROM asset_tariffs WHERE asset_id = ?", (asset_id,))
+    repositories.save_asset_tariff(conn, asset_id=asset_id, tariff_type="simple", simple_price_eur_kwh="0.10", valid_to="2026-06-30")
+    repositories.save_asset_tariff(conn, asset_id=asset_id, tariff_type="simple", simple_price_eur_kwh="0.20", valid_from="2026-07-01")
+    assert repositories.detect_tariff_validity_warnings(conn, asset_id=asset_id, start=date(2026, 1, 1), end=date(2026, 12, 31)) == ()
+
+
+def test_hourly_energy_upsert_is_idempotent_and_isolated(tmp_path: Path) -> None:
+    conn = connect(tmp_path)
+    conn.execute("INSERT INTO assets (project_name, active_contract, kwp) VALUES ('Hourly A', 'yes', '10')")
+    asset_a = int(conn.execute("SELECT id FROM assets WHERE project_name = 'Hourly A'").fetchone()["id"])
+    conn.execute("INSERT INTO assets (project_name, active_contract, kwp) VALUES ('Hourly B', 'yes', '10')")
+    asset_b = int(conn.execute("SELECT id FROM assets WHERE project_name = 'Hourly B'").fetchone()["id"])
+    start = datetime(2026, 1, 1, 10)
+
+    repositories.upsert_hourly_energy_record(
+        conn,
+        asset_id=asset_a,
+        provider="FusionSolar",
+        period_start=start,
+        period_end=start + timedelta(hours=1),
+        production_kwh="10",
+        self_use_kwh="6",
+        export_kwh="4",
+        consumption_kwh="12",
+        grid_import_kwh="6",
+        payload_json={"raw": 1},
+        data_quality="ok",
+        source_fields={"production_kwh": "PVYield", "self_use_kwh": "selfUsePower"},
+    )
+    repositories.upsert_hourly_energy_record(
+        conn,
+        asset_id=asset_a,
+        provider="FusionSolar",
+        period_start=start,
+        period_end=start + timedelta(hours=1),
+        production_kwh="11",
+        self_use_kwh="7",
+        export_kwh="4",
+        consumption_kwh="13",
+        grid_import_kwh="6",
+        payload_json={"raw": 2},
+        data_quality="corrected",
+        source_fields={"production_kwh": "PVYield2"},
+    )
+    repositories.upsert_hourly_energy_record(
+        conn,
+        asset_id=asset_b,
+        provider="FusionSolar",
+        period_start=start,
+        period_end=start + timedelta(hours=1),
+        production_kwh="3",
+    )
+
+    rows_a = repositories.list_hourly_production_records(conn, asset_id=asset_a, start_iso="2026-01-01T00:00:00", end_iso="2026-01-02T00:00:00")
+    rows_b = repositories.list_hourly_production_records(conn, asset_id=asset_b, start_iso="2026-01-01T00:00:00", end_iso="2026-01-02T00:00:00")
+    assert len(rows_a) == 1
+    assert len(rows_b) == 1
+    assert rows_a[0]["production_kwh"] == 11
+    assert rows_a[0]["self_use_kwh"] == 7
+    assert rows_a[0]["data_quality"] == "corrected"
+    assert json.loads(rows_a[0]["source_fields_json"]) == {"production_kwh": "PVYield2"}
 
 
 def test_reporting_foundation_modules_do_not_import_flask() -> None:

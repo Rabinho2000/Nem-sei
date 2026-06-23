@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -17,6 +17,9 @@ from monitoring_board.reporting.repositories import (
     ensure_billing_config_schema,
     get_asset_billing_config,
     get_asset_billing_config_row,
+    save_asset_tariff,
+    add_tariff_period_rule,
+    upsert_hourly_energy_record,
     upsert_asset_billing_config,
 )
 
@@ -320,6 +323,139 @@ def test_annual_fixed_monthly_fee_uses_twelve_months_and_epc_stays_zero(tmp_path
     assert epc["solcor_payment_eur"] == 0
     assert esco["missing_months"] == []
     assert epc["missing_months"] == []
+
+
+def test_annual_report_combines_simple_and_tri_hourly_without_double_counting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = connect(tmp_path)
+    asset_id = add_report_asset(conn, contract_type="EPC", name="Mixed Annual")
+    for month in range(2, 13):
+        add_monthly_report_record(conn, asset_id, month, production=100, self_use=60, export=40, consumption=120)
+    save_asset_tariff(conn, asset_id=asset_id, tariff_type="simple", simple_price_eur_kwh="0.20", valid_from="2026-01-01", valid_to="2026-06-30")
+    tri_id = save_asset_tariff(
+        conn,
+        asset_id=asset_id,
+        tariff_type="tri-hourly",
+        ponta_price_eur_kwh="0.30",
+        cheia_price_eur_kwh="0.20",
+        vazio_price_eur_kwh="0.10",
+        valid_from="2026-07-01",
+        valid_to="2026-12-31",
+    )
+    add_tariff_period_rule(conn, tariff_id=tri_id, weekday_type="all", start_time="08:00", end_time="10:00", period_name="ponta")
+    add_tariff_period_rule(conn, tariff_id=tri_id, weekday_type="all", start_time="10:00", end_time="20:00", period_name="cheia")
+    add_tariff_period_rule(conn, tariff_id=tri_id, weekday_type="all", start_time="20:00", end_time="08:00", period_name="vazio")
+    for month in range(7, 13):
+        start = date(2026, month, 1)
+        upsert_hourly_energy_record(
+            conn,
+            asset_id=asset_id,
+            provider="FusionSolar",
+            period_start=datetime(start.year, start.month, start.day, 8),
+            period_end=datetime(start.year, start.month, start.day, 9),
+            production_kwh="20",
+            self_use_kwh="10",
+            export_kwh="10",
+            payload_json={"month": month},
+            source_fields={"self_use_kwh": "selfUsePower"},
+        )
+    conn.commit()
+    monkeypatch.setattr("app.get_fusionsolar_session", lambda _config: pytest.fail("API should not be called"))
+
+    report = build_fusionsolar_customer_production_report(
+        conn,
+        asset_id=asset_id,
+        report_month="2026-01",
+        electricity_price=0.0,
+        sell_price=0.0,
+        billing_config=billing_config(report_type=ReportType.EPC, electricity_price="0.20", export_price="0.05"),
+        period=period_from_form({"period_type": "annual", "report_year": "2026"}),
+    )
+
+    assert report["tariff_type"] == "mixed"
+    assert report["tariff_types_used"] == ["simple", "tri-hourly"]
+    assert report["tariff_source"] == "stored_tariff"
+    assert report["tariff_value_eur"] == 90
+    assert sum(item["energy_kwh"] for item in report["tariff_period_breakdown"]) == 420
+    assert build_customer_report_pdf(report).startswith(b"%PDF-")
+
+
+def test_quarterly_report_combines_two_multi_hourly_tariffs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = connect(tmp_path)
+    asset_id = add_report_asset(conn, contract_type="EPC", name="Quarter Multi")
+    add_monthly_report_record(conn, asset_id, 2)
+    add_monthly_report_record(conn, asset_id, 3)
+    bi_id = save_asset_tariff(conn, asset_id=asset_id, tariff_type="bi-hourly", cheia_price_eur_kwh="0.20", vazio_price_eur_kwh="0.10", valid_from="2026-01-01", valid_to="2026-02-15")
+    tri_id = save_asset_tariff(conn, asset_id=asset_id, tariff_type="tri-hourly", ponta_price_eur_kwh="0.30", cheia_price_eur_kwh="0.20", vazio_price_eur_kwh="0.10", valid_from="2026-02-16", valid_to="2026-03-31")
+    add_tariff_period_rule(conn, tariff_id=bi_id, weekday_type="all", start_time="08:00", end_time="22:00", period_name="cheia")
+    add_tariff_period_rule(conn, tariff_id=bi_id, weekday_type="all", start_time="22:00", end_time="08:00", period_name="vazio")
+    add_tariff_period_rule(conn, tariff_id=tri_id, weekday_type="all", start_time="08:00", end_time="10:00", period_name="ponta")
+    add_tariff_period_rule(conn, tariff_id=tri_id, weekday_type="all", start_time="10:00", end_time="20:00", period_name="cheia")
+    add_tariff_period_rule(conn, tariff_id=tri_id, weekday_type="all", start_time="20:00", end_time="08:00", period_name="vazio")
+    for moment in (datetime(2026, 1, 10, 9), datetime(2026, 2, 20, 8), datetime(2026, 3, 10, 8)):
+        upsert_hourly_energy_record(conn, asset_id=asset_id, provider="FusionSolar", period_start=moment, period_end=moment.replace(hour=moment.hour + 1), production_kwh="10", self_use_kwh="10")
+    conn.commit()
+    monkeypatch.setattr("app.get_fusionsolar_session", lambda _config: pytest.fail("API should not be called"))
+
+    report = build_fusionsolar_customer_production_report(
+        conn,
+        asset_id=asset_id,
+        report_month="2026-01",
+        electricity_price=0.0,
+        sell_price=0.0,
+        billing_config=billing_config(report_type=ReportType.EPC),
+        period=period_from_form({"period_type": "quarterly", "report_year": "2026", "report_quarter": "1"}),
+    )
+
+    assert report["tariff_type"] == "mixed"
+    assert report["tariff_types_used"] == ["bi-hourly", "tri-hourly"]
+    assert report["tariff_value_eur"] == 8
+
+
+def test_overlapping_tariffs_use_explicit_billing_fallback_independent_of_insert_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.get_fusionsolar_session", lambda _config: pytest.fail("API should not be called"))
+    values = []
+    for order in (("0.90", "0.10"), ("0.10", "0.90")):
+        case_dir = tmp_path / order[0].replace(".", "")
+        case_dir.mkdir()
+        conn = connect(case_dir)
+        asset_id = add_report_asset(conn, contract_type="EPC", name=f"Overlap {order[0]}")
+        for price in order:
+            save_asset_tariff(conn, asset_id=asset_id, tariff_type="simple", simple_price_eur_kwh=price, valid_from="2026-01-01", valid_to="2026-01-31")
+        conn.commit()
+        report = build_fusionsolar_customer_production_report(
+            conn,
+            asset_id=asset_id,
+            report_month="2026-01",
+            electricity_price=0.0,
+            sell_price=0.0,
+            billing_config=billing_config(report_type=ReportType.EPC, electricity_price="0.20"),
+        )
+        values.append(report["tariff_value_eur"])
+        assert report["tariff_source"] == "billing_default"
+        assert "overlapping_tariffs" in report["tariff_warnings"]
+    assert values == [12, 12]
+
+
+def test_simple_tariff_change_within_month_without_daily_data_uses_explicit_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = connect(tmp_path)
+    asset_id = add_report_asset(conn, contract_type="EPC", name="Mid Month Simple")
+    save_asset_tariff(conn, asset_id=asset_id, tariff_type="simple", simple_price_eur_kwh="0.10", valid_from="2026-01-01", valid_to="2026-01-15")
+    save_asset_tariff(conn, asset_id=asset_id, tariff_type="simple", simple_price_eur_kwh="0.40", valid_from="2026-01-16", valid_to="2026-01-31")
+    conn.commit()
+    monkeypatch.setattr("app.get_fusionsolar_session", lambda _config: pytest.fail("API should not be called"))
+
+    report = build_fusionsolar_customer_production_report(
+        conn,
+        asset_id=asset_id,
+        report_month="2026-01",
+        electricity_price=0.0,
+        sell_price=0.0,
+        billing_config=billing_config(report_type=ReportType.EPC, electricity_price="0.20"),
+    )
+
+    assert report["tariff_source"] == "billing_default"
+    assert report["tariff_value_eur"] == 12
+    assert "tariff_change_within_month" in report["tariff_warnings"]
 
 
 def test_report_supports_total_production_fixed_fee_warnings_epc_and_pdf(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

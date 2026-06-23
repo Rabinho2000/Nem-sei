@@ -93,6 +93,8 @@ from monitoring_board.reporting.repositories import (
     get_asset_billing_config,
     get_asset_billing_config_row,
     get_tariff_config_for_date,
+    get_tariff_resolution_warnings,
+    list_tariffs_intersecting_period,
     list_daily_production_records,
     list_hourly_production_records,
     list_monthly_production_records,
@@ -7329,10 +7331,37 @@ def _build_customer_tariff_result(
     asset_id: int,
     period: ReportingPeriod,
     aggregate: dict[str, Any],
+    daily_rows: list[dict[str, Any]],
     billing_config: BillingConfig | None,
     electricity_price: float,
 ) -> dict[str, Any]:
     validity_warnings = set(detect_tariff_validity_warnings(conn, asset_id=asset_id, start=period.start, end=period.end))
+    if "overlapping_tariffs" in validity_warnings:
+        result = value_tariff_energy(None)
+        from dataclasses import replace
+
+        result = replace(result, warnings=tuple(sorted({*result.warnings, *validity_warnings})))
+        fallback_price = billing_config.electricity_price_eur_kwh if billing_config else decimal_from_value(electricity_price)
+        result = with_billing_fallback(result, self_use_kwh=decimal_from_value(aggregate.get("self_use_kwh")), default_price=fallback_price)
+        legacy = result_to_legacy_dict(result)
+        return {
+            "tariff_type": result.tariff_type.value if result.tariff_type else "",
+            "tariff_types_used": [],
+            "tariff_source": result.source,
+            "tariff_period_breakdown": [
+                {
+                    "period_name": item.period_name,
+                    "energy_kwh": float(item.energy_kwh),
+                    "production_kwh": float(item.production_kwh),
+                    "price_eur_kwh": float(item.price_eur_kwh) if item.price_eur_kwh is not None else None,
+                    "value_eur": float(item.value_eur),
+                }
+                for item in result.breakdown
+            ],
+            "tariff_value_eur": legacy["estimated_value_eur"],
+            "tariff_coverage_pct": legacy["coverage_pct"],
+            "tariff_warnings": legacy["warnings"],
+        }
     hourly_rows = list_hourly_production_records(
         conn,
         asset_id=asset_id,
@@ -7342,8 +7371,32 @@ def _build_customer_tariff_result(
     hourly_records = [row_to_hourly_energy_record(row) for row in hourly_rows]
     month_results = []
     hourly_results = []
+    daily_by_month: dict[date, list[dict[str, Any]]] = {}
+    for row in daily_rows:
+        if isinstance(row.get("date"), date):
+            daily_by_month.setdefault(row["date"].replace(day=1), []).append(row)
     for month_row in aggregate.get("monthly_rows", []):
         month_start = month_row.get("date") if isinstance(month_row.get("date"), date) else period.start
+        month_end = month_bounds(month_start.strftime("%Y-%m"))[1]
+        intersecting = list_tariffs_intersecting_period(conn, asset_id=asset_id, start=month_start, end=month_end)
+        if len(intersecting) > 1:
+            month_daily = daily_by_month.get(month_start, [])
+            if month_daily:
+                for day_row in month_daily:
+                    config = get_tariff_config_for_date(conn, asset_id=asset_id, moment=day_row["date"])
+                    if config is None or config.tariff_type != TariffType.SIMPLE:
+                        continue
+                    month_results.append(
+                        value_tariff_energy(
+                            config,
+                            aggregate_self_use_kwh=decimal_from_value(day_row.get("self_use_kwh")),
+                            period_start=day_row["date"],
+                            period_end=day_row["date"],
+                        )
+                    )
+            else:
+                validity_warnings.add("tariff_change_within_month")
+            continue
         config = get_tariff_config_for_date(conn, asset_id=asset_id, moment=month_start)
         if config is None:
             continue
@@ -7360,8 +7413,10 @@ def _build_customer_tariff_result(
         grouped: dict[int, list[Any]] = {}
         configs: dict[int, Any] = {}
         for record in hourly_records:
+            if get_tariff_resolution_warnings(conn, asset_id=asset_id, moment=record.period_start):
+                continue
             config = get_tariff_config_for_date(conn, asset_id=asset_id, moment=record.period_start)
-            if config is None or config.tariff_id is None:
+            if config is None or config.tariff_id is None or config.tariff_type == TariffType.SIMPLE:
                 continue
             grouped.setdefault(config.tariff_id, []).append(record)
             configs[config.tariff_id] = config
@@ -7374,12 +7429,19 @@ def _build_customer_tariff_result(
                     period_end=period.end,
                 )
             )
-    result = _combine_tariff_results(month_results or hourly_results)
+    applicable_results = month_results + hourly_results
+    result_types = sorted({result.tariff_type.value for result in applicable_results if result.tariff_type})
+    result = _combine_tariff_results(applicable_results)
     if result is not None:
         if validity_warnings:
             from dataclasses import replace
 
             result = replace(result, warnings=tuple(sorted({*result.warnings, *validity_warnings})))
+    elif "tariff_change_within_month" in validity_warnings:
+        result = value_tariff_energy(None)
+        from dataclasses import replace
+
+        result = replace(result, warnings=tuple(sorted({*result.warnings, *validity_warnings})))
     else:
         config = get_tariff_config_for_date(conn, asset_id=asset_id, moment=period.start)
         result = value_tariff_energy(
@@ -7401,7 +7463,8 @@ def _build_customer_tariff_result(
     )
     legacy = result_to_legacy_dict(result)
     return {
-        "tariff_type": result.tariff_type.value if result.tariff_type else "",
+        "tariff_type": "mixed" if len(result_types) > 1 else (result.tariff_type.value if result.tariff_type else ""),
+        "tariff_types_used": result_types,
         "tariff_source": result.source,
         "tariff_period_breakdown": [
             {
@@ -7507,6 +7570,7 @@ def _report_payload_for_period(
         "data_source": data_source,
         "report_notes": aggregate["report_notes"],
         "tariff_type": tariff_result.get("tariff_type", ""),
+        "tariff_types_used": tariff_result.get("tariff_types_used", []),
         "tariff_source": tariff_result.get("tariff_source", ""),
         "tariff_period_breakdown": tariff_result.get("tariff_period_breakdown", []),
         "tariff_value_eur": tariff_result.get("tariff_value_eur"),
@@ -7551,6 +7615,7 @@ def build_local_customer_production_report(
         asset_id=asset_id,
         period=period,
         aggregate=aggregate,
+        daily_rows=daily_rows,
         billing_config=billing_config,
         electricity_price=electricity_price,
     )
@@ -7669,6 +7734,7 @@ def build_fusionsolar_customer_production_report(
         asset_id=asset_id,
         period=period,
         aggregate=aggregate,
+        daily_rows=daily_rows,
         billing_config=billing_config,
         electricity_price=electricity_price,
     )

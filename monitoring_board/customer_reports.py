@@ -199,6 +199,7 @@ def prepare_customer_report(
         months_count=billing.months_count,
         billing_warnings=list(billing.warnings),
         tariff_type=report.get("tariff_type") or "",
+        tariff_types_used=list(report.get("tariff_types_used") or []),
         tariff_source=report.get("tariff_source") or ("billing_default" if tariff_value is None else "stored_tariff"),
         tariff_period_breakdown=list(report.get("tariff_period_breakdown") or []),
         tariff_value_eur=decimal_to_float(savings_eur),

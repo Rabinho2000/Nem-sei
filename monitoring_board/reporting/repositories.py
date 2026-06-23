@@ -157,6 +157,22 @@ def get_latest_tariff(conn: sqlite3.Connection, asset_id: int, report_start: dat
     ).fetchone()
 
 
+def list_tariffs_at(conn: sqlite3.Connection, *, asset_id: int, moment: date | datetime) -> list[sqlite3.Row]:
+    day = moment.date() if isinstance(moment, datetime) else moment
+    return query_all(
+        conn,
+        """
+        SELECT *
+        FROM asset_tariffs
+        WHERE asset_id = ?
+          AND (valid_from IS NULL OR valid_from = '' OR valid_from <= ?)
+          AND (valid_to IS NULL OR valid_to = '' OR valid_to >= ?)
+        ORDER BY COALESCE(valid_from, ''), id
+        """,
+        (asset_id, day.isoformat(), day.isoformat()),
+    )
+
+
 def has_expired_tariff(conn: sqlite3.Connection, asset_id: int, report_start: date) -> bool:
     row = conn.execute(
         """
@@ -195,8 +211,8 @@ def list_tariffs_intersecting_period(
 
 
 def resolve_tariff_at(conn: sqlite3.Connection, *, asset_id: int, moment: date | datetime) -> sqlite3.Row | None:
-    day = moment.date() if isinstance(moment, datetime) else moment
-    return get_latest_tariff(conn, asset_id, day)
+    rows = list_tariffs_at(conn, asset_id=asset_id, moment=moment)
+    return rows[0] if len(rows) == 1 else None
 
 
 def detect_tariff_validity_warnings(conn: sqlite3.Connection, *, asset_id: int, start: date, end: date) -> tuple[str, ...]:
@@ -217,14 +233,11 @@ def detect_tariff_validity_warnings(conn: sqlite3.Connection, *, asset_id: int, 
     for row_start, row_end in ordered:
         if row_start > cursor:
             warnings.add("tariff_validity_gap")
-        if row_start <= cursor <= row_end:
-            cursor = max(cursor, row_end)
-        for other_start, other_end in ordered:
-            if (row_start, row_end) == (other_start, other_end):
-                continue
-            if row_start <= other_end and other_start <= row_end:
-                warnings.add("overlapping_tariffs")
-    if cursor < end:
+        if row_start < cursor:
+            warnings.add("overlapping_tariffs")
+        if row_end >= cursor:
+            cursor = end + timedelta(days=1) if row_end >= end else row_end + timedelta(days=1)
+    if cursor <= end:
         warnings.add("tariff_validity_gap")
     return tuple(sorted(warnings))
 
@@ -270,6 +283,15 @@ def get_tariff_config_for_date(conn: sqlite3.Connection, *, asset_id: int, momen
         return None
     rules = list_tariff_period_rules(conn, int(row["id"]))
     return row_to_tariff_config(row, rules)
+
+
+def get_tariff_resolution_warnings(conn: sqlite3.Connection, *, asset_id: int, moment: date | datetime) -> tuple[str, ...]:
+    tariff_count = len(list_tariffs_at(conn, asset_id=asset_id, moment=moment))
+    if tariff_count == 0:
+        return ("missing_tariff",)
+    if tariff_count > 1:
+        return ("overlapping_tariffs",)
+    return ()
 
 
 def save_asset_tariff(
@@ -496,6 +518,61 @@ def list_hourly_production_records(
         ORDER BY period_start
         """,
         (asset_id, start_iso, end_iso),
+    )
+
+
+def upsert_hourly_energy_record(
+    conn: sqlite3.Connection,
+    *,
+    asset_id: int,
+    provider: str,
+    period_start: datetime,
+    period_end: datetime,
+    production_kwh: Any = None,
+    self_use_kwh: Any = None,
+    export_kwh: Any = None,
+    consumption_kwh: Any = None,
+    grid_import_kwh: Any = None,
+    payload_json: str | dict[str, Any] | None = None,
+    data_quality: str = "ok",
+    source_fields: dict[str, Any] | None = None,
+) -> None:
+    payload_text = json.dumps(payload_json, ensure_ascii=True) if isinstance(payload_json, dict) else (payload_json or "{}")
+    now = datetime.now().isoformat(timespec="seconds")
+    conn.execute(
+        """
+        INSERT INTO production_hourly_records (
+            asset_id, provider, period_start, period_end, production_kwh, self_use_kwh,
+            export_kwh, consumption_kwh, grid_import_kwh, payload_json, imported_at,
+            data_quality, source_fields_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(asset_id, provider, period_start) DO UPDATE SET
+            period_end = excluded.period_end,
+            production_kwh = excluded.production_kwh,
+            self_use_kwh = excluded.self_use_kwh,
+            export_kwh = excluded.export_kwh,
+            consumption_kwh = excluded.consumption_kwh,
+            grid_import_kwh = excluded.grid_import_kwh,
+            payload_json = excluded.payload_json,
+            imported_at = excluded.imported_at,
+            data_quality = excluded.data_quality,
+            source_fields_json = excluded.source_fields_json
+        """,
+        (
+            asset_id,
+            provider,
+            period_start.isoformat(timespec="seconds"),
+            period_end.isoformat(timespec="seconds"),
+            float(decimal_from_value(production_kwh)) if production_kwh is not None else None,
+            float(decimal_from_value(self_use_kwh)) if self_use_kwh is not None else None,
+            float(decimal_from_value(export_kwh)) if export_kwh is not None else None,
+            float(decimal_from_value(consumption_kwh)) if consumption_kwh is not None else None,
+            float(decimal_from_value(grid_import_kwh)) if grid_import_kwh is not None else None,
+            payload_text,
+            now,
+            data_quality,
+            json.dumps(source_fields or {}, ensure_ascii=True),
+        ),
     )
 
 

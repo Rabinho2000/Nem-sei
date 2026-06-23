@@ -500,9 +500,9 @@ def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, rep
         availability = get_monthly_availability(conn, asset_id, start, end) if asset_id is not None else None
         if availability is None:
             warnings.append("missing_availability")
-        if asset_id is not None:
-            warnings.extend(detect_tariff_validity_warnings(conn, asset_id=asset_id, start=start, end=end))
-        tariff = get_latest_tariff(conn, asset_id, start) if asset_id is not None else None
+        tariff_validity_warnings = detect_tariff_validity_warnings(conn, asset_id=asset_id, start=start, end=end) if asset_id is not None else ()
+        warnings.extend(tariff_validity_warnings)
+        tariff = None if "overlapping_tariffs" in tariff_validity_warnings else (get_latest_tariff(conn, asset_id, start) if asset_id is not None else None)
         if tariff is None and asset_id is not None and has_expired_tariff(conn, asset_id, start):
             warnings.append("expired_tariff")
         rules = list_tariff_period_rules(conn, int(tariff["id"])) if tariff else []
