@@ -70,7 +70,7 @@ from monitoring_board.customer_reports import (
     prepare_customer_report,
 )
 from monitoring_board.reporting.billing import decimal_from_value
-from monitoring_board.reporting.invoices import normalize_date, is_supported_invoice_extension, validate_invoice_values
+from monitoring_board.reporting.invoices import normalize_date, is_supported_invoice_extension, validate_invoice_values, warnings_require_override
 from monitoring_board.reporting.availability import (
     apply_inverter_edge_tolerance as reporting_apply_inverter_edge_tolerance,
     calculate_inverter_daily_availability as reporting_calculate_inverter_daily_availability,
@@ -125,7 +125,7 @@ from monitoring_board.reporting.validation import (
     validate_report_asset_selection,
 )
 from monitoring_board.reporting.tariffs import result_to_legacy_dict, value_tariff_energy, with_billing_fallback
-from monitoring_board.services.invoice_extraction import extract_invoice_file, sha256_file
+from monitoring_board.services.invoice_extraction import extract_invoice_file, sha256_file, validate_invoice_file_content
 from monitoring_board.services.fusionsolar import (
     build_provider_url,
     classify_fusionsolar_inverter_availability,
@@ -2908,6 +2908,8 @@ def create_app() -> Flask:
         if not asset_id or upload is None or not upload.filename:
             flash("Escolhe a instalacao e o ficheiro fonte da fatura.", "error")
             return redirect(url_for("portfolios"))
+        stored_path: Path | None = None
+        created_new_file = False
         try:
             document_id, warnings = store_invoice_upload(
                 g.db,
@@ -2916,11 +2918,17 @@ def create_app() -> Flask:
                 asset_id=asset_id,
                 portfolio_id=int(portfolio_id_raw) if portfolio_id_raw.isdigit() else None,
             )
+            created_new_file = "duplicate_invoice" not in warnings
+            if created_new_file:
+                invoice = get_invoice_document(g.db, document_id)
+                stored_path = Path(invoice["stored_path"]) if invoice is not None else None
             g.db.commit()
             suffix = " Avisos: " + ", ".join(warnings) if warnings else ""
             flash(f"Fatura guardada para revisao (doc {document_id}).{suffix}", "success")
         except Exception as exc:
             g.db.rollback()
+            if created_new_file and stored_path is not None:
+                stored_path.unlink(missing_ok=True)
             flash(f"Falha ao guardar fatura: {exc}", "error")
         return redirect(url_for("portfolios", tab="config", portfolio_id=portfolio_id_raw, report_month=report_month))
 
@@ -2954,20 +2962,23 @@ def create_app() -> Flask:
                 elif action == "archive_invoice":
                     archive_invoice_document(g.db, invoice_document_id)
                     flash("Fatura arquivada.", "success")
-                elif action in {"save_invoice_review", "confirm_invoice"}:
+                elif action in {"save_invoice_review", "confirm_invoice", "confirm_with_warnings"}:
                     values = invoice_values_from_form(request.form)
                     validation = validate_invoice_values(values, asset_nif=asset["nif"] if asset else None)
                     if not validation.valid:
                         raise ValueError("; ".join(validation.errors))
+                    requires_override = warnings_require_override(validation.warnings)
+                    if action == "confirm_invoice" and requires_override:
+                        raise ValueError("Confirmacao exige override explicito para estes avisos: " + ", ".join(validation.warnings))
                     update_invoice_review(
                         g.db,
                         invoice_document_id=invoice_document_id,
                         values=values,
                         warnings=validation.warnings,
-                        status=InvoiceStatus.CONFIRMED.value if action == "confirm_invoice" and not validation.warnings else InvoiceStatus.REVIEW_REQUIRED.value,
+                        status=InvoiceStatus.CONFIRMED.value if action in {"confirm_invoice", "confirm_with_warnings"} else InvoiceStatus.REVIEW_REQUIRED.value,
                     )
-                    if action == "confirm_invoice" and validation.warnings:
-                        flash("Valores guardados, mas a fatura continua por rever devido aos avisos.", "warning")
+                    if action == "confirm_with_warnings":
+                        flash("Fatura confirmada com avisos preservados.", "warning")
                     elif action == "confirm_invoice":
                         flash("Fatura confirmada.", "success")
                     else:
@@ -7964,46 +7975,61 @@ def store_invoice_upload(
         raise ValueError("Formato de fatura nao suportado.")
     target_dir = upload_dir / "portfolio_sources" / str(asset_id)
     target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_name}"
-    file_storage.save(target)
-    size_bytes = target.stat().st_size
-    if size_bytes <= 0:
-        target.unlink(missing_ok=True)
-        raise ValueError("Ficheiro vazio.")
-    if size_bytes > max_upload_bytes():
-        target.unlink(missing_ok=True)
-        raise ValueError("Ficheiro excede o limite de upload.")
-    digest = sha256_file(target)
-    same_asset = find_invoice_by_hash(conn, asset_id=asset_id, sha256=digest)
-    if same_asset is not None:
-        target.unlink(missing_ok=True)
-        return int(same_asset["id"]), ("duplicate_invoice",)
-    warnings: list[str] = []
-    if find_invoice_by_hash(conn, asset_id=None, sha256=digest) is not None:
-        warnings.append("possible_duplicate_invoice")
-    mime_type = mimetypes.guess_type(safe_name)[0] or str(getattr(file_storage, "mimetype", "") or "")
-    source_id = create_source_file_record(
-        conn,
-        asset_id=asset_id,
-        portfolio_id=portfolio_id,
-        file_type="invoice",
-        original_filename=original_filename,
-        stored_path=str(target),
-        sha256=digest,
-        mime_type=mime_type,
-        size_bytes=size_bytes,
-    )
-    document_id = create_invoice_document(
-        conn,
-        source_file_id=source_id,
-        asset_id=asset_id,
-        sha256=digest,
-        mime_type=mime_type,
-        size_bytes=size_bytes,
-        status=InvoiceStatus.REVIEW_REQUIRED.value if warnings else InvoiceStatus.UPLOADED.value,
-        warnings=tuple(warnings),
-    )
-    return document_id, tuple(warnings)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    target = target_dir / f"{stamp}_{safe_name}"
+    safe_path = Path(safe_name)
+    temp_target = target_dir / f".{stamp}_{safe_path.stem}.tmp{safe_path.suffix}"
+    final_created = False
+    try:
+        file_storage.save(temp_target)
+        size_bytes = temp_target.stat().st_size
+        if size_bytes <= 0:
+            raise ValueError("Ficheiro vazio.")
+        if size_bytes > max_upload_bytes():
+            raise ValueError("Ficheiro excede o limite de upload.")
+        validate_invoice_file_content(temp_target)
+    except Exception:
+        temp_target.unlink(missing_ok=True)
+        raise
+    try:
+        digest = sha256_file(temp_target)
+        same_asset = find_invoice_by_hash(conn, asset_id=asset_id, sha256=digest)
+        if same_asset is not None:
+            temp_target.unlink(missing_ok=True)
+            return int(same_asset["id"]), ("duplicate_invoice",)
+        warnings: list[str] = []
+        if find_invoice_by_hash(conn, asset_id=None, sha256=digest) is not None:
+            warnings.append("possible_duplicate_invoice")
+        temp_target.replace(target)
+        final_created = True
+        mime_type = mimetypes.guess_type(safe_name)[0] or str(getattr(file_storage, "mimetype", "") or "")
+        source_id = create_source_file_record(
+            conn,
+            asset_id=asset_id,
+            portfolio_id=portfolio_id,
+            file_type="invoice",
+            original_filename=original_filename,
+            stored_path=str(target),
+            sha256=digest,
+            mime_type=mime_type,
+            size_bytes=size_bytes,
+        )
+        document_id = create_invoice_document(
+            conn,
+            source_file_id=source_id,
+            asset_id=asset_id,
+            sha256=digest,
+            mime_type=mime_type,
+            size_bytes=size_bytes,
+            status=InvoiceStatus.REVIEW_REQUIRED.value if warnings else InvoiceStatus.UPLOADED.value,
+            warnings=tuple(warnings),
+        )
+        return document_id, tuple(warnings)
+    except Exception:
+        temp_target.unlink(missing_ok=True)
+        if final_created:
+            target.unlink(missing_ok=True)
+        raise
 
 
 def persist_invoice_extraction_result(conn: sqlite3.Connection, invoice: sqlite3.Row, result: Any) -> None:

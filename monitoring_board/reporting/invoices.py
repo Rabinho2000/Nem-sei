@@ -28,6 +28,23 @@ PRICE_FIELDS = {
     "vazio_price_eur_kwh",
     "super_vazio_price_eur_kwh",
 }
+INFORMATIVE_WARNINGS = {
+    "missing_asset_nif",
+    "missing_invoice_number",
+    "missing_issue_date",
+    "missing_billing_period",
+    "missing_customer_nif",
+    "low_extraction_confidence",
+    "scanned_pdf_requires_manual_review",
+    "invoice_requires_manual_review",
+    "ambiguous_invoice_price",
+}
+OVERRIDE_WARNINGS = {
+    "customer_nif_mismatch",
+    "invalid_customer_nif",
+    "unexpected_currency",
+    "invoice_values_incomplete",
+}
 
 
 def normalize_nif(value: Any) -> str:
@@ -49,12 +66,17 @@ def is_valid_portuguese_nif(value: Any) -> bool:
 def normalize_decimal(value: Any) -> Decimal:
     if value is None or str(value).strip() == "":
         raise ValueError("missing_decimal")
-    raw = str(value).strip().replace("€", "").replace("EUR", "").replace("eur", "")
+    raw = str(value).strip()
+    raw = re.sub(r"(?i)\b(?:eur|euros?|euro)\b", "", raw)
+    raw = raw.replace("\u20ac", "").replace("â‚¬", "")
+    if re.search(r"[A-DF-Za-df-z]", raw):
+        raise ValueError("invalid_decimal")
     raw = re.sub(r"\s+", "", raw)
-    if "," in raw and "." in raw:
-        raw = raw.replace(".", "").replace(",", ".")
-    elif "," in raw:
-        raw = raw.replace(",", ".")
+    if not re.fullmatch(r"[+-]?(?:\d+[.,]?|\d*[.,]\d+|\d{1,3}(?:[.,]\d{3})+(?:[.,]\d+)?)", raw):
+        raise ValueError("invalid_decimal")
+    raw = _normalize_decimal_separators(raw)
+    if raw in {"", "+", "-", ".", "+.", "-."}:
+        raise ValueError("invalid_decimal")
     try:
         parsed = Decimal(raw)
     except (InvalidOperation, ValueError) as exc:
@@ -62,6 +84,36 @@ def normalize_decimal(value: Any) -> Decimal:
     if not parsed.is_finite():
         raise ValueError("invalid_decimal")
     return parsed
+
+
+def _normalize_decimal_separators(raw: str) -> str:
+    sign = ""
+    if raw.startswith(("+", "-")):
+        sign, raw = raw[0], raw[1:]
+    if "," in raw and "." in raw:
+        decimal_separator = "," if raw.rfind(",") > raw.rfind(".") else "."
+        thousands_separator = "." if decimal_separator == "," else ","
+        integer_part, decimal_part = raw.rsplit(decimal_separator, 1)
+        if not decimal_part.isdigit() or not _valid_grouped_integer(integer_part, thousands_separator):
+            raise ValueError("invalid_decimal")
+        return sign + integer_part.replace(thousands_separator, "") + "." + decimal_part
+    for separator in (",", "."):
+        if separator not in raw:
+            continue
+        parts = raw.split(separator)
+        if len(parts) == 2:
+            if not all(part.isdigit() for part in parts) or parts[1] == "":
+                raise ValueError("invalid_decimal")
+            return sign + parts[0] + "." + parts[1]
+        if parts[0].isdigit() and 1 <= len(parts[0]) <= 3 and all(len(part) == 3 and part.isdigit() for part in parts[1:]):
+            return sign + "".join(parts)
+        raise ValueError("invalid_decimal")
+    return sign + raw
+
+
+def _valid_grouped_integer(value: str, separator: str) -> bool:
+    parts = value.split(separator)
+    return bool(parts and parts[0].isdigit() and 1 <= len(parts[0]) <= 3 and all(len(part) == 3 and part.isdigit() for part in parts[1:]))
 
 
 def normalize_date(value: Any) -> date:
@@ -169,6 +221,20 @@ def validate_invoice_values(values: dict[str, Any], *, asset_nif: str | None = N
         warnings.append("invoice_values_incomplete")
     status = InvoiceStatus.REVIEW_REQUIRED if warnings or errors else InvoiceStatus.EXTRACTED
     return InvoiceValidationResult(valid=not errors, status=status, warnings=tuple(sorted(set(warnings))), errors=tuple(sorted(set(errors))))
+
+
+def warning_groups(warnings: tuple[str, ...]) -> dict[str, tuple[str, ...]]:
+    warning_set = set(warnings)
+    return {
+        "informative": tuple(sorted(warning_set & INFORMATIVE_WARNINGS)),
+        "override": tuple(sorted(warning_set & OVERRIDE_WARNINGS)),
+        "unknown": tuple(sorted(warning_set - INFORMATIVE_WARNINGS - OVERRIDE_WARNINGS)),
+    }
+
+
+def warnings_require_override(warnings: tuple[str, ...]) -> bool:
+    groups = warning_groups(warnings)
+    return bool(groups["override"] or groups["unknown"])
 
 
 def extraction_result_from_candidates(
