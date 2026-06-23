@@ -164,6 +164,10 @@ def prepare_customer_report(
         config,
         months_count=months_count,
     )
+    tariff_value = decimal_from_value(report.get("tariff_value_eur")) if report.get("tariff_value_eur") is not None else None
+    savings_eur = tariff_value if tariff_value is not None else billing.savings_eur
+    gross_benefit_eur = savings_eur + billing.export_revenue_eur
+    net_benefit_eur = gross_benefit_eur - billing.solcor_payment_eur
 
     prepared.update(
         period_type=str(report.get("period_type") or "monthly"),
@@ -179,14 +183,14 @@ def prepare_customer_report(
         self_use_kwh=decimal_to_float(self_use_decimal),
         export_kwh=decimal_to_float(export_decimal),
         consumption_kwh=decimal_to_float(consumption_decimal),
-        savings_eur=decimal_to_float(billing.savings_eur),
+        savings_eur=decimal_to_float(savings_eur),
         export_revenue_eur=decimal_to_float(billing.export_revenue_eur),
-        total_benefit_eur=decimal_to_float(billing.total_benefit_eur),
-        gross_benefit_eur=decimal_to_float(billing.gross_benefit_eur),
+        total_benefit_eur=decimal_to_float(gross_benefit_eur),
+        gross_benefit_eur=decimal_to_float(gross_benefit_eur),
         solcor_price_per_kwh=decimal_to_float(billing.solcor_price_per_kwh),
         fixed_monthly_fee_eur=decimal_to_float(billing.fixed_monthly_fee_eur),
         solcor_payment_eur=decimal_to_float(billing.solcor_payment_eur),
-        net_benefit_eur=decimal_to_float(billing.net_benefit_eur),
+        net_benefit_eur=decimal_to_float(net_benefit_eur),
         billable_energy_kwh=decimal_to_float(billing.billable_energy_kwh),
         grid_import_kwh=decimal_to_float(billing.grid_import_kwh),
         exported_energy_kwh=decimal_to_float(billing.exported_energy_kwh),
@@ -194,6 +198,13 @@ def prepare_customer_report(
         billing_energy_base=billing.billing_energy_base.value,
         months_count=billing.months_count,
         billing_warnings=list(billing.warnings),
+        tariff_type=report.get("tariff_type") or "",
+        tariff_types_used=list(report.get("tariff_types_used") or []),
+        tariff_source=report.get("tariff_source") or ("billing_default" if tariff_value is None else "stored_tariff"),
+        tariff_period_breakdown=list(report.get("tariff_period_breakdown") or []),
+        tariff_value_eur=decimal_to_float(savings_eur),
+        tariff_coverage_pct=_number(report.get("tariff_coverage_pct")),
+        tariff_warnings=list(report.get("tariff_warnings") or []),
         autoconsumption_pct=decimal_to_float(billing.autoconsumption_pct),
         export_pct=decimal_to_float(billing.export_pct),
         self_sufficiency_pct=decimal_to_float(billing.self_sufficiency_pct),
@@ -574,6 +585,23 @@ def draw_donut_charts(pdf: canvas.Canvas, report: dict[str, Any], x: float, y: f
         pdf.setFillColor(TEXT_GRAY)
         pdf.setFont("Helvetica", 7)
         pdf.drawCentredString(tariff_x + card_w / 2, y + 35, "Sem dados suficientes")
+    tariff_breakdown = report.get("tariff_period_breakdown") or []
+    if tariff_breakdown:
+        row_y = y + 24
+        pdf.setFillColor(TEXT_GRAY)
+        pdf.setFont("Helvetica", 5.2)
+        for item in tariff_breakdown[:4]:
+            energy = format_kwh(item.get("energy_kwh"))
+            price = item.get("price_eur_kwh")
+            value = format_eur(item.get("value_eur"))
+            price_label = f"{float(price):.4f} EUR/kWh" if price is not None else "sem preco"
+            pdf.drawString(tariff_x + 10, row_y, f"{item.get('period_name')}: {energy} | {price_label} | {value}")
+            row_y -= 8
+    if report.get("tariff_coverage_pct") is not None:
+        pdf.setFillColor(TEXT_GRAY)
+        pdf.setFont("Helvetica", 5.2)
+        warnings = ", ".join((report.get("tariff_warnings") or [])[:3])
+        pdf.drawString(tariff_x + 10, y + 5, f"Cobertura: {format_pct(report.get('tariff_coverage_pct'))}" + (f" | {warnings}" if warnings else ""))
 
     suff_x = x + 2 * (card_w + gap)
     _draw_donut(pdf, suff_x + 54, y + 41, 29, report["self_sufficiency_pct"], ORANGE, "Autossuficiência Energética")

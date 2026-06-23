@@ -77,6 +77,11 @@
             <th>Cheia kWh</th>
             <th>Vazio kWh</th>
             <th>Super vazio kWh</th>
+            <th>Autoc. ponta kWh</th>
+            <th>Autoc. cheia kWh</th>
+            <th>Autoc. vazio kWh</th>
+            <th>Autoc. super vazio kWh</th>
+            <th>Valor autoc. EUR</th>
             <th>Helioscope base kWh</th>
             <th>Esperada ajustada kWh</th>
             <th>Fator degradacao</th>
@@ -101,6 +106,11 @@
               <td>{{ format_number(row.production_cheia_kwh, 2) }}</td>
               <td>{{ format_number(row.production_vazio_kwh, 2) }}</td>
               <td>{{ format_number(row.production_super_vazio_kwh, 2) }}</td>
+              <td>{{ format_number(row.self_use_ponta_kwh, 2) }}</td>
+              <td>{{ format_number(row.self_use_cheia_kwh, 2) }}</td>
+              <td>{{ format_number(row.self_use_vazio_kwh, 2) }}</td>
+              <td>{{ format_number(row.self_use_super_vazio_kwh, 2) }}</td>
+              <td>{{ format_number(row.estimated_value_eur, 2) }}</td>
               <td>{{ format_number(row.helioscope_expected_kwh, 2) }}</td>
               <td>{{ format_number(row.adjusted_expected_kwh, 2) }}</td>
               <td>{{ format_number(row.degradation_factor, 4) }}</td>
@@ -124,6 +134,11 @@
               <td><strong>{{ format_number(total_row.production_cheia_kwh, 2) }}</strong></td>
               <td><strong>{{ format_number(total_row.production_vazio_kwh, 2) }}</strong></td>
               <td><strong>{{ format_number(total_row.production_super_vazio_kwh, 2) }}</strong></td>
+              <td><strong>{{ format_number(total_row.self_use_ponta_kwh, 2) }}</strong></td>
+              <td><strong>{{ format_number(total_row.self_use_cheia_kwh, 2) }}</strong></td>
+              <td><strong>{{ format_number(total_row.self_use_vazio_kwh, 2) }}</strong></td>
+              <td><strong>{{ format_number(total_row.self_use_super_vazio_kwh, 2) }}</strong></td>
+              <td><strong>{{ format_number(total_row.estimated_value_eur, 2) }}</strong></td>
               <td><strong>{{ format_number(total_row.helioscope_expected_kwh, 2) }}</strong></td>
               <td><strong>{{ format_number(total_row.adjusted_expected_kwh, 2) }}</strong></td>
               <td></td>
@@ -275,28 +290,86 @@
                       <div class="grid two">
                         <label>Tipo
                           <select name="tariff_type">
-                            <option value="simple">Simples</option>
-                            <option value="bi-hourly">Bi-horaria</option>
-                            <option value="tri-hourly">Tri-horaria</option>
+                            <option value="simple" {{ 'selected' if item.tariff_type == 'simple' }}>Simples</option>
+                            <option value="bi-hourly" {{ 'selected' if item.tariff_type == 'bi-hourly' }}>Bi-horaria</option>
+                            <option value="tri-hourly" {{ 'selected' if item.tariff_type == 'tri-hourly' }}>Tri-horaria</option>
+                            <option value="tetra-hourly" {{ 'selected' if item.tariff_type == 'tetra-hourly' }}>Tetra-horaria</option>
+                          </select>
+                        </label>
+                        <label>Ciclo
+                          <select name="cycle_type">
+                            <option value="" {{ 'selected' if not item.cycle_type }}>Nao indicado</option>
+                            <option value="daily" {{ 'selected' if item.cycle_type == 'daily' }}>Diario</option>
+                            <option value="weekly" {{ 'selected' if item.cycle_type == 'weekly' }}>Semanal</option>
                           </select>
                         </label>
                         <label>Fatura fonte
                           <select name="invoice_file_id">
                             <option value="">Escolher</option>
                             {% for invoice in invoices if invoice.asset_id == item.asset_id %}
-                              <option value="{{ invoice.id }}">{{ invoice.original_filename }}</option>
+                              <option value="{{ invoice.id }}" {{ 'selected' if item.invoice_file_id == invoice.id }}>{{ invoice.original_filename }}</option>
                             {% endfor %}
                           </select>
                         </label>
-                        <label>Simples EUR/kWh <input type="number" step="0.00001" name="simple_price_eur_kwh"></label>
-                        <label>Ponta EUR/kWh <input type="number" step="0.00001" name="ponta_price_eur_kwh"></label>
-                        <label>Cheia EUR/kWh <input type="number" step="0.00001" name="cheia_price_eur_kwh"></label>
-                        <label>Vazio EUR/kWh <input type="number" step="0.00001" name="vazio_price_eur_kwh"></label>
-                        <label>Super vazio EUR/kWh <input type="number" step="0.00001" name="super_vazio_price_eur_kwh"></label>
-                        <label>Valida desde <input type="date" name="valid_from"></label>
+                        <label>Simples EUR/kWh <input type="number" step="0.00001" min="0" name="simple_price_eur_kwh" value="{{ item.simple_price_eur_kwh or '' }}"></label>
+                        <label>Ponta EUR/kWh <input type="number" step="0.00001" min="0" name="ponta_price_eur_kwh" value="{{ item.ponta_price_eur_kwh or '' }}"></label>
+                        <label>Cheia EUR/kWh <input type="number" step="0.00001" min="0" name="cheia_price_eur_kwh" value="{{ item.cheia_price_eur_kwh or '' }}"></label>
+                        <label>Vazio EUR/kWh <input type="number" step="0.00001" min="0" name="vazio_price_eur_kwh" value="{{ item.vazio_price_eur_kwh or '' }}"></label>
+                        <label>Super vazio EUR/kWh <input type="number" step="0.00001" min="0" name="super_vazio_price_eur_kwh" value="{{ item.super_vazio_price_eur_kwh or '' }}"></label>
+                        <label>Valida desde <input type="date" name="valid_from" value="{{ item.valid_from or '' }}"></label>
+                        <label>Valida ate <input type="date" name="valid_to" value="{{ item.valid_to or '' }}"></label>
+                        <label>Notas <input type="text" name="notes" value="{{ item.tariff_notes or '' }}"></label>
                       </div>
                       <button class="button secondary" type="submit">Guardar tarifa</button>
                     </form>
+                    {% if item.tariff_id %}
+                      <div class="list compact-list top-space">
+                        {% for rule in tariff_rules if rule.tariff_id == item.tariff_id %}
+                          <div class="list-row">
+                            <div>
+                              <strong>{{ rule.weekday_type }} {{ rule.start_time }}-{{ rule.end_time }}</strong>
+                              <small>{{ rule.period_name }}</small>
+                            </div>
+                            <form method="post" class="inline-form">
+                              <input type="hidden" name="action" value="delete_tariff_rule">
+                              <input type="hidden" name="portfolio_id" value="{{ selected_portfolio_id }}">
+                              <input type="hidden" name="report_month" value="{{ report_month }}">
+                              <input type="hidden" name="asset_id" value="{{ item.asset_id }}">
+                              <input type="hidden" name="rule_id" value="{{ rule.id }}">
+                              <button class="button secondary" type="submit">Remover</button>
+                            </form>
+                          </div>
+                        {% else %}
+                          <p class="muted">Sem regras horarias configuradas.</p>
+                        {% endfor %}
+                      </div>
+                      <form method="post" class="stack-form top-space">
+                        <input type="hidden" name="action" value="add_tariff_rule">
+                        <input type="hidden" name="portfolio_id" value="{{ selected_portfolio_id }}">
+                        <input type="hidden" name="report_month" value="{{ report_month }}">
+                        <input type="hidden" name="tariff_id" value="{{ item.tariff_id }}">
+                        <div class="grid four">
+                          <label>Dia
+                            <select name="weekday_type">
+                              <option value="all">Todos</option>
+                              <option value="weekday">Dias uteis</option>
+                              <option value="weekend">Fim de semana</option>
+                            </select>
+                          </label>
+                          <label>Inicio <input type="time" name="start_time" required></label>
+                          <label>Fim <input type="time" name="end_time" required></label>
+                          <label>Periodo
+                            <select name="period_name">
+                              <option value="ponta">Ponta</option>
+                              <option value="cheia">Cheia</option>
+                              <option value="vazio">Vazio</option>
+                              <option value="super_vazio">Super vazio</option>
+                            </select>
+                          </label>
+                        </div>
+                        <button class="button secondary" type="submit">Adicionar regra</button>
+                      </form>
+                    {% endif %}
                   </details>
                 {% else %}
                   <span class="muted">Mapear primeiro</span>

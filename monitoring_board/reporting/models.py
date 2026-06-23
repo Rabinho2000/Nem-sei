@@ -110,6 +110,47 @@ class HourlyEnergyRecord:
     export_kwh: Decimal | None = None
     consumption_kwh: Decimal | None = None
     grid_import_kwh: Decimal | None = None
+    data_quality: str | None = None
+    source_fields: dict[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class TariffConfig:
+    tariff_id: int | None
+    asset_id: int | None
+    tariff_type: TariffType
+    cycle_type: str = ""
+    valid_from: date | None = None
+    valid_to: date | None = None
+    prices: dict[str, Decimal] | None = None
+    rules: tuple[TariffPeriodRule, ...] = ()
+    source: str = "stored_tariff"
+    invoice_file_id: int | None = None
+    notes: str = ""
+
+
+@dataclass(frozen=True)
+class TariffPeriodBreakdown:
+    period_name: str
+    energy_kwh: Decimal
+    production_kwh: Decimal
+    price_eur_kwh: Decimal | None
+    value_eur: Decimal
+
+
+@dataclass(frozen=True)
+class TariffValuationResult:
+    tariff_type: TariffType | None
+    total_energy_kwh: Decimal
+    breakdown: tuple[TariffPeriodBreakdown, ...]
+    total_value_eur: Decimal | None
+    hours_classified: int
+    hours_unclassified: int
+    expected_slots: int
+    slots_with_data: int
+    coverage_pct: Decimal
+    source: str
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

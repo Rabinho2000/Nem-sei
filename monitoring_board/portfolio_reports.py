@@ -4,7 +4,7 @@ import json
 import re
 import sqlite3
 import unicodedata
-from datetime import date, datetime, time
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -12,9 +12,11 @@ from openpyxl import Workbook, load_workbook
 
 from monitoring_board.db import query_all
 from monitoring_board.reporting.availability import calculate_weighted_portfolio_availability
+from monitoring_board.reporting.billing import decimal_from_value
 from monitoring_board.reporting.degradation import calculate_degradation_factor
 from monitoring_board.reporting.periods import month_bounds
 from monitoring_board.reporting.repositories import (
+    detect_tariff_validity_warnings,
     get_latest_helioscope_expected,
     get_latest_tariff,
     get_monthly_availability,
@@ -23,6 +25,14 @@ from monitoring_board.reporting.repositories import (
     list_hourly_production_records,
     list_portfolio_report_assets,
     list_tariff_period_rules,
+    row_to_hourly_energy_record,
+    row_to_tariff_config,
+)
+from monitoring_board.reporting.tariffs import (
+    classify_tariff_period as tariff_classify_tariff_period,
+    result_to_legacy_dict,
+    time_in_rule as tariff_time_in_rule,
+    value_tariff_energy,
 )
 
 
@@ -45,6 +55,7 @@ WARNING_LABELS = {
     "ok": "OK",
     "missing_monthly_production": "Sem producao real FusionSolar",
     "missing_hourly_production": "Sem producao horaria FusionSolar",
+    "missing_hourly_self_use": "Sem autoconsumo horario",
     "missing_helioscope_expected": "Sem Helioscope",
     "missing_mounting_date": "Sem data de montagem",
     "invalid_mounting_date": "Sem data de montagem",
@@ -58,6 +69,11 @@ WARNING_LABELS = {
     "expired_tariff": "Tarifa expirada",
     "missing_installed_power": "Sem potencia instalada",
     "unclassified_hourly_production": "Dados incompletos",
+    "unclassified_hourly_energy": "Dados incompletos",
+    "inferred_hourly_self_use": "Autoconsumo inferido",
+    "incomplete_tariff_coverage": "Cobertura tarifaria incompleta",
+    "tariff_validity_gap": "Lacuna tarifaria",
+    "overlapping_tariffs": "Tarifas sobrepostas",
 }
 
 PORTFOLIO_EXTERNAL_ROWS = {
@@ -420,25 +436,12 @@ def data_status_label(warnings: list[str]) -> str:
     return "Dados incompletos"
 
 
-def time_in_rule(sample_time: time, start: time, end: time) -> bool:
-    if start == end:
-        return True
-    if start < end:
-        return start <= sample_time < end
-    return sample_time >= start or sample_time < end
+def time_in_rule(sample_time, start, end) -> bool:
+    return tariff_time_in_rule(sample_time, start, end)
 
 
 def classify_tariff_period(moment: datetime, rules: list[sqlite3.Row | dict[str, Any]]) -> str | None:
-    weekday_type = "weekend" if moment.weekday() >= 5 else "weekday"
-    for row in rules:
-        rule_type = str(row["weekday_type"] or "all")
-        if rule_type not in {"all", weekday_type}:
-            continue
-        start = datetime.strptime(str(row["start_time"]), "%H:%M").time()
-        end = datetime.strptime(str(row["end_time"]), "%H:%M").time()
-        if time_in_rule(moment.time(), start, end):
-            return str(row["period_name"])
-    return None
+    return tariff_classify_tariff_period(moment, rules)
 
 
 def calculate_tariff_value(
@@ -448,37 +451,17 @@ def calculate_tariff_value(
     hourly_records: list[sqlite3.Row | dict[str, Any]],
     rules: list[sqlite3.Row | dict[str, Any]],
 ) -> dict[str, Any]:
-    periods = {name: 0.0 for name in PERIOD_NAMES}
-    warnings: list[str] = []
-    if tariff is None:
-        return {"estimated_value_eur": None, "period_kwh": periods, "warnings": ["missing_tariff"]}
-    tariff_type = str(tariff["tariff_type"] or "simple")
-    if tariff_type == "simple":
-        price = parse_float(tariff["simple_price_eur_kwh"])
-        if price is None:
-            warnings.append("missing_simple_tariff_price")
-            return {"estimated_value_eur": None, "period_kwh": periods, "warnings": warnings}
-        return {"estimated_value_eur": round((monthly_kwh or 0) * price, 2), "period_kwh": periods, "warnings": warnings}
-    if not rules:
-        warnings.append("missing_tariff_rules")
-    if not hourly_records:
-        warnings.append("missing_hourly_production")
-    total = 0.0
-    for record in hourly_records:
-        start = datetime.fromisoformat(str(record["period_start"]))
-        period = classify_tariff_period(start, rules)
-        kwh = float(record["production_kwh"] or 0)
-        if not period:
-            warnings.append("unclassified_hourly_production")
-            continue
-        if period in periods:
-            periods[period] += kwh
-        price = parse_float(tariff[f"{period}_price_eur_kwh"]) if f"{period}_price_eur_kwh" in tariff.keys() else None
-        if price is None:
-            warnings.append(f"missing_{period}_price")
-            continue
-        total += kwh * price
-    return {"estimated_value_eur": round(total, 2) if hourly_records and not any(w.startswith("missing_") for w in warnings if w != "missing_super_vazio_price") else None, "period_kwh": periods, "warnings": sorted(set(warnings))}
+    config = row_to_tariff_config(tariff, rules) if tariff is not None else None
+    records = [row_to_hourly_energy_record(record) for record in hourly_records]
+    result = value_tariff_energy(
+        config,
+        hourly_records=records,
+        aggregate_self_use_kwh=None if monthly_kwh is None else decimal_from_value(monthly_kwh),
+    )
+    legacy = result_to_legacy_dict(result)
+    if "missing_hourly_self_use" in legacy["warnings"] and hourly_records:
+        legacy["warnings"].append("missing_hourly_production")
+    return legacy
 
 
 def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, report_month: str) -> list[dict[str, Any]]:
@@ -517,7 +500,9 @@ def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, rep
         availability = get_monthly_availability(conn, asset_id, start, end) if asset_id is not None else None
         if availability is None:
             warnings.append("missing_availability")
-        tariff = get_latest_tariff(conn, asset_id, start) if asset_id is not None else None
+        tariff_validity_warnings = detect_tariff_validity_warnings(conn, asset_id=asset_id, start=start, end=end) if asset_id is not None else ()
+        warnings.extend(tariff_validity_warnings)
+        tariff = None if "overlapping_tariffs" in tariff_validity_warnings else (get_latest_tariff(conn, asset_id, start) if asset_id is not None else None)
         if tariff is None and asset_id is not None and has_expired_tariff(conn, asset_id, start):
             warnings.append("expired_tariff")
         rules = list_tariff_period_rules(conn, int(tariff["id"])) if tariff else []
@@ -527,13 +512,21 @@ def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, rep
             start_iso=start.isoformat(),
             end_iso=datetime(end.year, end.month, end.day, 23, 59, 59).isoformat(),
         )
-        tariff_result = calculate_tariff_value(tariff, monthly_kwh=actual, hourly_records=hourly, rules=rules)
+        monthly_self_use = None
+        if prod is not None and "self_use_kwh" in prod.keys() and prod["self_use_kwh"] is not None:
+            monthly_self_use = float(prod["self_use_kwh"])
+        tariff_result = calculate_tariff_value(tariff, monthly_kwh=monthly_self_use, hourly_records=hourly, rules=rules)
         warnings.extend(tariff_result["warnings"])
         invoice_status = "ok" if tariff and tariff["invoice_file_id"] else "missing_invoice"
         if invoice_status != "ok":
             warnings.append(invoice_status)
         data_status = "ok" if not warnings else ("missing_data" if any(w.startswith("missing") for w in warnings) else "warning")
-        period_kwh = tariff_result["period_kwh"]
+        period_kwh = tariff_result["production_period_kwh"]
+        self_use_period_kwh = tariff_result["self_use_period_kwh"]
+        value_by_period = {
+            item.period_name: float(item.value_eur)
+            for item in tariff_result.get("breakdown", [])
+        }
         rows.append(
             {
                 "portfolio_id": portfolio_id,
@@ -550,6 +543,14 @@ def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, rep
                 "production_cheia_kwh": round(period_kwh["cheia"], 2),
                 "production_vazio_kwh": round(period_kwh["vazio"], 2),
                 "production_super_vazio_kwh": round(period_kwh["super_vazio"], 2),
+                "self_use_ponta_kwh": round(self_use_period_kwh["ponta"], 2),
+                "self_use_cheia_kwh": round(self_use_period_kwh["cheia"], 2),
+                "self_use_vazio_kwh": round(self_use_period_kwh["vazio"], 2),
+                "self_use_super_vazio_kwh": round(self_use_period_kwh["super_vazio"], 2),
+                "self_use_value_ponta_eur": round(value_by_period.get("ponta", 0.0), 2),
+                "self_use_value_cheia_eur": round(value_by_period.get("cheia", 0.0), 2),
+                "self_use_value_vazio_eur": round(value_by_period.get("vazio", 0.0), 2),
+                "self_use_value_super_vazio_eur": round(value_by_period.get("super_vazio", 0.0), 2),
                 "helioscope_expected_kwh": round(expected_kwh, 2) if expected_kwh is not None else None,
                 "adjusted_expected_kwh": round(adjusted, 2) if adjusted is not None else None,
                 "degradation_factor": round(factor, 6),
@@ -597,6 +598,14 @@ def aggregate_portfolio_total(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "production_cheia_kwh": total("production_cheia_kwh"),
         "production_vazio_kwh": total("production_vazio_kwh"),
         "production_super_vazio_kwh": total("production_super_vazio_kwh"),
+        "self_use_ponta_kwh": total("self_use_ponta_kwh"),
+        "self_use_cheia_kwh": total("self_use_cheia_kwh"),
+        "self_use_vazio_kwh": total("self_use_vazio_kwh"),
+        "self_use_super_vazio_kwh": total("self_use_super_vazio_kwh"),
+        "self_use_value_ponta_eur": total("self_use_value_ponta_eur"),
+        "self_use_value_cheia_eur": total("self_use_value_cheia_eur"),
+        "self_use_value_vazio_eur": total("self_use_value_vazio_eur"),
+        "self_use_value_super_vazio_eur": total("self_use_value_super_vazio_eur"),
         "helioscope_expected_kwh": total("helioscope_expected_kwh"),
         "adjusted_expected_kwh": adjusted_total,
         "degradation_factor": "",
@@ -694,6 +703,14 @@ def export_portfolio_report_workbook(rows: list[dict[str, Any]]) -> Workbook:
         ("production_cheia_kwh", "Producao cheia kWh"),
         ("production_vazio_kwh", "Producao vazio kWh"),
         ("production_super_vazio_kwh", "Producao super vazio kWh"),
+        ("self_use_ponta_kwh", "Autoconsumo ponta kWh"),
+        ("self_use_cheia_kwh", "Autoconsumo cheia kWh"),
+        ("self_use_vazio_kwh", "Autoconsumo vazio kWh"),
+        ("self_use_super_vazio_kwh", "Autoconsumo super vazio kWh"),
+        ("self_use_value_ponta_eur", "Valor autoconsumo ponta EUR"),
+        ("self_use_value_cheia_eur", "Valor autoconsumo cheia EUR"),
+        ("self_use_value_vazio_eur", "Valor autoconsumo vazio EUR"),
+        ("self_use_value_super_vazio_eur", "Valor autoconsumo super vazio EUR"),
         ("helioscope_expected_kwh", "Producao Helioscope base kWh"),
         ("adjusted_expected_kwh", "Producao esperada ajustada kWh"),
         ("degradation_factor", "Fator degradacao"),
