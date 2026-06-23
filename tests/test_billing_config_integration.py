@@ -12,6 +12,7 @@ from app import app as flask_app
 from app import build_fusionsolar_customer_production_report, ensure_database, upsert_production_record
 from monitoring_board.customer_reports import build_customer_report_pdf
 from monitoring_board.reporting.models import BillingConfig, BillingEnergyBase, BillingMode, ReportType
+from monitoring_board.reporting.periods import period_from_form
 from monitoring_board.reporting.repositories import (
     ensure_billing_config_schema,
     get_asset_billing_config,
@@ -59,6 +60,47 @@ def add_report_asset(conn: sqlite3.Connection, *, contract_type: str = "ESCO", n
     )
     conn.commit()
     return asset_id
+
+
+def add_monthly_report_record(
+    conn: sqlite3.Connection,
+    asset_id: int,
+    month: int,
+    *,
+    production: float = 100,
+    self_use: float = 60,
+    export: float = 40,
+    consumption: float = 120,
+    year: int = 2026,
+) -> None:
+    upsert_production_record(
+        conn,
+        asset_id=asset_id,
+        provider="FusionSolar",
+        external_id=f"S{asset_id}",
+        period_type="month",
+        period_date=date(year, month, 1),
+        production_kwh=production,
+        specific_yield=2,
+        expected_kwh=None,
+        expected_specific_yield=None,
+        deviation_pct=None,
+        performance_status="OK",
+        expected_source="none",
+        data_quality="ok",
+        notes="",
+        payload_json=json.dumps(
+            {
+                "collectTime": 1767225600000,
+                "dataItemMap": {
+                    "PVYield": str(production),
+                    "selfUsePower": str(self_use),
+                    "ongrid_power": str(export),
+                    "use_power": str(consumption),
+                },
+            }
+        ),
+    )
 
 
 def billing_config(
@@ -191,6 +233,95 @@ def test_manual_override_does_not_change_saved_config(tmp_path: Path, monkeypatc
     assert get_asset_billing_config(conn, asset_id, ReportType.ESCO).solcor_price_per_kwh == Decimal("0.10")
 
 
+def test_saved_billing_config_applies_to_quarterly_period_without_energy_multiplier(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = connect(tmp_path)
+    asset_id = add_report_asset(conn)
+    add_monthly_report_record(conn, asset_id, 2, production=120, self_use=70, export=50, consumption=130)
+    add_monthly_report_record(conn, asset_id, 3, production=140, self_use=80, export=60, consumption=150)
+    saved = billing_config(solcor_price="0.10", electricity_price="0.20", export_price="0.05")
+    upsert_asset_billing_config(conn, asset_id=asset_id, config=saved)
+    conn.commit()
+    monkeypatch.setattr("app.get_fusionsolar_session", lambda _config: pytest.fail("API should not be called"))
+
+    report = build_fusionsolar_customer_production_report(
+        conn,
+        asset_id=asset_id,
+        report_month="2026-01",
+        electricity_price=0.0,
+        sell_price=0.0,
+        billing_config=get_asset_billing_config(conn, asset_id, ReportType.ESCO),
+        period=period_from_form({"period_type": "quarterly", "report_year": "2026", "report_quarter": "1"}),
+    )
+
+    assert report["months_count"] == 3
+    assert report["self_use_kwh"] == 210
+    assert report["solcor_payment_eur"] == 21
+    assert report["solcor_payment_eur"] != 63
+    assert report["export_revenue_eur"] == 7.5
+    assert report["missing_months"] == []
+
+
+def test_manual_override_applies_to_semiannual_period_without_saving(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = connect(tmp_path)
+    asset_id = add_report_asset(conn)
+    for month in range(2, 7):
+        add_monthly_report_record(conn, asset_id, month, production=100, self_use=60, export=40, consumption=120)
+    upsert_asset_billing_config(conn, asset_id=asset_id, config=billing_config(solcor_price="0.10"))
+    conn.commit()
+    manual = billing_config(solcor_price="0.20", base=BillingEnergyBase.TOTAL_PRODUCTION)
+    monkeypatch.setattr("app.get_fusionsolar_session", lambda _config: pytest.fail("API should not be called"))
+
+    report = build_fusionsolar_customer_production_report(
+        conn,
+        asset_id=asset_id,
+        report_month="2026-01",
+        electricity_price=0.0,
+        sell_price=0.0,
+        billing_config=manual,
+        period=period_from_form({"period_type": "semiannual", "report_year": "2026", "report_semester": "1"}),
+    )
+
+    assert report["months_count"] == 6
+    assert report["production_kwh"] == 600
+    assert report["solcor_payment_eur"] == 120
+    assert get_asset_billing_config(conn, asset_id, ReportType.ESCO).solcor_price_per_kwh == Decimal("0.10")
+
+
+def test_annual_fixed_monthly_fee_uses_twelve_months_and_epc_stays_zero(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = connect(tmp_path)
+    esco_asset = add_report_asset(conn, contract_type="ESCO", name="ESCO Annual")
+    epc_asset = add_report_asset(conn, contract_type="EPC", name="EPC Annual")
+    for month in range(2, 13):
+        add_monthly_report_record(conn, esco_asset, month)
+        add_monthly_report_record(conn, epc_asset, month)
+    monkeypatch.setattr("app.get_fusionsolar_session", lambda _config: pytest.fail("API should not be called"))
+
+    annual_period = period_from_form({"period_type": "annual", "report_year": "2026"})
+    esco = build_fusionsolar_customer_production_report(
+        conn,
+        asset_id=esco_asset,
+        report_month="2026-01",
+        electricity_price=0.0,
+        sell_price=0.0,
+        billing_config=billing_config(mode=BillingMode.FIXED_MONTHLY_FEE, fixed_fee="33"),
+        period=annual_period,
+    )
+    epc = build_fusionsolar_customer_production_report(
+        conn,
+        asset_id=epc_asset,
+        report_month="2026-01",
+        electricity_price=0.0,
+        sell_price=0.0,
+        billing_config=billing_config(report_type=ReportType.EPC, mode=BillingMode.FIXED_MONTHLY_FEE, fixed_fee="999"),
+        period=annual_period,
+    )
+
+    assert esco["solcor_payment_eur"] == 396
+    assert epc["solcor_payment_eur"] == 0
+    assert esco["missing_months"] == []
+    assert epc["missing_months"] == []
+
+
 def test_report_supports_total_production_fixed_fee_warnings_epc_and_pdf(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     conn = connect(tmp_path)
     esco_asset = add_report_asset(conn, contract_type="ESCO", name="ESCO PDF")
@@ -262,7 +393,7 @@ def test_exports_selection_loads_selected_asset_billing_config_and_keeps_isolati
     conn.close()
 
     client = csrf_client(db_path)
-    response = client.get(f"/exports?asset_id={asset_b}&report_month=2026-01")
+    response = client.get(f"/exports?asset_id={asset_b}&period_type=quarterly&report_year=2026&report_quarter=2")
     html = response.data.decode()
 
     assert response.status_code == 200
@@ -271,6 +402,8 @@ def test_exports_selection_loads_selected_asset_billing_config_and_keeps_isolati
     assert 'value="0.31"' in html
     assert 'value="0.08"' in html
     assert '<option value="fixed_monthly_fee" selected>' in html
+    assert '<option value="quarterly" selected>' in html
+    assert '<option value="2" selected>T2' in html
     assert 'name="asset_id" id="report-asset"' in html
 
     save_b = client.post(

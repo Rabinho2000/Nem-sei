@@ -6,6 +6,7 @@ from datetime import date
 import pytest
 
 from app import (
+    build_local_customer_production_report,
     build_fusionsolar_customer_production_report,
     build_production_report_rows,
     build_missing_production_note,
@@ -21,6 +22,7 @@ from app import (
     upsert_production_record,
 )
 from monitoring_board.db import get_db
+from monitoring_board.reporting.periods import period_from_form
 
 
 @pytest.fixture()
@@ -240,6 +242,205 @@ def test_customer_pdf_report_uses_local_production_records(conn, monkeypatch: py
     assert report["self_use_kwh"] == 60
     assert report["export_kwh"] == 40
     assert report["daily_rows"][0]["production_kwh"] == 10
+
+
+def _insert_customer_asset(conn, name: str = "Central Periodos") -> int:
+    conn.execute(
+        """
+        INSERT INTO assets (project_name, installation_group, active_contract, kwp, location)
+        VALUES (?, ?, 'yes', '50', 'Porto')
+        """,
+        (name, name),
+    )
+    asset_id = int(conn.execute("SELECT id FROM assets WHERE project_name = ?", (name,)).fetchone()["id"])
+    conn.execute(
+        """
+        INSERT INTO asset_integrations (asset_id, provider, external_id, external_name, enabled)
+        VALUES (?, 'FusionSolar', 'S1', ?, 1)
+        """,
+        (asset_id, f"{name} FS"),
+    )
+    return asset_id
+
+
+def _insert_customer_record(conn, asset_id: int, period_type: str, period_date: date, production: float, self_use: float, export: float, consumption: float) -> None:
+    upsert_production_record(
+        conn,
+        asset_id=asset_id,
+        provider="FusionSolar",
+        external_id="S1",
+        period_type=period_type,
+        period_date=period_date,
+        production_kwh=production,
+        specific_yield=None,
+        expected_kwh=None,
+        expected_specific_yield=None,
+        deviation_pct=None,
+        performance_status="OK",
+        expected_source="none",
+        data_quality="ok",
+        notes="",
+        payload_json=json.dumps(
+            {
+                "collectTime": 1767225600000,
+                "dataItemMap": {
+                    "PVYield": str(production),
+                    "selfUsePower": str(self_use),
+                    "ongrid_power": str(export),
+                    "use_power": str(consumption),
+                },
+            }
+        ),
+    )
+
+
+def test_quarterly_customer_report_sums_three_monthly_records(conn, monkeypatch: pytest.MonkeyPatch) -> None:
+    asset_id = _insert_customer_asset(conn, "Central Trimestre")
+    for month, production in [(1, 100), (2, 120), (3, 140)]:
+        _insert_customer_record(conn, asset_id, "month", date(2026, month, 1), production, production - 20, 20, 200)
+    conn.commit()
+    monkeypatch.setattr("app.get_fusionsolar_session", lambda _config: pytest.fail("API should not be called"))
+
+    report = build_fusionsolar_customer_production_report(
+        conn,
+        asset_id=asset_id,
+        report_month="2026-01",
+        electricity_price=0.2,
+        sell_price=0.05,
+        period=period_from_form({"period_type": "quarterly", "report_year": "2026", "report_quarter": "1"}),
+    )
+
+    assert report["period_type"] == "quarterly"
+    assert report["months_count"] == 3
+    assert report["production_kwh"] == 360
+    assert report["self_use_kwh"] == 300
+    assert report["export_kwh"] == 60
+    assert report["consumption_kwh"] == 600
+    assert report["months_with_data"] == ["2026-01", "2026-02", "2026-03"]
+    assert report["missing_months"] == []
+    assert report["coverage_pct"] == 100
+    assert report["chart_granularity"] == "monthly"
+
+
+def test_semiannual_customer_report_mixes_monthly_and_daily_without_double_counting(conn, monkeypatch: pytest.MonkeyPatch) -> None:
+    asset_id = _insert_customer_asset(conn, "Central Semestre")
+    _insert_customer_record(conn, asset_id, "month", date(2026, 1, 1), 100, 70, 30, 180)
+    _insert_customer_record(conn, asset_id, "day", date(2026, 1, 2), 10, 6, 4, 20)
+    _insert_customer_record(conn, asset_id, "day", date(2026, 2, 1), 20, 15, 5, 30)
+    _insert_customer_record(conn, asset_id, "day", date(2026, 2, 2), 30, 20, 10, 40)
+    conn.commit()
+
+    report = build_local_customer_production_report(
+        conn,
+        asset_id=asset_id,
+        report_month="2026-01",
+        electricity_price=0.2,
+        sell_price=0.05,
+        period=period_from_form({"period_type": "semiannual", "report_year": "2026", "report_semester": "1"}),
+    )
+
+    assert report["production_kwh"] == 150
+    assert report["self_use_kwh"] == 105
+    assert report["export_kwh"] == 45
+    assert report["consumption_kwh"] == 250
+    assert report["months_with_data"] == ["2026-01", "2026-02"]
+    assert report["missing_months"] == ["2026-03", "2026-04", "2026-05", "2026-06"]
+    assert report["coverage_pct"] == pytest.approx(33.33)
+    assert any("dados diarios incompletos" in note for note in report["report_notes"])
+
+
+def test_annual_customer_report_identifies_missing_months(conn, monkeypatch: pytest.MonkeyPatch) -> None:
+    asset_id = _insert_customer_asset(conn, "Central Anual")
+    _insert_customer_record(conn, asset_id, "month", date(2026, 1, 1), 100, 60, 40, 180)
+    _insert_customer_record(conn, asset_id, "month", date(2026, 12, 1), 200, 150, 50, 260)
+    conn.commit()
+
+    report = build_local_customer_production_report(
+        conn,
+        asset_id=asset_id,
+        report_month="2026-01",
+        electricity_price=0.2,
+        sell_price=0.05,
+        period=period_from_form({"period_type": "annual", "report_year": "2026"}),
+    )
+
+    assert report["months_count"] == 12
+    assert report["production_kwh"] == 300
+    assert report["months_with_data"] == ["2026-01", "2026-12"]
+    assert report["missing_months"] == [
+        "2026-02",
+        "2026-03",
+        "2026-04",
+        "2026-05",
+        "2026-06",
+        "2026-07",
+        "2026-08",
+        "2026-09",
+        "2026-10",
+        "2026-11",
+    ]
+    assert report["coverage_pct"] == pytest.approx(16.67)
+
+
+def test_quarterly_customer_report_fetches_only_missing_month_from_api(conn, monkeypatch: pytest.MonkeyPatch) -> None:
+    asset_id = _insert_customer_asset(conn, "Central Fallback")
+    _insert_customer_record(conn, asset_id, "month", date(2026, 1, 1), 100, 70, 30, 180)
+    _insert_customer_record(conn, asset_id, "day", date(2026, 2, 1), 20, 15, 5, 30)
+    _insert_customer_record(conn, asset_id, "day", date(2026, 2, 2), 30, 20, 10, 40)
+    conn.execute(
+        """
+        INSERT INTO integration_configs (
+            provider, enabled, base_url, username, password,
+            day_kpi_endpoint, month_kpi_endpoint, created_at, updated_at
+        )
+        VALUES ('FusionSolar', 1, 'https://example.test', 'u', 'p', '/day', '/month', '2026-01-01T00:00:00', '2026-01-01T00:00:00')
+        """
+    )
+    conn.commit()
+    fetched_months: list[date] = []
+
+    monkeypatch.setattr("app.get_fusionsolar_session", lambda _config: (object(), {}))
+    monkeypatch.setattr(
+        "app.get_fusionsolar_endpoint_config",
+        lambda _config: {"base_url": "https://example.test", "day_kpi_endpoint": "/day", "month_kpi_endpoint": "/month"},
+    )
+    monkeypatch.setattr("app.fetch_fusionsolar_kpi_day_rows", lambda *_args, **kwargs: [])
+
+    def fake_month_map(*_args, **kwargs):
+        collect_date = kwargs["collect_date"]
+        fetched_months.append(collect_date)
+        if collect_date == date(2026, 3, 1):
+            return {
+                "S1": {
+                    "stationCode": "S1",
+                    "dataItemMap": {
+                        "PVYield": "90",
+                        "selfUsePower": "50",
+                        "ongrid_power": "40",
+                        "use_power": "120",
+                    },
+                }
+            }
+        return {}
+
+    monkeypatch.setattr("app.fetch_fusionsolar_kpi_month_map", fake_month_map)
+
+    report = build_fusionsolar_customer_production_report(
+        conn,
+        asset_id=asset_id,
+        report_month="2026-01",
+        electricity_price=0.2,
+        sell_price=0.05,
+        period=period_from_form({"period_type": "quarterly", "report_year": "2026", "report_quarter": "1"}),
+    )
+
+    assert fetched_months == [date(2026, 3, 1)]
+    assert report["production_kwh"] == 240
+    assert report["self_use_kwh"] == 155
+    assert report["export_kwh"] == 85
+    assert report["months_with_data"] == ["2026-01", "2026-02", "2026-03"]
+    assert report["missing_months"] == []
+    assert report["coverage_pct"] == 100
 
 
 def test_deviation_classification_with_thresholds() -> None:
