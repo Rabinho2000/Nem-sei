@@ -57,7 +57,7 @@ class EnergyBreakdown:
 class BillingConfig:
     report_type: ReportType
     billing_mode: BillingMode = BillingMode.ENERGY
-    billing_energy_base: BillingEnergyBase = BillingEnergyBase.TOTAL_PRODUCTION
+    billing_energy_base: BillingEnergyBase = BillingEnergyBase.SELF_CONSUMPTION
     solcor_price_per_kwh: Decimal = Decimal("0")
     fixed_monthly_fee_eur: Decimal = Decimal("0")
     electricity_price_eur_kwh: Decimal = Decimal("0")
@@ -66,14 +66,31 @@ class BillingConfig:
 
 @dataclass(frozen=True)
 class BillingResult:
+    production_kwh: Decimal
+    self_use_kwh: Decimal
+    export_kwh: Decimal
+    consumption_kwh: Decimal
+    billable_energy_kwh: Decimal
+    grid_import_kwh: Decimal
+    exported_energy_kwh: Decimal
     savings_eur: Decimal
     export_revenue_eur: Decimal
-    total_benefit_eur: Decimal
+    gross_benefit_eur: Decimal
     solcor_payment_eur: Decimal
     net_benefit_eur: Decimal
     autoconsumption_pct: Decimal
     export_pct: Decimal
     self_sufficiency_pct: Decimal
+    billing_mode: BillingMode
+    billing_energy_base: BillingEnergyBase
+    solcor_price_per_kwh: Decimal
+    fixed_monthly_fee_eur: Decimal
+    months_count: int
+    warnings: tuple[str, ...] = ()
+
+    @property
+    def total_benefit_eur(self) -> Decimal:
+        return self.gross_benefit_eur
 
 
 @dataclass(frozen=True)

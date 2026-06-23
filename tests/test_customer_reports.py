@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+from decimal import Decimal
 
 from monitoring_board.customer_reports import (
     REPORT_TYPES,
@@ -8,6 +9,7 @@ from monitoring_board.customer_reports import (
     detect_report_type,
     prepare_customer_report,
 )
+from monitoring_board.reporting.models import BillingConfig, BillingEnergyBase, ReportType
 
 
 def sample_report(contract_type: str | None) -> dict:
@@ -57,8 +59,9 @@ def test_prepare_esco_report_calculates_payment_and_net_benefit() -> None:
     assert report["savings_eur"] == 16
     assert report["export_revenue_eur"] == 1
     assert report["total_benefit_eur"] == 17
-    assert report["solcor_payment_eur"] == 9
-    assert report["net_benefit_eur"] == 8
+    assert report["billable_energy_kwh"] == 80
+    assert report["solcor_payment_eur"] == 7.2
+    assert report["net_benefit_eur"] == 9.8
     assert report["autoconsumption_pct"] == 80
     assert report["self_sufficiency_pct"] == 40
     assert any(label == "Pagamento à Solcor" for label, *_ in REPORT_TYPES["esco"]["summary"])
@@ -72,6 +75,22 @@ def test_prepare_epc_report_ignores_solcor_price_and_internal_rows() -> None:
     assert report["net_benefit_eur"] == report["total_benefit_eur"]
     assert all("Solcor" not in label for label, *_ in REPORT_TYPES["epc"]["summary"])
     assert all("Líquido" not in label for label, *_ in REPORT_TYPES["epc"]["summary"])
+
+
+def test_prepare_esco_report_can_charge_total_production() -> None:
+    report = prepare_customer_report(
+        sample_report("ESCO"),
+        billing_config=BillingConfig(
+            report_type=ReportType.ESCO,
+            billing_energy_base=BillingEnergyBase.TOTAL_PRODUCTION,
+            solcor_price_per_kwh=Decimal("0.09"),
+            electricity_price_eur_kwh=Decimal("0.20"),
+            export_price_eur_kwh=Decimal("0.05"),
+        ),
+    )
+
+    assert report["billable_energy_kwh"] == 100
+    assert report["solcor_payment_eur"] == 9
 
 
 def test_prepare_report_infers_self_use_and_handles_missing_secondary_metrics() -> None:

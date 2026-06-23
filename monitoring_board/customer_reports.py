@@ -5,7 +5,6 @@ import logging
 import re
 import unicodedata
 from datetime import date
-from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -112,7 +111,13 @@ def _number(value: Any) -> float:
     return decimal_to_float(decimal_from_value(value))
 
 
-def prepare_customer_report(report: dict[str, Any], *, solcor_price_per_kwh: float = 0.0) -> dict[str, Any]:
+def prepare_customer_report(
+    report: dict[str, Any],
+    *,
+    solcor_price_per_kwh: float = 0.0,
+    billing_config: BillingConfig | None = None,
+    months_count: int = 1,
+) -> dict[str, Any]:
     prepared = dict(report)
     prepared["asset"] = dict(report.get("asset") or {})
     prepared["report_type"] = detect_report_type(prepared["asset"])
@@ -128,7 +133,23 @@ def prepare_customer_report(report: dict[str, Any], *, solcor_price_per_kwh: flo
     if production_decimal and not self_use_decimal and export_decimal < production_decimal:
         self_use_decimal = production_decimal - export_decimal
     consumption_decimal = decimal_from_value(report.get("consumption_kwh"))
-    solcor_price_decimal = decimal_from_value(solcor_price_per_kwh)
+    fallback_solcor_price = decimal_from_value(solcor_price_per_kwh)
+    config = billing_config or BillingConfig(
+        report_type=ReportType(prepared["report_type"]),
+        solcor_price_per_kwh=fallback_solcor_price,
+        electricity_price_eur_kwh=decimal_from_value(report.get("electricity_price")),
+        export_price_eur_kwh=decimal_from_value(report.get("sell_price")),
+    )
+    if config.report_type != ReportType(prepared["report_type"]):
+        config = BillingConfig(
+            report_type=ReportType(prepared["report_type"]),
+            billing_mode=config.billing_mode,
+            billing_energy_base=config.billing_energy_base,
+            solcor_price_per_kwh=config.solcor_price_per_kwh,
+            fixed_monthly_fee_eur=config.fixed_monthly_fee_eur,
+            electricity_price_eur_kwh=config.electricity_price_eur_kwh,
+            export_price_eur_kwh=config.export_price_eur_kwh,
+        )
     billing = calculate_customer_billing(
         EnergyBreakdown(
             production_kwh=production_decimal,
@@ -136,12 +157,8 @@ def prepare_customer_report(report: dict[str, Any], *, solcor_price_per_kwh: flo
             export_kwh=export_decimal,
             consumption_kwh=consumption_decimal,
         ),
-        BillingConfig(
-            report_type=ReportType(prepared["report_type"]),
-            solcor_price_per_kwh=solcor_price_decimal,
-            electricity_price_eur_kwh=decimal_from_value(report.get("electricity_price")),
-            export_price_eur_kwh=decimal_from_value(report.get("sell_price")),
-        ),
+        config,
+        months_count=months_count,
     )
 
     prepared.update(
@@ -152,16 +169,33 @@ def prepare_customer_report(report: dict[str, Any], *, solcor_price_per_kwh: flo
         savings_eur=decimal_to_float(billing.savings_eur),
         export_revenue_eur=decimal_to_float(billing.export_revenue_eur),
         total_benefit_eur=decimal_to_float(billing.total_benefit_eur),
-        solcor_price_per_kwh=decimal_to_float(solcor_price_decimal),
+        gross_benefit_eur=decimal_to_float(billing.gross_benefit_eur),
+        solcor_price_per_kwh=decimal_to_float(billing.solcor_price_per_kwh),
+        fixed_monthly_fee_eur=decimal_to_float(billing.fixed_monthly_fee_eur),
         solcor_payment_eur=decimal_to_float(billing.solcor_payment_eur),
         net_benefit_eur=decimal_to_float(billing.net_benefit_eur),
+        billable_energy_kwh=decimal_to_float(billing.billable_energy_kwh),
+        grid_import_kwh=decimal_to_float(billing.grid_import_kwh),
+        exported_energy_kwh=decimal_to_float(billing.exported_energy_kwh),
+        billing_mode=billing.billing_mode.value,
+        billing_energy_base=billing.billing_energy_base.value,
+        months_count=billing.months_count,
+        billing_warnings=list(billing.warnings),
         autoconsumption_pct=decimal_to_float(billing.autoconsumption_pct),
         export_pct=decimal_to_float(billing.export_pct),
         self_sufficiency_pct=decimal_to_float(billing.self_sufficiency_pct),
     )
     prepared["report_notes"] = list(report.get("report_notes") or [])
-    if prepared["report_type"] == "esco" and solcor_price_decimal == Decimal("0"):
-        prepared["report_notes"].append("Preço Solcor não indicado; pagamento calculado a 0 EUR/kWh.")
+    warning_messages = {
+        "missing_solcor_price": "Preço Solcor não indicado; pagamento calculado a 0 EUR/kWh.",
+        "missing_fixed_monthly_fee": "Mensalidade Solcor não indicada; pagamento calculado a 0 EUR.",
+        "missing_electricity_price": "Preço de eletricidade não indicado; poupança calculada a 0 EUR/kWh.",
+        "missing_export_price": "Preço de venda do excedente não indicado; receita calculada a 0 EUR/kWh.",
+    }
+    for warning in billing.warnings:
+        message = warning_messages.get(warning)
+        if message:
+            prepared["report_notes"].append(message)
     prepared["tariff_rows"] = [
         ("Cheia", _number(report.get("self_use_cheia_kwh")), NAVY),
         ("Ponta", _number(report.get("self_use_ponta_kwh")), ORANGE),

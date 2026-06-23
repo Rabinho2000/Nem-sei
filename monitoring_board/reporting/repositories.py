@@ -1,10 +1,117 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 from monitoring_board.db import query_all
+from monitoring_board.reporting.billing import decimal_from_value
+from monitoring_board.reporting.models import BillingConfig, BillingEnergyBase, BillingMode, ReportType
+
+
+def ensure_billing_config_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS asset_billing_configs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset_id INTEGER NOT NULL UNIQUE,
+            billing_mode TEXT NOT NULL DEFAULT 'energy',
+            billing_energy_base TEXT NOT NULL DEFAULT 'self_consumption',
+            solcor_price_per_kwh TEXT NOT NULL DEFAULT '0',
+            fixed_monthly_fee_eur TEXT NOT NULL DEFAULT '0',
+            default_electricity_price TEXT NOT NULL DEFAULT '0',
+            default_export_price TEXT NOT NULL DEFAULT '0',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE
+        )
+        """
+    )
+
+
+def default_billing_config(report_type: ReportType) -> BillingConfig:
+    return BillingConfig(report_type=report_type)
+
+
+def row_to_billing_config(row: sqlite3.Row | dict[str, Any] | None, report_type: ReportType) -> BillingConfig:
+    if row is None:
+        return default_billing_config(report_type)
+    try:
+        billing_mode = BillingMode(str(row["billing_mode"] or BillingMode.ENERGY.value))
+    except ValueError:
+        billing_mode = BillingMode.ENERGY
+    try:
+        billing_energy_base = BillingEnergyBase(str(row["billing_energy_base"] or BillingEnergyBase.SELF_CONSUMPTION.value))
+    except ValueError:
+        billing_energy_base = BillingEnergyBase.SELF_CONSUMPTION
+    return BillingConfig(
+        report_type=report_type,
+        billing_mode=billing_mode,
+        billing_energy_base=billing_energy_base,
+        solcor_price_per_kwh=decimal_from_value(row["solcor_price_per_kwh"]),
+        fixed_monthly_fee_eur=decimal_from_value(row["fixed_monthly_fee_eur"]),
+        electricity_price_eur_kwh=decimal_from_value(row["default_electricity_price"]),
+        export_price_eur_kwh=decimal_from_value(row["default_export_price"]),
+    )
+
+
+def get_asset_billing_config_row(conn: sqlite3.Connection, asset_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM asset_billing_configs WHERE asset_id = ?",
+        (asset_id,),
+    ).fetchone()
+
+
+def get_asset_billing_config(conn: sqlite3.Connection, asset_id: int, report_type: ReportType) -> BillingConfig:
+    return row_to_billing_config(get_asset_billing_config_row(conn, asset_id), report_type)
+
+
+def upsert_asset_billing_config(
+    conn: sqlite3.Connection,
+    *,
+    asset_id: int,
+    config: BillingConfig,
+) -> None:
+    now = datetime.now().isoformat(timespec="seconds")
+    conn.execute(
+        """
+        INSERT INTO asset_billing_configs (
+            asset_id, billing_mode, billing_energy_base, solcor_price_per_kwh,
+            fixed_monthly_fee_eur, default_electricity_price, default_export_price,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(asset_id) DO UPDATE SET
+            billing_mode = excluded.billing_mode,
+            billing_energy_base = excluded.billing_energy_base,
+            solcor_price_per_kwh = excluded.solcor_price_per_kwh,
+            fixed_monthly_fee_eur = excluded.fixed_monthly_fee_eur,
+            default_electricity_price = excluded.default_electricity_price,
+            default_export_price = excluded.default_export_price,
+            updated_at = excluded.updated_at
+        """,
+        (
+            asset_id,
+            config.billing_mode.value,
+            config.billing_energy_base.value,
+            str(config.solcor_price_per_kwh),
+            str(config.fixed_monthly_fee_eur),
+            str(config.electricity_price_eur_kwh),
+            str(config.export_price_eur_kwh),
+            now,
+            now,
+        ),
+    )
+
+
+def billing_config_to_form_values(config: BillingConfig) -> dict[str, str]:
+    return {
+        "billing_mode": config.billing_mode.value,
+        "billing_energy_base": config.billing_energy_base.value,
+        "solcor_price_per_kwh": str(config.solcor_price_per_kwh),
+        "fixed_monthly_fee_eur": str(config.fixed_monthly_fee_eur),
+        "electricity_price": str(config.electricity_price_eur_kwh),
+        "sell_price": str(config.export_price_eur_kwh),
+    }
 
 
 def list_portfolio_groups(conn: sqlite3.Connection) -> list[sqlite3.Row]:
