@@ -81,6 +81,7 @@ from monitoring_board.portfolio_repository import (
     ensure_portfolio_management_schema,
     export_configuration_workbook,
     get_import_run,
+    import_preview_from_json,
     get_portfolio,
     list_aliases as portfolio_list_aliases,
     list_available_assets as portfolio_list_available_assets,
@@ -91,6 +92,7 @@ from monitoring_board.portfolio_repository import (
     rebuild_asset_alias_blob as portfolio_rebuild_asset_alias_blob,
     remove_members,
     reorder_members,
+    suggest_mapping as portfolio_suggest_mapping,
     toggle_alias,
     unmap_member,
     update_alias as portfolio_update_alias,
@@ -2643,12 +2645,26 @@ def create_app() -> Flask:
         selected_portfolio_id = int(request.args.get("portfolio_id", groups[0]["id"] if groups else 0) or 0)
         selected = get_portfolio(g.db, selected_portfolio_id) if selected_portfolio_id else None
         search = request.args.get("search", "").strip()
+        asset_filter = request.args.get("asset_filter", "available").strip()
+        alias_search = request.args.get("alias_search", "").strip()
+        alias_filter = request.args.get("alias_filter", "all").strip()
         members = list_portfolio_members(g.db, selected_portfolio_id) if selected else []
-        assets = portfolio_list_available_assets(g.db, portfolio_id=selected_portfolio_id or None, search=search)
-        aliases = portfolio_list_aliases(g.db)
+        assets = portfolio_list_available_assets(g.db, portfolio_id=selected_portfolio_id or None, search=search, asset_filter=asset_filter)
+        aliases = portfolio_list_aliases(g.db, include_inactive=alias_filter != "active")
+        if alias_search:
+            alias_search_lower = alias_search.lower()
+            aliases = [alias for alias in aliases if alias_search_lower in str(alias["alias_name"] or "").lower() or alias_search_lower in str(alias["project_name"] or "").lower()]
+        if alias_filter == "inactive":
+            aliases = [alias for alias in aliases if not alias["active"]]
         conflicts = detect_portfolio_conflicts(g.db, selected_portfolio_id or None)
         import_id = int(request.args.get("import_id", "0") or 0)
         import_run = get_import_run(g.db, import_id) if import_id else None
+        import_preview = import_preview_from_json(import_run["preview_json"] or "{}") if import_run else None
+        mapping_decisions = {
+            int(member["id"]): portfolio_suggest_mapping(g.db, external_name=member["external_name"] or "", nif=member["nif"] or "")
+            for member in members
+            if not member["asset_id"] or member["mapping_status"] in {"mapping_pending", "mapping_conflict", "mapping_suggested"}
+        }
         return render_template(
             "portfolio_manager.html",
             title="Gestor de portfolios",
@@ -2660,7 +2676,12 @@ def create_app() -> Flask:
             aliases=aliases,
             conflicts=conflicts,
             search=search,
+            asset_filter=asset_filter,
+            alias_search=alias_search,
+            alias_filter=alias_filter,
             import_run=import_run,
+            import_preview=import_preview,
+            mapping_decisions=mapping_decisions,
         )
 
     @app.route("/portfolio-manager/create", methods=["POST"])
@@ -2962,7 +2983,13 @@ def create_app() -> Flask:
     def portfolio_manager_import_apply(import_id: int):
         try:
             run = get_import_run(g.db, import_id)
-            apply_import_run(g.db, import_id)
+            selected_rows = _form_int_list("row_numbers")
+            overrides = {
+                int(key.removeprefix("asset_override_")): int(value)
+                for key, value in request.form.items()
+                if key.startswith("asset_override_") and str(value).isdigit()
+            }
+            apply_import_run(g.db, import_id, selected_rows=selected_rows or None, asset_overrides=overrides)
             g.db.commit()
             flash("Importacao aplicada.", "success")
             return redirect(url_for("portfolio_manager", portfolio_id=run["portfolio_id"] if run else 0))

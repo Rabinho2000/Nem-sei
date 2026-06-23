@@ -214,19 +214,52 @@ def list_portfolio_members(conn: sqlite3.Connection, portfolio_id: int) -> list[
     )
 
 
-def list_available_assets(conn: sqlite3.Connection, *, portfolio_id: int | None = None, search: str = "") -> list[sqlite3.Row]:
+def list_available_assets(conn: sqlite3.Connection, *, portfolio_id: int | None = None, search: str = "", asset_filter: str = "available") -> list[sqlite3.Row]:
     params: list[Any] = []
     where: list[str] = []
     if search:
         like = f"%{search.strip()}%"
         where.append("(a.project_name LIKE ? OR COALESCE(a.nif, '') LIKE ? OR COALESCE(a.alias_blob, '') LIKE ?)")
         params.extend([like, like, like])
+    if portfolio_id and asset_filter == "available":
+        where.append(
+            """
+            NOT EXISTS (
+                SELECT 1 FROM portfolio_assets current_pa
+                WHERE current_pa.portfolio_id = ? AND current_pa.asset_id = a.id AND current_pa.active = 1
+            )
+            """
+        )
+        params.append(portfolio_id)
+    elif portfolio_id and asset_filter == "in_current":
+        where.append(
+            """
+            EXISTS (
+                SELECT 1 FROM portfolio_assets current_pa
+                WHERE current_pa.portfolio_id = ? AND current_pa.asset_id = a.id AND current_pa.active = 1
+            )
+            """
+        )
+        params.append(portfolio_id)
+    elif asset_filter == "without_portfolio":
+        where.append("NOT EXISTS (SELECT 1 FROM portfolio_assets any_pa WHERE any_pa.asset_id = a.id AND any_pa.active = 1)")
+    elif portfolio_id and asset_filter == "other_portfolio":
+        where.append("EXISTS (SELECT 1 FROM portfolio_assets other_pa WHERE other_pa.asset_id = a.id AND other_pa.active = 1 AND other_pa.portfolio_id != ?)")
+        params.append(portfolio_id)
+    elif asset_filter == "inactive":
+        where.append("COALESCE(a.active_contract, '') NOT IN ('yes', 'Sim', 'sim', 'active')")
+    elif asset_filter == "mapping_pending":
+        where.append("EXISTS (SELECT 1 FROM portfolio_assets pending_pa WHERE pending_pa.asset_id = a.id AND pending_pa.mapping_status = 'mapping_pending')")
+    elif asset_filter == "conflict":
+        where.append("EXISTS (SELECT 1 FROM portfolio_assets conflict_pa WHERE conflict_pa.asset_id = a.id AND conflict_pa.mapping_status = 'mapping_conflict')")
     sql = """
         SELECT a.id, a.project_name, a.nif, a.active_contract, a.alias_blob,
-               GROUP_CONCAT(pg.name, ', ') AS portfolios
+               GROUP_CONCAT(DISTINCT pg.name) AS portfolios,
+               GROUP_CONCAT(DISTINCT ai.provider || ':' || ai.external_name) AS integrations
         FROM assets a
         LEFT JOIN portfolio_assets pa ON pa.asset_id = a.id AND pa.active = 1
         LEFT JOIN portfolio_groups pg ON pg.id = pa.portfolio_id
+        LEFT JOIN asset_integrations ai ON ai.asset_id = a.id AND ai.enabled = 1
     """
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -578,6 +611,22 @@ def parse_import_file(filename: str, data: bytes) -> list[dict[str, Any]]:
         return [dict(row) for row in csv.DictReader(io.StringIO(text))]
     if suffix == ".xlsx":
         workbook = load_workbook(io.BytesIO(data), read_only=True, data_only=True, keep_vba=False)
+        if {"Portfolios", "Membros", "Aliases"} & set(workbook.sheetnames):
+            parsed = []
+            for sheet_name in ("Portfolios", "Membros", "Aliases"):
+                if sheet_name not in workbook.sheetnames:
+                    continue
+                sheet = workbook[sheet_name]
+                rows = list(sheet.iter_rows(values_only=True))
+                if not rows:
+                    continue
+                headers = [str(value or "").strip() for value in rows[0]]
+                for row in rows[1:]:
+                    item = {headers[index]: row[index] if index < len(row) else "" for index in range(len(headers))}
+                    item["__sheet"] = sheet_name
+                    parsed.append(item)
+            workbook.close()
+            return parsed
         sheet = workbook.active
         rows = list(sheet.iter_rows(values_only=True))
         workbook.close()
@@ -594,18 +643,66 @@ def parse_import_file(filename: str, data: bytes) -> list[dict[str, Any]]:
 def create_import_preview(conn: sqlite3.Connection, *, portfolio_id: int | None, original_filename: str, data: bytes) -> int:
     raw_rows = parse_import_file(original_filename, data)
     rows: list[PortfolioImportRow] = []
+    seen_members: set[tuple[str, str, str]] = set()
     for index, raw in enumerate(raw_rows, start=2):
         normalized = _normalize_import_headers(raw)
         errors: list[str] = []
+        warnings: list[str] = []
+        sheet = str(raw.get("__sheet") or "")
         portfolio = str(normalized.get("portfolio") or "").strip()
         if not portfolio and portfolio_id is None:
             errors.append("missing_portfolio")
         external_name = str(normalized.get("external_name") or normalized.get("asset_name") or "").strip()
         asset_id = _int_or_none(normalized.get("asset_id"))
+        if asset_id is not None and conn.execute("SELECT 1 FROM assets WHERE id = ?", (asset_id,)).fetchone() is None:
+            errors.append("asset_not_found")
+        if not any(str(value or "").strip() for key, value in raw.items() if key != "__sheet"):
+            errors.append("empty_row")
+        active_raw = normalized.get("active")
+        if active_raw not in (None, "") and str(active_raw).strip().lower() not in {"1", "0", "true", "false", "yes", "no", "sim", "nao", "não", "ativo", "inativo", "active", "inactive"}:
+            errors.append("invalid_active")
+        if asset_id is not None and normalized.get("nif"):
+            asset = conn.execute("SELECT nif FROM assets WHERE id = ?", (asset_id,)).fetchone()
+            if asset and normalize_nif(asset["nif"]) and normalize_nif(asset["nif"]) != normalize_nif(normalized.get("nif")):
+                errors.append("nif_mismatch")
+        key = (portfolio, str(normalized.get("sub_account") or "").strip(), str(asset_id or ""))
+        if key in seen_members and (key[1] or key[2]):
+            errors.append("duplicate_import_member")
+        seen_members.add(key)
+        if portfolio:
+            existing_portfolio = conn.execute("SELECT id FROM portfolio_groups WHERE name = ?", (portfolio,)).fetchone()
+            effective_portfolio_id = int(existing_portfolio["id"]) if existing_portfolio else portfolio_id
+            if effective_portfolio_id and normalized.get("sub_account"):
+                duplicate_sub = conn.execute(
+                    "SELECT 1 FROM portfolio_assets WHERE portfolio_id = ? AND sub_account = ? LIMIT 1",
+                    (effective_portfolio_id, str(normalized.get("sub_account") or "").strip()),
+                ).fetchone()
+                if duplicate_sub and sheet != "Membros":
+                    warnings.append("sub_account_exists")
+            if effective_portfolio_id and asset_id:
+                duplicate_member = conn.execute("SELECT 1 FROM portfolio_assets WHERE portfolio_id = ? AND asset_id = ? LIMIT 1", (effective_portfolio_id, asset_id)).fetchone()
+                if duplicate_member:
+                    warnings.append("member_exists")
+        alias_name = str(normalized.get("alias") or raw.get("alias") or "").strip()
+        if sheet == "Aliases":
+            alias_name = str(raw.get("alias") or raw.get("Alias") or "").strip()
+            asset_id = _int_or_none(raw.get("asset_id"))
+            portfolio = portfolio or "_aliases"
+            external_name = str(raw.get("asset_name") or "").strip()
+        if alias_name:
+            normalized_alias = normalize_name(alias_name)
+            conflict = conn.execute("SELECT asset_id FROM asset_aliases WHERE normalized_alias = ?", (normalized_alias,)).fetchone()
+            if conflict and asset_id and int(conflict["asset_id"]) != asset_id:
+                errors.append("alias_conflict")
         decision = suggest_mapping(conn, external_name=external_name or str(normalized.get("asset_name") or ""), nif=str(normalized.get("nif") or ""))
         if asset_id is not None:
             decision = MappingDecision(asset_id, "manual", 1.0, "strong", "mapped", (), auto_mappable=False)
-        action = "error" if errors else ("conflict" if decision.status == "mapping_conflict" else ("new_member" if external_name or asset_id else "no_change"))
+        if sheet == "Portfolios":
+            action = "portfolio"
+        elif sheet == "Aliases":
+            action = "alias"
+        else:
+            action = "error" if errors else ("conflict" if decision.status == "mapping_conflict" else ("new_member" if external_name or asset_id else "no_change"))
         rows.append(
             PortfolioImportRow(
                 row_number=index,
@@ -615,12 +712,12 @@ def create_import_preview(conn: sqlite3.Connection, *, portfolio_id: int | None,
                 nif=normalize_nif(normalized.get("nif")),
                 asset_name=str(normalized.get("asset_name") or "").strip(),
                 asset_id=asset_id or decision.asset_id,
-                alias=str(normalized.get("alias") or "").strip(),
+                alias=alias_name,
                 notes=str(normalized.get("notes") or "").strip(),
                 active=_bool_value(normalized.get("active"), default=True),
                 action=action,
                 errors=tuple(errors),
-                warnings=decision.warnings,
+                warnings=tuple(sorted({*warnings, *decision.warnings})),
                 decision=decision,
             )
         )
@@ -647,36 +744,63 @@ def get_import_run(conn: sqlite3.Connection, import_id: int) -> sqlite3.Row | No
     return conn.execute("SELECT * FROM portfolio_import_runs WHERE id = ?", (import_id,)).fetchone()
 
 
-def apply_import_run(conn: sqlite3.Connection, import_id: int) -> None:
+def apply_import_run(conn: sqlite3.Connection, import_id: int, *, selected_rows: list[int] | None = None, asset_overrides: dict[int, int] | None = None) -> None:
     run = get_import_run(conn, import_id)
     if run is None:
         raise ValueError("import_not_found")
     if run["status"] == "applied":
         raise ValueError("import_already_applied")
     preview = import_preview_from_json(run["preview_json"] or "{}")
-    for row in preview.rows:
+    selected = set(selected_rows or [row.row_number for row in preview.rows])
+    overrides = asset_overrides or {}
+    selected_preview_rows = [row for row in preview.rows if row.row_number in selected]
+    for row in selected_preview_rows:
         if row.errors or row.action == "conflict":
             raise ValueError("import_has_errors_or_conflicts")
-    for row in preview.rows:
+    for row in selected_preview_rows:
+        row_asset_id = overrides.get(row.row_number, row.asset_id)
         portfolio_id = int(run["portfolio_id"] or 0)
         if not portfolio_id:
             portfolio = conn.execute("SELECT id FROM portfolio_groups WHERE name = ?", (row.portfolio,)).fetchone()
             portfolio_id = int(portfolio["id"]) if portfolio else create_portfolio(conn, name=row.portfolio)
-        member_id = add_member(
-            conn,
-            portfolio_id=portfolio_id,
-            asset_id=row.asset_id,
-            external_name=row.external_name or row.asset_name,
-            nif=row.nif,
-            sub_account=row.sub_account,
-            notes=row.notes,
-            mapping_method="manual" if row.asset_id else "unmapped",
-            confidence=1.0 if row.asset_id else 0.0,
-        )
-        if row.alias and row.asset_id:
-            upsert_alias(conn, asset_id=row.asset_id, alias_name=row.alias, source="portfolio_import", notes="Criado por importacao de portfolio")
-            rebuild_asset_alias_blob(conn, row.asset_id)
-        record_mapping_event(conn, portfolio_asset_id=member_id, external_name=row.external_name, previous_asset_id=None, selected_asset_id=row.asset_id, method="portfolio_import", confidence=1.0 if row.asset_id else 0.0, alias_created=bool(row.alias and row.asset_id))
+        if row.action == "portfolio":
+            update_portfolio(conn, portfolio_id=portfolio_id, name=row.portfolio, description="", notes=row.notes)
+            continue
+        if row.action == "alias":
+            if row_asset_id is None:
+                raise ValueError("alias_without_asset")
+            upsert_alias(conn, asset_id=row_asset_id, alias_name=row.alias, source="portfolio_import", notes=row.notes)
+            rebuild_asset_alias_blob(conn, row_asset_id)
+            continue
+        existing = conn.execute("SELECT id FROM portfolio_assets WHERE portfolio_id = ? AND asset_id = ? AND ? IS NOT NULL", (portfolio_id, row_asset_id, row_asset_id)).fetchone()
+        if existing:
+            portfolio_asset_id = int(existing["id"])
+            conn.execute(
+                """
+                UPDATE portfolio_assets
+                SET external_name = ?, nif = ?, sub_account = ?, active = ?, notes = ?,
+                    mapping_status = ?, mapping_method = ?, mapping_confidence = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (row.external_name or row.asset_name, row.nif, row.sub_account, 1 if row.active else 0, row.notes, "manual" if row_asset_id else "mapping_pending", "manual" if row_asset_id else "unmapped", 1.0 if row_asset_id else 0.0, now_text(), portfolio_asset_id),
+            )
+            member_id = portfolio_asset_id
+        else:
+            member_id = add_member(
+                conn,
+                portfolio_id=portfolio_id,
+                asset_id=row_asset_id,
+                external_name=row.external_name or row.asset_name,
+                nif=row.nif,
+                sub_account=row.sub_account,
+                notes=row.notes,
+                mapping_method="manual" if row_asset_id else "unmapped",
+                confidence=1.0 if row_asset_id else 0.0,
+            )
+        if row.alias and row_asset_id:
+            upsert_alias(conn, asset_id=row_asset_id, alias_name=row.alias, source="portfolio_import", notes="Criado por importacao de portfolio")
+            rebuild_asset_alias_blob(conn, row_asset_id)
+        record_mapping_event(conn, portfolio_asset_id=member_id, external_name=row.external_name, previous_asset_id=None, selected_asset_id=row_asset_id, method="portfolio_import", confidence=1.0 if row_asset_id else 0.0, alias_created=bool(row.alias and row_asset_id))
     conn.execute("UPDATE portfolio_import_runs SET status = 'applied', applied_at = ? WHERE id = ?", (now_text(), import_id))
 
 
@@ -737,6 +861,10 @@ def import_preview_to_json(preview: PortfolioImportPreview) -> str:
                 "action": row.action,
                 "errors": list(row.errors),
                 "warnings": list(row.warnings),
+                "candidate_asset_id": row.decision.asset_id if row.decision else None,
+                "candidate_method": row.decision.method if row.decision else "",
+                "candidate_score": row.decision.score if row.decision else 0,
+                "candidate_confidence": row.decision.confidence if row.decision else "",
             }
         )
     return json.dumps({"rows": rows}, ensure_ascii=True)

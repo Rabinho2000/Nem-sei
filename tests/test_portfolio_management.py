@@ -139,6 +139,38 @@ def test_portfolio_crud_members_order_copy_move_and_delete_rules(tmp_path: Path)
         raise AssertionError("expected delete block")
 
 
+def test_available_asset_filters_and_backend_rejects_manipulated_ids(tmp_path: Path) -> None:
+    conn = connect(tmp_path)
+    asset_a = add_asset(conn, "Filtro A")
+    asset_b = add_asset(conn, "Filtro B")
+    source = repo.create_portfolio(conn, name="Filtro Origem")
+    target = repo.create_portfolio(conn, name="Filtro Destino")
+    member_a = repo.add_member(conn, portfolio_id=source, asset_id=asset_a)
+    repo.add_member(conn, portfolio_id=target, asset_id=asset_b)
+
+    available = repo.list_available_assets(conn, portfolio_id=source, asset_filter="available")
+    in_current = repo.list_available_assets(conn, portfolio_id=source, asset_filter="in_current")
+    other = repo.list_available_assets(conn, portfolio_id=source, asset_filter="other_portfolio")
+
+    assert asset_a not in {row["id"] for row in available}
+    assert {row["id"] for row in in_current} == {asset_a}
+    assert asset_b in {row["id"] for row in other}
+
+    try:
+        repo.remove_members(conn, portfolio_id=target, member_ids=[member_a])
+    except ValueError as exc:
+        assert str(exc) == "member_not_found"
+    else:
+        raise AssertionError("expected cross-portfolio member rejection")
+
+    try:
+        repo.reorder_members(conn, portfolio_id=source, ordered_ids=[member_a, member_a])
+    except ValueError as exc:
+        assert str(exc) == "duplicate_ids"
+    else:
+        raise AssertionError("expected duplicate order rejection")
+
+
 def test_import_preview_apply_and_export_roundtrip(tmp_path: Path) -> None:
     conn = connect(tmp_path)
     asset_id = add_asset(conn, "Central Importada", "509999999")
@@ -159,6 +191,45 @@ def test_import_preview_apply_and_export_roundtrip(tmp_path: Path) -> None:
     loaded = load_workbook(output, read_only=True)
     assert {"Portfolios", "Membros", "Aliases", "Pendentes", "Conflitos"}.issubset(set(loaded.sheetnames))
     loaded.close()
+
+
+def test_import_preview_validates_and_applies_selected_rows(tmp_path: Path) -> None:
+    conn = connect(tmp_path)
+    asset_id = add_asset(conn, "Central Selectiva", "509999991")
+    other_asset = add_asset(conn, "Outra Central", "508888888")
+    portfolio_id = repo.create_portfolio(conn, name="Selecionado")
+    repo.add_member(conn, portfolio_id=portfolio_id, asset_id=other_asset, sub_account="001")
+    csv_data = (
+        "portfolio,sub_account,external_name,nif,asset_id,alias,active\n"
+        f"Selecionado,002,Central Selectiva,509999991,{asset_id},Alias Selectivo,1\n"
+        "Selecionado,001,Subconta Duplicada,,999999,,1\n"
+    ).encode()
+    import_id = repo.create_import_preview(conn, portfolio_id=portfolio_id, original_filename="preview.csv", data=csv_data)
+    preview = repo.import_preview_from_json(repo.get_import_run(conn, import_id)["preview_json"])
+
+    assert preview.rows_total == 2
+    assert preview.rows[1].errors == ("asset_not_found",)
+    repo.apply_import_run(conn, import_id, selected_rows=[preview.rows[0].row_number])
+    assert conn.execute("SELECT COUNT(*) FROM portfolio_assets WHERE portfolio_id = ?", (portfolio_id,)).fetchone()[0] == 2
+    assert conn.execute("SELECT source FROM asset_aliases WHERE alias_name = 'Alias Selectivo'").fetchone()[0] == "portfolio_import"
+
+
+def test_xlsx_multisheet_export_import_roundtrip(tmp_path: Path) -> None:
+    conn = connect(tmp_path)
+    asset_id = add_asset(conn, "Central Roundtrip", "507777777")
+    portfolio_id = repo.create_portfolio(conn, name="Roundtrip")
+    repo.add_member(conn, portfolio_id=portfolio_id, asset_id=asset_id, external_name="Central Roundtrip", sub_account="001")
+    repo.upsert_alias(conn, asset_id=asset_id, alias_name="Round Alias", source="manual")
+
+    workbook = repo.export_configuration_workbook(conn)
+    output = io.BytesIO()
+    workbook.save(output)
+    import_id = repo.create_import_preview(conn, portfolio_id=None, original_filename="roundtrip.xlsx", data=output.getvalue())
+    preview = repo.import_preview_from_json(repo.get_import_run(conn, import_id)["preview_json"])
+
+    assert any(row.action == "portfolio" for row in preview.rows)
+    assert any(row.action == "new_member" for row in preview.rows)
+    assert any(row.action == "alias" for row in preview.rows)
 
 
 def test_portfolio_manager_routes_and_existing_portfolios_page(tmp_path: Path) -> None:
@@ -206,6 +277,9 @@ def test_portfolio_manager_routes_and_existing_portfolios_page(tmp_path: Path) -
         assert import_response.status_code in {302, 303}
         with sqlite3.connect(db_path) as check:
             import_id = check.execute("SELECT id FROM portfolio_import_runs ORDER BY id DESC LIMIT 1").fetchone()[0]
+        preview_html = client.get(f"/portfolio-manager?portfolio_id={portfolio_id}&import_id={import_id}")
+        assert b"Aplicar linhas selecionadas" in preview_html.data
+        assert b"Rotas Import" in preview_html.data
         assert client.post(f"/portfolio-manager/import/{import_id}/apply", data={"csrf_token": "token"}).status_code in {302, 303}
         export = client.get("/portfolio-manager/export")
         assert export.status_code == 200
