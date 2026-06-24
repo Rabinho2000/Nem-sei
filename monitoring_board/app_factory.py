@@ -15,6 +15,7 @@ import sqlite3
 import threading
 import time
 import unicodedata
+import struct
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -130,6 +131,7 @@ from monitoring_board.report_template_repository import (
     save_template,
     set_default_template,
 )
+from monitoring_board.reporting_storage import reconcile_generated_reports
 from monitoring_board.reporting.portfolio import METRIC_CATALOG, profile_from_config, profile_to_config
 from monitoring_board.reporting.templates import default_template, template_from_config, template_to_config, validate_template_scope
 from monitoring_board.services.report_rendering import (
@@ -224,6 +226,8 @@ from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+
+LOGGER = logging.getLogger(__name__)
 
 build_runtime_paths = runtime_module.build_runtime_paths
 load_local_env = runtime_module.load_local_env
@@ -3666,13 +3670,26 @@ def create_app() -> Flask:
                     archive_report_template(g.db, template_id)
                     flash("Template arquivado.", "success")
                 elif action == "duplicate" and template_id:
+                    existing = get_template(g.db, template_id)
+                    if existing:
+                        validate_template_scope(existing, existing.report_type, portfolio_id=existing.portfolio_id, client_key=existing.client_key, allow_inactive=True)
                     duplicate_report_template(g.db, template_id, request.form.get("name", "").strip() or "Copia")
                     flash("Template duplicado.", "success")
                 elif action == "set_default" and template_id:
+                    existing = get_template(g.db, template_id)
+                    if existing:
+                        validate_template_scope(existing, existing.report_type, portfolio_id=existing.portfolio_id, client_key=existing.client_key)
                     set_default_template(g.db, template_id)
                     flash("Template default atualizado.", "success")
                 else:
                     base = get_template(g.db, template_id) if template_id else default_template("Portfolio executivo" if request.form.get("report_type") == "portfolio" else "Individual padrao", portfolio_id=portfolio_id)
+                    if base.id:
+                        validate_template_scope(base, base.report_type, portfolio_id=base.portfolio_id, client_key=base.client_key, allow_inactive=True)
+                    logo_path = base.branding.logo_path
+                    logo_file = request.files.get("logo")
+                    old_logo_path = logo_path
+                    if logo_file and logo_file.filename:
+                        logo_path = store_report_logo(logo_file, old_logo_path=old_logo_path)
                     config = template_to_config(base)
                     config.update(
                         name=request.form.get("name", "").strip() or base.name,
@@ -3690,6 +3707,9 @@ def create_app() -> Flask:
                             "primary_color": request.form.get("primary_color", base.branding.primary_color),
                             "secondary_color": request.form.get("secondary_color", base.branding.secondary_color),
                             "footer": request.form.get("footer", "").strip(),
+                            "contacts": request.form.get("contacts", "").strip(),
+                            "disclaimer": request.form.get("disclaimer", "").strip(),
+                            "logo_path": logo_path,
                         },
                     )
                     enabled_sections = set(request.form.getlist("section_key"))
@@ -3703,7 +3723,8 @@ def create_app() -> Flask:
                 g.db.commit()
             except Exception as exc:
                 g.db.rollback()
-                flash(f"Falha no template: {exc}", "error")
+                LOGGER.warning("report_template_action_failed action=%s template_id=%s error_code=%s", action, template_id, type(exc).__name__)
+                flash("Falha no template. Verifica os dados submetidos.", "error")
             return redirect(url_for("report_templates", template_id=template_id))
         templates = list_templates(g.db, include_inactive=True)
         selected_id = int(request.args.get("template_id", templates[0]["id"] if templates else 0) or 0)
@@ -3728,10 +3749,18 @@ def create_app() -> Flask:
                 template = get_template(g.db, template_id) if template_id else get_default_template(g.db, report_type, portfolio_id)
                 if template is None:
                     raise ValueError("Template invalido.")
-                validate_template_scope(template, report_type, portfolio_id=portfolio_id)
+                snapshot_result = None
+                if snapshot_id:
+                    snapshot_result = get_portfolio_snapshot_result(g.db, snapshot_id)
+                    if snapshot_result is None or (portfolio_id and snapshot_result.portfolio_id != portfolio_id):
+                        raise ValueError("Snapshot invalido.")
+                    portfolio_id = snapshot_result.portfolio_id
+                    reject_snapshot_period_overrides(request.form, snapshot_result)
+                client_key = resolve_generation_client_key(g.db, report_type, request.form, portfolio_id)
+                validate_template_scope(template, report_type, portfolio_id=portfolio_id, client_key=client_key)
                 if report_type == "portfolio" and not snapshot_id and not portfolio_id:
                     raise ValueError("Portfolio obrigatorio.")
-                jobs = build_generation_jobs(request.form, report_type, main_formats)
+                jobs = build_snapshot_generation_jobs(snapshot_result, main_formats) if snapshot_result else build_generation_jobs(request.form, report_type, main_formats)
                 if not jobs:
                     raise ValueError("Pedido sem outputs principais.")
                 if len(jobs) > MAX_TOTAL_OUTPUTS:
@@ -3750,6 +3779,7 @@ def create_app() -> Flask:
                     period_end=first_period["period_end"],
                     requested_count=len(jobs),
                 )
+                LOGGER.info("report_generation_run_created run_id=%s report_type=%s template_id=%s portfolio_id=%s snapshot_id=%s requested_count=%s", run_id, report_type, template.id, portfolio_id, snapshot_id, len(jobs))
                 g.db.commit()
                 completed = 0
                 failed = 0
@@ -3759,26 +3789,32 @@ def create_app() -> Flask:
                 if report_type == "portfolio":
                     for job in jobs:
                         try:
-                            result = build_portfolio_generation_result(g.db, request.form, portfolio_id, snapshot_id, job["period"])
+                            LOGGER.info("report_generation_item_started run_id=%s format=%s portfolio_id=%s snapshot_id=%s", run_id, job["format"], portfolio_id, snapshot_id)
+                            result = snapshot_result or build_portfolio_generation_result(g.db, request.form, portfolio_id, snapshot_id, job["period"])
                             if snapshot_id:
                                 portfolio_id = result.portfolio_id
                             rendered = render_portfolio_pdf(result, template) if job["format"] == "pdf" else render_portfolio_excel(result, template)
                             completed_files.append(register_rendered_generation_file(g.db, output_dir, run_id, rendered, snapshot_id=snapshot_id))
                             completed += 1
                             warnings.extend(rendered.warnings)
+                            LOGGER.info("report_generation_item_completed run_id=%s format=%s portfolio_id=%s snapshot_id=%s", run_id, job["format"], rendered.portfolio_id, snapshot_id)
                         except Exception as exc:
                             failed += 1
+                            LOGGER.warning("report_generation_item_failed run_id=%s format=%s portfolio_id=%s snapshot_id=%s error_code=%s", run_id, job.get("format"), portfolio_id, snapshot_id, type(exc).__name__)
                             add_failed_generation_file(g.db, run_id, job, str(exc), portfolio_id=portfolio_id, snapshot_id=snapshot_id)
                 else:
                     for job in jobs:
                         try:
+                            LOGGER.info("report_generation_item_started run_id=%s format=%s asset_id=%s", run_id, job["format"], job.get("asset_id"))
                             report = build_individual_generation_report(g.db, job["asset_id"], job["period"])
                             rendered = render_individual_pdf(report, template) if job["format"] == "pdf" else render_individual_excel(report, template)
                             completed_files.append(register_rendered_generation_file(g.db, output_dir, run_id, rendered))
                             completed += 1
                             warnings.extend(rendered.warnings)
+                            LOGGER.info("report_generation_item_completed run_id=%s format=%s asset_id=%s", run_id, job["format"], rendered.asset_id)
                         except Exception as exc:
                             failed += 1
+                            LOGGER.warning("report_generation_item_failed run_id=%s format=%s asset_id=%s error_code=%s", run_id, job.get("format"), job.get("asset_id"), type(exc).__name__)
                             add_failed_generation_file(g.db, run_id, job, str(exc), asset_id=job.get("asset_id"))
                 if "zip" in formats and completed_files:
                     zip_file = render_zip(completed_files, filename=f"run_{run_id}.zip")
@@ -3792,15 +3828,31 @@ def create_app() -> Flask:
                 if run_id:
                     finish_generation_run(g.db, run_id, status="failed", completed_count=0, failed_count=0, error_message=str(exc))
                     g.db.commit()
-                flash(f"Falha na geracao: {exc}", "error")
+                LOGGER.warning("report_generation_failed run_id=%s report_type=%s template_id=%s error_code=%s", run_id, report_type, template_id, type(exc).__name__)
+                flash("Falha na geração. Revê o pedido e consulta os logs para detalhe técnico.", "error")
             return redirect(url_for("report_generation"))
         groups = query_all(g.db, "SELECT * FROM portfolio_groups ORDER BY name COLLATE NOCASE")
         assets = query_all(g.db, "SELECT id, project_name FROM assets WHERE active_contract = 'yes' OR active_contract IS NULL ORDER BY project_name COLLATE NOCASE LIMIT 200")
         templates = list_templates(g.db)
         profiles = list_portfolio_report_profiles(g.db)
-        runs = list_generation_runs(g.db, limit=20)
-        files = list_generated_files(g.db)
-        return render_template("report_generation.html", title="Geracao de relatorios", groups=groups, assets=assets, templates=templates, profiles=profiles, runs=runs, files=files)
+        page = max(int(request.args.get("page", "1") or 1), 1)
+        offset = (page - 1) * 20
+        runs = list_generation_runs(g.db, limit=20, offset=offset)
+        files = list_generated_files(g.db, limit=50, offset=(page - 1) * 50)
+        return render_template("report_generation.html", title="Geracao de relatorios", groups=groups, assets=assets, templates=templates, profiles=profiles, runs=runs, files=files, page=page)
+
+    @app.route("/reporting-health")
+    def reporting_health():
+        findings = reconcile_generated_reports(g.db, cleanup=False)
+        stale_runs = query_scalar(g.db, "SELECT COUNT(*) FROM report_generation_runs WHERE status = 'running' AND created_at < datetime('now', '-2 hours')")
+        payload = {
+            "database": "ok",
+            "storage": "ok" if UPLOAD_DIR.exists() else "missing",
+            "defaults": len(list_templates(g.db)) > 0,
+            "storage_findings": len([item for item in findings if item.status != "ok"]),
+            "stale_runs": stale_runs,
+        }
+        return payload
 
     @app.route("/report-generation/preview")
     def report_generation_preview():
@@ -3809,7 +3861,7 @@ def create_app() -> Flask:
         template = get_template(g.db, template_id) if template_id else get_default_template(g.db, "portfolio", portfolio_id)
         if template is None:
             abort(404)
-        validate_template_scope(template, "portfolio", portfolio_id=portfolio_id)
+        validate_template_scope(template, "portfolio", portfolio_id=portfolio_id, client_key=resolve_report_client_key(g.db, portfolio_id=portfolio_id))
         snapshot_id = int(request.args.get("snapshot_id", "0") or 0)
         if snapshot_id:
             result = get_portfolio_snapshot_result(g.db, snapshot_id)
@@ -3844,6 +3896,8 @@ def create_app() -> Flask:
             abort(404)
         path = resolve_runtime_file_path_within(row["relative_path"], UPLOAD_DIR / "generated_reports")
         if path is None or not path.exists():
+            abort(404)
+        if path.is_symlink() or not path_is_within(path.resolve(), (UPLOAD_DIR / "generated_reports").resolve()):
             abort(404)
         if path.stat().st_size != int(row["size_bytes"] or 0):
             abort(404)
@@ -8702,6 +8756,60 @@ def export_customer_production_pdf(report: dict[str, Any]):
     return send_file(buffer, as_attachment=True, download_name=filename, mimetype="application/pdf")
 
 
+def store_report_logo(file_storage, *, old_logo_path: str = "") -> str:
+    filename = safe_upload_filename(file_storage.filename or "")
+    extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if extension not in {"png", "jpg", "jpeg"}:
+        raise ValueError("invalid_logo_extension")
+    payload = file_storage.read()
+    if not payload or len(payload) > 512 * 1024:
+        raise ValueError("invalid_logo_size")
+    width, height = image_dimensions(payload, extension)
+    if width <= 0 or height <= 0 or width > 2400 or height > 1200:
+        raise ValueError("invalid_logo_dimensions")
+    logo_dir = UPLOAD_DIR / "report_logos"
+    logo_dir.mkdir(parents=True, exist_ok=True)
+    target = logo_dir / f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{filename}"
+    target.write_bytes(payload)
+    return store_runtime_relative_path(target)
+
+
+def safe_upload_filename(filename: str) -> str:
+    cleaned = secure_filename(filename)
+    if not cleaned or any(item in cleaned for item in {"..", "/", "\\"}):
+        raise ValueError("invalid_upload_filename")
+    return cleaned
+
+
+def image_dimensions(payload: bytes, extension: str) -> tuple[int, int]:
+    if extension == "png":
+        if not payload.startswith(b"\x89PNG\r\n\x1a\n") or len(payload) < 24:
+            raise ValueError("invalid_logo_content")
+        width, height = struct.unpack(">II", payload[16:24])
+        return int(width), int(height)
+    if extension in {"jpg", "jpeg"}:
+        if not payload.startswith(b"\xff\xd8"):
+            raise ValueError("invalid_logo_content")
+        index = 2
+        while index + 9 < len(payload):
+            if payload[index] != 0xFF:
+                index += 1
+                continue
+            marker = payload[index + 1]
+            index += 2
+            if marker in {0xD8, 0xD9}:
+                continue
+            length = int.from_bytes(payload[index : index + 2], "big")
+            if length < 2:
+                raise ValueError("invalid_logo_content")
+            if marker in {0xC0, 0xC2} and index + 7 < len(payload):
+                height = int.from_bytes(payload[index + 3 : index + 5], "big")
+                width = int.from_bytes(payload[index + 5 : index + 7], "big")
+                return int(width), int(height)
+            index += length
+    raise ValueError("invalid_logo_content")
+
+
 def build_generation_jobs(form: Any, report_type: str, main_formats: tuple[str, ...]) -> list[dict[str, Any]]:
     periods = parse_generation_periods(form)
     jobs: list[dict[str, Any]] = []
@@ -8725,6 +8833,51 @@ def build_generation_jobs(form: Any, report_type: str, main_formats: tuple[str, 
     if len(jobs) > MAX_TOTAL_OUTPUTS:
         raise ValueError("Demasiados outputs no mesmo run.")
     return jobs
+
+
+def build_snapshot_generation_jobs(snapshot_result, main_formats: tuple[str, ...]) -> list[dict[str, Any]]:
+    period = {
+        "period_type": snapshot_result.period.period_type.value,
+        "report_month": snapshot_result.period.start.strftime("%Y-%m"),
+        "period_start": snapshot_result.period.start.isoformat(),
+        "period_end": snapshot_result.period.end.isoformat(),
+    }
+    return [{"period": period, "format": fmt} for fmt in main_formats]
+
+
+def reject_snapshot_period_overrides(form: Any, snapshot_result) -> None:
+    raw_months = [part for item in form.getlist("report_months") for part in re.split(r"[\s,;]+", str(item)) if part]
+    if len(set(raw_months)) > 1:
+        raise ValueError("snapshot_rejects_multiple_periods")
+    submitted_type = str(form.get("period_type") or snapshot_result.period.period_type.value)
+    if submitted_type != snapshot_result.period.period_type.value:
+        raise ValueError("snapshot_period_mismatch")
+    submitted_month = form.get("report_month")
+    if submitted_month and normalize_report_month(submitted_month) != snapshot_result.period.start.strftime("%Y-%m"):
+        raise ValueError("snapshot_period_mismatch")
+
+
+def resolve_report_client_key(conn: sqlite3.Connection, *, portfolio_id: int | None = None, asset_id: int | None = None) -> str:
+    if portfolio_id:
+        row = conn.execute("SELECT name FROM portfolio_groups WHERE id = ?", (portfolio_id,)).fetchone()
+        return normalize_name(row["name"]) if row else ""
+    if asset_id:
+        row = conn.execute("SELECT nif, project_name FROM assets WHERE id = ?", (asset_id,)).fetchone()
+        return normalize_name(row["nif"] or row["project_name"]) if row else ""
+    return ""
+
+
+def resolve_generation_client_key(conn: sqlite3.Connection, report_type: str, form: Any, portfolio_id: int | None) -> str:
+    if report_type == "portfolio":
+        return resolve_report_client_key(conn, portfolio_id=portfolio_id)
+    asset_ids = [int(item) for item in form.getlist("asset_ids") if str(item).isdigit()]
+    if not asset_ids and str(form.get("asset_id", "")).isdigit():
+        asset_ids = [int(form.get("asset_id"))]
+    keys = {resolve_report_client_key(conn, asset_id=asset_id) for asset_id in asset_ids if asset_id}
+    keys.discard("")
+    if len(keys) > 1:
+        raise ValueError("mixed_client_batch")
+    return next(iter(keys), "")
 
 
 def parse_generation_periods(form: Any) -> list[dict[str, str]]:

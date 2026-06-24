@@ -32,7 +32,7 @@
       </table>
     </div>
 
-    <form method="post" class="stack-form">
+    <form method="post" class="stack-form" enctype="multipart/form-data">
       <input type="hidden" name="template_id" value="{{ selected_template.id or 0 }}">
       <div class="grid two">
         <label>Nome
@@ -70,12 +70,27 @@
         <label>Cor primária
           <input name="primary_color" value="{{ selected_template.branding.primary_color }}">
         </label>
+        <label>Cor secundária
+          <input name="secondary_color" value="{{ selected_template.branding.secondary_color }}">
+        </label>
+        <label>Logótipo
+          <input type="file" name="logo" accept=".png,.jpg,.jpeg">
+        </label>
       </div>
       <label>Descrição
         <input name="description" value="{{ selected_template.description }}">
       </label>
       <label>Subtítulo
         <input name="subtitle" value="{{ selected_template.subtitle }}">
+      </label>
+      <label>Contactos
+        <input name="contacts" value="{{ selected_template.branding.contacts }}">
+      </label>
+      <label>Rodapé
+        <input name="footer" value="{{ selected_template.branding.footer }}">
+      </label>
+      <label>Disclaimer
+        <input name="disclaimer" value="{{ selected_template.branding.disclaimer }}">
       </label>
       <div class="table-wrap">
         <table>

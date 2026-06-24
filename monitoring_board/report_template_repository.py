@@ -53,6 +53,7 @@ def ensure_report_template_schema(conn: sqlite3.Connection) -> None:
             requested_count INTEGER DEFAULT 0,
             completed_count INTEGER DEFAULT 0,
             failed_count INTEGER DEFAULT 0,
+            skipped_count INTEGER DEFAULT 0,
             warnings_json TEXT DEFAULT '[]',
             error_message TEXT,
             created_at TEXT NOT NULL,
@@ -73,9 +74,23 @@ def ensure_report_template_schema(conn: sqlite3.Connection) -> None:
             size_bytes INTEGER NOT NULL,
             status TEXT NOT NULL,
             error_message TEXT,
+            period_type TEXT,
+            period_start TEXT,
+            period_end TEXT,
+            is_auxiliary INTEGER DEFAULT 0,
+            warnings_json TEXT DEFAULT '[]',
             created_at TEXT NOT NULL,
             FOREIGN KEY (run_id) REFERENCES report_generation_runs(id) ON DELETE CASCADE
         );
+
+        CREATE INDEX IF NOT EXISTS idx_report_templates_type_scope
+            ON report_templates(report_type, portfolio_id, active, is_default);
+        CREATE INDEX IF NOT EXISTS idx_report_generation_runs_created
+            ON report_generation_runs(created_at DESC, status);
+        CREATE INDEX IF NOT EXISTS idx_report_generated_files_run
+            ON report_generated_files(run_id, status, is_auxiliary);
+        CREATE INDEX IF NOT EXISTS idx_report_generated_files_asset_period
+            ON report_generated_files(asset_id, period_start, format);
         """
     )
     ensure_column(conn, "report_generation_runs", "skipped_count INTEGER DEFAULT 0")
@@ -283,23 +298,23 @@ def add_generated_file(conn: sqlite3.Connection, *, run_id: int, fmt: str, filen
     return int(cursor.lastrowid)
 
 
-def list_generation_runs(conn: sqlite3.Connection, *, limit: int = 30) -> list[sqlite3.Row]:
+def list_generation_runs(conn: sqlite3.Connection, *, limit: int = 30, offset: int = 0) -> list[sqlite3.Row]:
     return conn.execute(
         """
         SELECT r.*, t.name AS template_name
         FROM report_generation_runs r
         LEFT JOIN report_templates t ON t.id = r.template_id
         ORDER BY r.created_at DESC
-        LIMIT ?
+        LIMIT ? OFFSET ?
         """,
-        (limit,),
+        (limit, offset),
     ).fetchall()
 
 
-def list_generated_files(conn: sqlite3.Connection, run_id: int | None = None) -> list[sqlite3.Row]:
+def list_generated_files(conn: sqlite3.Connection, run_id: int | None = None, *, limit: int = 50, offset: int = 0) -> list[sqlite3.Row]:
     if run_id:
-        return conn.execute("SELECT * FROM report_generated_files WHERE run_id = ? ORDER BY id", (run_id,)).fetchall()
-    return conn.execute("SELECT * FROM report_generated_files ORDER BY created_at DESC LIMIT 50").fetchall()
+        return conn.execute("SELECT * FROM report_generated_files WHERE run_id = ? ORDER BY id LIMIT ? OFFSET ?", (run_id, limit, offset)).fetchall()
+    return conn.execute("SELECT * FROM report_generated_files ORDER BY created_at DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
 
 
 def get_generated_file(conn: sqlite3.Connection, file_id: int) -> sqlite3.Row | None:

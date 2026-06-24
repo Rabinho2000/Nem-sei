@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import struct
 from pathlib import Path
 
 import app as app_module
@@ -20,6 +21,8 @@ from monitoring_board.report_template_repository import (
     set_default_template,
 )
 from monitoring_board.reporting.templates import default_template
+from monitoring_board.reporting.templates import validate_template_scope
+from monitoring_board.reporting_storage import reconcile_generated_reports
 from monitoring_board.services.portfolio_reporting import prepare_portfolio_report
 from monitoring_board.reporting.templates import TemplateSection
 from monitoring_board.services.report_rendering import render_individual_excel, render_portfolio_excel, render_portfolio_html, render_portfolio_pdf, render_zip, safe_filename
@@ -358,3 +361,138 @@ def test_portfolio_pdf_includes_more_than_ten_columns(tmp_path: Path) -> None:
     assert len(result.columns) > 10
     assert "Beneficio liquido" in text
     assert "Warnings" in text
+
+
+def test_template_client_scope_is_strict() -> None:
+    template = default_template("Portfolio executivo")
+    client_template = template.__class__(**{**template.__dict__, "client_key": "cliente-a"})
+
+    validate_template_scope(template, "portfolio", portfolio_id=None, client_key=None)
+    validate_template_scope(client_template, "portfolio", portfolio_id=None, client_key="cliente-a")
+    for client_key in (None, "", "cliente-b"):
+        try:
+            validate_template_scope(client_template, "portfolio", portfolio_id=None, client_key=client_key)
+        except ValueError as exc:
+            assert str(exc) == "template_client_mismatch"
+        else:
+            raise AssertionError("expected client mismatch")
+
+
+def test_snapshot_rejects_multiple_periods(tmp_path: Path) -> None:
+    db_path = tmp_path / "snapshot-period.db"
+    ensure_database(str(db_path))
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    portfolio_id = add_portfolio(conn, add_asset(conn))
+    profile = get_default_profile(conn, portfolio_id)
+    from monitoring_board.portfolio_report_repository import snapshot_portfolio_result
+
+    result = prepare_portfolio_report(conn, portfolio_id=portfolio_id, portfolio_name="Snapshot P", profile=profile, report_month="2026-01")
+    snapshot_id = snapshot_portfolio_result(conn, result)
+    template_id = next(row["id"] for row in list_templates(conn, "portfolio") if row["name"] == "Portfolio executivo")
+    conn.commit()
+    conn.close()
+    flask_app = app_module.app
+    previous_db = flask_app.config["DATABASE"]
+    previous_testing = flask_app.config.get("TESTING")
+    flask_app.config["DATABASE"] = str(db_path)
+    flask_app.config["TESTING"] = True
+    client = flask_app.test_client()
+    with client.session_transaction() as session:
+        session["authenticated"] = True
+        session["csrf_token"] = "token"
+    try:
+        client.post(
+            "/report-generation",
+            data={
+                "csrf_token": "token",
+                "report_type": "portfolio",
+                "template_id": str(template_id),
+                "portfolio_id": str(portfolio_id),
+                "snapshot_id": str(snapshot_id),
+                "report_months": "2026-01,2026-02",
+                "formats": ["pdf", "excel"],
+            },
+        )
+        conn = sqlite3.connect(db_path)
+        assert conn.execute("SELECT COUNT(*) FROM report_generation_runs").fetchone()[0] == 0
+        conn.close()
+    finally:
+        flask_app.config["DATABASE"] = previous_db
+        flask_app.config["TESTING"] = previous_testing
+
+
+def test_logo_upload_validation_and_storage() -> None:
+    payload = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8 + struct.pack(">II", 120, 40) + b"\x08\x02\x00\x00\x00" + b"x"
+
+    class File:
+        filename = "logo.png"
+
+        def read(self):
+            return payload
+
+    path = app_factory_module.store_report_logo(File())
+    assert path.endswith(".png")
+    bad = File()
+    bad.filename = "logo.svg"
+    try:
+        app_factory_module.store_report_logo(bad)
+    except ValueError as exc:
+        assert str(exc) == "invalid_logo_extension"
+    else:
+        raise AssertionError("expected invalid extension")
+
+
+def test_storage_reconciliation_detects_missing_orphan_and_hash(tmp_path: Path) -> None:
+    db_path = tmp_path / "storage.db"
+    ensure_database(str(db_path))
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    root = tmp_path / "generated"
+    root.mkdir()
+    ok = root / "ok.pdf"
+    ok.write_bytes(b"abc")
+    orphan = root / "orphan.pdf"
+    orphan.write_bytes(b"orphan")
+    conn.execute("INSERT INTO report_generation_runs (report_type, status, requested_count, created_at) VALUES ('portfolio', 'completed', 1, '2026-01-01')")
+    run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute(
+        """
+        INSERT INTO report_generated_files
+            (run_id, format, filename, relative_path, sha256, size_bytes, status, created_at)
+        VALUES (?, 'pdf', 'ok.pdf', ?, 'bad-hash', 3, 'completed', '2026-01-01')
+        """,
+        (run_id, str(ok)),
+    )
+
+    statuses = {finding.status for finding in reconcile_generated_reports(conn, root=root)}
+    assert {"hash_mismatch", "orphan_file"} <= statuses
+
+
+def test_ensure_database_is_idempotent_for_reporting_outputs(tmp_path: Path) -> None:
+    db_path = tmp_path / "idempotent.db"
+    ensure_database(str(db_path))
+    ensure_database(str(db_path))
+    conn = sqlite3.connect(db_path)
+    assert conn.execute("SELECT COUNT(*) FROM report_templates WHERE name = 'Portfolio executivo'").fetchone()[0] == 1
+
+
+def test_reporting_health_route(tmp_path: Path) -> None:
+    db_path = tmp_path / "health.db"
+    ensure_database(str(db_path))
+    flask_app = app_module.app
+    previous_db = flask_app.config["DATABASE"]
+    previous_testing = flask_app.config.get("TESTING")
+    flask_app.config["DATABASE"] = str(db_path)
+    flask_app.config["TESTING"] = True
+    client = flask_app.test_client()
+    with client.session_transaction() as session:
+        session["authenticated"] = True
+        session["csrf_token"] = "token"
+    try:
+        response = client.get("/reporting-health")
+        assert response.status_code == 200
+        assert response.json["database"] == "ok"
+    finally:
+        flask_app.config["DATABASE"] = previous_db
+        flask_app.config["TESTING"] = previous_testing

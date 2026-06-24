@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import html
 import io
+import shutil
 import re
 import unicodedata
 import zipfile
@@ -15,8 +16,9 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import mm
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+from monitoring_board.runtime import resolve_runtime_file_path
 from monitoring_board.reporting.portfolio import METRIC_CATALOG, PortfolioReportResult
 from monitoring_board.reporting.templates import ReportTemplate, enabled_sections_in_order
 from monitoring_board.services.portfolio_reporting import export_portfolio_result_workbook, format_cell
@@ -93,6 +95,7 @@ def render_portfolio_html(result: PortfolioReportResult, template: ReportTemplat
     title = html.escape(expand_pattern(template.title, result=result) or f"{result.portfolio_name} - {result.period.label}")
     parts = [
         f"<article class='report-preview' style='--primary:{html.escape(template.branding.primary_color)};--secondary:{html.escape(template.branding.secondary_color)}'>",
+        logo_html(template),
         f"<h1>{title}</h1>",
         f"<p>{html.escape(template.subtitle)}</p>",
         f"<p>{html.escape(template.branding.company_name)} - {html.escape(template.branding.client_name)} - {html.escape(result.period.label)}</p>",
@@ -119,8 +122,7 @@ def render_portfolio_html_section(result: PortfolioReportResult, key: str, title
         rows = "".join("<tr>" + "".join(f"<td>{html.escape(str(format_cell(row.values.get(column.metric_key)) or '-'))}</td>" for column in result.columns) + "</tr>" for row in result.rows)
         return f"<section data-section='installations_table'><h2>{html.escape(title)}</h2><table><thead><tr>{header}</tr></thead><tbody>{rows}</tbody></table></section>"
     if key in {"availability", "quality", "warnings", "metadata", "financial", "top_performers", "underperformers"}:
-        warnings = html.escape(", ".join(result.warnings) or "sem warnings")
-        return f"<section data-section='{html.escape(key)}'><h2>{html.escape(title)}</h2><p>Cobertura global: {result.coverage.global_pct}%</p><p>{warnings}</p></section>"
+        return portfolio_detail_section(result, key, title)
     return ""
 
 
@@ -135,6 +137,7 @@ def render_portfolio_pdf(result: PortfolioReportResult, template: ReportTemplate
         Paragraph(template.subtitle or template.branding.company_name, styles["Normal"]),
         Spacer(1, 12),
     ]
+    append_logo(story, template)
     for section in enabled_sections_in_order(template):
         append_portfolio_pdf_section(story, styles, result, template, section.key, section.title)
     doc.build(story, onFirstPage=page_footer(template), onLaterPages=page_footer(template))
@@ -178,7 +181,8 @@ def append_portfolio_pdf_section(story: list[Any], styles: Any, result: Portfoli
             story.append(Spacer(1, 8))
     elif key in {"availability", "quality", "warnings", "metadata", "financial", "top_performers", "underperformers"}:
         story.append(Paragraph(title, styles["Heading2"]))
-        story.append(Paragraph(f"Cobertura global: {result.coverage.global_pct}% - Warnings: {', '.join(result.warnings) or 'sem warnings'}", styles["Normal"]))
+        for row in portfolio_detail_rows(result, key):
+            story.append(Paragraph(" - ".join(str(item) for item in row), styles["Normal"]))
         story.append(Spacer(1, 8))
 
 
@@ -189,7 +193,16 @@ def render_individual_pdf(report: dict[str, Any], template: ReportTemplate) -> R
     styles = getSampleStyleSheet()
     asset = report.get("asset") or {}
     title = expand_individual_pattern(template.title or "{asset} - {period}", report)
-    doc.build([Paragraph(title, styles["Title"]), Paragraph(template.subtitle, styles["Normal"]), Spacer(1, 12), Table(individual_rows(report), hAlign="LEFT", repeatRows=1)], onFirstPage=page_footer(template), onLaterPages=page_footer(template))
+    story: list[Any] = [Paragraph(title, styles["Title"]), Paragraph(template.subtitle, styles["Normal"]), Spacer(1, 12)]
+    append_logo(story, template)
+    for section in enabled_sections_in_order(template):
+        rows = individual_section_rows(report, section.key)
+        if not rows:
+            continue
+        story.append(Paragraph(section.title, styles["Heading2"]))
+        story.append(Table(rows, hAlign="LEFT", repeatRows=1))
+        story.append(Spacer(1, 8))
+    doc.build(story, onFirstPage=page_footer(template), onLaterPages=page_footer(template))
     return checked_file(
         RenderedFile(
             filename=safe_filename(expand_individual_pattern(template.filename_pattern or "{asset}_{period}", report), extension="pdf"),
@@ -264,6 +277,64 @@ def individual_rows(report: dict[str, Any]) -> list[list[str]]:
     return rows
 
 
+def individual_section_rows(report: dict[str, Any], key: str) -> list[list[str]]:
+    asset = report.get("asset") or {}
+    mapping = {
+        "cover": [["Campo", "Valor"], ["Instalacao", asset.get("project_name") or "Dados indisponiveis"], ["Periodo", report.get("period_label") or "Dados indisponiveis"]],
+        "identification": [["Campo", "Valor"], ["NIF", asset.get("nif") or "Dados indisponiveis"], ["Tipo", report.get("report_type") or "Dados indisponiveis"]],
+        "executive_summary": individual_rows(report),
+        "production": [["Metrica", "Valor"], ["Producao", report.get("production_kwh") or "Dados indisponiveis"]],
+        "self_consumption": [["Metrica", "Valor"], ["Autoconsumo", report.get("self_use_kwh") or "Dados indisponiveis"], ["Taxa", report.get("autoconsumption_pct") or "Dados indisponiveis"]],
+        "financial": [["Metrica", "Valor"], ["Poupanca", report.get("savings_eur") or "Dados indisponiveis"], ["Beneficio liquido", report.get("net_benefit_eur") or "Dados indisponiveis"]],
+        "tariffs": [["Campo", "Valor"], ["Tarifa", report.get("tariff_type") or "Dados indisponiveis"], ["Fonte", report.get("tariff_source") or "Dados indisponiveis"]],
+        "data_quality": [["Campo", "Valor"], ["Cobertura", report.get("coverage_pct") or "Dados indisponiveis"]],
+        "warnings": [["Codigo"], *[[warning] for warning in list(report.get("warnings") or []) + list(report.get("billing_warnings") or [])]],
+        "metadata": [["Campo", "Valor"], ["Engine", report.get("engine_version") or "individual-report-v1"], ["Periodo", report.get("period_type") or "monthly"]],
+    }
+    return mapping.get(key, [["Campo", "Valor"], [key, "Dados indisponiveis"]])
+
+
+def portfolio_detail_section(result: PortfolioReportResult, key: str, title: str) -> str:
+    rows = "".join("<tr>" + "".join(f"<td>{html.escape(str(value))}</td>" for value in row) + "</tr>" for row in portfolio_detail_rows(result, key))
+    return f"<section data-section='{html.escape(key)}'><h2>{html.escape(title)}</h2><table><tbody>{rows}</tbody></table></section>"
+
+
+def portfolio_detail_rows(result: PortfolioReportResult, key: str) -> list[list[Any]]:
+    if key == "financial":
+        keys = ("estimated_value_eur", "export_revenue_eur", "esco_payment_eur", "fixed_fee_eur", "net_benefit_eur")
+        return [[METRIC_CATALOG[item].label, format_cell(result.summary.values.get(item)) or "Dados indisponiveis"] for item in keys if item in result.summary.values]
+    if key == "availability":
+        low = [row.values.get("installation") for row in result.rows if row.values.get("availability_pct") is not None and row.values.get("availability_pct") < 95]
+        return [["Disponibilidade", format_cell(result.summary.values.get("availability_pct")) or "Dados indisponiveis"], ["Abaixo threshold", ", ".join(str(item) for item in low) or "nenhuma"]]
+    if key == "top_performers":
+        ranked = sorted((row for row in result.rows if row.values.get("deviation_pct") is not None), key=lambda row: row.values["deviation_pct"], reverse=True)[:5]
+        return [[row.values.get("installation"), format_cell(row.values.get("deviation_pct"))] for row in ranked] or [["Dados indisponiveis"]]
+    if key == "underperformers":
+        ranked = sorted((row for row in result.rows if row.values.get("deviation_pct") is not None), key=lambda row: row.values["deviation_pct"])[:5]
+        return [[row.values.get("installation"), format_cell(row.values.get("deviation_pct")), ", ".join(row.warnings)] for row in ranked] or [["Dados indisponiveis"]]
+    if key == "quality":
+        return [["Fonte", "Cobertura"], *[[source, value] for source, value in result.coverage.by_source.items()], ["Incompletas", result.coverage.incomplete_installations], ["Meses em falta", ", ".join(result.coverage.missing_months)]]
+    if key == "metadata":
+        return [["Engine", result.engine_version], ["Perfil", result.profile.name], ["Versao", result.profile_version], ["Periodo", result.period.label], ["Gerado", result.generated_at.isoformat(timespec="seconds")], ["Snapshot", result.metadata.get("snapshot_id") or "-"]]
+    return [["Warnings", ", ".join(result.warnings) or "sem warnings"]]
+
+
+def logo_html(template: ReportTemplate) -> str:
+    if not template.branding.logo_path:
+        return ""
+    src = html.escape(template.branding.logo_path)
+    return f"<img alt='Logo' src='/{src}' style='max-height:80px'>"
+
+
+def append_logo(story: list[Any], template: ReportTemplate) -> None:
+    if not template.branding.logo_path:
+        return
+    path = resolve_runtime_file_path(template.branding.logo_path)
+    if path.exists() and path.is_file():
+        story.append(Image(str(path), width=80, height=40, kind="proportional"))
+        story.append(Spacer(1, 8))
+
+
 def render_portfolio_excel(result: PortfolioReportResult, template: ReportTemplate) -> RenderedFile:
     workbook = export_portfolio_result_workbook(result)
     workbook["Resumo"].insert_rows(1)
@@ -300,11 +371,29 @@ def render_zip(files: list[RenderedFile], filename: str = "reports.zip") -> Rend
 def store_rendered_file(base_dir: Path, run_id: int, file: RenderedFile) -> tuple[Path, str]:
     run_dir = (base_dir / str(run_id)).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
+    staging_dir = run_dir / ".staging"
+    staging_dir.mkdir(parents=True, exist_ok=True)
     target = unique_path(run_dir, file.filename)
     if run_dir not in target.parents:
         raise ValueError("unsafe_output_path")
-    target.write_bytes(file.content)
+    staging_target = (staging_dir / target.name).resolve()
+    if staging_dir not in staging_target.parents:
+        raise ValueError("unsafe_output_path")
+    staging_target.write_bytes(file.content)
+    if hashlib.sha256(staging_target.read_bytes()).hexdigest() != file.sha256:
+        staging_target.unlink(missing_ok=True)
+        raise ValueError("staging_hash_mismatch")
+    shutil.move(str(staging_target), str(target))
+    cleanup_empty_staging(staging_dir)
     return target, str(target)
+
+
+def cleanup_empty_staging(staging_dir: Path) -> None:
+    try:
+        if staging_dir.exists() and not any(staging_dir.iterdir()):
+            staging_dir.rmdir()
+    except OSError:
+        pass
 
 
 def unique_path(run_dir: Path, filename: str) -> Path:

@@ -25,6 +25,7 @@ SECTIONS_INDIVIDUAL = (
     "warnings",
     "notes",
     "methodology",
+    "metadata",
 )
 SECTIONS_PORTFOLIO = (
     "cover",
@@ -167,7 +168,7 @@ def validate_template_scope(
         raise ValueError("template_archived")
     if template.portfolio_id is not None and template.portfolio_id != portfolio_id:
         raise ValueError("template_scope_mismatch")
-    if template.client_key and client_key and template.client_key != client_key:
+    if template.client_key and template.client_key != (client_key or ""):
         raise ValueError("template_client_mismatch")
 
 
@@ -183,8 +184,14 @@ def validate_branding(branding: BrandingConfig) -> None:
         raise ValueError("branding_text_too_long")
     if len(branding.footer) > 300 or len(branding.contacts) > 300 or len(branding.disclaimer) > 500:
         raise ValueError("branding_text_too_long")
-    if branding.logo_path and any(item in branding.logo_path for item in ("..", ":", "\\", "/")):
+    if branding.logo_path and (PathLike.is_absolute(branding.logo_path) or any(item in branding.logo_path for item in ("..", ":", "\\"))):
         raise ValueError("invalid_logo_path")
+
+
+class PathLike:
+    @staticmethod
+    def is_absolute(value: str) -> bool:
+        return bool(re.match(r"^[A-Za-z]:", value or "") or str(value or "").startswith("/"))
 
 
 def template_to_config(template: ReportTemplate) -> dict[str, Any]:
