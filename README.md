@@ -60,6 +60,17 @@ explicitamente `python app.py --host 0.0.0.0`.
 python -m pytest -q
 ```
 
+Checks adicionais de release para reporting:
+
+```powershell
+python -m ruff check monitoring_board tests
+python -m compileall monitoring_board
+python -m pip check
+python -m monitoring_board.reporting_storage_check --database .\data\monitoring_board.db --root .\data\uploads\generated_reports --dry-run
+```
+
+Guia operacional: [docs/reporting_operations.md](docs/reporting_operations.md).
+
 ## Docker / Raspberry Pi
 
 Deployment previsto para Raspberry Pi 5 com Raspberry Pi OS 64-bit, Docker
