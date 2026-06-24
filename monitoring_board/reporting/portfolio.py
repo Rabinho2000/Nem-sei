@@ -177,10 +177,39 @@ def default_profile(name: str = "Completo", *, portfolio_id: int | None = None) 
 def validate_profile(profile: PortfolioReportProfile) -> PortfolioReportProfile:
     if not profile.name.strip():
         raise ValueError("profile_name_required")
+    if len(profile.name.strip()) > 120:
+        raise ValueError("profile_name_too_long")
+    if profile.period_type not in {"monthly", "quarterly", "semiannual", "annual"}:
+        raise ValueError("invalid_profile_period_type")
+    if profile.comparison not in {"", "previous_period", "previous_year"}:
+        raise ValueError("invalid_profile_comparison")
     metric_keys = [column.metric_key for column in profile.columns if column.visible]
+    if len(metric_keys) != len(set(metric_keys)):
+        raise ValueError("duplicate_profile_metrics")
     invalid = [key for key in metric_keys if key not in METRIC_CATALOG]
     if invalid:
         raise ValueError("invalid_profile_metrics:" + ",".join(invalid))
+    for column in profile.columns:
+        if column.decimals is not None and not 0 <= int(column.decimals) <= 6:
+            raise ValueError("invalid_profile_decimals")
+        if len(column.label or "") > 80:
+            raise ValueError("profile_label_too_long")
+    if profile.sort:
+        key, direction = profile.sort
+        if key not in METRIC_CATALOG or direction.lower() not in {"asc", "desc"}:
+            raise ValueError("invalid_profile_sort")
+    allowed_filters = {"warnings_only"}
+    if set(profile.filters) - allowed_filters:
+        raise ValueError("invalid_profile_filters")
+    for threshold in profile.thresholds:
+        if threshold.metric_key not in METRIC_CATALOG:
+            raise ValueError("invalid_threshold_metric")
+        if threshold.operator not in {"<", "<=", ">", ">=", "=="}:
+            raise ValueError("invalid_threshold_operator")
+        if threshold.severity not in {"info", "warning", "critical", "missing"}:
+            raise ValueError("invalid_threshold_severity")
+        if not threshold.value.is_finite():
+            raise ValueError("invalid_threshold_value")
     return profile
 
 
@@ -292,10 +321,11 @@ def comparison_values(current: PortfolioReportSummary, previous: PortfolioReport
 def data_coverage(rows: tuple[PortfolioReportRow, ...], months: tuple[date, ...]) -> PortfolioDataCoverage:
     sources = ("production", "helioscope", "availability", "tariff", "self_use", "invoice", "mapping")
     by_source: dict[str, Decimal] = {}
-    total = len(rows) or 1
+    expected_months = len(months) or 1
+    expected_slots = len(rows) * expected_months
     for source in sources:
-        complete = sum(1 for row in rows if source not in row.values.get("missing_sources", ()))
-        by_source[source] = _round(Decimal(complete) / Decimal(total) * Decimal("100"), 2)
+        complete = sum(int((row.values.get("_source_slots") or {}).get(source, 0)) for row in rows)
+        by_source[source] = _round(Decimal(complete) / Decimal(expected_slots) * Decimal("100"), 2) if expected_slots else Decimal("0.00")
     complete_rows = sum(1 for row in rows if not row.values.get("missing_sources"))
     global_pct = _round(sum(by_source.values(), Decimal("0")) / Decimal(len(sources)), 2)
     missing_months = tuple(sorted({month for row in rows for month in row.values.get("missing_months", ())}))

@@ -13,6 +13,7 @@ from monitoring_board.reporting.periods import build_period
 from monitoring_board.reporting.portfolio import (
     DEFAULT_PROFILE_COLUMNS,
     ENGINE_VERSION,
+    PortfolioComparisonResult,
     PortfolioDataCoverage,
     PortfolioReportColumn,
     PortfolioReportProfile,
@@ -67,6 +68,7 @@ def ensure_portfolio_reporting_schema(conn: sqlite3.Connection) -> None:
         "coverage_json TEXT",
         "warnings_json TEXT",
         "rows_json TEXT",
+        "comparison_json TEXT",
         "completed_at TEXT",
     ):
         ensure_column(conn, "portfolio_report_runs", column)
@@ -95,7 +97,16 @@ def seed_default_profiles(conn: sqlite3.Connection) -> None:
         if name in existing:
             continue
         profile = default_profile(name)
-        save_profile(conn, profile, is_default=1)
+        save_profile(conn, profile, is_default=1 if name == "Completo" else 0)
+    defaults = conn.execute(
+        "SELECT id FROM portfolio_report_profiles WHERE portfolio_id IS NULL AND active = 1 AND is_default = 1 ORDER BY name = 'Completo' DESC, id"
+    ).fetchall()
+    if not defaults:
+        row = conn.execute("SELECT id FROM portfolio_report_profiles WHERE portfolio_id IS NULL AND active = 1 AND name = 'Completo' LIMIT 1").fetchone()
+        if row:
+            set_default_profile(conn, int(row["id"]))
+    elif len(defaults) > 1:
+        set_default_profile(conn, int(defaults[0]["id"]))
 
 
 def list_profiles(conn: sqlite3.Connection, portfolio_id: int | None = None, *, include_inactive: bool = False) -> list[sqlite3.Row]:
@@ -127,7 +138,7 @@ def get_default_profile(conn: sqlite3.Connection, portfolio_id: int | None = Non
         SELECT *
         FROM portfolio_report_profiles
         WHERE active = 1
-          AND name = 'Completo'
+          AND is_default = 1
           AND (portfolio_id IS NULL OR portfolio_id = ?)
         ORDER BY portfolio_id IS NOT NULL DESC, is_default DESC, id
         LIMIT 1
@@ -141,7 +152,14 @@ def save_profile(conn: sqlite3.Connection, profile: PortfolioReportProfile, *, a
     profile = validate_profile(profile)
     now = datetime.now().isoformat(timespec="seconds")
     config_json = dump_json(profile_to_config(profile))
+    if len(config_json) > 20000:
+        raise ValueError("profile_config_too_large")
     if profile.id:
+        existing = conn.execute("SELECT portfolio_id FROM portfolio_report_profiles WHERE id = ?", (profile.id,)).fetchone()
+        if existing is None:
+            raise ValueError("profile_not_found")
+        if existing["portfolio_id"] != profile.portfolio_id:
+            raise ValueError("profile_scope_change_forbidden")
         conn.execute(
             """
             UPDATE portfolio_report_profiles
@@ -162,8 +180,22 @@ def save_profile(conn: sqlite3.Connection, profile: PortfolioReportProfile, *, a
             (profile.portfolio_id, profile.name, profile.description, active, is_default, config_json, now, now),
         )
         profile_id = int(cursor.lastrowid)
+    if is_default:
+        set_default_profile(conn, profile_id)
     create_profile_version(conn, profile_id, profile)
     return profile_id
+
+
+def set_default_profile(conn: sqlite3.Connection, profile_id: int) -> None:
+    row = conn.execute("SELECT portfolio_id FROM portfolio_report_profiles WHERE id = ? AND active = 1", (profile_id,)).fetchone()
+    if row is None:
+        raise ValueError("profile_not_found")
+    portfolio_id = row["portfolio_id"]
+    if portfolio_id is None:
+        conn.execute("UPDATE portfolio_report_profiles SET is_default = 0 WHERE portfolio_id IS NULL")
+    else:
+        conn.execute("UPDATE portfolio_report_profiles SET is_default = 0 WHERE portfolio_id = ?", (portfolio_id,))
+    conn.execute("UPDATE portfolio_report_profiles SET is_default = 1, updated_at = ? WHERE id = ?", (datetime.now().isoformat(timespec="seconds"), profile_id))
 
 
 def duplicate_profile(conn: sqlite3.Connection, profile_id: int, name: str) -> int:
@@ -208,9 +240,9 @@ def snapshot_portfolio_result(conn: sqlite3.Connection, result: PortfolioReportR
         INSERT INTO portfolio_report_runs (
             portfolio_id, report_month, created_at, notes, profile_id, profile_version,
             period_type, period_start, period_end, engine_version, status,
-            config_snapshot_json, summary_json, coverage_json, warnings_json, rows_json, completed_at
+            config_snapshot_json, summary_json, coverage_json, warnings_json, rows_json, comparison_json, completed_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             result.portfolio_id,
@@ -228,6 +260,7 @@ def snapshot_portfolio_result(conn: sqlite3.Connection, result: PortfolioReportR
             dump_json(payload["coverage"]),
             dump_json(payload["warnings"]),
             dump_json(payload["rows"]),
+            dump_json(payload["comparison"]),
             now,
         ),
     )
@@ -283,7 +316,16 @@ def snapshot_result_from_row(row: sqlite3.Row) -> PortfolioReportResult:
     )
     summary_payload = json.loads(row["summary_json"] or "{}")
     coverage_payload = json.loads(row["coverage_json"] or "{}")
-    comparison = None
+    comparison_payload = json.loads(row["comparison_json"] or "null") if "comparison_json" in row.keys() else None
+    comparison = (
+        None
+        if comparison_payload is None
+        else PortfolioComparisonResult(
+            mode=str(comparison_payload.get("mode") or ""),
+            values=dict(comparison_payload.get("values") or {}),
+            warnings=tuple(comparison_payload.get("warnings") or ()),
+        )
+    )
     return PortfolioReportResult(
         portfolio_id=int(row["portfolio_id"]),
         portfolio_name=row["portfolio_name"],

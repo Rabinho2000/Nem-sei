@@ -110,6 +110,7 @@ from monitoring_board.portfolio_report_repository import (
     list_profiles as list_portfolio_report_profiles,
     list_report_history as list_portfolio_report_history,
     save_profile as save_portfolio_report_profile,
+    set_default_profile as set_default_portfolio_report_profile,
     snapshot_portfolio_result,
 )
 from monitoring_board.reporting.portfolio import METRIC_CATALOG, profile_from_config, profile_to_config
@@ -3455,12 +3456,13 @@ def create_app() -> Flask:
             except Exception as exc:
                 flash(f"Falha ao preparar relatorio configuravel: {exc}", "error")
                 portfolio_result = None
-            rows = build_portfolio_report_rows(g.db, selected_portfolio_id, report_month)
-            for row in rows:
-                row["portfolio"] = portfolio_name
-            total_row = aggregate_portfolio_total(rows) if rows else None
-            if total_row:
-                total_row["portfolio"] = portfolio_name
+            if portfolio_result is None:
+                rows = build_portfolio_report_rows(g.db, selected_portfolio_id, report_month)
+                for row in rows:
+                    row["portfolio"] = portfolio_name
+                total_row = aggregate_portfolio_total(rows) if rows else None
+                if total_row:
+                    total_row["portfolio"] = portfolio_name
         runs = list_portfolio_report_history(g.db, selected_portfolio_id, limit=20)
         return render_template(
             "portfolio_reports.html",
@@ -3492,6 +3494,9 @@ def create_app() -> Flask:
             if action == "archive" and profile_id:
                 archive_portfolio_report_profile(g.db, profile_id)
                 flash("Perfil arquivado.", "success")
+            elif action == "set_default" and profile_id:
+                set_default_portfolio_report_profile(g.db, profile_id)
+                flash("Perfil predefinido atualizado.", "success")
             elif action == "duplicate" and profile_id:
                 duplicate_portfolio_report_profile(g.db, profile_id, request.form.get("name", "").strip() or "Copia")
                 flash("Perfil duplicado.", "success")

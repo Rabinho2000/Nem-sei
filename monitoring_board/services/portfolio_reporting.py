@@ -5,6 +5,7 @@ from decimal import Decimal
 from typing import Any
 
 from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill
 
 from monitoring_board.portfolio_reports import build_portfolio_report_rows
 from monitoring_board.reporting.periods import build_period
@@ -101,11 +102,13 @@ def load_period_rows(conn, request: PortfolioReportRequest) -> tuple[PortfolioRe
             target = by_asset.setdefault(asset_id, base_values(monthly))
             warnings_by_asset.setdefault(asset_id, set()).update(monthly.get("warnings", []))
             accumulate_month(target, monthly)
+            accumulate_source_coverage(target, monthly)
         for asset_id in set(by_asset) - seen_assets:
             missing_months_by_asset.setdefault(asset_id, set()).add(month.isoformat())
     rows: list[PortfolioReportRow] = []
     for asset_id, values in by_asset.items():
         finalize_values(values)
+        values["_expected_months"] = len(request.period.included_months)
         missing_sources = missing_sources_for_values(values, warnings_by_asset.get(asset_id, set()))
         values["missing_sources"] = tuple(sorted(missing_sources))
         values["missing_months"] = tuple(sorted(missing_months_by_asset.get(asset_id, set())))
@@ -128,6 +131,7 @@ def base_values(monthly: dict[str, Any]) -> dict[str, Any]:
         "tariff_type": monthly.get("tariff_type"),
         "data_status": monthly.get("data_status"),
         "warning_labels": monthly.get("warning_labels", []),
+        "_source_slots": {"production": 0, "helioscope": 0, "availability": 0, "tariff": 0, "self_use": 0, "invoice": 0, "mapping": 0},
         "_availability_weighted": Decimal("0"),
         "_availability_weight": Decimal("0"),
     }
@@ -151,20 +155,41 @@ def accumulate_month(target: dict[str, Any], monthly: dict[str, Any]) -> None:
         "self_use_value_vazio_eur",
         "self_use_value_super_vazio_eur",
         "estimated_value_eur",
+        "self_use_kwh",
+        "self_use_simple_kwh",
+        "self_use_value_simple_eur",
+        "export_kwh",
+        "consumption_kwh",
+        "grid_import_kwh",
+        "export_revenue_eur",
+        "esco_payment_eur",
+        "fixed_fee_eur",
+        "net_benefit_eur",
     ):
         if monthly.get(key) is not None:
             target[key] = Decimal(str(target.get(key) or 0)) + Decimal(str(monthly[key]))
-    target["self_use_kwh"] = Decimal(str(target.get("self_use_kwh") or 0)) + sum(Decimal(str(monthly.get(key) or 0)) for key in ("self_use_ponta_kwh", "self_use_cheia_kwh", "self_use_vazio_kwh", "self_use_super_vazio_kwh"))
-    target["export_kwh"] = Decimal(str(target.get("export_kwh") or 0))
-    target["consumption_kwh"] = Decimal(str(target.get("consumption_kwh") or 0))
-    target["grid_import_kwh"] = Decimal(str(target.get("grid_import_kwh") or 0))
-    target["export_revenue_eur"] = Decimal(str(target.get("export_revenue_eur") or 0))
-    target["esco_payment_eur"] = Decimal(str(target.get("esco_payment_eur") or 0))
-    target["fixed_fee_eur"] = Decimal(str(target.get("fixed_fee_eur") or 0))
-    target["net_benefit_eur"] = Decimal(str(target.get("net_benefit_eur") or 0)) + Decimal(str(monthly.get("estimated_value_eur") or 0))
     if monthly.get("availability_pct") is not None and monthly.get("installed_power_kwp"):
         target["_availability_weighted"] += Decimal(str(monthly["availability_pct"])) * Decimal(str(monthly["installed_power_kwp"]))
         target["_availability_weight"] += Decimal(str(monthly["installed_power_kwp"]))
+
+
+def accumulate_source_coverage(target: dict[str, Any], monthly: dict[str, Any]) -> None:
+    warnings = set(monthly.get("warnings") or ())
+    slots = target.setdefault("_source_slots", {})
+    source_warnings = {
+        "production": {"missing_monthly_production"},
+        "helioscope": {"missing_helioscope_expected"},
+        "availability": {"missing_availability"},
+        "tariff": {"missing_tariff", "expired_tariff", "tariff_validity_gap", "overlapping_tariffs"},
+        "self_use": {"missing_hourly_self_use", "missing_self_use"},
+        "invoice": {"missing_invoice", "review_required", "extraction_failed", "incompatible_invoice"},
+        "mapping": {"mapping_pending", "mapping_conflict"},
+    }
+    for source, missing_codes in source_warnings.items():
+        if source == "self_use" and "inferred_hourly_self_use" in warnings and not warnings.intersection(missing_codes):
+            slots[source] = int(slots.get(source, 0)) + 1
+        elif not warnings.intersection(missing_codes):
+            slots[source] = int(slots.get(source, 0)) + 1
 
 
 def finalize_values(values: dict[str, Any]) -> None:
@@ -197,7 +222,7 @@ def missing_sources_for_values(values: dict[str, Any], warnings: set[str]) -> se
         missing.add("availability")
     if any(warning in warnings for warning in {"missing_tariff", "expired_tariff", "tariff_validity_gap", "overlapping_tariffs"}):
         missing.add("tariff")
-    if any(warning in warnings for warning in {"missing_hourly_self_use", "inferred_hourly_self_use"}):
+    if any(warning in warnings for warning in {"missing_hourly_self_use", "missing_self_use"}):
         missing.add("self_use")
     if any(warning in warnings for warning in {"missing_invoice", "review_required", "extraction_failed", "incompatible_invoice"}):
         missing.add("invoice")
@@ -240,25 +265,73 @@ def export_portfolio_result_workbook(result: PortfolioReportResult) -> Workbook:
     summary.append(["Portfolio", result.portfolio_name])
     summary.append(["Periodo", result.period.label])
     summary.append(["Perfil", result.profile.name])
-    summary.append(["Cobertura global", str(result.coverage.global_pct)])
+    summary.append(["Versao do perfil", result.profile_version])
+    summary.append(["Engine", result.engine_version])
+    summary.append(["Cobertura global", float(result.coverage.global_pct)])
     summary.append([])
     summary.append(["Metrica", "Valor"])
     for key, value in result.summary.values.items():
-        summary.append([METRIC_CATALOG[key].label if key in METRIC_CATALOG else key, value])
+        summary.append([METRIC_CATALOG[key].label if key in METRIC_CATALOG else key, format_cell(value)])
+    if result.comparison:
+        summary.append([])
+        summary.append(["Comparacao", result.comparison.mode])
+        summary.append(["Metrica", "Atual", "Anterior", "Diferenca", "Diferenca %"])
+        for key, item in result.comparison.values.items():
+            summary.append([
+                METRIC_CATALOG[key].label if key in METRIC_CATALOG else key,
+                format_cell(item.get("current")),
+                format_cell(item.get("previous")),
+                format_cell(item.get("delta")),
+                format_cell(item.get("delta_pct")),
+            ])
+    summary.append([])
+    summary.append(["Warnings", ", ".join(result.warnings)])
     sheet = workbook.create_sheet("Instalacoes")
     sheet.append([column.label for column in result.columns])
     for row in result.rows:
         sheet.append([format_cell(row.values.get(column.metric_key)) for column in result.columns])
+    if result.summary.values:
+        sheet.append([
+            format_cell(result.summary.values.get(column.metric_key)) if column.metric_key in result.summary.values else ("TOTAL" if index == 0 else None)
+            for index, column in enumerate(result.columns)
+        ])
+    sheet.freeze_panes = "B2"
+    if sheet.max_row and sheet.max_column:
+        sheet.auto_filter.ref = sheet.dimensions
+    for index, column in enumerate(result.columns, start=1):
+        definition = METRIC_CATALOG.get(column.metric_key)
+        number_format = number_format_for(definition.value_type if definition else "", column.decimals if column.decimals is not None else (definition.decimals if definition else 2))
+        if number_format:
+            for cell in sheet.iter_cols(min_col=index, max_col=index, min_row=2):
+                for item in cell:
+                    item.number_format = number_format
     quality = workbook.create_sheet("Qualidade dos dados")
     quality.append(["Fonte", "Cobertura"])
     for source, value in result.coverage.by_source.items():
-        quality.append([source, str(value)])
-    quality.append(["Warnings", ", ".join(result.warnings)])
+        quality.append([source, float(value)])
+    quality.append([])
+    quality.append(["Instalacao", "Codigo", "Severidade", "Fonte", "Acao sugerida"])
+    for row in result.rows:
+        for warning in row.warnings:
+            quality.append([row.values.get("installation") or row.asset_id or "-", warning, warning_severity(warning), warning_source(warning), warning_action(warning)])
     metadata = workbook.create_sheet("Metadados")
     metadata.append(["engine_version", result.engine_version])
     metadata.append(["generated_at", result.generated_at.isoformat(timespec="seconds")])
+    if result.metadata.get("snapshot_id"):
+        metadata.append(["snapshot_id", result.metadata["snapshot_id"]])
+    metadata.append(["profile", result.profile.name])
     metadata.append(["profile_version", result.profile_version])
+    metadata.append(["period_type", result.period.period_type.value])
+    metadata.append(["period_start", result.period.start.isoformat()])
+    metadata.append(["period_end", result.period.end.isoformat()])
+    metadata.append(["months", ", ".join(month.isoformat() for month in result.period.included_months)])
+    metadata.append(["sources", ", ".join(result.coverage.by_source.keys())])
+    metadata.append(["columns", ", ".join(column.metric_key for column in result.columns)])
     for sheet_obj in workbook.worksheets:
+        if sheet_obj.max_row:
+            for cell in sheet_obj[1]:
+                cell.font = Font(bold=True)
+                cell.fill = PatternFill("solid", fgColor="D9EAF7")
         for column in sheet_obj.columns:
             width = max(len(str(cell.value or "")) for cell in column)
             sheet_obj.column_dimensions[column[0].column_letter].width = min(max(width + 2, 12), 48)
@@ -271,3 +344,44 @@ def format_cell(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return "; ".join(str(item) for item in value)
     return value
+
+
+def number_format_for(value_type: str, decimals: int) -> str:
+    if value_type in {"number", "money"}:
+        base = "#,##0" if decimals <= 0 else "#,##0." + ("0" * decimals)
+        return base + ' "EUR"' if value_type == "money" else base
+    return ""
+
+
+def warning_severity(code: str) -> str:
+    if "conflict" in code or "overlapping" in code:
+        return "critical"
+    if code.startswith("missing") or code in {"expired_tariff", "incompatible_invoice"}:
+        return "missing"
+    return "warning"
+
+
+def warning_source(code: str) -> str:
+    if "helioscope" in code:
+        return "helioscope"
+    if "availability" in code:
+        return "availability"
+    if "tariff" in code or "price" in code:
+        return "tariff"
+    if "invoice" in code or code in {"review_required", "extraction_failed", "incompatible_invoice"}:
+        return "invoice"
+    if "mapping" in code:
+        return "mapping"
+    if "self_use" in code:
+        return "self_use"
+    return "production"
+
+
+def warning_action(code: str) -> str:
+    if code.startswith("missing"):
+        return "Importar ou confirmar a fonte em falta."
+    if code == "inferred_hourly_self_use":
+        return "Confirmar dados horarios quando disponiveis."
+    if "conflict" in code:
+        return "Resolver conflito antes de publicar."
+    return "Rever configuracao ou dados de origem."
