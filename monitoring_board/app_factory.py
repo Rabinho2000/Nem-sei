@@ -113,7 +113,34 @@ from monitoring_board.portfolio_report_repository import (
     set_default_profile as set_default_portfolio_report_profile,
     snapshot_portfolio_result,
 )
+from monitoring_board.report_template_repository import (
+    add_generated_file,
+    archive_template as archive_report_template,
+    create_generation_run,
+    duplicate_template as duplicate_report_template,
+    ensure_report_template_schema,
+    finish_generation_run,
+    get_default_template,
+    get_generated_file,
+    get_template,
+    latest_template_version,
+    list_generated_files,
+    list_generation_runs,
+    list_templates,
+    save_template,
+    set_default_template,
+)
 from monitoring_board.reporting.portfolio import METRIC_CATALOG, profile_from_config, profile_to_config
+from monitoring_board.reporting.templates import default_template, template_from_config, template_to_config
+from monitoring_board.services.report_rendering import (
+    MAX_BATCH_ASSETS,
+    render_individual_pdf,
+    render_portfolio_excel,
+    render_portfolio_html,
+    render_portfolio_pdf,
+    render_zip,
+    store_rendered_file,
+)
 from monitoring_board.services.portfolio_reporting import export_portfolio_result_workbook, prepare_portfolio_report
 from monitoring_board.reporting.billing import decimal_from_value
 from monitoring_board.reporting.invoices import normalize_date, is_supported_invoice_extension, validate_invoice_values, warnings_require_override
@@ -3623,6 +3650,208 @@ def create_app() -> Flask:
             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
+    @app.route("/report-templates", methods=["GET", "POST"])
+    def report_templates():
+        if request.method == "POST":
+            action = request.form.get("action", "save").strip()
+            template_id = int(request.form.get("template_id", "0") or 0)
+            portfolio_id = int(request.form.get("portfolio_id", "0") or 0) or None
+            try:
+                if action == "archive" and template_id:
+                    archive_report_template(g.db, template_id)
+                    flash("Template arquivado.", "success")
+                elif action == "duplicate" and template_id:
+                    duplicate_report_template(g.db, template_id, request.form.get("name", "").strip() or "Copia")
+                    flash("Template duplicado.", "success")
+                elif action == "set_default" and template_id:
+                    set_default_template(g.db, template_id)
+                    flash("Template default atualizado.", "success")
+                else:
+                    base = get_template(g.db, template_id) if template_id else default_template("Portfolio executivo" if request.form.get("report_type") == "portfolio" else "Individual padrao", portfolio_id=portfolio_id)
+                    config = template_to_config(base)
+                    config.update(
+                        name=request.form.get("name", "").strip() or base.name,
+                        report_type=request.form.get("report_type", base.report_type),
+                        description=request.form.get("description", "").strip(),
+                        portfolio_id=portfolio_id,
+                        orientation=request.form.get("orientation", base.orientation),
+                        title=request.form.get("title", "").strip() or base.title,
+                        subtitle=request.form.get("subtitle", "").strip(),
+                        filename_pattern=request.form.get("filename_pattern", "").strip() or base.filename_pattern,
+                        branding={
+                            **config.get("branding", {}),
+                            "company_name": request.form.get("company_name", "").strip() or base.branding.company_name,
+                            "client_name": request.form.get("client_name", "").strip(),
+                            "primary_color": request.form.get("primary_color", base.branding.primary_color),
+                            "secondary_color": request.form.get("secondary_color", base.branding.secondary_color),
+                            "footer": request.form.get("footer", "").strip(),
+                        },
+                    )
+                    enabled_sections = set(request.form.getlist("section_key"))
+                    config["sections"] = [
+                        {**section, "enabled": section["key"] in enabled_sections, "display_order": int(request.form.get(f"order_{section['key']}", section["display_order"]) or section["display_order"])}
+                        for section in config["sections"]
+                    ]
+                    template = template_from_config(config, template_id=template_id or None, portfolio_id=portfolio_id)
+                    template_id = save_template(g.db, template, is_default=1 if request.form.get("is_default") == "on" else 0)
+                    flash("Template guardado.", "success")
+                g.db.commit()
+            except Exception as exc:
+                g.db.rollback()
+                flash(f"Falha no template: {exc}", "error")
+            return redirect(url_for("report_templates", template_id=template_id))
+        templates = list_templates(g.db, include_inactive=True)
+        selected_id = int(request.args.get("template_id", templates[0]["id"] if templates else 0) or 0)
+        selected_template = get_template(g.db, selected_id) if selected_id else default_template("Portfolio executivo")
+        groups = query_all(g.db, "SELECT * FROM portfolio_groups ORDER BY name COLLATE NOCASE")
+        return render_template("report_templates.html", title="Templates de relatorio", templates=templates, selected_template=selected_template, groups=groups)
+
+    @app.route("/report-generation", methods=["GET", "POST"])
+    def report_generation():
+        output_dir = UPLOAD_DIR / "generated_reports"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if request.method == "POST":
+            report_type = request.form.get("report_type", "portfolio")
+            template_id = int(request.form.get("template_id", "0") or 0)
+            portfolio_id = int(request.form.get("portfolio_id", "0") or 0) or None
+            snapshot_id = int(request.form.get("snapshot_id", "0") or 0) or None
+            formats = request.form.getlist("formats") or ["pdf"]
+            try:
+                template = get_template(g.db, template_id) if template_id else get_default_template(g.db, report_type, portfolio_id)
+                if template.report_type != report_type:
+                    raise ValueError("Template de tipo incompatível.")
+                rendered = []
+                result = None
+                asset_id = None
+                if report_type == "portfolio":
+                    if snapshot_id:
+                        result = get_portfolio_snapshot_result(g.db, snapshot_id)
+                        if result is None or (portfolio_id and result.portfolio_id != portfolio_id):
+                            raise ValueError("Snapshot invalido.")
+                    else:
+                        if not portfolio_id:
+                            raise ValueError("Portfolio obrigatorio.")
+                        group = g.db.execute("SELECT * FROM portfolio_groups WHERE id = ?", (portfolio_id,)).fetchone()
+                        if not group:
+                            raise ValueError("Portfolio invalido.")
+                        profile_id = int(request.form.get("profile_id", "0") or 0)
+                        profile = get_portfolio_report_profile(g.db, profile_id) if profile_id else get_default_portfolio_report_profile(g.db, portfolio_id)
+                        result = prepare_portfolio_report(
+                            g.db,
+                            portfolio_id=portfolio_id,
+                            portfolio_name=group["name"],
+                            profile=profile,
+                            period_type=request.form.get("period_type", "monthly"),
+                            report_month=normalize_report_month(request.form.get("report_month", "")),
+                            year=request.form.get("report_year") or normalize_report_month(request.form.get("report_month", ""))[:4],
+                            quarter=request.form.get("report_quarter"),
+                            semester=request.form.get("report_semester"),
+                            comparison=request.form.get("comparison", ""),
+                            profile_version=latest_portfolio_report_profile_version(g.db, profile.id),
+                        )
+                    if "pdf" in formats:
+                        rendered.append(render_portfolio_pdf(result, template))
+                    if "excel" in formats:
+                        rendered.append(render_portfolio_excel(result, template))
+                    period_type = result.period.period_type.value
+                    period_start = result.period.start.isoformat()
+                    period_end = result.period.end.isoformat()
+                    portfolio_id = result.portfolio_id
+                else:
+                    asset_ids = [int(item) for item in request.form.getlist("asset_ids") if str(item).isdigit()]
+                    if not asset_ids:
+                        asset_ids = [int(request.form.get("asset_id", "0") or 0)]
+                    asset_ids = [item for item in asset_ids if item]
+                    if len(asset_ids) > MAX_BATCH_ASSETS:
+                        raise ValueError("Demasiadas instalacoes no mesmo run.")
+                    for asset_id in asset_ids:
+                        billing_config = get_asset_billing_config(g.db, asset_id, ReportType.EPC)
+                        report = build_local_customer_production_report(
+                            g.db,
+                            asset_id=asset_id,
+                            report_month=normalize_report_month(request.form.get("report_month", "")),
+                            electricity_price=float(billing_config.electricity_price_eur_kwh),
+                            sell_price=float(billing_config.export_price_eur_kwh),
+                            billing_config=billing_config,
+                        )
+                        if report is None:
+                            raise ValueError(f"Sem dados para a instalacao {asset_id}.")
+                        if "pdf" in formats:
+                            rendered.append(render_individual_pdf(report, template))
+                    period_type = "monthly"
+                    period_start = normalize_report_month(request.form.get("report_month", "")) + "-01"
+                    period_end = period_start
+                requested_count = len(rendered)
+                run_id = create_generation_run(
+                    g.db,
+                    template_id=template.id,
+                    template_version=latest_template_version(g.db, template.id),
+                    report_type=report_type,
+                    portfolio_id=portfolio_id,
+                    asset_id=asset_id,
+                    snapshot_id=snapshot_id,
+                    period_type=period_type,
+                    period_start=period_start,
+                    period_end=period_end,
+                    requested_count=requested_count,
+                )
+                if "zip" in formats or len(rendered) > 1:
+                    rendered.append(render_zip(rendered, filename=f"run_{run_id}.zip"))
+                completed = 0
+                for file in rendered:
+                    path, _ = store_rendered_file(output_dir, run_id, file)
+                    add_generated_file(
+                        g.db,
+                        run_id=run_id,
+                        fmt=file.fmt,
+                        filename=file.filename,
+                        relative_path=store_runtime_relative_path(path),
+                        sha256=file.sha256,
+                        size_bytes=file.size_bytes,
+                        portfolio_id=portfolio_id,
+                        asset_id=asset_id,
+                        snapshot_id=snapshot_id,
+                    )
+                    completed += 1
+                finish_generation_run(g.db, run_id, status="completed", completed_count=completed, failed_count=0)
+                g.db.commit()
+                flash(f"Run #{run_id} concluido com {completed} ficheiros.", "success")
+            except Exception as exc:
+                g.db.rollback()
+                flash(f"Falha na geracao: {exc}", "error")
+            return redirect(url_for("report_generation"))
+        groups = query_all(g.db, "SELECT * FROM portfolio_groups ORDER BY name COLLATE NOCASE")
+        assets = query_all(g.db, "SELECT id, project_name FROM assets WHERE active_contract = 'yes' OR active_contract IS NULL ORDER BY project_name COLLATE NOCASE LIMIT 200")
+        templates = list_templates(g.db)
+        profiles = list_portfolio_report_profiles(g.db)
+        runs = list_generation_runs(g.db, limit=20)
+        files = list_generated_files(g.db)
+        return render_template("report_generation.html", title="Geracao de relatorios", groups=groups, assets=assets, templates=templates, profiles=profiles, runs=runs, files=files)
+
+    @app.route("/report-generation/preview")
+    def report_generation_preview():
+        portfolio_id = int(request.args.get("portfolio_id", "0") or 0)
+        template_id = int(request.args.get("template_id", "0") or 0)
+        group = g.db.execute("SELECT * FROM portfolio_groups WHERE id = ?", (portfolio_id,)).fetchone()
+        if not group:
+            abort(404)
+        template = get_template(g.db, template_id) if template_id else get_default_template(g.db, "portfolio", portfolio_id)
+        profile = get_default_portfolio_report_profile(g.db, portfolio_id)
+        report_month = normalize_report_month(request.args.get("report_month", ""))
+        result = prepare_portfolio_report(g.db, portfolio_id=portfolio_id, portfolio_name=group["name"], profile=profile, report_month=report_month)
+        return render_portfolio_html(result, template)
+
+    @app.route("/report-generation/files/<int:file_id>")
+    def download_generated_report(file_id: int):
+        row = get_generated_file(g.db, file_id)
+        if row is None:
+            abort(404)
+        path = resolve_runtime_file_path_within(row["relative_path"], UPLOAD_DIR / "generated_reports")
+        if path is None or not path.exists():
+            abort(404)
+        mimetype = "application/pdf" if row["format"] == "pdf" else ("application/zip" if row["format"] == "zip" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        return send_file(path, as_attachment=True, download_name=row["filename"], mimetype=mimetype)
+
     @app.route("/integrations", methods=["GET", "POST"])
     def integrations() -> str:
         provider = INTEGRATION_PROVIDER_FUSIONSOLAR
@@ -4884,6 +5113,7 @@ def ensure_database(path: str) -> None:
         ensure_predefined_export_templates(conn)
         ensure_portfolio_management_schema(conn)
         ensure_portfolio_reporting_schema(conn)
+        ensure_report_template_schema(conn)
         ensure_portfolio_seed_data(conn)
         ensure_alert_settings_defaults(conn)
         ensure_billing_config_schema(conn)

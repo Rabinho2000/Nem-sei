@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">Reporting</p>
+    <h2>Geração de relatórios</h2>
+    <p class="muted">PDF, Excel e ZIP gerados a partir dos objetos canónicos e snapshots.</p>
+  </div>
+  <div class="hero-actions">
+    <a class="button secondary" href="{{ url_for('report_templates') }}">Templates</a>
+  </div>
+</section>
+
+<section class="card">
+  <form method="post" class="stack-form">
+    <div class="grid four">
+      <label>Tipo
+        <select name="report_type">
+          <option value="portfolio">Portefólio</option>
+          <option value="individual">Individual</option>
+        </select>
+      </label>
+      <label>Template
+        <select name="template_id">
+          {% for template in templates %}
+            <option value="{{ template.id }}">{{ template.name }} · {{ template.report_type }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Portefólio
+        <select name="portfolio_id">
+          <option value="">-</option>
+          {% for group in groups %}
+            <option value="{{ group.id }}">{{ group.name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Perfil
+        <select name="profile_id">
+          <option value="">Default</option>
+          {% for profile in profiles %}
+            <option value="{{ profile.id }}">{{ profile.name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Instalação individual
+        <select name="asset_id">
+          <option value="">-</option>
+          {% for asset in assets %}
+            <option value="{{ asset.id }}">{{ asset.project_name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Snapshot
+        <input name="snapshot_id" inputmode="numeric" placeholder="Opcional">
+      </label>
+      <label>Mês
+        <input type="month" name="report_month" value="{{ current_month or '' }}">
+      </label>
+      <label>Período
+        <select name="period_type">
+          <option value="monthly">Mensal</option>
+          <option value="quarterly">Trimestral</option>
+          <option value="semiannual">Semestral</option>
+          <option value="annual">Anual</option>
+        </select>
+      </label>
+    </div>
+    <div class="inline-form">
+      <label><input type="checkbox" name="formats" value="pdf" checked> PDF</label>
+      <label><input type="checkbox" name="formats" value="excel"> Excel</label>
+      <label><input type="checkbox" name="formats" value="zip"> ZIP</label>
+    </div>
+    <button class="button" type="submit">Gerar</button>
+  </form>
+</section>
+
+<section class="card">
+  <div class="section-title">
+    <h3>Histórico</h3>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Run</th><th>Template</th><th>Tipo</th><th>Estado</th><th>Concluídos</th><th>Falhados</th><th>Criado</th></tr></thead>
+      <tbody>
+        {% for run in runs %}
+          <tr>
+            <td>{{ run.id }}</td>
+            <td>{{ run.template_name or '-' }}</td>
+            <td>{{ run.report_type }}</td>
+            <td>{{ run.status }}</td>
+            <td>{{ run.completed_count }}</td>
+            <td>{{ run.failed_count }}</td>
+            <td>{{ run.created_at }}</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="7" class="muted">Sem runs.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="card">
+  <div class="section-title">
+    <h3>Ficheiros</h3>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>ID</th><th>Run</th><th>Formato</th><th>Nome</th><th>Tamanho</th><th>Download</th></tr></thead>
+      <tbody>
+        {% for file in files %}
+          <tr>
+            <td>{{ file.id }}</td>
+            <td>{{ file.run_id }}</td>
+            <td>{{ file.format }}</td>
+            <td>{{ file.filename }}</td>
+            <td>{{ file.size_bytes }}</td>
+            <td><a class="button secondary small" href="{{ url_for('download_generated_report', file_id=file.id) }}">Download</a></td>
+          </tr>
+        {% else %}
+          <tr><td colspan="6" class="muted">Sem ficheiros.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}
