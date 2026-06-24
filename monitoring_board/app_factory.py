@@ -131,15 +131,19 @@ from monitoring_board.report_template_repository import (
     set_default_template,
 )
 from monitoring_board.reporting.portfolio import METRIC_CATALOG, profile_from_config, profile_to_config
-from monitoring_board.reporting.templates import default_template, template_from_config, template_to_config
+from monitoring_board.reporting.templates import default_template, template_from_config, template_to_config, validate_template_scope
 from monitoring_board.services.report_rendering import (
     MAX_BATCH_ASSETS,
+    MAX_BATCH_PERIODS,
+    MAX_TOTAL_OUTPUTS,
+    render_individual_excel,
     render_individual_pdf,
     render_portfolio_excel,
     render_portfolio_html,
     render_portfolio_pdf,
     render_zip,
     store_rendered_file,
+    validate_formats,
 )
 from monitoring_board.services.portfolio_reporting import export_portfolio_result_workbook, prepare_portfolio_report
 from monitoring_board.reporting.billing import decimal_from_value
@@ -155,6 +159,7 @@ from monitoring_board.reporting.availability import (
 from monitoring_board.reporting.models import BillingConfig, InvoiceCandidate, InvoiceStatus, ReportPeriodType, ReportType, ReportingPeriod, TariffType
 from monitoring_board.reporting.periods import (
     ReportingPeriodError,
+    build_period,
     month_bounds,
     monthly_period,
     normalize_report_month as reporting_normalize_report_month,
@@ -3715,109 +3720,78 @@ def create_app() -> Flask:
             template_id = int(request.form.get("template_id", "0") or 0)
             portfolio_id = int(request.form.get("portfolio_id", "0") or 0) or None
             snapshot_id = int(request.form.get("snapshot_id", "0") or 0) or None
-            formats = request.form.getlist("formats") or ["pdf"]
+            raw_formats = request.form.getlist("formats") or ["pdf"]
+            run_id = None
             try:
+                formats = validate_formats(report_type, raw_formats)
+                main_formats = tuple(item for item in formats if item != "zip")
                 template = get_template(g.db, template_id) if template_id else get_default_template(g.db, report_type, portfolio_id)
-                if template.report_type != report_type:
-                    raise ValueError("Template de tipo incompatível.")
-                rendered = []
-                result = None
-                asset_id = None
-                if report_type == "portfolio":
-                    if snapshot_id:
-                        result = get_portfolio_snapshot_result(g.db, snapshot_id)
-                        if result is None or (portfolio_id and result.portfolio_id != portfolio_id):
-                            raise ValueError("Snapshot invalido.")
-                    else:
-                        if not portfolio_id:
-                            raise ValueError("Portfolio obrigatorio.")
-                        group = g.db.execute("SELECT * FROM portfolio_groups WHERE id = ?", (portfolio_id,)).fetchone()
-                        if not group:
-                            raise ValueError("Portfolio invalido.")
-                        profile_id = int(request.form.get("profile_id", "0") or 0)
-                        profile = get_portfolio_report_profile(g.db, profile_id) if profile_id else get_default_portfolio_report_profile(g.db, portfolio_id)
-                        result = prepare_portfolio_report(
-                            g.db,
-                            portfolio_id=portfolio_id,
-                            portfolio_name=group["name"],
-                            profile=profile,
-                            period_type=request.form.get("period_type", "monthly"),
-                            report_month=normalize_report_month(request.form.get("report_month", "")),
-                            year=request.form.get("report_year") or normalize_report_month(request.form.get("report_month", ""))[:4],
-                            quarter=request.form.get("report_quarter"),
-                            semester=request.form.get("report_semester"),
-                            comparison=request.form.get("comparison", ""),
-                            profile_version=latest_portfolio_report_profile_version(g.db, profile.id),
-                        )
-                    if "pdf" in formats:
-                        rendered.append(render_portfolio_pdf(result, template))
-                    if "excel" in formats:
-                        rendered.append(render_portfolio_excel(result, template))
-                    period_type = result.period.period_type.value
-                    period_start = result.period.start.isoformat()
-                    period_end = result.period.end.isoformat()
-                    portfolio_id = result.portfolio_id
-                else:
-                    asset_ids = [int(item) for item in request.form.getlist("asset_ids") if str(item).isdigit()]
-                    if not asset_ids:
-                        asset_ids = [int(request.form.get("asset_id", "0") or 0)]
-                    asset_ids = [item for item in asset_ids if item]
-                    if len(asset_ids) > MAX_BATCH_ASSETS:
-                        raise ValueError("Demasiadas instalacoes no mesmo run.")
-                    for asset_id in asset_ids:
-                        billing_config = get_asset_billing_config(g.db, asset_id, ReportType.EPC)
-                        report = build_local_customer_production_report(
-                            g.db,
-                            asset_id=asset_id,
-                            report_month=normalize_report_month(request.form.get("report_month", "")),
-                            electricity_price=float(billing_config.electricity_price_eur_kwh),
-                            sell_price=float(billing_config.export_price_eur_kwh),
-                            billing_config=billing_config,
-                        )
-                        if report is None:
-                            raise ValueError(f"Sem dados para a instalacao {asset_id}.")
-                        if "pdf" in formats:
-                            rendered.append(render_individual_pdf(report, template))
-                    period_type = "monthly"
-                    period_start = normalize_report_month(request.form.get("report_month", "")) + "-01"
-                    period_end = period_start
-                requested_count = len(rendered)
+                if template is None:
+                    raise ValueError("Template invalido.")
+                validate_template_scope(template, report_type, portfolio_id=portfolio_id)
+                if report_type == "portfolio" and not snapshot_id and not portfolio_id:
+                    raise ValueError("Portfolio obrigatorio.")
+                jobs = build_generation_jobs(request.form, report_type, main_formats)
+                if not jobs:
+                    raise ValueError("Pedido sem outputs principais.")
+                if len(jobs) > MAX_TOTAL_OUTPUTS:
+                    raise ValueError("Demasiados outputs no mesmo run.")
+                first_period = jobs[0]["period"]
                 run_id = create_generation_run(
                     g.db,
                     template_id=template.id,
                     template_version=latest_template_version(g.db, template.id),
                     report_type=report_type,
                     portfolio_id=portfolio_id,
-                    asset_id=asset_id,
+                    asset_id=jobs[0].get("asset_id"),
                     snapshot_id=snapshot_id,
-                    period_type=period_type,
-                    period_start=period_start,
-                    period_end=period_end,
-                    requested_count=requested_count,
+                    period_type=first_period["period_type"],
+                    period_start=first_period["period_start"],
+                    period_end=first_period["period_end"],
+                    requested_count=len(jobs),
                 )
-                if "zip" in formats or len(rendered) > 1:
-                    rendered.append(render_zip(rendered, filename=f"run_{run_id}.zip"))
-                completed = 0
-                for file in rendered:
-                    path, _ = store_rendered_file(output_dir, run_id, file)
-                    add_generated_file(
-                        g.db,
-                        run_id=run_id,
-                        fmt=file.fmt,
-                        filename=file.filename,
-                        relative_path=store_runtime_relative_path(path),
-                        sha256=file.sha256,
-                        size_bytes=file.size_bytes,
-                        portfolio_id=portfolio_id,
-                        asset_id=asset_id,
-                        snapshot_id=snapshot_id,
-                    )
-                    completed += 1
-                finish_generation_run(g.db, run_id, status="completed", completed_count=completed, failed_count=0)
                 g.db.commit()
-                flash(f"Run #{run_id} concluido com {completed} ficheiros.", "success")
+                completed = 0
+                failed = 0
+                skipped = 0
+                warnings: list[str] = []
+                completed_files = []
+                if report_type == "portfolio":
+                    for job in jobs:
+                        try:
+                            result = build_portfolio_generation_result(g.db, request.form, portfolio_id, snapshot_id, job["period"])
+                            if snapshot_id:
+                                portfolio_id = result.portfolio_id
+                            rendered = render_portfolio_pdf(result, template) if job["format"] == "pdf" else render_portfolio_excel(result, template)
+                            completed_files.append(register_rendered_generation_file(g.db, output_dir, run_id, rendered, snapshot_id=snapshot_id))
+                            completed += 1
+                            warnings.extend(rendered.warnings)
+                        except Exception as exc:
+                            failed += 1
+                            add_failed_generation_file(g.db, run_id, job, str(exc), portfolio_id=portfolio_id, snapshot_id=snapshot_id)
+                else:
+                    for job in jobs:
+                        try:
+                            report = build_individual_generation_report(g.db, job["asset_id"], job["period"])
+                            rendered = render_individual_pdf(report, template) if job["format"] == "pdf" else render_individual_excel(report, template)
+                            completed_files.append(register_rendered_generation_file(g.db, output_dir, run_id, rendered))
+                            completed += 1
+                            warnings.extend(rendered.warnings)
+                        except Exception as exc:
+                            failed += 1
+                            add_failed_generation_file(g.db, run_id, job, str(exc), asset_id=job.get("asset_id"))
+                if "zip" in formats and completed_files:
+                    zip_file = render_zip(completed_files, filename=f"run_{run_id}.zip")
+                    register_rendered_generation_file(g.db, output_dir, run_id, zip_file)
+                status = "completed" if completed and not failed else ("partial" if completed and failed else "failed")
+                finish_generation_run(g.db, run_id, status=status, completed_count=completed, failed_count=failed, skipped_count=skipped, warnings=sorted(set(warnings)), error_message="" if completed else "Todos os outputs falharam.")
+                g.db.commit()
+                flash(f"Run #{run_id} terminado: {completed} concluídos, {failed} falhados.", "success" if status == "completed" else "warning")
             except Exception as exc:
                 g.db.rollback()
+                if run_id:
+                    finish_generation_run(g.db, run_id, status="failed", completed_count=0, failed_count=0, error_message=str(exc))
+                    g.db.commit()
                 flash(f"Falha na geracao: {exc}", "error")
             return redirect(url_for("report_generation"))
         groups = query_all(g.db, "SELECT * FROM portfolio_groups ORDER BY name COLLATE NOCASE")
@@ -3832,13 +3806,35 @@ def create_app() -> Flask:
     def report_generation_preview():
         portfolio_id = int(request.args.get("portfolio_id", "0") or 0)
         template_id = int(request.args.get("template_id", "0") or 0)
+        template = get_template(g.db, template_id) if template_id else get_default_template(g.db, "portfolio", portfolio_id)
+        if template is None:
+            abort(404)
+        validate_template_scope(template, "portfolio", portfolio_id=portfolio_id)
+        snapshot_id = int(request.args.get("snapshot_id", "0") or 0)
+        if snapshot_id:
+            result = get_portfolio_snapshot_result(g.db, snapshot_id)
+            if result is None or (portfolio_id and result.portfolio_id != portfolio_id):
+                abort(404)
+            return render_portfolio_html(result, template)
         group = g.db.execute("SELECT * FROM portfolio_groups WHERE id = ?", (portfolio_id,)).fetchone()
         if not group:
             abort(404)
-        template = get_template(g.db, template_id) if template_id else get_default_template(g.db, "portfolio", portfolio_id)
-        profile = get_default_portfolio_report_profile(g.db, portfolio_id)
+        profile_id = int(request.args.get("profile_id", "0") or 0)
+        profile = get_portfolio_report_profile(g.db, profile_id) if profile_id else get_default_portfolio_report_profile(g.db, portfolio_id)
         report_month = normalize_report_month(request.args.get("report_month", ""))
-        result = prepare_portfolio_report(g.db, portfolio_id=portfolio_id, portfolio_name=group["name"], profile=profile, report_month=report_month)
+        period_job = parse_generation_periods(request.args)[0]
+        result = prepare_portfolio_report(
+            g.db,
+            portfolio_id=portfolio_id,
+            portfolio_name=group["name"],
+            profile=profile,
+            period_type=period_job["period_type"],
+            report_month=report_month,
+            year=period_job.get("report_year") or report_month[:4],
+            quarter=period_job.get("report_quarter"),
+            semester=period_job.get("report_semester"),
+            comparison=request.args.get("comparison", ""),
+        )
         return render_portfolio_html(result, template)
 
     @app.route("/report-generation/files/<int:file_id>")
@@ -3849,6 +3845,13 @@ def create_app() -> Flask:
         path = resolve_runtime_file_path_within(row["relative_path"], UPLOAD_DIR / "generated_reports")
         if path is None or not path.exists():
             abort(404)
+        if path.stat().st_size != int(row["size_bytes"] or 0):
+            abort(404)
+        if row["sha256"]:
+            import hashlib
+
+            if hashlib.sha256(path.read_bytes()).hexdigest() != row["sha256"]:
+                abort(404)
         mimetype = "application/pdf" if row["format"] == "pdf" else ("application/zip" if row["format"] == "zip" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         return send_file(path, as_attachment=True, download_name=row["filename"], mimetype=mimetype)
 
@@ -8697,6 +8700,167 @@ def export_customer_production_pdf(report: dict[str, Any]):
     period_slug = str(report.get("period_label") or report["month_start"].strftime("%m-%Y")).replace(" ", "_").replace("/", "-")
     filename = f"Relatorio_{model}_{safe_name}_{period_slug}.pdf"
     return send_file(buffer, as_attachment=True, download_name=filename, mimetype="application/pdf")
+
+
+def build_generation_jobs(form: Any, report_type: str, main_formats: tuple[str, ...]) -> list[dict[str, Any]]:
+    periods = parse_generation_periods(form)
+    jobs: list[dict[str, Any]] = []
+    if report_type == "individual":
+        asset_ids = [int(item) for item in form.getlist("asset_ids") if str(item).isdigit()]
+        if not asset_ids:
+            asset_ids = [int(form.get("asset_id", "0") or 0)]
+        asset_ids = sorted({item for item in asset_ids if item})
+        if not asset_ids:
+            raise ValueError("Instalação obrigatória.")
+        if len(asset_ids) > MAX_BATCH_ASSETS:
+            raise ValueError("Demasiadas instalacoes no mesmo run.")
+        for asset_id in asset_ids:
+            for period in periods:
+                for fmt in main_formats:
+                    jobs.append({"asset_id": asset_id, "period": period, "format": fmt})
+    else:
+        for period in periods:
+            for fmt in main_formats:
+                jobs.append({"period": period, "format": fmt})
+    if len(jobs) > MAX_TOTAL_OUTPUTS:
+        raise ValueError("Demasiados outputs no mesmo run.")
+    return jobs
+
+
+def parse_generation_periods(form: Any) -> list[dict[str, str]]:
+    period_type = str(form.get("period_type", "monthly") or "monthly")
+    raw_months = form.getlist("report_months")
+    if raw_months:
+        raw_months = [part for item in raw_months for part in re.split(r"[\s,;]+", str(item)) if part]
+    elif form.get("report_months"):
+        raw_months = re.split(r"[\s,;]+", str(form.get("report_months")))
+    if period_type == "monthly":
+        months = [normalize_report_month(item) for item in raw_months if str(item).strip()]
+        if not months:
+            months = [normalize_report_month(form.get("report_month", ""))]
+        months = list(dict.fromkeys(months))
+        if len(months) > MAX_BATCH_PERIODS:
+            raise ValueError("Demasiados periodos no mesmo run.")
+        periods = []
+        for month in months:
+            period = build_period("monthly", report_month=month)
+            periods.append({"period_type": "monthly", "report_month": month, "period_start": period.start.isoformat(), "period_end": period.end.isoformat()})
+        return periods
+    if len(raw_months) > 1:
+        raise ValueError("Periodos estruturados multiplos devem ser submetidos separadamente.")
+    period = build_period(
+        period_type,
+        year=form.get("report_year") or normalize_report_month(form.get("report_month", ""))[:4],
+        quarter=form.get("report_quarter"),
+        semester=form.get("report_semester"),
+    )
+    return [
+        {
+            "period_type": period_type,
+            "report_month": period.start.strftime("%Y-%m"),
+            "report_year": str(period.start.year),
+            "report_quarter": str(((period.start.month - 1) // 3) + 1),
+            "report_semester": "1" if period.start.month == 1 else "2",
+            "period_start": period.start.isoformat(),
+            "period_end": period.end.isoformat(),
+        }
+    ]
+
+
+def build_portfolio_generation_result(conn: sqlite3.Connection, form: Any, portfolio_id: int | None, snapshot_id: int | None, period_job: dict[str, str]):
+    if snapshot_id:
+        result = get_portfolio_snapshot_result(conn, snapshot_id)
+        if result is None or (portfolio_id and result.portfolio_id != portfolio_id):
+            raise ValueError("Snapshot invalido.")
+        return result
+    if not portfolio_id:
+        raise ValueError("Portfolio obrigatorio.")
+    group = conn.execute("SELECT * FROM portfolio_groups WHERE id = ?", (portfolio_id,)).fetchone()
+    if not group:
+        raise ValueError("Portfolio invalido.")
+    profile_id = int(form.get("profile_id", "0") or 0)
+    profile = get_portfolio_report_profile(conn, profile_id) if profile_id else get_default_portfolio_report_profile(conn, portfolio_id)
+    return prepare_portfolio_report(
+        conn,
+        portfolio_id=portfolio_id,
+        portfolio_name=group["name"],
+        profile=profile,
+        period_type=period_job["period_type"],
+        report_month=period_job.get("report_month"),
+        year=period_job.get("report_year") or period_job["period_start"][:4],
+        quarter=period_job.get("report_quarter"),
+        semester=period_job.get("report_semester"),
+        comparison=form.get("comparison", ""),
+        profile_version=latest_portfolio_report_profile_version(conn, profile.id),
+    )
+
+
+def build_individual_generation_report(conn: sqlite3.Connection, asset_id: int, period_job: dict[str, str]) -> dict[str, Any]:
+    period = build_period(
+        period_job["period_type"],
+        report_month=period_job.get("report_month"),
+        year=period_job.get("report_year") or period_job["period_start"][:4],
+        quarter=period_job.get("report_quarter"),
+        semester=period_job.get("report_semester"),
+    )
+    billing_config = get_asset_billing_config(conn, asset_id, ReportType.EPC)
+    report = build_local_customer_production_report(
+        conn,
+        asset_id=asset_id,
+        report_month=period.start.strftime("%Y-%m"),
+        electricity_price=float(billing_config.electricity_price_eur_kwh),
+        sell_price=float(billing_config.export_price_eur_kwh),
+        billing_config=billing_config,
+        period=period,
+    )
+    if report is None:
+        raise ValueError(f"Sem dados para a instalacao {asset_id}.")
+    report["asset_id"] = asset_id
+    report["engine_version"] = "individual-report-v1"
+    return report
+
+
+def register_rendered_generation_file(conn: sqlite3.Connection, output_dir: Path, run_id: int, file, *, snapshot_id: int | None = None):
+    path, _ = store_rendered_file(output_dir, run_id, file)
+    add_generated_file(
+        conn,
+        run_id=run_id,
+        fmt=file.fmt,
+        filename=path.name,
+        relative_path=store_runtime_relative_path(path),
+        sha256=file.sha256,
+        size_bytes=file.size_bytes,
+        portfolio_id=file.portfolio_id,
+        asset_id=file.asset_id,
+        snapshot_id=snapshot_id or file.snapshot_id,
+        period_type=file.period_type,
+        period_start=file.period_start,
+        period_end=file.period_end,
+        is_auxiliary=1 if file.is_auxiliary else 0,
+        warnings=list(file.warnings),
+    )
+    return file
+
+
+def add_failed_generation_file(conn: sqlite3.Connection, run_id: int, job: dict[str, Any], error: str, *, portfolio_id: int | None = None, asset_id: int | None = None, snapshot_id: int | None = None) -> None:
+    period = job.get("period") or {}
+    add_generated_file(
+        conn,
+        run_id=run_id,
+        fmt=str(job.get("format") or ""),
+        filename="failed",
+        relative_path="",
+        sha256="",
+        size_bytes=0,
+        portfolio_id=portfolio_id,
+        asset_id=asset_id,
+        snapshot_id=snapshot_id,
+        period_type=period.get("period_type", ""),
+        period_start=period.get("period_start", ""),
+        period_end=period.get("period_end", ""),
+        status="failed",
+        error_message=error[:500],
+    )
 
 
 def export_rows_file(

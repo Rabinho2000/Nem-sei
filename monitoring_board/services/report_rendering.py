@@ -10,19 +10,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from openpyxl import Workbook
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import mm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 from monitoring_board.reporting.portfolio import METRIC_CATALOG, PortfolioReportResult
-from monitoring_board.reporting.templates import ReportTemplate
+from monitoring_board.reporting.templates import ReportTemplate, enabled_sections_in_order
 from monitoring_board.services.portfolio_reporting import export_portfolio_result_workbook, format_cell
 
 
 MAX_BATCH_ASSETS = 25
 MAX_BATCH_PERIODS = 12
 MAX_ZIP_FILES = 80
+MAX_TOTAL_OUTPUTS = 120
+MAX_RENDERED_FILE_BYTES = 25 * 1024 * 1024
 RESERVED_WINDOWS_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{index}" for index in range(1, 10)), *(f"LPT{index}" for index in range(1, 10))}
 
 
@@ -32,6 +36,14 @@ class RenderedFile:
     content: bytes
     mimetype: str
     fmt: str
+    asset_id: int | None = None
+    portfolio_id: int | None = None
+    snapshot_id: int | None = None
+    period_type: str = ""
+    period_start: str = ""
+    period_end: str = ""
+    is_auxiliary: bool = False
+    warnings: tuple[str, ...] = ()
 
     @property
     def sha256(self) -> str:
@@ -59,94 +71,197 @@ def safe_filename(value: str, *, extension: str = "") -> str:
     return cleaned
 
 
+def validate_formats(report_type: str, formats: list[str]) -> tuple[str, ...]:
+    allowed = {"pdf", "excel", "zip"}
+    selected = tuple(dict.fromkeys(item.strip().lower() for item in formats if item.strip()))
+    if not selected:
+        raise ValueError("no_output_formats")
+    unknown = set(selected) - allowed
+    if unknown:
+        raise ValueError("unsupported_output_format")
+    main = tuple(item for item in selected if item != "zip")
+    if "zip" in selected and not main:
+        raise ValueError("zip_requires_main_format")
+    if report_type == "individual" and any(item not in {"pdf", "excel", "zip"} for item in selected):
+        raise ValueError("unsupported_individual_format")
+    if report_type == "portfolio" and any(item not in {"pdf", "excel", "zip"} for item in selected):
+        raise ValueError("unsupported_portfolio_format")
+    return selected
+
+
 def render_portfolio_html(result: PortfolioReportResult, template: ReportTemplate) -> str:
     title = html.escape(expand_pattern(template.title, result=result) or f"{result.portfolio_name} - {result.period.label}")
     parts = [
-        "<article class='report-preview'>",
+        f"<article class='report-preview' style='--primary:{html.escape(template.branding.primary_color)};--secondary:{html.escape(template.branding.secondary_color)}'>",
         f"<h1>{title}</h1>",
         f"<p>{html.escape(template.subtitle)}</p>",
-        f"<p>{html.escape(template.branding.company_name)} · {html.escape(result.period.label)}</p>",
+        f"<p>{html.escape(template.branding.company_name)} - {html.escape(template.branding.client_name)} - {html.escape(result.period.label)}</p>",
     ]
-    enabled = {section.key for section in template.sections if section.enabled}
-    if "kpis" in enabled or "executive_summary" in enabled:
-        parts.append("<section><h2>Resumo</h2><dl>")
-        for key, value in result.summary.values.items():
-            label = METRIC_CATALOG[key].label if key in METRIC_CATALOG else key
-            parts.append(f"<dt>{html.escape(label)}</dt><dd>{html.escape(str(format_cell(value)))}</dd>")
-        parts.append("</dl></section>")
-    if result.comparison and "comparison" in enabled:
-        parts.append("<section><h2>Comparacao</h2><table><thead><tr><th>Metrica</th><th>Atual</th><th>Anterior</th><th>Diferenca</th></tr></thead><tbody>")
-        for key, item in result.comparison.values.items():
-            label = METRIC_CATALOG[key].label if key in METRIC_CATALOG else key
-            parts.append(f"<tr><td>{html.escape(label)}</td><td>{html.escape(str(item.get('current')))}</td><td>{html.escape(str(item.get('previous')))}</td><td>{html.escape(str(item.get('delta')))}</td></tr>")
-        parts.append("</tbody></table></section>")
-    if "installations_table" in enabled:
-        parts.append("<section><h2>Instalacoes</h2><table><thead><tr>")
-        for column in result.columns:
-            parts.append(f"<th>{html.escape(column.label)}</th>")
-        parts.append("</tr></thead><tbody>")
-        for row in result.rows:
-            parts.append("<tr>")
-            for column in result.columns:
-                parts.append(f"<td>{html.escape(str(format_cell(row.values.get(column.metric_key)) or '-'))}</td>")
-            parts.append("</tr>")
-        parts.append("</tbody></table></section>")
-    if "quality" in enabled or "warnings" in enabled:
-        parts.append(f"<section><h2>Qualidade</h2><p>Cobertura global: {result.coverage.global_pct}%</p>")
-        if result.warnings:
-            parts.append(f"<p>Warnings: {html.escape(', '.join(result.warnings))}</p>")
-        parts.append("</section>")
+    for section in enabled_sections_in_order(template):
+        parts.append(render_portfolio_html_section(result, section.key, section.title))
+    if template.branding.footer or template.branding.disclaimer:
+        parts.append(f"<footer>{html.escape(template.branding.footer)} {html.escape(template.branding.contacts)} {html.escape(template.branding.disclaimer)}</footer>")
     parts.append("</article>")
     return "".join(parts)
+
+
+def render_portfolio_html_section(result: PortfolioReportResult, key: str, title: str) -> str:
+    if key in {"cover", "executive_summary", "kpis"}:
+        body = "".join(f"<dt>{html.escape(METRIC_CATALOG[item].label if item in METRIC_CATALOG else item)}</dt><dd>{html.escape(str(format_cell(value)))}</dd>" for item, value in result.summary.values.items())
+        return f"<section data-section='{html.escape(key)}'><h2>{html.escape(title)}</h2><dl>{body}</dl></section>"
+    if key == "comparison":
+        if not result.comparison:
+            return ""
+        rows = "".join(f"<tr><td>{html.escape(METRIC_CATALOG[item].label if item in METRIC_CATALOG else item)}</td><td>{html.escape(str(values.get('current')))}</td><td>{html.escape(str(values.get('previous')))}</td><td>{html.escape(str(values.get('delta')))}</td></tr>" for item, values in result.comparison.values.items())
+        return f"<section data-section='comparison'><h2>{html.escape(title)}</h2><table><tbody>{rows}</tbody></table></section>"
+    if key == "installations_table":
+        header = "".join(f"<th>{html.escape(column.label)}</th>" for column in result.columns)
+        rows = "".join("<tr>" + "".join(f"<td>{html.escape(str(format_cell(row.values.get(column.metric_key)) or '-'))}</td>" for column in result.columns) + "</tr>" for row in result.rows)
+        return f"<section data-section='installations_table'><h2>{html.escape(title)}</h2><table><thead><tr>{header}</tr></thead><tbody>{rows}</tbody></table></section>"
+    if key in {"availability", "quality", "warnings", "metadata", "financial", "top_performers", "underperformers"}:
+        warnings = html.escape(", ".join(result.warnings) or "sem warnings")
+        return f"<section data-section='{html.escape(key)}'><h2>{html.escape(title)}</h2><p>Cobertura global: {result.coverage.global_pct}%</p><p>{warnings}</p></section>"
+    return ""
 
 
 def render_portfolio_pdf(result: PortfolioReportResult, template: ReportTemplate) -> RenderedFile:
     buffer = io.BytesIO()
     pagesize = landscape(A4) if template.orientation == "landscape" else A4
-    doc = SimpleDocTemplate(buffer, pagesize=pagesize, leftMargin=32, rightMargin=32, topMargin=32, bottomMargin=28)
+    top, right, bottom, left = template.margins_mm
+    doc = SimpleDocTemplate(buffer, pagesize=pagesize, leftMargin=left * mm, rightMargin=right * mm, topMargin=top * mm, bottomMargin=bottom * mm)
     styles = getSampleStyleSheet()
     story: list[Any] = [
         Paragraph(expand_pattern(template.title, result=result) or f"{result.portfolio_name} - {result.period.label}", styles["Title"]),
         Paragraph(template.subtitle or template.branding.company_name, styles["Normal"]),
         Spacer(1, 12),
     ]
-    enabled = {section.key for section in template.sections if section.enabled}
-    if "kpis" in enabled or "executive_summary" in enabled:
-        story.append(Paragraph("Resumo", styles["Heading2"]))
-        story.append(Table([["Metrica", "Valor"], *[[METRIC_CATALOG[key].label if key in METRIC_CATALOG else key, str(format_cell(value))] for key, value in result.summary.values.items()]], hAlign="LEFT"))
+    for section in enabled_sections_in_order(template):
+        append_portfolio_pdf_section(story, styles, result, template, section.key, section.title)
+    doc.build(story, onFirstPage=page_footer(template), onLaterPages=page_footer(template))
+    return checked_file(
+        RenderedFile(
+            filename=safe_filename(expand_pattern(template.filename_pattern, result=result), extension="pdf"),
+            content=buffer.getvalue(),
+            mimetype="application/pdf",
+            fmt="pdf",
+            portfolio_id=result.portfolio_id,
+            period_type=result.period.period_type.value,
+            period_start=result.period.start.isoformat(),
+            period_end=result.period.end.isoformat(),
+            warnings=tuple(result.warnings),
+        )
+    )
+
+
+def append_portfolio_pdf_section(story: list[Any], styles: Any, result: PortfolioReportResult, template: ReportTemplate, key: str, title: str) -> None:
+    if key in {"cover", "executive_summary", "kpis"}:
+        story.append(Paragraph(title, styles["Heading2"]))
+        story.append(Table([["Metrica", "Valor"], *[[METRIC_CATALOG[item].label if item in METRIC_CATALOG else item, str(format_cell(value))] for item, value in result.summary.values.items()]], hAlign="LEFT", repeatRows=1))
         story.append(Spacer(1, 10))
-    if result.comparison and "comparison" in enabled:
-        story.append(Paragraph("Comparacao", styles["Heading2"]))
-        story.append(Table([["Metrica", "Atual", "Anterior", "Diferenca"], *[[METRIC_CATALOG[key].label if key in METRIC_CATALOG else key, str(item.get("current")), str(item.get("previous")), str(item.get("delta"))] for key, item in result.comparison.values.items()]], hAlign="LEFT"))
+    elif key == "comparison" and result.comparison:
+        story.append(Paragraph(title, styles["Heading2"]))
+        story.append(Table([["Metrica", "Atual", "Anterior", "Diferenca"], *[[METRIC_CATALOG[item].label if item in METRIC_CATALOG else item, str(values.get("current")), str(values.get("previous")), str(values.get("delta"))] for item, values in result.comparison.values.items()]], hAlign="LEFT", repeatRows=1))
         story.append(Spacer(1, 10))
-    if "installations_table" in enabled:
-        table_rows = [[column.label for column in result.columns[:10]]]
-        for row in result.rows:
-            table_rows.append([str(format_cell(row.values.get(column.metric_key)) or "-") for column in result.columns[:10]])
-        table = Table(table_rows, repeatRows=1, hAlign="LEFT")
-        table.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(template.branding.primary_color)), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("GRID", (0, 0), (-1, -1), 0.25, colors.lightgrey), ("FONTSIZE", (0, 0), (-1, -1), 7)]))
-        story.append(Paragraph("Instalacoes", styles["Heading2"]))
-        story.append(table)
-    if "quality" in enabled or "warnings" in enabled:
-        story.append(Spacer(1, 10))
-        story.append(Paragraph(f"Cobertura global: {result.coverage.global_pct}%", styles["Normal"]))
-        if result.warnings:
-            story.append(Paragraph("Warnings: " + ", ".join(result.warnings), styles["Normal"]))
-    doc.build(story)
-    return RenderedFile(filename=safe_filename(expand_pattern(template.filename_pattern, result=result), extension="pdf"), content=buffer.getvalue(), mimetype="application/pdf", fmt="pdf")
+    elif key == "installations_table":
+        first_column = result.columns[:1]
+        metric_columns = result.columns[1:]
+        chunks = [metric_columns[index : index + 8] for index in range(0, len(metric_columns), 8)] or [()]
+        for chunk_index, chunk in enumerate(chunks, start=1):
+            columns = tuple(first_column) + tuple(chunk)
+            table_rows = [[column.label for column in columns]]
+            for row in result.rows:
+                table_rows.append([clip(str(format_cell(row.values.get(column.metric_key)) or "-")) for column in columns])
+            table = Table(table_rows, repeatRows=1, hAlign="LEFT")
+            table.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(template.branding.primary_color)), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("GRID", (0, 0), (-1, -1), 0.25, colors.lightgrey), ("FONTSIZE", (0, 0), (-1, -1), 7)]))
+            story.append(Paragraph(f"{title} {chunk_index}/{len(chunks)}", styles["Heading2"]))
+            story.append(table)
+            story.append(Spacer(1, 8))
+    elif key in {"availability", "quality", "warnings", "metadata", "financial", "top_performers", "underperformers"}:
+        story.append(Paragraph(title, styles["Heading2"]))
+        story.append(Paragraph(f"Cobertura global: {result.coverage.global_pct}% - Warnings: {', '.join(result.warnings) or 'sem warnings'}", styles["Normal"]))
+        story.append(Spacer(1, 8))
 
 
 def render_individual_pdf(report: dict[str, Any], template: ReportTemplate) -> RenderedFile:
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=30)
+    top, right, bottom, left = template.margins_mm
+    doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=left * mm, rightMargin=right * mm, topMargin=top * mm, bottomMargin=bottom * mm)
     styles = getSampleStyleSheet()
     asset = report.get("asset") or {}
-    title = (template.title or "{asset} - {period}").format(asset=asset.get("project_name") or asset.get("name") or "Instalacao", period=report.get("period_label") or report.get("report_month") or "")
+    title = expand_individual_pattern(template.title or "{asset} - {period}", report)
+    doc.build([Paragraph(title, styles["Title"]), Paragraph(template.subtitle, styles["Normal"]), Spacer(1, 12), Table(individual_rows(report), hAlign="LEFT", repeatRows=1)], onFirstPage=page_footer(template), onLaterPages=page_footer(template))
+    return checked_file(
+        RenderedFile(
+            filename=safe_filename(expand_individual_pattern(template.filename_pattern or "{asset}_{period}", report), extension="pdf"),
+            content=buffer.getvalue(),
+            mimetype="application/pdf",
+            fmt="pdf",
+            asset_id=int(asset.get("id") or asset.get("asset_id") or report.get("asset_id") or 0) or None,
+            period_type=str(report.get("period_type") or "monthly"),
+            period_start=str(report.get("period_start") or report.get("month_start") or ""),
+            period_end=str(report.get("period_end") or report.get("month_end") or ""),
+            warnings=tuple(report.get("warnings") or report.get("billing_warnings") or ()),
+        )
+    )
+
+
+def render_individual_excel(report: dict[str, Any], template: ReportTemplate) -> RenderedFile:
+    workbook = Workbook()
+    asset = report.get("asset") or {}
+    summary = workbook.active
+    summary.title = "Resumo"
+    summary.append(["Empresa", template.branding.company_name])
+    summary.append(["Cliente", template.branding.client_name])
+    summary.append(["Instalacao", asset.get("project_name") or asset.get("name") or ""])
+    summary.append(["Periodo", report.get("period_label") or report.get("report_month") or ""])
+    summary.append(["Motor", report.get("engine_version") or "individual-report-v1"])
+    energy = workbook.create_sheet("Energia")
+    energy.append(["Metrica", "Valor"])
+    for key in ("production_kwh", "self_use_kwh", "export_kwh", "consumption_kwh", "grid_import_kwh"):
+        energy.append([key, report.get(key)])
+    financial = workbook.create_sheet("Financeiro")
+    financial.append(["Metrica", "Valor"])
+    for key in ("savings_eur", "export_revenue_eur", "solcor_payment_eur", "fixed_monthly_fee_eur", "net_benefit_eur"):
+        financial.append([key, report.get(key)])
+    quality = workbook.create_sheet("Qualidade dos dados")
+    quality.append(["Codigo"])
+    for warning in list(report.get("warnings") or []) + list(report.get("billing_warnings") or []):
+        quality.append([warning])
+    metadata = workbook.create_sheet("Metadados")
+    for key in ("period_type", "period_start", "period_end", "months_count", "tariff_type", "billing_mode", "billing_energy_base"):
+        metadata.append([key, str(report.get(key) or "")])
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    return checked_file(
+        RenderedFile(
+            filename=safe_filename(expand_individual_pattern(template.filename_pattern or "{asset}_{period}", report), extension="xlsx"),
+            content=buffer.getvalue(),
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            fmt="xlsx",
+            asset_id=int(asset.get("id") or asset.get("asset_id") or report.get("asset_id") or 0) or None,
+            period_type=str(report.get("period_type") or "monthly"),
+            period_start=str(report.get("period_start") or report.get("month_start") or ""),
+            period_end=str(report.get("period_end") or report.get("month_end") or ""),
+            warnings=tuple(report.get("warnings") or report.get("billing_warnings") or ()),
+        )
+    )
+
+
+def individual_rows(report: dict[str, Any]) -> list[list[str]]:
     rows = [["Metrica", "Valor"]]
-    for label, key in (("Producao", "production_kwh"), ("Autoconsumo", "self_use_kwh"), ("Excedente", "export_kwh"), ("Beneficio liquido", "net_benefit_eur")):
-        rows.append([label, str(report.get(key, "-"))])
-    doc.build([Paragraph(title, styles["Title"]), Paragraph(template.subtitle, styles["Normal"]), Spacer(1, 12), Table(rows, hAlign="LEFT")])
-    return RenderedFile(filename=safe_filename(f"{asset.get('project_name') or 'Instalacao'}_{report.get('period_label') or 'periodo'}", extension="pdf"), content=buffer.getvalue(), mimetype="application/pdf", fmt="pdf")
+    for label, key in (
+        ("Periodo", "period_label"),
+        ("Producao", "production_kwh"),
+        ("Autoconsumo", "self_use_kwh"),
+        ("Excedente", "export_kwh"),
+        ("Consumo", "consumption_kwh"),
+        ("Importacao", "grid_import_kwh"),
+        ("Pagamento ESCO", "solcor_payment_eur"),
+        ("Mensalidade", "fixed_monthly_fee_eur"),
+        ("Beneficio liquido", "net_benefit_eur"),
+    ):
+        rows.append([label, str(report.get(key, "dados indisponiveis"))])
+    return rows
 
 
 def render_portfolio_excel(result: PortfolioReportResult, template: ReportTemplate) -> RenderedFile:
@@ -155,7 +270,19 @@ def render_portfolio_excel(result: PortfolioReportResult, template: ReportTempla
     workbook["Resumo"]["A1"] = template.branding.company_name
     buffer = io.BytesIO()
     workbook.save(buffer)
-    return RenderedFile(filename=safe_filename(expand_pattern(template.filename_pattern, result=result), extension="xlsx"), content=buffer.getvalue(), mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", fmt="xlsx")
+    return checked_file(
+        RenderedFile(
+            filename=safe_filename(expand_pattern(template.filename_pattern, result=result), extension="xlsx"),
+            content=buffer.getvalue(),
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            fmt="xlsx",
+            portfolio_id=result.portfolio_id,
+            period_type=result.period.period_type.value,
+            period_start=result.period.start.isoformat(),
+            period_end=result.period.end.isoformat(),
+            warnings=tuple(result.warnings),
+        )
+    )
 
 
 def render_zip(files: list[RenderedFile], filename: str = "reports.zip") -> RenderedFile:
@@ -167,17 +294,34 @@ def render_zip(files: list[RenderedFile], filename: str = "reports.zip") -> Rend
         for file in files:
             name = unique_name(file.filename, used)
             archive.writestr(name, file.content)
-    return RenderedFile(filename=safe_filename(filename, extension="zip"), content=buffer.getvalue(), mimetype="application/zip", fmt="zip")
+    return checked_file(RenderedFile(filename=safe_filename(filename, extension="zip"), content=buffer.getvalue(), mimetype="application/zip", fmt="zip", is_auxiliary=True))
 
 
 def store_rendered_file(base_dir: Path, run_id: int, file: RenderedFile) -> tuple[Path, str]:
     run_dir = (base_dir / str(run_id)).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
-    target = (run_dir / file.filename).resolve()
+    target = unique_path(run_dir, file.filename)
     if run_dir not in target.parents:
         raise ValueError("unsafe_output_path")
     target.write_bytes(file.content)
     return target, str(target)
+
+
+def unique_path(run_dir: Path, filename: str) -> Path:
+    target = (run_dir / filename).resolve()
+    if run_dir not in target.parents:
+        raise ValueError("unsafe_output_path")
+    if not target.exists():
+        return target
+    stem = target.stem
+    suffix = target.suffix
+    for index in range(2, 1000):
+        candidate = (run_dir / f"{stem}_{index}{suffix}").resolve()
+        if run_dir not in candidate.parents:
+            raise ValueError("unsafe_output_path")
+        if not candidate.exists():
+            return candidate
+    raise ValueError("too_many_duplicate_filenames")
 
 
 def expand_pattern(pattern: str, *, result: PortfolioReportResult) -> str:
@@ -189,7 +333,17 @@ def expand_pattern(pattern: str, *, result: PortfolioReportResult) -> str:
     )
 
 
+def expand_individual_pattern(pattern: str, report: dict[str, Any]) -> str:
+    asset = report.get("asset") or {}
+    return (pattern or "{asset}_{period}").format(
+        asset=asset.get("project_name") or asset.get("name") or "Instalacao",
+        period=str(report.get("period_label") or report.get("report_month") or "periodo").replace(" ", "-"),
+    )
+
+
 def unique_name(filename: str, used: set[str]) -> str:
+    if any(item in filename for item in ("/", "\\", "..")):
+        raise ValueError("unsafe_zip_filename")
     if filename not in used:
         used.add(filename)
         return filename
@@ -201,3 +355,25 @@ def unique_name(filename: str, used: set[str]) -> str:
             used.add(candidate)
             return candidate
     raise ValueError("too_many_duplicate_filenames")
+
+
+def page_footer(template: ReportTemplate):
+    def draw(canvas, doc):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 8)
+        footer = " - ".join(item for item in (template.branding.footer, template.branding.contacts, template.branding.disclaimer) if item)
+        canvas.drawString(doc.leftMargin, 12, clip(footer, 160))
+        canvas.drawRightString(doc.pagesize[0] - doc.rightMargin, 12, f"Pag. {doc.page}")
+        canvas.restoreState()
+
+    return draw
+
+
+def clip(value: str, limit: int = 80) -> str:
+    return value if len(value) <= limit else value[: limit - 1] + "..."
+
+
+def checked_file(file: RenderedFile) -> RenderedFile:
+    if file.size_bytes > MAX_RENDERED_FILE_BYTES:
+        raise ValueError("rendered_file_too_large")
+    return file

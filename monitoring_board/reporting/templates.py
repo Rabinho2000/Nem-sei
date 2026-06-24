@@ -153,6 +153,28 @@ def validate_template(template: ReportTemplate) -> ReportTemplate:
     return template
 
 
+def validate_template_scope(
+    template: ReportTemplate,
+    report_type: str,
+    *,
+    portfolio_id: int | None = None,
+    client_key: str | None = None,
+    allow_inactive: bool = False,
+) -> None:
+    if template.report_type != report_type:
+        raise ValueError("template_type_mismatch")
+    if not allow_inactive and not template.active:
+        raise ValueError("template_archived")
+    if template.portfolio_id is not None and template.portfolio_id != portfolio_id:
+        raise ValueError("template_scope_mismatch")
+    if template.client_key and client_key and template.client_key != client_key:
+        raise ValueError("template_client_mismatch")
+
+
+def enabled_sections_in_order(template: ReportTemplate) -> tuple[TemplateSection, ...]:
+    return tuple(section for section in sorted(template.sections, key=lambda item: item.display_order) if section.enabled)
+
+
 def validate_branding(branding: BrandingConfig) -> None:
     for color in (branding.primary_color, branding.secondary_color):
         if not re.fullmatch(r"#[0-9A-Fa-f]{6}", color or ""):

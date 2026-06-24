@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
+from monitoring_board.db import ensure_column
 from monitoring_board.reporting.templates import DEFAULT_TEMPLATE_NAMES, ReportTemplate, default_template, template_from_config, template_to_config, validate_template
 
 
@@ -77,6 +78,12 @@ def ensure_report_template_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    ensure_column(conn, "report_generation_runs", "skipped_count INTEGER DEFAULT 0")
+    ensure_column(conn, "report_generated_files", "period_type TEXT")
+    ensure_column(conn, "report_generated_files", "period_start TEXT")
+    ensure_column(conn, "report_generated_files", "period_end TEXT")
+    ensure_column(conn, "report_generated_files", "is_auxiliary INTEGER DEFAULT 0")
+    ensure_column(conn, "report_generated_files", "warnings_json TEXT DEFAULT '[]'")
     seed_default_templates(conn)
 
 
@@ -86,6 +93,13 @@ def seed_default_templates(conn: sqlite3.Connection) -> None:
         if name not in existing:
             template = default_template(name)
             save_template(conn, template, is_default=1 if template.is_default else 0)
+    for report_type in ("individual", "portfolio"):
+        defaults = conn.execute(
+            "SELECT id FROM report_templates WHERE report_type = ? AND portfolio_id IS NULL AND active = 1 AND is_default = 1 ORDER BY id",
+            (report_type,),
+        ).fetchall()
+        if len(defaults) > 1:
+            set_default_template(conn, int(defaults[0]["id"]))
 
 
 def list_templates(conn: sqlite3.Connection, report_type: str | None = None, portfolio_id: int | None = None, *, include_inactive: bool = False) -> list[sqlite3.Row]:
@@ -170,6 +184,9 @@ def duplicate_template(conn: sqlite3.Connection, template_id: int, name: str) ->
 
 
 def archive_template(conn: sqlite3.Connection, template_id: int) -> None:
+    row = conn.execute("SELECT is_default FROM report_templates WHERE id = ?", (template_id,)).fetchone()
+    if row and row["is_default"]:
+        raise ValueError("cannot_archive_default_template")
     conn.execute("UPDATE report_templates SET active = 0, updated_at = ? WHERE id = ?", (datetime.now().isoformat(timespec="seconds"), template_id))
 
 
@@ -218,26 +235,50 @@ def create_generation_run(conn: sqlite3.Connection, *, template_id: int | None, 
     return int(cursor.lastrowid)
 
 
-def finish_generation_run(conn: sqlite3.Connection, run_id: int, *, status: str, completed_count: int, failed_count: int, warnings: list[str] | None = None, error_message: str = "") -> None:
+def finish_generation_run(conn: sqlite3.Connection, run_id: int, *, status: str, completed_count: int, failed_count: int, skipped_count: int = 0, warnings: list[str] | None = None, error_message: str = "") -> None:
+    if status not in {"running", "completed", "partial", "failed"}:
+        raise ValueError("invalid_generation_run_status")
     conn.execute(
         """
         UPDATE report_generation_runs
-        SET status = ?, completed_count = ?, failed_count = ?, warnings_json = ?, error_message = ?, completed_at = ?
+        SET status = ?, completed_count = ?, failed_count = ?, skipped_count = ?,
+            warnings_json = ?, error_message = ?, completed_at = ?
         WHERE id = ?
         """,
-        (status, completed_count, failed_count, json.dumps(warnings or [], ensure_ascii=True), error_message, datetime.now().isoformat(timespec="seconds"), run_id),
+        (status, completed_count, failed_count, skipped_count, json.dumps(warnings or [], ensure_ascii=True), error_message, datetime.now().isoformat(timespec="seconds"), run_id),
     )
 
 
-def add_generated_file(conn: sqlite3.Connection, *, run_id: int, fmt: str, filename: str, relative_path: str, sha256: str, size_bytes: int, portfolio_id: int | None = None, asset_id: int | None = None, snapshot_id: int | None = None, status: str = "completed", error_message: str = "") -> int:
+def add_generated_file(conn: sqlite3.Connection, *, run_id: int, fmt: str, filename: str, relative_path: str, sha256: str, size_bytes: int, portfolio_id: int | None = None, asset_id: int | None = None, snapshot_id: int | None = None, period_type: str = "", period_start: str = "", period_end: str = "", is_auxiliary: int = 0, warnings: list[str] | None = None, status: str = "completed", error_message: str = "") -> int:
+    if status not in {"completed", "failed", "skipped"}:
+        raise ValueError("invalid_generated_file_status")
     cursor = conn.execute(
         """
         INSERT INTO report_generated_files (
             run_id, asset_id, portfolio_id, snapshot_id, format, filename, relative_path,
-            sha256, size_bytes, status, error_message, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            sha256, size_bytes, status, error_message, period_type, period_start, period_end,
+            is_auxiliary, warnings_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (run_id, asset_id, portfolio_id, snapshot_id, fmt, filename, relative_path, sha256, size_bytes, status, error_message, datetime.now().isoformat(timespec="seconds")),
+        (
+            run_id,
+            asset_id,
+            portfolio_id,
+            snapshot_id,
+            fmt,
+            filename,
+            relative_path,
+            sha256,
+            size_bytes,
+            status,
+            error_message,
+            period_type,
+            period_start,
+            period_end,
+            is_auxiliary,
+            json.dumps(warnings or [], ensure_ascii=True),
+            datetime.now().isoformat(timespec="seconds"),
+        ),
     )
     return int(cursor.lastrowid)
 

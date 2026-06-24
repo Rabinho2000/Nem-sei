@@ -52,11 +52,21 @@
           {% endfor %}
         </select>
       </label>
+      <label>Instalações em lote
+        <select name="asset_ids" multiple size="6">
+          {% for asset in assets %}
+            <option value="{{ asset.id }}">{{ asset.project_name }}</option>
+          {% endfor %}
+        </select>
+      </label>
       <label>Snapshot
         <input name="snapshot_id" inputmode="numeric" placeholder="Opcional">
       </label>
       <label>Mês
         <input type="month" name="report_month" value="{{ current_month or '' }}">
+      </label>
+      <label>Meses em lote
+        <input name="report_months" placeholder="2026-01, 2026-02">
       </label>
       <label>Período
         <select name="period_type">
@@ -108,7 +118,7 @@
   </div>
   <div class="table-wrap">
     <table>
-      <thead><tr><th>ID</th><th>Run</th><th>Formato</th><th>Nome</th><th>Tamanho</th><th>Download</th></tr></thead>
+      <thead><tr><th>ID</th><th>Run</th><th>Formato</th><th>Nome</th><th>Estado</th><th>Asset</th><th>Período</th><th>Aux.</th><th>Tamanho</th><th>Download</th></tr></thead>
       <tbody>
         {% for file in files %}
           <tr>
@@ -116,11 +126,15 @@
             <td>{{ file.run_id }}</td>
             <td>{{ file.format }}</td>
             <td>{{ file.filename }}</td>
+            <td>{{ file.status }}</td>
+            <td>{{ file.asset_id or '-' }}</td>
+            <td>{{ file.period_start or '-' }}</td>
+            <td>{{ 'sim' if file.is_auxiliary else '-' }}</td>
             <td>{{ file.size_bytes }}</td>
-            <td><a class="button secondary small" href="{{ url_for('download_generated_report', file_id=file.id) }}">Download</a></td>
+            <td>{% if file.status == 'completed' %}<a class="button secondary small" href="{{ url_for('download_generated_report', file_id=file.id) }}">Download</a>{% else %}{{ file.error_message }}{% endif %}</td>
           </tr>
         {% else %}
-          <tr><td colspan="6" class="muted">Sem ficheiros.</td></tr>
+          <tr><td colspan="10" class="muted">Sem ficheiros.</td></tr>
         {% endfor %}
       </tbody>
     </table>
