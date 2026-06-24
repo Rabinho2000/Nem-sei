@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import struct
+import hashlib
 from pathlib import Path
 
 import app as app_module
@@ -467,6 +468,54 @@ def test_storage_reconciliation_detects_missing_orphan_and_hash(tmp_path: Path) 
 
     statuses = {finding.status for finding in reconcile_generated_reports(conn, root=root)}
     assert {"hash_mismatch", "orphan_file"} <= statuses
+
+
+def test_storage_reconciliation_ignores_failed_rows_without_file(tmp_path: Path) -> None:
+    db_path = tmp_path / "storage-failed.db"
+    ensure_database(str(db_path))
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    root = tmp_path / "generated"
+    root.mkdir()
+    conn.execute("INSERT INTO report_generation_runs (report_type, status, requested_count, created_at) VALUES ('portfolio', 'partial', 1, '2026-01-01')")
+    run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute(
+        """
+        INSERT INTO report_generated_files
+            (run_id, format, filename, relative_path, sha256, size_bytes, status, error_message, created_at)
+        VALUES (?, 'pdf', 'failed', '', '', 0, 'failed', 'Sem dados', '2026-01-01')
+        """,
+        (run_id,),
+    )
+
+    statuses = {finding.status for finding in reconcile_generated_reports(conn, root=root)}
+    assert "invalid_path" not in statuses
+
+
+def test_storage_reconciliation_resolves_runtime_relative_paths_from_explicit_root(tmp_path: Path) -> None:
+    db_path = tmp_path / "storage-root.db"
+    ensure_database(str(db_path))
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    root = tmp_path / "uploads" / "generated_reports"
+    root.mkdir(parents=True)
+    report = root / "1" / "ok.pdf"
+    report.parent.mkdir()
+    report.write_bytes(b"abc")
+    conn.execute("INSERT INTO report_generation_runs (report_type, status, requested_count, created_at) VALUES ('portfolio', 'completed', 1, '2026-01-01')")
+    run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute(
+        """
+        INSERT INTO report_generated_files
+            (run_id, format, filename, relative_path, sha256, size_bytes, status, created_at)
+        VALUES (?, 'pdf', 'ok.pdf', 'uploads/generated_reports/1/ok.pdf', ?, 3, 'completed', '2026-01-01')
+        """,
+        (run_id, hashlib.sha256(b"abc").hexdigest()),
+    )
+
+    statuses = {finding.status for finding in reconcile_generated_reports(conn, root=root)}
+    assert "invalid_path" not in statuses
+    assert "ok" in statuses
 
 
 def test_ensure_database_is_idempotent_for_reporting_outputs(tmp_path: Path) -> None:

@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable
 
-from monitoring_board.runtime import UPLOAD_DIR, path_is_within, resolve_runtime_file_path_within
+from monitoring_board.runtime import UPLOAD_DIR, path_is_within
 
 
 @dataclass(frozen=True)
@@ -26,7 +26,9 @@ def reconcile_generated_reports(conn: sqlite3.Connection, *, root: Path | None =
     rows = conn.execute("SELECT * FROM report_generated_files").fetchall()
     for row in rows:
         stored = str(row["relative_path"] or "")
-        path = resolve_runtime_file_path_within(stored, root) if stored else None
+        if row["status"] != "completed" and not stored:
+            continue
+        path = resolve_generated_report_path(stored, root) if stored else None
         if path is None:
             findings.append(StorageFinding("invalid_path", stored, row["id"], row["run_id"]))
             continue
@@ -70,3 +72,12 @@ def iter_storage_files(root: Path) -> Iterable[Path]:
     for path in root.rglob("*"):
         if path.is_file():
             yield path
+
+
+def resolve_generated_report_path(stored_path: str, root: Path) -> Path | None:
+    path = Path(stored_path)
+    candidates = [path] if path.is_absolute() else [root.parent.parent / path, root.parent / path, root / path]
+    for candidate in candidates:
+        if path_is_within(candidate, root):
+            return candidate.resolve()
+    return None
