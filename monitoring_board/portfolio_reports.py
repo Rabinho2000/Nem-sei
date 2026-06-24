@@ -10,13 +10,18 @@ from typing import Any
 
 from openpyxl import Workbook, load_workbook
 
-from monitoring_board.db import query_all
+from monitoring_board.portfolio_repository import (
+    auto_map_portfolio_assets as repository_auto_map_portfolio_assets,
+    suggest_mapping,
+)
 from monitoring_board.reporting.availability import calculate_weighted_portfolio_availability
-from monitoring_board.reporting.billing import decimal_from_value
+from monitoring_board.reporting.billing import calculate_billing, decimal_from_value, detect_report_type_value
 from monitoring_board.reporting.degradation import calculate_degradation_factor
+from monitoring_board.reporting.models import EnergyBreakdown
 from monitoring_board.reporting.periods import month_bounds
 from monitoring_board.reporting.repositories import (
     detect_tariff_validity_warnings,
+    get_asset_billing_config,
     get_latest_helioscope_expected,
     get_latest_tariff,
     get_monthly_availability,
@@ -63,6 +68,9 @@ WARNING_LABELS = {
     "missing_tariff_rules": "Sem tarifa",
     "missing_simple_tariff_price": "Sem tarifa",
     "missing_invoice": "Sem fatura",
+    "review_required": "Fatura por rever",
+    "extraction_failed": "Extracao falhou",
+    "incompatible_invoice": "Fatura nao compativel",
     "missing_availability": "Sem availability",
     "mapping_pending": "Mapping pendente",
     "mapping_conflict": "Mapping conflito",
@@ -291,34 +299,16 @@ def import_helioscope_file(
 
 
 def map_external_portfolio_entity(conn: sqlite3.Connection, *, nif: str = "", external_name: str = "") -> dict[str, Any]:
-    normalized_nif = normalize_nif(nif)
-    if normalized_nif:
-        row = conn.execute("SELECT id FROM assets WHERE REPLACE(REPLACE(COALESCE(nif, ''), ' ', ''), '-', '') = ? LIMIT 1", (normalized_nif,)).fetchone()
-        if row:
-            return {"asset_id": int(row["id"]), "mapping_status": "auto_nif", "mapping_confidence": 1.0}
-    normalized_name = normalize_text(external_name)
-    if normalized_name:
-        row = conn.execute("SELECT asset_id FROM asset_aliases WHERE normalized_alias = ? LIMIT 1", (normalized_name,)).fetchone()
-        if row:
-            return {"asset_id": int(row["asset_id"]), "mapping_status": "auto_name", "mapping_confidence": 0.9}
-        row = conn.execute("SELECT id FROM assets WHERE LOWER(project_name) = ? LIMIT 1", (external_name.strip().lower(),)).fetchone()
-        if row:
-            return {"asset_id": int(row["id"]), "mapping_status": "auto_name", "mapping_confidence": 0.85}
-    return {"asset_id": None, "mapping_status": "unmapped", "mapping_confidence": 0.0}
+    decision = suggest_mapping(conn, nif=nif, external_name=external_name)
+    return {
+        "asset_id": decision.asset_id if decision.auto_mappable else None,
+        "mapping_status": decision.status if decision.auto_mappable else ("mapping_conflict" if decision.status == "mapping_conflict" else "unmapped"),
+        "mapping_confidence": decision.score,
+    }
 
 
-def repeated_portfolio_nifs(conn: sqlite3.Connection) -> set[str]:
-    rows = query_all(
-        conn,
-        """
-        SELECT nif
-        FROM portfolio_assets
-        WHERE COALESCE(nif, '') != ''
-        GROUP BY nif
-        HAVING COUNT(DISTINCT portfolio_id) > 1
-        """,
-    )
-    return {str(row["nif"]) for row in rows}
+def auto_map_portfolio_assets(conn: sqlite3.Connection, portfolio_id: int | None = None) -> dict[str, int]:
+    return repository_auto_map_portfolio_assets(conn, portfolio_id)
 
 
 def seed_external_portfolio_rows(conn: sqlite3.Connection) -> None:
@@ -327,7 +317,7 @@ def seed_external_portfolio_rows(conn: sqlite3.Connection) -> None:
         if group is None:
             continue
         portfolio_id = int(group["id"])
-        for sub_account, nif, external_name in rows:
+        for index, (sub_account, nif, external_name) in enumerate(rows, start=1):
             existing = conn.execute(
                 """
                 SELECT id
@@ -343,10 +333,11 @@ def seed_external_portfolio_rows(conn: sqlite3.Connection) -> None:
                     UPDATE portfolio_assets
                     SET external_name = COALESCE(NULLIF(external_name, ''), ?),
                         nif = COALESCE(NULLIF(nif, ''), ?),
+                        display_order = COALESCE(NULLIF(display_order, 0), ?),
                         active = 1
                     WHERE id = ?
                     """,
-                    (external_name, nif, existing["id"]),
+                    (external_name, nif, index * 10, existing["id"]),
                 )
                 continue
             mapping_status = "mapping_pending" if nif else "missing_source"
@@ -355,63 +346,11 @@ def seed_external_portfolio_rows(conn: sqlite3.Connection) -> None:
                 """
                 INSERT INTO portfolio_assets (
                     portfolio_id, asset_id, external_name, nif, sub_account, active,
-                    mapping_status, mapping_confidence, notes
-                ) VALUES (?, NULL, ?, ?, ?, 1, ?, 0, ?)
+                    mapping_status, mapping_confidence, notes, display_order, mapping_method, updated_at
+                ) VALUES (?, NULL, ?, ?, ?, 1, ?, 0, ?, ?, 'unmapped', ?)
                 """,
-                (portfolio_id, external_name, nif, sub_account, mapping_status, notes),
+                (portfolio_id, external_name, nif, sub_account, mapping_status, notes, index * 10, datetime.now().isoformat(timespec="seconds")),
             )
-    mark_repeated_nif_conflicts(conn)
-
-
-def mark_repeated_nif_conflicts(conn: sqlite3.Connection) -> None:
-    repeated = repeated_portfolio_nifs(conn)
-    if not repeated:
-        return
-    for nif in repeated:
-        conn.execute(
-            """
-            UPDATE portfolio_assets
-            SET mapping_status = 'mapping_conflict',
-                notes = TRIM(COALESCE(notes, '') || ' NIF repetido entre portfolios; confirmar mapping.')
-            WHERE nif = ?
-            """,
-            (nif,),
-        )
-
-
-def auto_map_portfolio_assets(conn: sqlite3.Connection, portfolio_id: int | None = None) -> dict[str, int]:
-    conditions = ["active = 1"]
-    params: list[Any] = []
-    if portfolio_id:
-        conditions.append("portfolio_id = ?")
-        params.append(portfolio_id)
-    rows = query_all(conn, f"SELECT * FROM portfolio_assets WHERE {' AND '.join(conditions)}", params)
-    repeated = repeated_portfolio_nifs(conn)
-    mapped = 0
-    pending = 0
-    conflicts = 0
-    for row in rows:
-        result = map_external_portfolio_entity(conn, nif=row["nif"] or "", external_name=row["external_name"] or "")
-        status = result["mapping_status"]
-        confidence = result["mapping_confidence"]
-        asset_id = result["asset_id"]
-        if row["nif"] and row["nif"] in repeated:
-            status = "mapping_conflict"
-            conflicts += 1
-        elif not asset_id:
-            status = "mapping_pending"
-            pending += 1
-        else:
-            mapped += 1
-        conn.execute(
-            """
-            UPDATE portfolio_assets
-            SET asset_id = ?, mapping_status = ?, mapping_confidence = ?
-            WHERE id = ?
-            """,
-            (asset_id, status, confidence, row["id"]),
-        )
-    return {"mapped": mapped, "pending": pending, "conflicts": conflicts}
 
 
 def warning_label(code: str) -> str:
@@ -517,7 +456,19 @@ def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, rep
             monthly_self_use = float(prod["self_use_kwh"])
         tariff_result = calculate_tariff_value(tariff, monthly_kwh=monthly_self_use, hourly_records=hourly, rules=rules)
         warnings.extend(tariff_result["warnings"])
-        invoice_status = "ok" if tariff and tariff["invoice_file_id"] else "missing_invoice"
+        invoice_status = "missing_invoice"
+        if tariff and tariff["invoice_file_id"]:
+            invoice_doc = conn.execute("SELECT status FROM invoice_documents WHERE source_file_id = ?", (tariff["invoice_file_id"],)).fetchone()
+            if invoice_doc is None:
+                invoice_status = "review_required"
+            elif invoice_doc["status"] == "confirmed":
+                invoice_status = "ok"
+            elif invoice_doc["status"] == "extraction_failed":
+                invoice_status = "extraction_failed"
+            elif invoice_doc["status"] in {"rejected", "archived"}:
+                invoice_status = "incompatible_invoice"
+            else:
+                invoice_status = "review_required"
         if invoice_status != "ok":
             warnings.append(invoice_status)
         data_status = "ok" if not warnings else ("missing_data" if any(w.startswith("missing") for w in warnings) else "warning")
@@ -527,6 +478,62 @@ def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, rep
             item.period_name: float(item.value_eur)
             for item in tariff_result.get("breakdown", [])
         }
+        energy_by_period = {
+            item.period_name: float(item.energy_kwh)
+            for item in tariff_result.get("breakdown", [])
+        }
+        simple_self_use = energy_by_period.get("simple")
+        multi_self_use = sum(energy_by_period.get(period, 0.0) for period in PERIOD_NAMES)
+        self_use_total = simple_self_use if simple_self_use is not None else (multi_self_use if hourly else monthly_self_use)
+        if self_use_total is None and "missing_hourly_self_use" not in tariff_result["warnings"] and actual is not None:
+            self_use_total = multi_self_use
+        hourly_energy = [row_to_hourly_energy_record(record) for record in hourly]
+
+        def monthly_field(key: str) -> float | None:
+            if prod is not None and key in prod.keys() and prod[key] is not None:
+                return float(prod[key])
+            return None
+
+        def hourly_total(key: str) -> float | None:
+            values = [getattr(record, key) for record in hourly_energy if getattr(record, key) is not None]
+            return round(float(sum(values)), 6) if values else None
+
+        export_kwh = monthly_field("export_kwh")
+        if export_kwh is None:
+            export_kwh = hourly_total("export_kwh")
+        consumption_kwh = monthly_field("consumption_kwh")
+        if consumption_kwh is None:
+            consumption_kwh = hourly_total("consumption_kwh")
+        grid_import_kwh = monthly_field("grid_import_kwh")
+        if grid_import_kwh is None:
+            grid_import_kwh = hourly_total("grid_import_kwh")
+        if grid_import_kwh is None and consumption_kwh is not None and self_use_total is not None:
+            grid_import_kwh = max(consumption_kwh - self_use_total, 0.0)
+        if export_kwh is None and actual is not None and self_use_total is not None:
+            export_kwh = max(actual - self_use_total, 0.0)
+        if self_use_total is None:
+            warnings.append("missing_self_use")
+        if export_kwh is None:
+            warnings.append("missing_export")
+        if consumption_kwh is None:
+            warnings.append("missing_consumption")
+        report_type = detect_report_type_value(asset)
+        billing_config = get_asset_billing_config(conn, asset_id, report_type) if asset_id is not None else None
+        billing = None
+        if actual is not None and self_use_total is not None and export_kwh is not None and consumption_kwh is not None and billing_config is not None:
+            billing = calculate_billing(
+                EnergyBreakdown(
+                    production_kwh=decimal_from_value(actual),
+                    self_use_kwh=decimal_from_value(self_use_total),
+                    export_kwh=decimal_from_value(export_kwh),
+                    consumption_kwh=decimal_from_value(consumption_kwh),
+                ),
+                billing_config,
+                months_count=1,
+            )
+            warnings.extend(billing.warnings)
+        else:
+            warnings.append("missing_billing")
         rows.append(
             {
                 "portfolio_id": portfolio_id,
@@ -543,14 +550,20 @@ def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, rep
                 "production_cheia_kwh": round(period_kwh["cheia"], 2),
                 "production_vazio_kwh": round(period_kwh["vazio"], 2),
                 "production_super_vazio_kwh": round(period_kwh["super_vazio"], 2),
+                "self_use_kwh": round(self_use_total, 2) if self_use_total is not None else None,
                 "self_use_ponta_kwh": round(self_use_period_kwh["ponta"], 2),
                 "self_use_cheia_kwh": round(self_use_period_kwh["cheia"], 2),
                 "self_use_vazio_kwh": round(self_use_period_kwh["vazio"], 2),
                 "self_use_super_vazio_kwh": round(self_use_period_kwh["super_vazio"], 2),
+                "self_use_simple_kwh": round(simple_self_use, 2) if simple_self_use is not None else None,
                 "self_use_value_ponta_eur": round(value_by_period.get("ponta", 0.0), 2),
                 "self_use_value_cheia_eur": round(value_by_period.get("cheia", 0.0), 2),
                 "self_use_value_vazio_eur": round(value_by_period.get("vazio", 0.0), 2),
                 "self_use_value_super_vazio_eur": round(value_by_period.get("super_vazio", 0.0), 2),
+                "self_use_value_simple_eur": round(value_by_period.get("simple", 0.0), 2) if "simple" in value_by_period else None,
+                "export_kwh": round(export_kwh, 2) if export_kwh is not None else None,
+                "consumption_kwh": round(consumption_kwh, 2) if consumption_kwh is not None else None,
+                "grid_import_kwh": round(grid_import_kwh, 2) if grid_import_kwh is not None else None,
                 "helioscope_expected_kwh": round(expected_kwh, 2) if expected_kwh is not None else None,
                 "adjusted_expected_kwh": round(adjusted, 2) if adjusted is not None else None,
                 "degradation_factor": round(factor, 6),
@@ -559,6 +572,10 @@ def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, rep
                 "availability_pct": availability,
                 "tariff_type": tariff["tariff_type"] if tariff else "",
                 "estimated_value_eur": tariff_result["estimated_value_eur"],
+                "export_revenue_eur": round(float(billing.export_revenue_eur), 2) if billing else None,
+                "esco_payment_eur": round(float(billing.solcor_payment_eur), 2) if billing else None,
+                "fixed_fee_eur": round(float(billing.fixed_monthly_fee_eur), 2) if billing else None,
+                "net_benefit_eur": round(float(billing.net_benefit_eur), 2) if billing else None,
                 "invoice_status": invoice_status,
                 "data_status": data_status,
                 "warnings": sorted(set(warnings)),

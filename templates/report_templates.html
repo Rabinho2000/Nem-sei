@@ -1,0 +1,119 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">Reporting</p>
+    <h2>Templates</h2>
+    <p class="muted">Configura templates, branding e secções sem HTML arbitrário.</p>
+  </div>
+  <div class="hero-actions">
+    <a class="button secondary" href="{{ url_for('report_generation') }}">Gerar relatórios</a>
+  </div>
+</section>
+
+<section class="card">
+  <div class="grid two">
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Nome</th><th>Tipo</th><th>Default</th><th>Estado</th></tr></thead>
+        <tbody>
+          {% for template in templates %}
+            <tr>
+              <td><a href="{{ url_for('report_templates', template_id=template.id) }}">{{ template.name }}</a></td>
+              <td>{{ template.report_type }}</td>
+              <td>{{ 'sim' if template.is_default else '-' }}</td>
+              <td>{{ 'ativo' if template.active else 'arquivado' }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="4" class="muted">Sem templates.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <form method="post" class="stack-form" enctype="multipart/form-data">
+      <input type="hidden" name="template_id" value="{{ selected_template.id or 0 }}">
+      <div class="grid two">
+        <label>Nome
+          <input name="name" value="{{ selected_template.name }}">
+        </label>
+        <label>Tipo
+          <select name="report_type">
+            <option value="portfolio" {{ 'selected' if selected_template.report_type == 'portfolio' }}>Portefólio</option>
+            <option value="individual" {{ 'selected' if selected_template.report_type == 'individual' }}>Individual</option>
+          </select>
+        </label>
+        <label>Portefólio
+          <select name="portfolio_id">
+            <option value="">Global</option>
+            {% for group in groups %}
+              <option value="{{ group.id }}" {{ 'selected' if selected_template.portfolio_id == group.id }}>{{ group.name }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Orientação
+          <select name="orientation">
+            <option value="portrait" {{ 'selected' if selected_template.orientation == 'portrait' }}>Portrait</option>
+            <option value="landscape" {{ 'selected' if selected_template.orientation == 'landscape' }}>Landscape</option>
+          </select>
+        </label>
+        <label>Título
+          <input name="title" value="{{ selected_template.title }}">
+        </label>
+        <label>Nome ficheiro
+          <input name="filename_pattern" value="{{ selected_template.filename_pattern }}">
+        </label>
+        <label>Empresa
+          <input name="company_name" value="{{ selected_template.branding.company_name }}">
+        </label>
+        <label>Cor primária
+          <input name="primary_color" value="{{ selected_template.branding.primary_color }}">
+        </label>
+        <label>Cor secundária
+          <input name="secondary_color" value="{{ selected_template.branding.secondary_color }}">
+        </label>
+        <label>Logótipo
+          <input type="file" name="logo" accept=".png,.jpg,.jpeg">
+        </label>
+      </div>
+      <label>Descrição
+        <input name="description" value="{{ selected_template.description }}">
+      </label>
+      <label>Subtítulo
+        <input name="subtitle" value="{{ selected_template.subtitle }}">
+      </label>
+      <label>Contactos
+        <input name="contacts" value="{{ selected_template.branding.contacts }}">
+      </label>
+      <label>Rodapé
+        <input name="footer" value="{{ selected_template.branding.footer }}">
+      </label>
+      <label>Disclaimer
+        <input name="disclaimer" value="{{ selected_template.branding.disclaimer }}">
+      </label>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Incluir</th><th>Ordem</th><th>Secção</th></tr></thead>
+          <tbody>
+            {% for section in selected_template.sections %}
+              <tr>
+                <td><input type="checkbox" name="section_key" value="{{ section.key }}" {{ 'checked' if section.enabled }}></td>
+                <td><input name="order_{{ section.key }}" value="{{ section.display_order }}" inputmode="numeric"></td>
+                <td>{{ section.title }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <label><input type="checkbox" name="is_default" {{ 'checked' if selected_template.is_default }}> Default neste âmbito</label>
+      <div class="inline-form">
+        <button class="button" type="submit" name="action" value="save">Guardar</button>
+        <button class="button secondary" type="submit" name="action" value="duplicate">Duplicar</button>
+        <button class="button secondary" type="submit" name="action" value="set_default">Definir default</button>
+        <button class="button danger" type="submit" name="action" value="archive">Arquivar</button>
+      </div>
+    </form>
+  </div>
+</section>
+{% endblock %}

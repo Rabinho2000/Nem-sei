@@ -7,6 +7,7 @@ import html
 import io
 import json
 import logging
+import mimetypes
 import os
 import re
 import secrets
@@ -14,6 +15,7 @@ import sqlite3
 import threading
 import time
 import unicodedata
+import struct
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -25,6 +27,7 @@ import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import current_app
 from flask import Flask, abort, flash, g, has_app_context, redirect, render_template, request, send_file, session, url_for
+from werkzeug.utils import secure_filename
 from monitoring_board.db import configure_database_for_runtime, create_database_backup, ensure_column, get_db, query_all, query_scalar
 from monitoring_board.logging_config import configure_logging
 from monitoring_board.portfolio_reports import (
@@ -37,11 +40,10 @@ from monitoring_board.portfolio_reports import (
     import_helioscope_file,
     map_external_portfolio_entity,
     seed_external_portfolio_rows,
-    snapshot_portfolio_report,
-    store_source_file,
 )
 from monitoring_board.routes.auth import auth_bp
 from monitoring_board.routes.field_routes import field_routes_bp
+from monitoring_board import runtime as runtime_module
 from monitoring_board.runtime import (
     BACKUP_DIR,
     BASE_DIR,
@@ -51,13 +53,10 @@ from monitoring_board.runtime import (
     LOG_DIR,
     RUNTIME_PATHS,
     UPLOAD_DIR,
-    build_runtime_paths,
     ensure_runtime_directories,
     env_flag,
-    load_local_env,
     max_upload_bytes,
     path_is_within,
-    resolve_runtime_file_path,
     resolve_runtime_file_path_within,
     store_runtime_relative_path,
 )
@@ -67,7 +66,90 @@ from monitoring_board.customer_reports import (
     detect_report_type,
     prepare_customer_report,
 )
+from monitoring_board.portfolio_repository import (
+    add_member as portfolio_add_member,
+    apply_import_run,
+    archive_portfolio,
+    confirm_mapping,
+    copy_members,
+    create_import_preview,
+    create_portfolio,
+    delete_alias as portfolio_delete_alias,
+    delete_portfolio,
+    detect_portfolio_conflicts,
+    duplicate_portfolio,
+    ensure_portfolio_management_schema,
+    export_configuration_workbook,
+    get_import_run,
+    import_preview_from_json,
+    get_portfolio,
+    list_aliases as portfolio_list_aliases,
+    list_available_assets as portfolio_list_available_assets,
+    list_portfolio_members,
+    list_portfolios,
+    move_member_up_down,
+    reactivate_portfolio,
+    rebuild_asset_alias_blob as portfolio_rebuild_asset_alias_blob,
+    remove_members,
+    reorder_members,
+    suggest_mapping as portfolio_suggest_mapping,
+    toggle_alias,
+    unmap_member,
+    update_alias as portfolio_update_alias,
+    update_member as portfolio_update_member,
+    update_portfolio,
+    upsert_alias,
+)
+from monitoring_board.portfolio_report_repository import (
+    archive_profile as archive_portfolio_report_profile,
+    duplicate_profile as duplicate_portfolio_report_profile,
+    ensure_portfolio_reporting_schema,
+    get_default_profile as get_default_portfolio_report_profile,
+    get_profile as get_portfolio_report_profile,
+    get_snapshot_result as get_portfolio_snapshot_result,
+    latest_profile_version as latest_portfolio_report_profile_version,
+    list_profiles as list_portfolio_report_profiles,
+    list_report_history as list_portfolio_report_history,
+    save_profile as save_portfolio_report_profile,
+    set_default_profile as set_default_portfolio_report_profile,
+    snapshot_portfolio_result,
+)
+from monitoring_board.report_template_repository import (
+    add_generated_file,
+    archive_template as archive_report_template,
+    create_generation_run,
+    duplicate_template as duplicate_report_template,
+    ensure_report_template_schema,
+    finish_generation_run,
+    get_default_template,
+    get_generated_file,
+    get_template,
+    latest_template_version,
+    list_generated_files,
+    list_generation_runs,
+    list_templates,
+    save_template,
+    set_default_template,
+)
+from monitoring_board.reporting_storage import reconcile_generated_reports
+from monitoring_board.reporting.portfolio import METRIC_CATALOG, profile_from_config, profile_to_config
+from monitoring_board.reporting.templates import default_template, template_from_config, template_to_config, validate_template_scope
+from monitoring_board.services.report_rendering import (
+    MAX_BATCH_ASSETS,
+    MAX_BATCH_PERIODS,
+    MAX_TOTAL_OUTPUTS,
+    render_individual_excel,
+    render_individual_pdf,
+    render_portfolio_excel,
+    render_portfolio_html,
+    render_portfolio_pdf,
+    render_zip,
+    store_rendered_file,
+    validate_formats,
+)
+from monitoring_board.services.portfolio_reporting import export_portfolio_result_workbook, prepare_portfolio_report
 from monitoring_board.reporting.billing import decimal_from_value
+from monitoring_board.reporting.invoices import normalize_date, is_supported_invoice_extension, validate_invoice_values, warnings_require_override
 from monitoring_board.reporting.availability import (
     apply_inverter_edge_tolerance as reporting_apply_inverter_edge_tolerance,
     calculate_inverter_daily_availability as reporting_calculate_inverter_daily_availability,
@@ -76,9 +158,10 @@ from monitoring_board.reporting.availability import (
     inverter_availability_slot as reporting_inverter_availability_slot,
     is_inverter_available as reporting_is_inverter_available,
 )
-from monitoring_board.reporting.models import BillingConfig, ReportPeriodType, ReportType, ReportingPeriod, TariffType
+from monitoring_board.reporting.models import BillingConfig, InvoiceCandidate, InvoiceStatus, ReportPeriodType, ReportType, ReportingPeriod, TariffType
 from monitoring_board.reporting.periods import (
     ReportingPeriodError,
+    build_period,
     month_bounds,
     monthly_period,
     normalize_report_month as reporting_normalize_report_month,
@@ -86,20 +169,31 @@ from monitoring_board.reporting.periods import (
 )
 from monitoring_board.reporting.repositories import (
     add_tariff_period_rule,
+    archive_invoice_document,
     billing_config_to_form_values,
+    create_invoice_document,
+    create_invoice_extraction_run,
+    create_source_file_record,
     delete_tariff_period_rule,
     detect_tariff_validity_warnings,
     ensure_billing_config_schema,
     get_asset_billing_config,
     get_asset_billing_config_row,
+    get_invoice_document,
     get_tariff_config_for_date,
     get_tariff_resolution_warnings,
-    list_tariffs_intersecting_period,
     list_daily_production_records,
+    list_invoice_extraction_runs,
+    list_portfolio_invoice_documents,
     list_hourly_production_records,
     list_monthly_production_records,
+    list_tariffs_intersecting_period,
     row_to_hourly_energy_record,
     save_asset_tariff,
+    find_invoice_by_hash,
+    reject_invoice_document,
+    update_invoice_from_candidates,
+    update_invoice_review,
     upsert_asset_billing_config,
 )
 from monitoring_board.reporting.validation import (
@@ -109,6 +203,7 @@ from monitoring_board.reporting.validation import (
     validate_report_asset_selection,
 )
 from monitoring_board.reporting.tariffs import result_to_legacy_dict, value_tariff_energy, with_billing_fallback
+from monitoring_board.services.invoice_extraction import extract_invoice_file, sha256_file, validate_invoice_file_content
 from monitoring_board.services.fusionsolar import (
     build_provider_url,
     classify_fusionsolar_inverter_availability,
@@ -116,6 +211,7 @@ from monitoring_board.services.fusionsolar import (
     map_fusionsolar_status,
     normalize_sync_hours,
 )
+
 from monitoring_board.services.telegram_service import (
     get_telegram_config,
     is_telegram_configured,
@@ -129,6 +225,13 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+
+LOGGER = logging.getLogger(__name__)
+
+build_runtime_paths = runtime_module.build_runtime_paths
+load_local_env = runtime_module.load_local_env
+resolve_runtime_file_path = runtime_module.resolve_runtime_file_path
 
 
 INTEGRATION_PROVIDER_FUSIONSOLAR = "FusionSolar"
@@ -2587,6 +2690,378 @@ def create_app() -> Flask:
             fusionsolar_api_warning=get_fusionsolar_performance_cooldown_reason(g.db),
         )
 
+    @app.route("/portfolio-manager")
+    def portfolio_manager() -> str:
+        groups = list_portfolios(g.db, include_archived=True)
+        selected_portfolio_id = int(request.args.get("portfolio_id", groups[0]["id"] if groups else 0) or 0)
+        selected = get_portfolio(g.db, selected_portfolio_id) if selected_portfolio_id else None
+        search = request.args.get("search", "").strip()
+        asset_filter = request.args.get("asset_filter", "available").strip()
+        alias_search = request.args.get("alias_search", "").strip()
+        alias_filter = request.args.get("alias_filter", "all").strip()
+        members = list_portfolio_members(g.db, selected_portfolio_id) if selected else []
+        assets = portfolio_list_available_assets(g.db, portfolio_id=selected_portfolio_id or None, search=search, asset_filter=asset_filter)
+        aliases = portfolio_list_aliases(g.db, include_inactive=alias_filter != "active")
+        if alias_search:
+            alias_search_lower = alias_search.lower()
+            aliases = [alias for alias in aliases if alias_search_lower in str(alias["alias_name"] or "").lower() or alias_search_lower in str(alias["project_name"] or "").lower()]
+        if alias_filter == "inactive":
+            aliases = [alias for alias in aliases if not alias["active"]]
+        conflicts = detect_portfolio_conflicts(g.db, selected_portfolio_id or None)
+        import_id = int(request.args.get("import_id", "0") or 0)
+        import_run = get_import_run(g.db, import_id) if import_id else None
+        import_preview = import_preview_from_json(import_run["preview_json"] or "{}") if import_run else None
+        mapping_decisions = {
+            int(member["id"]): portfolio_suggest_mapping(g.db, external_name=member["external_name"] or "", nif=member["nif"] or "")
+            for member in members
+            if not member["asset_id"] or member["mapping_status"] in {"mapping_pending", "mapping_conflict", "mapping_suggested"}
+        }
+        return render_template(
+            "portfolio_manager.html",
+            title="Gestor de portfolios",
+            groups=groups,
+            selected=selected,
+            selected_portfolio_id=selected_portfolio_id,
+            members=members,
+            assets=assets,
+            aliases=aliases,
+            conflicts=conflicts,
+            search=search,
+            asset_filter=asset_filter,
+            alias_search=alias_search,
+            alias_filter=alias_filter,
+            import_run=import_run,
+            import_preview=import_preview,
+            mapping_decisions=mapping_decisions,
+        )
+
+    @app.route("/portfolio-manager/create", methods=["POST"])
+    def portfolio_manager_create():
+        try:
+            portfolio_id = create_portfolio(g.db, name=request.form.get("name", ""), description=request.form.get("description", ""), notes=request.form.get("notes", ""))
+            g.db.commit()
+            flash("Portfolio criado.", "success")
+            return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id))
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao criar portfolio: {exc}", "error")
+            return redirect(url_for("portfolio_manager"))
+
+    @app.route("/portfolio-manager/update", methods=["POST"])
+    def portfolio_manager_update():
+        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
+        try:
+            update_portfolio(
+                g.db,
+                portfolio_id=portfolio_id,
+                name=request.form.get("name", ""),
+                description=request.form.get("description", ""),
+                notes=request.form.get("notes", ""),
+                display_order=int(request.form.get("display_order", "0") or 0) or None,
+            )
+            g.db.commit()
+            flash("Portfolio atualizado.", "success")
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao atualizar portfolio: {exc}", "error")
+        return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id))
+
+    @app.route("/portfolio-manager/duplicate", methods=["POST"])
+    def portfolio_manager_duplicate():
+        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
+        try:
+            new_id = duplicate_portfolio(g.db, portfolio_id=portfolio_id, new_name=request.form.get("new_name", ""))
+            g.db.commit()
+            flash("Portfolio duplicado.", "success")
+            return redirect(url_for("portfolio_manager", portfolio_id=new_id))
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao duplicar portfolio: {exc}", "error")
+            return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id))
+
+    @app.route("/portfolio-manager/archive", methods=["POST"])
+    def portfolio_manager_archive():
+        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
+        try:
+            archive_portfolio(g.db, portfolio_id)
+            g.db.commit()
+            flash("Portfolio arquivado.", "success")
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao arquivar portfolio: {exc}", "error")
+        return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id))
+
+    @app.route("/portfolio-manager/reactivate", methods=["POST"])
+    def portfolio_manager_reactivate():
+        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
+        try:
+            reactivate_portfolio(g.db, portfolio_id)
+            g.db.commit()
+            flash("Portfolio reativado.", "success")
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao reativar portfolio: {exc}", "error")
+        return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id))
+
+    @app.route("/portfolio-manager/delete", methods=["POST"])
+    def portfolio_manager_delete():
+        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
+        try:
+            delete_portfolio(g.db, portfolio_id, confirm_name=request.form.get("confirm_name", ""))
+            g.db.commit()
+            flash("Portfolio apagado.", "success")
+            return redirect(url_for("portfolio_manager"))
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao apagar portfolio: {exc}", "error")
+            return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id))
+
+    @app.route("/portfolio-manager/members/add", methods=["POST"])
+    def portfolio_manager_members_add():
+        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
+        try:
+            asset_ids = _form_int_list("asset_ids")
+            if asset_ids:
+                for asset_id in asset_ids:
+                    portfolio_add_member(g.db, portfolio_id=portfolio_id, asset_id=asset_id)
+            else:
+                asset_raw = request.form.get("asset_id", "").strip()
+                portfolio_add_member(
+                    g.db,
+                    portfolio_id=portfolio_id,
+                    asset_id=int(asset_raw) if asset_raw.isdigit() else None,
+                    external_name=request.form.get("external_name", ""),
+                    nif=request.form.get("nif", ""),
+                    sub_account=request.form.get("sub_account", ""),
+                    notes=request.form.get("notes", ""),
+                )
+            g.db.commit()
+            flash("Membro adicionado.", "success")
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao adicionar membro: {exc}", "error")
+        return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id))
+
+    @app.route("/portfolio-manager/members/remove", methods=["POST"])
+    def portfolio_manager_members_remove():
+        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
+        try:
+            remove_members(g.db, portfolio_id=portfolio_id, member_ids=_form_int_list("member_ids"))
+            g.db.commit()
+            flash("Membros removidos.", "success")
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao remover membros: {exc}", "error")
+        return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id))
+
+    @app.route("/portfolio-manager/members/copy", methods=["POST"])
+    def portfolio_manager_members_copy():
+        source_id = int(request.form.get("portfolio_id", "0") or 0)
+        target_id = int(request.form.get("target_portfolio_id", "0") or 0)
+        try:
+            copy_members(g.db, source_portfolio_id=source_id, target_portfolio_id=target_id, member_ids=_form_int_list("member_ids"), move=False)
+            g.db.commit()
+            flash("Membros copiados.", "success")
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao copiar membros: {exc}", "error")
+        return redirect(url_for("portfolio_manager", portfolio_id=source_id))
+
+    @app.route("/portfolio-manager/members/move", methods=["POST"])
+    def portfolio_manager_members_move():
+        source_id = int(request.form.get("portfolio_id", "0") or 0)
+        target_id = int(request.form.get("target_portfolio_id", "0") or 0)
+        try:
+            copy_members(g.db, source_portfolio_id=source_id, target_portfolio_id=target_id, member_ids=_form_int_list("member_ids"), move=True)
+            g.db.commit()
+            flash("Membros movidos.", "success")
+            return redirect(url_for("portfolio_manager", portfolio_id=target_id))
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao mover membros: {exc}", "error")
+            return redirect(url_for("portfolio_manager", portfolio_id=source_id))
+
+    @app.route("/portfolio-manager/members/reorder", methods=["POST"])
+    def portfolio_manager_members_reorder():
+        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
+        try:
+            ordered = _form_int_list("ordered_ids")
+            if not ordered:
+                member_id = int(request.form.get("member_id", "0") or 0)
+                move_member_up_down(g.db, portfolio_id=portfolio_id, member_id=member_id, direction=request.form.get("direction", "down"))
+            else:
+                reorder_members(g.db, portfolio_id=portfolio_id, ordered_ids=ordered)
+            g.db.commit()
+            flash("Ordem guardada.", "success")
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao reordenar: {exc}", "error")
+        return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id))
+
+    @app.route("/portfolio-manager/members/update", methods=["POST"])
+    def portfolio_manager_members_update():
+        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
+        member_id = int(request.form.get("member_id", "0") or 0)
+        asset_raw = request.form.get("asset_id", "").strip()
+        try:
+            portfolio_update_member(
+                g.db,
+                member_id=member_id,
+                portfolio_id=portfolio_id,
+                asset_id=int(asset_raw) if asset_raw.isdigit() else None,
+                external_name=request.form.get("external_name", ""),
+                nif=request.form.get("nif", ""),
+                sub_account=request.form.get("sub_account", ""),
+                notes=request.form.get("notes", ""),
+                active=request.form.get("active", "on") == "on",
+                create_alias=request.form.get("create_alias") == "on",
+            )
+            g.db.commit()
+            flash("Membro atualizado.", "success")
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao atualizar membro: {exc}", "error")
+        return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id))
+
+    @app.route("/portfolio-manager/mappings/suggest", methods=["POST"])
+    def portfolio_manager_mappings_suggest():
+        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
+        try:
+            result = auto_map_portfolio_assets(g.db, portfolio_id=portfolio_id or None)
+            g.db.commit()
+            flash(f"Sugestoes calculadas: {result['mapped']} auto, {result['pending']} pendentes, {result['conflicts']} conflitos.", "success")
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao sugerir mappings: {exc}", "error")
+        return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id))
+
+    @app.route("/portfolio-manager/mappings/confirm", methods=["POST"])
+    def portfolio_manager_mappings_confirm():
+        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
+        try:
+            confirm_mapping(
+                g.db,
+                member_id=int(request.form.get("member_id", "0") or 0),
+                portfolio_id=portfolio_id,
+                asset_id=int(request.form.get("asset_id", "0") or 0),
+                create_alias=request.form.get("create_alias", "on") == "on",
+            )
+            g.db.commit()
+            flash("Mapping confirmado.", "success")
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao confirmar mapping: {exc}", "error")
+        return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id))
+
+    @app.route("/portfolio-manager/mappings/unmap", methods=["POST"])
+    def portfolio_manager_mappings_unmap():
+        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
+        try:
+            unmap_member(g.db, member_id=int(request.form.get("member_id", "0") or 0), portfolio_id=portfolio_id)
+            g.db.commit()
+            flash("Mapping removido.", "success")
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao remover mapping: {exc}", "error")
+        return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id))
+
+    @app.route("/assets/<int:asset_id>/aliases/add", methods=["POST"])
+    def portfolio_alias_add(asset_id: int):
+        try:
+            upsert_alias(g.db, asset_id=asset_id, alias_name=request.form.get("alias_name", ""), source="manual", notes=request.form.get("notes", ""))
+            portfolio_rebuild_asset_alias_blob(g.db, asset_id)
+            g.db.commit()
+            flash("Alias guardado.", "success")
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao guardar alias: {exc}", "error")
+        return _alias_return(asset_id)
+
+    @app.route("/assets/<int:asset_id>/aliases/update", methods=["POST"])
+    def portfolio_alias_update(asset_id: int):
+        try:
+            portfolio_update_alias(g.db, asset_id=asset_id, alias_id=int(request.form.get("alias_id", "0") or 0), alias_name=request.form.get("alias_name", ""), notes=request.form.get("notes", ""))
+            portfolio_rebuild_asset_alias_blob(g.db, asset_id)
+            g.db.commit()
+            flash("Alias atualizado.", "success")
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao atualizar alias: {exc}", "error")
+        return _alias_return(asset_id)
+
+    @app.route("/assets/<int:asset_id>/aliases/toggle", methods=["POST"])
+    def portfolio_alias_toggle(asset_id: int):
+        try:
+            toggle_alias(g.db, asset_id=asset_id, alias_id=int(request.form.get("alias_id", "0") or 0), active=request.form.get("active") == "1")
+            portfolio_rebuild_asset_alias_blob(g.db, asset_id)
+            g.db.commit()
+            flash("Alias atualizado.", "success")
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao alterar alias: {exc}", "error")
+        return _alias_return(asset_id)
+
+    @app.route("/assets/<int:asset_id>/aliases/delete", methods=["POST"])
+    def portfolio_alias_delete(asset_id: int):
+        try:
+            portfolio_delete_alias(g.db, asset_id=asset_id, alias_id=int(request.form.get("alias_id", "0") or 0))
+            portfolio_rebuild_asset_alias_blob(g.db, asset_id)
+            g.db.commit()
+            flash("Alias apagado.", "success")
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao apagar alias: {exc}", "error")
+        return _alias_return(asset_id)
+
+    @app.route("/portfolio-manager/import", methods=["POST"])
+    def portfolio_manager_import():
+        portfolio_id = int(request.form.get("portfolio_id", "0") or 0) or None
+        upload = request.files.get("file")
+        if upload is None or not upload.filename:
+            flash("Escolhe um ficheiro CSV ou XLSX.", "error")
+            return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id or 0))
+        try:
+            import_id = create_import_preview(g.db, portfolio_id=portfolio_id, original_filename=Path(upload.filename).name, data=upload.read())
+            g.db.commit()
+            flash("Preview de importacao criado.", "success")
+            return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id or 0, import_id=import_id))
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao importar configuracao: {exc}", "error")
+            return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id or 0))
+
+    @app.route("/portfolio-manager/import/<int:import_id>/apply", methods=["POST"])
+    def portfolio_manager_import_apply(import_id: int):
+        try:
+            run = get_import_run(g.db, import_id)
+            selected_rows = _form_int_list("row_numbers")
+            overrides = {
+                int(key.removeprefix("asset_override_")): int(value)
+                for key, value in request.form.items()
+                if key.startswith("asset_override_") and str(value).isdigit()
+            }
+            apply_import_run(g.db, import_id, selected_rows=selected_rows or None, asset_overrides=overrides)
+            g.db.commit()
+            flash("Importacao aplicada.", "success")
+            return redirect(url_for("portfolio_manager", portfolio_id=run["portfolio_id"] if run else 0))
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao aplicar importacao: {exc}", "error")
+            return redirect(url_for("portfolio_manager", import_id=import_id))
+
+    @app.route("/portfolio-manager/export")
+    def portfolio_manager_export():
+        workbook = export_configuration_workbook(g.db)
+        output = io.BytesIO()
+        workbook.save(output)
+        output.seek(0)
+        return send_file(
+            output,
+            as_attachment=True,
+            download_name="portfolio_configuration.xlsx",
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
     @app.route("/portfolios", methods=["GET", "POST"])
     def portfolios() -> str:
         if request.method == "POST":
@@ -2766,6 +3241,7 @@ def create_app() -> Flask:
         )
         assets = query_all(g.db, "SELECT id, project_name, nif FROM assets ORDER BY project_name COLLATE NOCASE")
         invoices = query_all(g.db, "SELECT id, asset_id, original_filename FROM source_files WHERE file_type = 'invoice' ORDER BY uploaded_at DESC")
+        invoice_documents = list_portfolio_invoice_documents(g.db, selected_portfolio_id) if selected_portfolio_id else []
         tariff_rules = query_all(g.db, "SELECT * FROM tariff_period_rules ORDER BY tariff_id, weekday_type, start_time")
         config_assets = [row for row in portfolio_assets if int(row["portfolio_id"]) == selected_portfolio_id]
         if config_filter == "pending":
@@ -2788,6 +3264,7 @@ def create_app() -> Flask:
             config_assets=config_assets,
             assets=assets,
             invoices=invoices,
+            invoice_documents=invoice_documents,
             tariff_rules=tariff_rules,
         )
 
@@ -2884,66 +3361,240 @@ def create_app() -> Flask:
     def upload_portfolio_invoice():
         asset_id = int(request.form.get("asset_id", "0") or 0)
         portfolio_id_raw = request.form.get("portfolio_id", "").strip()
+        report_month = normalize_report_month(request.form.get("report_month", ""))
         upload = request.files.get("file")
         if not asset_id or upload is None or not upload.filename:
             flash("Escolhe a instalacao e o ficheiro fonte da fatura.", "error")
             return redirect(url_for("portfolios"))
+        stored_path: Path | None = None
+        created_new_file = False
         try:
-            store_source_file(
+            document_id, warnings = store_invoice_upload(
                 g.db,
                 upload_dir=UPLOAD_DIR,
                 file_storage=upload,
                 asset_id=asset_id,
                 portfolio_id=int(portfolio_id_raw) if portfolio_id_raw.isdigit() else None,
-                file_type="invoice",
             )
+            created_new_file = "duplicate_invoice" not in warnings
+            if created_new_file:
+                invoice = get_invoice_document(g.db, document_id)
+                stored_path = Path(invoice["stored_path"]) if invoice is not None else None
             g.db.commit()
-            flash("Fatura/ficheiro fonte guardado.", "success")
+            suffix = " Avisos: " + ", ".join(warnings) if warnings else ""
+            flash(f"Fatura guardada para revisao (doc {document_id}).{suffix}", "success")
         except Exception as exc:
             g.db.rollback()
+            if created_new_file and stored_path is not None:
+                stored_path.unlink(missing_ok=True)
             flash(f"Falha ao guardar fatura: {exc}", "error")
-        return redirect(url_for("portfolios"))
+        return redirect(url_for("portfolios", tab="config", portfolio_id=portfolio_id_raw, report_month=report_month))
+
+    @app.route("/invoices/<int:invoice_document_id>/extract", methods=["POST"])
+    def extract_invoice_document_route(invoice_document_id: int):
+        invoice = get_invoice_document(g.db, invoice_document_id)
+        if invoice is None:
+            abort(404)
+        try:
+            result = extract_invoice_file(Path(invoice["stored_path"]))
+            persist_invoice_extraction_result(g.db, invoice, result)
+            g.db.commit()
+            flash("Extracao assistida concluida. Revê os valores antes de usar.", "success")
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha na extracao: {exc}", "error")
+        return redirect(url_for("review_invoice_document", invoice_document_id=invoice_document_id))
+
+    @app.route("/invoices/<int:invoice_document_id>/review", methods=["GET", "POST"])
+    def review_invoice_document(invoice_document_id: int):
+        invoice = get_invoice_document(g.db, invoice_document_id)
+        if invoice is None:
+            abort(404)
+        asset = g.db.execute("SELECT id, project_name, nif FROM assets WHERE id = ?", (invoice["asset_id"],)).fetchone()
+        if request.method == "POST":
+            action = request.form.get("action", "").strip()
+            try:
+                if action == "reject_invoice":
+                    reject_invoice_document(g.db, invoice_document_id)
+                    flash("Fatura rejeitada.", "success")
+                elif action == "archive_invoice":
+                    archive_invoice_document(g.db, invoice_document_id)
+                    flash("Fatura arquivada.", "success")
+                elif action in {"save_invoice_review", "confirm_invoice", "confirm_with_warnings"}:
+                    values = invoice_values_from_form(request.form)
+                    validation = validate_invoice_values(values, asset_nif=asset["nif"] if asset else None)
+                    if not validation.valid:
+                        raise ValueError("; ".join(validation.errors))
+                    requires_override = warnings_require_override(validation.warnings)
+                    if action == "confirm_invoice" and requires_override:
+                        raise ValueError("Confirmacao exige override explicito para estes avisos: " + ", ".join(validation.warnings))
+                    update_invoice_review(
+                        g.db,
+                        invoice_document_id=invoice_document_id,
+                        values=values,
+                        warnings=validation.warnings,
+                        status=InvoiceStatus.CONFIRMED.value if action in {"confirm_invoice", "confirm_with_warnings"} else InvoiceStatus.REVIEW_REQUIRED.value,
+                    )
+                    if action == "confirm_with_warnings":
+                        flash("Fatura confirmada com avisos preservados.", "warning")
+                    elif action == "confirm_invoice":
+                        flash("Fatura confirmada.", "success")
+                    else:
+                        flash("Revisao guardada.", "success")
+                elif action == "use_invoice_tariff":
+                    apply_invoice_to_tariff(g.db, invoice_document_id)
+                    flash("Tarifa criada a partir da fatura confirmada.", "success")
+                else:
+                    raise ValueError("Acao invalida.")
+                g.db.commit()
+            except Exception as exc:
+                g.db.rollback()
+                flash(f"Falha na revisao da fatura: {exc}", "error")
+            return redirect(url_for("review_invoice_document", invoice_document_id=invoice_document_id))
+        runs = list_invoice_extraction_runs(g.db, invoice_document_id)
+        return render_template("invoice_review.html", invoice=invoice, asset=asset, runs=runs, title="Revisao de fatura")
 
     @app.route("/portfolio-reports")
     def portfolio_reports() -> str:
         groups = query_all(g.db, "SELECT * FROM portfolio_groups ORDER BY name COLLATE NOCASE")
         selected_portfolio_id = int(request.args.get("portfolio_id", groups[0]["id"] if groups else 0) or 0)
         report_month = normalize_report_month(request.args.get("report_month", ""))
-        rows = build_portfolio_report_rows(g.db, selected_portfolio_id, report_month) if selected_portfolio_id else []
         portfolio_name = next((row["name"] for row in groups if int(row["id"]) == selected_portfolio_id), "")
-        for row in rows:
-            row["portfolio"] = portfolio_name
-        total_row = aggregate_portfolio_total(rows) if rows else None
-        if total_row:
-            total_row["portfolio"] = portfolio_name
-        runs = query_all(
-            g.db,
-            """
-            SELECT prr.*, pg.name AS portfolio_name
-            FROM portfolio_report_runs prr
-            JOIN portfolio_groups pg ON pg.id = prr.portfolio_id
-            ORDER BY prr.created_at DESC
-            LIMIT 20
-            """,
-        )
+        period_type = request.args.get("period_type", "monthly").strip() or "monthly"
+        report_year = request.args.get("report_year") or report_month[:4]
+        report_quarter = request.args.get("report_quarter") or str(((int(report_month[5:7]) - 1) // 3) + 1)
+        report_semester = request.args.get("report_semester") or ("1" if int(report_month[5:7]) <= 6 else "2")
+        comparison = request.args.get("comparison", "").strip()
+        profiles = list_portfolio_report_profiles(g.db, selected_portfolio_id)
+        selected_profile_id = int(request.args.get("profile_id", "0") or 0)
+        profile = get_portfolio_report_profile(g.db, selected_profile_id) if selected_profile_id else None
+        if profile is None:
+            profile = get_default_portfolio_report_profile(g.db, selected_portfolio_id)
+            selected_profile_id = int(profile.id or 0)
+        portfolio_result = None
+        rows = []
+        total_row = None
+        if selected_portfolio_id:
+            try:
+                portfolio_result = prepare_portfolio_report(
+                    g.db,
+                    portfolio_id=selected_portfolio_id,
+                    portfolio_name=portfolio_name,
+                    profile=profile,
+                    period_type=period_type,
+                    report_month=report_month,
+                    year=report_year,
+                    quarter=report_quarter,
+                    semester=report_semester,
+                    comparison=comparison,
+                    profile_version=latest_portfolio_report_profile_version(g.db, profile.id),
+                )
+            except Exception as exc:
+                flash(f"Falha ao preparar relatorio configuravel: {exc}", "error")
+                portfolio_result = None
+            if portfolio_result is None:
+                rows = build_portfolio_report_rows(g.db, selected_portfolio_id, report_month)
+                for row in rows:
+                    row["portfolio"] = portfolio_name
+                total_row = aggregate_portfolio_total(rows) if rows else None
+                if total_row:
+                    total_row["portfolio"] = portfolio_name
+        runs = list_portfolio_report_history(g.db, selected_portfolio_id, limit=20)
         return render_template(
             "portfolio_reports.html",
             title="Relatorios de portfolio",
             groups=groups,
             selected_portfolio_id=selected_portfolio_id,
             report_month=report_month,
+            report_year=report_year,
+            report_quarter=report_quarter,
+            report_semester=report_semester,
+            period_type=period_type,
+            comparison=comparison,
+            profiles=profiles,
+            selected_profile_id=selected_profile_id,
+            selected_profile=profile,
+            metric_catalog=METRIC_CATALOG,
+            portfolio_result=portfolio_result,
             rows=rows,
             total_row=total_row,
             runs=runs,
         )
 
+    @app.route("/portfolio-reports/profiles", methods=["POST"])
+    def save_portfolio_report_profile_route():
+        action = request.form.get("action", "save").strip()
+        portfolio_id = int(request.form.get("portfolio_id", "0") or 0) or None
+        profile_id = int(request.form.get("profile_id", "0") or 0)
+        try:
+            if action == "archive" and profile_id:
+                archive_portfolio_report_profile(g.db, profile_id)
+                flash("Perfil arquivado.", "success")
+            elif action == "set_default" and profile_id:
+                set_default_portfolio_report_profile(g.db, profile_id)
+                flash("Perfil predefinido atualizado.", "success")
+            elif action == "duplicate" and profile_id:
+                duplicate_portfolio_report_profile(g.db, profile_id, request.form.get("name", "").strip() or "Copia")
+                flash("Perfil duplicado.", "success")
+            else:
+                base = get_portfolio_report_profile(g.db, profile_id) if profile_id else get_default_portfolio_report_profile(g.db, portfolio_id)
+                selected_metrics = request.form.getlist("metric_key") or [column.metric_key for column in base.columns if column.visible]
+                config = profile_to_config(base)
+                config["name"] = request.form.get("name", "").strip() or base.name
+                config["description"] = request.form.get("description", "").strip()
+                config["portfolio_id"] = portfolio_id
+                config["period_type"] = request.form.get("default_period_type", "monthly")
+                config["comparison"] = request.form.get("default_comparison", "")
+                selected_metrics = sorted(
+                    selected_metrics,
+                    key=lambda metric_key: int(request.form.get(f"order_{metric_key}", "9999") or 9999),
+                )
+                config["columns"] = [
+                    {
+                        "metric_key": metric_key,
+                        "label": request.form.get(f"label_{metric_key}", "").strip() or metric_key,
+                        "decimals": request.form.get(f"decimals_{metric_key}", ""),
+                        "visible": True,
+                        "display_order": index * 10,
+                    }
+                    for index, metric_key in enumerate(selected_metrics, start=1)
+                ]
+                profile = profile_from_config(config, profile_id=profile_id or None, portfolio_id=portfolio_id)
+                profile_id = save_portfolio_report_profile(g.db, profile)
+                flash("Perfil guardado.", "success")
+            g.db.commit()
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao guardar perfil: {exc}", "error")
+        return redirect(url_for("portfolio_reports", portfolio_id=portfolio_id or 0, profile_id=profile_id))
+
     @app.route("/portfolio-reports/generate", methods=["POST"])
     def generate_portfolio_report():
         portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
         report_month = normalize_report_month(request.form.get("report_month", ""))
+        period_type = request.form.get("period_type", "monthly").strip() or "monthly"
+        profile_id = int(request.form.get("profile_id", "0") or 0)
+        comparison = request.form.get("comparison", "").strip()
         return_to = request.form.get("return_to", "").strip()
         try:
-            report_id = snapshot_portfolio_report(g.db, portfolio_id, report_month, request.form.get("notes", "").strip())
+            group = g.db.execute("SELECT * FROM portfolio_groups WHERE id = ?", (portfolio_id,)).fetchone()
+            if not group:
+                raise ValueError("Portfolio invalido.")
+            profile = get_portfolio_report_profile(g.db, profile_id) if profile_id else get_default_portfolio_report_profile(g.db, portfolio_id)
+            result = prepare_portfolio_report(
+                g.db,
+                portfolio_id=portfolio_id,
+                portfolio_name=group["name"],
+                profile=profile,
+                period_type=period_type,
+                report_month=report_month,
+                year=request.form.get("report_year") or report_month[:4],
+                quarter=request.form.get("report_quarter"),
+                semester=request.form.get("report_semester"),
+                comparison=comparison,
+                profile_version=latest_portfolio_report_profile_version(g.db, profile.id),
+            )
+            report_id = snapshot_portfolio_result(g.db, result, request.form.get("notes", "").strip())
             g.db.commit()
             flash(f"Relatorio snapshot #{report_id} gerado.", "success")
         except Exception as exc:
@@ -2951,21 +3602,53 @@ def create_app() -> Flask:
             flash(f"Falha ao gerar relatorio: {exc}", "error")
         if return_to == "portfolios":
             return redirect(url_for("portfolios", portfolio_id=portfolio_id, report_month=report_month, tab="report"))
-        return redirect(url_for("portfolio_reports", portfolio_id=portfolio_id, report_month=report_month))
+        return redirect(url_for("portfolio_reports", portfolio_id=portfolio_id, report_month=report_month, profile_id=profile_id, period_type=period_type, comparison=comparison))
 
     @app.route("/portfolio-reports/export")
     def export_portfolio_report():
+        snapshot_id = int(request.args.get("snapshot_id", "0") or 0)
+        if snapshot_id:
+            result = get_portfolio_snapshot_result(g.db, snapshot_id)
+            if result:
+                workbook = export_portfolio_result_workbook(result)
+                buffer = io.BytesIO()
+                workbook.save(buffer)
+                buffer.seek(0)
+                return send_file(
+                    buffer,
+                    as_attachment=True,
+                    download_name=f"portfolio_snapshot_{snapshot_id}.xlsx",
+                    mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
         portfolio_id = int(request.args.get("portfolio_id", "0") or 0)
         report_month = normalize_report_month(request.args.get("report_month", ""))
         group = g.db.execute("SELECT * FROM portfolio_groups WHERE id = ?", (portfolio_id,)).fetchone()
-        rows = build_portfolio_report_rows(g.db, portfolio_id, report_month) if group else []
-        for row in rows:
-            row["portfolio"] = group["name"] if group else ""
-        if rows:
-            total = aggregate_portfolio_total(rows)
-            total["portfolio"] = group["name"] if group else ""
-            rows.append(total)
-        workbook = export_portfolio_report_workbook(rows)
+        profile_id = int(request.args.get("profile_id", "0") or 0)
+        if group and (profile_id or request.args.get("period_type") or request.args.get("comparison")):
+            profile = get_portfolio_report_profile(g.db, profile_id) if profile_id else get_default_portfolio_report_profile(g.db, portfolio_id)
+            result = prepare_portfolio_report(
+                g.db,
+                portfolio_id=portfolio_id,
+                portfolio_name=group["name"],
+                profile=profile,
+                period_type=request.args.get("period_type", "monthly"),
+                report_month=report_month,
+                year=request.args.get("report_year") or report_month[:4],
+                quarter=request.args.get("report_quarter"),
+                semester=request.args.get("report_semester"),
+                comparison=request.args.get("comparison", ""),
+                profile_version=latest_portfolio_report_profile_version(g.db, profile.id),
+            )
+            workbook = export_portfolio_result_workbook(result)
+        else:
+            rows = build_portfolio_report_rows(g.db, portfolio_id, report_month) if group else []
+            for row in rows:
+                row["portfolio"] = group["name"] if group else ""
+            if rows:
+                total = aggregate_portfolio_total(rows)
+                total["portfolio"] = group["name"] if group else ""
+                rows.append(total)
+            workbook = export_portfolio_report_workbook(rows)
         buffer = io.BytesIO()
         workbook.save(buffer)
         buffer.seek(0)
@@ -2975,6 +3658,256 @@ def create_app() -> Flask:
             download_name=f"portfolio_{portfolio_id}_{report_month}.xlsx",
             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+
+    @app.route("/report-templates", methods=["GET", "POST"])
+    def report_templates():
+        if request.method == "POST":
+            action = request.form.get("action", "save").strip()
+            template_id = int(request.form.get("template_id", "0") or 0)
+            portfolio_id = int(request.form.get("portfolio_id", "0") or 0) or None
+            try:
+                if action == "archive" and template_id:
+                    archive_report_template(g.db, template_id)
+                    flash("Template arquivado.", "success")
+                elif action == "duplicate" and template_id:
+                    existing = get_template(g.db, template_id)
+                    if existing:
+                        validate_template_scope(existing, existing.report_type, portfolio_id=existing.portfolio_id, client_key=existing.client_key, allow_inactive=True)
+                    duplicate_report_template(g.db, template_id, request.form.get("name", "").strip() or "Copia")
+                    flash("Template duplicado.", "success")
+                elif action == "set_default" and template_id:
+                    existing = get_template(g.db, template_id)
+                    if existing:
+                        validate_template_scope(existing, existing.report_type, portfolio_id=existing.portfolio_id, client_key=existing.client_key)
+                    set_default_template(g.db, template_id)
+                    flash("Template default atualizado.", "success")
+                else:
+                    base = get_template(g.db, template_id) if template_id else default_template("Portfolio executivo" if request.form.get("report_type") == "portfolio" else "Individual padrao", portfolio_id=portfolio_id)
+                    if base.id:
+                        validate_template_scope(base, base.report_type, portfolio_id=base.portfolio_id, client_key=base.client_key, allow_inactive=True)
+                    logo_path = base.branding.logo_path
+                    logo_file = request.files.get("logo")
+                    old_logo_path = logo_path
+                    if logo_file and logo_file.filename:
+                        logo_path = store_report_logo(logo_file, old_logo_path=old_logo_path)
+                    config = template_to_config(base)
+                    config.update(
+                        name=request.form.get("name", "").strip() or base.name,
+                        report_type=request.form.get("report_type", base.report_type),
+                        description=request.form.get("description", "").strip(),
+                        portfolio_id=portfolio_id,
+                        orientation=request.form.get("orientation", base.orientation),
+                        title=request.form.get("title", "").strip() or base.title,
+                        subtitle=request.form.get("subtitle", "").strip(),
+                        filename_pattern=request.form.get("filename_pattern", "").strip() or base.filename_pattern,
+                        branding={
+                            **config.get("branding", {}),
+                            "company_name": request.form.get("company_name", "").strip() or base.branding.company_name,
+                            "client_name": request.form.get("client_name", "").strip(),
+                            "primary_color": request.form.get("primary_color", base.branding.primary_color),
+                            "secondary_color": request.form.get("secondary_color", base.branding.secondary_color),
+                            "footer": request.form.get("footer", "").strip(),
+                            "contacts": request.form.get("contacts", "").strip(),
+                            "disclaimer": request.form.get("disclaimer", "").strip(),
+                            "logo_path": logo_path,
+                        },
+                    )
+                    enabled_sections = set(request.form.getlist("section_key"))
+                    config["sections"] = [
+                        {**section, "enabled": section["key"] in enabled_sections, "display_order": int(request.form.get(f"order_{section['key']}", section["display_order"]) or section["display_order"])}
+                        for section in config["sections"]
+                    ]
+                    template = template_from_config(config, template_id=template_id or None, portfolio_id=portfolio_id)
+                    template_id = save_template(g.db, template, is_default=1 if request.form.get("is_default") == "on" else 0)
+                    flash("Template guardado.", "success")
+                g.db.commit()
+            except Exception as exc:
+                g.db.rollback()
+                LOGGER.warning("report_template_action_failed action=%s template_id=%s error_code=%s", action, template_id, type(exc).__name__)
+                flash("Falha no template. Verifica os dados submetidos.", "error")
+            return redirect(url_for("report_templates", template_id=template_id))
+        templates = list_templates(g.db, include_inactive=True)
+        selected_id = int(request.args.get("template_id", templates[0]["id"] if templates else 0) or 0)
+        selected_template = get_template(g.db, selected_id) if selected_id else default_template("Portfolio executivo")
+        groups = query_all(g.db, "SELECT * FROM portfolio_groups ORDER BY name COLLATE NOCASE")
+        return render_template("report_templates.html", title="Templates de relatorio", templates=templates, selected_template=selected_template, groups=groups)
+
+    @app.route("/report-generation", methods=["GET", "POST"])
+    def report_generation():
+        output_dir = UPLOAD_DIR / "generated_reports"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if request.method == "POST":
+            report_type = request.form.get("report_type", "portfolio")
+            template_id = int(request.form.get("template_id", "0") or 0)
+            portfolio_id = int(request.form.get("portfolio_id", "0") or 0) or None
+            snapshot_id = int(request.form.get("snapshot_id", "0") or 0) or None
+            raw_formats = request.form.getlist("formats") or ["pdf"]
+            run_id = None
+            try:
+                formats = validate_formats(report_type, raw_formats)
+                main_formats = tuple(item for item in formats if item != "zip")
+                template = get_template(g.db, template_id) if template_id else get_default_template(g.db, report_type, portfolio_id)
+                if template is None:
+                    raise ValueError("Template invalido.")
+                snapshot_result = None
+                if snapshot_id:
+                    snapshot_result = get_portfolio_snapshot_result(g.db, snapshot_id)
+                    if snapshot_result is None or (portfolio_id and snapshot_result.portfolio_id != portfolio_id):
+                        raise ValueError("Snapshot invalido.")
+                    portfolio_id = snapshot_result.portfolio_id
+                    reject_snapshot_period_overrides(request.form, snapshot_result)
+                client_key = resolve_generation_client_key(g.db, report_type, request.form, portfolio_id)
+                validate_template_scope(template, report_type, portfolio_id=portfolio_id, client_key=client_key)
+                if report_type == "portfolio" and not snapshot_id and not portfolio_id:
+                    raise ValueError("Portfolio obrigatorio.")
+                jobs = build_snapshot_generation_jobs(snapshot_result, main_formats) if snapshot_result else build_generation_jobs(request.form, report_type, main_formats)
+                if not jobs:
+                    raise ValueError("Pedido sem outputs principais.")
+                if len(jobs) > MAX_TOTAL_OUTPUTS:
+                    raise ValueError("Demasiados outputs no mesmo run.")
+                first_period = jobs[0]["period"]
+                run_id = create_generation_run(
+                    g.db,
+                    template_id=template.id,
+                    template_version=latest_template_version(g.db, template.id),
+                    report_type=report_type,
+                    portfolio_id=portfolio_id,
+                    asset_id=jobs[0].get("asset_id"),
+                    snapshot_id=snapshot_id,
+                    period_type=first_period["period_type"],
+                    period_start=first_period["period_start"],
+                    period_end=first_period["period_end"],
+                    requested_count=len(jobs),
+                )
+                LOGGER.info("report_generation_run_created run_id=%s report_type=%s template_id=%s portfolio_id=%s snapshot_id=%s requested_count=%s", run_id, report_type, template.id, portfolio_id, snapshot_id, len(jobs))
+                g.db.commit()
+                completed = 0
+                failed = 0
+                skipped = 0
+                warnings: list[str] = []
+                completed_files = []
+                if report_type == "portfolio":
+                    for job in jobs:
+                        try:
+                            LOGGER.info("report_generation_item_started run_id=%s format=%s portfolio_id=%s snapshot_id=%s", run_id, job["format"], portfolio_id, snapshot_id)
+                            result = snapshot_result or build_portfolio_generation_result(g.db, request.form, portfolio_id, snapshot_id, job["period"])
+                            if snapshot_id:
+                                portfolio_id = result.portfolio_id
+                            rendered = render_portfolio_pdf(result, template) if job["format"] == "pdf" else render_portfolio_excel(result, template)
+                            completed_files.append(register_rendered_generation_file(g.db, output_dir, run_id, rendered, snapshot_id=snapshot_id))
+                            completed += 1
+                            warnings.extend(rendered.warnings)
+                            LOGGER.info("report_generation_item_completed run_id=%s format=%s portfolio_id=%s snapshot_id=%s", run_id, job["format"], rendered.portfolio_id, snapshot_id)
+                        except Exception as exc:
+                            failed += 1
+                            LOGGER.warning("report_generation_item_failed run_id=%s format=%s portfolio_id=%s snapshot_id=%s error_code=%s", run_id, job.get("format"), portfolio_id, snapshot_id, type(exc).__name__)
+                            add_failed_generation_file(g.db, run_id, job, str(exc), portfolio_id=portfolio_id, snapshot_id=snapshot_id)
+                else:
+                    for job in jobs:
+                        try:
+                            LOGGER.info("report_generation_item_started run_id=%s format=%s asset_id=%s", run_id, job["format"], job.get("asset_id"))
+                            report = build_individual_generation_report(g.db, job["asset_id"], job["period"])
+                            rendered = render_individual_pdf(report, template) if job["format"] == "pdf" else render_individual_excel(report, template)
+                            completed_files.append(register_rendered_generation_file(g.db, output_dir, run_id, rendered))
+                            completed += 1
+                            warnings.extend(rendered.warnings)
+                            LOGGER.info("report_generation_item_completed run_id=%s format=%s asset_id=%s", run_id, job["format"], rendered.asset_id)
+                        except Exception as exc:
+                            failed += 1
+                            LOGGER.warning("report_generation_item_failed run_id=%s format=%s asset_id=%s error_code=%s", run_id, job.get("format"), job.get("asset_id"), type(exc).__name__)
+                            add_failed_generation_file(g.db, run_id, job, str(exc), asset_id=job.get("asset_id"))
+                if "zip" in formats and completed_files:
+                    zip_file = render_zip(completed_files, filename=f"run_{run_id}.zip")
+                    register_rendered_generation_file(g.db, output_dir, run_id, zip_file)
+                status = "completed" if completed and not failed else ("partial" if completed and failed else "failed")
+                finish_generation_run(g.db, run_id, status=status, completed_count=completed, failed_count=failed, skipped_count=skipped, warnings=sorted(set(warnings)), error_message="" if completed else "Todos os outputs falharam.")
+                g.db.commit()
+                flash(f"Run #{run_id} terminado: {completed} concluídos, {failed} falhados.", "success" if status == "completed" else "warning")
+            except Exception as exc:
+                g.db.rollback()
+                if run_id:
+                    finish_generation_run(g.db, run_id, status="failed", completed_count=0, failed_count=0, error_message=str(exc))
+                    g.db.commit()
+                LOGGER.warning("report_generation_failed run_id=%s report_type=%s template_id=%s error_code=%s", run_id, report_type, template_id, type(exc).__name__)
+                flash("Falha na geração. Revê o pedido e consulta os logs para detalhe técnico.", "error")
+            return redirect(url_for("report_generation"))
+        groups = query_all(g.db, "SELECT * FROM portfolio_groups ORDER BY name COLLATE NOCASE")
+        assets = query_all(g.db, "SELECT id, project_name FROM assets WHERE active_contract = 'yes' OR active_contract IS NULL ORDER BY project_name COLLATE NOCASE LIMIT 200")
+        templates = list_templates(g.db)
+        profiles = list_portfolio_report_profiles(g.db)
+        page = max(int(request.args.get("page", "1") or 1), 1)
+        offset = (page - 1) * 20
+        runs = list_generation_runs(g.db, limit=20, offset=offset)
+        files = list_generated_files(g.db, limit=50, offset=(page - 1) * 50)
+        return render_template("report_generation.html", title="Geracao de relatorios", groups=groups, assets=assets, templates=templates, profiles=profiles, runs=runs, files=files, page=page)
+
+    @app.route("/reporting-health")
+    def reporting_health():
+        findings = reconcile_generated_reports(g.db, cleanup=False)
+        stale_runs = query_scalar(g.db, "SELECT COUNT(*) FROM report_generation_runs WHERE status = 'running' AND created_at < datetime('now', '-2 hours')")
+        payload = {
+            "database": "ok",
+            "storage": "ok" if UPLOAD_DIR.exists() else "missing",
+            "defaults": len(list_templates(g.db)) > 0,
+            "storage_findings": len([item for item in findings if item.status != "ok"]),
+            "stale_runs": stale_runs,
+        }
+        return payload
+
+    @app.route("/report-generation/preview")
+    def report_generation_preview():
+        portfolio_id = int(request.args.get("portfolio_id", "0") or 0)
+        template_id = int(request.args.get("template_id", "0") or 0)
+        template = get_template(g.db, template_id) if template_id else get_default_template(g.db, "portfolio", portfolio_id)
+        if template is None:
+            abort(404)
+        validate_template_scope(template, "portfolio", portfolio_id=portfolio_id, client_key=resolve_report_client_key(g.db, portfolio_id=portfolio_id))
+        snapshot_id = int(request.args.get("snapshot_id", "0") or 0)
+        if snapshot_id:
+            result = get_portfolio_snapshot_result(g.db, snapshot_id)
+            if result is None or (portfolio_id and result.portfolio_id != portfolio_id):
+                abort(404)
+            return render_portfolio_html(result, template)
+        group = g.db.execute("SELECT * FROM portfolio_groups WHERE id = ?", (portfolio_id,)).fetchone()
+        if not group:
+            abort(404)
+        profile_id = int(request.args.get("profile_id", "0") or 0)
+        profile = get_portfolio_report_profile(g.db, profile_id) if profile_id else get_default_portfolio_report_profile(g.db, portfolio_id)
+        report_month = normalize_report_month(request.args.get("report_month", ""))
+        period_job = parse_generation_periods(request.args)[0]
+        result = prepare_portfolio_report(
+            g.db,
+            portfolio_id=portfolio_id,
+            portfolio_name=group["name"],
+            profile=profile,
+            period_type=period_job["period_type"],
+            report_month=report_month,
+            year=period_job.get("report_year") or report_month[:4],
+            quarter=period_job.get("report_quarter"),
+            semester=period_job.get("report_semester"),
+            comparison=request.args.get("comparison", ""),
+        )
+        return render_portfolio_html(result, template)
+
+    @app.route("/report-generation/files/<int:file_id>")
+    def download_generated_report(file_id: int):
+        row = get_generated_file(g.db, file_id)
+        if row is None:
+            abort(404)
+        path = resolve_runtime_file_path_within(row["relative_path"], UPLOAD_DIR / "generated_reports")
+        if path is None or not path.exists():
+            abort(404)
+        if path.is_symlink() or not path_is_within(path.resolve(), (UPLOAD_DIR / "generated_reports").resolve()):
+            abort(404)
+        if path.stat().st_size != int(row["size_bytes"] or 0):
+            abort(404)
+        if row["sha256"]:
+            import hashlib
+
+            if hashlib.sha256(path.read_bytes()).hexdigest() != row["sha256"]:
+                abort(404)
+        mimetype = "application/pdf" if row["format"] == "pdf" else ("application/zip" if row["format"] == "zip" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        return send_file(path, as_attachment=True, download_name=row["filename"], mimetype=mimetype)
 
     @app.route("/integrations", methods=["GET", "POST"])
     def integrations() -> str:
@@ -3951,6 +4884,56 @@ def ensure_database(path: str) -> None:
                 FOREIGN KEY (portfolio_id) REFERENCES portfolio_groups(id) ON DELETE SET NULL
             );
 
+            CREATE TABLE IF NOT EXISTS invoice_documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_file_id INTEGER NOT NULL UNIQUE,
+                asset_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                sha256 TEXT,
+                mime_type TEXT,
+                size_bytes INTEGER,
+                supplier_name TEXT,
+                supplier_nif TEXT,
+                customer_name TEXT,
+                customer_nif TEXT,
+                invoice_number TEXT,
+                issue_date TEXT,
+                billing_period_start TEXT,
+                billing_period_end TEXT,
+                currency TEXT,
+                total_amount TEXT,
+                total_energy_kwh TEXT,
+                tariff_type_candidate TEXT,
+                simple_price_eur_kwh TEXT,
+                ponta_price_eur_kwh TEXT,
+                cheia_price_eur_kwh TEXT,
+                vazio_price_eur_kwh TEXT,
+                super_vazio_price_eur_kwh TEXT,
+                extraction_method TEXT,
+                extraction_confidence TEXT,
+                warnings_json TEXT,
+                reviewed_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (source_file_id) REFERENCES source_files(id) ON DELETE CASCADE,
+                FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS invoice_extraction_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invoice_document_id INTEGER NOT NULL,
+                parser_name TEXT NOT NULL,
+                parser_version TEXT NOT NULL,
+                status TEXT NOT NULL,
+                extracted_values_json TEXT,
+                confidence_json TEXT,
+                evidence_json TEXT,
+                warnings_json TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (invoice_document_id) REFERENCES invoice_documents(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS helioscope_expected_production (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 asset_id INTEGER NOT NULL,
@@ -4176,11 +5159,18 @@ def ensure_database(path: str) -> None:
         ensure_column(conn, "production_hourly_records", "grid_import_kwh REAL")
         ensure_column(conn, "production_hourly_records", "data_quality TEXT")
         ensure_column(conn, "production_hourly_records", "source_fields_json TEXT")
+        ensure_column(conn, "source_files", "sha256 TEXT")
+        ensure_column(conn, "source_files", "mime_type TEXT")
+        ensure_column(conn, "source_files", "size_bytes INTEGER")
+        ensure_column(conn, "source_files", "archived_at TEXT")
         disable_removed_inverter_devices(conn)
         populate_missing_inverter_rated_power(conn)
         populate_missing_installation_groups(conn)
         populate_missing_group_metadata(conn)
         ensure_predefined_export_templates(conn)
+        ensure_portfolio_management_schema(conn)
+        ensure_portfolio_reporting_schema(conn)
+        ensure_report_template_schema(conn)
         ensure_portfolio_seed_data(conn)
         ensure_alert_settings_defaults(conn)
         ensure_billing_config_schema(conn)
@@ -7766,6 +8756,266 @@ def export_customer_production_pdf(report: dict[str, Any]):
     return send_file(buffer, as_attachment=True, download_name=filename, mimetype="application/pdf")
 
 
+def store_report_logo(file_storage, *, old_logo_path: str = "") -> str:
+    filename = safe_upload_filename(file_storage.filename or "")
+    extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if extension not in {"png", "jpg", "jpeg"}:
+        raise ValueError("invalid_logo_extension")
+    payload = file_storage.read()
+    if not payload or len(payload) > 512 * 1024:
+        raise ValueError("invalid_logo_size")
+    width, height = image_dimensions(payload, extension)
+    if width <= 0 or height <= 0 or width > 2400 or height > 1200:
+        raise ValueError("invalid_logo_dimensions")
+    logo_dir = UPLOAD_DIR / "report_logos"
+    logo_dir.mkdir(parents=True, exist_ok=True)
+    target = logo_dir / f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{filename}"
+    target.write_bytes(payload)
+    return store_runtime_relative_path(target)
+
+
+def safe_upload_filename(filename: str) -> str:
+    cleaned = secure_filename(filename)
+    if not cleaned or any(item in cleaned for item in {"..", "/", "\\"}):
+        raise ValueError("invalid_upload_filename")
+    return cleaned
+
+
+def image_dimensions(payload: bytes, extension: str) -> tuple[int, int]:
+    if extension == "png":
+        if not payload.startswith(b"\x89PNG\r\n\x1a\n") or len(payload) < 24:
+            raise ValueError("invalid_logo_content")
+        width, height = struct.unpack(">II", payload[16:24])
+        return int(width), int(height)
+    if extension in {"jpg", "jpeg"}:
+        if not payload.startswith(b"\xff\xd8"):
+            raise ValueError("invalid_logo_content")
+        index = 2
+        while index + 9 < len(payload):
+            if payload[index] != 0xFF:
+                index += 1
+                continue
+            marker = payload[index + 1]
+            index += 2
+            if marker in {0xD8, 0xD9}:
+                continue
+            length = int.from_bytes(payload[index : index + 2], "big")
+            if length < 2:
+                raise ValueError("invalid_logo_content")
+            if marker in {0xC0, 0xC2} and index + 7 < len(payload):
+                height = int.from_bytes(payload[index + 3 : index + 5], "big")
+                width = int.from_bytes(payload[index + 5 : index + 7], "big")
+                return int(width), int(height)
+            index += length
+    raise ValueError("invalid_logo_content")
+
+
+def build_generation_jobs(form: Any, report_type: str, main_formats: tuple[str, ...]) -> list[dict[str, Any]]:
+    periods = parse_generation_periods(form)
+    jobs: list[dict[str, Any]] = []
+    if report_type == "individual":
+        asset_ids = [int(item) for item in form.getlist("asset_ids") if str(item).isdigit()]
+        if not asset_ids:
+            asset_ids = [int(form.get("asset_id", "0") or 0)]
+        asset_ids = sorted({item for item in asset_ids if item})
+        if not asset_ids:
+            raise ValueError("Instalação obrigatória.")
+        if len(asset_ids) > MAX_BATCH_ASSETS:
+            raise ValueError("Demasiadas instalacoes no mesmo run.")
+        for asset_id in asset_ids:
+            for period in periods:
+                for fmt in main_formats:
+                    jobs.append({"asset_id": asset_id, "period": period, "format": fmt})
+    else:
+        for period in periods:
+            for fmt in main_formats:
+                jobs.append({"period": period, "format": fmt})
+    if len(jobs) > MAX_TOTAL_OUTPUTS:
+        raise ValueError("Demasiados outputs no mesmo run.")
+    return jobs
+
+
+def build_snapshot_generation_jobs(snapshot_result, main_formats: tuple[str, ...]) -> list[dict[str, Any]]:
+    period = {
+        "period_type": snapshot_result.period.period_type.value,
+        "report_month": snapshot_result.period.start.strftime("%Y-%m"),
+        "period_start": snapshot_result.period.start.isoformat(),
+        "period_end": snapshot_result.period.end.isoformat(),
+    }
+    return [{"period": period, "format": fmt} for fmt in main_formats]
+
+
+def reject_snapshot_period_overrides(form: Any, snapshot_result) -> None:
+    raw_months = [part for item in form.getlist("report_months") for part in re.split(r"[\s,;]+", str(item)) if part]
+    if len(set(raw_months)) > 1:
+        raise ValueError("snapshot_rejects_multiple_periods")
+    submitted_type = str(form.get("period_type") or snapshot_result.period.period_type.value)
+    if submitted_type != snapshot_result.period.period_type.value:
+        raise ValueError("snapshot_period_mismatch")
+    submitted_month = form.get("report_month")
+    if submitted_month and normalize_report_month(submitted_month) != snapshot_result.period.start.strftime("%Y-%m"):
+        raise ValueError("snapshot_period_mismatch")
+
+
+def resolve_report_client_key(conn: sqlite3.Connection, *, portfolio_id: int | None = None, asset_id: int | None = None) -> str:
+    if portfolio_id:
+        row = conn.execute("SELECT name FROM portfolio_groups WHERE id = ?", (portfolio_id,)).fetchone()
+        return normalize_name(row["name"]) if row else ""
+    if asset_id:
+        row = conn.execute("SELECT nif, project_name FROM assets WHERE id = ?", (asset_id,)).fetchone()
+        return normalize_name(row["nif"] or row["project_name"]) if row else ""
+    return ""
+
+
+def resolve_generation_client_key(conn: sqlite3.Connection, report_type: str, form: Any, portfolio_id: int | None) -> str:
+    if report_type == "portfolio":
+        return resolve_report_client_key(conn, portfolio_id=portfolio_id)
+    asset_ids = [int(item) for item in form.getlist("asset_ids") if str(item).isdigit()]
+    if not asset_ids and str(form.get("asset_id", "")).isdigit():
+        asset_ids = [int(form.get("asset_id"))]
+    keys = {resolve_report_client_key(conn, asset_id=asset_id) for asset_id in asset_ids if asset_id}
+    keys.discard("")
+    if len(keys) > 1:
+        raise ValueError("mixed_client_batch")
+    return next(iter(keys), "")
+
+
+def parse_generation_periods(form: Any) -> list[dict[str, str]]:
+    period_type = str(form.get("period_type", "monthly") or "monthly")
+    raw_months = form.getlist("report_months")
+    if raw_months:
+        raw_months = [part for item in raw_months for part in re.split(r"[\s,;]+", str(item)) if part]
+    elif form.get("report_months"):
+        raw_months = re.split(r"[\s,;]+", str(form.get("report_months")))
+    if period_type == "monthly":
+        months = [normalize_report_month(item) for item in raw_months if str(item).strip()]
+        if not months:
+            months = [normalize_report_month(form.get("report_month", ""))]
+        months = list(dict.fromkeys(months))
+        if len(months) > MAX_BATCH_PERIODS:
+            raise ValueError("Demasiados periodos no mesmo run.")
+        periods = []
+        for month in months:
+            period = build_period("monthly", report_month=month)
+            periods.append({"period_type": "monthly", "report_month": month, "period_start": period.start.isoformat(), "period_end": period.end.isoformat()})
+        return periods
+    if len(raw_months) > 1:
+        raise ValueError("Periodos estruturados multiplos devem ser submetidos separadamente.")
+    period = build_period(
+        period_type,
+        year=form.get("report_year") or normalize_report_month(form.get("report_month", ""))[:4],
+        quarter=form.get("report_quarter"),
+        semester=form.get("report_semester"),
+    )
+    return [
+        {
+            "period_type": period_type,
+            "report_month": period.start.strftime("%Y-%m"),
+            "report_year": str(period.start.year),
+            "report_quarter": str(((period.start.month - 1) // 3) + 1),
+            "report_semester": "1" if period.start.month == 1 else "2",
+            "period_start": period.start.isoformat(),
+            "period_end": period.end.isoformat(),
+        }
+    ]
+
+
+def build_portfolio_generation_result(conn: sqlite3.Connection, form: Any, portfolio_id: int | None, snapshot_id: int | None, period_job: dict[str, str]):
+    if snapshot_id:
+        result = get_portfolio_snapshot_result(conn, snapshot_id)
+        if result is None or (portfolio_id and result.portfolio_id != portfolio_id):
+            raise ValueError("Snapshot invalido.")
+        return result
+    if not portfolio_id:
+        raise ValueError("Portfolio obrigatorio.")
+    group = conn.execute("SELECT * FROM portfolio_groups WHERE id = ?", (portfolio_id,)).fetchone()
+    if not group:
+        raise ValueError("Portfolio invalido.")
+    profile_id = int(form.get("profile_id", "0") or 0)
+    profile = get_portfolio_report_profile(conn, profile_id) if profile_id else get_default_portfolio_report_profile(conn, portfolio_id)
+    return prepare_portfolio_report(
+        conn,
+        portfolio_id=portfolio_id,
+        portfolio_name=group["name"],
+        profile=profile,
+        period_type=period_job["period_type"],
+        report_month=period_job.get("report_month"),
+        year=period_job.get("report_year") or period_job["period_start"][:4],
+        quarter=period_job.get("report_quarter"),
+        semester=period_job.get("report_semester"),
+        comparison=form.get("comparison", ""),
+        profile_version=latest_portfolio_report_profile_version(conn, profile.id),
+    )
+
+
+def build_individual_generation_report(conn: sqlite3.Connection, asset_id: int, period_job: dict[str, str]) -> dict[str, Any]:
+    period = build_period(
+        period_job["period_type"],
+        report_month=period_job.get("report_month"),
+        year=period_job.get("report_year") or period_job["period_start"][:4],
+        quarter=period_job.get("report_quarter"),
+        semester=period_job.get("report_semester"),
+    )
+    billing_config = get_asset_billing_config(conn, asset_id, ReportType.EPC)
+    report = build_local_customer_production_report(
+        conn,
+        asset_id=asset_id,
+        report_month=period.start.strftime("%Y-%m"),
+        electricity_price=float(billing_config.electricity_price_eur_kwh),
+        sell_price=float(billing_config.export_price_eur_kwh),
+        billing_config=billing_config,
+        period=period,
+    )
+    if report is None:
+        raise ValueError(f"Sem dados para a instalacao {asset_id}.")
+    report["asset_id"] = asset_id
+    report["engine_version"] = "individual-report-v1"
+    return report
+
+
+def register_rendered_generation_file(conn: sqlite3.Connection, output_dir: Path, run_id: int, file, *, snapshot_id: int | None = None):
+    path, _ = store_rendered_file(output_dir, run_id, file)
+    add_generated_file(
+        conn,
+        run_id=run_id,
+        fmt=file.fmt,
+        filename=path.name,
+        relative_path=store_runtime_relative_path(path),
+        sha256=file.sha256,
+        size_bytes=file.size_bytes,
+        portfolio_id=file.portfolio_id,
+        asset_id=file.asset_id,
+        snapshot_id=snapshot_id or file.snapshot_id,
+        period_type=file.period_type,
+        period_start=file.period_start,
+        period_end=file.period_end,
+        is_auxiliary=1 if file.is_auxiliary else 0,
+        warnings=list(file.warnings),
+    )
+    return file
+
+
+def add_failed_generation_file(conn: sqlite3.Connection, run_id: int, job: dict[str, Any], error: str, *, portfolio_id: int | None = None, asset_id: int | None = None, snapshot_id: int | None = None) -> None:
+    period = job.get("period") or {}
+    add_generated_file(
+        conn,
+        run_id=run_id,
+        fmt=str(job.get("format") or ""),
+        filename="failed",
+        relative_path="",
+        sha256="",
+        size_bytes=0,
+        portfolio_id=portfolio_id,
+        asset_id=asset_id,
+        snapshot_id=snapshot_id,
+        period_type=period.get("period_type", ""),
+        period_start=period.get("period_start", ""),
+        period_end=period.get("period_end", ""),
+        status="failed",
+        error_message=error[:500],
+    )
+
+
 def export_rows_file(
     rows: list[dict[str, Any]],
     headers: list[tuple[str, str]],
@@ -7810,6 +9060,167 @@ def export_rows_file(
         as_attachment=True,
         download_name=f"{filename}.xlsx",
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+def _form_int_list(field_name: str) -> list[int]:
+    values = request.form.getlist(field_name)
+    if len(values) == 1 and "," in values[0]:
+        values = [item.strip() for item in values[0].split(",")]
+    return [int(value) for value in values if str(value).strip().isdigit()]
+
+
+def _alias_return(asset_id: int) -> Any:
+    next_url = request.form.get("next", "").strip()
+    if next_url.startswith("/"):
+        return redirect(next_url)
+    if request.referrer and "/portfolio-manager" in request.referrer:
+        return redirect(request.referrer)
+    return redirect(url_for("asset_detail", asset_id=asset_id))
+
+
+def store_invoice_upload(
+    conn: sqlite3.Connection,
+    *,
+    upload_dir: Path,
+    file_storage: Any,
+    asset_id: int,
+    portfolio_id: int | None,
+) -> tuple[int, tuple[str, ...]]:
+    if conn.execute("SELECT id FROM assets WHERE id = ?", (asset_id,)).fetchone() is None:
+        raise ValueError("Instalacao inexistente.")
+    original_filename = Path(file_storage.filename or "invoice").name
+    safe_name = secure_filename(original_filename) or "invoice"
+    if not is_supported_invoice_extension(safe_name):
+        raise ValueError("Formato de fatura nao suportado.")
+    target_dir = upload_dir / "portfolio_sources" / str(asset_id)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    target = target_dir / f"{stamp}_{safe_name}"
+    safe_path = Path(safe_name)
+    temp_target = target_dir / f".{stamp}_{safe_path.stem}.tmp{safe_path.suffix}"
+    final_created = False
+    try:
+        file_storage.save(temp_target)
+        size_bytes = temp_target.stat().st_size
+        if size_bytes <= 0:
+            raise ValueError("Ficheiro vazio.")
+        if size_bytes > max_upload_bytes():
+            raise ValueError("Ficheiro excede o limite de upload.")
+        validate_invoice_file_content(temp_target)
+    except Exception:
+        temp_target.unlink(missing_ok=True)
+        raise
+    try:
+        digest = sha256_file(temp_target)
+        same_asset = find_invoice_by_hash(conn, asset_id=asset_id, sha256=digest)
+        if same_asset is not None:
+            temp_target.unlink(missing_ok=True)
+            return int(same_asset["id"]), ("duplicate_invoice",)
+        warnings: list[str] = []
+        if find_invoice_by_hash(conn, asset_id=None, sha256=digest) is not None:
+            warnings.append("possible_duplicate_invoice")
+        temp_target.replace(target)
+        final_created = True
+        mime_type = mimetypes.guess_type(safe_name)[0] or str(getattr(file_storage, "mimetype", "") or "")
+        source_id = create_source_file_record(
+            conn,
+            asset_id=asset_id,
+            portfolio_id=portfolio_id,
+            file_type="invoice",
+            original_filename=original_filename,
+            stored_path=str(target),
+            sha256=digest,
+            mime_type=mime_type,
+            size_bytes=size_bytes,
+        )
+        document_id = create_invoice_document(
+            conn,
+            source_file_id=source_id,
+            asset_id=asset_id,
+            sha256=digest,
+            mime_type=mime_type,
+            size_bytes=size_bytes,
+            status=InvoiceStatus.REVIEW_REQUIRED.value if warnings else InvoiceStatus.UPLOADED.value,
+            warnings=tuple(warnings),
+        )
+        return document_id, tuple(warnings)
+    except Exception:
+        temp_target.unlink(missing_ok=True)
+        if final_created:
+            target.unlink(missing_ok=True)
+        raise
+
+
+def persist_invoice_extraction_result(conn: sqlite3.Connection, invoice: sqlite3.Row, result: Any) -> None:
+    create_invoice_extraction_run(conn, invoice_document_id=int(invoice["id"]), result=result)
+    candidates = list(result.candidates)
+    if result.tariff_candidate.tariff_type is not None:
+        candidates.append(
+            InvoiceCandidate(
+                "tariff_type_candidate",
+                result.tariff_candidate.tariff_type.value,
+                result.confidence,
+                evidence="inferido dos precos extraidos",
+                source=result.method,
+            )
+        )
+    values = {candidate.field_name: candidate.value for candidate in candidates}
+    asset = conn.execute("SELECT nif FROM assets WHERE id = ?", (invoice["asset_id"],)).fetchone()
+    validation = validate_invoice_values(values, asset_nif=asset["nif"] if asset else None)
+    warnings = tuple(sorted({*result.warnings, *validation.warnings}))
+    status = InvoiceStatus.EXTRACTION_FAILED.value if result.errors or validation.errors else validation.status.value
+    update_invoice_from_candidates(
+        conn,
+        invoice_document_id=int(invoice["id"]),
+        candidates=tuple(candidates),
+        status=status,
+        confidence=result.confidence,
+        warnings=warnings,
+    )
+
+
+def invoice_values_from_form(form: Any) -> dict[str, str]:
+    fields = (
+        "supplier_name",
+        "supplier_nif",
+        "customer_name",
+        "customer_nif",
+        "invoice_number",
+        "issue_date",
+        "billing_period_start",
+        "billing_period_end",
+        "currency",
+        "total_amount",
+        "total_energy_kwh",
+        "tariff_type_candidate",
+        "simple_price_eur_kwh",
+        "ponta_price_eur_kwh",
+        "cheia_price_eur_kwh",
+        "vazio_price_eur_kwh",
+        "super_vazio_price_eur_kwh",
+    )
+    return {field: str(form.get(field, "")).strip() for field in fields}
+
+
+def apply_invoice_to_tariff(conn: sqlite3.Connection, invoice_document_id: int) -> int:
+    invoice = get_invoice_document(conn, invoice_document_id)
+    if invoice is None:
+        raise ValueError("Fatura inexistente.")
+    if invoice["status"] != InvoiceStatus.CONFIRMED.value:
+        raise ValueError("A fatura tem de estar confirmada antes de ser usada na tarifa.")
+    tariff_type = str(invoice["tariff_type_candidate"] or "simple")
+    if tariff_type != TariffType.SIMPLE.value:
+        raise ValueError("Tarifas multi-horarias exigem regras horarias manuais antes de guardar.")
+    return save_asset_tariff(
+        conn,
+        asset_id=int(invoice["asset_id"]),
+        tariff_type=tariff_type,
+        simple_price_eur_kwh=invoice["simple_price_eur_kwh"],
+        invoice_file_id=int(invoice["source_file_id"]),
+        valid_from=normalize_date(invoice["billing_period_start"]).isoformat() if invoice["billing_period_start"] else "",
+        valid_to=normalize_date(invoice["billing_period_end"]).isoformat() if invoice["billing_period_end"] else "",
+        notes=f"Criada a partir da fatura {invoice['invoice_number'] or invoice_document_id}",
     )
 
 
@@ -11817,6 +13228,7 @@ def _run_fusionsolar_production_backfill_legacy(
         "still_without_reference": 0,
     }
     logger = current_app.logger if has_app_context() else logging.getLogger(__name__)
+    session_obj, _ = get_fusionsolar_session(config)
 
     for asset in assets:
         summary["assets_processed"] += 1
@@ -13910,7 +15322,6 @@ def resolve_fusionsolar_unresolved(conn: sqlite3.Connection, unresolved_id: int,
     ).fetchone()
     if row is None:
         raise ValueError("Entrada FusionSolar por resolver nao encontrada.")
-    payload = json.loads(row["payload_json"] or "{}")
     create_or_update_asset_integration(
         conn,
         asset_id,

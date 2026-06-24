@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - feat/reporting-roadmap
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      FLASK_SECRET_KEY: ci-test-secret
+      APP_USERNAME: admin
+      APP_PASSWORD: ci-test-password
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt ruff
+
+      - name: Check dependency metadata
+        run: python -m pip check
+
+      - name: Lint
+        run: python -m ruff check monitoring_board tests
+
+      - name: Compile
+        run: python -m compileall monitoring_board
+
+      - name: Smoke imports
+        run: |
+          python -c "from monitoring_board.reporting import templates, portfolio, invoices; print('reporting imports ok')"
+          python -c "from monitoring_board.services import report_rendering, portfolio_reporting, invoice_extraction; print('service imports ok')"
+
+      - name: Test
+        run: python -m pytest -q

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 from monitoring_board.db import query_all
@@ -12,6 +13,9 @@ from monitoring_board.reporting.models import (
     BillingEnergyBase,
     BillingMode,
     HourlyEnergyRecord,
+    InvoiceCandidate,
+    InvoiceExtractionResult,
+    InvoiceStatus,
     ReportType,
     TariffConfig,
     TariffPeriodRule,
@@ -140,6 +144,302 @@ def billing_config_to_form_values(config: BillingConfig) -> dict[str, str]:
 
 def list_portfolio_groups(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return query_all(conn, "SELECT * FROM portfolio_groups ORDER BY name COLLATE NOCASE")
+
+
+def create_source_file_record(
+    conn: sqlite3.Connection,
+    *,
+    asset_id: int,
+    portfolio_id: int | None,
+    file_type: str,
+    original_filename: str,
+    stored_path: str,
+    sha256: str = "",
+    mime_type: str = "",
+    size_bytes: int | None = None,
+    notes: str = "",
+) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO source_files (
+            asset_id, portfolio_id, file_type, original_filename, stored_path, uploaded_at,
+            notes, sha256, mime_type, size_bytes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            asset_id,
+            portfolio_id,
+            file_type,
+            original_filename,
+            stored_path,
+            datetime.now().isoformat(timespec="seconds"),
+            notes,
+            sha256,
+            mime_type,
+            size_bytes,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def find_invoice_by_hash(conn: sqlite3.Connection, *, asset_id: int | None, sha256: str) -> sqlite3.Row | None:
+    if asset_id is None:
+        return conn.execute(
+            """
+            SELECT d.*
+            FROM invoice_documents d
+            WHERE d.sha256 = ?
+            LIMIT 1
+            """,
+            (sha256,),
+        ).fetchone()
+    return conn.execute(
+        """
+        SELECT d.*
+        FROM invoice_documents d
+        WHERE d.asset_id = ? AND d.sha256 = ?
+        LIMIT 1
+        """,
+        (asset_id, sha256),
+    ).fetchone()
+
+
+def create_invoice_document(
+    conn: sqlite3.Connection,
+    *,
+    source_file_id: int,
+    asset_id: int,
+    sha256: str,
+    mime_type: str,
+    size_bytes: int,
+    status: str = InvoiceStatus.UPLOADED.value,
+    warnings: tuple[str, ...] = (),
+) -> int:
+    now = datetime.now().isoformat(timespec="seconds")
+    cursor = conn.execute(
+        """
+        INSERT INTO invoice_documents (
+            source_file_id, asset_id, status, sha256, mime_type, size_bytes,
+            warnings_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_file_id) DO UPDATE SET
+            status = excluded.status,
+            sha256 = excluded.sha256,
+            mime_type = excluded.mime_type,
+            size_bytes = excluded.size_bytes,
+            warnings_json = excluded.warnings_json,
+            updated_at = excluded.updated_at
+        """,
+        (source_file_id, asset_id, status, sha256, mime_type, size_bytes, json.dumps(list(warnings), ensure_ascii=True), now, now),
+    )
+    row = conn.execute("SELECT id FROM invoice_documents WHERE source_file_id = ?", (source_file_id,)).fetchone()
+    return int(row["id"] if row else cursor.lastrowid)
+
+
+def ensure_invoice_document_for_source_file(conn: sqlite3.Connection, source_file_id: int) -> sqlite3.Row | None:
+    existing = conn.execute("SELECT * FROM invoice_documents WHERE source_file_id = ?", (source_file_id,)).fetchone()
+    if existing:
+        return existing
+    source = conn.execute("SELECT * FROM source_files WHERE id = ? AND file_type = 'invoice'", (source_file_id,)).fetchone()
+    if source is None:
+        return None
+    document_id = create_invoice_document(
+        conn,
+        source_file_id=source_file_id,
+        asset_id=int(source["asset_id"]),
+        sha256=source["sha256"] if _row_has_key(source, "sha256") and source["sha256"] else "",
+        mime_type=source["mime_type"] if _row_has_key(source, "mime_type") and source["mime_type"] else "",
+        size_bytes=int(source["size_bytes"] or 0) if _row_has_key(source, "size_bytes") and source["size_bytes"] is not None else 0,
+        status=InvoiceStatus.UPLOADED.value,
+    )
+    return get_invoice_document(conn, document_id)
+
+
+def get_invoice_document(conn: sqlite3.Connection, invoice_document_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT d.*, sf.original_filename, sf.stored_path
+        FROM invoice_documents d
+        JOIN source_files sf ON sf.id = d.source_file_id
+        WHERE d.id = ?
+        """,
+        (invoice_document_id,),
+    ).fetchone()
+
+
+def list_asset_invoice_documents(conn: sqlite3.Connection, asset_id: int) -> list[sqlite3.Row]:
+    source_rows = query_all(conn, "SELECT id FROM source_files WHERE asset_id = ? AND file_type = 'invoice'", (asset_id,))
+    for row in source_rows:
+        ensure_invoice_document_for_source_file(conn, int(row["id"]))
+    return query_all(
+        conn,
+        """
+        SELECT d.*, sf.original_filename, sf.stored_path
+        FROM invoice_documents d
+        JOIN source_files sf ON sf.id = d.source_file_id
+        WHERE d.asset_id = ? AND COALESCE(sf.archived_at, '') = ''
+        ORDER BY d.created_at DESC, d.id DESC
+        """,
+        (asset_id,),
+    )
+
+
+def list_portfolio_invoice_documents(conn: sqlite3.Connection, portfolio_id: int) -> list[sqlite3.Row]:
+    rows = query_all(
+        conn,
+        """
+        SELECT DISTINCT pa.asset_id
+        FROM portfolio_assets pa
+        WHERE pa.portfolio_id = ? AND pa.asset_id IS NOT NULL
+        """,
+        (portfolio_id,),
+    )
+    documents: list[sqlite3.Row] = []
+    for row in rows:
+        documents.extend(list_asset_invoice_documents(conn, int(row["asset_id"])))
+    return documents
+
+
+def create_invoice_extraction_run(
+    conn: sqlite3.Connection,
+    *,
+    invoice_document_id: int,
+    result: InvoiceExtractionResult,
+) -> int:
+    fields = {candidate.field_name: candidate.value for candidate in result.candidates}
+    confidence = {candidate.field_name: str(candidate.confidence) for candidate in result.candidates}
+    evidence = {candidate.field_name: {"evidence": candidate.evidence, "source": candidate.source} for candidate in result.candidates}
+    cursor = conn.execute(
+        """
+        INSERT INTO invoice_extraction_runs (
+            invoice_document_id, parser_name, parser_version, status, extracted_values_json,
+            confidence_json, evidence_json, warnings_json, error_message, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            invoice_document_id,
+            result.parser_name,
+            result.parser_version,
+            result.status.value,
+            json.dumps(fields, ensure_ascii=True),
+            json.dumps(confidence, ensure_ascii=True),
+            json.dumps(evidence, ensure_ascii=True),
+            json.dumps(list(result.warnings), ensure_ascii=True),
+            "; ".join(result.errors),
+            datetime.now().isoformat(timespec="seconds"),
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def list_invoice_extraction_runs(conn: sqlite3.Connection, invoice_document_id: int) -> list[sqlite3.Row]:
+    return query_all(
+        conn,
+        """
+        SELECT *
+        FROM invoice_extraction_runs
+        WHERE invoice_document_id = ?
+        ORDER BY created_at DESC, id DESC
+        """,
+        (invoice_document_id,),
+    )
+
+
+def update_invoice_from_candidates(
+    conn: sqlite3.Connection,
+    *,
+    invoice_document_id: int,
+    candidates: tuple[InvoiceCandidate, ...],
+    status: str,
+    confidence: Decimal,
+    warnings: tuple[str, ...] = (),
+) -> None:
+    values = {candidate.field_name: candidate.value for candidate in candidates}
+    now = datetime.now().isoformat(timespec="seconds")
+    conn.execute(
+        """
+        UPDATE invoice_documents
+        SET status = ?, supplier_name = ?, supplier_nif = ?, customer_name = ?, customer_nif = ?,
+            invoice_number = ?, issue_date = ?, billing_period_start = ?, billing_period_end = ?,
+            currency = ?, total_amount = ?, total_energy_kwh = ?, tariff_type_candidate = ?,
+            simple_price_eur_kwh = ?, ponta_price_eur_kwh = ?, cheia_price_eur_kwh = ?,
+            vazio_price_eur_kwh = ?, super_vazio_price_eur_kwh = ?, extraction_method = ?,
+            extraction_confidence = ?, warnings_json = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            status,
+            values.get("supplier_name"),
+            values.get("supplier_nif"),
+            values.get("customer_name"),
+            values.get("customer_nif"),
+            values.get("invoice_number"),
+            values.get("issue_date"),
+            values.get("billing_period_start"),
+            values.get("billing_period_end"),
+            values.get("currency") or "EUR",
+            values.get("total_amount"),
+            values.get("total_energy_kwh"),
+            values.get("tariff_type_candidate"),
+            values.get("simple_price_eur_kwh"),
+            values.get("ponta_price_eur_kwh"),
+            values.get("cheia_price_eur_kwh"),
+            values.get("vazio_price_eur_kwh"),
+            values.get("super_vazio_price_eur_kwh"),
+            "assisted",
+            str(confidence),
+            json.dumps(list(warnings), ensure_ascii=True),
+            now,
+            invoice_document_id,
+        ),
+    )
+
+
+def update_invoice_review(
+    conn: sqlite3.Connection,
+    *,
+    invoice_document_id: int,
+    values: dict[str, Any],
+    warnings: tuple[str, ...],
+    status: str = InvoiceStatus.REVIEW_REQUIRED.value,
+) -> None:
+    candidates = tuple(
+        InvoiceCandidate(field_name=key, value=str(value), confidence=Decimal("1"), evidence="manual_review", source="manual")
+        for key, value in values.items()
+        if value not in (None, "")
+    )
+    update_invoice_from_candidates(conn, invoice_document_id=invoice_document_id, candidates=candidates, status=status, confidence=Decimal("1"), warnings=warnings)
+    conn.execute("UPDATE invoice_documents SET reviewed_at = ?, updated_at = ? WHERE id = ?", (datetime.now().isoformat(timespec="seconds"), datetime.now().isoformat(timespec="seconds"), invoice_document_id))
+
+
+def confirm_invoice_document(conn: sqlite3.Connection, invoice_document_id: int) -> None:
+    now = datetime.now().isoformat(timespec="seconds")
+    conn.execute("UPDATE invoice_documents SET status = ?, reviewed_at = ?, updated_at = ? WHERE id = ?", (InvoiceStatus.CONFIRMED.value, now, now, invoice_document_id))
+
+
+def reject_invoice_document(conn: sqlite3.Connection, invoice_document_id: int) -> None:
+    now = datetime.now().isoformat(timespec="seconds")
+    conn.execute("UPDATE invoice_documents SET status = ?, reviewed_at = ?, updated_at = ? WHERE id = ?", (InvoiceStatus.REJECTED.value, now, now, invoice_document_id))
+
+
+def archive_invoice_document(conn: sqlite3.Connection, invoice_document_id: int) -> None:
+    now = datetime.now().isoformat(timespec="seconds")
+    row = get_invoice_document(conn, invoice_document_id)
+    if row:
+        conn.execute("UPDATE source_files SET archived_at = ? WHERE id = ?", (now, row["source_file_id"]))
+    conn.execute("UPDATE invoice_documents SET status = ?, updated_at = ? WHERE id = ?", (InvoiceStatus.ARCHIVED.value, now, invoice_document_id))
+
+
+def get_confirmed_invoice_for_tariff(conn: sqlite3.Connection, tariff_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT d.*
+        FROM asset_tariffs t
+        JOIN invoice_documents d ON d.source_file_id = t.invoice_file_id
+        WHERE t.id = ? AND d.status = ?
+        """,
+        (tariff_id, InvoiceStatus.CONFIRMED.value),
+    ).fetchone()
 
 
 def get_latest_tariff(conn: sqlite3.Connection, asset_id: int, report_start: date) -> sqlite3.Row | None:

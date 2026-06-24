@@ -35,6 +35,22 @@ class TariffType(StrEnum):
     TETRA_HOURLY = "tetra-hourly"
 
 
+class InvoiceStatus(StrEnum):
+    UPLOADED = "uploaded"
+    EXTRACTED = "extracted"
+    REVIEW_REQUIRED = "review_required"
+    CONFIRMED = "confirmed"
+    REJECTED = "rejected"
+    EXTRACTION_FAILED = "extraction_failed"
+    ARCHIVED = "archived"
+
+
+class InvoiceExtractionStatus(StrEnum):
+    EXTRACTED = "extracted"
+    REVIEW_REQUIRED = "review_required"
+    EXTRACTION_FAILED = "extraction_failed"
+
+
 @dataclass(frozen=True)
 class ReportingPeriod:
     period_type: ReportPeriodType
@@ -151,6 +167,47 @@ class TariffValuationResult:
     coverage_pct: Decimal
     source: str
     warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class InvoiceCandidate:
+    field_name: str
+    value: str
+    confidence: Decimal
+    evidence: str = ""
+    source: str = ""
+
+
+@dataclass(frozen=True)
+class InvoiceTariffCandidate:
+    tariff_type: TariffType | None
+    simple_price_eur_kwh: Decimal | None = None
+    ponta_price_eur_kwh: Decimal | None = None
+    cheia_price_eur_kwh: Decimal | None = None
+    vazio_price_eur_kwh: Decimal | None = None
+    super_vazio_price_eur_kwh: Decimal | None = None
+
+
+@dataclass(frozen=True)
+class InvoiceValidationResult:
+    valid: bool
+    status: InvoiceStatus
+    warnings: tuple[str, ...] = ()
+    errors: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class InvoiceExtractionResult:
+    method: str
+    parser_name: str
+    parser_version: str
+    status: InvoiceExtractionStatus
+    candidates: tuple[InvoiceCandidate, ...]
+    tariff_candidate: InvoiceTariffCandidate
+    confidence: Decimal
+    warnings: tuple[str, ...] = ()
+    errors: tuple[str, ...] = ()
+    requires_review: bool = True
 
 
 @dataclass(frozen=True)
