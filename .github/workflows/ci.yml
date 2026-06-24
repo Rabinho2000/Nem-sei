@@ -10,6 +10,10 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      FLASK_SECRET_KEY: ci-test-secret
+      APP_USERNAME: admin
+      APP_PASSWORD: ci-test-password
 
     steps:
       - name: Checkout
