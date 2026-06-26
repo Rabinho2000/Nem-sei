@@ -87,6 +87,7 @@ from monitoring_board.portfolio_repository import (
     list_available_assets as portfolio_list_available_assets,
     list_portfolio_members,
     list_portfolios,
+    mapping_context as portfolio_mapping_context,
     move_member_up_down,
     reactivate_portfolio,
     rebuild_asset_alias_blob as portfolio_rebuild_asset_alias_blob,
@@ -2788,17 +2789,25 @@ def create_app() -> Flask:
         ) if selected else 0
         pending_count = sum(1 for member in members if not member["asset_id"] or member["mapping_status"] == "mapping_pending")
         conflict_count = sum(1 for member in members if member["mapping_status"] == "mapping_conflict")
-        aliases = portfolio_list_aliases(g.db, include_inactive=alias_filter != "active")
-        if alias_search:
-            alias_search_lower = alias_search.lower()
-            aliases = [alias for alias in aliases if alias_search_lower in str(alias["alias_name"] or "").lower() or alias_search_lower in str(alias["project_name"] or "").lower()]
-        if alias_filter == "inactive":
-            aliases = [alias for alias in aliases if not alias["active"]]
+        aliases = []
+        if active_tab == "aliases":
+            aliases = portfolio_list_aliases(g.db, include_inactive=alias_filter != "active")
+            if alias_search:
+                alias_search_lower = alias_search.lower()
+                aliases = [alias for alias in aliases if alias_search_lower in str(alias["alias_name"] or "").lower() or alias_search_lower in str(alias["project_name"] or "").lower()]
+            if alias_filter == "inactive":
+                aliases = [alias for alias in aliases if not alias["active"]]
         conflicts = detect_portfolio_conflicts(g.db, selected_portfolio_id or None)
         import_run = get_import_run(g.db, import_id) if import_id else None
         import_preview = import_preview_from_json(import_run["preview_json"] or "{}") if import_run else None
+        mapping_context = portfolio_mapping_context(g.db)
         mapping_decisions = {
-            int(member["id"]): portfolio_suggest_mapping(g.db, external_name=member["external_name"] or "", nif=member["nif"] or "")
+            int(member["id"]): portfolio_suggest_mapping(
+                g.db,
+                external_name=member["external_name"] or "",
+                nif=member["nif"] or "",
+                context=mapping_context,
+            )
             for member in members
             if not member["asset_id"] or member["mapping_status"] in {"mapping_pending", "mapping_conflict", "mapping_suggested"}
         }
@@ -10048,7 +10057,7 @@ def refresh_integration_scheduler(app: Flask) -> None:
         if (
             job.id.startswith("integration-sync-")
             or job.id.startswith("fusionsolar-sync-")
-            or job.id in {"telegram-daily-summary", "fusionsolar-wat-daily"}
+            or job.id in {"telegram-daily-summary", "fusionsolar-production-daily", "fusionsolar-wat-daily"}
         ):
             SCHEDULER.remove_job(job.id)
 
@@ -10078,6 +10087,18 @@ def refresh_integration_scheduler(app: Flask) -> None:
                 minute=0,
                 args=[app, provider],
                 id="integration-sync-fusionsolar-hourly",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=1800,
+            )
+            SCHEDULER.add_job(
+                func=run_scheduled_fusionsolar_production_sync,
+                trigger="cron",
+                hour=0,
+                minute=10,
+                args=[app],
+                id="fusionsolar-production-daily",
                 replace_existing=True,
                 max_instances=1,
                 coalesce=True,
@@ -10141,6 +10162,49 @@ def run_scheduled_fusionsolar_sync(app: Flask) -> None:
 
 def current_lisbon_date() -> date:
     return datetime.now(LISBON_TIMEZONE).date()
+
+
+def run_scheduled_fusionsolar_production_sync(app: Flask) -> None:
+    scheduler_date = current_lisbon_date()
+    target_date = scheduler_date - timedelta(days=1)
+    with app.app_context():
+        with closing(get_db(app.config["DATABASE"])) as conn:
+            current_app.logger.info(
+                "Scheduled FusionSolar production preparing previous closed day: scheduler_date=%s target_date=%s",
+                scheduler_date,
+                target_date,
+            )
+            config = get_integration_config(conn, INTEGRATION_PROVIDER_FUSIONSOLAR)
+            if config is None or not config["enabled"]:
+                current_app.logger.info(
+                    "Scheduled FusionSolar production skipped because integration is disabled: target_date=%s",
+                    target_date,
+                )
+                return
+            job_id, created = create_background_job(
+                conn,
+                "fusionsolar_production_sync",
+                {
+                    "provider": INTEGRATION_PROVIDER_FUSIONSOLAR,
+                    "target_date": target_date.isoformat(),
+                    "period_type": "day",
+                    "trigger_type": "scheduled",
+                },
+            )
+            conn.commit()
+            if created:
+                schedule_background_job(app, job_id)
+                current_app.logger.info(
+                    "Scheduled FusionSolar production queued: job_id=%s target_date=%s",
+                    job_id,
+                    target_date,
+                )
+            else:
+                current_app.logger.info(
+                    "Scheduled FusionSolar production reused existing pending/running job: job_id=%s target_date=%s",
+                    job_id,
+                    target_date,
+                )
 
 
 def run_scheduled_fusionsolar_wat_backfill(app: Flask) -> None:

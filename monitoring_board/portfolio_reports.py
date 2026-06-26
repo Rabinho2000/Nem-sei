@@ -24,6 +24,7 @@ from monitoring_board.reporting.repositories import (
     get_asset_billing_config,
     get_latest_helioscope_expected,
     get_latest_tariff,
+    get_daily_production_totals,
     get_monthly_availability,
     get_monthly_production_record,
     has_expired_tariff,
@@ -416,7 +417,10 @@ def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, rep
         if mapping_status == "mapping_conflict":
             warnings.append("mapping_conflict")
         prod = get_monthly_production_record(conn, asset_id, start)
+        daily_totals = get_daily_production_totals(conn, asset_id, start, end) if asset_id is not None else None
         actual = float(prod["production_kwh"]) if prod and prod["production_kwh"] is not None else None
+        if actual is None and daily_totals is not None:
+            actual = daily_totals["production_kwh"]
         if actual is None:
             warnings.append("missing_monthly_production")
         expected = get_latest_helioscope_expected(conn, asset_id, start.month)
@@ -492,6 +496,8 @@ def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, rep
         def monthly_field(key: str) -> float | None:
             if prod is not None and key in prod.keys() and prod[key] is not None:
                 return float(prod[key])
+            if daily_totals is not None and key in daily_totals and daily_totals[key] is not None:
+                return float(daily_totals[key])
             return None
 
         def hourly_total(key: str) -> float | None:

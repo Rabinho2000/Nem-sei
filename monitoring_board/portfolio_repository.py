@@ -639,8 +639,14 @@ def mapping_context(conn: sqlite3.Connection) -> tuple[tuple[dict[str, Any], ...
     return assets, tuple([*aliases, *extras])
 
 
-def suggest_mapping(conn: sqlite3.Connection, *, external_name: str, nif: str = "") -> MappingDecision:
-    assets, aliases = mapping_context(conn)
+def suggest_mapping(
+    conn: sqlite3.Connection,
+    *,
+    external_name: str,
+    nif: str = "",
+    context: tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]] | None = None,
+) -> MappingDecision:
+    assets, aliases = context if context is not None else mapping_context(conn)
     return decide_mapping(external_name=external_name, nif=nif, assets=assets, aliases=aliases)
 
 
@@ -651,9 +657,10 @@ def auto_map_portfolio_assets(conn: sqlite3.Connection, portfolio_id: int | None
         conditions.append("portfolio_id = ?")
         params.append(portfolio_id)
     rows = query_all(conn, f"SELECT * FROM portfolio_assets WHERE {' AND '.join(conditions)}", params)
+    context = mapping_context(conn)
     mapped = pending = conflicts = 0
     for row in rows:
-        decision = suggest_mapping(conn, external_name=row["external_name"] or "", nif=row["nif"] or "")
+        decision = suggest_mapping(conn, external_name=row["external_name"] or "", nif=row["nif"] or "", context=context)
         if decision.auto_mappable and decision.asset_id is not None:
             mapped += 1
             conn.execute(

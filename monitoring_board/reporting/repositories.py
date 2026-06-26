@@ -932,6 +932,31 @@ def get_monthly_production_record(conn: sqlite3.Connection, asset_id: int | None
     ).fetchone()
 
 
+def get_daily_production_totals(conn: sqlite3.Connection, asset_id: int | None, start: date, end: date) -> dict[str, float] | None:
+    if asset_id is None:
+        return None
+    row = conn.execute(
+        """
+        SELECT
+            SUM(production_kwh) AS production_kwh,
+            COUNT(*) AS rows_with_data
+        FROM production_records
+        WHERE asset_id = ?
+          AND provider = 'FusionSolar'
+          AND period_type = 'day'
+          AND period_date BETWEEN ? AND ?
+          AND COALESCE(data_quality, '') != 'missing_production'
+          AND production_kwh IS NOT NULL
+        """,
+        (asset_id, start.isoformat(), end.isoformat()),
+    ).fetchone()
+    if row is None or int(row["rows_with_data"] or 0) == 0:
+        return None
+    return {
+        "production_kwh": float(row["production_kwh"] or 0),
+    }
+
+
 def list_monthly_production_records(
     conn: sqlite3.Connection,
     *,

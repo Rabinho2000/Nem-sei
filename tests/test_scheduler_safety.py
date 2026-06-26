@@ -79,6 +79,7 @@ def test_refresh_scheduler_registers_stable_single_instance_provider_jobs(tmp_pa
         assert "fusionsolar-sync-1" not in second_ids
         assert "fusionsolar-sync-1" in fake_scheduler.remove_calls
         assert "integration-sync-fusionsolar-hourly" in second_ids
+        assert "fusionsolar-production-daily" in second_ids
         assert "fusionsolar-wat-daily" in second_ids
         assert any("sigenergy" in job_id for job_id in second_ids)
 
@@ -86,7 +87,7 @@ def test_refresh_scheduler_registers_stable_single_instance_provider_jobs(tmp_pa
             call
             for call in fake_scheduler.add_calls
             if str(call["id"]).startswith("integration-sync-")
-            or call["id"] in {"telegram-daily-summary", "fusionsolar-wat-daily"}
+            or call["id"] in {"telegram-daily-summary", "fusionsolar-production-daily", "fusionsolar-wat-daily"}
         ]
         assert recurring_calls
         for call in recurring_calls:
@@ -101,6 +102,11 @@ def test_refresh_scheduler_registers_stable_single_instance_provider_jobs(tmp_pa
         assert hourly_call["trigger"] == "cron"
         assert hourly_call["minute"] == 0
         assert "hour" not in hourly_call
+
+        production_call = next(call for call in fake_scheduler.add_calls if call["id"] == "fusionsolar-production-daily")
+        assert production_call["trigger"] == "cron"
+        assert production_call["hour"] == 0
+        assert production_call["minute"] == 10
 
         wat_call = next(call for call in fake_scheduler.add_calls if call["id"] == "fusionsolar-wat-daily")
         assert wat_call["trigger"] == "cron"
@@ -154,6 +160,37 @@ def test_scheduled_fusionsolar_wat_queues_previous_day(tmp_path, monkeypatch) ->
         "from_date": expected_date,
         "provider": app_module.INTEGRATION_PROVIDER_FUSIONSOLAR,
         "to_date": expected_date,
+        "trigger_type": "scheduled",
+    }
+    assert scheduled == [job["id"]]
+
+
+def test_scheduled_fusionsolar_production_queues_previous_day(tmp_path, monkeypatch) -> None:
+    flask_app, original_database = _make_test_app(tmp_path)
+    scheduled: list[int] = []
+    monkeypatch.setattr(app_module, "current_lisbon_date", lambda: app_module.date(2026, 6, 15))
+    monkeypatch.setattr(app_module, "schedule_background_job", lambda _app, job_id: scheduled.append(job_id) or True)
+    try:
+        with get_db(flask_app.config["DATABASE"]) as conn:
+            _insert_enabled_config(conn, app_module.INTEGRATION_PROVIDER_FUSIONSOLAR)
+
+        app_module.run_scheduled_fusionsolar_production_sync(flask_app)
+
+        with get_db(flask_app.config["DATABASE"]) as conn:
+            job = conn.execute(
+                "SELECT id, job_type, status, params_json FROM background_jobs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+    finally:
+        flask_app.config["DATABASE"] = original_database
+
+    params = json.loads(job["params_json"])
+    expected_date = "2026-06-14"
+    assert job["job_type"] == "fusionsolar_production_sync"
+    assert job["status"] == "pending"
+    assert params == {
+        "period_type": "day",
+        "provider": app_module.INTEGRATION_PROVIDER_FUSIONSOLAR,
+        "target_date": expected_date,
         "trigger_type": "scheduled",
     }
     assert scheduled == [job["id"]]

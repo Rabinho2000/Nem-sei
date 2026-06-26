@@ -126,6 +126,40 @@ def test_report_flags_missing_data(tmp_path: Path) -> None:
     assert "missing_tariff" in row["warnings"]
 
 
+def test_report_uses_daily_production_when_monthly_row_is_missing(tmp_path: Path) -> None:
+    conn = connect(tmp_path)
+    asset_id = add_asset(conn)
+    portfolio_id = conn.execute("SELECT id FROM portfolio_groups WHERE name = 'Solcorelios I'").fetchone()["id"]
+    conn.execute(
+        "INSERT INTO portfolio_assets (portfolio_id, asset_id, active, mapping_status, mapping_confidence) VALUES (?, ?, 1, 'manual', 1)",
+        (portfolio_id, asset_id),
+    )
+    conn.execute(
+        """
+        INSERT INTO production_records (
+            asset_id, provider, external_id, period_type, period_date,
+            production_kwh, data_quality, created_at, updated_at
+        ) VALUES (?, 'FusionSolar', 'D1', 'day', '2026-01-01', 10, 'ok', '2026-01-02T00:00:00', '2026-01-02T00:00:00')
+        """,
+        (asset_id,),
+    )
+    conn.execute(
+        """
+        INSERT INTO production_records (
+            asset_id, provider, external_id, period_type, period_date,
+            production_kwh, data_quality, created_at, updated_at
+        ) VALUES (?, 'FusionSolar', 'D2', 'day', '2026-01-02', 15, 'ok', '2026-01-03T00:00:00', '2026-01-03T00:00:00')
+        """,
+        (asset_id,),
+    )
+    conn.commit()
+
+    row = next(item for item in build_portfolio_report_rows(conn, portfolio_id, "2026-01") if item["asset_id"] == asset_id)
+
+    assert row["actual_production_kwh"] == 25
+    assert "missing_monthly_production" not in row["warnings"]
+
+
 def test_portfolio_total_aggregates_and_weights_availability() -> None:
     rows = [
         {"actual_production_kwh": 100, "adjusted_expected_kwh": 100, "installed_power_kwp": 100, "availability_pct": 90, "estimated_value_eur": 10, "production_ponta_kwh": 1, "production_cheia_kwh": 2, "production_vazio_kwh": 3, "production_super_vazio_kwh": 0, "helioscope_expected_kwh": 110, "warnings": []},
