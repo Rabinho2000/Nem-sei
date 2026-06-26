@@ -1,420 +1,627 @@
 {% extends "base.html" %}
 
 {% block content %}
-<section class="hero">
+{% set tab_links = [
+  ('installations', 'Instalacoes'),
+  ('mappings', 'Mappings pendentes'),
+  ('aliases', 'Aliases'),
+  ('import', 'Importar/exportar'),
+  ('settings', 'Definicoes do portfolio')
+] %}
+
+<section class="hero portfolio-hero">
   <div>
     <p class="eyebrow">Portfolios</p>
     <h2>Gestor de portfolios</h2>
-    <p class="muted">Gestao, aliases, mapping e importacao com preview.</p>
+    <p class="muted">Gestao de instalacoes, mappings, aliases e configuracao.</p>
   </div>
   <div class="hero-actions">
-    <a class="button secondary" href="{{ url_for('portfolios', portfolio_id=selected_portfolio_id) }}">Relatorios</a>
+    <a class="button secondary" href="{{ url_for('portfolios', portfolio_id=selected_portfolio_id, tab='report') }}">Relatorios</a>
     <a class="button secondary" href="{{ url_for('portfolio_manager_export') }}">Exportar configuracao</a>
   </div>
 </section>
 
-<section class="card">
-  <div class="grid four">
-    <form method="get" class="stack-form">
-      <label>Portfolio
-        <select name="portfolio_id" onchange="this.form.submit()">
-          {% for group in groups %}
-            <option value="{{ group.id }}" {{ 'selected' if selected_portfolio_id == group.id }}>{{ group.name }}{{ ' (arquivado)' if not group.active or group.archived_at }}</option>
-          {% endfor %}
-        </select>
-      </label>
-      <label>Pesquisa <input name="search" value="{{ search }}" placeholder="Instalacao, NIF ou alias"></label>
-      <label>Filtro
-        <select name="asset_filter">
-          {% for value, label in [('available','Disponiveis'),('in_current','Ja neste portfolio'),('other_portfolio','Noutros portfolios'),('without_portfolio','Sem portfolio'),('inactive','Inativas'),('mapping_pending','Mapping pendente'),('conflict','Conflito')] %}
-            <option value="{{ value }}" {{ 'selected' if asset_filter == value }}>{{ label }}</option>
-          {% endfor %}
-        </select>
-      </label>
-      <button class="button secondary" type="submit">Filtrar</button>
-    </form>
-
-    <form method="post" action="{{ url_for('portfolio_manager_create') }}" class="stack-form">
-      <label>Novo portfolio <input name="name" placeholder="Nome"></label>
-      <label>Descricao <input name="description"></label>
-      <label>Notas <input name="notes"></label>
-      <button class="button" type="submit">Criar</button>
-    </form>
-
-    {% if selected %}
-    <form method="post" action="{{ url_for('portfolio_manager_update') }}" class="stack-form">
-      <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
-      <label>Nome <input name="name" value="{{ selected.name }}"></label>
-      <label>Descricao <input name="description" value="{{ selected.description or '' }}"></label>
-      <label>Notas <input name="notes" value="{{ selected.notes or '' }}"></label>
-      <label>Ordem <input name="display_order" value="{{ selected.display_order or 0 }}"></label>
-      <button class="button secondary" type="submit">Editar</button>
-    </form>
-
-    <div class="stack-form">
-      <form method="post" action="{{ url_for('portfolio_manager_duplicate') }}" class="inline-form">
-        <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
-        <input name="new_name" placeholder="Nome da copia" required>
-        <button class="button secondary" type="submit">Duplicar</button>
-      </form>
-      <form method="post" action="{{ url_for('portfolio_manager_archive') }}" class="inline-form">
-        <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
-        <button class="button secondary" type="submit">Arquivar</button>
-      </form>
-      <form method="post" action="{{ url_for('portfolio_manager_reactivate') }}" class="inline-form">
-        <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
-        <button class="button secondary" type="submit">Reativar</button>
-      </form>
-      <form method="post" action="{{ url_for('portfolio_manager_delete') }}" class="inline-form">
-        <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
-        <input name="confirm_name" placeholder="Escrever nome para apagar">
-        <button class="button danger-button" type="submit">Apagar</button>
-      </form>
-    </div>
-    {% endif %}
-  </div>
-</section>
-
-{% if selected %}
-<section class="grid two">
-  <article class="card drop-zone" data-drop-action="add">
-    <div class="section-title">
-      <h3>Instalacoes</h3>
-      <span class="badge">{{ assets|length }}</span>
-    </div>
-    <form method="post" action="{{ url_for('portfolio_manager_members_add') }}">
-      <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
-      <div class="list compact-list" id="asset-list">
-        {% for asset in assets %}
-          <label class="list-row" draggable="true" data-asset-id="{{ asset.id }}">
-            <input type="checkbox" name="asset_ids" value="{{ asset.id }}">
-            <span>
-              <strong>{{ asset.project_name }}</strong>
-              <small>NIF {{ asset.nif or '-' }} · {{ asset.portfolios or 'sem portfolio' }} · {{ asset.active_contract or 'estado indefinido' }}</small>
-              <small>{{ asset.alias_blob or 'sem aliases' }}{% if asset.integrations %} · {{ asset.integrations }}{% endif %}</small>
-            </span>
-          </label>
-        {% else %}
-          <p class="muted">Sem instalacoes para este filtro.</p>
-        {% endfor %}
-      </div>
-      <button class="button" type="submit">Adicionar selecionadas</button>
-    </form>
-
-    <form method="post" action="{{ url_for('portfolio_manager_members_add') }}" class="stack-form">
-      <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
-      <div class="grid two">
-        <label>Instalacao
-          <select name="asset_id">
-            <option value="">Pendente</option>
-            {% for asset in assets %}
-              <option value="{{ asset.id }}">{{ asset.project_name }}</option>
-            {% endfor %}
-          </select>
-        </label>
-        <label>Subconta <input name="sub_account"></label>
-        <label>Nome externo <input name="external_name"></label>
-        <label>NIF externo <input name="nif"></label>
-        <label>Notas <input name="notes"></label>
-      </div>
-      <button class="button secondary" type="submit">Adicionar manualmente</button>
-    </form>
-  </article>
-
-  <article class="card">
-    <div class="section-title">
-      <h3>Membros</h3>
-      <span class="badge">{{ members|length }}</span>
-    </div>
-    <form method="post" action="{{ url_for('portfolio_manager_members_reorder') }}" id="order-form">
-      <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
-      <input type="hidden" name="ordered_ids" id="ordered-ids">
-      <div class="list compact-list drop-zone" id="member-list" data-drop-action="reorder-add">
-        {% for member in members %}
-          <div class="list-row" draggable="true" data-member-id="{{ member.id }}">
-            <label><input type="checkbox" form="bulk-form" name="member_ids" value="{{ member.id }}"></label>
-            <div>
-              <strong>{{ member.external_name or member.project_name or 'Pendente' }}</strong>
-              <small>{{ member.sub_account or '-' }} · {{ member.project_name or 'sem mapping' }} · {{ member.mapping_status or 'pendente' }} · {{ member.mapping_confidence or 0 }}</small>
-              <small>NIF externo {{ member.nif or '-' }} · Alias {{ member.alias_blob or '-' }}</small>
-            </div>
-            <div class="hero-actions">
-              <button class="button secondary" form="move-{{ member.id }}-up" type="submit">Subir</button>
-              <button class="button secondary" form="move-{{ member.id }}-down" type="submit">Descer</button>
-            </div>
-          </div>
-        {% else %}
-          <p class="muted">Sem membros neste portfolio.</p>
-        {% endfor %}
-      </div>
-      <button class="button secondary" type="submit">Guardar ordem</button>
-    </form>
-    {% for member in members %}
-      <form id="move-{{ member.id }}-up" method="post" action="{{ url_for('portfolio_manager_members_reorder') }}">
-        <input type="hidden" name="portfolio_id" value="{{ selected.id }}"><input type="hidden" name="member_id" value="{{ member.id }}"><input type="hidden" name="direction" value="up">
-      </form>
-      <form id="move-{{ member.id }}-down" method="post" action="{{ url_for('portfolio_manager_members_reorder') }}">
-        <input type="hidden" name="portfolio_id" value="{{ selected.id }}"><input type="hidden" name="member_id" value="{{ member.id }}"><input type="hidden" name="direction" value="down">
-      </form>
-    {% endfor %}
-    <form method="post" action="{{ url_for('portfolio_manager_members_remove') }}" id="bulk-form" class="inline-form drop-zone" data-drop-action="remove">
-      <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
-      <button class="button secondary" type="submit">Remover selecionados</button>
-    </form>
-    <form method="post" action="{{ url_for('portfolio_manager_members_copy') }}" class="inline-form drop-zone" data-drop-action="copy">
-      <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
-      <select name="target_portfolio_id">
-        {% for group in groups if group.id != selected.id and group.active %}
-          <option value="{{ group.id }}">{{ group.name }}</option>
+<section class="card portfolio-topbar">
+  <form method="get" class="portfolio-select-form">
+    <label>Portfolio
+      <select name="portfolio_id" onchange="this.form.submit()">
+        {% for group in groups %}
+          <option value="{{ group.id }}" {{ 'selected' if selected_portfolio_id == group.id }}>{{ group.name }}{{ ' (arquivado)' if not group.active or group.archived_at }}</option>
         {% endfor %}
       </select>
-      {% for member in members %}<label><input type="checkbox" name="member_ids" value="{{ member.id }}"> {{ member.external_name or member.project_name or member.id }}</label>{% endfor %}
-      <button class="button secondary" type="submit">Copiar selecionados</button>
-    </form>
-    <form method="post" action="{{ url_for('portfolio_manager_members_move') }}" class="inline-form drop-zone" data-drop-action="move">
-      <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
-      <select name="target_portfolio_id">
-        {% for group in groups if group.id != selected.id and group.active %}
-          <option value="{{ group.id }}">{{ group.name }}</option>
-        {% endfor %}
-      </select>
-      {% for member in members %}<label><input type="checkbox" name="member_ids" value="{{ member.id }}"> {{ member.external_name or member.project_name or member.id }}</label>{% endfor %}
-      <button class="button secondary" type="submit">Mover selecionados</button>
-    </form>
-  </article>
-</section>
+    </label>
+    <input type="hidden" name="tab" value="{{ active_tab }}">
+  </form>
 
-<section class="card">
-  <div class="section-title"><h3>Revisao de mappings</h3></div>
-  <form method="post" action="{{ url_for('portfolio_manager_mappings_suggest') }}" class="inline-form">
-    <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
-    <button class="button" type="submit">Sugerir mappings</button>
-  </form>
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr><th>Linha</th><th>Candidatos</th><th>Acao</th></tr>
-      </thead>
-      <tbody>
-        {% for member in members if not member.asset_id or member.mapping_status in ['mapping_pending', 'mapping_conflict', 'mapping_suggested'] %}
-          {% set decision = mapping_decisions.get(member.id) %}
-          <tr>
-            <td>
-              <strong>{{ member.external_name or 'Linha pendente' }}</strong>
-              <small>{{ member.mapping_status }} · {{ member.mapping_method or '-' }} · {{ member.mapping_confidence or 0 }}</small>
-            </td>
-            <td>
-              {% if decision %}
-                {% for candidate in decision.candidates[:5] %}
-                  <div class="badge">
-                    {{ candidate.asset_name }} · {{ candidate.method }} · {{ '%.2f'|format(candidate.score) }} · {{ candidate.confidence }}
-                    {% if candidate.matched_alias %} · alias {{ candidate.matched_alias }}{% endif %}
-                    {% if loop.index == 1 and decision.candidates|length > 1 %} · Δ {{ '%.2f'|format(candidate.score - decision.candidates[1].score) }}{% endif %}
-                    {% if candidate.reasons %} · {{ candidate.reasons|join(', ') }}{% endif %}
-                  </div>
-                {% else %}
-                  <span class="muted">Sem candidatos.</span>
-                {% endfor %}
-                {% if decision.warnings %}<small>Avisos: {{ decision.warnings|join(', ') }}</small>{% endif %}
-              {% endif %}
-            </td>
-            <td>
-              {% if decision and decision.candidates %}
-                <form method="post" action="{{ url_for('portfolio_manager_mappings_confirm') }}" class="inline-form">
-                  <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
-                  <input type="hidden" name="member_id" value="{{ member.id }}">
-                  <select name="asset_id">
-                    {% for candidate in decision.candidates[:5] %}
-                      <option value="{{ candidate.asset_id }}">{{ candidate.asset_name }} ({{ candidate.method }})</option>
-                    {% endfor %}
-                  </select>
-                  <label><input type="checkbox" name="create_alias" checked> Guardar alias</label>
-                  <button class="button secondary" type="submit">Confirmar</button>
-                </form>
-              {% endif %}
-              <form method="post" action="{{ url_for('portfolio_manager_mappings_unmap') }}" class="inline-form">
-                <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
-                <input type="hidden" name="member_id" value="{{ member.id }}">
-                <button class="button secondary" type="submit">Desmapear</button>
-              </form>
-            </td>
-          </tr>
-        {% else %}
-          <tr><td colspan="3" class="muted">Sem mappings pendentes.</td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-</section>
-
-<section class="card">
-  <div class="section-title"><h3>Aliases</h3></div>
-  <form method="get" class="inline-form">
-    <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
-    <input name="alias_search" value="{{ alias_search }}" placeholder="Pesquisar alias">
-    <select name="alias_filter">
-      <option value="all" {{ 'selected' if alias_filter == 'all' }}>Todos</option>
-      <option value="active" {{ 'selected' if alias_filter == 'active' }}>Ativos</option>
-      <option value="inactive" {{ 'selected' if alias_filter == 'inactive' }}>Inativos</option>
-    </select>
-    <button class="button secondary" type="submit">Filtrar aliases</button>
-  </form>
-  <form method="post" action="{{ url_for('portfolio_alias_add', asset_id=assets[0].id if assets else 0) }}" class="inline-form">
-    <input type="hidden" name="next" value="{{ url_for('portfolio_manager', portfolio_id=selected.id) }}">
-    <select name="asset_id" onchange="this.form.action='/assets/' + this.value + '/aliases/add'">
-      {% for asset in assets %}
-        <option value="{{ asset.id }}">{{ asset.project_name }}</option>
-      {% endfor %}
-    </select>
-    <input name="alias_name" placeholder="Novo alias">
-    <input name="notes" placeholder="Notas">
-    <button class="button" type="submit">Adicionar alias</button>
-  </form>
-  <div class="table-wrap">
-    <table>
-      <thead><tr><th>Alias</th><th>Instalacao</th><th>Origem</th><th>Uso</th><th>Acao</th></tr></thead>
-      <tbody>
-        {% for alias in aliases %}
-          <tr>
-            <td>{{ alias.alias_name }}<br><small>{{ alias.normalized_alias }}</small></td>
-            <td>{{ alias.project_name }}</td>
-            <td>{{ alias.source }} · {{ 'ativo' if alias.active else 'inativo' }}</td>
-            <td>{{ alias.used_count }}</td>
-            <td>
-              <form method="post" action="{{ url_for('portfolio_alias_update', asset_id=alias.asset_id) }}" class="inline-form">
-                <input type="hidden" name="next" value="{{ url_for('portfolio_manager', portfolio_id=selected.id) }}">
-                <input type="hidden" name="alias_id" value="{{ alias.id }}">
-                <input name="alias_name" value="{{ alias.alias_name }}">
-                <button class="button secondary" type="submit">Editar</button>
-              </form>
-              <form method="post" action="{{ url_for('portfolio_alias_toggle', asset_id=alias.asset_id) }}" class="inline-form">
-                <input type="hidden" name="next" value="{{ url_for('portfolio_manager', portfolio_id=selected.id) }}">
-                <input type="hidden" name="alias_id" value="{{ alias.id }}">
-                <input type="hidden" name="active" value="{{ 0 if alias.active else 1 }}">
-                <button class="button secondary" type="submit">{{ 'Desativar' if alias.active else 'Reativar' }}</button>
-              </form>
-              <form method="post" action="{{ url_for('portfolio_alias_delete', asset_id=alias.asset_id) }}" class="inline-form">
-                <input type="hidden" name="next" value="{{ url_for('portfolio_manager', portfolio_id=selected.id) }}">
-                <input type="hidden" name="alias_id" value="{{ alias.id }}">
-                <button class="button danger-button" type="submit">Apagar</button>
-              </form>
-            </td>
-          </tr>
-        {% else %}
-          <tr><td colspan="5" class="muted">Sem aliases para mostrar.</td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-  {% for conflict in conflicts %}<p class="badge warning">{{ conflict.code }} {{ conflict.value }}</p>{% endfor %}
-</section>
-
-<section class="card">
-  <div class="section-title"><h3>Importacao e exportacao</h3></div>
-  <form method="post" action="{{ url_for('portfolio_manager_import') }}" enctype="multipart/form-data" class="inline-form">
-    <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
-    <input type="file" name="file" accept=".csv,.xlsx">
-    <button class="button secondary" type="submit">Criar preview</button>
-  </form>
-  {% if import_run and import_preview %}
-    <p class="muted">Preview #{{ import_run.id }} · {{ import_preview.rows_total }} linhas · {{ import_preview.rows_conflict }} conflitos</p>
-    <form method="post" action="{{ url_for('portfolio_manager_import_apply', import_id=import_run.id) }}">
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Aplicar</th><th>Linha</th><th>Portfolio</th><th>Subconta</th><th>Nome</th><th>NIF</th><th>Asset</th><th>Acao</th><th>Avisos</th><th>Erros</th></tr></thead>
-          <tbody>
-            {% for row in import_preview.rows %}
-              <tr>
-                <td><input type="checkbox" name="row_numbers" value="{{ row.row_number }}" {{ 'disabled' if row.errors or row.action == 'conflict' else 'checked' }}></td>
-                <td>{{ row.row_number }}</td>
-                <td>{{ row.portfolio }}</td>
-                <td>{{ row.sub_account }}</td>
-                <td>{{ row.external_name or row.asset_name }}</td>
-                <td>{{ row.nif }}</td>
-                <td><input name="asset_override_{{ row.row_number }}" value="{{ row.asset_id or '' }}" placeholder="asset_id"></td>
-                <td>{{ row.action }}</td>
-                <td>{{ row.warnings|join(', ') }}</td>
-                <td>{{ row.errors|join(', ') }}</td>
-              </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
-      <button class="button" type="submit">Aplicar linhas selecionadas</button>
-      <a class="button secondary" href="{{ url_for('portfolio_manager', portfolio_id=selected.id) }}">Cancelar</a>
-    </form>
+  {% if selected %}
+    <div class="portfolio-title-block">
+      <p class="eyebrow">Portfolio selecionado</p>
+      <h3>{{ selected.name }}</h3>
+      <p class="muted">{{ selected.description or selected.notes or 'Sem descricao.' }}</p>
+    </div>
+    <div class="portfolio-metrics">
+      <span class="badge">{{ members|length }} membros</span>
+      <span class="badge">{{ pending_count }} pendentes</span>
+      <span class="badge {{ 'warning' if conflict_count }}">{{ conflict_count }} conflitos</span>
+    </div>
+    <div class="portfolio-actions">
+      <button class="button" type="button" data-open-dialog="add-assets-dialog">Adicionar instalacoes</button>
+      <details class="action-menu">
+        <summary class="button secondary">Acoes</summary>
+        <div class="action-menu-panel">
+          <a class="button secondary" href="{{ url_for('portfolio_manager', portfolio_id=selected.id, tab='settings') }}">Editar</a>
+          <button class="button secondary" type="button" data-open-dialog="duplicate-portfolio-dialog">Duplicar</button>
+          {% if selected.active and not selected.archived_at %}
+            <form method="post" action="{{ url_for('portfolio_manager_archive') }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
+              <input type="hidden" name="tab" value="settings">
+              <button class="button secondary" type="submit" data-confirm="Arquivar este portfolio?">Arquivar</button>
+            </form>
+          {% else %}
+            <form method="post" action="{{ url_for('portfolio_manager_reactivate') }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
+              <input type="hidden" name="tab" value="settings">
+              <button class="button secondary" type="submit">Reativar</button>
+            </form>
+          {% endif %}
+          <button class="button danger-button" type="button" data-open-dialog="delete-portfolio-dialog">Apagar</button>
+        </div>
+      </details>
+    </div>
+  {% else %}
+    <div class="portfolio-title-block">
+      <h3>Sem portfolios</h3>
+      <p class="muted">Cria um portfolio para comecar.</p>
+    </div>
   {% endif %}
 </section>
+
+<section class="portfolio-manager-shell">
+  <aside class="portfolio-list-panel card">
+    <div class="section-title">
+      <div>
+        <h3>Portfolios</h3>
+        <p class="muted">{{ groups|length }} registos</p>
+      </div>
+      <button class="button secondary small" type="button" data-open-dialog="new-portfolio-dialog">Criar</button>
+    </div>
+    <nav class="portfolio-list" aria-label="Lista de portfolios">
+      {% for group in groups %}
+        <a class="portfolio-list-item {{ 'active' if selected_portfolio_id == group.id }} {{ 'archived' if not group.active or group.archived_at }}"
+           href="{{ url_for('portfolio_manager', portfolio_id=group.id, tab=active_tab) }}">
+          <span>
+            <strong>{{ group.name }}</strong>
+            <small>{{ group.description or group.notes or ('Arquivado' if not group.active or group.archived_at else 'Sem descricao') }}</small>
+          </span>
+          <span class="count-pill">{{ portfolio_counts.get(group.id, 0) }}</span>
+        </a>
+      {% else %}
+        <p class="muted">Ainda nao existem portfolios.</p>
+      {% endfor %}
+    </nav>
+  </aside>
+
+  <section class="portfolio-detail-panel">
+    {% if selected %}
+      <nav class="tab-nav" aria-label="Gestor de portfolios">
+        {% for value, label in tab_links %}
+          <a class="{{ 'active' if active_tab == value else '' }}"
+             href="{{ url_for('portfolio_manager', portfolio_id=selected.id, tab=value, search=search, asset_filter=asset_filter, alias_search=alias_search, alias_filter=alias_filter) }}">{{ label }}</a>
+        {% endfor %}
+      </nav>
+
+      {% if active_tab == 'installations' %}
+        <article class="card">
+          <div class="section-title">
+            <div>
+              <h3>Instalacoes do portfolio</h3>
+              <p class="muted">Seleciona uma vez para remover, copiar ou mover em massa.</p>
+            </div>
+            <span class="badge">{{ members|length }}</span>
+          </div>
+          <div class="bulk-action-bar" id="bulk-action-bar" hidden>
+            <strong><span id="bulk-selected-count">0</span> selecionadas</strong>
+            <button class="button secondary small" type="button" id="bulk-clear">Limpar selecao</button>
+            <form method="post" action="{{ url_for('portfolio_manager_members_remove') }}" data-bulk-form data-confirm="Remover as instalacoes selecionadas deste portfolio?">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
+              <input type="hidden" name="tab" value="installations">
+              <button class="button danger-button small" type="submit">Remover</button>
+            </form>
+            <form method="post" action="{{ url_for('portfolio_manager_members_copy') }}" data-bulk-form>
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
+              <input type="hidden" name="tab" value="installations">
+              <label class="sr-only">Portfolio de destino para copiar</label>
+              <select name="target_portfolio_id" required>
+                {% for group in groups if group.id != selected.id and group.active %}
+                  <option value="{{ group.id }}">{{ group.name }}</option>
+                {% endfor %}
+              </select>
+              <button class="button secondary small" type="submit">Copiar para...</button>
+            </form>
+            <form method="post" action="{{ url_for('portfolio_manager_members_move') }}" data-bulk-form data-confirm="Mover as instalacoes selecionadas para outro portfolio?">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
+              <input type="hidden" name="tab" value="installations">
+              <label class="sr-only">Portfolio de destino para mover</label>
+              <select name="target_portfolio_id" required>
+                {% for group in groups if group.id != selected.id and group.active %}
+                  <option value="{{ group.id }}">{{ group.name }}</option>
+                {% endfor %}
+              </select>
+              <button class="button secondary small" type="submit">Mover para...</button>
+            </form>
+          </div>
+
+          <div class="table-wrap">
+            <table class="portfolio-members-table">
+              <thead>
+                <tr>
+                  <th><label class="sr-only" for="select-all-members">Selecionar todos</label><input id="select-all-members" type="checkbox"></th>
+                  <th>Instalacao local</th>
+                  <th>Nome externo</th>
+                  <th>NIF</th>
+                  <th>Subconta</th>
+                  <th>Mapping</th>
+                  <th>Dados</th>
+                  <th>Acoes</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for member in members %}
+                  <tr id="member-{{ member.id }}">
+                    <td><input class="member-select" type="checkbox" value="{{ member.id }}" aria-label="Selecionar {{ member.project_name or member.external_name or member.id }}"></td>
+                    <td>{{ member.project_name or 'Sem associacao local' }}</td>
+                    <td>{{ member.external_name or '-' }}</td>
+                    <td>{{ member.asset_nif or member.nif or '-' }}</td>
+                    <td>{{ member.sub_account or '-' }}</td>
+                    <td><span class="chip {{ 'warning' if not member.asset_id or member.mapping_status == 'mapping_conflict' else 'success' }}">{{ member.mapping_status or ('manual' if member.asset_id else 'mapping_pending') }}</span></td>
+                    <td>
+                      <small>Alias: {{ member.alias_blob or '-' }}</small><br>
+                      <small>{{ 'Ativo' if member.active else 'Inativo' }}</small>
+                    </td>
+                    <td class="row-actions">
+                      <button class="button secondary small" type="button" data-open-dialog="edit-member-{{ member.id }}">Editar</button>
+                      <button class="button secondary small" type="button" data-open-dialog="edit-member-{{ member.id }}" data-focus-member-select>Alterar associacao</button>
+                      <form method="post" action="{{ url_for('portfolio_manager_mappings_unmap') }}">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
+                        <input type="hidden" name="member_id" value="{{ member.id }}">
+                        <input type="hidden" name="tab" value="installations">
+                        <button class="button secondary small" type="submit" data-confirm="Retirar apenas o mapping desta entrada?">Retirar associacao</button>
+                      </form>
+                      <form method="post" action="{{ url_for('portfolio_manager_members_remove') }}">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
+                        <input type="hidden" name="member_ids" value="{{ member.id }}">
+                        <input type="hidden" name="tab" value="installations">
+                        <button class="button danger-button small" type="submit" data-confirm="Remover esta entrada do portfolio?">Remover</button>
+                      </form>
+                    </td>
+                  </tr>
+                {% else %}
+                  <tr><td colspan="8" class="muted">Este portfolio ainda nao tem instalacoes.</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </article>
+      {% elif active_tab == 'mappings' %}
+        <article class="card">
+          <div class="section-title">
+            <div>
+              <h3>Mappings pendentes e conflitos</h3>
+              <p class="muted">Aceita a melhor sugestao ou escolhe qualquer instalacao local.</p>
+            </div>
+            <form method="post" action="{{ url_for('portfolio_manager_mappings_suggest') }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
+              <input type="hidden" name="tab" value="mappings">
+              <button class="button secondary" type="submit">Sugerir mappings</button>
+            </form>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Entrada externa</th><th>Estado</th><th>Confianca</th><th>Sugestoes</th><th>Associar</th></tr></thead>
+              <tbody>
+                {% for member in members if not member.asset_id or member.mapping_status in ['mapping_pending', 'mapping_conflict', 'mapping_suggested'] %}
+                  {% set decision = mapping_decisions.get(member.id) %}
+                  <tr id="mapping-{{ member.id }}">
+                    <td>
+                      <strong>{{ member.external_name or 'Sem nome externo' }}</strong>
+                      <small>NIF {{ member.nif or '-' }} · Subconta {{ member.sub_account or '-' }}</small>
+                    </td>
+                    <td>{{ member.mapping_status or 'mapping_pending' }}</td>
+                    <td>{{ "%.0f%%"|format((member.mapping_confidence or 0) * 100) }}</td>
+                    <td>
+                      {% if decision and decision.candidates %}
+                        {% for candidate in decision.candidates[:5] %}
+                          <div class="candidate-line">
+                            <strong>{{ candidate.asset_name }}</strong>
+                            <small>{{ candidate.method }} · {{ "%.0f%%"|format(candidate.score * 100) }}{% if candidate.reasons %} · {{ candidate.reasons|join(', ') }}{% endif %}</small>
+                          </div>
+                        {% endfor %}
+                      {% else %}
+                        <span class="muted">Sem sugestoes calculadas.</span>
+                      {% endif %}
+                    </td>
+                    <td>
+                      <form method="post" action="{{ url_for('portfolio_manager_mappings_confirm') }}" class="stack-form compact-action-form">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
+                        <input type="hidden" name="member_id" value="{{ member.id }}">
+                        <input type="hidden" name="tab" value="mappings">
+                        <label>Instalacao local
+                          <select name="asset_id" required>
+                            {% for asset in all_assets %}
+                              <option value="{{ asset.id }}" {{ 'selected' if decision and decision.asset_id == asset.id }}>{{ asset.project_name }}{% if asset.nif %} · {{ asset.nif }}{% endif %}</option>
+                            {% endfor %}
+                          </select>
+                        </label>
+                        <label class="check-row"><input type="checkbox" name="create_alias" checked> Criar alias</label>
+                        <button class="button secondary small" type="submit">Associar</button>
+                      </form>
+                      <form method="post" action="{{ url_for('portfolio_manager_mappings_unmap') }}" class="top-space">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
+                        <input type="hidden" name="member_id" value="{{ member.id }}">
+                        <input type="hidden" name="tab" value="mappings">
+                        <button class="button secondary small" type="submit">Retirar associacao</button>
+                      </form>
+                    </td>
+                  </tr>
+                {% else %}
+                  <tr><td colspan="5" class="muted">Sem mappings pendentes ou conflitos.</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </article>
+      {% elif active_tab == 'aliases' %}
+        <article class="card">
+          <div class="section-title"><h3>Aliases</h3></div>
+          <form method="get" class="portfolio-search">
+            <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
+            <input type="hidden" name="tab" value="aliases">
+            <label>Pesquisa <input name="alias_search" value="{{ alias_search }}" placeholder="Alias ou instalacao"></label>
+            <label>Filtro
+              <select name="alias_filter">
+                <option value="all" {{ 'selected' if alias_filter == 'all' }}>Todos</option>
+                <option value="active" {{ 'selected' if alias_filter == 'active' }}>Ativos</option>
+                <option value="inactive" {{ 'selected' if alias_filter == 'inactive' }}>Inativos</option>
+              </select>
+            </label>
+            <button class="button secondary" type="submit">Filtrar</button>
+          </form>
+          <form method="post" action="{{ url_for('portfolio_alias_add', asset_id=all_assets[0].id if all_assets else 0) }}" class="portfolio-search" data-alias-add-form>
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="next" value="{{ url_for('portfolio_manager', portfolio_id=selected.id, tab='aliases', alias_search=alias_search, alias_filter=alias_filter) }}">
+            <label>Instalacao
+              <select name="asset_id" required>
+                {% for asset in all_assets %}
+                  <option value="{{ asset.id }}">{{ asset.project_name }}</option>
+                {% endfor %}
+              </select>
+            </label>
+            <label>Novo alias <input name="alias_name" required></label>
+            <label>Notas <input name="notes"></label>
+            <button class="button" type="submit">Adicionar alias</button>
+          </form>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Alias</th><th>Instalacao</th><th>Origem</th><th>Uso</th><th>Acoes</th></tr></thead>
+              <tbody>
+                {% for alias in aliases %}
+                  <tr>
+                    <td>{{ alias.alias_name }}<br><small>{{ alias.normalized_alias }}</small></td>
+                    <td>{{ alias.project_name }}</td>
+                    <td>{{ alias.source }} · {{ 'ativo' if alias.active else 'inativo' }}</td>
+                    <td>{{ alias.used_count }}</td>
+                    <td class="row-actions">
+                      <form method="post" action="{{ url_for('portfolio_alias_update', asset_id=alias.asset_id) }}" class="inline-form">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <input type="hidden" name="next" value="{{ url_for('portfolio_manager', portfolio_id=selected.id, tab='aliases', alias_search=alias_search, alias_filter=alias_filter) }}">
+                        <input type="hidden" name="alias_id" value="{{ alias.id }}">
+                        <input name="alias_name" value="{{ alias.alias_name }}" required>
+                        <button class="button secondary small" type="submit">Editar</button>
+                      </form>
+                      <form method="post" action="{{ url_for('portfolio_alias_toggle', asset_id=alias.asset_id) }}">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <input type="hidden" name="next" value="{{ url_for('portfolio_manager', portfolio_id=selected.id, tab='aliases', alias_search=alias_search, alias_filter=alias_filter) }}">
+                        <input type="hidden" name="alias_id" value="{{ alias.id }}">
+                        <input type="hidden" name="active" value="{{ 0 if alias.active else 1 }}">
+                        <button class="button secondary small" type="submit">{{ 'Desativar' if alias.active else 'Reativar' }}</button>
+                      </form>
+                      <form method="post" action="{{ url_for('portfolio_alias_delete', asset_id=alias.asset_id) }}">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <input type="hidden" name="next" value="{{ url_for('portfolio_manager', portfolio_id=selected.id, tab='aliases', alias_search=alias_search, alias_filter=alias_filter) }}">
+                        <input type="hidden" name="alias_id" value="{{ alias.id }}">
+                        <button class="button danger-button small" type="submit" data-confirm="Apagar este alias?">Apagar</button>
+                      </form>
+                    </td>
+                  </tr>
+                {% else %}
+                  <tr><td colspan="5" class="muted">Sem aliases para mostrar.</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          {% for conflict in conflicts %}<p class="badge warning">{{ conflict.code }} {{ conflict.value }}</p>{% endfor %}
+        </article>
+      {% elif active_tab == 'import' %}
+        <article class="card">
+          <div class="section-title">
+            <h3>Importar/exportar</h3>
+            <a class="button secondary" href="{{ url_for('portfolio_manager_export') }}">Exportar XLSX</a>
+          </div>
+          <form method="post" action="{{ url_for('portfolio_manager_import') }}" enctype="multipart/form-data" class="portfolio-search">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
+            <label>Ficheiro CSV/XLSX <input type="file" name="file" accept=".csv,.xlsx" required></label>
+            <button class="button secondary" type="submit">Criar preview</button>
+          </form>
+          {% if import_run and import_preview %}
+            <p class="muted">Preview #{{ import_run.id }} · {{ import_preview.rows_total }} linhas · {{ import_preview.rows_conflict }} conflitos</p>
+            <form method="post" action="{{ url_for('portfolio_manager_import_apply', import_id=import_run.id) }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>Aplicar</th><th>Linha</th><th>Portfolio</th><th>Subconta</th><th>Nome</th><th>NIF</th><th>Asset</th><th>Acao</th><th>Avisos</th><th>Erros</th></tr></thead>
+                  <tbody>
+                    {% for row in import_preview.rows %}
+                      <tr>
+                        <td><input type="checkbox" name="row_numbers" value="{{ row.row_number }}" {{ 'disabled' if row.errors or row.action == 'conflict' else 'checked' }}></td>
+                        <td>{{ row.row_number }}</td>
+                        <td>{{ row.portfolio }}</td>
+                        <td>{{ row.sub_account }}</td>
+                        <td>{{ row.external_name or row.asset_name }}</td>
+                        <td>{{ row.nif }}</td>
+                        <td><input name="asset_override_{{ row.row_number }}" value="{{ row.asset_id or '' }}" placeholder="asset_id"></td>
+                        <td>{{ row.action }}</td>
+                        <td>{{ row.warnings|join(', ') }}</td>
+                        <td>{{ row.errors|join(', ') }}</td>
+                      </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+              <button class="button" type="submit">Aplicar linhas selecionadas</button>
+            </form>
+          {% else %}
+            <p class="muted">Sem preview ativo.</p>
+          {% endif %}
+        </article>
+      {% else %}
+        <article class="card">
+          <div class="section-title"><h3>Definicoes do portfolio</h3></div>
+          <form method="post" action="{{ url_for('portfolio_manager_update') }}" class="portfolio-inline-edit">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
+            <input type="hidden" name="tab" value="settings">
+            <label>Nome <input name="name" value="{{ selected.name }}" required></label>
+            <label>Descricao <input name="description" value="{{ selected.description or '' }}"></label>
+            <label>Notas <input name="notes" value="{{ selected.notes or '' }}"></label>
+            <label>Ordem <input name="display_order" value="{{ selected.display_order or 0 }}" inputmode="numeric"></label>
+            <button class="button" type="submit">Guardar</button>
+          </form>
+          <div class="portfolio-admin-actions top-space">
+            <button class="button secondary" type="button" data-open-dialog="duplicate-portfolio-dialog">Duplicar</button>
+            {% if selected.active and not selected.archived_at %}
+              <form method="post" action="{{ url_for('portfolio_manager_archive') }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
+                <input type="hidden" name="tab" value="settings">
+                <button class="button secondary" type="submit" data-confirm="Arquivar este portfolio?">Arquivar</button>
+              </form>
+            {% else %}
+              <form method="post" action="{{ url_for('portfolio_manager_reactivate') }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
+                <input type="hidden" name="tab" value="settings">
+                <button class="button secondary" type="submit">Reativar</button>
+              </form>
+            {% endif %}
+            <button class="button danger-button" type="button" data-open-dialog="delete-portfolio-dialog">Apagar</button>
+          </div>
+        </article>
+      {% endif %}
+    {% else %}
+      <article class="card empty-state">
+        <h3>Seleciona ou cria um portfolio</h3>
+        <p class="muted">A lista da esquerda mostra os portfolios existentes.</p>
+      </article>
+    {% endif %}
+  </section>
+</section>
+
+<dialog class="portfolio-dialog" id="new-portfolio-dialog">
+  <form method="post" action="{{ url_for('portfolio_manager_create') }}" class="stack-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <div class="section-title"><h3>Criar portfolio</h3><button class="button secondary small" type="button" data-close-dialog>Fechar</button></div>
+    <label>Nome <input name="name" required></label>
+    <label>Descricao <input name="description"></label>
+    <label>Notas <input name="notes"></label>
+    <button class="button" type="submit">Criar</button>
+  </form>
+</dialog>
+
+{% if selected %}
+<dialog class="portfolio-dialog wide-dialog" id="add-assets-dialog">
+  <div class="section-title">
+    <div><h3>Adicionar instalacoes</h3><p class="muted">Filtra por nome, NIF, alias ou portfolio.</p></div>
+    <button class="button secondary small" type="button" data-close-dialog>Fechar</button>
+  </div>
+  <form method="get" class="portfolio-search">
+    <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
+    <input type="hidden" name="tab" value="installations">
+    <label>Pesquisa <input name="search" value="{{ search }}" placeholder="Nome, NIF ou alias"></label>
+    <label>Filtro
+      <select name="asset_filter">
+        {% for value, label in [('available','Disponiveis'),('without_portfolio','Sem portfolio'),('other_portfolio','Noutros portfolios'),('inactive','Inativas'),('all','Todas')] %}
+          <option value="{{ value }}" {{ 'selected' if asset_filter == value }}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <button class="button secondary" type="submit">Filtrar</button>
+  </form>
+  <form method="post" action="{{ url_for('portfolio_manager_members_add') }}" id="add-assets-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
+    <input type="hidden" name="tab" value="installations">
+    <div class="portfolio-check-list">
+      {% for asset in assets %}
+        <div class="portfolio-check-row">
+          <input type="checkbox" name="asset_ids" value="{{ asset.id }}" aria-label="Selecionar {{ asset.project_name }}">
+          <span>
+            <strong>{{ asset.project_name }}</strong>
+            <small>NIF {{ asset.nif or '-' }} · contrato {{ asset.active_contract or 'indefinido' }}</small>
+            <small>{{ asset.portfolios or 'sem portfolio' }}{% if asset.alias_blob %} · aliases {{ asset.alias_blob }}{% endif %}{% if asset.integrations %} · {{ asset.integrations }}{% endif %}</small>
+          </span>
+          <button class="button secondary small" type="submit" name="asset_id" value="{{ asset.id }}">Adicionar</button>
+        </div>
+      {% else %}
+        <p class="muted">Sem instalacoes para este filtro.</p>
+      {% endfor %}
+    </div>
+    <button class="button top-space" type="submit">Adicionar selecionadas</button>
+  </form>
+</dialog>
+
+<dialog class="portfolio-dialog" id="duplicate-portfolio-dialog">
+  <form method="post" action="{{ url_for('portfolio_manager_duplicate') }}" class="stack-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
+    <input type="hidden" name="tab" value="settings">
+    <div class="section-title"><h3>Duplicar portfolio</h3><button class="button secondary small" type="button" data-close-dialog>Fechar</button></div>
+    <label>Nome da copia <input name="new_name" required></label>
+    <button class="button" type="submit">Duplicar</button>
+  </form>
+</dialog>
+
+<dialog class="portfolio-dialog" id="delete-portfolio-dialog">
+  <form method="post" action="{{ url_for('portfolio_manager_delete') }}" class="stack-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
+    <input type="hidden" name="tab" value="settings">
+    <div class="section-title"><h3>Apagar portfolio</h3><button class="button secondary small" type="button" data-close-dialog>Fechar</button></div>
+    <p class="muted">Escreve o nome exato para confirmar: {{ selected.name }}</p>
+    <label>Confirmacao <input name="confirm_name" required></label>
+    <button class="button danger-button" type="submit">Apagar</button>
+  </form>
+</dialog>
+
+{% for member in members %}
+<dialog class="portfolio-dialog wide-dialog" id="edit-member-{{ member.id }}">
+  <form method="post" action="{{ url_for('portfolio_manager_members_update') }}" class="stack-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
+    <input type="hidden" name="member_id" value="{{ member.id }}">
+    <input type="hidden" name="tab" value="{{ active_tab }}">
+    <div class="section-title">
+      <div><h3>Editar entrada</h3><p class="muted">{{ member.external_name or member.project_name or 'Linha pendente' }}</p></div>
+      <button class="button secondary small" type="button" data-close-dialog>Fechar</button>
+    </div>
+    <label>Instalacao local
+      <select name="asset_id" data-member-asset-select>
+        <option value="">Sem associacao local</option>
+        {% for asset in all_assets %}
+          <option value="{{ asset.id }}" {{ 'selected' if member.asset_id == asset.id }}>{{ asset.project_name }}{% if asset.nif %} · {{ asset.nif }}{% endif %}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <div class="grid two">
+      <label>Nome externo <input name="external_name" value="{{ member.external_name or '' }}"></label>
+      <label>NIF externo <input name="nif" value="{{ member.nif or '' }}"></label>
+      <label>Subconta <input name="sub_account" value="{{ member.sub_account or '' }}"></label>
+      <label>Notas <input name="notes" value="{{ member.notes or '' }}"></label>
+    </div>
+    <label class="check-row"><input type="checkbox" name="active" {{ 'checked' if member.active }}> Ativo</label>
+    <label class="check-row"><input type="checkbox" name="create_alias"> Criar alias com o nome externo</label>
+    <div class="portfolio-admin-actions">
+      <button class="button" type="submit">Guardar</button>
+      <button class="button secondary" type="submit" formaction="{{ url_for('portfolio_manager_mappings_unmap') }}" data-confirm="Retirar apenas o mapping desta entrada?">Retirar associacao</button>
+      <button class="button danger-button" type="submit" formaction="{{ url_for('portfolio_manager_members_remove') }}" name="member_ids" value="{{ member.id }}" data-confirm="Remover esta entrada do portfolio?">Remover do portfolio</button>
+    </div>
+  </form>
+</dialog>
+{% endfor %}
 {% endif %}
 
 <script>
   (() => {
-    const csrf = document.querySelector('meta[name="csrf-token"]')?.content || "";
-    const selectedPortfolio = "{{ selected.id if selected else 0 }}";
-    const postForm = (action, fields) => {
-      const form = document.createElement("form");
-      form.method = "post";
-      form.action = action;
-      Object.entries({csrf_token: csrf, ...fields}).forEach(([name, value]) => {
-        const input = document.createElement("input");
-        input.type = "hidden";
-        input.name = name;
-        input.value = value;
-        form.appendChild(input);
-      });
-      document.body.appendChild(form);
-      form.submit();
-    };
-    let dragged = null;
-    document.querySelectorAll("[draggable='true']").forEach(item => {
-      item.addEventListener("dragstart", event => {
-        dragged = item;
-        item.classList.add("dragging");
-        event.dataTransfer.effectAllowed = "move";
-      });
-      item.addEventListener("dragend", () => {
-        item.classList.remove("dragging");
-        document.querySelectorAll(".drop-active").forEach(zone => zone.classList.remove("drop-active"));
-        dragged = null;
-      });
-    });
-    document.querySelectorAll(".drop-zone").forEach(zone => {
-      zone.addEventListener("dragover", event => {
-        event.preventDefault();
-        zone.classList.add("drop-active");
-        if (zone.dataset.dropAction === "reorder-add" && dragged?.dataset.memberId) {
-          const target = event.target.closest("[data-member-id]");
-          if (target && target !== dragged) {
-            const box = target.getBoundingClientRect();
-            target.parentNode.insertBefore(dragged, event.clientY < box.top + box.height / 2 ? target : target.nextSibling);
-          }
+    document.querySelectorAll("[data-open-dialog]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const dialog = document.getElementById(button.dataset.openDialog);
+        if (!dialog) return;
+        dialog.showModal();
+        if (button.hasAttribute("data-focus-member-select")) {
+          dialog.querySelector("[data-member-asset-select]")?.focus();
         }
       });
-      zone.addEventListener("drop", event => {
-        event.preventDefault();
-        zone.classList.remove("drop-active");
-        if (!dragged) return;
-        const assetId = dragged.dataset.assetId;
-        const memberId = dragged.dataset.memberId;
-        if (zone.dataset.dropAction === "reorder-add" && assetId) {
-          postForm("{{ url_for('portfolio_manager_members_add') }}", {portfolio_id: selectedPortfolio, asset_ids: assetId});
-        } else if (zone.dataset.dropAction === "remove" && memberId) {
-          postForm("{{ url_for('portfolio_manager_members_remove') }}", {portfolio_id: selectedPortfolio, member_ids: memberId});
-        } else if (zone.dataset.dropAction === "copy" && memberId) {
-          const target = zone.querySelector("[name='target_portfolio_id']")?.value || "";
-          postForm("{{ url_for('portfolio_manager_members_copy') }}", {portfolio_id: selectedPortfolio, target_portfolio_id: target, member_ids: memberId});
-        } else if (zone.dataset.dropAction === "move" && memberId) {
-          const target = zone.querySelector("[name='target_portfolio_id']")?.value || "";
-          postForm("{{ url_for('portfolio_manager_members_move') }}", {portfolio_id: selectedPortfolio, target_portfolio_id: target, member_ids: memberId});
-        }
-        const input = document.querySelector("#ordered-ids");
-        const list = document.querySelector("#member-list");
-        if (input && list) input.value = [...list.querySelectorAll("[data-member-id]")].map(item => item.dataset.memberId).join(",");
+    });
+    document.querySelectorAll("[data-close-dialog]").forEach((button) => {
+      button.addEventListener("click", () => button.closest("dialog")?.close());
+    });
+    document.querySelectorAll("[data-confirm]").forEach((item) => {
+      item.addEventListener("click", (event) => {
+        if (!confirm(item.dataset.confirm)) event.preventDefault();
       });
     });
-    const input = document.querySelector("#ordered-ids");
-    const list = document.querySelector("#member-list");
-    if (input && list) input.value = [...list.querySelectorAll("[data-member-id]")].map(item => item.dataset.memberId).join(",");
+
+    const memberChecks = [...document.querySelectorAll(".member-select")];
+    const selectAll = document.getElementById("select-all-members");
+    const bar = document.getElementById("bulk-action-bar");
+    const count = document.getElementById("bulk-selected-count");
+    const clear = document.getElementById("bulk-clear");
+    function selectedIds() {
+      return memberChecks.filter((item) => item.checked).map((item) => item.value);
+    }
+    function syncBulk() {
+      const ids = selectedIds();
+      if (bar) bar.hidden = ids.length === 0;
+      if (count) count.textContent = ids.length;
+      if (selectAll) selectAll.checked = ids.length > 0 && ids.length === memberChecks.length;
+    }
+    memberChecks.forEach((item) => item.addEventListener("change", syncBulk));
+    selectAll?.addEventListener("change", () => {
+      memberChecks.forEach((item) => { item.checked = selectAll.checked; });
+      syncBulk();
+    });
+    clear?.addEventListener("click", () => {
+      memberChecks.forEach((item) => { item.checked = false; });
+      syncBulk();
+    });
+    document.querySelectorAll("[data-bulk-form]").forEach((form) => {
+      form.addEventListener("submit", (event) => {
+        const ids = selectedIds();
+        form.querySelectorAll("input[data-generated-member-id]").forEach((input) => input.remove());
+        ids.forEach((id) => {
+          const input = document.createElement("input");
+          input.type = "hidden";
+          input.name = "member_ids";
+          input.value = id;
+          input.dataset.generatedMemberId = "1";
+          form.appendChild(input);
+        });
+        if (!ids.length) {
+          event.preventDefault();
+          return;
+        }
+        if (form.dataset.confirm && !confirm(form.dataset.confirm)) event.preventDefault();
+      });
+    });
+    document.querySelectorAll("[data-alias-add-form]").forEach((form) => {
+      const select = form.querySelector("select[name='asset_id']");
+      form.addEventListener("submit", () => {
+        if (select?.value) form.action = `/assets/${select.value}/aliases/add`;
+      });
+    });
+    const focus = new URLSearchParams(window.location.search).get("focus");
+    if (focus) document.getElementById(focus)?.scrollIntoView({block: "center"});
+    syncBulk();
   })();
 </script>
 {% endblock %}

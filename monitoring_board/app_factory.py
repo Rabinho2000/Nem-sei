@@ -93,6 +93,7 @@ from monitoring_board.portfolio_repository import (
     remove_members,
     reorder_members,
     suggest_mapping as portfolio_suggest_mapping,
+    sync_portfolio_asset_members,
     toggle_alias,
     unmap_member,
     update_alias as portfolio_update_alias,
@@ -100,6 +101,41 @@ from monitoring_board.portfolio_repository import (
     update_portfolio,
     upsert_alias,
 )
+
+PORTFOLIO_MANAGER_ERROR_MESSAGES = {
+    "member_already_exists": "Esta instalacao ja pertence a este portfolio.",
+    "member_not_found": "A entrada selecionada ja nao existe neste portfolio.",
+    "no_members_copied": "Nenhuma instalacao pode ser copiada.",
+    "no_members_moved": "Nenhuma instalacao pode ser movida.",
+    "portfolio_not_found": "O portfolio selecionado nao existe.",
+    "alias_conflict": "Este alias ja esta associado a outra instalacao.",
+    "portfolio_has_report_history": "Este portfolio nao pode ser apagado porque tem historico de relatorios.",
+    "delete_confirmation_mismatch": "Escreve o nome exato do portfolio para confirmar.",
+    "asset_not_found": "A instalacao selecionada ja nao existe.",
+    "duplicate_ids": "A selecao contem entradas repetidas.",
+    "invalid_member_order": "A ordem enviada ja nao corresponde a este portfolio.",
+    "no_ids": "Seleciona pelo menos uma instalacao.",
+}
+
+
+def _portfolio_error_message(exc: Exception) -> str:
+    code = str(exc)
+    return PORTFOLIO_MANAGER_ERROR_MESSAGES.get(code, code or "Nao foi possivel concluir a operacao.")
+
+
+def _portfolio_manager_redirect(portfolio_id: int | None = None, **overrides: Any):
+    values: dict[str, Any] = {}
+    selected_id = portfolio_id if portfolio_id is not None else int(request.form.get("portfolio_id", request.args.get("portfolio_id", "0")) or 0)
+    if selected_id:
+        values["portfolio_id"] = selected_id
+    for key in ("tab", "search", "asset_filter", "alias_search", "alias_filter"):
+        value = overrides.pop(key, None)
+        if value is None:
+            value = request.form.get(key, request.args.get(key, ""))
+        if value:
+            values[key] = value
+    values.update({key: value for key, value in overrides.items() if value not in (None, "")})
+    return redirect(url_for("portfolio_manager", **values))
 from monitoring_board.portfolio_report_repository import (
     archive_profile as archive_portfolio_report_profile,
     duplicate_profile as duplicate_portfolio_report_profile,
@@ -2695,12 +2731,45 @@ def create_app() -> Flask:
         groups = list_portfolios(g.db, include_archived=True)
         selected_portfolio_id = int(request.args.get("portfolio_id", groups[0]["id"] if groups else 0) or 0)
         selected = get_portfolio(g.db, selected_portfolio_id) if selected_portfolio_id else None
+        active_tab = request.args.get("tab", "installations").strip()
+        if active_tab not in {"installations", "mappings", "aliases", "import", "settings"}:
+            active_tab = "installations"
         search = request.args.get("search", "").strip()
         asset_filter = request.args.get("asset_filter", "available").strip()
         alias_search = request.args.get("alias_search", "").strip()
         alias_filter = request.args.get("alias_filter", "all").strip()
+        import_id = int(request.args.get("import_id", "0") or 0)
+        if import_id and request.args.get("tab") is None:
+            active_tab = "import"
         members = list_portfolio_members(g.db, selected_portfolio_id) if selected else []
-        assets = portfolio_list_available_assets(g.db, portfolio_id=selected_portfolio_id or None, search=search, asset_filter=asset_filter)
+        assets = portfolio_list_available_assets(
+            g.db,
+            portfolio_id=selected_portfolio_id or None,
+            search=search,
+            asset_filter=asset_filter,
+        )
+        all_assets = portfolio_list_available_assets(g.db, portfolio_id=selected_portfolio_id or None, asset_filter="all")
+        portfolio_counts = {
+            int(row["portfolio_id"]): int(row["count"] or 0)
+            for row in query_all(
+                g.db,
+                "SELECT portfolio_id, COUNT(*) AS count FROM portfolio_assets WHERE active = 1 GROUP BY portfolio_id",
+            )
+        }
+        available_total = query_scalar(
+            g.db,
+            """
+            SELECT COUNT(*)
+            FROM assets a
+            WHERE NOT EXISTS (
+                SELECT 1 FROM portfolio_assets pa
+                WHERE pa.portfolio_id = ? AND pa.asset_id = a.id AND pa.active = 1
+            )
+            """,
+            (selected_portfolio_id,),
+        ) if selected else 0
+        pending_count = sum(1 for member in members if not member["asset_id"] or member["mapping_status"] == "mapping_pending")
+        conflict_count = sum(1 for member in members if member["mapping_status"] == "mapping_conflict")
         aliases = portfolio_list_aliases(g.db, include_inactive=alias_filter != "active")
         if alias_search:
             alias_search_lower = alias_search.lower()
@@ -2708,7 +2777,6 @@ def create_app() -> Flask:
         if alias_filter == "inactive":
             aliases = [alias for alias in aliases if not alias["active"]]
         conflicts = detect_portfolio_conflicts(g.db, selected_portfolio_id or None)
-        import_id = int(request.args.get("import_id", "0") or 0)
         import_run = get_import_run(g.db, import_id) if import_id else None
         import_preview = import_preview_from_json(import_run["preview_json"] or "{}") if import_run else None
         mapping_decisions = {
@@ -2721,9 +2789,15 @@ def create_app() -> Flask:
             title="Gestor de portfolios",
             groups=groups,
             selected=selected,
+            active_tab=active_tab,
             selected_portfolio_id=selected_portfolio_id,
+            portfolio_counts=portfolio_counts,
+            available_total=available_total,
+            pending_count=pending_count,
+            conflict_count=conflict_count,
             members=members,
             assets=assets,
+            all_assets=all_assets,
             aliases=aliases,
             conflicts=conflicts,
             search=search,
@@ -2741,11 +2815,11 @@ def create_app() -> Flask:
             portfolio_id = create_portfolio(g.db, name=request.form.get("name", ""), description=request.form.get("description", ""), notes=request.form.get("notes", ""))
             g.db.commit()
             flash("Portfolio criado.", "success")
-            return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id))
+            return _portfolio_manager_redirect(portfolio_id, tab="installations")
         except Exception as exc:
             g.db.rollback()
-            flash(f"Falha ao criar portfolio: {exc}", "error")
-            return redirect(url_for("portfolio_manager"))
+            flash(f"Falha ao criar portfolio: {_portfolio_error_message(exc)}", "error")
+            return _portfolio_manager_redirect(0)
 
     @app.route("/portfolio-manager/update", methods=["POST"])
     def portfolio_manager_update():
@@ -2763,8 +2837,8 @@ def create_app() -> Flask:
             flash("Portfolio atualizado.", "success")
         except Exception as exc:
             g.db.rollback()
-            flash(f"Falha ao atualizar portfolio: {exc}", "error")
-        return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id))
+            flash(f"Falha ao atualizar portfolio: {_portfolio_error_message(exc)}", "error")
+        return _portfolio_manager_redirect(portfolio_id, tab="settings")
 
     @app.route("/portfolio-manager/duplicate", methods=["POST"])
     def portfolio_manager_duplicate():
@@ -2773,11 +2847,11 @@ def create_app() -> Flask:
             new_id = duplicate_portfolio(g.db, portfolio_id=portfolio_id, new_name=request.form.get("new_name", ""))
             g.db.commit()
             flash("Portfolio duplicado.", "success")
-            return redirect(url_for("portfolio_manager", portfolio_id=new_id))
+            return _portfolio_manager_redirect(new_id, tab="installations")
         except Exception as exc:
             g.db.rollback()
-            flash(f"Falha ao duplicar portfolio: {exc}", "error")
-            return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id))
+            flash(f"Falha ao duplicar portfolio: {_portfolio_error_message(exc)}", "error")
+            return _portfolio_manager_redirect(portfolio_id, tab="settings")
 
     @app.route("/portfolio-manager/archive", methods=["POST"])
     def portfolio_manager_archive():
@@ -2788,8 +2862,8 @@ def create_app() -> Flask:
             flash("Portfolio arquivado.", "success")
         except Exception as exc:
             g.db.rollback()
-            flash(f"Falha ao arquivar portfolio: {exc}", "error")
-        return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id))
+            flash(f"Falha ao arquivar portfolio: {_portfolio_error_message(exc)}", "error")
+        return _portfolio_manager_redirect(portfolio_id, tab="settings")
 
     @app.route("/portfolio-manager/reactivate", methods=["POST"])
     def portfolio_manager_reactivate():
@@ -2800,8 +2874,8 @@ def create_app() -> Flask:
             flash("Portfolio reativado.", "success")
         except Exception as exc:
             g.db.rollback()
-            flash(f"Falha ao reativar portfolio: {exc}", "error")
-        return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id))
+            flash(f"Falha ao reativar portfolio: {_portfolio_error_message(exc)}", "error")
+        return _portfolio_manager_redirect(portfolio_id, tab="settings")
 
     @app.route("/portfolio-manager/delete", methods=["POST"])
     def portfolio_manager_delete():
@@ -2810,37 +2884,72 @@ def create_app() -> Flask:
             delete_portfolio(g.db, portfolio_id, confirm_name=request.form.get("confirm_name", ""))
             g.db.commit()
             flash("Portfolio apagado.", "success")
-            return redirect(url_for("portfolio_manager"))
+            return _portfolio_manager_redirect(0)
         except Exception as exc:
             g.db.rollback()
-            flash(f"Falha ao apagar portfolio: {exc}", "error")
-            return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id))
+            flash(f"Falha ao apagar portfolio: {_portfolio_error_message(exc)}", "error")
+            return _portfolio_manager_redirect(portfolio_id, tab="settings")
 
     @app.route("/portfolio-manager/members/add", methods=["POST"])
     def portfolio_manager_members_add():
         portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
         try:
             asset_ids = _form_int_list("asset_ids")
+            reactivated = 0
             if asset_ids:
                 for asset_id in asset_ids:
+                    inactive = g.db.execute(
+                        "SELECT 1 FROM portfolio_assets WHERE portfolio_id = ? AND asset_id = ? AND active = 0",
+                        (portfolio_id, asset_id),
+                    ).fetchone()
                     portfolio_add_member(g.db, portfolio_id=portfolio_id, asset_id=asset_id)
+                    if inactive:
+                        reactivated += 1
             else:
                 asset_raw = request.form.get("asset_id", "").strip()
+                asset_id = int(asset_raw) if asset_raw.isdigit() else None
+                inactive = (
+                    g.db.execute(
+                        "SELECT 1 FROM portfolio_assets WHERE portfolio_id = ? AND asset_id = ? AND active = 0",
+                        (portfolio_id, asset_id),
+                    ).fetchone()
+                    if asset_id
+                    else None
+                )
                 portfolio_add_member(
                     g.db,
                     portfolio_id=portfolio_id,
-                    asset_id=int(asset_raw) if asset_raw.isdigit() else None,
+                    asset_id=asset_id,
                     external_name=request.form.get("external_name", ""),
                     nif=request.form.get("nif", ""),
                     sub_account=request.form.get("sub_account", ""),
                     notes=request.form.get("notes", ""),
                 )
+                if inactive:
+                    reactivated += 1
             g.db.commit()
-            flash("Membro adicionado.", "success")
+            flash("Instalacao reativada no portfolio." if reactivated else "Instalacao adicionada ao portfolio.", "success")
         except Exception as exc:
             g.db.rollback()
-            flash(f"Falha ao adicionar membro: {exc}", "error")
-        return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id))
+            flash(f"Falha ao adicionar instalacao: {_portfolio_error_message(exc)}", "error")
+        return _portfolio_manager_redirect(portfolio_id, tab="installations")
+
+    @app.route("/portfolio-manager/members/apply", methods=["POST"])
+    def portfolio_manager_members_apply():
+        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
+        try:
+            asset_ids = _form_int_list("asset_ids")
+            asset_names = {
+                asset_id: request.form.get(f"asset_name_{asset_id}", "")
+                for asset_id in asset_ids
+            }
+            result = sync_portfolio_asset_members(g.db, portfolio_id=portfolio_id, asset_ids=asset_ids, asset_names=asset_names)
+            g.db.commit()
+            flash(f"Alteracoes aplicadas: {result['selected']} instalacoes selecionadas.", "success")
+        except Exception as exc:
+            g.db.rollback()
+            flash(f"Falha ao aplicar alteracoes: {_portfolio_error_message(exc)}", "error")
+        return _portfolio_manager_redirect(portfolio_id, tab="installations")
 
     @app.route("/portfolio-manager/members/remove", methods=["POST"])
     def portfolio_manager_members_remove():
@@ -2848,11 +2957,11 @@ def create_app() -> Flask:
         try:
             remove_members(g.db, portfolio_id=portfolio_id, member_ids=_form_int_list("member_ids"))
             g.db.commit()
-            flash("Membros removidos.", "success")
+            flash("Instalacoes removidas do portfolio.", "success")
         except Exception as exc:
             g.db.rollback()
-            flash(f"Falha ao remover membros: {exc}", "error")
-        return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id))
+            flash(f"Falha ao remover instalacoes: {_portfolio_error_message(exc)}", "error")
+        return _portfolio_manager_redirect(portfolio_id, tab="installations")
 
     @app.route("/portfolio-manager/members/copy", methods=["POST"])
     def portfolio_manager_members_copy():
@@ -2861,11 +2970,11 @@ def create_app() -> Flask:
         try:
             copy_members(g.db, source_portfolio_id=source_id, target_portfolio_id=target_id, member_ids=_form_int_list("member_ids"), move=False)
             g.db.commit()
-            flash("Membros copiados.", "success")
+            flash("Instalacoes copiadas.", "success")
         except Exception as exc:
             g.db.rollback()
-            flash(f"Falha ao copiar membros: {exc}", "error")
-        return redirect(url_for("portfolio_manager", portfolio_id=source_id))
+            flash(f"Falha ao copiar instalacoes: {_portfolio_error_message(exc)}", "error")
+        return _portfolio_manager_redirect(source_id, tab="installations")
 
     @app.route("/portfolio-manager/members/move", methods=["POST"])
     def portfolio_manager_members_move():
@@ -2874,12 +2983,12 @@ def create_app() -> Flask:
         try:
             copy_members(g.db, source_portfolio_id=source_id, target_portfolio_id=target_id, member_ids=_form_int_list("member_ids"), move=True)
             g.db.commit()
-            flash("Membros movidos.", "success")
-            return redirect(url_for("portfolio_manager", portfolio_id=target_id))
+            flash("Instalacoes movidas.", "success")
+            return _portfolio_manager_redirect(target_id, tab="installations")
         except Exception as exc:
             g.db.rollback()
-            flash(f"Falha ao mover membros: {exc}", "error")
-            return redirect(url_for("portfolio_manager", portfolio_id=source_id))
+            flash(f"Falha ao mover instalacoes: {_portfolio_error_message(exc)}", "error")
+            return _portfolio_manager_redirect(source_id, tab="installations")
 
     @app.route("/portfolio-manager/members/reorder", methods=["POST"])
     def portfolio_manager_members_reorder():
@@ -2895,8 +3004,8 @@ def create_app() -> Flask:
             flash("Ordem guardada.", "success")
         except Exception as exc:
             g.db.rollback()
-            flash(f"Falha ao reordenar: {exc}", "error")
-        return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id))
+            flash(f"Falha ao reordenar: {_portfolio_error_message(exc)}", "error")
+        return _portfolio_manager_redirect(portfolio_id, tab="installations")
 
     @app.route("/portfolio-manager/members/update", methods=["POST"])
     def portfolio_manager_members_update():
@@ -2917,11 +3026,11 @@ def create_app() -> Flask:
                 create_alias=request.form.get("create_alias") == "on",
             )
             g.db.commit()
-            flash("Membro atualizado.", "success")
+            flash("Entrada atualizada.", "success")
         except Exception as exc:
             g.db.rollback()
-            flash(f"Falha ao atualizar membro: {exc}", "error")
-        return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id))
+            flash(f"Falha ao atualizar entrada: {_portfolio_error_message(exc)}", "error")
+        return _portfolio_manager_redirect(portfolio_id, tab=request.form.get("tab") or "installations", focus=f"member-{member_id}")
 
     @app.route("/portfolio-manager/mappings/suggest", methods=["POST"])
     def portfolio_manager_mappings_suggest():
@@ -2932,8 +3041,8 @@ def create_app() -> Flask:
             flash(f"Sugestoes calculadas: {result['mapped']} auto, {result['pending']} pendentes, {result['conflicts']} conflitos.", "success")
         except Exception as exc:
             g.db.rollback()
-            flash(f"Falha ao sugerir mappings: {exc}", "error")
-        return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id))
+            flash(f"Falha ao sugerir mappings: {_portfolio_error_message(exc)}", "error")
+        return _portfolio_manager_redirect(portfolio_id, tab="mappings")
 
     @app.route("/portfolio-manager/mappings/confirm", methods=["POST"])
     def portfolio_manager_mappings_confirm():
@@ -2950,8 +3059,8 @@ def create_app() -> Flask:
             flash("Mapping confirmado.", "success")
         except Exception as exc:
             g.db.rollback()
-            flash(f"Falha ao confirmar mapping: {exc}", "error")
-        return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id))
+            flash(f"Falha ao confirmar mapping: {_portfolio_error_message(exc)}", "error")
+        return _portfolio_manager_redirect(portfolio_id, tab=request.form.get("tab") or "mappings", focus=f"member-{request.form.get('member_id', '0')}")
 
     @app.route("/portfolio-manager/mappings/unmap", methods=["POST"])
     def portfolio_manager_mappings_unmap():
@@ -2962,8 +3071,8 @@ def create_app() -> Flask:
             flash("Mapping removido.", "success")
         except Exception as exc:
             g.db.rollback()
-            flash(f"Falha ao remover mapping: {exc}", "error")
-        return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id))
+            flash(f"Falha ao remover mapping: {_portfolio_error_message(exc)}", "error")
+        return _portfolio_manager_redirect(portfolio_id, tab=request.form.get("tab") or "installations", focus=f"member-{request.form.get('member_id', '0')}")
 
     @app.route("/assets/<int:asset_id>/aliases/add", methods=["POST"])
     def portfolio_alias_add(asset_id: int):
@@ -2974,7 +3083,7 @@ def create_app() -> Flask:
             flash("Alias guardado.", "success")
         except Exception as exc:
             g.db.rollback()
-            flash(f"Falha ao guardar alias: {exc}", "error")
+            flash(f"Falha ao guardar alias: {_portfolio_error_message(exc)}", "error")
         return _alias_return(asset_id)
 
     @app.route("/assets/<int:asset_id>/aliases/update", methods=["POST"])
@@ -2986,7 +3095,7 @@ def create_app() -> Flask:
             flash("Alias atualizado.", "success")
         except Exception as exc:
             g.db.rollback()
-            flash(f"Falha ao atualizar alias: {exc}", "error")
+            flash(f"Falha ao atualizar alias: {_portfolio_error_message(exc)}", "error")
         return _alias_return(asset_id)
 
     @app.route("/assets/<int:asset_id>/aliases/toggle", methods=["POST"])
@@ -2998,7 +3107,7 @@ def create_app() -> Flask:
             flash("Alias atualizado.", "success")
         except Exception as exc:
             g.db.rollback()
-            flash(f"Falha ao alterar alias: {exc}", "error")
+            flash(f"Falha ao alterar alias: {_portfolio_error_message(exc)}", "error")
         return _alias_return(asset_id)
 
     @app.route("/assets/<int:asset_id>/aliases/delete", methods=["POST"])
@@ -3010,7 +3119,7 @@ def create_app() -> Flask:
             flash("Alias apagado.", "success")
         except Exception as exc:
             g.db.rollback()
-            flash(f"Falha ao apagar alias: {exc}", "error")
+            flash(f"Falha ao apagar alias: {_portfolio_error_message(exc)}", "error")
         return _alias_return(asset_id)
 
     @app.route("/portfolio-manager/import", methods=["POST"])
@@ -3024,11 +3133,11 @@ def create_app() -> Flask:
             import_id = create_import_preview(g.db, portfolio_id=portfolio_id, original_filename=Path(upload.filename).name, data=upload.read())
             g.db.commit()
             flash("Preview de importacao criado.", "success")
-            return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id or 0, import_id=import_id))
+            return _portfolio_manager_redirect(portfolio_id or 0, tab="import", import_id=import_id)
         except Exception as exc:
             g.db.rollback()
-            flash(f"Falha ao importar configuracao: {exc}", "error")
-            return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id or 0))
+            flash(f"Falha ao importar configuracao: {_portfolio_error_message(exc)}", "error")
+            return _portfolio_manager_redirect(portfolio_id or 0, tab="import")
 
     @app.route("/portfolio-manager/import/<int:import_id>/apply", methods=["POST"])
     def portfolio_manager_import_apply(import_id: int):
@@ -3043,11 +3152,11 @@ def create_app() -> Flask:
             apply_import_run(g.db, import_id, selected_rows=selected_rows or None, asset_overrides=overrides)
             g.db.commit()
             flash("Importacao aplicada.", "success")
-            return redirect(url_for("portfolio_manager", portfolio_id=run["portfolio_id"] if run else 0))
+            return _portfolio_manager_redirect(run["portfolio_id"] if run else 0, tab="import")
         except Exception as exc:
             g.db.rollback()
-            flash(f"Falha ao aplicar importacao: {exc}", "error")
-            return redirect(url_for("portfolio_manager", import_id=import_id))
+            flash(f"Falha ao aplicar importacao: {_portfolio_error_message(exc)}", "error")
+            return _portfolio_manager_redirect(None, tab="import", import_id=import_id)
 
     @app.route("/portfolio-manager/export")
     def portfolio_manager_export():

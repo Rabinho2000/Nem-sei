@@ -636,6 +636,416 @@ th {
   color: #fff;
 }
 
+.button.small,
+button.small {
+  min-height: 34px;
+  padding: 8px 11px;
+  font-size: 0.88rem;
+}
+
+.icon-button {
+  width: 34px;
+  height: 34px;
+  min-height: 34px;
+  padding: 0;
+  border-radius: 10px;
+  flex: 0 0 auto;
+}
+
+.portfolio-hero {
+  align-items: center;
+}
+
+.portfolio-manager-shell {
+  display: grid;
+  grid-template-columns: minmax(260px, 340px) minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.portfolio-topbar {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.8fr) minmax(240px, 1fr) auto auto;
+  gap: 16px;
+  align-items: center;
+}
+
+.portfolio-select-form {
+  display: grid;
+  gap: 8px;
+}
+
+.portfolio-title-block h3 {
+  margin: 0 0 4px;
+  font-size: 1.35rem;
+}
+
+.portfolio-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.action-menu {
+  position: relative;
+}
+
+.action-menu summary {
+  list-style: none;
+}
+
+.action-menu summary::-webkit-details-marker {
+  display: none;
+}
+
+.action-menu-panel {
+  position: absolute;
+  right: 0;
+  z-index: 20;
+  min-width: 220px;
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+
+.portfolio-list-panel {
+  position: sticky;
+  top: 24px;
+  max-height: calc(100vh - 48px);
+  overflow: hidden;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+}
+
+.portfolio-create-form {
+  margin-bottom: 16px;
+  display: grid;
+  gap: 12px;
+}
+
+.portfolio-list {
+  display: grid;
+  gap: 10px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.portfolio-list-item {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 13px 14px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--row-bg);
+}
+
+.portfolio-list-item strong,
+.portfolio-list-item small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.portfolio-list-item.active {
+  border-color: color-mix(in srgb, var(--brand) 65%, var(--line));
+  background: var(--brand-soft);
+}
+
+.portfolio-list-item.archived {
+  opacity: 0.68;
+}
+
+.count-pill,
+.badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 30px;
+  min-height: 28px;
+  padding: 5px 9px;
+  border-radius: 999px;
+  background: var(--panel-strong);
+  border: 1px solid var(--line);
+  color: var(--text);
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+.badge.warning {
+  color: var(--warning);
+  background: var(--warning-soft);
+  border-color: color-mix(in srgb, var(--warning) 35%, var(--line));
+}
+
+.portfolio-detail-panel,
+.portfolio-column,
+.portfolio-secondary-grid {
+  display: grid;
+  gap: 18px;
+}
+
+.portfolio-summary h3 {
+  margin: 0 0 6px;
+  font-size: 1.6rem;
+}
+
+.portfolio-actions,
+.portfolio-admin-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.portfolio-inline-edit,
+.portfolio-search {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr)) auto;
+  gap: 12px;
+  align-items: end;
+}
+
+.portfolio-search {
+  grid-template-columns: minmax(180px, 1fr) minmax(150px, 220px) auto;
+  margin-bottom: 14px;
+}
+
+.portfolio-edit-grid {
+  display: grid;
+  grid-template-columns: minmax(280px, 0.9fr) minmax(360px, 1.1fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.portfolio-edit-grid-single {
+  grid-template-columns: 1fr;
+}
+
+.portfolio-check-list {
+  min-height: 280px;
+  max-height: 62vh;
+  overflow: auto;
+  display: grid;
+  align-content: start;
+  gap: 9px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--panel-strong) 45%, transparent);
+}
+
+.portfolio-check-row {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(180px, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--row-bg-strong);
+}
+
+.portfolio-check-row:hover {
+  border-color: color-mix(in srgb, var(--brand) 45%, var(--line));
+}
+
+.portfolio-check-row strong,
+.portfolio-check-row small {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.portfolio-member-name {
+  display: grid;
+  gap: 5px;
+}
+
+.portfolio-apply-bar {
+  margin-top: 14px;
+}
+
+.portfolio-drop-list {
+  min-height: 280px;
+  max-height: 58vh;
+  overflow: auto;
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  padding: 10px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--panel-strong) 45%, transparent);
+}
+
+.portfolio-drop-list.drop-target {
+  border-color: var(--brand);
+  background: color-mix(in srgb, var(--brand-soft) 65%, transparent);
+}
+
+.portfolio-asset-row,
+.portfolio-member-row,
+.portfolio-readonly-row,
+.compact-table-row {
+  min-width: 0;
+  display: grid;
+  gap: 10px;
+  align-items: center;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--row-bg-strong);
+}
+
+.portfolio-asset-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.portfolio-member-row {
+  grid-template-columns: auto minmax(0, 1fr) auto;
+}
+
+.portfolio-asset-row strong,
+.portfolio-asset-row small,
+.portfolio-member-row strong,
+.portfolio-member-row small,
+.portfolio-readonly-row strong,
+.portfolio-readonly-row span,
+.compact-table-row strong,
+.compact-table-row span,
+.compact-table-row small {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.portfolio-asset-row small,
+.portfolio-member-row small {
+  display: block;
+}
+
+.portfolio-member-row.dragging,
+.portfolio-asset-row.dragging {
+  opacity: 0.48;
+}
+
+.drag-handle {
+  width: 28px;
+  height: 44px;
+  border-radius: 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  background: var(--panel-strong);
+  border: 1px solid var(--line);
+  cursor: grab;
+}
+
+.portfolio-secondary-grid {
+  grid-template-columns: minmax(0, 1.1fr) minmax(280px, 0.9fr);
+}
+
+.compact-table {
+  display: grid;
+  gap: 8px;
+}
+
+.compact-table-row {
+  grid-template-columns: minmax(150px, 0.7fr) minmax(180px, 1fr) auto;
+}
+
+.portfolio-readonly-members {
+  display: grid;
+  gap: 10px;
+}
+
+.portfolio-readonly-row {
+  grid-template-columns: minmax(220px, 1.2fr) minmax(120px, 0.7fr) minmax(90px, 0.5fr) minmax(120px, 0.6fr);
+}
+
+.bulk-action-bar {
+  position: sticky;
+  top: 8px;
+  z-index: 10;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 14px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+
+.bulk-action-bar form,
+.row-actions,
+.candidate-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.row-actions {
+  min-width: 220px;
+}
+
+.candidate-line {
+  align-items: baseline;
+  margin-bottom: 6px;
+}
+
+.compact-action-form {
+  gap: 8px;
+}
+
+.portfolio-dialog {
+  width: min(640px, calc(100vw - 28px));
+  max-height: calc(100vh - 40px);
+  overflow: auto;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  color: var(--text);
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+
+.portfolio-dialog::backdrop {
+  background: rgb(15 23 42 / 0.55);
+}
+
+.wide-dialog {
+  width: min(980px, calc(100vw - 28px));
+}
+
+.portfolio-members-table td {
+  vertical-align: top;
+}
+
+.top-space {
+  margin-top: 12px;
+}
+
+.empty-state {
+  min-height: 260px;
+  display: grid;
+  align-content: center;
+}
+
 .checkbox-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1939,13 +2349,30 @@ th {
   .route-stop-time,
   .route-cost-grid,
   .route-summary-grid,
-  .route-review-correction {
+  .route-review-correction,
+  .portfolio-manager-shell,
+  .portfolio-topbar,
+  .portfolio-edit-grid,
+  .portfolio-secondary-grid,
+  .portfolio-inline-edit,
+  .portfolio-search,
+  .portfolio-readonly-row,
+  .compact-table-row {
     grid-template-columns: 1fr;
   }
 
   .sidebar {
     position: relative;
     height: auto;
+  }
+
+  .portfolio-list-panel {
+    position: static;
+    max-height: none;
+  }
+
+  .portfolio-list {
+    max-height: 360px;
   }
 
   .hero,

@@ -282,8 +282,30 @@ def add_member(
     _require_portfolio(conn, portfolio_id, active_only=True)
     if asset_id is not None:
         _require_asset(conn, asset_id)
-        existing = conn.execute("SELECT id FROM portfolio_assets WHERE portfolio_id = ? AND asset_id = ?", (portfolio_id, asset_id)).fetchone()
+        existing = conn.execute("SELECT id, active FROM portfolio_assets WHERE portfolio_id = ? AND asset_id = ?", (portfolio_id, asset_id)).fetchone()
         if existing:
+            if int(existing["active"] or 0) == 0:
+                conn.execute(
+                    """
+                    UPDATE portfolio_assets
+                    SET active = 1, external_name = ?, nif = ?, sub_account = ?, notes = ?,
+                        mapping_status = 'manual', mapping_confidence = ?, mapping_method = ?, mapped_at = ?, updated_at = ?
+                    WHERE id = ? AND portfolio_id = ?
+                    """,
+                    (
+                        external_name.strip(),
+                        normalize_nif(nif),
+                        sub_account.strip(),
+                        notes.strip(),
+                        confidence,
+                        mapping_method,
+                        now_text(),
+                        now_text(),
+                        existing["id"],
+                        portfolio_id,
+                    ),
+                )
+                return int(existing["id"])
             raise ValueError("member_already_exists")
     order = next_member_order(conn, portfolio_id)
     status = "manual" if asset_id is not None else "mapping_pending"
@@ -329,6 +351,12 @@ def update_member(
     previous_asset_id = member["asset_id"]
     if asset_id is not None:
         _require_asset(conn, asset_id)
+        duplicate = conn.execute(
+            "SELECT id FROM portfolio_assets WHERE portfolio_id = ? AND asset_id = ? AND id != ? LIMIT 1",
+            (portfolio_id, asset_id, member_id),
+        ).fetchone()
+        if duplicate:
+            raise ValueError("member_already_exists")
     conn.execute(
         """
         UPDATE portfolio_assets
@@ -366,14 +394,78 @@ def remove_members(conn: sqlite3.Connection, *, portfolio_id: int, member_ids: l
     normalize_member_order(conn, portfolio_id)
 
 
+def sync_portfolio_asset_members(
+    conn: sqlite3.Connection,
+    *,
+    portfolio_id: int,
+    asset_ids: list[int],
+    asset_names: dict[int, str] | None = None,
+) -> dict[str, int]:
+    _require_portfolio(conn, portfolio_id, active_only=True)
+    cleaned: list[int] = []
+    seen: set[int] = set()
+    for asset_id in asset_ids:
+        parsed = int(asset_id)
+        if parsed <= 0 or parsed in seen:
+            continue
+        seen.add(parsed)
+        cleaned.append(parsed)
+    if len(cleaned) > 100:
+        raise ValueError("too_many_assets")
+    for asset_id in cleaned:
+        _require_asset(conn, asset_id)
+
+    names = asset_names or {}
+    existing_rows = query_all(
+        conn,
+        "SELECT id, asset_id FROM portfolio_assets WHERE portfolio_id = ? AND asset_id IS NOT NULL ORDER BY display_order, id",
+        (portfolio_id,),
+    )
+    existing_by_asset = {int(row["asset_id"]): int(row["id"]) for row in existing_rows}
+    selected = set(cleaned)
+    remove_ids = [int(row["id"]) for row in existing_rows if int(row["asset_id"]) not in selected]
+    if remove_ids:
+        conn.executemany("DELETE FROM portfolio_assets WHERE id = ? AND portfolio_id = ?", [(member_id, portfolio_id) for member_id in remove_ids])
+
+    added = 0
+    current = now_text()
+    for index, asset_id in enumerate(cleaned, start=1):
+        member_id = existing_by_asset.get(asset_id)
+        display_order = index * ORDER_STEP
+        external_name = str(names.get(asset_id, "") or "").strip()
+        if member_id:
+            conn.execute(
+                """
+                UPDATE portfolio_assets
+                SET active = 1, external_name = ?, display_order = ?, updated_at = ?
+                WHERE id = ? AND portfolio_id = ?
+                """,
+                (external_name, display_order, current, member_id, portfolio_id),
+            )
+            continue
+        conn.execute(
+            """
+            INSERT INTO portfolio_assets (
+                portfolio_id, asset_id, external_name, nif, sub_account, active, mapping_status,
+                mapping_confidence, notes, display_order, mapping_method, mapped_at, updated_at
+            ) VALUES (?, ?, ?, '', '', 1, 'manual', 1.0, '', ?, 'manual', ?, ?)
+            """,
+            (portfolio_id, asset_id, external_name, display_order, current, current),
+        )
+        added += 1
+    normalize_member_order(conn, portfolio_id)
+    return {"selected": len(cleaned), "added": added, "removed": len(remove_ids)}
+
+
 def copy_members(conn: sqlite3.Connection, *, source_portfolio_id: int, target_portfolio_id: int, member_ids: list[int], move: bool = False) -> None:
     _require_portfolio(conn, source_portfolio_id)
     _require_portfolio(conn, target_portfolio_id, active_only=True)
     ids = _validated_unique_ids(member_ids)
     copied: list[int] = []
+    moved_source_ids: list[int] = []
     for member_id in ids:
         member = _require_member(conn, member_id, source_portfolio_id)
-        if member["asset_id"] is not None and conn.execute("SELECT 1 FROM portfolio_assets WHERE portfolio_id = ? AND asset_id = ?", (target_portfolio_id, member["asset_id"])).fetchone():
+        if member["asset_id"] is not None and conn.execute("SELECT 1 FROM portfolio_assets WHERE portfolio_id = ? AND asset_id = ? AND active = 1", (target_portfolio_id, member["asset_id"])).fetchone():
             continue
         copied.append(
             add_member(
@@ -388,8 +480,11 @@ def copy_members(conn: sqlite3.Connection, *, source_portfolio_id: int, target_p
                 confidence=float(member["mapping_confidence"] or 0),
             )
         )
+        moved_source_ids.append(member_id)
     if move:
-        remove_members(conn, portfolio_id=source_portfolio_id, member_ids=ids)
+        if not moved_source_ids:
+            raise ValueError("no_members_moved")
+        remove_members(conn, portfolio_id=source_portfolio_id, member_ids=moved_source_ids)
     if not copied and not move:
         raise ValueError("no_members_copied")
 
@@ -541,6 +636,12 @@ def auto_map_portfolio_assets(conn: sqlite3.Connection, portfolio_id: int | None
 def confirm_mapping(conn: sqlite3.Connection, *, member_id: int, portfolio_id: int, asset_id: int, create_alias: bool = True) -> None:
     member = _require_member(conn, member_id, portfolio_id)
     _require_asset(conn, asset_id)
+    duplicate = conn.execute(
+        "SELECT id FROM portfolio_assets WHERE portfolio_id = ? AND asset_id = ? AND id != ? LIMIT 1",
+        (portfolio_id, asset_id, member_id),
+    ).fetchone()
+    if duplicate:
+        raise ValueError("member_already_exists")
     previous = member["asset_id"]
     external_name = member["external_name"] or ""
     alias_created = False

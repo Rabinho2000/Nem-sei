@@ -171,6 +171,76 @@ def test_available_asset_filters_and_backend_rejects_manipulated_ids(tmp_path: P
         raise AssertionError("expected duplicate order rejection")
 
 
+def test_add_member_reactivates_inactive_member_and_prevents_active_duplicates(tmp_path: Path) -> None:
+    conn = connect(tmp_path)
+    asset_id = add_asset(conn, "Reativar A")
+    portfolio_id = repo.create_portfolio(conn, name="Reativar")
+    member_id = repo.add_member(conn, portfolio_id=portfolio_id, asset_id=asset_id, external_name="Nome antigo")
+    repo.update_member(
+        conn,
+        member_id=member_id,
+        portfolio_id=portfolio_id,
+        asset_id=asset_id,
+        external_name="Nome antigo",
+        nif="501111111",
+        sub_account="001",
+        notes="inativo",
+        active=False,
+    )
+
+    reactivated_id = repo.add_member(
+        conn,
+        portfolio_id=portfolio_id,
+        asset_id=asset_id,
+        external_name="Nome novo",
+        nif="502222222",
+        sub_account="002",
+        notes="reativado",
+    )
+
+    assert reactivated_id == member_id
+    row = conn.execute("SELECT * FROM portfolio_assets WHERE id = ?", (member_id,)).fetchone()
+    assert row["active"] == 1
+    assert row["external_name"] == "Nome novo"
+    assert row["sub_account"] == "002"
+    assert conn.execute("SELECT COUNT(*) FROM portfolio_assets WHERE portfolio_id = ? AND asset_id = ?", (portfolio_id, asset_id)).fetchone()[0] == 1
+
+    try:
+        repo.add_member(conn, portfolio_id=portfolio_id, asset_id=asset_id)
+    except ValueError as exc:
+        assert str(exc) == "member_already_exists"
+    else:
+        raise AssertionError("expected active duplicate rejection")
+
+
+def test_sync_portfolio_asset_members_replaces_asset_selection_and_keeps_pending_rows(tmp_path: Path) -> None:
+    conn = connect(tmp_path)
+    asset_a = add_asset(conn, "Sync A")
+    asset_b = add_asset(conn, "Sync B")
+    asset_c = add_asset(conn, "Sync C")
+    portfolio_id = repo.create_portfolio(conn, name="Sync Portfolio")
+    repo.add_member(conn, portfolio_id=portfolio_id, asset_id=asset_a)
+    repo.add_member(conn, portfolio_id=portfolio_id, asset_id=asset_b)
+    pending = repo.add_member(conn, portfolio_id=portfolio_id, asset_id=None, external_name="Pendente")
+
+    result = repo.sync_portfolio_asset_members(
+        conn,
+        portfolio_id=portfolio_id,
+        asset_ids=[asset_b, asset_c, asset_c],
+        asset_names={asset_b: "Nome B no Portfolio", asset_c: "Nome C no Portfolio"},
+    )
+
+    members = repo.list_portfolio_members(conn, portfolio_id)
+    assert result == {"selected": 2, "added": 1, "removed": 1}
+    assert {row["asset_id"] for row in members if row["asset_id"] is not None} == {asset_b, asset_c}
+    assert {
+        row["asset_id"]: row["external_name"]
+        for row in members
+        if row["asset_id"] is not None
+    } == {asset_b: "Nome B no Portfolio", asset_c: "Nome C no Portfolio"}
+    assert any(row["id"] == pending and row["asset_id"] is None for row in members)
+
+
 def test_import_preview_apply_and_export_roundtrip(tmp_path: Path) -> None:
     conn = connect(tmp_path)
     asset_id = add_asset(conn, "Central Importada", "509999999")
@@ -284,6 +354,96 @@ def test_portfolio_manager_routes_and_existing_portfolios_page(tmp_path: Path) -
         export = client.get("/portfolio-manager/export")
         assert export.status_code == 200
         assert client.get(f"/portfolios?portfolio_id={target_id}").status_code == 200
+    finally:
+        flask_app.config["DATABASE"] = previous_db
+        flask_app.config["TESTING"] = previous_testing
+
+
+def test_portfolio_manager_add_modal_buttons_friendly_errors_and_state(tmp_path: Path) -> None:
+    db_path = tmp_path / "portfolio-ui.db"
+    ensure_database(str(db_path))
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    asset_a = add_asset(conn, "UI A", "501111111")
+    asset_b = add_asset(conn, "UI B", "502222222")
+    asset_c = add_asset(conn, "UI C", "503333333")
+    portfolio_id = repo.create_portfolio(conn, name="UI Portfolio")
+    repo.add_member(conn, portfolio_id=portfolio_id, asset_id=asset_a)
+    inactive_id = repo.add_member(conn, portfolio_id=portfolio_id, asset_id=asset_b, external_name="Inativo")
+    repo.update_member(
+        conn,
+        member_id=inactive_id,
+        portfolio_id=portfolio_id,
+        asset_id=asset_b,
+        external_name="Inativo",
+        nif="",
+        sub_account="",
+        notes="",
+        active=False,
+    )
+    conn.commit()
+    conn.close()
+    flask_app, previous_db, previous_testing, client = csrf_client(db_path)
+    try:
+        page = client.get(f"/portfolio-manager?portfolio_id={portfolio_id}&tab=installations&search=UI&asset_filter=available")
+        assert page.status_code == 200
+        assert b"Adicionar instalacoes" in page.data
+        assert b"Editar" in page.data
+        assert b"Retirar associacao" in page.data
+        assert b"Remover" in page.data
+
+        add_many = client.post(
+            "/portfolio-manager/members/add",
+            data={
+                "csrf_token": "token",
+                "portfolio_id": portfolio_id,
+                "tab": "installations",
+                "search": "UI",
+                "asset_filter": "available",
+                "asset_ids": [str(asset_b), str(asset_c)],
+            },
+        )
+        assert add_many.status_code in {302, 303}
+        assert "tab=installations" in add_many.headers["Location"]
+        assert "search=UI" in add_many.headers["Location"]
+        with sqlite3.connect(db_path) as check:
+            rows = {
+                row[0]: row[1]
+                for row in check.execute(
+                    "SELECT asset_id, active FROM portfolio_assets WHERE portfolio_id = ? AND asset_id IS NOT NULL",
+                    (portfolio_id,),
+                )
+            }
+        assert rows == {asset_a: 1, asset_b: 1, asset_c: 1}
+
+        duplicate = client.post(
+            "/portfolio-manager/members/add",
+            data={
+                "csrf_token": "token",
+                "portfolio_id": portfolio_id,
+                "tab": "installations",
+                "asset_id": asset_a,
+            },
+            follow_redirects=True,
+        )
+        assert "Esta instalacao ja pertence a este portfolio.".encode() in duplicate.data
+
+        with sqlite3.connect(db_path) as check:
+            member_id = check.execute("SELECT id FROM portfolio_assets WHERE portfolio_id = ? AND asset_id = ?", (portfolio_id, asset_a)).fetchone()[0]
+        update = client.post(
+            "/portfolio-manager/members/update",
+            data={
+                "csrf_token": "token",
+                "portfolio_id": portfolio_id,
+                "member_id": member_id,
+                "asset_id": asset_c,
+                "external_name": "UI A externo",
+                "tab": "installations",
+            },
+            follow_redirects=True,
+        )
+        assert "Esta instalacao ja pertence a este portfolio.".encode() in update.data
     finally:
         flask_app.config["DATABASE"] = previous_db
         flask_app.config["TESTING"] = previous_testing

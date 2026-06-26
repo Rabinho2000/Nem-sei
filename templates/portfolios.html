@@ -162,52 +162,16 @@
     <div class="section-title">
       <h3>Configuracao</h3>
       <div class="hero-actions">
-        <form method="post" class="inline-form">
-          <input type="hidden" name="action" value="seed_external">
-          <input type="hidden" name="portfolio_id" value="{{ selected_portfolio_id }}">
-          <input type="hidden" name="report_month" value="{{ report_month }}">
-          <button class="button secondary" type="submit">Importar lista do portefolio</button>
-        </form>
-        <form method="post" class="inline-form">
-          <input type="hidden" name="action" value="auto_map">
-          <input type="hidden" name="portfolio_id" value="{{ selected_portfolio_id }}">
-          <input type="hidden" name="report_month" value="{{ report_month }}">
-          <button class="button secondary" type="submit">Auto-mapear por NIF/nome</button>
-        </form>
-        <a class="button secondary" href="{{ url_for('portfolios', tab='config', portfolio_id=selected_portfolio_id, report_month=report_month, config_filter='pending') }}">Mostrar so pendentes</a>
-        <a class="button secondary" href="{{ url_for('portfolios', tab='config', portfolio_id=selected_portfolio_id, report_month=report_month, config_filter='conflicts') }}">Mostrar conflitos</a>
+        <a class="button" href="{{ url_for('portfolio_manager', portfolio_id=selected_portfolio_id, tab='installations') }}">Abrir gestor de portfolios</a>
         <a class="button secondary" href="{{ url_for('export_portfolio_mapping', portfolio_id=selected_portfolio_id) }}">Exportar mapping</a>
       </div>
     </div>
-    <details class="asset-edit-details">
-      <summary class="button secondary">Adicionar manualmente</summary>
-      <form class="stack-form top-space" method="post">
-        <input type="hidden" name="action" value="add_asset">
-        <input type="hidden" name="report_month" value="{{ report_month }}">
-        <div class="grid four">
-          <label>Portfolio
-            <select name="portfolio_id" required>
-              {% for group in groups %}
-                <option value="{{ group.id }}" {{ 'selected' if selected_portfolio_id == group.id }}>{{ group.name }}</option>
-              {% endfor %}
-            </select>
-          </label>
-          <label>Instalacao local
-            <select name="asset_id">
-              <option value="">Sem mapping</option>
-              {% for asset in assets %}
-                <option value="{{ asset.id }}">{{ asset.project_name }}</option>
-              {% endfor %}
-            </select>
-          </label>
-          <label>Nome externo <input type="text" name="external_name"></label>
-          <label>NIF <input type="text" name="nif"></label>
-          <label>Subconta <input type="text" name="sub_account"></label>
-          <label>Notas <input type="text" name="notes"></label>
-        </div>
-        <button class="button" type="submit">Guardar</button>
-      </form>
-    </details>
+    <div class="cards dashboard-kpis">
+      <article class="card stat-card"><span>Entradas no portfolio</span><strong>{{ config_assets|length }}</strong></article>
+      <article class="card stat-card"><span>Mappings pendentes</span><strong>{{ config_assets|selectattr('asset_id', 'none')|list|length }}</strong></article>
+      <article class="card stat-card"><span>Conflitos</span><strong>{{ config_assets|selectattr('mapping_status', 'equalto', 'mapping_conflict')|list|length }}</strong></article>
+    </div>
+    <p class="muted">A gestao de instalacoes, mappings e aliases foi centralizada no gestor de portfolios. Esta pagina fica focada em relatorios, ficheiros e tarifas.</p>
   </section>
 
   <section class="card">
@@ -219,8 +183,7 @@
             <th>Subconta</th>
             <th>NIF</th>
             <th>Nome externo</th>
-            <th>Instalacao local mapeada</th>
-            <th>Confianca</th>
+            <th>Instalacao local</th>
             <th>Estado mapping</th>
             <th>Helioscope</th>
             <th>Fatura</th>
@@ -235,31 +198,7 @@
               <td>{{ item.sub_account or "-" }}</td>
               <td>{{ item.nif or item.asset_nif or "-" }}</td>
               <td>{{ item.external_name or "-" }}</td>
-              <td>
-                <form method="post" class="stack-form">
-                  <input type="hidden" name="action" value="update_asset">
-                  <input type="hidden" name="portfolio_id" value="{{ selected_portfolio_id }}">
-                  <input type="hidden" name="report_month" value="{{ report_month }}">
-                  <input type="hidden" name="portfolio_asset_id" value="{{ item.id }}">
-                  <input type="hidden" name="external_name" value="{{ item.external_name or '' }}">
-                  <input type="hidden" name="nif" value="{{ item.nif or '' }}">
-                  <input type="hidden" name="sub_account" value="{{ item.sub_account or '' }}">
-                  <input type="hidden" name="notes" value="{{ item.notes or '' }}">
-                  <label class="sr-only">Instalacao local</label>
-                  <select name="asset_id">
-                    <option value="">Sem mapping</option>
-                    {% for asset in assets %}
-                      <option value="{{ asset.id }}" {{ 'selected' if item.asset_id == asset.id }}>{{ asset.project_name }}</option>
-                    {% endfor %}
-                  </select>
-                  <label class="check-row">
-                    <input type="checkbox" name="active" {{ 'checked' if item.active }}>
-                    <span>Ativo</span>
-                  </label>
-                  <button class="button secondary" type="submit">Guardar mapping</button>
-                </form>
-              </td>
-              <td>{{ "%.0f%%"|format((item.mapping_confidence or 0) * 100) }}</td>
+              <td>{{ item.project_name or "Sem mapping" }}</td>
               <td>{{ item.mapping_status or "-" }}</td>
               <td>{{ item.latest_helioscope_file or "Em falta" }}</td>
               <td>{{ item.latest_invoice_file or "Em falta" }}</td>

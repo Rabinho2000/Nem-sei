@@ -205,7 +205,8 @@ def render_individual_pdf(report: dict[str, Any], template: ReportTemplate) -> R
     doc.build(story, onFirstPage=page_footer(template), onLaterPages=page_footer(template))
     return checked_file(
         RenderedFile(
-            filename=safe_filename(expand_individual_pattern(template.filename_pattern or "{asset}_{period}", report), extension="pdf"),
+            filename=safe_filename(expand_individual_pattern(template.fi
+                                                             lename_pattern or "{asset}_{period}", report), extension="pdf"),
             content=buffer.getvalue(),
             mimetype="application/pdf",
             fmt="pdf",
