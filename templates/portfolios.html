@@ -202,7 +202,12 @@
               <td>{{ item.mapping_status or "-" }}</td>
               <td>{{ item.latest_helioscope_file or "Em falta" }}</td>
               <td>{{ item.latest_invoice_file or "Em falta" }}</td>
-              <td>{{ item.tariff_type or "Em falta" }}</td>
+              <td>
+                {{ item.tariff_summary or "Sem tarifa aplicavel" }}
+                {% if item.tariff_warning_labels %}
+                  <br><small class="muted">{{ item.tariff_warning_labels|join(', ') }}</small>
+                {% endif %}
+              </td>
               <td>
                 {% if item.asset_id %}
                   <div class="grid two">
@@ -241,6 +246,207 @@
                       {% endfor %}
                     </div>
                   </details>
+                  <details id="asset-{{ item.asset_id }}" {{ 'open' if request.args.get('focus') and request.args.get('focus').startswith('tariff-') }}>
+                    <summary class="button secondary">Tarifas</summary>
+                    <div class="tariff-history top-space">
+                      <div class="section-title">
+                        <div>
+                          <h4>Historico de tarifas</h4>
+                          <p class="muted">Tarifa aplicavel a {{ report_month }}: {{ item.tariff_summary or 'Sem tarifa aplicavel' }}</p>
+                        </div>
+                        <button class="button secondary small" type="button" data-toggle-target="new-tariff-{{ item.asset_id }}">Nova tarifa</button>
+                      </div>
+                      <form id="new-tariff-{{ item.asset_id }}" method="post" class="stack-form tariff-form" hidden>
+                        <input type="hidden" name="action" value="save_tariff">
+                        <input type="hidden" name="portfolio_id" value="{{ selected_portfolio_id }}">
+                        <input type="hidden" name="report_month" value="{{ report_month }}">
+                        <input type="hidden" name="asset_id" value="{{ item.asset_id }}">
+                        <div class="grid two">
+                          <label>Tipo
+                            <select name="tariff_type" data-tariff-type>
+                              <option value="simple">Simples</option>
+                              <option value="bi-hourly">Bi-horaria</option>
+                              <option value="tri-hourly">Tri-horaria</option>
+                              <option value="tetra-hourly">Tetra-horaria</option>
+                            </select>
+                          </label>
+                          <label>Ciclo
+                            <select name="cycle_type">
+                              <option value="">Nao indicado</option>
+                              <option value="daily">Diario</option>
+                              <option value="weekly">Semanal</option>
+                            </select>
+                          </label>
+                          <label>Modelo tri-horario
+                            <select name="tri_hourly_template" data-tri-template>
+                              <option value="">Personalizado</option>
+                              <option value="daily_winter">Ciclo diario - inverno</option>
+                              <option value="daily_summer">Ciclo diario - verao</option>
+                            </select>
+                          </label>
+                          <label>Fatura fonte
+                            <select name="invoice_file_id">
+                              <option value="">Escolher</option>
+                              {% for invoice in invoices if invoice.asset_id == item.asset_id %}
+                                <option value="{{ invoice.id }}">{{ invoice.original_filename }}</option>
+                              {% endfor %}
+                            </select>
+                          </label>
+                          <label data-price-field="simple">Simples EUR/kWh <input type="number" step="0.00001" min="0" name="simple_price_eur_kwh"></label>
+                          <label data-price-field="ponta">Ponta EUR/kWh <input type="number" step="0.00001" min="0" name="ponta_price_eur_kwh"></label>
+                          <label data-price-field="cheia">Cheia EUR/kWh <input type="number" step="0.00001" min="0" name="cheia_price_eur_kwh"></label>
+                          <label data-price-field="vazio">Vazio EUR/kWh <input type="number" step="0.00001" min="0" name="vazio_price_eur_kwh"></label>
+                          <label data-price-field="super_vazio">Super vazio EUR/kWh <input type="number" step="0.00001" min="0" name="super_vazio_price_eur_kwh"></label>
+                          <label>Valida desde <input type="date" name="valid_from"></label>
+                          <label>Valida ate <input type="date" name="valid_to"></label>
+                          <label>Notas <input type="text" name="notes"></label>
+                        </div>
+                        <p class="muted" data-template-preview>Escolhe explicitamente um modelo tri-horario se quiseres preencher horarios automaticamente.</p>
+                        <button class="button secondary" type="submit">Criar tarifa</button>
+                      </form>
+
+                      {% for tariff in tariffs_by_asset.get(item.asset_id, []) %}
+                        {% set tariff_rules_for_item = rules_by_tariff.get(tariff.id, []) %}
+                        <article class="tariff-card" id="tariff-{{ tariff.id }}">
+                          <div class="section-title">
+                            <div>
+                              <h4>{{ tariff.tariff_type }}{% if item.applicable_tariff_id == tariff.id %} · aplicavel{% endif %}</h4>
+                              <p class="muted">
+                                {{ tariff.valid_from or 'sem inicio' }} a {{ tariff.valid_to or 'sem fim' }} ·
+                                {{ tariff.rule_count or 0 }} regras ·
+                                {{ tariff.invoice_filename or 'sem fatura fonte' }}
+                              </p>
+                            </div>
+                            <div class="hero-actions">
+                              <form method="post" class="inline-form">
+                                <input type="hidden" name="action" value="duplicate_tariff">
+                                <input type="hidden" name="portfolio_id" value="{{ selected_portfolio_id }}">
+                                <input type="hidden" name="report_month" value="{{ report_month }}">
+                                <input type="hidden" name="asset_id" value="{{ item.asset_id }}">
+                                <input type="hidden" name="tariff_id" value="{{ tariff.id }}">
+                                <button class="button secondary small" type="submit">Duplicar</button>
+                              </form>
+                              <form method="post" class="inline-form">
+                                <input type="hidden" name="action" value="delete_tariff">
+                                <input type="hidden" name="portfolio_id" value="{{ selected_portfolio_id }}">
+                                <input type="hidden" name="report_month" value="{{ report_month }}">
+                                <input type="hidden" name="asset_id" value="{{ item.asset_id }}">
+                                <input type="hidden" name="tariff_id" value="{{ tariff.id }}">
+                                <label class="check-row"><input type="checkbox" name="confirm_delete" required> Confirmar</label>
+                                <button class="button danger-button small" type="submit">Apagar</button>
+                              </form>
+                            </div>
+                          </div>
+                          <form method="post" class="stack-form tariff-form">
+                            <input type="hidden" name="action" value="save_tariff">
+                            <input type="hidden" name="portfolio_id" value="{{ selected_portfolio_id }}">
+                            <input type="hidden" name="report_month" value="{{ report_month }}">
+                            <input type="hidden" name="asset_id" value="{{ item.asset_id }}">
+                            <input type="hidden" name="tariff_id" value="{{ tariff.id }}">
+                            <div class="grid two">
+                              <label>Tipo
+                                <select name="tariff_type" data-tariff-type>
+                                  <option value="simple" {{ 'selected' if tariff.tariff_type == 'simple' }}>Simples</option>
+                                  <option value="bi-hourly" {{ 'selected' if tariff.tariff_type == 'bi-hourly' }}>Bi-horaria</option>
+                                  <option value="tri-hourly" {{ 'selected' if tariff.tariff_type == 'tri-hourly' }}>Tri-horaria</option>
+                                  <option value="tetra-hourly" {{ 'selected' if tariff.tariff_type == 'tetra-hourly' }}>Tetra-horaria</option>
+                                </select>
+                              </label>
+                              <label>Ciclo
+                                <select name="cycle_type">
+                                  <option value="" {{ 'selected' if not tariff.cycle_type }}>Nao indicado</option>
+                                  <option value="daily" {{ 'selected' if tariff.cycle_type == 'daily' }}>Diario</option>
+                                  <option value="weekly" {{ 'selected' if tariff.cycle_type == 'weekly' }}>Semanal</option>
+                                </select>
+                              </label>
+                              <label>Fatura fonte
+                                <select name="invoice_file_id">
+                                  <option value="">Escolher</option>
+                                  {% for invoice in invoices if invoice.asset_id == item.asset_id %}
+                                    <option value="{{ invoice.id }}" {{ 'selected' if tariff.invoice_file_id == invoice.id }}>{{ invoice.original_filename }}</option>
+                                  {% endfor %}
+                                </select>
+                              </label>
+                              <label data-price-field="simple">Simples EUR/kWh <input type="number" step="0.00001" min="0" name="simple_price_eur_kwh" value="{{ tariff.simple_price_eur_kwh or '' }}"></label>
+                              <label data-price-field="ponta">Ponta EUR/kWh <input type="number" step="0.00001" min="0" name="ponta_price_eur_kwh" value="{{ tariff.ponta_price_eur_kwh or '' }}"></label>
+                              <label data-price-field="cheia">Cheia EUR/kWh <input type="number" step="0.00001" min="0" name="cheia_price_eur_kwh" value="{{ tariff.cheia_price_eur_kwh or '' }}"></label>
+                              <label data-price-field="vazio">Vazio EUR/kWh <input type="number" step="0.00001" min="0" name="vazio_price_eur_kwh" value="{{ tariff.vazio_price_eur_kwh or '' }}"></label>
+                              <label data-price-field="super_vazio">Super vazio EUR/kWh <input type="number" step="0.00001" min="0" name="super_vazio_price_eur_kwh" value="{{ tariff.super_vazio_price_eur_kwh or '' }}"></label>
+                              <label>Valida desde <input type="date" name="valid_from" value="{{ tariff.valid_from or '' }}"></label>
+                              <label>Valida ate <input type="date" name="valid_to" value="{{ tariff.valid_to or '' }}"></label>
+                              <label>Notas <input type="text" name="notes" value="{{ tariff.notes or '' }}"></label>
+                            </div>
+                            <button class="button secondary" type="submit">Guardar tarifa</button>
+                          </form>
+
+                          <details class="top-space">
+                            <summary class="button secondary">Gerir horarios tarifarios</summary>
+                            <div class="tariff-coverage" data-tariff-rules='{{ rules_by_tariff_json.get(tariff.id, [])|tojson }}'></div>
+                            <div class="list compact-list top-space">
+                              {% for rule in tariff_rules_for_item %}
+                                <form method="post" class="list-row tariff-rule-row">
+                                  <input type="hidden" name="action" value="update_tariff_rule">
+                                  <input type="hidden" name="portfolio_id" value="{{ selected_portfolio_id }}">
+                                  <input type="hidden" name="report_month" value="{{ report_month }}">
+                                  <input type="hidden" name="asset_id" value="{{ item.asset_id }}">
+                                  <input type="hidden" name="tariff_id" value="{{ tariff.id }}">
+                                  <input type="hidden" name="rule_id" value="{{ rule.id }}">
+                                  <select name="weekday_type">
+                                    <option value="all" {{ 'selected' if rule.weekday_type == 'all' }}>Todos</option>
+                                    <option value="weekday" {{ 'selected' if rule.weekday_type == 'weekday' }}>Dias uteis</option>
+                                    <option value="weekend" {{ 'selected' if rule.weekday_type == 'weekend' }}>Fim de semana</option>
+                                  </select>
+                                  <input type="time" name="start_time" value="{{ rule.start_time }}" required>
+                                  <input type="time" name="end_time" value="{{ rule.end_time }}" required>
+                                  <select name="period_name">
+                                    <option value="ponta" {{ 'selected' if rule.period_name == 'ponta' }}>Ponta</option>
+                                    <option value="cheia" {{ 'selected' if rule.period_name == 'cheia' }}>Cheia</option>
+                                    <option value="vazio" {{ 'selected' if rule.period_name == 'vazio' }}>Vazio</option>
+                                    <option value="super_vazio" {{ 'selected' if rule.period_name == 'super_vazio' }}>Super vazio</option>
+                                  </select>
+                                  <button class="button secondary small" type="submit">Editar</button>
+                                  <button class="button danger-button small" type="submit" name="action" value="delete_tariff_rule">Apagar</button>
+                                </form>
+                              {% else %}
+                                <p class="muted">A tarifa ainda nao tem regras horarias.</p>
+                              {% endfor %}
+                            </div>
+                            <form method="post" class="stack-form top-space">
+                              <input type="hidden" name="action" value="add_tariff_rule">
+                              <input type="hidden" name="portfolio_id" value="{{ selected_portfolio_id }}">
+                              <input type="hidden" name="report_month" value="{{ report_month }}">
+                              <input type="hidden" name="asset_id" value="{{ item.asset_id }}">
+                              <input type="hidden" name="tariff_id" value="{{ tariff.id }}">
+                              <div class="grid four">
+                                <label>Dia
+                                  <select name="weekday_type">
+                                    <option value="all">Todos</option>
+                                    <option value="weekday">Dias uteis</option>
+                                    <option value="weekend">Fim de semana</option>
+                                  </select>
+                                </label>
+                                <label>Inicio <input type="time" name="start_time" required></label>
+                                <label>Fim <input type="time" name="end_time" required></label>
+                                <label>Periodo
+                                  <select name="period_name">
+                                    <option value="ponta">Ponta</option>
+                                    <option value="cheia">Cheia</option>
+                                    <option value="vazio">Vazio</option>
+                                    <option value="super_vazio">Super vazio</option>
+                                  </select>
+                                </label>
+                              </div>
+                              <button class="button secondary" type="submit">Adicionar regra</button>
+                            </form>
+                          </details>
+                        </article>
+                      {% else %}
+                        <p class="muted">Sem tarifas configuradas para esta instalacao.</p>
+                      {% endfor %}
+                    </div>
+                  </details>
+                  {# tariff management moved above #}
+                  {% if false %}
                   <details>
                     <summary class="button secondary">Editar tarifa</summary>
                     <form method="post" class="stack-form top-space">
@@ -332,6 +538,7 @@
                       </form>
                     {% endif %}
                   </details>
+                  {% endif %}
                 {% else %}
                   <span class="muted">Mapear primeiro</span>
                 {% endif %}
@@ -345,4 +552,110 @@
     </div>
   </section>
 {% endif %}
+<script>
+  (() => {
+    const allowedPrices = {
+      "simple": new Set(["simple"]),
+      "bi-hourly": new Set(["cheia", "vazio"]),
+      "tri-hourly": new Set(["ponta", "cheia", "vazio"]),
+      "tetra-hourly": new Set(["ponta", "cheia", "vazio", "super_vazio"]),
+    };
+
+    function syncTariffForm(form, clearHidden) {
+      const type = form.querySelector("[data-tariff-type]")?.value || "simple";
+      const allowed = allowedPrices[type] || allowedPrices.simple;
+      form.querySelectorAll("[data-price-field]").forEach((field) => {
+        const period = field.dataset.priceField;
+        const input = field.querySelector("input");
+        const visible = allowed.has(period);
+        field.hidden = !visible;
+        if (!visible && input && clearHidden) input.value = "";
+      });
+      form.querySelectorAll("[data-tri-template]").forEach((select) => {
+        select.closest("label").hidden = type !== "tri-hourly";
+        if (type !== "tri-hourly") select.value = "";
+      });
+    }
+
+    document.querySelectorAll(".tariff-form").forEach((form) => {
+      syncTariffForm(form, false);
+      form.querySelector("[data-tariff-type]")?.addEventListener("change", () => syncTariffForm(form, true));
+    });
+    document.querySelectorAll("[data-toggle-target]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const target = document.getElementById(button.dataset.toggleTarget);
+        if (target) target.hidden = !target.hidden;
+      });
+    });
+    document.querySelectorAll(".tariff-rule-row .danger-button").forEach((button) => {
+      button.addEventListener("click", () => {
+        const action = button.closest("form")?.querySelector("input[name='action']");
+        if (action) action.value = "delete_tariff_rule";
+      });
+    });
+
+    function timeToMinute(value) {
+      const [hours, minutes] = String(value || "00:00").split(":").map(Number);
+      return hours * 60 + minutes;
+    }
+    function ranges(rule) {
+      const start = timeToMinute(rule.start_time);
+      const end = timeToMinute(rule.end_time);
+      if (start === end) return [[0, 1440]];
+      if (start < end) return [[start, end]];
+      return [[start, 1440], [0, end]];
+    }
+    function coverageFor(day, rules) {
+      const counts = Array(24).fill(0);
+      const periods = Array(24).fill("");
+      rules.filter((rule) => rule.weekday_type === "all" || rule.weekday_type === day).forEach((rule) => {
+        ranges(rule).forEach(([start, end]) => {
+          for (let hour = 0; hour < 24; hour += 1) {
+            const hourStart = hour * 60;
+            const hourEnd = hourStart + 60;
+            if (start < hourEnd && hourStart < end) {
+              counts[hour] += 1;
+              periods[hour] = rule.period_name;
+            }
+          }
+        });
+      });
+      return {counts, periods};
+    }
+    document.querySelectorAll(".tariff-coverage").forEach((box) => {
+      let rules = [];
+      try { rules = JSON.parse(box.dataset.tariffRules || "[]"); } catch { rules = []; }
+      const warnings = [];
+      if (!rules.length) warnings.push("A tarifa ainda nao tem regras horarias.");
+      ["weekday", "weekend"].forEach((day) => {
+        const result = coverageFor(day, rules);
+        const row = document.createElement("div");
+        row.className = "tariff-coverage-row";
+        const label = document.createElement("strong");
+        label.textContent = day === "weekday" ? "Dias uteis" : "Fim de semana";
+        row.appendChild(label);
+        const grid = document.createElement("div");
+        grid.className = "tariff-coverage-grid";
+        result.counts.forEach((count, hour) => {
+          const cell = document.createElement("span");
+          cell.className = `tariff-hour ${count > 1 ? "overlap" : count === 0 ? "missing" : result.periods[hour]}`;
+          cell.title = `${String(hour).padStart(2, "0")}:00 ${count > 1 ? "sobreposicao" : count === 0 ? "sem regra" : result.periods[hour]}`;
+          grid.appendChild(cell);
+        });
+        row.appendChild(grid);
+        box.appendChild(row);
+        if (result.counts.some((count) => count === 0)) warnings.push(day === "weekend" ? "Os fins de semana nao tem cobertura." : "Existem horas sem periodo tarifario.");
+        if (result.counts.some((count) => count > 1)) warnings.push("Existem regras sobrepostas.");
+      });
+      [...new Set(warnings)].forEach((warning) => {
+        const message = document.createElement("p");
+        message.className = "muted";
+        message.textContent = warning;
+        box.appendChild(message);
+      });
+    });
+    const focus = new URLSearchParams(window.location.search).get("focus");
+    if (focus) document.getElementById(focus)?.scrollIntoView({block: "center"});
+  })();
+</script>
 {% endblock %}

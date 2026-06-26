@@ -174,6 +174,39 @@ def test_missing_billing_config_returns_safe_defaults(tmp_path: Path) -> None:
     assert config.solcor_price_per_kwh == Decimal("0")
 
 
+def test_portfolio_config_renders_tariff_history_and_edit_ids(tmp_path: Path) -> None:
+    db_path = tmp_path / "billing-ui.db"
+    ensure_database(str(db_path))
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    asset_id = add_report_asset(conn, name="Tariff UI")
+    portfolio_id = int(conn.execute("INSERT INTO portfolio_groups (name, active) VALUES ('Tariff Portfolio', 1)").lastrowid)
+    conn.execute(
+        "INSERT INTO portfolio_assets (portfolio_id, asset_id, external_name, active, mapping_status, mapping_confidence) VALUES (?, ?, 'Tariff UI', 1, 'manual', 1)",
+        (portfolio_id, asset_id),
+    )
+    first_id = save_asset_tariff(conn, asset_id=asset_id, tariff_type="simple", simple_price_eur_kwh="0.10", valid_from="2026-01-01", valid_to="2026-01-31")
+    second_id = save_asset_tariff(conn, asset_id=asset_id, tariff_type="tri-hourly", ponta_price_eur_kwh="0.30", cheia_price_eur_kwh="0.20", vazio_price_eur_kwh="0.10", valid_from="2026-02-01", valid_to="2026-12-31")
+    add_tariff_period_rule(conn, tariff_id=second_id, weekday_type="all", start_time="08:00", end_time="10:00", period_name="ponta")
+    add_tariff_period_rule(conn, tariff_id=second_id, weekday_type="all", start_time="10:00", end_time="20:00", period_name="cheia")
+    add_tariff_period_rule(conn, tariff_id=second_id, weekday_type="all", start_time="20:00", end_time="08:00", period_name="vazio")
+    conn.commit()
+    conn.close()
+
+    client = csrf_client(db_path)
+    response = client.get(f"/portfolios?tab=config&portfolio_id={portfolio_id}&report_month=2026-02")
+
+    assert response.status_code == 200
+    assert b"Historico de tarifas" in response.data
+    assert b"Nova tarifa" in response.data
+    assert b"Duplicar" in response.data
+    assert b"Apagar" in response.data
+    assert f'name="tariff_id" value="{first_id}"'.encode() in response.data
+    assert f'name="tariff_id" value="{second_id}"'.encode() in response.data
+    assert b"tri-hourly" in response.data
+
+
 def test_billing_configs_are_isolated_between_assets(tmp_path: Path) -> None:
     conn = connect(tmp_path)
     asset_a = add_report_asset(conn, name="A")
@@ -420,7 +453,15 @@ def test_overlapping_tariffs_use_explicit_billing_fallback_independent_of_insert
         conn = connect(case_dir)
         asset_id = add_report_asset(conn, contract_type="EPC", name=f"Overlap {order[0]}")
         for price in order:
-            save_asset_tariff(conn, asset_id=asset_id, tariff_type="simple", simple_price_eur_kwh=price, valid_from="2026-01-01", valid_to="2026-01-31")
+            conn.execute(
+                """
+                INSERT INTO asset_tariffs (
+                    asset_id, tariff_type, cycle_type, simple_price_eur_kwh,
+                    valid_from, valid_to, notes
+                ) VALUES (?, 'simple', '', ?, '2026-01-01', '2026-01-31', 'legacy overlap fixture')
+                """,
+                (asset_id, price),
+            )
         conn.commit()
         report = build_fusionsolar_customer_production_report(
             conn,

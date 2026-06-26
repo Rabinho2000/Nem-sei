@@ -117,6 +117,18 @@ PORTFOLIO_MANAGER_ERROR_MESSAGES = {
     "no_ids": "Seleciona pelo menos uma instalacao.",
 }
 
+TARIFF_WARNING_MESSAGES = {
+    "overlapping_tariffs": "Existem tarifas com datas de validade sobrepostas.",
+    "missing_tariff_rules": "A tarifa ainda nao tem horarios configurados.",
+    "incomplete_tariff_coverage": "Os horarios nao cobrem todas as horas.",
+    "missing_hourly_self_use": "Nao existem dados horarios suficientes para calcular o autoconsumo.",
+    "unclassified_hourly_energy": "Existem registos horarios que nao correspondem a nenhuma regra.",
+    "missing_tariff": "Nao existe uma tarifa valida para este periodo.",
+    "expired_tariff": "A ultima tarifa terminou antes deste periodo.",
+    "tariff_validity_gap": "Existem dias sem tarifa valida neste periodo.",
+    "tariff_change_within_month": "Existem varias tarifas aplicaveis dentro do mes.",
+}
+
 
 def _portfolio_error_message(exc: Exception) -> str:
     code = str(exc)
@@ -205,12 +217,14 @@ from monitoring_board.reporting.periods import (
 )
 from monitoring_board.reporting.repositories import (
     add_tariff_period_rule,
+    apply_tri_hourly_template,
     archive_invoice_document,
     billing_config_to_form_values,
     create_invoice_document,
     create_invoice_extraction_run,
     create_source_file_record,
     delete_tariff_period_rule,
+    delete_asset_tariff,
     detect_tariff_validity_warnings,
     ensure_billing_config_schema,
     get_asset_billing_config,
@@ -218,6 +232,8 @@ from monitoring_board.reporting.repositories import (
     get_invoice_document,
     get_tariff_config_for_date,
     get_tariff_resolution_warnings,
+    list_asset_tariffs,
+    list_tariffs_at,
     list_daily_production_records,
     list_invoice_extraction_runs,
     list_portfolio_invoice_documents,
@@ -226,10 +242,12 @@ from monitoring_board.reporting.repositories import (
     list_tariffs_intersecting_period,
     row_to_hourly_energy_record,
     save_asset_tariff,
+    duplicate_asset_tariff,
     find_invoice_by_hash,
     reject_invoice_document,
     update_invoice_from_candidates,
     update_invoice_review,
+    update_tariff_period_rule,
     upsert_asset_billing_config,
 )
 from monitoring_board.reporting.validation import (
@@ -3260,9 +3278,11 @@ def create_app() -> Flask:
                     flash("Mapeamento atualizado.", "success")
                 elif action == "save_tariff":
                     asset_id = int(request.form.get("asset_id", "0") or 0)
+                    tariff_id_raw = request.form.get("tariff_id", "").strip()
                     invoice_file_id_raw = request.form.get("invoice_file_id", "").strip()
-                    save_asset_tariff(
+                    saved_tariff_id = save_asset_tariff(
                         g.db,
+                        tariff_id=int(tariff_id_raw) if tariff_id_raw.isdigit() else None,
                         asset_id=asset_id,
                         tariff_type=request.form.get("tariff_type", "simple"),
                         cycle_type=request.form.get("cycle_type", ""),
@@ -3276,12 +3296,38 @@ def create_app() -> Flask:
                         valid_to=request.form.get("valid_to", "").strip(),
                         notes=request.form.get("notes", "").strip(),
                     )
+                    template_name = request.form.get("tri_hourly_template", "").strip()
+                    if template_name:
+                        apply_tri_hourly_template(g.db, tariff_id=saved_tariff_id, template_name=template_name)
                     g.db.commit()
                     flash("Tarifa guardada.", "success")
-                elif action == "add_tariff_rule":
-                    add_tariff_period_rule(
+                    return redirect(url_for("portfolios", tab="config", portfolio_id=portfolio_id_redirect, report_month=report_month_redirect, focus=f"tariff-{saved_tariff_id}"))
+                elif action == "duplicate_tariff":
+                    asset_id = int(request.form.get("asset_id", "0") or 0)
+                    new_tariff_id = duplicate_asset_tariff(
                         g.db,
                         tariff_id=int(request.form.get("tariff_id", "0") or 0),
+                        asset_id=asset_id,
+                    )
+                    g.db.commit()
+                    flash("Tarifa duplicada. Revê as datas de validade antes de usar.", "success")
+                    return redirect(url_for("portfolios", tab="config", portfolio_id=portfolio_id_redirect, report_month=report_month_redirect, focus=f"tariff-{new_tariff_id}"))
+                elif action == "delete_tariff":
+                    asset_id = int(request.form.get("asset_id", "0") or 0)
+                    delete_asset_tariff(
+                        g.db,
+                        tariff_id=int(request.form.get("tariff_id", "0") or 0),
+                        asset_id=asset_id,
+                        confirm=request.form.get("confirm_delete") == "on",
+                    )
+                    g.db.commit()
+                    flash("Tarifa apagada.", "success")
+                    return redirect(url_for("portfolios", tab="config", portfolio_id=portfolio_id_redirect, report_month=report_month_redirect, focus=f"asset-{asset_id}"))
+                elif action == "add_tariff_rule":
+                    tariff_id = int(request.form.get("tariff_id", "0") or 0)
+                    add_tariff_period_rule(
+                        g.db,
+                        tariff_id=tariff_id,
                         weekday_type=request.form.get("weekday_type", "all"),
                         start_time=request.form.get("start_time", ""),
                         end_time=request.form.get("end_time", ""),
@@ -3289,8 +3335,24 @@ def create_app() -> Flask:
                     )
                     g.db.commit()
                     flash("Regra horaria adicionada.", "success")
+                    return redirect(url_for("portfolios", tab="config", portfolio_id=portfolio_id_redirect, report_month=report_month_redirect, focus=f"tariff-{tariff_id}"))
+                elif action == "update_tariff_rule":
+                    tariff_id = int(request.form.get("tariff_id", "0") or 0)
+                    update_tariff_period_rule(
+                        g.db,
+                        rule_id=int(request.form.get("rule_id", "0") or 0),
+                        tariff_id=tariff_id,
+                        weekday_type=request.form.get("weekday_type", "all"),
+                        start_time=request.form.get("start_time", ""),
+                        end_time=request.form.get("end_time", ""),
+                        period_name=request.form.get("period_name", ""),
+                    )
+                    g.db.commit()
+                    flash("Regra horaria atualizada.", "success")
+                    return redirect(url_for("portfolios", tab="config", portfolio_id=portfolio_id_redirect, report_month=report_month_redirect, focus=f"tariff-{tariff_id}"))
                 elif action == "delete_tariff_rule":
                     asset_id = int(request.form.get("asset_id", "0") or 0)
+                    tariff_id = int(request.form.get("tariff_id", "0") or 0)
                     deleted = delete_tariff_period_rule(
                         g.db,
                         rule_id=int(request.form.get("rule_id", "0") or 0),
@@ -3298,6 +3360,7 @@ def create_app() -> Flask:
                     )
                     g.db.commit()
                     flash("Regra horaria removida." if deleted else "Regra horaria nao encontrada.", "success" if deleted else "error")
+                    return redirect(url_for("portfolios", tab="config", portfolio_id=portfolio_id_redirect, report_month=report_month_redirect, focus=f"tariff-{tariff_id or asset_id}"))
             except Exception as exc:
                 g.db.rollback()
                 flash(f"Falha ao guardar portfolio: {exc}", "error")
@@ -3323,10 +3386,7 @@ def create_app() -> Flask:
             """
             SELECT pa.*, pg.name AS portfolio_name, a.project_name, a.nif AS asset_nif, a.mounting_date,
                    sf.original_filename AS latest_helioscope_file,
-                   inv.original_filename AS latest_invoice_file,
-                   at.id AS tariff_id, at.tariff_type, at.cycle_type, at.simple_price_eur_kwh, at.ponta_price_eur_kwh,
-                   at.cheia_price_eur_kwh, at.vazio_price_eur_kwh, at.super_vazio_price_eur_kwh,
-                   at.invoice_file_id, at.valid_from, at.valid_to, at.notes AS tariff_notes
+                   inv.original_filename AS latest_invoice_file
             FROM portfolio_assets pa
             JOIN portfolio_groups pg ON pg.id = pa.portfolio_id
             LEFT JOIN assets a ON a.id = pa.asset_id
@@ -3340,11 +3400,6 @@ def create_app() -> Flask:
                 WHERE asset_id = pa.asset_id AND file_type = 'invoice'
                 ORDER BY uploaded_at DESC, id DESC LIMIT 1
             )
-            LEFT JOIN asset_tariffs at ON at.id = (
-                SELECT id FROM asset_tariffs
-                WHERE asset_id = pa.asset_id
-                ORDER BY COALESCE(valid_from, '') DESC, id DESC LIMIT 1
-            )
             ORDER BY pg.name COLLATE NOCASE, COALESCE(pa.external_name, a.project_name) COLLATE NOCASE
             """,
         )
@@ -3352,7 +3407,44 @@ def create_app() -> Flask:
         invoices = query_all(g.db, "SELECT id, asset_id, original_filename FROM source_files WHERE file_type = 'invoice' ORDER BY uploaded_at DESC")
         invoice_documents = list_portfolio_invoice_documents(g.db, selected_portfolio_id) if selected_portfolio_id else []
         tariff_rules = query_all(g.db, "SELECT * FROM tariff_period_rules ORDER BY tariff_id, weekday_type, start_time")
-        config_assets = [row for row in portfolio_assets if int(row["portfolio_id"]) == selected_portfolio_id]
+        rules_by_tariff: dict[int, list[sqlite3.Row]] = {}
+        for rule in tariff_rules:
+            rules_by_tariff.setdefault(int(rule["tariff_id"]), []).append(rule)
+        rules_by_tariff_json = {
+            tariff_id: [
+                {
+                    "weekday_type": rule["weekday_type"],
+                    "start_time": rule["start_time"],
+                    "end_time": rule["end_time"],
+                    "period_name": rule["period_name"],
+                }
+                for rule in rules
+            ]
+            for tariff_id, rules in rules_by_tariff.items()
+        }
+        report_start, report_end = month_bounds(report_month)
+        config_assets = [dict(row) for row in portfolio_assets if int(row["portfolio_id"]) == selected_portfolio_id]
+        tariffs_by_asset: dict[int, list[sqlite3.Row]] = {}
+        for item in config_assets:
+            asset_id = int(item["asset_id"] or 0)
+            if not asset_id:
+                item["tariff_summary"] = "Sem mapping"
+                continue
+            tariffs = list_asset_tariffs(g.db, asset_id)
+            tariffs_by_asset[asset_id] = tariffs
+            applicable = list_tariffs_at(g.db, asset_id=asset_id, moment=report_start)
+            warnings = detect_tariff_validity_warnings(g.db, asset_id=asset_id, start=report_start, end=report_end)
+            item["tariff_warnings"] = warnings
+            item["tariff_warning_labels"] = [TARIFF_WARNING_MESSAGES.get(warning, warning) for warning in warnings]
+            if len(applicable) == 1:
+                item["tariff_summary"] = applicable[0]["tariff_type"]
+                item["applicable_tariff_id"] = int(applicable[0]["id"])
+            elif len(applicable) > 1:
+                item["tariff_summary"] = "Conflito de tarifas"
+                item["applicable_tariff_id"] = None
+            else:
+                item["tariff_summary"] = "Sem tarifa aplicavel"
+                item["applicable_tariff_id"] = None
         if config_filter == "pending":
             config_assets = [row for row in config_assets if not row["asset_id"] or row["mapping_status"] == "mapping_pending"]
         elif config_filter == "conflicts":
@@ -3375,6 +3467,11 @@ def create_app() -> Flask:
             invoices=invoices,
             invoice_documents=invoice_documents,
             tariff_rules=tariff_rules,
+            rules_by_tariff=rules_by_tariff,
+            rules_by_tariff_json=rules_by_tariff_json,
+            tariffs_by_asset=tariffs_by_asset,
+            report_start=report_start,
+            report_end=report_end,
         )
 
     @app.route("/portfolios/export-mapping")

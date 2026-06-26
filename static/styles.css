@@ -1040,6 +1040,81 @@ button.small {
   margin-top: 12px;
 }
 
+.tariff-history {
+  display: grid;
+  gap: 14px;
+  min-width: 520px;
+}
+
+.tariff-card {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--row-bg-strong);
+}
+
+.tariff-card h4 {
+  margin: 0 0 4px;
+}
+
+.tariff-rule-row {
+  grid-template-columns: repeat(4, minmax(110px, 1fr)) auto auto;
+}
+
+.tariff-coverage {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel-strong);
+}
+
+.tariff-coverage-row {
+  display: grid;
+  grid-template-columns: 110px minmax(240px, 1fr);
+  gap: 10px;
+  align-items: center;
+}
+
+.tariff-coverage-grid {
+  display: grid;
+  grid-template-columns: repeat(24, minmax(8px, 1fr));
+  gap: 2px;
+}
+
+.tariff-hour {
+  height: 18px;
+  border-radius: 3px;
+  background: var(--line);
+}
+
+.tariff-hour.ponta {
+  background: #d97706;
+}
+
+.tariff-hour.cheia {
+  background: #2563eb;
+}
+
+.tariff-hour.vazio {
+  background: #16a34a;
+}
+
+.tariff-hour.super_vazio {
+  background: #0f766e;
+}
+
+.tariff-hour.missing {
+  background: repeating-linear-gradient(45deg, var(--line), var(--line) 4px, transparent 4px, transparent 8px);
+}
+
+.tariff-hour.overlap {
+  background: #dc2626;
+}
+
 .empty-state {
   min-height: 260px;
   display: grid;

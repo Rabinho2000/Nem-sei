@@ -352,10 +352,50 @@ def update_member(
     if asset_id is not None:
         _require_asset(conn, asset_id)
         duplicate = conn.execute(
-            "SELECT id FROM portfolio_assets WHERE portfolio_id = ? AND asset_id = ? AND id != ? LIMIT 1",
+            "SELECT * FROM portfolio_assets WHERE portfolio_id = ? AND asset_id = ? AND id != ? LIMIT 1",
             (portfolio_id, asset_id, member_id),
         ).fetchone()
         if duplicate:
+            if member["asset_id"] is None:
+                current = now_text()
+                conn.execute(
+                    """
+                    UPDATE portfolio_assets
+                    SET external_name = ?, nif = ?, sub_account = ?, active = ?,
+                        mapping_status = 'manual', mapping_confidence = 1.0, mapping_method = 'manual',
+                        mapped_at = ?, notes = ?, updated_at = ?
+                    WHERE id = ? AND portfolio_id = ?
+                    """,
+                    (
+                        external_name.strip(),
+                        normalize_nif(nif),
+                        sub_account.strip(),
+                        1 if active else 0,
+                        current,
+                        notes.strip(),
+                        current,
+                        duplicate["id"],
+                        portfolio_id,
+                    ),
+                )
+                alias_created = False
+                if create_alias and external_name.strip():
+                    alias_created = upsert_alias(conn, asset_id=asset_id, alias_name=external_name, source="mapping_confirmed", notes="Criado ao confirmar mapping") is not None
+                    rebuild_asset_alias_blob(conn, asset_id)
+                record_mapping_event(
+                    conn,
+                    portfolio_asset_id=duplicate["id"],
+                    external_name=external_name,
+                    previous_asset_id=None,
+                    selected_asset_id=asset_id,
+                    method="manual_merge",
+                    confidence=1.0,
+                    alias_created=alias_created,
+                    notes=f"Merge da entrada pendente #{member_id}",
+                )
+                conn.execute("DELETE FROM portfolio_assets WHERE id = ? AND portfolio_id = ?", (member_id, portfolio_id))
+                normalize_member_order(conn, portfolio_id)
+                return
             raise ValueError("member_already_exists")
     conn.execute(
         """
@@ -637,10 +677,40 @@ def confirm_mapping(conn: sqlite3.Connection, *, member_id: int, portfolio_id: i
     member = _require_member(conn, member_id, portfolio_id)
     _require_asset(conn, asset_id)
     duplicate = conn.execute(
-        "SELECT id FROM portfolio_assets WHERE portfolio_id = ? AND asset_id = ? AND id != ? LIMIT 1",
+        "SELECT * FROM portfolio_assets WHERE portfolio_id = ? AND asset_id = ? AND id != ? LIMIT 1",
         (portfolio_id, asset_id, member_id),
     ).fetchone()
     if duplicate:
+        if member["asset_id"] is None:
+            external_name = member["external_name"] or ""
+            alias_created = False
+            if create_alias and external_name:
+                alias_created = upsert_alias(conn, asset_id=asset_id, alias_name=external_name, source="mapping_confirmed", notes="Criado ao confirmar mapping") is not None
+                rebuild_asset_alias_blob(conn, asset_id)
+            current = now_text()
+            conn.execute(
+                """
+                UPDATE portfolio_assets
+                SET external_name = ?, nif = ?, sub_account = ?, active = 1,
+                    mapping_status = 'manual', mapping_method = 'manual', mapping_confidence = 1,
+                    mapped_at = ?, notes = ?, updated_at = ?
+                WHERE id = ? AND portfolio_id = ?
+                """,
+                (
+                    external_name,
+                    member["nif"] or "",
+                    member["sub_account"] or "",
+                    current,
+                    member["notes"] or "",
+                    current,
+                    duplicate["id"],
+                    portfolio_id,
+                ),
+            )
+            record_mapping_event(conn, portfolio_asset_id=duplicate["id"], external_name=external_name, previous_asset_id=None, selected_asset_id=asset_id, method="manual_merge", confidence=1.0, alias_created=alias_created, notes=f"Merge da entrada pendente #{member_id}")
+            conn.execute("DELETE FROM portfolio_assets WHERE id = ? AND portfolio_id = ?", (member_id, portfolio_id))
+            normalize_member_order(conn, portfolio_id)
+            return
         raise ValueError("member_already_exists")
     previous = member["asset_id"]
     external_name = member["external_name"] or ""

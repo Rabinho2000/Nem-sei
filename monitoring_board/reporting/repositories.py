@@ -37,6 +37,27 @@ from monitoring_board.reporting.tariffs import (
 )
 
 
+TRI_HOURLY_DAILY_WINTER_RULES = (
+    ("all", "00:00", "08:00", PERIOD_VAZIO),
+    ("all", "08:00", "08:30", PERIOD_CHEIA),
+    ("all", "08:30", "10:30", PERIOD_PONTA),
+    ("all", "10:30", "18:00", PERIOD_CHEIA),
+    ("all", "18:00", "20:30", PERIOD_PONTA),
+    ("all", "20:30", "22:00", PERIOD_CHEIA),
+    ("all", "22:00", "00:00", PERIOD_VAZIO),
+)
+
+TRI_HOURLY_DAILY_SUMMER_RULES = (
+    ("all", "00:00", "08:00", PERIOD_VAZIO),
+    ("all", "08:00", "10:30", PERIOD_CHEIA),
+    ("all", "10:30", "13:00", PERIOD_PONTA),
+    ("all", "13:00", "19:30", PERIOD_CHEIA),
+    ("all", "19:30", "21:00", PERIOD_PONTA),
+    ("all", "21:00", "22:00", PERIOD_CHEIA),
+    ("all", "22:00", "00:00", PERIOD_VAZIO),
+)
+
+
 def ensure_billing_config_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -594,9 +615,70 @@ def get_tariff_resolution_warnings(conn: sqlite3.Connection, *, asset_id: int, m
     return ()
 
 
+def list_asset_tariffs(conn: sqlite3.Connection, asset_id: int) -> list[sqlite3.Row]:
+    return query_all(
+        conn,
+        """
+        SELECT t.*,
+               sf.original_filename AS invoice_filename,
+               (SELECT COUNT(*) FROM tariff_period_rules r WHERE r.tariff_id = t.id) AS rule_count
+        FROM asset_tariffs t
+        LEFT JOIN source_files sf ON sf.id = t.invoice_file_id
+        WHERE t.asset_id = ?
+        ORDER BY COALESCE(t.valid_from, ''), COALESCE(t.valid_to, ''), t.id
+        """,
+        (asset_id,),
+    )
+
+
+def get_asset_tariff(conn: sqlite3.Connection, *, tariff_id: int, asset_id: int | None = None) -> sqlite3.Row | None:
+    if asset_id is None:
+        return conn.execute("SELECT * FROM asset_tariffs WHERE id = ?", (tariff_id,)).fetchone()
+    return conn.execute("SELECT * FROM asset_tariffs WHERE id = ? AND asset_id = ?", (tariff_id, asset_id)).fetchone()
+
+
+def _format_pt_date(value: date | None) -> str:
+    return value.strftime("%d/%m/%Y") if value else "sem limite"
+
+
+def validate_tariff_validity_range(
+    conn: sqlite3.Connection,
+    asset_id: int,
+    valid_from: str | date | None,
+    valid_to: str | date | None,
+    exclude_tariff_id: int | None = None,
+) -> tuple[date | None, date | None]:
+    start = valid_from if isinstance(valid_from, date) else parse_date_optional(valid_from)
+    end = valid_to if isinstance(valid_to, date) else parse_date_optional(valid_to)
+    if start and end and end < start:
+        raise TariffValidationError("A data final da tarifa nao pode ser anterior a data inicial.")
+    start_cmp = start or date.min
+    end_cmp = end or date.max
+    rows = query_all(
+        conn,
+        """
+        SELECT id, valid_from, valid_to
+        FROM asset_tariffs
+        WHERE asset_id = ? AND (? IS NULL OR id != ?)
+        """,
+        (asset_id, exclude_tariff_id, exclude_tariff_id),
+    )
+    for row in rows:
+        other_start = parse_date_optional(row["valid_from"]) or date.min
+        other_end = parse_date_optional(row["valid_to"]) or date.max
+        if start_cmp <= other_end and other_start <= end_cmp:
+            overlap_start = max(start_cmp, other_start)
+            overlap_end = min(end_cmp, other_end)
+            raise TariffValidationError(
+                f"Esta tarifa sobrepoe-se a outra tarifa da instalacao entre {_format_pt_date(None if overlap_start == date.min else overlap_start)} e {_format_pt_date(None if overlap_end == date.max else overlap_end)}."
+            )
+    return start, end
+
+
 def save_asset_tariff(
     conn: sqlite3.Connection,
     *,
+    tariff_id: int | None = None,
     asset_id: int,
     tariff_type: str,
     cycle_type: str = "",
@@ -612,17 +694,24 @@ def save_asset_tariff(
 ) -> int:
     if asset_id <= 0:
         raise TariffValidationError("Tarifa sem instalacao.")
+    existing_rules: tuple[TariffPeriodRule, ...] = ()
+    if tariff_id is not None:
+        existing = get_asset_tariff(conn, tariff_id=tariff_id, asset_id=asset_id)
+        if existing is None:
+            raise TariffValidationError("A tarifa selecionada nao pertence a esta instalacao.")
+        existing_rules = tuple(row_to_tariff_rule(row) for row in list_tariff_period_rules(conn, tariff_id))
     if invoice_file_id is not None:
         invoice = conn.execute("SELECT asset_id FROM source_files WHERE id = ? AND file_type = 'invoice'", (invoice_file_id,)).fetchone()
         if invoice is None or int(invoice["asset_id"]) != asset_id:
             raise TariffValidationError("Fatura associada pertence a outra instalacao.")
+    parsed_valid_from, parsed_valid_to = validate_tariff_validity_range(conn, asset_id, valid_from, valid_to, exclude_tariff_id=tariff_id)
     config = TariffConfig(
-        tariff_id=None,
+        tariff_id=tariff_id,
         asset_id=asset_id,
         tariff_type=parse_tariff_type(tariff_type),
         cycle_type=cycle_type.strip(),
-        valid_from=parse_date_optional(valid_from),
-        valid_to=parse_date_optional(valid_to),
+        valid_from=parsed_valid_from,
+        valid_to=parsed_valid_to,
         prices={
             PERIOD_SIMPLE: decimal_from_tariff_value(simple_price_eur_kwh, field_name="simple_price_eur_kwh"),
             PERIOD_PONTA: decimal_from_tariff_value(ponta_price_eur_kwh, field_name="ponta_price_eur_kwh"),
@@ -630,10 +719,36 @@ def save_asset_tariff(
             PERIOD_VAZIO: decimal_from_tariff_value(vazio_price_eur_kwh, field_name="vazio_price_eur_kwh"),
             PERIOD_SUPER_VAZIO: decimal_from_tariff_value(super_vazio_price_eur_kwh, field_name="super_vazio_price_eur_kwh"),
         },
+        rules=existing_rules,
         invoice_file_id=invoice_file_id,
         notes=notes.strip(),
     )
     validate_tariff_config(config)
+    values = (
+        config.tariff_type.value,
+        config.cycle_type,
+        str(config.prices.get(PERIOD_SIMPLE)) if config.prices.get(PERIOD_SIMPLE) is not None else None,
+        str(config.prices.get(PERIOD_PONTA)) if config.prices.get(PERIOD_PONTA) is not None else None,
+        str(config.prices.get(PERIOD_CHEIA)) if config.prices.get(PERIOD_CHEIA) is not None else None,
+        str(config.prices.get(PERIOD_VAZIO)) if config.prices.get(PERIOD_VAZIO) is not None else None,
+        str(config.prices.get(PERIOD_SUPER_VAZIO)) if config.prices.get(PERIOD_SUPER_VAZIO) is not None else None,
+        invoice_file_id,
+        config.valid_from.isoformat() if config.valid_from else "",
+        config.valid_to.isoformat() if config.valid_to else "",
+        config.notes,
+    )
+    if tariff_id is not None:
+        conn.execute(
+            """
+            UPDATE asset_tariffs
+            SET tariff_type = ?, cycle_type = ?, simple_price_eur_kwh = ?, ponta_price_eur_kwh = ?,
+                cheia_price_eur_kwh = ?, vazio_price_eur_kwh = ?, super_vazio_price_eur_kwh = ?,
+                invoice_file_id = ?, valid_from = ?, valid_to = ?, notes = ?
+            WHERE id = ? AND asset_id = ?
+            """,
+            (*values, tariff_id, asset_id),
+        )
+        return tariff_id
     cursor = conn.execute(
         """
         INSERT INTO asset_tariffs (
@@ -644,20 +759,56 @@ def save_asset_tariff(
         """,
         (
             asset_id,
-            config.tariff_type.value,
-            config.cycle_type,
-            str(config.prices.get(PERIOD_SIMPLE)) if config.prices.get(PERIOD_SIMPLE) is not None else None,
-            str(config.prices.get(PERIOD_PONTA)) if config.prices.get(PERIOD_PONTA) is not None else None,
-            str(config.prices.get(PERIOD_CHEIA)) if config.prices.get(PERIOD_CHEIA) is not None else None,
-            str(config.prices.get(PERIOD_VAZIO)) if config.prices.get(PERIOD_VAZIO) is not None else None,
-            str(config.prices.get(PERIOD_SUPER_VAZIO)) if config.prices.get(PERIOD_SUPER_VAZIO) is not None else None,
-            invoice_file_id,
-            config.valid_from.isoformat() if config.valid_from else "",
-            config.valid_to.isoformat() if config.valid_to else "",
-            config.notes,
+            *values,
         ),
     )
     return int(cursor.lastrowid)
+
+
+def duplicate_asset_tariff(conn: sqlite3.Connection, *, tariff_id: int, asset_id: int) -> int:
+    row = get_asset_tariff(conn, tariff_id=tariff_id, asset_id=asset_id)
+    if row is None:
+        raise TariffValidationError("A tarifa selecionada nao pertence a esta instalacao.")
+    source_end = parse_date_optional(row["valid_to"])
+    if source_end is None:
+        raise TariffValidationError("Para duplicar uma tarifa aberta, cria uma nova tarifa e define primeiro as datas de validade.")
+    next_start = source_end + timedelta(days=1)
+    new_id = save_asset_tariff(
+        conn,
+        asset_id=asset_id,
+        tariff_type=row["tariff_type"],
+        cycle_type=row["cycle_type"] or "",
+        simple_price_eur_kwh=row["simple_price_eur_kwh"],
+        ponta_price_eur_kwh=row["ponta_price_eur_kwh"],
+        cheia_price_eur_kwh=row["cheia_price_eur_kwh"],
+        vazio_price_eur_kwh=row["vazio_price_eur_kwh"],
+        super_vazio_price_eur_kwh=row["super_vazio_price_eur_kwh"],
+        invoice_file_id=None,
+        valid_from=next_start.isoformat(),
+        valid_to="",
+        notes=f"Copia de tarifa #{tariff_id}" if not row["notes"] else f"{row['notes']} (copia)",
+    )
+    for rule_row in list_tariff_period_rules(conn, tariff_id):
+        add_tariff_period_rule(
+            conn,
+            tariff_id=new_id,
+            weekday_type=rule_row["weekday_type"],
+            start_time=rule_row["start_time"],
+            end_time=rule_row["end_time"],
+            period_name=rule_row["period_name"],
+        )
+    return new_id
+
+
+def delete_asset_tariff(conn: sqlite3.Connection, *, tariff_id: int, asset_id: int, confirm: bool) -> bool:
+    if not confirm:
+        raise TariffValidationError("Confirma que pretendes apagar a tarifa.")
+    row = get_asset_tariff(conn, tariff_id=tariff_id, asset_id=asset_id)
+    if row is None:
+        raise TariffValidationError("A tarifa selecionada nao pertence a esta instalacao.")
+    conn.execute("DELETE FROM tariff_period_rules WHERE tariff_id = ?", (tariff_id,))
+    conn.execute("DELETE FROM asset_tariffs WHERE id = ? AND asset_id = ?", (tariff_id, asset_id))
+    return True
 
 
 def add_tariff_period_rule(
@@ -683,6 +834,36 @@ def add_tariff_period_rule(
     return int(cursor.lastrowid)
 
 
+def update_tariff_period_rule(
+    conn: sqlite3.Connection,
+    *,
+    rule_id: int,
+    tariff_id: int,
+    weekday_type: str,
+    start_time: str,
+    end_time: str,
+    period_name: str,
+) -> None:
+    tariff = conn.execute("SELECT * FROM asset_tariffs WHERE id = ?", (tariff_id,)).fetchone()
+    if tariff is None:
+        raise TariffValidationError("Tarifa inexistente.")
+    rule = conn.execute("SELECT * FROM tariff_period_rules WHERE id = ? AND tariff_id = ?", (rule_id, tariff_id)).fetchone()
+    if rule is None:
+        raise TariffValidationError("A regra selecionada nao pertence a esta tarifa.")
+    candidate = TariffPeriodRule(weekday_type=weekday_type.strip(), start_time=parse_hhmm(start_time), end_time=parse_hhmm(end_time), period_name=period_name.strip())
+    existing = [row_to_tariff_rule(row) for row in list_tariff_period_rules(conn, tariff_id) if int(row["id"]) != rule_id]
+    tariff_type = parse_tariff_type(tariff["tariff_type"])
+    validate_rules([*existing, candidate], tariff_type)
+    conn.execute(
+        """
+        UPDATE tariff_period_rules
+        SET weekday_type = ?, start_time = ?, end_time = ?, period_name = ?
+        WHERE id = ? AND tariff_id = ?
+        """,
+        (candidate.weekday_type, candidate.start_time.strftime("%H:%M"), candidate.end_time.strftime("%H:%M"), candidate.period_name, rule_id, tariff_id),
+    )
+
+
 def delete_tariff_period_rule(conn: sqlite3.Connection, *, rule_id: int, asset_id: int | None = None) -> bool:
     row = conn.execute(
         """
@@ -697,6 +878,30 @@ def delete_tariff_period_rule(conn: sqlite3.Connection, *, rule_id: int, asset_i
         return False
     conn.execute("DELETE FROM tariff_period_rules WHERE id = ?", (rule_id,))
     return True
+
+
+def apply_tri_hourly_template(conn: sqlite3.Connection, *, tariff_id: int, template_name: str) -> None:
+    tariff = conn.execute("SELECT * FROM asset_tariffs WHERE id = ?", (tariff_id,)).fetchone()
+    if tariff is None:
+        raise TariffValidationError("Tarifa inexistente.")
+    if parse_tariff_type(tariff["tariff_type"]) != TariffType.TRI_HOURLY:
+        raise TariffValidationError("Modelos diarios so podem ser aplicados a tarifas tri-horarias.")
+    if template_name == "daily_winter":
+        template_rules = TRI_HOURLY_DAILY_WINTER_RULES
+    elif template_name == "daily_summer":
+        template_rules = TRI_HOURLY_DAILY_SUMMER_RULES
+    else:
+        return
+    normalized = tuple(
+        TariffPeriodRule(weekday_type=day, start_time=parse_hhmm(start), end_time=parse_hhmm(end), period_name=period)
+        for day, start, end, period in template_rules
+    )
+    validate_rules(normalized, TariffType.TRI_HOURLY)
+    conn.execute("DELETE FROM tariff_period_rules WHERE tariff_id = ?", (tariff_id,))
+    conn.executemany(
+        "INSERT INTO tariff_period_rules (tariff_id, weekday_type, start_time, end_time, period_name) VALUES (?, ?, ?, ?, ?)",
+        [(tariff_id, rule.weekday_type, rule.start_time.strftime("%H:%M"), rule.end_time.strftime("%H:%M"), rule.period_name) for rule in normalized],
+    )
 
 
 def get_monthly_availability(conn: sqlite3.Connection, asset_id: int, start: date, end: date) -> float | None:

@@ -357,14 +357,101 @@ def test_tariff_validity_boundaries_gap_overlap_and_open_ends(tmp_path: Path) ->
     assert "tariff_validity_gap" in repositories.detect_tariff_validity_warnings(conn, asset_id=asset_id, start=date(2026, 1, 1), end=date(2026, 12, 31))
 
     conn.execute("DELETE FROM asset_tariffs WHERE asset_id = ?", (asset_id,))
-    repositories.save_asset_tariff(conn, asset_id=asset_id, tariff_type="simple", simple_price_eur_kwh="0.10", valid_from="2026-01-01", valid_to="2026-02-01")
-    repositories.save_asset_tariff(conn, asset_id=asset_id, tariff_type="simple", simple_price_eur_kwh="0.20", valid_from="2026-02-01", valid_to="2026-12-31")
+    conn.execute(
+        "INSERT INTO asset_tariffs (asset_id, tariff_type, cycle_type, simple_price_eur_kwh, valid_from, valid_to, notes) VALUES (?, 'simple', '', 0.10, '2026-01-01', '2026-02-01', 'legacy overlap fixture')",
+        (asset_id,),
+    )
+    conn.execute(
+        "INSERT INTO asset_tariffs (asset_id, tariff_type, cycle_type, simple_price_eur_kwh, valid_from, valid_to, notes) VALUES (?, 'simple', '', 0.20, '2026-02-01', '2026-12-31', 'legacy overlap fixture')",
+        (asset_id,),
+    )
     assert "overlapping_tariffs" in repositories.detect_tariff_validity_warnings(conn, asset_id=asset_id, start=date(2026, 1, 1), end=date(2026, 12, 31))
 
     conn.execute("DELETE FROM asset_tariffs WHERE asset_id = ?", (asset_id,))
     repositories.save_asset_tariff(conn, asset_id=asset_id, tariff_type="simple", simple_price_eur_kwh="0.10", valid_to="2026-06-30")
     repositories.save_asset_tariff(conn, asset_id=asset_id, tariff_type="simple", simple_price_eur_kwh="0.20", valid_from="2026-07-01")
     assert repositories.detect_tariff_validity_warnings(conn, asset_id=asset_id, start=date(2026, 1, 1), end=date(2026, 12, 31)) == ()
+
+
+def test_save_asset_tariff_edits_existing_row_and_preserves_rules(tmp_path: Path) -> None:
+    conn = connect(tmp_path)
+    conn.execute("INSERT INTO assets (project_name, active_contract, kwp) VALUES ('Central Tariff Edit', 'yes', '10')")
+    asset_id = int(conn.execute("SELECT id FROM assets").fetchone()["id"])
+    tariff_id = repositories.save_asset_tariff(
+        conn,
+        asset_id=asset_id,
+        tariff_type="tri-hourly",
+        ponta_price_eur_kwh="0.30",
+        cheia_price_eur_kwh="0.20",
+        vazio_price_eur_kwh="0.10",
+        valid_from="2026-01-01",
+        valid_to="2026-12-31",
+    )
+    repositories.add_tariff_period_rule(conn, tariff_id=tariff_id, weekday_type="all", start_time="08:00", end_time="10:00", period_name="ponta")
+    repositories.add_tariff_period_rule(conn, tariff_id=tariff_id, weekday_type="all", start_time="10:00", end_time="20:00", period_name="cheia")
+    repositories.add_tariff_period_rule(conn, tariff_id=tariff_id, weekday_type="all", start_time="20:00", end_time="08:00", period_name="vazio")
+
+    saved_id = repositories.save_asset_tariff(
+        conn,
+        tariff_id=tariff_id,
+        asset_id=asset_id,
+        tariff_type="tri-hourly",
+        ponta_price_eur_kwh="0.31",
+        cheia_price_eur_kwh="0.21",
+        vazio_price_eur_kwh="0.11",
+        valid_from="2026-01-01",
+        valid_to="2026-12-31",
+    )
+
+    assert saved_id == tariff_id
+    assert conn.execute("SELECT COUNT(*) FROM asset_tariffs WHERE asset_id = ?", (asset_id,)).fetchone()[0] == 1
+    assert conn.execute("SELECT ponta_price_eur_kwh FROM asset_tariffs WHERE id = ?", (tariff_id,)).fetchone()[0] == 0.31
+    assert len(repositories.list_tariff_period_rules(conn, tariff_id)) == 3
+
+
+def test_tariff_validity_validation_blocks_overlap_and_cross_asset_edit(tmp_path: Path) -> None:
+    conn = connect(tmp_path)
+    conn.execute("INSERT INTO assets (project_name, active_contract, kwp) VALUES ('Tariff A', 'yes', '10')")
+    conn.execute("INSERT INTO assets (project_name, active_contract, kwp) VALUES ('Tariff B', 'yes', '10')")
+    asset_a = int(conn.execute("SELECT id FROM assets WHERE project_name = 'Tariff A'").fetchone()["id"])
+    asset_b = int(conn.execute("SELECT id FROM assets WHERE project_name = 'Tariff B'").fetchone()["id"])
+    tariff_id = repositories.save_asset_tariff(conn, asset_id=asset_a, tariff_type="simple", simple_price_eur_kwh="0.10", valid_from="2026-01-01", valid_to="2026-01-31")
+
+    with pytest.raises(Exception, match="sobrepoe-se"):
+        repositories.save_asset_tariff(conn, asset_id=asset_a, tariff_type="simple", simple_price_eur_kwh="0.20", valid_from="2026-01-31", valid_to="2026-02-28")
+    repositories.save_asset_tariff(conn, asset_id=asset_a, tariff_type="simple", simple_price_eur_kwh="0.20", valid_from="2026-02-01", valid_to="2026-02-28")
+    with pytest.raises(Exception, match="data final"):
+        repositories.save_asset_tariff(conn, asset_id=asset_a, tariff_type="simple", simple_price_eur_kwh="0.20", valid_from="2026-03-01", valid_to="2026-02-28")
+    with pytest.raises(Exception, match="nao pertence"):
+        repositories.save_asset_tariff(conn, tariff_id=tariff_id, asset_id=asset_b, tariff_type="simple", simple_price_eur_kwh="0.15", valid_from="2026-01-01", valid_to="2026-01-31")
+
+
+def test_update_duplicate_delete_tariff_rules_and_tri_template(tmp_path: Path) -> None:
+    conn = connect(tmp_path)
+    conn.execute("INSERT INTO assets (project_name, active_contract, kwp) VALUES ('Central Rules', 'yes', '10')")
+    asset_id = int(conn.execute("SELECT id FROM assets").fetchone()["id"])
+    tariff_id = repositories.save_asset_tariff(
+        conn,
+        asset_id=asset_id,
+        tariff_type="tri-hourly",
+        ponta_price_eur_kwh="0.30",
+        cheia_price_eur_kwh="0.20",
+        vazio_price_eur_kwh="0.10",
+        valid_from="2026-01-01",
+        valid_to="2026-06-30",
+    )
+    repositories.apply_tri_hourly_template(conn, tariff_id=tariff_id, template_name="daily_winter")
+    assert len(repositories.list_tariff_period_rules(conn, tariff_id)) == 7
+    rule_id = int(repositories.list_tariff_period_rules(conn, tariff_id)[0]["id"])
+    repositories.update_tariff_period_rule(conn, rule_id=rule_id, tariff_id=tariff_id, weekday_type="all", start_time="00:00", end_time="07:30", period_name="vazio")
+    assert repositories.list_tariff_period_rules(conn, tariff_id)[0]["end_time"] == "07:30"
+    assert repositories.delete_tariff_period_rule(conn, rule_id=rule_id, asset_id=asset_id) is True
+
+    duplicate_id = repositories.duplicate_asset_tariff(conn, tariff_id=tariff_id, asset_id=asset_id)
+    assert duplicate_id != tariff_id
+    assert len(repositories.list_tariff_period_rules(conn, duplicate_id)) == len(repositories.list_tariff_period_rules(conn, tariff_id))
+    repositories.delete_asset_tariff(conn, tariff_id=duplicate_id, asset_id=asset_id, confirm=True)
+    assert repositories.get_asset_tariff(conn, tariff_id=duplicate_id, asset_id=asset_id) is None
 
 
 def test_hourly_energy_upsert_is_idempotent_and_isolated(tmp_path: Path) -> None:
