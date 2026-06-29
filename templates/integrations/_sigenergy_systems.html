@@ -1,0 +1,45 @@
+<section class="card">
+  <div class="section-title"><h3>Instalacoes Sigenergy</h3></div>
+  {% if sigenergy_system_rows %}
+  <div class="table-wrapper">
+    <table>
+      <thead>
+        <tr>
+          <th>Instalacao</th>
+          <th>Asset local</th>
+          <th>Estado</th>
+          <th>PV</th>
+          <th>Carga</th>
+          <th>Rede raw</th>
+          <th>Bateria</th>
+          <th>SOC</th>
+          <th>Recolhido</th>
+          <th>Erro</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in sigenergy_system_rows %}
+          {% set no_battery = row.battery_capacity_kwh is not none and row.battery_capacity_kwh|float == 0 %}
+          <tr>
+            <td>
+              <strong>{{ row.mapped_external_name or row.external_id }}</strong>
+              <div class="muted">{{ row.external_id }}</div>
+            </td>
+            <td>{{ row.project_name or 'Por associar' }}</td>
+            <td>{{ row.normalized_status or '-' }}{% if row.external_status %}<div class="muted">{{ row.external_status }}</div>{% endif %}</td>
+            <td>{{ "%.3g"|format(row.pv_power_kw) if row.pv_power_kw is not none else 'N/A' }} kW</td>
+            <td>{{ "%.3g"|format(row.load_power_kw) if row.load_power_kw is not none else 'N/A' }} kW</td>
+            <td>{{ "%.3g"|format(row.grid_power_kw_raw) if row.grid_power_kw_raw is not none else 'N/A' }} kW</td>
+            <td>{{ 'N/A' if no_battery else (("%.3g"|format(row.battery_power_kw) ~ ' kW') if row.battery_power_kw is not none else 'N/A') }}</td>
+            <td>{{ 'N/A' if no_battery else (("%.3g"|format(row.battery_soc_pct) ~ '%') if row.battery_soc_pct is not none else 'N/A') }}</td>
+            <td>{{ row.collected_at }}</td>
+            <td>{{ row.last_error or '-' }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+    <p class="muted">Ainda nao existem snapshots Sigenergy. Usa Testar ligacao para validar a API ou Sincronizar agora para guardar dados.</p>
+  {% endif %}
+</section>

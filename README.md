@@ -71,6 +71,35 @@ python -m monitoring_board.reporting_storage_check --database .\data\monitoring_
 
 Guia operacional: [docs/reporting_operations.md](docs/reporting_operations.md).
 
+## Integracao Sigenergy
+
+Esta fase suporta apenas monitorizacao atual Sigenergy: autenticacao por App
+Key/App Secret, lista de instalacoes e `energyFlow` atual. Ainda nao inclui
+historico de producao, alarmes, inversores, strings, disponibilidade por
+inversor ou controlo remoto.
+
+No `.env`, preencher:
+
+```text
+SIGENERGY_ENABLED=true
+SIGENERGY_APP_KEY=
+SIGENERGY_APP_SECRET=
+SIGENERGY_BASE_URL=https://api-eu.sigencloud.com
+SIGENERGY_AUTH_ENDPOINT=/openapi/auth/login/key
+SIGENERGY_SYSTEMS_ENDPOINT=/openapi/system
+SIGENERGY_ENERGY_FLOW_ENDPOINT=/openapi/systems/{system_id}/energyFlow
+SIGENERGY_REGION=eu
+SIGENERGY_SYNC_HOURS=08:00,14:00
+```
+
+Se a conta nao devolver a lista de sistemas, usar `SIGENERGY_SYSTEM_IDS` com os
+IDs separados por virgula. Nao enviar App Secret, tokens, `.env`, bases de
+dados, logs ou exports para Git.
+
+Na interface, abrir `Integracoes > Sigenergy`, guardar a configuracao, usar
+`Testar ligacao` para validar autenticacao/lista/energy flow sem escrever dados
+e `Sincronizar agora` para gravar snapshots e registos de monitorizacao.
+
 ## Docker / Raspberry Pi
 
 Deployment previsto para Raspberry Pi 5 com Raspberry Pi OS 64-bit, Docker
