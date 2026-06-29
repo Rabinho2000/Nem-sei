@@ -64,19 +64,3 @@
     {% endif %}
   </form>
 </section>
-
-{% set sigenergy_config = (integration_configs | selectattr('provider', 'equalto', 'Sigenergy') | list | first) %}
-{% if sigenergy_config %}
-<section class="card">
-  <div class="section-title"><h3>Configuracao Sigenergy</h3></div>
-  <div class="grid two">
-    <div><dt>App Key</dt><dd>{{ sigenergy_config.username or '-' }}</dd></div>
-    <div><dt>Secret</dt><dd>{{ 'Configurado em ' ~ sigenergy_config.password_source if sigenergy_config.password_configured else 'Por configurar' }}</dd></div>
-    <div><dt>Base URL</dt><dd>{{ sigenergy_config.base_url or '-' }}</dd></div>
-    <div><dt>Regiao</dt><dd>{{ sigenergy_config.region or 'eu' }}</dd></div>
-    <div><dt>Systems endpoint</dt><dd>{{ sigenergy_config.plants_endpoint or '-' }}</dd></div>
-    <div><dt>Realtime endpoint</dt><dd>{{ sigenergy_config.real_time_endpoint or '-' }}</dd></div>
-  </div>
-  <p class="muted">Credenciais Sigenergy lidas do `.env`. Define `SIGENERGY_SYSTEM_IDS` se a API nao devolver a lista de sistemas automaticamente.</p>
-</section>
-{% endif %}

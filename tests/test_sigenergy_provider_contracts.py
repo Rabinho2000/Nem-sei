@@ -112,8 +112,25 @@ def test_get_sigenergy_token_accepts_json_string_and_object_payloads(
 
     assert token == expected_token
     assert post_calls[0]["url"] == "https://sigenergy.example.test/openapi/auth/login/key"
-    assert "key" in post_calls[0]["json"]
+    assert post_calls[0]["json"]["key"] == "ZmFrZS1hcHAta2V5OmZha2UtYXBwLXNlY3JldA=="
     assert post_calls[0]["headers"]["Accept"] == "application/json"
+    assert post_calls[0]["headers"]["Content-Type"] == "application/json"
+    assert post_calls[0]["headers"]["sigen-region"] == "eu"
+
+
+def test_get_sigenergy_token_reuses_cache(monkeypatch) -> None:
+    payload = load_fixture("auth_success_object.json")
+    post_calls: list[str] = []
+
+    def fake_post(url: str, **kwargs: Any) -> FakeResponse:
+        post_calls.append(url)
+        return FakeResponse(payload)
+
+    monkeypatch.setattr(app_module.requests, "post", fake_post)
+
+    assert app_module.get_sigenergy_token(sigenergy_config()) == "fake-sigenergy-token-object"
+    assert app_module.get_sigenergy_token(sigenergy_config()) == "fake-sigenergy-token-object"
+    assert len(post_calls) == 1
 
 
 def test_normalize_sigenergy_system_rows_accepts_list_variants_and_single_object() -> None:
@@ -157,11 +174,140 @@ def test_normalize_sigenergy_system_row_maps_realtime_and_energy_flow_fields() -
     assert "system_status=running" in row["notes"]
     assert "pvPower=4.25" in row["notes"]
     assert "batterySoc=78" in row["notes"]
+    assert row["grid_power_kw_raw"] == -0.5
     assert row["payload"] == {
         "system": system,
         "realtime": realtime,
         "energy_flow": energy_flow,
     }
+
+
+def test_sigenergy_notes_show_battery_na_when_capacity_zero() -> None:
+    row = app_module.normalize_sigenergy_system_row(
+        {"systemId": "SIG-001", "systemName": "No Battery", "status": "Normal", "batteryCapacity": 0},
+        {},
+        {"pvPower": 2.0, "loadPower": 1.0, "gridPower": -0.25, "batteryPower": 0, "batterySoc": 0},
+    )
+
+    assert row["status"] == "Operacional"
+    assert "Rede: -0.25 kW" in row["notes"]
+    assert "Bateria: N/A" in row["notes"]
+    assert "SOC: N/A" in row["notes"]
+
+
+def test_run_sigenergy_check_continues_after_single_energy_flow_failure(tmp_path, monkeypatch) -> None:
+    db_path = tmp_path / "sigenergy-check.db"
+    app_module.ensure_database(str(db_path))
+
+    monkeypatch.setattr(app_module, "get_sigenergy_token", lambda _config: "fake-token")
+    monkeypatch.setattr(
+        app_module,
+        "fetch_sigenergy_systems",
+        lambda _config, _token: [
+            {"systemId": "SIG-001", "systemName": "A", "status": "Normal"},
+            {"systemId": "SIG-002", "systemName": "B", "status": "Offline"},
+        ],
+    )
+
+    def fake_energy_flow(_config, _token, system_id: str) -> dict[str, Any]:
+        if system_id == "SIG-002":
+            raise ValueError("energy flow unavailable")
+        return {"pvPower": 1.0}
+
+    monkeypatch.setattr(app_module, "fetch_sigenergy_energy_flow", fake_energy_flow)
+
+    with get_db(str(db_path)) as conn:
+        insert_enabled_sigenergy_config(conn)
+        result = app_module.run_sigenergy_check(conn, app_module.INTEGRATION_PROVIDER_SIGENERGY, dry_run=True)
+        snapshot_count = conn.execute("SELECT COUNT(*) AS total FROM integration_realtime_snapshots").fetchone()["total"]
+
+    assert result["station_count"] == 2
+    assert result["realtime_count"] == 1
+    assert result["failed_realtime_count"] == 1
+    assert len(result["rows"]) == 2
+    assert snapshot_count == 0
+
+
+def _sigenergy_sync_row(external_name: str = "Plant A") -> dict[str, Any]:
+    return {
+        "external_id": "SIG-001",
+        "external_name": external_name,
+        "status": "Operacional",
+        "raw_status": "Normal",
+        "notes": "PV: 4 kW | Carga: 1 kW | Rede: -0.5 kW | Bateria: N/A | SOC: N/A",
+        "pv_power_kw": 4.0,
+        "load_power_kw": 1.0,
+        "grid_power_kw_raw": -0.5,
+        "battery_power_kw": 0.0,
+        "battery_soc_pct": 0.0,
+        "ev_power_kw": None,
+        "ac_power_kw": None,
+        "heat_pump_power_kw": None,
+        "pv_capacity_kw": 10.0,
+        "battery_capacity_kwh": 0.0,
+        "payload": {"system": {"systemId": "SIG-001"}, "energy_flow": {"gridPower": -0.5}},
+    }
+
+
+def test_run_sigenergy_sync_writes_snapshot_and_monitoring_for_existing_mapping(tmp_path, monkeypatch) -> None:
+    db_path = tmp_path / "sigenergy-sync.db"
+    app_module.ensure_database(str(db_path))
+
+    monkeypatch.setattr(
+        app_module,
+        "run_provider_check",
+        lambda _conn, _provider, dry_run=True: {
+            "rows": [_sigenergy_sync_row()],
+            "station_count": 1,
+            "realtime_count": 1,
+            "failed_realtime_count": 0,
+        },
+    )
+
+    with get_db(str(db_path)) as conn:
+        insert_enabled_sigenergy_config(conn)
+        asset_id = conn.execute("INSERT INTO assets (project_name, active_contract) VALUES ('Plant A', 'yes')").lastrowid
+        conn.execute(
+            "INSERT INTO asset_integrations (asset_id, provider, external_id, external_name, enabled) VALUES (?, 'Sigenergy', 'SIG-001', 'Plant A', 1)",
+            (asset_id,),
+        )
+        conn.commit()
+
+        result = app_module.run_sigenergy_sync(conn, app_module.INTEGRATION_PROVIDER_SIGENERGY)
+        snapshot = conn.execute("SELECT * FROM integration_realtime_snapshots WHERE provider = 'Sigenergy'").fetchone()
+        monitoring = conn.execute("SELECT * FROM monitoring_records WHERE source = 'Sigenergy'").fetchone()
+
+    assert result["matched"] == 1
+    assert result["snapshots"] == 1
+    assert snapshot["asset_id"] == asset_id
+    assert snapshot["grid_power_kw_raw"] == -0.5
+    assert monitoring["asset_id"] == asset_id
+    assert monitoring["status"] == "Operacional"
+
+
+def test_run_sigenergy_sync_creates_unresolved_when_no_exact_match(tmp_path, monkeypatch) -> None:
+    db_path = tmp_path / "sigenergy-unresolved.db"
+    app_module.ensure_database(str(db_path))
+    monkeypatch.setattr(
+        app_module,
+        "run_provider_check",
+        lambda _conn, _provider, dry_run=True: {
+            "rows": [_sigenergy_sync_row("Unmapped Site")],
+            "station_count": 1,
+            "realtime_count": 1,
+            "failed_realtime_count": 0,
+        },
+    )
+
+    with get_db(str(db_path)) as conn:
+        insert_enabled_sigenergy_config(conn)
+        app_module.run_sigenergy_sync(conn, app_module.INTEGRATION_PROVIDER_SIGENERGY)
+        unresolved = conn.execute("SELECT * FROM integration_unresolved WHERE provider = 'Sigenergy'").fetchone()
+        monitoring_count = conn.execute("SELECT COUNT(*) AS total FROM monitoring_records WHERE source = 'Sigenergy'").fetchone()["total"]
+
+    assert unresolved["external_id"] == "SIG-001"
+    assert unresolved["external_name"] == "Unmapped Site"
+    assert monitoring_count == 0
 
 
 def test_fetch_sigenergy_json_raises_value_error_on_non_zero_provider_code(monkeypatch) -> None:
