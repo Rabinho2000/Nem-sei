@@ -107,6 +107,10 @@
         <input type="checkbox" name="force_api">
         <span>Atualizar diretamente da FusionSolar</span>
       </label>
+      <label class="check-row">
+        <input type="checkbox" name="include_availability" {{ 'checked' if include_availability }}>
+        <span>Incluir Disponibilidade (%)</span>
+      </label>
 
       <div class="hero-actions">
         <button class="button" type="submit" name="action" value="generate_report">Gerar PDF</button>

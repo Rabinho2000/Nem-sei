@@ -88,8 +88,10 @@ SIGENERGY_BASE_URL=https://api-eu.sigencloud.com
 SIGENERGY_AUTH_ENDPOINT=/openapi/auth/login/key
 SIGENERGY_SYSTEMS_ENDPOINT=/openapi/system
 SIGENERGY_ENERGY_FLOW_ENDPOINT=/openapi/systems/{system_id}/energyFlow
+SIGENERGY_ONBOARD_ENDPOINT=/openapi/board/onboard
 SIGENERGY_REGION=eu
 SIGENERGY_SYNC_HOURS=08:00,14:00
+SIGENERGY_SNAPSHOT_RETENTION_DAYS=90
 ```
 
 Se a conta nao devolver a lista de sistemas, usar `SIGENERGY_SYSTEM_IDS` com os
@@ -99,6 +101,30 @@ dados, logs ou exports para Git.
 Na interface, abrir `Integracoes > Sigenergy`, guardar a configuracao, usar
 `Testar ligacao` para validar autenticacao/lista/energy flow sem escrever dados
 e `Sincronizar agora` para gravar snapshots e registos de monitorizacao.
+
+Para pedir acesso a uma nova instalacao, usar o bloco `Onboarding Sigenergy` na
+mesma pagina e enviar um unico System ID. O pedido chama
+`POST /openapi/board/onboard` com payload `["SYSTEM_ID"]`; a app guarda o
+codigo e mensagem devolvidos pelo provider sem tokens nem secrets. O proprietario
+da instalacao podera ter de aprovar o acesso na Sigenergy. Usar `Atualizar
+estado` ou uma sincronizacao futura para reconciliar: quando o System ID aparecer
+em `/openapi/system`, o pedido passa para `approved`.
+
+Estados de onboarding principais:
+
+- `requested`: pedido enviado.
+- `already_requested_or_onboarded`: codigo conservador para respostas como
+  `1401` ate o sistema aparecer na lista autorizada.
+- `approved`: sistema encontrado na lista Sigenergy.
+- `failed`: pedido rejeitado ou erro do provider.
+
+Nao existe suporte a Bearer token estatico (`SIGENERGY_BEARER`); a integracao
+usa sempre App Key/App Secret, token temporario em cache e renovacao automatica
+apos HTTP 401. Se parte das chamadas `energyFlow` falhar, a sincronizacao fica
+com estado `partial`, preserva o ultimo estado valido e guarda o erro sanitizado.
+Snapshots Sigenergy sao limpos uma vez por dia conforme
+`SIGENERGY_SNAPSHOT_RETENTION_DAYS`, mantendo sempre o snapshot mais recente de
+cada sistema.
 
 ## Docker / Raspberry Pi
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import threading
 from datetime import datetime, timedelta
 from typing import Any
@@ -18,6 +19,41 @@ class SigenergyAPIError(Exception):
 
 _TOKEN_CACHE: dict[str, dict[str, Any]] = {}
 _TOKEN_LOCK = threading.Lock()
+_SENSITIVE_PATTERNS = (
+    re.compile(r"(Bearer\s+)[A-Za-z0-9._~+/=-]+", re.IGNORECASE),
+    re.compile(r'("Authorization"\s*:\s*")[^"]+', re.IGNORECASE),
+    re.compile(r"('Authorization'\s*:\s*')[^']+", re.IGNORECASE),
+    re.compile(r'("key"\s*:\s*")[^"]+', re.IGNORECASE),
+    re.compile(r"('key'\s*:\s*')[^']+", re.IGNORECASE),
+)
+
+
+def sanitize_sigenergy_error(value: Any) -> str:
+    message = str(value or "")
+    for pattern in _SENSITIVE_PATTERNS:
+        message = pattern.sub(r"\1[redacted]", message)
+    return message.replace("\n", " ").replace("\r", " ").strip()
+
+
+def sanitize_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if key.lower() in {"authorization", "accesstoken", "access_token", "token", "appsecret", "password", "key"}:
+                result[key] = "[redacted]"
+            else:
+                result[key] = sanitize_payload(item)
+        return result
+    if isinstance(value, list):
+        return [sanitize_payload(item) for item in value]
+    if isinstance(value, str):
+        return sanitize_sigenergy_error(value)
+    return value
+
+
+def clear_token_cache_for_tests() -> None:
+    with _TOKEN_LOCK:
+        _TOKEN_CACHE.clear()
 
 
 def build_sigenergy_url(base_url: str, endpoint: str, **path_values: str) -> str:
@@ -34,7 +70,7 @@ def parse_sigenergy_response(payload: Any) -> Any:
         raise SigenergyAPIError("Resposta Sigenergy invalida: payload JSON inesperado.")
     code = payload.get("code")
     if code not in (None, 0, "0"):
-        raise SigenergyAPIError(f"{payload.get('msg') or 'Pedido Sigenergy falhou.'} (code={code})")
+        raise SigenergyAPIError(sanitize_sigenergy_error(f"{payload.get('msg') or 'Pedido Sigenergy falhou.'} (code={code})"))
     data = payload.get("data")
     if isinstance(data, str):
         try:
@@ -111,34 +147,6 @@ def get_access_token(
     return access_token
 
 
-def _request_json(
-    config: dict[str, Any],
-    endpoint: str,
-    session: requests.Session,
-    *,
-    token: str,
-) -> Any:
-    response = session.get(
-        build_sigenergy_url(str(config.get("base_url") or ""), endpoint),
-        headers=_bearer_headers(token, str(config.get("region") or "eu")),
-        timeout=30,
-    )
-    response.raise_for_status()
-    return parse_sigenergy_response(response.json())
-
-
-def _request_with_refresh(config: dict[str, Any], endpoint: str, session: requests.Session) -> Any:
-    token = get_access_token(config, session=session)
-    try:
-        return _request_json(config, endpoint, session, token=token)
-    except requests.HTTPError as exc:
-        if exc.response is None or exc.response.status_code != 401:
-            raise
-        invalidate_access_token(config)
-        token = get_access_token(config, session=session, force_login=True)
-        return _request_json(config, endpoint, session, token=token)
-
-
 def _rows_from_data(data: Any) -> list[dict[str, Any]]:
     if isinstance(data, list):
         return [row for row in data if isinstance(row, dict)]
@@ -152,28 +160,104 @@ def _rows_from_data(data: Any) -> list[dict[str, Any]]:
     return []
 
 
-def list_systems(config: dict[str, Any], session: requests.Session | None = None) -> list[dict[str, Any]]:
-    configured_ids = str(config.get("system_ids") or "").strip()
-    if configured_ids:
-        import re
+class SigenergyClient:
+    def __init__(self, config: dict[str, Any], session: requests.Session | None = None) -> None:
+        self.config = config
+        self.session = session or requests.Session()
 
-        return [{"systemId": item, "systemName": item} for item in re.split(r"[,;\s]+", configured_ids) if item]
-    http = session or requests.Session()
-    data = _request_with_refresh(config, str(config.get("systems_endpoint") or config.get("plants_endpoint") or ""), http)
-    rows = _rows_from_data(data)
-    if not rows:
-        raise SigenergyAPIError(
-            "A API Sigenergy respondeu com sucesso, mas sem sistemas. Confirma se a App Key tem sistemas autorizados."
+    def authenticate(self) -> str:
+        return get_access_token(self.config, session=self.session, force_login=True)
+
+    def _request(
+        self,
+        method: str,
+        endpoint: str,
+        *,
+        json_payload: Any | None = None,
+        validate_code: bool = True,
+        refreshed: bool = False,
+    ) -> dict[str, Any]:
+        token = get_access_token(self.config, session=self.session)
+        response = self.session.request(
+            method,
+            build_sigenergy_url(str(self.config.get("base_url") or ""), endpoint),
+            headers=_bearer_headers(token, str(self.config.get("region") or "eu")),
+            json=json_payload,
+            timeout=30,
         )
-    return rows
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 401 and not refreshed:
+                invalidate_access_token(self.config)
+                get_access_token(self.config, session=self.session, force_login=True)
+                return self._request(method, endpoint, json_payload=json_payload, validate_code=validate_code, refreshed=True)
+            raise SigenergyAPIError(sanitize_sigenergy_error(exc)) from exc
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise SigenergyAPIError("Resposta Sigenergy invalida: payload JSON inesperado.")
+        if validate_code:
+            parse_sigenergy_response(payload)
+        return payload
+
+    def list_systems(self) -> list[dict[str, Any]]:
+        configured_ids = str(self.config.get("system_ids") or "").strip()
+        if configured_ids:
+            return [{"systemId": item, "systemName": item} for item in re.split(r"[,;\s]+", configured_ids) if item]
+        payload = self._request("GET", str(self.config.get("systems_endpoint") or self.config.get("plants_endpoint") or ""))
+        rows = _rows_from_data(parse_sigenergy_response(payload))
+        if not rows:
+            raise SigenergyAPIError(
+                "A API Sigenergy respondeu com sucesso, mas sem sistemas. Confirma se a App Key tem sistemas autorizados."
+            )
+        return rows
+
+    def get_energy_flow(self, system_id: str) -> dict[str, Any]:
+        endpoint = str(self.config.get("energy_flow_endpoint") or "").replace("{systemId}", "{system_id}")
+        endpoint = endpoint.replace("{system_id}", str(system_id))
+        payload = self._request("GET", endpoint)
+        data = parse_sigenergy_response(payload)
+        return data if isinstance(data, dict) else {"raw_data": data}
+
+    def onboard_system(self, system_id: str) -> dict[str, Any]:
+        payload = self._request(
+            "POST",
+            str(self.config.get("onboard_endpoint") or "/openapi/board/onboard"),
+            json_payload=[system_id],
+            validate_code=False,
+        )
+        return normalize_onboarding_response(system_id, payload)
+
+
+def list_systems(config: dict[str, Any], session: requests.Session | None = None) -> list[dict[str, Any]]:
+    return SigenergyClient(config, session=session).list_systems()
 
 
 def get_energy_flow(config: dict[str, Any], system_id: str, session: requests.Session | None = None) -> dict[str, Any]:
-    http = session or requests.Session()
-    endpoint = str(config.get("energy_flow_endpoint") or "").replace("{systemId}", "{system_id}")
-    endpoint = endpoint.replace("{system_id}", str(system_id))
-    data = _request_with_refresh(config, endpoint, http)
-    return data if isinstance(data, dict) else {"raw_data": data}
+    return SigenergyClient(config, session=session).get_energy_flow(system_id)
+
+
+def normalize_onboarding_response(system_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    code = payload.get("code")
+    message = sanitize_sigenergy_error(payload.get("msg") or payload.get("message") or "")
+    provider_code = "" if code is None else str(code)
+    if code in (0, "0", None):
+        status = "requested"
+    elif provider_code == "1401":
+        status = "already_requested_or_onboarded"
+    else:
+        status = "failed"
+    return {
+        "system_id": system_id,
+        "status": status,
+        "provider_code": provider_code,
+        "message": message,
+        "response": sanitize_payload(payload),
+    }
+
+
+def onboard_system(config: dict[str, Any], system_id: str, session: requests.Session | None = None) -> dict[str, Any]:
+    return SigenergyClient(config, session=session).onboard_system(system_id)
 
 
 def _first(payload: dict[str, Any], keys: tuple[str, ...]) -> Any:
@@ -201,7 +285,7 @@ def map_sigenergy_status(raw_status: Any) -> str:
         return "Erro"
     if normalized in {"offline", "disconnected"}:
         return "Desconectada"
-    return str(raw_status or "Operacional").strip().title() or "Operacional"
+    return str(raw_status or "").strip().title() or "Sem dados"
 
 
 def normalize_system(system: dict[str, Any]) -> dict[str, Any]:

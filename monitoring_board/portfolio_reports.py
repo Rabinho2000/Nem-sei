@@ -4,7 +4,8 @@ import json
 import re
 import sqlite3
 import unicodedata
-from datetime import date, datetime
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -30,9 +31,12 @@ from monitoring_board.reporting.repositories import (
     has_expired_tariff,
     list_hourly_production_records,
     list_portfolio_report_assets,
+    list_tariffs_intersecting_period,
     list_tariff_period_rules,
     row_to_hourly_energy_record,
     row_to_tariff_config,
+    save_asset_tariff,
+    upsert_asset_billing_config,
 )
 from monitoring_board.reporting.tariffs import (
     classify_tariff_period as tariff_classify_tariff_period,
@@ -57,6 +61,7 @@ MONTH_LABELS = {
     12: ("dez", "dezembro", "dec", "december"),
 }
 PERIOD_NAMES = ("ponta", "cheia", "vazio", "super_vazio")
+FINANCIAL_SOURCE_TYPE = "financial_model"
 WARNING_LABELS = {
     "ok": "OK",
     "missing_monthly_production": "Sem producao real FusionSolar",
@@ -212,33 +217,224 @@ def parse_float(value: Any) -> float | None:
     return parsed if parsed >= 0 else None
 
 
+@dataclass(frozen=True)
+class FinancialTariffImport:
+    tariff_type: str
+    cycle_type: str
+    simple_price_eur_kwh: float | None
+    ponta_price_eur_kwh: float | None
+    cheia_price_eur_kwh: float | None
+    vazio_price_eur_kwh: float | None
+    super_vazio_price_eur_kwh: float | None
+    export_price_eur_kwh: float | None
+    valid_from: str
+    valid_to: str
+    solcor_price_eur_kwh: float | None
+    fixed_monthly_fee_eur: float | None
+
+
+@dataclass(frozen=True)
+class FinancialIntervalExpected:
+    period_start: datetime
+    period_end: datetime
+    expected_kwh: float
+
+
+@dataclass(frozen=True)
+class FinancialModelImport:
+    project_name: str
+    installed_power_kwp: float | None
+    monthly_expected: dict[int, float]
+    interval_expected: tuple[FinancialIntervalExpected, ...]
+    tariff: FinancialTariffImport | None
+    financial_outputs: dict[str, Any]
+    warnings: tuple[str, ...] = ()
+
+
 def parse_helioscope_monthly_expected(path: Path) -> dict[int, float]:
     workbook = load_workbook(path, data_only=True)
-    candidates: list[dict[int, float]] = []
-    for sheet in workbook.worksheets:
-        rows = list(sheet.iter_rows(values_only=True))
-        for row_index, row in enumerate(rows):
-            month_columns: dict[int, int] = {}
-            for col_index, value in enumerate(row):
-                month = parse_month(value)
-                if month:
-                    month_columns[month] = col_index
-            if len(month_columns) < 10:
-                continue
-            for values_row in rows[row_index + 1 : min(row_index + 8, len(rows))]:
-                parsed: dict[int, float] = {}
-                for month, col_index in month_columns.items():
-                    value = parse_float(values_row[col_index] if col_index < len(values_row) else None)
-                    if value is not None:
-                        parsed[month] = value
-                if len(parsed) >= 10:
-                    candidates.append(parsed)
-    if not candidates:
-        raise ValueError("Nao foi possivel identificar valores mensais no ficheiro Helioscope.")
-    best = max(candidates, key=len)
-    if len(best) != 12:
-        raise ValueError("O ficheiro Helioscope nao contem 12 valores mensais confiaveis.")
-    return {month: float(best[month]) for month in range(1, 13)}
+    try:
+        candidates: list[dict[int, float]] = []
+        for sheet in workbook.worksheets:
+            rows = list(sheet.iter_rows(values_only=True))
+            for row_index, row in enumerate(rows):
+                month_columns: dict[int, int] = {}
+                for col_index, value in enumerate(row):
+                    month = parse_month(value)
+                    if month:
+                        month_columns[month] = col_index
+                if len(month_columns) < 10:
+                    continue
+                for values_row in rows[row_index + 1 : min(row_index + 8, len(rows))]:
+                    parsed: dict[int, float] = {}
+                    for month, col_index in month_columns.items():
+                        value = parse_float(values_row[col_index] if col_index < len(values_row) else None)
+                        if value is not None:
+                            parsed[month] = value
+                    if len(parsed) >= 10:
+                        candidates.append(parsed)
+        if not candidates:
+            raise ValueError("Nao foi possivel identificar valores mensais no ficheiro Helioscope.")
+        best = max(candidates, key=len)
+        if len(best) != 12:
+            raise ValueError("O ficheiro Helioscope nao contem 12 valores mensais confiaveis.")
+        return {month: float(best[month]) for month in range(1, 13)}
+    finally:
+        workbook.close()
+
+
+def parse_financial_model_file(path: Path) -> FinancialModelImport:
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    try:
+        warnings: list[str] = []
+        monthly = _parse_financial_monthly_expected(workbook)
+        if not monthly:
+            monthly = parse_helioscope_monthly_expected(path)
+            warnings.append("financial_monthly_fallback")
+        intervals = _parse_financial_interval_expected(workbook)
+        if not intervals:
+            warnings.append("missing_financial_interval_expected")
+        tariff = _parse_financial_tariff(workbook)
+        if tariff is None:
+            warnings.append("missing_financial_tariff")
+        outputs = _parse_financial_outputs(workbook)
+        project_name = str(_cell_value(workbook, "Projeto", "C5") or "").strip()
+        return FinancialModelImport(
+            project_name=project_name,
+            installed_power_kwp=parse_float(_cell_value(workbook, "Projeto", "H8")),
+            monthly_expected=monthly,
+            interval_expected=tuple(intervals),
+            tariff=tariff,
+            financial_outputs=outputs,
+            warnings=tuple(warnings),
+        )
+    finally:
+        workbook.close()
+
+
+def _cell_value(workbook: Any, sheet_name: str, address: str) -> Any:
+    if sheet_name not in workbook.sheetnames:
+        return None
+    return workbook[sheet_name][address].value
+
+
+def _parse_financial_monthly_expected(workbook: Any) -> dict[int, float]:
+    if "Projeto" not in workbook.sheetnames:
+        return {}
+    sheet = workbook["Projeto"]
+    parsed: dict[int, float] = {}
+    for month_cell, expected_cell in sheet.iter_rows(min_row=6, max_row=17, min_col=10, max_col=11, values_only=True):
+        month = parse_month(month_cell)
+        expected = parse_float(expected_cell)
+        if month and expected is not None:
+            parsed[month] = expected
+    return parsed if len(parsed) == 12 else {}
+
+
+def _parse_financial_interval_expected(workbook: Any) -> list[FinancialIntervalExpected]:
+    if "Helio&Cons" not in workbook.sheetnames:
+        return []
+    sheet = workbook["Helio&Cons"]
+    records: list[FinancialIntervalExpected] = []
+    for row in sheet.iter_rows(min_row=2, min_col=12, max_col=14, values_only=True):
+        raw_expected = row[0]
+        raw_start = row[2]
+        expected_wh = parse_float(raw_expected)
+        started_at = _parse_excel_datetime(raw_start)
+        if expected_wh is None or started_at is None:
+            continue
+        records.append(
+            FinancialIntervalExpected(
+                period_start=started_at,
+                period_end=started_at + timedelta(minutes=15),
+                expected_kwh=expected_wh / 1000,
+            )
+        )
+    return records
+
+
+def _parse_excel_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    if value is None or value == "":
+        return None
+    try:
+        return datetime.fromisoformat(str(value).strip())
+    except ValueError:
+        return None
+
+
+def _parse_financial_tariff(workbook: Any) -> FinancialTariffImport | None:
+    if "Projeto" not in workbook.sheetnames:
+        return None
+    sheet = workbook["Projeto"]
+    tariff_type = _map_financial_tariff_type(sheet["C44"].value)
+    if tariff_type is None:
+        return None
+    totals = {
+        "super_vazio": parse_float(sheet["H41"].value),
+        "vazio": parse_float(sheet["H42"].value),
+        "cheia": parse_float(sheet["H43"].value),
+        "ponta": parse_float(sheet["H44"].value),
+    }
+    simple_price = totals["super_vazio"] if tariff_type == "simple" else None
+    return FinancialTariffImport(
+        tariff_type=tariff_type,
+        cycle_type=_map_financial_cycle_type(sheet["C45"].value),
+        simple_price_eur_kwh=simple_price,
+        ponta_price_eur_kwh=totals["ponta"] if tariff_type in {"tri-hourly", "tetra-hourly"} else None,
+        cheia_price_eur_kwh=totals["cheia"] if tariff_type in {"bi-hourly", "tri-hourly", "tetra-hourly"} else None,
+        vazio_price_eur_kwh=totals["vazio"] if tariff_type in {"bi-hourly", "tri-hourly", "tetra-hourly"} else None,
+        super_vazio_price_eur_kwh=totals["super_vazio"] if tariff_type == "tetra-hourly" else None,
+        export_price_eur_kwh=parse_float(sheet["F46"].value),
+        valid_from=_date_iso(sheet["C41"].value),
+        valid_to=_date_iso(sheet["C42"].value),
+        solcor_price_eur_kwh=parse_float(sheet["L33"].value),
+        fixed_monthly_fee_eur=parse_float(sheet["M33"].value),
+    )
+
+
+def _parse_financial_outputs(workbook: Any) -> dict[str, Any]:
+    if "Projeto" not in workbook.sheetnames:
+        return {}
+    sheet = workbook["Projeto"]
+    return {
+        "sale_price_eur": parse_float(sheet["P28"].value),
+        "first_year_net_benefit_eur": parse_float(sheet["L28"].value),
+        "first_year_global_benefit_eur": parse_float(sheet["P29"].value),
+        "global_roi_years": parse_float(sheet["P30"].value),
+        "profit_margin_pct": parse_float(sheet["P32"].value),
+        "avoided_tariff_eur_kwh": parse_float(sheet["L32"].value),
+        "ppa_tariff_eur_kwh": parse_float(sheet["L33"].value),
+        "monthly_payment_eur": parse_float(sheet["M33"].value),
+    }
+
+
+def _map_financial_tariff_type(value: Any) -> str | None:
+    normalized = normalize_text(value)
+    if "tetra" in normalized:
+        return "tetra-hourly"
+    if "tri" in normalized:
+        return "tri-hourly"
+    if "bi" in normalized:
+        return "bi-hourly"
+    if "simples" in normalized or "simples" in normalized or "simple" in normalized:
+        return "simple"
+    return None
+
+
+def _map_financial_cycle_type(value: Any) -> str:
+    normalized = normalize_text(value)
+    if "diario" in normalized:
+        return "daily"
+    if "semanal" in normalized:
+        return "weekly"
+    return ""
+
+
+def _date_iso(value: Any) -> str:
+    parsed = _parse_excel_datetime(value)
+    return parsed.date().isoformat() if parsed else ""
 
 
 def store_source_file(
@@ -297,6 +493,119 @@ def import_helioscope_file(
             (asset_id, source_id, year, month, expected_kwh, datetime.now().isoformat(timespec="seconds"), ""),
         )
     return {"source_file_id": source_id, "months": len(monthly)}
+
+
+def import_financial_model_file(
+    conn: sqlite3.Connection,
+    *,
+    upload_dir: Path,
+    file_storage: Any,
+    asset_id: int,
+    portfolio_id: int | None,
+    base_year: int | None = None,
+) -> dict[str, Any]:
+    source_id = store_source_file(
+        conn,
+        upload_dir=upload_dir,
+        file_storage=file_storage,
+        asset_id=asset_id,
+        portfolio_id=portfolio_id,
+        file_type=FINANCIAL_SOURCE_TYPE,
+    )
+    stored = conn.execute("SELECT stored_path FROM source_files WHERE id = ?", (source_id,)).fetchone()
+    parsed = parse_financial_model_file(Path(stored["stored_path"]))
+    year = base_year or date.today().year
+    imported_at = datetime.now().isoformat(timespec="seconds")
+    conn.execute("DELETE FROM helioscope_expected_production WHERE asset_id = ? AND source_file_id != ?", (asset_id, source_id))
+    for month, expected_kwh in parsed.monthly_expected.items():
+        conn.execute(
+            """
+            INSERT INTO helioscope_expected_production (asset_id, source_file_id, base_year, month, expected_kwh, imported_at, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (asset_id, source_id, year, month, expected_kwh, imported_at, "financial_model"),
+        )
+    conn.execute("DELETE FROM helioscope_expected_interval_production WHERE asset_id = ?", (asset_id,))
+    conn.executemany(
+        """
+        INSERT INTO helioscope_expected_interval_production (
+            asset_id, source_file_id, period_start, period_end, expected_kwh, imported_at, notes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                asset_id,
+                source_id,
+                item.period_start.isoformat(timespec="seconds"),
+                item.period_end.isoformat(timespec="seconds"),
+                item.expected_kwh,
+                imported_at,
+                "financial_model",
+            )
+            for item in parsed.interval_expected
+        ],
+    )
+    tariff_action = "none"
+    tariff_id = None
+    if parsed.tariff is not None:
+        tariff_id, tariff_action = _apply_financial_tariff(conn, asset_id, parsed.tariff)
+        report_type = detect_report_type_value(conn.execute("SELECT * FROM assets WHERE id = ?", (asset_id,)).fetchone() or {})
+        upsert_asset_billing_config(
+            conn,
+            asset_id=asset_id,
+            config=_financial_billing_config(parsed.tariff, report_type),
+        )
+    summary = {
+        "source_file_id": source_id,
+        "project_name": parsed.project_name,
+        "installed_power_kwp": parsed.installed_power_kwp,
+        "months": len(parsed.monthly_expected),
+        "intervals_15m": len(parsed.interval_expected),
+        "tariff_id": tariff_id,
+        "tariff_action": tariff_action,
+        "financial_outputs": parsed.financial_outputs,
+        "warnings": list(parsed.warnings),
+    }
+    conn.execute("UPDATE source_files SET notes = ? WHERE id = ?", (json.dumps(summary, ensure_ascii=True), source_id))
+    return summary
+
+
+def _apply_financial_tariff(conn: sqlite3.Connection, asset_id: int, tariff: FinancialTariffImport) -> tuple[int, str]:
+    start = datetime.fromisoformat(tariff.valid_from).date() if tariff.valid_from else date.today()
+    end = datetime.fromisoformat(tariff.valid_to).date() if tariff.valid_to else start
+    existing = list_tariffs_intersecting_period(conn, asset_id=asset_id, start=start, end=end)
+    tariff_id = int(existing[0]["id"]) if len(existing) == 1 else None
+    action = "updated" if tariff_id is not None else "created"
+    if len(existing) > 1:
+        return int(existing[0]["id"]), "skipped_multiple_overlaps"
+    saved = save_asset_tariff(
+        conn,
+        tariff_id=tariff_id,
+        asset_id=asset_id,
+        tariff_type=tariff.tariff_type,
+        cycle_type=tariff.cycle_type,
+        simple_price_eur_kwh=tariff.simple_price_eur_kwh,
+        ponta_price_eur_kwh=tariff.ponta_price_eur_kwh,
+        cheia_price_eur_kwh=tariff.cheia_price_eur_kwh,
+        vazio_price_eur_kwh=tariff.vazio_price_eur_kwh,
+        super_vazio_price_eur_kwh=tariff.super_vazio_price_eur_kwh,
+        valid_from=tariff.valid_from,
+        valid_to=tariff.valid_to,
+        notes="Importado do modelo financeiro",
+    )
+    return saved, action
+
+
+def _financial_billing_config(tariff: FinancialTariffImport, report_type: Any) -> Any:
+    from monitoring_board.reporting.models import BillingConfig
+
+    return BillingConfig(
+        report_type=report_type,
+        solcor_price_per_kwh=decimal_from_value(tariff.solcor_price_eur_kwh),
+        fixed_monthly_fee_eur=decimal_from_value(tariff.fixed_monthly_fee_eur),
+        electricity_price_eur_kwh=decimal_from_value(tariff.simple_price_eur_kwh or tariff.cheia_price_eur_kwh or 0),
+        export_price_eur_kwh=decimal_from_value(tariff.export_price_eur_kwh),
+    )
 
 
 def map_external_portfolio_entity(conn: sqlite3.Connection, *, nif: str = "", external_name: str = "") -> dict[str, Any]:

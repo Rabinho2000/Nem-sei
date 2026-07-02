@@ -14,7 +14,9 @@ from monitoring_board.portfolio_reports import (
     calculate_degradation_factor,
     calculate_tariff_value,
     classify_tariff_period,
+    import_financial_model_file,
     map_external_portfolio_entity,
+    parse_financial_model_file,
     parse_helioscope_monthly_expected,
 )
 
@@ -58,6 +60,90 @@ def test_helioscope_monthly_parser_reads_month_columns(tmp_path: Path) -> None:
 
     assert parsed[1] == 1
     assert parsed[12] == 12
+
+
+def build_financial_workbook(path: Path) -> None:
+    workbook = Workbook()
+    projeto = workbook.active
+    projeto.title = "Projeto"
+    projeto["C5"] = "Residencia Teste"
+    projeto["H8"] = 6.5
+    for month in range(1, 13):
+        row = 5 + month
+        projeto.cell(row=row, column=10, value=month)
+        projeto.cell(row=row, column=11, value=month * 100)
+    projeto["C41"] = datetime(2026, 1, 1)
+    projeto["C42"] = datetime(2026, 1, 31)
+    projeto["C44"] = "Simples"
+    projeto["C45"] = "Diario"
+    projeto["F41"] = 0.08
+    projeto["G41"] = 0.0607
+    projeto["H41"] = 0.1407
+    projeto["F46"] = 0.045
+    projeto["L33"] = 0.0555
+    projeto["M33"] = 809
+    projeto["P28"] = 20520.93
+    helio = workbook.create_sheet("Helio&Cons")
+    helio["L1"] = "New Production\n(8760)"
+    helio["N1"] = "Dates of Year"
+    helio["L2"] = 250
+    helio["N2"] = datetime(2026, 1, 1, 0, 0)
+    helio["L3"] = 500
+    helio["N3"] = datetime(2026, 1, 1, 0, 15)
+    workbook.save(path)
+
+
+def test_financial_model_parser_reads_monthly_interval_and_tariff(tmp_path: Path) -> None:
+    path = tmp_path / "financial.xlsx"
+    build_financial_workbook(path)
+
+    parsed = parse_financial_model_file(path)
+
+    assert parsed.project_name == "Residencia Teste"
+    assert parsed.monthly_expected[1] == 100
+    assert parsed.monthly_expected[12] == 1200
+    assert len(parsed.interval_expected) == 2
+    assert parsed.interval_expected[0].expected_kwh == 0.25
+    assert parsed.tariff is not None
+    assert parsed.tariff.tariff_type == "simple"
+    assert parsed.tariff.simple_price_eur_kwh == 0.1407
+
+
+class UploadStub:
+    def __init__(self, source: Path, filename: str = "financial.xlsx") -> None:
+        self.source = source
+        self.filename = filename
+
+    def save(self, target: Path) -> None:
+        target.write_bytes(self.source.read_bytes())
+
+
+def test_financial_model_import_replaces_helioscope_and_applies_tariff(tmp_path: Path) -> None:
+    conn = connect(tmp_path)
+    asset_id = add_asset(conn)
+    portfolio_id = conn.execute("SELECT id FROM portfolio_groups WHERE name = 'Solcorelios I'").fetchone()["id"]
+    path = tmp_path / "financial.xlsx"
+    build_financial_workbook(path)
+
+    result = import_financial_model_file(
+        conn,
+        upload_dir=tmp_path / "uploads",
+        file_storage=UploadStub(path),
+        asset_id=asset_id,
+        portfolio_id=portfolio_id,
+        base_year=2026,
+    )
+    conn.commit()
+
+    assert result["months"] == 12
+    assert result["intervals_15m"] == 2
+    assert conn.execute("SELECT COUNT(*) FROM helioscope_expected_production WHERE asset_id = ?", (asset_id,)).fetchone()[0] == 12
+    assert conn.execute("SELECT COUNT(*) FROM helioscope_expected_interval_production WHERE asset_id = ?", (asset_id,)).fetchone()[0] == 2
+    tariff = conn.execute("SELECT * FROM asset_tariffs WHERE asset_id = ?", (asset_id,)).fetchone()
+    assert tariff["tariff_type"] == "simple"
+    assert tariff["simple_price_eur_kwh"] == 0.1407
+    billing = conn.execute("SELECT * FROM asset_billing_configs WHERE asset_id = ?", (asset_id,)).fetchone()
+    assert billing["default_electricity_price"] == "0.1407"
 
 
 def test_tariff_period_classification_handles_overnight_rule() -> None:

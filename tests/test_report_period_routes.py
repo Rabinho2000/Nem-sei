@@ -126,6 +126,54 @@ def test_exports_post_passes_valid_periods_to_report_builder(
     }
 
 
+def test_exports_checkbox_adds_availability_to_individual_pdf(
+    exports_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, asset_id = exports_client
+    captured = {}
+
+    def fake_builder(_conn, **kwargs):
+        return {"asset": {"asset_id": kwargs["asset_id"], "project_name": "Central Rota"}, "ok": True}
+
+    def fake_availability(_conn, report, *, asset_id, period):
+        report["include_availability_kpi"] = True
+        report["availability_pct"] = 98.5
+        captured.update(asset_id=asset_id, period_start=period.start.isoformat())
+        return True
+
+    def fake_export(report):
+        captured.update(report=report)
+        return Response(b"%PDF-test", mimetype="application/pdf")
+
+    monkeypatch.setattr(app_module, "build_fusionsolar_customer_production_report", fake_builder)
+    monkeypatch.setattr(app_module, "add_customer_report_availability", fake_availability)
+    monkeypatch.setattr(app_module, "export_customer_production_pdf", fake_export)
+
+    response = client.post(
+        "/exports",
+        data={
+            "csrf_token": "token",
+            "asset_id": str(asset_id),
+            "period_type": "monthly",
+            "report_month": "2026-03",
+            "billing_values_source": "manual",
+            "billing_mode": "energy",
+            "billing_energy_base": "self_consumption",
+            "electricity_price": "0.22",
+            "sell_price": "0.05",
+            "solcor_price_per_kwh": "0.09",
+            "include_availability": "on",
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["asset_id"] == asset_id
+    assert captured["period_start"] == "2026-03-01"
+    assert captured["report"]["include_availability_kpi"] is True
+    assert captured["report"]["availability_pct"] == 98.5
+
+
 def test_exports_post_rejects_invalid_quarter_and_preserves_asset(exports_client) -> None:
     client, asset_id = exports_client
 

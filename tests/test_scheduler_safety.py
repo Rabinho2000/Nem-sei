@@ -78,7 +78,8 @@ def test_refresh_scheduler_registers_stable_single_instance_provider_jobs(tmp_pa
         assert len(second_ids) == len(set(second_ids))
         assert "fusionsolar-sync-1" not in second_ids
         assert "fusionsolar-sync-1" in fake_scheduler.remove_calls
-        assert "integration-sync-fusionsolar-hourly" in second_ids
+        assert "integration-sync-fusionsolar-1" in second_ids
+        assert "integration-sync-fusionsolar-2" in second_ids
         assert "fusionsolar-production-daily" in second_ids
         assert "fusionsolar-wat-daily" in second_ids
         assert any("sigenergy" in job_id for job_id in second_ids)
@@ -96,12 +97,10 @@ def test_refresh_scheduler_registers_stable_single_instance_provider_jobs(tmp_pa
             assert call["coalesce"] is True
             assert call["misfire_grace_time"] == 1800
 
-        hourly_call = next(
-            call for call in fake_scheduler.add_calls if call["id"] == "integration-sync-fusionsolar-hourly"
-        )
-        assert hourly_call["trigger"] == "cron"
-        assert hourly_call["minute"] == 0
-        assert "hour" not in hourly_call
+        fusionsolar_calls = [
+            call for call in fake_scheduler.add_calls if str(call["id"]).startswith("integration-sync-fusionsolar-")
+        ]
+        assert [(call["hour"], call["minute"]) for call in fusionsolar_calls[-2:]] == [(8, 0), (14, 0)]
 
         production_call = next(call for call in fake_scheduler.add_calls if call["id"] == "fusionsolar-production-daily")
         assert production_call["trigger"] == "cron"

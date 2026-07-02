@@ -1,0 +1,44 @@
+<section class="card">
+  <div class="section-title"><h3>Onboarding Sigenergy</h3></div>
+  <form method="post" class="stack-form">
+    <div class="grid two">
+      <label>System ID
+        <input type="text" name="system_id" maxlength="64" placeholder="SYSTEM_ID">
+      </label>
+      <div class="hero-actions">
+        <button class="button" type="submit" name="action" value="onboard_sigenergy_system">Enviar pedido de acesso</button>
+        <button class="button secondary" type="submit" name="action" value="refresh_sigenergy_onboarding">Atualizar estado</button>
+      </div>
+    </div>
+    <p class="muted">O proprietario da instalacao podera ter de aprovar o pedido na plataforma Sigenergy. Nao sao criados assets locais durante este pedido.</p>
+  </form>
+
+  {% if sigenergy_onboarding_rows %}
+  <div class="table-wrapper">
+    <table>
+      <thead>
+        <tr>
+          <th>System ID</th>
+          <th>Estado</th>
+          <th>Pedido</th>
+          <th>Ultima verificacao</th>
+          <th>Mensagem provider</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in sigenergy_onboarding_rows %}
+        <tr>
+          <td><strong>{{ row.system_id }}</strong></td>
+          <td>{{ row.status }}</td>
+          <td>{{ row.requested_at }}</td>
+          <td>{{ row.last_checked_at or '-' }}</td>
+          <td>{{ row.provider_message or row.last_error or '-' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+    <p class="muted">Ainda nao existem pedidos de onboarding Sigenergy.</p>
+  {% endif %}
+</section>

@@ -5,16 +5,16 @@
   <form method="post" class="stack-form">
     <div class="grid two">
       <label>App Key
-        <input type="text" name="username" value="{{ cfg.username or '' }}" autocomplete="off">
+        <input type="text" name="username" value="{{ cfg.username or '' }}" autocomplete="off" {{ 'readonly' if cfg.env_overrides and cfg.env_overrides.username else '' }}>
       </label>
       <label>App Secret
         <input type="password" name="password" value="" autocomplete="new-password" placeholder="{{ 'Configurada atraves de variavel de ambiente' if cfg.password_source == 'env' else ('Configurada na base de dados' if cfg.password_configured else 'Por configurar') }}">
       </label>
       <label>Base URL
-        <input type="text" name="base_url" value="{{ cfg.base_url or 'https://api-eu.sigencloud.com' }}">
+        <input type="text" name="base_url" value="{{ cfg.base_url or 'https://api-eu.sigencloud.com' }}" {{ 'readonly' if cfg.env_overrides and cfg.env_overrides.base_url else '' }}>
       </label>
       <label>Regiao
-        <input type="text" name="region" value="{{ cfg.region or 'eu' }}">
+        <input type="text" name="region" value="{{ cfg.region or 'eu' }}" {{ 'readonly' if cfg.env_overrides and cfg.env_overrides.region else '' }}>
       </label>
       <label>Auth endpoint
         <input type="text" name="login_endpoint" value="{{ cfg.login_endpoint or '/openapi/auth/login/key' }}">
@@ -25,11 +25,17 @@
       <label>Energy flow endpoint
         <input type="text" name="energy_flow_endpoint" value="{{ cfg.energy_flow_endpoint or '/openapi/systems/{system_id}/energyFlow' }}">
       </label>
+      <label>Onboard endpoint
+        <input type="text" name="onboard_endpoint" value="{{ cfg.onboard_endpoint or '/openapi/board/onboard' }}" {{ 'readonly' if cfg.env_overrides and cfg.env_overrides.onboard_endpoint else '' }}>
+      </label>
       <label>Horas de sync
         <input type="text" name="sync_hours" value="{{ cfg.sync_hours or '08:00,14:00' }}">
       </label>
       <label>System IDs opcionais
         <input type="text" name="system_ids" value="{{ cfg.system_ids or '' }}" placeholder="SIG-001,SIG-002">
+      </label>
+      <label>Retencao snapshots (dias)
+        <input type="number" min="1" name="snapshot_retention_days" value="{{ cfg.snapshot_retention_days or 90 }}" {{ 'readonly' if cfg.env_overrides and cfg.env_overrides.snapshot_retention_days else '' }}>
       </label>
     </div>
     <div class="hero-actions">
@@ -47,7 +53,7 @@
       <button class="button secondary" type="submit" name="action" value="test_sigenergy_connection">Testar ligacao</button>
       <button class="button secondary" type="submit" name="action" value="sync_sigenergy_now">Sincronizar agora</button>
     </div>
-    <p class="muted">O endpoint realtime antigo nao e usado nesta fase. A App Secret nao e mostrada nem copiada da variavel de ambiente para a base de dados.</p>
+    <p class="muted">A App Secret nao e mostrada nem copiada da variavel de ambiente para a base de dados. Campos definidos no ambiente têm prioridade sobre a interface.</p>
     {% if cfg.last_error %}
       <p class="muted">Ultimo erro: {{ cfg.last_error }}</p>
     {% endif %}
