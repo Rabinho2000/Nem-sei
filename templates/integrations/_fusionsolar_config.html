@@ -7,14 +7,19 @@
         <input type="text" name="username" value="{{ config.username or '' }}">
       </label>
       <label>Password
-        <input type="password" name="password" value="" autocomplete="new-password" placeholder="{{ 'Configurada em ' ~ config.password_source if config.password_configured else 'Por configurar' }}">
+        <input type="password" name="password" value="" autocomplete="new-password" {{ 'disabled' if config.password_source == 'env' else '' }} placeholder="{{ 'Configurado por variavel de ambiente' if config.password_source == 'env' else ('Configurada na base de dados' if config.password_configured else 'Por configurar') }}">
       </label>
       <label>Base URL
         <input type="text" name="base_url" value="{{ config.base_url or '' }}" placeholder="https://xxx.fusionsolar.huawei.com">
       </label>
-      <label>Auto-sync FusionSolar
-        <input type="text" value="De hora em hora" readonly>
-        <input type="hidden" name="sync_hours" value="00:00,01:00">
+      <label>Frequencia estado (horas)
+        <input type="number" min="1" max="24" name="state_sync_interval_hours" value="{{ config.state_sync_interval_hours or 1 }}">
+      </label>
+      <label>Hora producao diaria
+        <input type="time" name="production_sync_time" value="{{ config.production_sync_time or '00:10' }}">
+      </label>
+      <label>Hora diagnostico diario
+        <input type="time" name="diagnostics_sync_time" value="{{ config.diagnostics_sync_time or '00:30' }}">
       </label>
     </div>
 
@@ -48,15 +53,26 @@
       </label>
     </div>
 
-    <p class="muted">A password nao e mostrada. Deixa em branco para manter a atual; se estiver definida em `.env`, esse valor tem prioridade.</p>
+    <p class="muted">A password nao e mostrada. Deixa em branco para manter a atual; se estiver definida em `.env`, aparece como configurado por variavel de ambiente e nao pode ser sobrescrita aqui.</p>
     <p class="muted">Defaults da documentacao: `/thirdData/login`, `/thirdData/stations`, `/thirdData/getStationRealKpi`, `/thirdData/getDevList`, `/thirdData/getDevRealKpi`, `/thirdData/getDevHistoryKpi`, `/thirdData/getAlarmList`, `/thirdData/getKpiStationDay`, `/thirdData/getKpiStationMonth`.</p>
     <div class="hero-actions">
       <label class="checkbox-inline">
         <input type="checkbox" name="enabled" {{ 'checked' if config.enabled else '' }}>
         <span>Integracao ativa</span>
       </label>
-      <input type="hidden" name="auto_sync_enabled" value="on">
-      <span class="muted">Sync horario ativo; WAT diario as 00:05.</span>
+      <label class="checkbox-inline">
+        <input type="checkbox" name="auto_sync_enabled" {{ 'checked' if config.auto_sync_enabled else '' }}>
+        <span>Estado horario</span>
+      </label>
+      <label class="checkbox-inline">
+        <input type="checkbox" name="production_sync_enabled" {{ 'checked' if config.production_sync_enabled else '' }}>
+        <span>Producao diaria</span>
+      </label>
+      <label class="checkbox-inline">
+        <input type="checkbox" name="diagnostics_sync_enabled" {{ 'checked' if config.diagnostics_sync_enabled else '' }}>
+        <span>Diagnostico diario</span>
+      </label>
+      <span class="muted">Estado no maximo de hora a hora; producao e diagnostico correm em jobs diarios separados.</span>
     </div>
     <button class="button" type="submit">Guardar configuracao</button>
     {% if config.last_error %}

@@ -8,7 +8,7 @@
         <input type="text" name="username" value="{{ cfg.username or '' }}" autocomplete="off" {{ 'readonly' if cfg.env_overrides and cfg.env_overrides.username else '' }}>
       </label>
       <label>App Secret
-        <input type="password" name="password" value="" autocomplete="new-password" placeholder="{{ 'Configurada atraves de variavel de ambiente' if cfg.password_source == 'env' else ('Configurada na base de dados' if cfg.password_configured else 'Por configurar') }}">
+        <input type="password" name="password" value="" autocomplete="new-password" {{ 'disabled' if cfg.password_source == 'env' else '' }} placeholder="{{ 'Configurado por variavel de ambiente' if cfg.password_source == 'env' else ('Configurada na base de dados' if cfg.password_configured else 'Por configurar') }}">
       </label>
       <label>Base URL
         <input type="text" name="base_url" value="{{ cfg.base_url or 'https://api-eu.sigencloud.com' }}" {{ 'readonly' if cfg.env_overrides and cfg.env_overrides.base_url else '' }}>
@@ -28,8 +28,8 @@
       <label>Onboard endpoint
         <input type="text" name="onboard_endpoint" value="{{ cfg.onboard_endpoint or '/openapi/board/onboard' }}" {{ 'readonly' if cfg.env_overrides and cfg.env_overrides.onboard_endpoint else '' }}>
       </label>
-      <label>Horas de sync
-        <input type="text" name="sync_hours" value="{{ cfg.sync_hours or '08:00,14:00' }}">
+      <label>Intervalo estado (horas)
+        <input type="number" min="1" max="24" name="state_sync_interval_hours" value="{{ cfg.state_sync_interval_hours or 1 }}">
       </label>
       <label>System IDs opcionais
         <input type="text" name="system_ids" value="{{ cfg.system_ids or '' }}" placeholder="SIG-001,SIG-002">

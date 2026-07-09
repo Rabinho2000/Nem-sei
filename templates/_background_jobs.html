@@ -7,10 +7,13 @@
         <tr>
           <th>ID</th>
           <th>Tipo</th>
+          <th>Provider</th>
+          <th>Area</th>
           <th>Estado</th>
           <th>Criado</th>
           <th>Inicio</th>
           <th>Fim</th>
+          <th>Proxima tentativa</th>
           <th>Resultado</th>
         </tr>
       </thead>
@@ -19,10 +22,25 @@
           <tr>
             <td>#{{ job.id }}</td>
             <td>{{ job.job_type }}</td>
-            <td><span class="chip {{ 'success' if job.status == 'success' else 'danger' if job.status == 'failed' else 'warning' if job.status == 'running' else 'accent' }}">{{ job.status }}</span></td>
+            <td>{{ job.provider or "-" }}</td>
+            <td>{{ job.api_area or "-" }}</td>
+            <td>
+              {% set status_labels = {
+                "pending": "Pendente",
+                "running": "Em execucao",
+                "waiting_rate_limit": "A aguardar limite API",
+                "success": "Sucesso",
+                "failed": "Falhou",
+                "cancelled": "Cancelado"
+              } %}
+              <span class="chip {{ 'success' if job.status == 'success' else 'danger' if job.status == 'failed' else 'warning' if job.status in ['running', 'waiting_rate_limit'] else 'accent' }}">
+                {{ status_labels.get(job.status, job.status) }}
+              </span>
+            </td>
             <td>{{ job.created_at }}</td>
             <td>{{ job.started_at or "-" }}</td>
             <td>{{ job.finished_at or "-" }}</td>
+            <td>{{ job.next_attempt_at or "-" }}</td>
             <td>
               {% if job.error_message %}
                 {{ job.error_message }}

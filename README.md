@@ -90,7 +90,7 @@ SIGENERGY_SYSTEMS_ENDPOINT=/openapi/system
 SIGENERGY_ENERGY_FLOW_ENDPOINT=/openapi/systems/{system_id}/energyFlow
 SIGENERGY_ONBOARD_ENDPOINT=/openapi/board/onboard
 SIGENERGY_REGION=eu
-SIGENERGY_SYNC_HOURS=08:00,14:00
+SIGENERGY_STATE_SYNC_INTERVAL_HOURS=1
 SIGENERGY_SNAPSHOT_RETENTION_DAYS=90
 ```
 
@@ -125,6 +125,67 @@ com estado `partial`, preserva o ultimo estado valido e guarda o erro sanitizado
 Snapshots Sigenergy sao limpos uma vez por dia conforme
 `SIGENERGY_SNAPSHOT_RETENTION_DAYS`, mantendo sempre o snapshot mais recente de
 cada sistema.
+
+## Politica de chamadas API das integracoes
+
+O APScheduler corre dentro do processo Flask/Gunicorn e o deployment atual deve
+continuar com exatamente 1 worker. Os jobs usam IDs estaveis e `replace_existing`
+para evitar duplicados apos restart ou alteracao da configuracao.
+
+FusionSolar:
+
+- `integration-state-fusionsolar-hourly`: estado/monitorizacao, no maximo uma
+  vez por hora. So e agendado se a integracao estiver ativa e
+  `auto_sync_enabled` estiver ligado na UI.
+- `integration-production-fusionsolar-daily`: producao diaria, uma vez por dia,
+  sempre para o dia anterior. Controlado por `production_sync_enabled` e
+  `production_sync_time`.
+- `integration-diagnostics-fusionsolar-daily`: chamadas pesadas de diagnostico,
+  como disponibilidade/inversores/device history/alarmes, uma vez por dia e em
+  job separado da producao. Controlado por `diagnostics_sync_enabled` e
+  `diagnostics_sync_time`.
+
+Sigenergy:
+
+- `integration-state-sigenergy-hourly`: estado atual/`energyFlow`, no maximo uma
+  vez por hora. So e agendado se a integracao estiver ativa e
+  `auto_sync_enabled` estiver ligado na UI.
+- A app nao agenda producao nem historico Sigenergy enquanto nao houver
+  endpoints/configuracao validados para isso.
+
+Rate limit e backoff:
+
+- O estado de cooldown fica persistido por `provider` e `api_area`
+  (`state`, `production`, `diagnostics`) em `api_call_state`.
+- FusionSolar `failCode=407` e HTTP 429 criam cooldown persistente de 60
+  minutos por defeito. `failCode=305`/`USER_MUST_RELOGIN` invalida a sessao e
+  tenta login uma vez.
+- Sigenergy HTTP 401 invalida o token e autentica novamente uma vez. HTTP 429
+  cria cooldown persistente.
+- HTTP 5xx e falhas de rede usam backoff curto finito em background
+  (`15s`, `60s`, `180s`, maximo 3 retries). Requests Flask nao fazem sleeps
+  longos.
+- Se um background job encontrar cooldown ativo, fica em
+  `waiting_rate_limit`, grava `next_attempt_at` e e reagendado para depois do
+  cooldown.
+- A UI mostra o estado das APIs e jobs em espera, incluindo a proxima tentativa.
+
+Pagina `Integracoes`:
+
+- O separador `Resumo` mostra uma linha por provider com estado enabled,
+  auto-sync, frequencia do estado, hora de producao/diagnostics FusionSolar,
+  ultima tentativa, ultimo sucesso, proxima tentativa e ultimo erro.
+- Os estados API aparecem como `OK`, `Em cooldown`, `Falhou ultima tentativa`,
+  `Sem credenciais` ou `Disabled`.
+- Os botoes de sync manual apenas criam jobs em background:
+  `Estado agora`, `Producao agora` e `Diagnostics agora`. Se existir cooldown,
+  o botao indica que o job fica em fila.
+- `Limpar cooldown` aparece quando existe cooldown ativo e pede confirmacao no
+  browser antes de alterar o estado.
+- Passwords e secrets nunca sao mostrados. Quando configurados por variavel de
+  ambiente, a UI mostra essa origem e bloqueia a sobrescrita no campo secreto.
+- O separador `Historico` junta os ultimos sync runs e os ultimos background
+  jobs, incluindo `waiting_rate_limit` e `next_attempt_at`.
 
 ## Docker / Raspberry Pi
 

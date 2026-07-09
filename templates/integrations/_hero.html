@@ -2,8 +2,8 @@
   <div>
     <p class="eyebrow">Integracoes</p>
     <h2>Monitorizacao API</h2>
-    <p class="muted">Sincronizacao automatica duas vezes por dia, check manual e lista de centrais por resolver.</p>
-    <p class="muted">O botao sincroniza todas as integracoes ativas: FusionSolar e Sigenergy.</p>
+    <p class="muted">Estado das APIs, sincronizacoes agendadas, cooldowns e jobs em background.</p>
+    <p class="muted">As sincronizacoes manuais ficam em fila e nao bloqueiam o pedido da pagina.</p>
   </div>
   <div class="hero-actions">
     <form method="post">
@@ -12,7 +12,7 @@
     </form>
     <form method="post">
       <input type="hidden" name="action" value="sync_now">
-      <button class="button" type="submit">Sincronizar tudo</button>
+      <button class="button" type="submit">Enfileirar estado de todas</button>
     </form>
   </div>
 </section>

@@ -25,7 +25,7 @@ from zoneinfo import ZoneInfo
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import current_app
-from flask import Flask, abort, flash, g, has_app_context, redirect, render_template, request, send_file, session, url_for
+from flask import Flask, abort, flash, g, has_app_context, has_request_context, redirect, render_template, request, send_file, session, url_for
 from werkzeug.utils import secure_filename
 from monitoring_board.db import configure_database_for_runtime, create_database_backup, ensure_column, get_db, query_all, query_scalar
 from monitoring_board.logging_config import configure_logging
@@ -221,7 +221,35 @@ from monitoring_board.services.fusionsolar import (
     map_fusionsolar_status,
     normalize_sync_hours,
 )
+from monitoring_board.services import fusionsolar_client as fusionsolar_client_module
+from monitoring_board.services.fusionsolar_client import FusionSolarClient
+from monitoring_board.services.fusionsolar_errors import (
+    FusionSolarApiError,
+    FusionSolarCredentialsError,
+    FusionSolarRateLimitError,
+    FusionSolarSessionExpiredError,
+)
+from monitoring_board.services.fusionsolar_models import (
+    FusionSolarCredentials,
+    FusionSolarEndpoints,
+    collect_time_noon_of_month_ms,
+    collect_time_start_of_day_ms,
+    normalize_kpi_rows as normalize_client_kpi_rows,
+    parse_collect_date as parse_client_collect_date,
+)
 from monitoring_board.services import sigenergy as sigenergy_service
+from monitoring_board.services.api_client_base import http_rate_limited_status, http_retryable_status, retry_api_call
+from monitoring_board.services.api_rate_limit import (
+    ApiRateLimitError,
+    ApiTransientError,
+    active_cooldown_until,
+    ensure_api_call_state_schema,
+    get_api_call_state,
+    mark_api_cooldown,
+    record_api_attempt,
+    record_api_success,
+    require_not_in_cooldown,
+)
 
 from monitoring_board.services.telegram_service import (
     get_telegram_config,
@@ -296,15 +324,23 @@ resolve_runtime_file_path = runtime_module.resolve_runtime_file_path
 INTEGRATION_PROVIDER_FUSIONSOLAR = "FusionSolar"
 INTEGRATION_PROVIDER_SIGENERGY = "Sigenergy"
 INTEGRATION_PROVIDER_OPTIONS = [INTEGRATION_PROVIDER_FUSIONSOLAR, INTEGRATION_PROVIDER_SIGENERGY]
+API_AREA_STATE = "state"
+API_AREA_PRODUCTION = "production"
+API_AREA_DIAGNOSTICS = "diagnostics"
 BACKGROUND_JOB_TYPES_PERFORMANCE = (
+    "fusionsolar_state_sync",
     "fusionsolar_production_sync",
     "fusionsolar_production_backfill",
     "fusionsolar_inverter_availability_backfill",
     "fusionsolar_month_cycle",
+    "sigenergy_state_sync",
     "performance_reference_recalculation",
 )
 BACKGROUND_JOB_STALE_RUNNING_MINUTES = 30
 DEFAULT_FUSIONSOLAR_SYNC_HOURS = "08:00,14:00"
+DEFAULT_STATE_SYNC_INTERVAL_HOURS = 1
+DEFAULT_FUSIONSOLAR_PRODUCTION_SYNC_TIME = "00:10"
+DEFAULT_FUSIONSOLAR_DIAGNOSTICS_SYNC_TIME = "00:30"
 DEFAULT_FUSIONSOLAR_LOGIN_ENDPOINT = "/thirdData/login"
 DEFAULT_FUSIONSOLAR_STATIONS_ENDPOINT = "/thirdData/stations"
 DEFAULT_FUSIONSOLAR_REALTIME_ENDPOINT = "/thirdData/getStationRealKpi"
@@ -530,21 +566,6 @@ SCHEDULER: BackgroundScheduler | None = None
 FUSIONSOLAR_SESSION_CACHE: dict[str, Any] = {}
 FUSIONSOLAR_SESSION_LOCK = threading.Lock()
 FUSIONSOLAR_SYNC_LOCK = threading.Lock()
-
-
-class FusionSolarApiError(ValueError):
-    def __init__(
-        self,
-        message: str,
-        *,
-        payload: dict[str, Any] | None = None,
-        status_code: int | None = None,
-        error_type: str = "api",
-    ) -> None:
-        super().__init__(message)
-        self.payload = payload or {}
-        self.status_code = status_code
-        self.error_type = error_type
 
 
 @contextmanager
@@ -4217,9 +4238,24 @@ def create_app() -> Flask:
         if request.method == "POST":
             action = request.form.get("action", "").strip()
             if action == "save_config":
-                sync_hours = normalize_sync_hours(request.form.get("sync_hours", DEFAULT_FUSIONSOLAR_SYNC_HOURS))
                 auto_sync_enabled = 1 if request.form.get("auto_sync_enabled") == "on" else 0
                 enabled = 1 if request.form.get("enabled") == "on" else 0
+                production_sync_enabled = 1 if request.form.get("production_sync_enabled") == "on" else 0
+                diagnostics_sync_enabled = 1 if request.form.get("diagnostics_sync_enabled") == "on" else 0
+                state_sync_interval_hours = normalize_positive_int(
+                    request.form.get("state_sync_interval_hours"),
+                    DEFAULT_STATE_SYNC_INTERVAL_HOURS,
+                    minimum=1,
+                    maximum=24,
+                )
+                production_sync_time = normalize_clock_time(
+                    request.form.get("production_sync_time"),
+                    DEFAULT_FUSIONSOLAR_PRODUCTION_SYNC_TIME,
+                )
+                diagnostics_sync_time = normalize_clock_time(
+                    request.form.get("diagnostics_sync_time"),
+                    DEFAULT_FUSIONSOLAR_DIAGNOSTICS_SYNC_TIME,
+                )
                 submitted_password = request.form.get("password", "").strip()
                 g.db.execute(
                     """
@@ -4230,7 +4266,10 @@ def create_app() -> Flask:
                         real_time_endpoint = ?, device_list_endpoint = ?, device_real_time_endpoint = ?,
                         device_history_endpoint = ?, alarms_endpoint = ?,
                         day_kpi_endpoint = ?, month_kpi_endpoint = ?,
-                        enabled = ?, auto_sync_enabled = ?, sync_hours = ?, updated_at = ?
+                        enabled = ?, auto_sync_enabled = ?,
+                        production_sync_enabled = ?, diagnostics_sync_enabled = ?,
+                        state_sync_interval_hours = ?, production_sync_time = ?, diagnostics_sync_time = ?,
+                        sync_hours = ?, updated_at = ?
                     WHERE provider = ?
                     """,
                     (
@@ -4249,7 +4288,12 @@ def create_app() -> Flask:
                         request.form.get("month_kpi_endpoint", "").strip(),
                         enabled,
                         auto_sync_enabled,
-                        sync_hours,
+                        production_sync_enabled,
+                        diagnostics_sync_enabled,
+                        state_sync_interval_hours,
+                        production_sync_time,
+                        diagnostics_sync_time,
+                        f"{production_sync_time},{diagnostics_sync_time}",
                         datetime.now().isoformat(timespec="seconds"),
                         provider,
                     ),
@@ -4294,9 +4338,14 @@ def create_app() -> Flask:
 
             if action == "save_sigenergy_config":
                 sig_provider = INTEGRATION_PROVIDER_SIGENERGY
-                sync_hours = normalize_sync_hours(request.form.get("sync_hours", DEFAULT_SIGENERGY_SYNC_HOURS))
                 auto_sync_enabled = 1 if request.form.get("auto_sync_enabled") == "on" else 0
                 enabled = 1 if request.form.get("enabled") == "on" else 0
+                state_sync_interval_hours = normalize_positive_int(
+                    request.form.get("state_sync_interval_hours"),
+                    DEFAULT_STATE_SYNC_INTERVAL_HOURS,
+                    minimum=1,
+                    maximum=24,
+                )
                 submitted_secret = request.form.get("password", "").strip()
                 env_secret_configured = bool(os.environ.get("SIGENERGY_APP_SECRET", "").strip())
                 g.db.execute(
@@ -4306,7 +4355,7 @@ def create_app() -> Flask:
                         password = CASE WHEN ? = 0 AND ? != '' THEN ? ELSE password END,
                         base_url = ?, login_endpoint = ?, plants_endpoint = ?,
                         energy_flow_endpoint = ?, onboard_endpoint = ?, enabled = ?, auto_sync_enabled = ?,
-                        sync_hours = ?, region = ?, system_ids = ?, snapshot_retention_days = ?, updated_at = ?
+                        state_sync_interval_hours = ?, sync_hours = ?, region = ?, system_ids = ?, snapshot_retention_days = ?, updated_at = ?
                     WHERE provider = ?
                     """,
                     (
@@ -4321,7 +4370,8 @@ def create_app() -> Flask:
                         request.form.get("onboard_endpoint", DEFAULT_SIGENERGY_ONBOARD_ENDPOINT).strip(),
                         enabled,
                         auto_sync_enabled,
-                        sync_hours,
+                        state_sync_interval_hours,
+                        f"{state_sync_interval_hours}:00",
                         request.form.get("region", DEFAULT_SIGENERGY_REGION).strip() or DEFAULT_SIGENERGY_REGION,
                         request.form.get("system_ids", "").strip(),
                         parse_int_value(request.form.get("snapshot_retention_days", str(DEFAULT_SIGENERGY_SNAPSHOT_RETENTION_DAYS))) or DEFAULT_SIGENERGY_SNAPSHOT_RETENTION_DAYS,
@@ -4377,30 +4427,146 @@ def create_app() -> Flask:
 
             if action == "sync_sigenergy_now":
                 try:
-                    result = run_sigenergy_sync(g.db, INTEGRATION_PROVIDER_SIGENERGY, trigger_type="manual")
+                    job_id, created = create_background_job(
+                        g.db,
+                        "sigenergy_state_sync",
+                        {"provider": INTEGRATION_PROVIDER_SIGENERGY, "trigger_type": "manual_background"},
+                    )
+                    g.db.commit()
+                    schedule_background_job(app, job_id)
                     flash(
-                        f"Sync Sigenergy concluido: {result['matched']} associados, {result['unresolved']} por resolver, {result['snapshots']} snapshots.",
-                        "success" if result.get("status") == "success" else "warning",
+                        f"Sync Sigenergy enviado para background (job #{job_id})." if created else f"Ja existe sync Sigenergy pendente/em execucao (job #{job_id}).",
+                        "success" if created else "warning",
                     )
                 except Exception as exc:
-                    flash(f"Falha ao sincronizar Sigenergy: {sigenergy_service.sanitize_sigenergy_error(exc)}", "error")
+                    flash(f"Falha ao agendar sync Sigenergy: {sigenergy_service.sanitize_sigenergy_error(exc)}", "error")
                 return redirect(url_for("integrations") + "#integrations-sigenergy")
 
             if action == "sync_now":
                 try:
-                    result = run_all_integration_syncs(g.db, trigger_type="manual")
-                    summaries = [
-                        f"{item_provider}: {item_result['matched']} associados, {item_result['unresolved']} por resolver, {item_result['auto_resolved']} resolvidos"
-                        for item_provider, item_result in result["results"].items()
-                    ]
-                    if summaries:
-                        flash("Sync concluido: " + " | ".join(summaries), "success")
+                    queued: list[str] = []
+                    queued_job_ids: list[int] = []
+                    for item_provider, job_type in (
+                        (INTEGRATION_PROVIDER_FUSIONSOLAR, "fusionsolar_state_sync"),
+                        (INTEGRATION_PROVIDER_SIGENERGY, "sigenergy_state_sync"),
+                    ):
+                        item_config = get_integration_config(g.db, item_provider)
+                        if item_config is None or not item_config["enabled"]:
+                            continue
+                        job_id, created = create_background_job(
+                            g.db,
+                            job_type,
+                            {"provider": item_provider, "trigger_type": "manual_background"},
+                        )
+                        queued.append(f"{item_provider} job #{job_id}" + ("" if created else " existente"))
+                        queued_job_ids.append(job_id)
+                    g.db.commit()
+                    for job_id in queued_job_ids:
+                        schedule_background_job(app, job_id)
+                    if queued:
+                        flash("Sync enviado para background: " + " | ".join(queued), "success")
                     else:
                         flash("Nao ha integracoes ativas para sincronizar.", "warning")
-                    if result["errors"]:
-                        flash("Falhas no sync: " + " | ".join(f"{key}: {value}" for key, value in result["errors"].items()), "error")
                 except Exception as exc:
-                    flash(f"Falha ao sincronizar integracoes: {exc}", "error")
+                    flash(f"Falha ao agendar sincronizacao: {exc}", "error")
+                return redirect(url_for("integrations"))
+
+            if action == "sync_provider_state_now":
+                provider_value = request.form.get("provider", "").strip()
+                if provider_value not in INTEGRATION_PROVIDER_OPTIONS:
+                    flash("Integracao invalida.", "error")
+                    return redirect(url_for("integrations"))
+                job_type = "sigenergy_state_sync" if provider_value == INTEGRATION_PROVIDER_SIGENERGY else "fusionsolar_state_sync"
+                try:
+                    job_id, created = create_background_job(
+                        g.db,
+                        job_type,
+                        {"provider": provider_value, "trigger_type": "manual_background"},
+                    )
+                    g.db.commit()
+                    schedule_background_job(app, job_id)
+                    cooldown = get_provider_cooldown_reason(g.db, provider_value, API_AREA_STATE)
+                    suffix = " Vai aguardar pelo fim do cooldown." if cooldown else ""
+                    flash(
+                        f"Sync de estado {provider_value} enviado para background (job #{job_id}).{suffix}"
+                        if created
+                        else f"Ja existe sync de estado {provider_value} pendente/em execucao (job #{job_id}).{suffix}",
+                        "success" if created else "warning",
+                    )
+                except Exception as exc:
+                    flash(f"Falha ao agendar sync de estado {provider_value}: {exc}", "error")
+                return redirect(url_for("integrations"))
+
+            if action == "sync_fusionsolar_production_now":
+                target_date = current_lisbon_date() - timedelta(days=1)
+                try:
+                    job_id, created = create_background_job(
+                        g.db,
+                        "fusionsolar_production_sync",
+                        {
+                            "provider": INTEGRATION_PROVIDER_FUSIONSOLAR,
+                            "target_date": target_date.isoformat(),
+                            "period_type": "day",
+                            "trigger_type": "manual_background",
+                        },
+                    )
+                    g.db.commit()
+                    schedule_background_job(app, job_id)
+                    cooldown = get_provider_cooldown_reason(g.db, INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_PRODUCTION)
+                    suffix = " Vai aguardar pelo fim do cooldown." if cooldown else ""
+                    flash(
+                        f"Sync de producao FusionSolar enviado para background (job #{job_id}, dia {target_date.isoformat()}).{suffix}"
+                        if created
+                        else f"Ja existe sync de producao FusionSolar pendente/em execucao (job #{job_id}).{suffix}",
+                        "success" if created else "warning",
+                    )
+                except Exception as exc:
+                    flash(f"Falha ao agendar producao FusionSolar: {exc}", "error")
+                return redirect(url_for("integrations") + "#integrations-fusionsolar")
+
+            if action == "sync_fusionsolar_diagnostics_now":
+                target_date = current_lisbon_date() - timedelta(days=1)
+                try:
+                    job_id, created = create_background_job(
+                        g.db,
+                        "fusionsolar_inverter_availability_backfill",
+                        {
+                            "provider": INTEGRATION_PROVIDER_FUSIONSOLAR,
+                            "from_date": target_date.isoformat(),
+                            "to_date": target_date.isoformat(),
+                            "trigger_type": "manual_background",
+                        },
+                    )
+                    g.db.commit()
+                    schedule_background_job(app, job_id)
+                    cooldown = get_provider_cooldown_reason(g.db, INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_DIAGNOSTICS)
+                    suffix = " Vai aguardar pelo fim do cooldown." if cooldown else ""
+                    flash(
+                        f"Sync de diagnostics FusionSolar enviado para background (job #{job_id}, dia {target_date.isoformat()}).{suffix}"
+                        if created
+                        else f"Ja existe sync de diagnostics FusionSolar pendente/em execucao (job #{job_id}).{suffix}",
+                        "success" if created else "warning",
+                    )
+                except Exception as exc:
+                    flash(f"Falha ao agendar diagnostics FusionSolar: {exc}", "error")
+                return redirect(url_for("integrations") + "#integrations-fusionsolar")
+
+            if action == "clear_api_cooldown":
+                provider_value = request.form.get("provider", "").strip()
+                api_area = request.form.get("api_area", "").strip() or None
+                confirm_value = request.form.get("confirm_clear_cooldown", "").strip()
+                if provider_value not in INTEGRATION_PROVIDER_OPTIONS or api_area not in {API_AREA_STATE, API_AREA_PRODUCTION, API_AREA_DIAGNOSTICS, None}:
+                    flash("Cooldown invalido.", "error")
+                    return redirect(url_for("integrations"))
+                if confirm_value != "on":
+                    flash("Confirma a limpeza do cooldown antes de continuar.", "warning")
+                    return redirect(url_for("integrations"))
+                clear_api_cooldown(g.db, provider_value, api_area)
+                g.db.commit()
+                flash(
+                    f"Cooldown {provider_value}{' / ' + api_area if api_area else ''} limpo manualmente.",
+                    "success",
+                )
                 return redirect(url_for("integrations"))
 
             if action == "test_telegram":
@@ -4678,6 +4844,7 @@ def create_app() -> Flask:
             provider=provider,
             config=config,
             integration_configs=integration_configs,
+            integration_api_controls=build_integration_api_controls(g.db),
             sync_runs=sync_runs,
             unresolved_rows=unresolved_rows,
             mapped_assets=mapped_assets,
@@ -4693,6 +4860,8 @@ def create_app() -> Flask:
             alert_scope_options=ALERT_SCOPE_OPTIONS,
             alert_filter_assets=alert_filter_assets,
             alert_blacklist_rows=alert_blacklist_rows,
+            api_call_states=list_api_call_states(g.db),
+            background_jobs=fetch_latest_background_jobs(g.db, job_types=BACKGROUND_JOB_TYPES_PERFORMANCE),
             fusionsolar_api_warning=get_fusionsolar_performance_cooldown_reason(g.db),
         )
 
@@ -5085,6 +5254,11 @@ def ensure_database(path: str) -> None:
                 enabled INTEGER DEFAULT 0,
                 auto_sync_enabled INTEGER DEFAULT 0,
                 sync_hours TEXT,
+                production_sync_enabled INTEGER DEFAULT 1,
+                diagnostics_sync_enabled INTEGER DEFAULT 1,
+                state_sync_interval_hours INTEGER DEFAULT 1,
+                production_sync_time TEXT,
+                diagnostics_sync_time TEXT,
                 region TEXT,
                 system_ids TEXT,
                 snapshot_retention_days INTEGER,
@@ -5567,7 +5741,8 @@ def ensure_database(path: str) -> None:
                 error_message TEXT,
                 created_at TEXT NOT NULL,
                 started_at TEXT,
-                finished_at TEXT
+                finished_at TEXT,
+                next_attempt_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS alert_blacklist (
@@ -5658,6 +5833,19 @@ def ensure_database(path: str) -> None:
         ensure_column(conn, "integration_configs", "snapshot_retention_days INTEGER")
         ensure_column(conn, "integration_configs", "day_kpi_endpoint TEXT")
         ensure_column(conn, "integration_configs", "month_kpi_endpoint TEXT")
+        ensure_column(conn, "integration_configs", "production_sync_enabled INTEGER DEFAULT 1")
+        ensure_column(conn, "integration_configs", "diagnostics_sync_enabled INTEGER DEFAULT 1")
+        ensure_column(conn, "integration_configs", "state_sync_interval_hours INTEGER DEFAULT 1")
+        ensure_column(conn, "integration_configs", "production_sync_time TEXT")
+        ensure_column(conn, "integration_configs", "diagnostics_sync_time TEXT")
+        ensure_column(conn, "background_jobs", "next_attempt_at TEXT")
+        ensure_api_call_state_schema(conn)
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_background_jobs_status_next_attempt
+            ON background_jobs(status, next_attempt_at)
+            """
+        )
         ensure_column(conn, "production_records", "selected_production_key TEXT")
         ensure_column(conn, "production_records", "selected_production_raw_value TEXT")
         ensure_column(conn, "production_records", "reference_diagnostic_json TEXT")
@@ -5829,23 +6017,61 @@ def encode_job_params(params: dict[str, Any]) -> str:
     return json.dumps(params, ensure_ascii=True, sort_keys=True)
 
 
+def decode_job_params(params_json: str | None) -> dict[str, Any]:
+    try:
+        value = json.loads(params_json or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def background_job_params_with_scope(job_type: str, params: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(params or {})
+    provider, api_area = background_job_api_scope(job_type, normalized)
+    if provider and "provider" not in normalized:
+        normalized["provider"] = provider
+    if api_area and "api_area" not in normalized:
+        normalized["api_area"] = api_area
+    return normalized
+
+
 def create_background_job(
     conn: sqlite3.Connection,
     job_type: str,
     params: dict[str, Any],
     prevent_duplicate: bool = True,
 ) -> tuple[int, bool]:
+    normalized_params = background_job_params_with_scope(job_type, params)
+    provider, api_area = background_job_api_scope(job_type, normalized_params)
     if prevent_duplicate:
-        existing = conn.execute(
-            """
-            SELECT id
-            FROM background_jobs
-            WHERE job_type = ? AND status IN ('pending', 'running')
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (job_type,),
-        ).fetchone()
+        if provider and api_area:
+            existing = None
+            rows = conn.execute(
+                """
+                SELECT id, params_json
+                FROM background_jobs
+                WHERE job_type = ? AND status IN ('pending', 'running', 'waiting_rate_limit')
+                ORDER BY id DESC
+                """,
+                (job_type,),
+            ).fetchall()
+            for row in rows:
+                row_params = decode_job_params(row["params_json"])
+                row_provider, row_api_area = background_job_api_scope(job_type, row_params)
+                if row_provider == provider and row_api_area == api_area:
+                    existing = row
+                    break
+        else:
+            existing = conn.execute(
+                """
+                SELECT id
+                FROM background_jobs
+                WHERE job_type = ? AND status IN ('pending', 'running', 'waiting_rate_limit')
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (job_type,),
+            ).fetchone()
         if existing is not None:
             return int(existing["id"]), False
 
@@ -5855,7 +6081,7 @@ def create_background_job(
         INSERT INTO background_jobs (job_type, status, params_json, created_at)
         VALUES (?, 'pending', ?, ?)
         """,
-        (job_type, encode_job_params(params), now),
+        (job_type, encode_job_params(normalized_params), now),
     )
     return int(cursor.lastrowid), True
 
@@ -5865,10 +6091,14 @@ def mark_background_job_running(conn: sqlite3.Connection, job_id: int) -> bool:
     cursor = conn.execute(
         """
         UPDATE background_jobs
-        SET status = 'running', started_at = ?, error_message = NULL
-        WHERE id = ? AND status = 'pending'
+        SET status = 'running', started_at = ?, error_message = NULL, next_attempt_at = NULL
+        WHERE id = ?
+          AND (
+            status = 'pending'
+            OR (status = 'waiting_rate_limit' AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+          )
         """,
-        (now, job_id),
+        (now, job_id, now),
     )
     conn.commit()
     return cursor.rowcount == 1
@@ -5879,7 +6109,7 @@ def mark_background_job_success(conn: sqlite3.Connection, job_id: int, result: d
     conn.execute(
         """
         UPDATE background_jobs
-        SET status = 'success', result_json = ?, error_message = NULL, finished_at = ?
+        SET status = 'success', result_json = ?, error_message = NULL, finished_at = ?, next_attempt_at = NULL
         WHERE id = ?
         """,
         (json.dumps(result, ensure_ascii=True, sort_keys=True), now, job_id),
@@ -5892,10 +6122,40 @@ def mark_background_job_failed(conn: sqlite3.Connection, job_id: int, error_mess
     conn.execute(
         """
         UPDATE background_jobs
-        SET status = 'failed', error_message = ?, finished_at = ?
+        SET status = 'failed', error_message = ?, finished_at = ?, next_attempt_at = NULL
         WHERE id = ?
         """,
         (error_message[:2000], now, job_id),
+    )
+    conn.commit()
+
+
+def mark_background_job_waiting_rate_limit(
+    conn: sqlite3.Connection,
+    job_id: int,
+    *,
+    next_attempt_at: datetime,
+    error_message: str,
+    result: dict[str, Any] | None = None,
+) -> None:
+    now = datetime.now().isoformat(timespec="seconds")
+    conn.execute(
+        """
+        UPDATE background_jobs
+        SET status = 'waiting_rate_limit',
+            error_message = ?,
+            result_json = ?,
+            finished_at = ?,
+            next_attempt_at = ?
+        WHERE id = ?
+        """,
+        (
+            error_message[:2000],
+            json.dumps(result or {}, ensure_ascii=True, sort_keys=True),
+            now,
+            next_attempt_at.isoformat(timespec="seconds"),
+            job_id,
+        ),
     )
     conn.commit()
 
@@ -5920,6 +6180,23 @@ def mark_stale_running_background_jobs_failed(
             now,
             cutoff.isoformat(timespec="seconds"),
         ),
+    )
+    conn.commit()
+    return cursor.rowcount
+
+
+def reactivate_due_rate_limited_background_jobs(conn: sqlite3.Connection) -> int:
+    now = datetime.now().isoformat(timespec="seconds")
+    cursor = conn.execute(
+        """
+        UPDATE background_jobs
+        SET status = 'pending',
+            error_message = NULL,
+            finished_at = NULL
+        WHERE status = 'waiting_rate_limit'
+          AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+        """,
+        (now,),
     )
     conn.commit()
     return cursor.rowcount
@@ -5952,7 +6229,7 @@ def fetch_latest_background_jobs(
     params.append(limit)
     rows = conn.execute(
         f"""
-        SELECT id, job_type, status, params_json, result_json, error_message, created_at, started_at, finished_at
+        SELECT id, job_type, status, params_json, result_json, error_message, created_at, started_at, finished_at, next_attempt_at
         FROM background_jobs
         {where_sql}
         ORDER BY id DESC
@@ -5963,6 +6240,10 @@ def fetch_latest_background_jobs(
     jobs: list[dict[str, Any]] = []
     for row in rows:
         job = dict(row)
+        params_payload = decode_job_params(row["params_json"])
+        provider, api_area = background_job_api_scope(str(row["job_type"]), params_payload)
+        job["provider"] = params_payload.get("provider") or provider or ""
+        job["api_area"] = params_payload.get("api_area") or api_area or ""
         result_summary = ""
         if row["result_json"]:
             try:
@@ -5983,6 +6264,8 @@ def fetch_latest_background_jobs(
                     parts.append(f"retomar: {result['resume_hint']}")
                 if result.get("stopped_reason"):
                     parts.append(str(result["stopped_reason"]))
+                if result.get("cooldown_until"):
+                    parts.append(f"nova tentativa: {result['cooldown_until']}")
                 elif result.get("status"):
                     parts.append(f"estado: {result['status']}")
                 result_summary = " | ".join(parts)
@@ -6020,6 +6303,35 @@ def normalize_bool(value: Any, default: bool = False) -> bool:
     if not normalized:
         return default
     return normalized in {"1", "true", "yes", "on", "sim", "y"}
+
+
+def normalize_positive_int(value: Any, default: int, minimum: int = 1, maximum: int | None = None) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
+    return parsed
+
+
+def normalize_clock_time(value: Any, default: str) -> str:
+    raw = str(value or "").strip()
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", raw)
+    if not match:
+        return default
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if hour > 23 or minute > 59:
+        return default
+    return f"{hour:02d}:{minute:02d}"
+
+
+def split_clock_time(value: Any, default: str) -> tuple[int, int]:
+    normalized = normalize_clock_time(value, default)
+    hour, minute = normalized.split(":")
+    return int(hour), int(minute)
 
 
 def get_alert_setting(conn: sqlite3.Connection, key: str, default: str | None = None) -> str:
@@ -10217,6 +10529,9 @@ def get_fusionsolar_env_config() -> dict[str, str]:
             DEFAULT_FUSIONSOLAR_MONTH_KPI_ENDPOINT,
         ).strip(),
         "sync_hours": os.environ.get("FUSIONSOLAR_SYNC_HOURS", DEFAULT_FUSIONSOLAR_SYNC_HOURS).strip(),
+        "state_sync_interval_hours": os.environ.get("FUSIONSOLAR_STATE_SYNC_INTERVAL_HOURS", "").strip(),
+        "production_sync_time": os.environ.get("FUSIONSOLAR_PRODUCTION_SYNC_TIME", "").strip(),
+        "diagnostics_sync_time": os.environ.get("FUSIONSOLAR_DIAGNOSTICS_SYNC_TIME", "").strip(),
     }
 
 
@@ -10232,6 +10547,7 @@ def get_sigenergy_env_config() -> dict[str, str]:
         "day_kpi_endpoint": "",
         "month_kpi_endpoint": "",
         "sync_hours": os.environ.get("SIGENERGY_SYNC_HOURS", DEFAULT_SIGENERGY_SYNC_HOURS).strip(),
+        "state_sync_interval_hours": os.environ.get("SIGENERGY_STATE_SYNC_INTERVAL_HOURS", "").strip(),
         "region": os.environ.get("SIGENERGY_REGION", DEFAULT_SIGENERGY_REGION).strip() or DEFAULT_SIGENERGY_REGION,
         "system_ids": os.environ.get("SIGENERGY_SYSTEM_IDS", os.environ.get("SIGENERGY_SYSTEM_ID", "")).strip(),
         "snapshot_retention_days": os.environ.get("SIGENERGY_SNAPSHOT_RETENTION_DAYS", str(DEFAULT_SIGENERGY_SNAPSHOT_RETENTION_DAYS)).strip(),
@@ -10261,6 +10577,11 @@ def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
                 day_kpi_endpoint = CASE WHEN COALESCE(day_kpi_endpoint, '') = '' THEN ? ELSE day_kpi_endpoint END,
                 month_kpi_endpoint = CASE WHEN COALESCE(month_kpi_endpoint, '') = '' THEN ? ELSE month_kpi_endpoint END,
                 sync_hours = CASE WHEN COALESCE(sync_hours, '') = '' THEN ? ELSE sync_hours END,
+                production_sync_enabled = CASE WHEN production_sync_enabled IS NULL THEN 1 ELSE production_sync_enabled END,
+                diagnostics_sync_enabled = CASE WHEN diagnostics_sync_enabled IS NULL THEN 1 ELSE diagnostics_sync_enabled END,
+                state_sync_interval_hours = CASE WHEN state_sync_interval_hours IS NULL OR state_sync_interval_hours < 1 THEN ? ELSE state_sync_interval_hours END,
+                production_sync_time = CASE WHEN COALESCE(production_sync_time, '') = '' THEN ? ELSE production_sync_time END,
+                diagnostics_sync_time = CASE WHEN COALESCE(diagnostics_sync_time, '') = '' THEN ? ELSE diagnostics_sync_time END,
                 updated_at = ?
             WHERE provider = ?
             """,
@@ -10277,6 +10598,9 @@ def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
                 env_config["day_kpi_endpoint"],
                 env_config["month_kpi_endpoint"],
                 env_config["sync_hours"],
+                DEFAULT_STATE_SYNC_INTERVAL_HOURS,
+                DEFAULT_FUSIONSOLAR_PRODUCTION_SYNC_TIME,
+                DEFAULT_FUSIONSOLAR_DIAGNOSTICS_SYNC_TIME,
                 datetime.now().isoformat(timespec="seconds"),
                 INTEGRATION_PROVIDER_FUSIONSOLAR,
             ),
@@ -10288,8 +10612,9 @@ def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
                 provider, username, password, base_url, login_endpoint, plants_endpoint, real_time_endpoint,
                 device_list_endpoint, device_real_time_endpoint, device_history_endpoint, alarms_endpoint,
                 day_kpi_endpoint, month_kpi_endpoint,
-                enabled, auto_sync_enabled, sync_hours, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                enabled, auto_sync_enabled, sync_hours, production_sync_enabled, diagnostics_sync_enabled,
+                state_sync_interval_hours, production_sync_time, diagnostics_sync_time, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 INTEGRATION_PROVIDER_FUSIONSOLAR,
@@ -10308,6 +10633,11 @@ def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
                 0,
                 0,
                 env_config["sync_hours"],
+                1,
+                1,
+                DEFAULT_STATE_SYNC_INTERVAL_HOURS,
+                DEFAULT_FUSIONSOLAR_PRODUCTION_SYNC_TIME,
+                DEFAULT_FUSIONSOLAR_DIAGNOSTICS_SYNC_TIME,
                 datetime.now().isoformat(timespec="seconds"),
                 datetime.now().isoformat(timespec="seconds"),
             ),
@@ -10330,6 +10660,9 @@ def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
                 energy_flow_endpoint = CASE WHEN COALESCE(energy_flow_endpoint, '') = '' THEN ? ELSE energy_flow_endpoint END,
                 onboard_endpoint = CASE WHEN COALESCE(onboard_endpoint, '') = '' THEN ? ELSE onboard_endpoint END,
                 sync_hours = CASE WHEN COALESCE(sync_hours, '') = '' THEN ? ELSE sync_hours END,
+                state_sync_interval_hours = CASE WHEN state_sync_interval_hours IS NULL OR state_sync_interval_hours < 1 THEN ? ELSE state_sync_interval_hours END,
+                production_sync_enabled = 0,
+                diagnostics_sync_enabled = 0,
                 region = CASE WHEN COALESCE(region, '') = '' THEN ? ELSE region END,
                 system_ids = CASE WHEN COALESCE(system_ids, '') = '' THEN ? ELSE system_ids END,
                 snapshot_retention_days = CASE WHEN snapshot_retention_days IS NULL OR snapshot_retention_days <= 0 THEN ? ELSE snapshot_retention_days END,
@@ -10345,6 +10678,7 @@ def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
                 sigenergy_env["energy_flow_endpoint"],
                 sigenergy_env["onboard_endpoint"],
                 sigenergy_env["sync_hours"],
+                DEFAULT_STATE_SYNC_INTERVAL_HOURS,
                 sigenergy_env["region"],
                 sigenergy_env["system_ids"],
                 int(sigenergy_env["snapshot_retention_days"] or DEFAULT_SIGENERGY_SNAPSHOT_RETENTION_DAYS),
@@ -10360,8 +10694,9 @@ def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
         INSERT INTO integration_configs (
             provider, username, password, base_url, login_endpoint, plants_endpoint, energy_flow_endpoint, onboard_endpoint,
             day_kpi_endpoint, month_kpi_endpoint, region, system_ids, snapshot_retention_days,
-            enabled, auto_sync_enabled, sync_hours, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            enabled, auto_sync_enabled, sync_hours, production_sync_enabled, diagnostics_sync_enabled,
+            state_sync_interval_hours, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             INTEGRATION_PROVIDER_SIGENERGY,
@@ -10380,6 +10715,9 @@ def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
             sigenergy_enabled,
             sigenergy_enabled,
             sigenergy_env["sync_hours"],
+            0,
+            0,
+            DEFAULT_STATE_SYNC_INTERVAL_HOURS,
             datetime.now().isoformat(timespec="seconds"),
             datetime.now().isoformat(timespec="seconds"),
         ),
@@ -10393,9 +10731,27 @@ def get_integration_config(conn: sqlite3.Connection, provider: str) -> dict[str,
     config = dict(row)
     if provider == INTEGRATION_PROVIDER_FUSIONSOLAR:
         env_config = get_fusionsolar_env_config()
+        config["env_overrides"] = {}
         for key, value in env_config.items():
             if value and key in config:
                 config[key] = value
+                config["env_overrides"][key] = True
+        config["state_sync_interval_hours"] = normalize_positive_int(
+            config.get("state_sync_interval_hours"),
+            DEFAULT_STATE_SYNC_INTERVAL_HOURS,
+            minimum=1,
+            maximum=24,
+        )
+        config["production_sync_time"] = normalize_clock_time(
+            config.get("production_sync_time"),
+            DEFAULT_FUSIONSOLAR_PRODUCTION_SYNC_TIME,
+        )
+        config["diagnostics_sync_time"] = normalize_clock_time(
+            config.get("diagnostics_sync_time"),
+            DEFAULT_FUSIONSOLAR_DIAGNOSTICS_SYNC_TIME,
+        )
+        config["production_sync_enabled"] = 1 if normalize_bool(config.get("production_sync_enabled"), True) else 0
+        config["diagnostics_sync_enabled"] = 1 if normalize_bool(config.get("diagnostics_sync_enabled"), True) else 0
         config["password_configured"] = bool(config.get("password"))
         config["password_source"] = "env" if env_config["password"] else ("database" if config.get("password") else "")
     if provider == INTEGRATION_PROVIDER_SIGENERGY:
@@ -10409,6 +10765,7 @@ def get_integration_config(conn: sqlite3.Connection, provider: str) -> dict[str,
             "energy_flow_endpoint": "SIGENERGY_ENERGY_FLOW_ENDPOINT",
             "onboard_endpoint": "SIGENERGY_ONBOARD_ENDPOINT",
             "sync_hours": "SIGENERGY_SYNC_HOURS",
+            "state_sync_interval_hours": "SIGENERGY_STATE_SYNC_INTERVAL_HOURS",
             "snapshot_retention_days": "SIGENERGY_SNAPSHOT_RETENTION_DAYS",
         }
         config["env_overrides"] = {}
@@ -10423,6 +10780,14 @@ def get_integration_config(conn: sqlite3.Connection, provider: str) -> dict[str,
         config["energy_flow_endpoint"] = config.get("energy_flow_endpoint") or DEFAULT_SIGENERGY_ENERGY_FLOW_ENDPOINT
         config["onboard_endpoint"] = config.get("onboard_endpoint") or DEFAULT_SIGENERGY_ONBOARD_ENDPOINT
         config["sync_hours"] = config.get("sync_hours") or DEFAULT_SIGENERGY_SYNC_HOURS
+        config["state_sync_interval_hours"] = normalize_positive_int(
+            config.get("state_sync_interval_hours"),
+            DEFAULT_STATE_SYNC_INTERVAL_HOURS,
+            minimum=1,
+            maximum=24,
+        )
+        config["production_sync_enabled"] = 0
+        config["diagnostics_sync_enabled"] = 0
         config["snapshot_retention_days"] = int(config.get("snapshot_retention_days") or DEFAULT_SIGENERGY_SNAPSHOT_RETENTION_DAYS)
         if os.environ.get("SIGENERGY_REGION", "").strip():
             config["region"] = env_config["region"]
@@ -10448,6 +10813,7 @@ def start_integration_scheduler(app: Flask) -> None:
     SCHEDULER = BackgroundScheduler(timezone="Europe/Lisbon")
     SCHEDULER.start()
     refresh_integration_scheduler(app)
+    register_background_job_reactivation_scheduler(app)
     schedule_pending_background_jobs(app)
 
 
@@ -10459,7 +10825,17 @@ def refresh_integration_scheduler(app: Flask) -> None:
         if (
             job.id.startswith("integration-sync-")
             or job.id.startswith("fusionsolar-sync-")
-            or job.id in {"telegram-daily-summary", "fusionsolar-production-daily", "fusionsolar-wat-daily"}
+            or job.id
+            in {
+                "telegram-daily-summary",
+                "fusionsolar-production-daily",
+                "fusionsolar-wat-daily",
+                "integration-state-fusionsolar-hourly",
+                "integration-production-fusionsolar-daily",
+                "integration-diagnostics-fusionsolar-daily",
+                "integration-state-sigenergy-hourly",
+                "background-jobs-reactivate-rate-limit",
+            }
         ):
             SCHEDULER.remove_job(job.id)
 
@@ -10482,68 +10858,86 @@ def refresh_integration_scheduler(app: Flask) -> None:
         if config is None or not config["enabled"]:
             continue
         provider = str(config["provider"])
-        normalized_provider = normalize_name(provider).replace(" ", "-")
         if provider == INTEGRATION_PROVIDER_FUSIONSOLAR:
-            if config["auto_sync_enabled"]:
-                sync_hours = normalize_sync_hours(config["sync_hours"] or DEFAULT_FUSIONSOLAR_SYNC_HOURS)
-                app.logger.info("Registering FusionSolar sync jobs at %s", sync_hours)
-                for index, item in enumerate(sync_hours.split(","), start=1):
-                    hour, minute = item.split(":")
-                    SCHEDULER.add_job(
-                        func=run_scheduled_integration_sync,
-                        trigger="cron",
-                        hour=int(hour),
-                        minute=int(minute),
-                        args=[app, provider],
-                        id=f"integration-sync-{normalized_provider}-{index}",
-                        replace_existing=True,
-                        max_instances=1,
-                        coalesce=True,
-                        misfire_grace_time=1800,
-                    )
-            SCHEDULER.add_job(
-                func=run_scheduled_fusionsolar_production_sync,
-                trigger="cron",
-                hour=0,
-                minute=10,
-                args=[app],
-                id="fusionsolar-production-daily",
-                replace_existing=True,
-                max_instances=1,
-                coalesce=True,
-                misfire_grace_time=1800,
-            )
-            SCHEDULER.add_job(
-                func=run_scheduled_fusionsolar_wat_backfill,
-                trigger="cron",
-                hour=0,
-                minute=30,
-                args=[app],
-                id="fusionsolar-wat-daily",
-                replace_existing=True,
-                max_instances=1,
-                coalesce=True,
-                misfire_grace_time=1800,
-            )
+            register_fusionsolar_scheduler_jobs(app, config)
             continue
-        if not config["auto_sync_enabled"]:
-            continue
-        sync_hours = normalize_sync_hours(config["sync_hours"] or DEFAULT_FUSIONSOLAR_SYNC_HOURS)
-        app.logger.info("Registering %s sync jobs at %s", provider, sync_hours)
-        for index, item in enumerate(sync_hours.split(","), start=1):
-            hour, minute = item.split(":")
-            SCHEDULER.add_job(
-                func=run_scheduled_integration_sync,
-                trigger="cron",
-                hour=int(hour),
-                minute=int(minute),
-                args=[app, provider],
-                id=f"integration-sync-{normalized_provider}-{index}",
-                replace_existing=True,
-                max_instances=1,
-                coalesce=True,
-                misfire_grace_time=1800,
-            )
+        if provider == INTEGRATION_PROVIDER_SIGENERGY:
+            register_sigenergy_scheduler_jobs(app, config)
+    register_background_job_reactivation_scheduler(app)
+
+
+def add_scheduler_job(**kwargs: Any) -> None:
+    if SCHEDULER is None:
+        return
+    kwargs.setdefault("replace_existing", True)
+    kwargs.setdefault("max_instances", 1)
+    kwargs.setdefault("coalesce", True)
+    kwargs.setdefault("misfire_grace_time", 1800)
+    SCHEDULER.add_job(**kwargs)
+
+
+def register_hourly_state_sync(app: Flask, config: dict[str, Any], job_id: str) -> None:
+    if not config.get("auto_sync_enabled"):
+        return
+    interval_hours = normalize_positive_int(
+        config.get("state_sync_interval_hours"),
+        DEFAULT_STATE_SYNC_INTERVAL_HOURS,
+        minimum=1,
+        maximum=24,
+    )
+    provider = str(config["provider"])
+    app.logger.info("Registering %s state sync every %s hour(s)", provider, interval_hours)
+    add_scheduler_job(
+        func=run_scheduled_hourly_state_sync,
+        trigger="interval",
+        hours=interval_hours,
+        args=[app, provider],
+        id=job_id,
+    )
+
+
+def register_fusionsolar_scheduler_jobs(app: Flask, config: dict[str, Any]) -> None:
+    register_hourly_state_sync(app, config, "integration-state-fusionsolar-hourly")
+    if config.get("production_sync_enabled"):
+        hour, minute = split_clock_time(config.get("production_sync_time"), DEFAULT_FUSIONSOLAR_PRODUCTION_SYNC_TIME)
+        add_scheduler_job(
+            func=run_scheduled_fusionsolar_production_sync,
+            trigger="cron",
+            hour=hour,
+            minute=minute,
+            args=[app],
+            id="integration-production-fusionsolar-daily",
+        )
+    if config.get("diagnostics_sync_enabled"):
+        hour, minute = split_clock_time(config.get("diagnostics_sync_time"), DEFAULT_FUSIONSOLAR_DIAGNOSTICS_SYNC_TIME)
+        add_scheduler_job(
+            func=run_scheduled_fusionsolar_diagnostics_sync,
+            trigger="cron",
+            hour=hour,
+            minute=minute,
+            args=[app],
+            id="integration-diagnostics-fusionsolar-daily",
+        )
+
+
+def register_sigenergy_scheduler_jobs(app: Flask, config: dict[str, Any]) -> None:
+    register_hourly_state_sync(app, config, "integration-state-sigenergy-hourly")
+
+
+def register_background_job_reactivation_scheduler(app: Flask) -> None:
+    add_scheduler_job(
+        func=run_scheduled_background_job_reactivation,
+        trigger="interval",
+        minutes=5,
+        args=[app],
+        id="background-jobs-reactivate-rate-limit",
+    )
+
+
+def run_scheduled_background_job_reactivation(app: Flask) -> None:
+    summary = schedule_pending_background_jobs(app)
+    if summary.get("rate_limit_reactivated") or summary.get("pending_scheduled"):
+        app.logger.info("Background job reactivation summary: %s", summary)
 
 
 def run_scheduled_telegram_daily_summary(app: Flask) -> None:
@@ -10567,8 +10961,26 @@ def run_scheduled_integration_sync(app: Flask, provider: str) -> None:
                 current_app.logger.exception("Scheduled %s sync failed", provider)
 
 
+def run_scheduled_hourly_state_sync(app: Flask, provider: str) -> None:
+    with app.app_context():
+        with closing(get_db(app.config["DATABASE"])) as conn:
+            try:
+                job_type = "sigenergy_state_sync" if provider == INTEGRATION_PROVIDER_SIGENERGY else "fusionsolar_state_sync"
+                job_id, created = create_background_job(
+                    conn,
+                    job_type,
+                    {"provider": provider, "trigger_type": "scheduled_state"},
+                )
+                conn.commit()
+                if created:
+                    schedule_background_job(app, job_id)
+                current_app.logger.info("Scheduled %s state sync queued: job_id=%s created=%s", provider, job_id, created)
+            except Exception:
+                current_app.logger.exception("Scheduled %s state sync failed", provider)
+
+
 def run_scheduled_fusionsolar_sync(app: Flask) -> None:
-    run_scheduled_integration_sync(app, INTEGRATION_PROVIDER_FUSIONSOLAR)
+    run_scheduled_hourly_state_sync(app, INTEGRATION_PROVIDER_FUSIONSOLAR)
 
 
 def current_lisbon_date() -> date:
@@ -10589,6 +11001,12 @@ def run_scheduled_fusionsolar_production_sync(app: Flask) -> None:
             if config is None or not config["enabled"]:
                 current_app.logger.info(
                     "Scheduled FusionSolar production skipped because integration is disabled: target_date=%s",
+                    target_date,
+                )
+                return
+            if not config.get("production_sync_enabled"):
+                current_app.logger.info(
+                    "Scheduled FusionSolar production skipped because production sync is disabled: target_date=%s",
                     target_date,
                 )
                 return
@@ -10635,6 +11053,12 @@ def run_scheduled_fusionsolar_wat_backfill(app: Flask) -> None:
                     target_date,
                 )
                 return
+            if not config.get("diagnostics_sync_enabled"):
+                current_app.logger.info(
+                    "Scheduled FusionSolar WAT skipped because diagnostics sync is disabled: target_date=%s",
+                    target_date,
+                )
+                return
             job_id, created = create_background_job(
                 conn,
                 "fusionsolar_inverter_availability_backfill",
@@ -10662,14 +11086,18 @@ def run_scheduled_fusionsolar_wat_backfill(app: Flask) -> None:
                 )
 
 
-def schedule_background_job(app: Flask, job_id: int) -> bool:
+def run_scheduled_fusionsolar_diagnostics_sync(app: Flask) -> None:
+    run_scheduled_fusionsolar_wat_backfill(app)
+
+
+def schedule_background_job(app: Flask, job_id: int, run_date: datetime | None = None) -> bool:
     if SCHEDULER is None:
         app.logger.error("Background job %s was queued but APScheduler is not running", job_id)
         return False
     SCHEDULER.add_job(
         func=run_background_job,
         trigger="date",
-        run_date=datetime.now(),
+        run_date=run_date or datetime.now(),
         args=[app, job_id],
         id=f"background-job-{job_id}",
         replace_existing=True,
@@ -10683,6 +11111,9 @@ def schedule_pending_background_jobs(app: Flask) -> dict[str, Any]:
         recovered_count = mark_stale_running_background_jobs_failed(conn)
         if recovered_count:
             app.logger.warning("Marked %s stale running background jobs as failed on startup", recovered_count)
+        reactivated_count = reactivate_due_rate_limited_background_jobs(conn)
+        if reactivated_count:
+            app.logger.info("Reactivated %s background jobs after API cooldown", reactivated_count)
         pending_job_ids = fetch_pending_background_job_ids(conn)
     failed_job_ids: list[int] = []
     for job_id in pending_job_ids:
@@ -10695,6 +11126,7 @@ def schedule_pending_background_jobs(app: Flask) -> dict[str, Any]:
         app.logger.warning("Could not schedule pending background jobs on startup: %s", failed_job_ids)
     return {
         "stale_running_failed": recovered_count,
+        "rate_limit_reactivated": reactivated_count,
         "pending_found": len(pending_job_ids),
         "pending_scheduled": scheduled_count,
         "pending_schedule_failed_ids": failed_job_ids,
@@ -10717,22 +11149,70 @@ def run_background_job(app: Flask, job_id: int) -> None:
                 result = run_background_job_payload(conn, str(job["job_type"]), params)
                 mark_background_job_success(conn, job_id, result)
                 current_app.logger.info("Background job %s completed: %s", job_id, job["job_type"])
+            except ApiRateLimitError as exc:
+                current_app.logger.info(
+                    "Background job %s waiting for %s %s rate limit until %s",
+                    job_id,
+                    exc.provider,
+                    exc.area,
+                    exc.cooldown_until,
+                )
+                result = {
+                    "status": "waiting_rate_limit",
+                    "provider": exc.provider,
+                    "api_area": exc.area,
+                    "cooldown_until": exc.cooldown_until.isoformat(timespec="seconds"),
+                    "stopped_reason": exc.message,
+                }
+                mark_background_job_waiting_rate_limit(
+                    conn,
+                    job_id,
+                    next_attempt_at=exc.cooldown_until,
+                    error_message=exc.message,
+                    result=result,
+                )
+                schedule_background_job(app, job_id, run_date=exc.cooldown_until)
             except Exception as exc:
                 current_app.logger.exception("Background job %s failed: %s", job_id, job["job_type"])
                 mark_background_job_failed(conn, job_id, str(exc))
 
 
 def run_background_job_payload(conn: sqlite3.Connection, job_type: str, params: dict[str, Any]) -> dict[str, Any]:
+    provider, api_area = background_job_api_scope(job_type, params)
+    if provider and api_area:
+        require_not_in_cooldown(conn, provider, api_area)
+        record_api_attempt(conn, provider, api_area)
+
+    if job_type == "fusionsolar_state_sync":
+        result = run_fusionsolar_sync(
+            conn,
+            str(params.get("provider") or INTEGRATION_PROVIDER_FUSIONSOLAR),
+            trigger_type=str(params.get("trigger_type") or "manual_background"),
+        )
+        record_api_success(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_STATE)
+        return result
+
+    if job_type == "sigenergy_state_sync":
+        result = run_sigenergy_sync(
+            conn,
+            str(params.get("provider") or INTEGRATION_PROVIDER_SIGENERGY),
+            trigger_type=str(params.get("trigger_type") or "manual_background"),
+        )
+        record_api_success(conn, INTEGRATION_PROVIDER_SIGENERGY, API_AREA_STATE)
+        return result
+
     if job_type == "fusionsolar_production_sync":
         target_date = parse_date_value(str(params.get("target_date") or ""))
         if target_date is None:
             raise ValueError("Data invalida para sync de producao.")
-        return run_fusionsolar_production_sync(
+        result = run_fusionsolar_production_sync(
             conn,
             provider=str(params.get("provider") or INTEGRATION_PROVIDER_FUSIONSOLAR),
             target_date=target_date,
             period_type=str(params.get("period_type") or "day"),
         )
+        record_api_success(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_PRODUCTION)
+        return result
 
     if job_type == "performance_reference_recalculation":
         period_date = parse_date_value(str(params.get("period_date") or ""))
@@ -10751,7 +11231,7 @@ def run_background_job_payload(conn: sqlite3.Connection, job_type: str, params: 
         date_from = parse_date_value(str(params.get("date_from") or ""))
         date_to = parse_date_value(str(params.get("date_to") or ""))
         asset_id_value = params.get("asset_id")
-        return run_fusionsolar_production_backfill(
+        result = run_fusionsolar_production_backfill(
             conn,
             provider=str(params.get("provider") or INTEGRATION_PROVIDER_FUSIONSOLAR),
             period_type=str(params.get("period_type") or "day"),
@@ -10762,29 +11242,274 @@ def run_background_job_payload(conn: sqlite3.Connection, job_type: str, params: 
             date_to=date_to,
             max_api_calls=int(params.get("max_api_calls") or FUSIONSOLAR_PERFORMANCE_MAX_API_CALLS),
         )
+        record_api_success(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_PRODUCTION)
+        return result
 
     if job_type == "fusionsolar_inverter_availability_backfill":
         from_date = parse_date_value(str(params.get("from_date") or ""))
         to_date = parse_date_value(str(params.get("to_date") or ""))
         if from_date is None or to_date is None or from_date > to_date:
             raise ValueError("Intervalo invalido para backfill WAT.")
-        return run_fusionsolar_inverter_availability_backfill(
+        result = run_fusionsolar_inverter_availability_backfill(
             conn,
             from_date=from_date,
             to_date=to_date,
         )
+        record_api_success(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_DIAGNOSTICS)
+        return result
 
     if job_type == "fusionsolar_month_cycle":
         raw_asset_ids = params.get("asset_ids") or []
         asset_ids = [int(value) for value in raw_asset_ids if str(value).isdigit()]
-        return run_fusionsolar_month_cycle(
+        result = run_fusionsolar_month_cycle(
             conn,
             provider=str(params.get("provider") or INTEGRATION_PROVIDER_FUSIONSOLAR),
             report_month=str(params.get("report_month") or date.today().strftime("%Y-%m")),
             asset_ids=asset_ids,
         )
+        record_api_success(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_PRODUCTION)
+        return result
 
     raise ValueError(f"Tipo de job desconhecido: {job_type}")
+
+
+def background_job_api_scope(job_type: str, params: dict[str, Any]) -> tuple[str, str]:
+    provider = str(params.get("provider") or "")
+    if job_type == "fusionsolar_state_sync":
+        return provider or INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_STATE
+    if job_type in {"fusionsolar_production_sync", "fusionsolar_production_backfill", "fusionsolar_month_cycle"}:
+        return provider or INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_PRODUCTION
+    if job_type == "fusionsolar_inverter_availability_backfill":
+        return provider or INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_DIAGNOSTICS
+    if job_type == "sigenergy_state_sync":
+        return provider or INTEGRATION_PROVIDER_SIGENERGY, API_AREA_STATE
+    return "", ""
+
+
+def fusionsolar_area_for_url(url: str) -> str:
+    lowered = url.lower()
+    if "getkpistationday" in lowered or "getkpistationmonth" in lowered:
+        return API_AREA_PRODUCTION
+    if any(token in lowered for token in ("getdevlist", "getdevrealkpi", "getdevhistorykpi", "getalarmlist")):
+        return API_AREA_DIAGNOSTICS
+    return API_AREA_STATE
+
+
+def raise_fusionsolar_rate_limit(exc: FusionSolarRateLimitError, api_area: str) -> None:
+    conn = _current_app_db_connection()
+    try:
+        until = mark_fusionsolar_api_cooldown(conn, api_area, reason=str(exc))
+        reason = get_provider_cooldown_reason(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, api_area) if conn else str(exc)
+        raise ApiRateLimitError(INTEGRATION_PROVIDER_FUSIONSOLAR, api_area, until, reason) from exc
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def get_provider_cooldown_reason(
+    conn: sqlite3.Connection,
+    provider: str,
+    area: str,
+    now_value: datetime | None = None,
+) -> str:
+    until = active_cooldown_until(conn, provider, area, now_value or datetime.now())
+    if until is None:
+        return ""
+    remaining_seconds = int((until - (now_value or datetime.now())).total_seconds())
+    remaining_minutes = max(1, (remaining_seconds + 59) // 60)
+    return (
+        f"{provider} em espera por limite da API. "
+        f"Nova tentativa disponivel apos {until.isoformat(timespec='minutes')} ({remaining_minutes} min)."
+    )
+
+
+def list_api_call_states(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    ensure_api_call_state_schema(conn)
+    rows = query_all(
+        conn,
+        """
+        SELECT provider, api_area, cooldown_until, last_error, last_success_at,
+               last_attempt_at, last_alert_at, updated_at
+        FROM api_call_state
+        ORDER BY provider, api_area
+        """,
+    )
+    now_value = datetime.now()
+    states: list[dict[str, Any]] = []
+    for row in rows:
+        state = dict(row)
+        until = active_cooldown_until(conn, str(row["provider"]), str(row["api_area"]), now_value)
+        state["cooldown_active"] = bool(until)
+        state["cooldown_message"] = get_provider_cooldown_reason(
+            conn,
+            str(row["provider"]),
+            str(row["api_area"]),
+            now_value,
+        )
+        states.append(state)
+    return states
+
+
+def clear_api_cooldown(conn: sqlite3.Connection, provider: str, api_area: str | None = None) -> None:
+    ensure_api_call_state_schema(conn)
+    if api_area:
+        conn.execute(
+            """
+            UPDATE api_call_state
+            SET cooldown_until = '', last_error = '', updated_at = ?
+            WHERE provider = ? AND api_area = ?
+            """,
+            (datetime.now().isoformat(timespec="seconds"), provider, api_area),
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE api_call_state
+            SET cooldown_until = '', last_error = '', updated_at = ?
+            WHERE provider = ?
+            """,
+            (datetime.now().isoformat(timespec="seconds"), provider),
+        )
+    if provider == INTEGRATION_PROVIDER_FUSIONSOLAR:
+        clear_fusionsolar_rate_limit_cooldown(conn)
+
+
+def latest_background_job_for_type(conn: sqlite3.Connection, job_type: str) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT id, job_type, status, params_json, result_json, error_message,
+               created_at, started_at, finished_at, next_attempt_at
+        FROM background_jobs
+        WHERE job_type = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (job_type,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def scheduler_next_run_label(job_id: str) -> str:
+    if SCHEDULER is None:
+        return ""
+    job = SCHEDULER.get_job(job_id)
+    next_run = getattr(job, "next_run_time", None) if job else None
+    if not next_run:
+        return ""
+    try:
+        return next_run.astimezone(LISBON_TIMEZONE).isoformat(timespec="minutes")
+    except Exception:
+        return str(next_run)
+
+
+def build_integration_api_controls(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    configs = {
+        provider: get_integration_config(conn, provider)
+        for provider in INTEGRATION_PROVIDER_OPTIONS
+    }
+    state_rows = {
+        (row["provider"], row["api_area"]): row
+        for row in list_api_call_states(conn)
+    }
+    job_types = {
+        (INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_STATE): "fusionsolar_state_sync",
+        (INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_PRODUCTION): "fusionsolar_production_sync",
+        (INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_DIAGNOSTICS): "fusionsolar_inverter_availability_backfill",
+        (INTEGRATION_PROVIDER_SIGENERGY, API_AREA_STATE): "sigenergy_state_sync",
+    }
+    scheduler_jobs = {
+        (INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_STATE): "integration-state-fusionsolar-hourly",
+        (INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_PRODUCTION): "integration-production-fusionsolar-daily",
+        (INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_DIAGNOSTICS): "integration-diagnostics-fusionsolar-daily",
+        (INTEGRATION_PROVIDER_SIGENERGY, API_AREA_STATE): "integration-state-sigenergy-hourly",
+    }
+    controls: list[dict[str, Any]] = []
+    for provider in INTEGRATION_PROVIDER_OPTIONS:
+        config = configs.get(provider)
+        if config is None:
+            continue
+        credentials_ok = bool(config.get("username")) and bool(config.get("password_configured"))
+        provider_areas = [API_AREA_STATE]
+        if provider == INTEGRATION_PROVIDER_FUSIONSOLAR:
+            provider_areas.extend([API_AREA_PRODUCTION, API_AREA_DIAGNOSTICS])
+        areas: dict[str, dict[str, Any]] = {}
+        for area in provider_areas:
+            state = state_rows.get((provider, area), {})
+            job_type = job_types.get((provider, area), "")
+            latest_job = latest_background_job_for_type(conn, job_type) if job_type else None
+            cooldown_active = bool(state.get("cooldown_active"))
+            if not config.get("enabled"):
+                api_status = "Disabled"
+            elif not credentials_ok:
+                api_status = "Sem credenciais"
+            elif cooldown_active:
+                api_status = "Em cooldown"
+            elif latest_job and latest_job.get("status") == "failed":
+                api_status = "Falhou ultima tentativa"
+            else:
+                api_status = "OK"
+            areas[area] = {
+                "state": state,
+                "latest_job": latest_job,
+                "api_status": api_status,
+                "last_attempt_at": state.get("last_attempt_at") or (latest_job or {}).get("started_at") or "",
+                "last_success_at": state.get("last_success_at") or "",
+                "next_attempt_at": state.get("cooldown_until") if cooldown_active else (latest_job or {}).get("next_attempt_at") or "",
+                "next_scheduled_at": scheduler_next_run_label(scheduler_jobs.get((provider, area), "")),
+                "last_error": state.get("last_error") or (latest_job or {}).get("error_message") or "",
+                "cooldown_active": cooldown_active,
+                "cooldown_message": state.get("cooldown_message") or "",
+            }
+        controls.append(
+            {
+                "provider": provider,
+                "config": config,
+                "enabled": bool(config.get("enabled")),
+                "credentials_ok": credentials_ok,
+                "state_enabled": bool(config.get("auto_sync_enabled")),
+                "production_enabled": bool(config.get("production_sync_enabled")) if provider == INTEGRATION_PROVIDER_FUSIONSOLAR else False,
+                "diagnostics_enabled": bool(config.get("diagnostics_sync_enabled")) if provider == INTEGRATION_PROVIDER_FUSIONSOLAR else False,
+                "auto_sync_enabled": bool(config.get("auto_sync_enabled")),
+                "state_interval_hours": config.get("state_sync_interval_hours") or DEFAULT_STATE_SYNC_INTERVAL_HOURS,
+                "production_sync_time": config.get("production_sync_time") or DEFAULT_FUSIONSOLAR_PRODUCTION_SYNC_TIME,
+                "diagnostics_sync_time": config.get("diagnostics_sync_time") or DEFAULT_FUSIONSOLAR_DIAGNOSTICS_SYNC_TIME,
+                "areas": areas,
+                "state_area": areas.get(API_AREA_STATE, {}),
+                "production_area": areas.get(API_AREA_PRODUCTION, {}),
+                "diagnostics_area": areas.get(API_AREA_DIAGNOSTICS, {}),
+            }
+        )
+    return controls
+
+
+def notify_api_rate_limit(
+    conn: sqlite3.Connection,
+    provider: str,
+    api_area: str,
+    cooldown_until: datetime,
+    message: str,
+) -> None:
+    state = get_api_call_state(conn, provider, api_area)
+    last_alert_at = parse_datetime_value(str(state.get("last_alert_at") or ""))
+    if last_alert_at and last_alert_at >= datetime.now() - timedelta(minutes=DEFAULT_FUSIONSOLAR_RATE_LIMIT_MINUTES):
+        return
+    now = datetime.now().isoformat(timespec="seconds")
+    conn.execute(
+        """
+        UPDATE api_call_state
+        SET last_alert_at = ?, updated_at = ?
+        WHERE provider = ? AND api_area = ?
+        """,
+        (now, now, provider, api_area),
+    )
+    alert_key = f"api_rate_limit:{provider}:{api_area}:{cooldown_until.strftime('%Y%m%d%H%M')}"
+    telegram_message = (
+        f"<b>{html.escape(provider)} API em cooldown</b>\n\n"
+        f"Area: {html.escape(api_area)}\n"
+        f"Ate: {cooldown_until.isoformat(timespec='minutes')}\n"
+        f"{html.escape(message)}"
+    )
+    send_and_record_telegram_alert(conn, None, "api_rate_limit", alert_key, telegram_message)
 
 
 def get_fusionsolar_endpoint_config(config: sqlite3.Row | dict[str, Any]) -> dict[str, str]:
@@ -10802,15 +11527,26 @@ def get_fusionsolar_endpoint_config(config: sqlite3.Row | dict[str, Any]) -> dic
     }
 
 
+def build_fusionsolar_endpoints(config: sqlite3.Row | dict[str, Any]) -> FusionSolarEndpoints:
+    endpoints = get_fusionsolar_endpoint_config(config)
+    return FusionSolarEndpoints(**endpoints)
+
+
+def build_fusionsolar_client(config: sqlite3.Row | dict[str, Any]) -> FusionSolarClient:
+    return fusionsolar_client_module.client_from_config(
+        dict(config),
+        build_fusionsolar_endpoints(config),
+        session_factory=requests.Session,
+        session_cache=FUSIONSOLAR_SESSION_CACHE,
+        session_lock=FUSIONSOLAR_SESSION_LOCK,
+        session_cache_minutes=fusionsolar_session_cache_minutes(),
+        allow_sleep=not has_request_context(),
+        sleeper=time.sleep,
+    )
+
+
 def extract_fusionsolar_xsrf_token(response: requests.Response, session: requests.Session) -> str:
-    for key, value in response.headers.items():
-        if key.lower() == "xsrf-token" and value:
-            return value.strip()
-    for cookie_name in ("XSRF-TOKEN", "xsrf-token"):
-        cookie_value = session.cookies.get(cookie_name)
-        if cookie_value:
-            return str(cookie_value).strip()
-    raise ValueError("O login FusionSolar respondeu sem XSRF-TOKEN no header/cookies.")
+    return fusionsolar_client_module.extract_xsrf_token(response, session)
 
 
 def get_fusionsolar_session(config: sqlite3.Row | dict[str, Any], *, force_login: bool = False) -> tuple[requests.Session, str]:
@@ -10818,82 +11554,25 @@ def get_fusionsolar_session(config: sqlite3.Row | dict[str, Any], *, force_login
     if cooldown_reason:
         LOGGER.info("FusionSolar login blocked by active rate limit cooldown")
         raise ValueError(cooldown_reason)
-
-    endpoints = get_fusionsolar_endpoint_config(config)
-    base_url = endpoints["base_url"]
-    username = str(config["username"] or "").strip()
-    password = str(config["password"] or "").strip()
-
-    if not username or not password:
-        raise ValueError("Preenche username e password do FusionSolar.")
-    if not base_url:
-        raise ValueError("Preenche a Base URL do FusionSolar.")
-
-    cache_key = f"{base_url}|{username}"
-    now = datetime.now()
-
-    with FUSIONSOLAR_SESSION_LOCK:
-        cooldown_reason = get_fusionsolar_rate_limit_cooldown_reason()
-        if cooldown_reason:
-            LOGGER.info("FusionSolar login blocked by active rate limit cooldown")
-            raise ValueError(cooldown_reason)
-
-        cached = FUSIONSOLAR_SESSION_CACHE.get(cache_key)
-        if cached and not force_login and cached["expires_at"] > now:
-            LOGGER.info("Reusing cached FusionSolar session")
-            return cached["session"], cached["xsrf_token"]
-
-        LOGGER.info("FusionSolar login required; cached session missing, expired, or forced")
-        session = requests.Session()
+    try:
+        return build_fusionsolar_client(config).login(force_login=force_login)
+    except FusionSolarRateLimitError as exc:
+        conn = _current_app_db_connection()
         try:
-            login_response = session.post(
-                build_provider_url(base_url, endpoints["login_endpoint"]),
-                json={"userName": username, "systemCode": password},
-                headers={"Content-Type": "application/json", "Accept": "application/json, */*"},
-                timeout=30,
-            )
-            login_response.raise_for_status()
-        except requests.HTTPError as exc:
-            status_code = getattr(exc.response, "status_code", None)
-            raise FusionSolarApiError(
-                f"Erro HTTP no login FusionSolar ({status_code or 'sem codigo'}).",
-                status_code=status_code,
-                error_type="http",
-            ) from exc
-        try:
-            payload = login_response.json()
-        except ValueError as exc:
-            raise FusionSolarApiError("O login FusionSolar devolveu uma resposta JSON invalida.", error_type="invalid_json") from exc
-        if payload.get("success") is not True or int(payload.get("failCode") or 0) != 0:
-            message = payload.get("message") or "Login FusionSolar falhou."
-            if is_fusionsolar_rate_limit_payload(payload):
-                reason = mark_fusionsolar_rate_limited()
-                raise FusionSolarApiError(reason, payload=payload, error_type="rate_limit")
-            if is_fusionsolar_invalid_credentials_payload(payload):
-                raise FusionSolarApiError("Credenciais FusionSolar invalidas.", payload=payload, error_type="credentials")
-            raise FusionSolarApiError(f"{message} (failCode={payload.get('failCode')})", payload=payload)
-
-        xsrf_token = extract_fusionsolar_xsrf_token(login_response, session)
-        session.headers.update(
-            {
-                "Content-Type": "application/json",
-                "Accept": "application/json, */*",
-                "XSRF-TOKEN": xsrf_token,
-            }
-        )
-        FUSIONSOLAR_SESSION_CACHE[cache_key] = {
-            "session": session,
-            "xsrf_token": xsrf_token,
-            "expires_at": now + timedelta(minutes=fusionsolar_session_cache_minutes()),
-        }
-        return session, xsrf_token
+            until = mark_fusionsolar_api_cooldown(conn, API_AREA_STATE, reason=str(exc))
+            reason = get_provider_cooldown_reason(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_STATE) if conn else str(exc)
+            raise ApiRateLimitError(INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_STATE, until, reason) from exc
+        finally:
+            if conn is not None:
+                conn.close()
 
 
 def invalidate_fusionsolar_session(config: sqlite3.Row | dict[str, Any]) -> None:
-    endpoints = get_fusionsolar_endpoint_config(config)
-    cache_key = f"{endpoints['base_url']}|{str(config['username'] or '').strip()}"
-    with FUSIONSOLAR_SESSION_LOCK:
-        FUSIONSOLAR_SESSION_CACHE.pop(cache_key, None)
+    build_fusionsolar_client(config).invalidate_session()
+
+
+def fusionsolar_retry_options() -> dict[str, Any]:
+    return {"allow_sleep": not has_request_context(), "sleeper": time.sleep}
 
 
 def post_fusionsolar_json(
@@ -10903,31 +11582,26 @@ def post_fusionsolar_json(
     *,
     expected_message: str,
 ) -> dict[str, Any]:
-    cooldown_reason = get_fusionsolar_rate_limit_cooldown_reason()
-    if cooldown_reason:
-        LOGGER.info("FusionSolar API call blocked by active rate limit cooldown")
-        raise ValueError(cooldown_reason)
+    api_area = fusionsolar_area_for_url(url)
+    conn = _current_app_db_connection()
     try:
-        response = session.post(url, json=payload, timeout=30)
-        response.raise_for_status()
-    except requests.HTTPError as exc:
-        status_code = getattr(exc.response, "status_code", None)
-        raise FusionSolarApiError(
-            f"Erro HTTP na chamada FusionSolar ({status_code or 'sem codigo'}).",
-            status_code=status_code,
-            error_type="http",
-        ) from exc
-    try:
-        data = response.json()
-    except ValueError as exc:
-        raise FusionSolarApiError("A API FusionSolar devolveu uma resposta JSON invalida.", error_type="invalid_json") from exc
-    if data.get("success") is not True or int(data.get("failCode") or 0) != 0:
-        message = data.get("message") or expected_message
-        if is_fusionsolar_rate_limit_payload(data):
-            reason = mark_fusionsolar_rate_limited()
-            raise FusionSolarApiError(reason, payload=data, error_type="rate_limit")
-        raise FusionSolarApiError(f"{message} (failCode={data.get('failCode')})", payload=data)
-    return data
+        if conn is not None:
+            require_not_in_cooldown(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, api_area)
+        return fusionsolar_client_module.post_fusionsolar_json(
+            session,
+            url,
+            payload,
+            expected_message=expected_message,
+            require_data=False,
+            **fusionsolar_retry_options(),
+        )
+    except FusionSolarRateLimitError as exc:
+        until = mark_fusionsolar_api_cooldown(conn, api_area, reason=str(exc))
+        reason = get_provider_cooldown_reason(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, api_area) if conn else str(exc)
+        raise ApiRateLimitError(INTEGRATION_PROVIDER_FUSIONSOLAR, api_area, until, reason) from exc
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def chunked(values: list[str], size: int) -> list[list[str]]:
@@ -10935,27 +11609,10 @@ def chunked(values: list[str], size: int) -> list[list[str]]:
 
 
 def fetch_fusionsolar_stations(session: requests.Session, *, base_url: str, endpoint: str) -> list[dict[str, Any]]:
-    url = build_provider_url(base_url, endpoint)
-    stations: list[dict[str, Any]] = []
-    page_no = 1
-    page_count = 1
-
-    while page_no <= page_count:
-        payload = post_fusionsolar_json(
-            session,
-            url,
-            {"pageNo": page_no},
-            expected_message="Falha ao obter a lista de centrais FusionSolar.",
-        )
-        page_data = payload.get("data") or {}
-        page_list = page_data.get("list") or []
-        if not isinstance(page_list, list):
-            raise ValueError("A resposta FusionSolar da lista de centrais nao trouxe data.list.")
-        stations.extend([item for item in page_list if isinstance(item, dict)])
-        page_count = int(page_data.get("pageCount") or 1)
-        page_no += 1
-
-    return stations
+    try:
+        return fusionsolar_client_module.fetch_stations(session, base_url=base_url, endpoint=endpoint, **fusionsolar_retry_options())
+    except FusionSolarRateLimitError as exc:
+        raise_fusionsolar_rate_limit(exc, API_AREA_STATE)
 
 
 def fetch_fusionsolar_realtime_map(
@@ -10965,27 +11622,16 @@ def fetch_fusionsolar_realtime_map(
     endpoint: str,
     station_codes: list[str],
 ) -> dict[str, dict[str, Any]]:
-    url = build_provider_url(base_url, endpoint)
-    real_time_map: dict[str, dict[str, Any]] = {}
-
-    for group in chunked(station_codes, 100):
-        payload = post_fusionsolar_json(
+    try:
+        return fusionsolar_client_module.fetch_realtime_map(
             session,
-            url,
-            {"stationCodes": ",".join(group)},
-            expected_message="Falha ao obter os dados realtime das centrais FusionSolar.",
+            base_url=base_url,
+            endpoint=endpoint,
+            station_codes=station_codes,
+            **fusionsolar_retry_options(),
         )
-        data_rows = payload.get("data") or []
-        if not isinstance(data_rows, list):
-            raise ValueError("A resposta FusionSolar realtime nao trouxe uma lista em data.")
-        for row in data_rows:
-            if not isinstance(row, dict):
-                continue
-            station_code = str(row.get("stationCode") or "").strip()
-            if station_code:
-                real_time_map[station_code] = row
-
-    return real_time_map
+    except FusionSolarRateLimitError as exc:
+        raise_fusionsolar_rate_limit(exc, API_AREA_STATE)
 
 
 def fetch_fusionsolar_device_list(
@@ -10995,21 +11641,16 @@ def fetch_fusionsolar_device_list(
     endpoint: str,
     station_codes: list[str],
 ) -> list[dict[str, Any]]:
-    url = build_provider_url(base_url, endpoint)
-    devices: list[dict[str, Any]] = []
-    for group in chunked(station_codes, 100):
-        payload = post_fusionsolar_json(
+    try:
+        return fusionsolar_client_module.fetch_device_list(
             session,
-            url,
-            {"stationCodes": ",".join(group)},
-            expected_message="Falha ao obter a lista de dispositivos FusionSolar.",
+            base_url=base_url,
+            endpoint=endpoint,
+            station_codes=station_codes,
+            **fusionsolar_retry_options(),
         )
-        data = payload.get("data") or []
-        rows = data.get("list") if isinstance(data, dict) else data
-        if not isinstance(rows, list):
-            raise ValueError("A resposta FusionSolar de dispositivos nao trouxe uma lista em data.")
-        devices.extend([row for row in rows if isinstance(row, dict)])
-    return devices
+    except FusionSolarRateLimitError as exc:
+        raise_fusionsolar_rate_limit(exc, API_AREA_DIAGNOSTICS)
 
 
 def fetch_fusionsolar_device_realtime_map(
@@ -11019,34 +11660,16 @@ def fetch_fusionsolar_device_realtime_map(
     endpoint: str,
     devices: list[dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
-    url = build_provider_url(base_url, endpoint)
-    real_time_map: dict[str, dict[str, Any]] = {}
-    devices_by_type: dict[int, list[str]] = {}
-    for device in devices:
-        dev_type_id = device.get("dev_type_id")
-        external_device_id = str(device.get("external_device_id") or "").strip()
-        if dev_type_id is None or not external_device_id:
-            continue
-        devices_by_type.setdefault(int(dev_type_id), []).append(external_device_id)
-    for dev_type_id, device_ids in devices_by_type.items():
-        for group in chunked(device_ids, 100):
-            payload = post_fusionsolar_json(
-                session,
-                url,
-                {"devIds": ",".join(group), "devTypeId": dev_type_id},
-                expected_message="Falha ao obter os dados realtime dos dispositivos FusionSolar.",
-            )
-            rows = payload.get("data") or []
-            if not isinstance(rows, list):
-                raise ValueError("A resposta FusionSolar realtime de dispositivos nao trouxe uma lista em data.")
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                for key in ("devId", "id", "devDn", "deviceDn", "esnCode", "sn"):
-                    value = str(row.get(key) or "").strip()
-                    if value:
-                        real_time_map[value] = row
-    return real_time_map
+    try:
+        return fusionsolar_client_module.fetch_device_realtime_map(
+            session,
+            base_url=base_url,
+            endpoint=endpoint,
+            devices=devices,
+            **fusionsolar_retry_options(),
+        )
+    except FusionSolarRateLimitError as exc:
+        raise_fusionsolar_rate_limit(exc, API_AREA_DIAGNOSTICS)
 
 
 def fetch_fusionsolar_device_history(
@@ -11059,34 +11682,20 @@ def fetch_fusionsolar_device_history(
     call_delay_seconds: float = 0,
     sleeper: Any = time.sleep,
 ) -> list[dict[str, Any]]:
-    url = build_provider_url(base_url, endpoint)
-    start_time = int(datetime.combine(target_date, datetime.min.time()).timestamp() * 1000)
-    end_time = int(datetime.combine(target_date + timedelta(days=1), datetime.min.time()).timestamp() * 1000) - 1
-    rows: list[dict[str, Any]] = []
-    calls_made = 0
-    devices_by_type: dict[int, list[dict[str, Any]]] = {}
-    for device in devices:
-        if device.get("dev_type_id") is None or not device.get("external_device_id"):
-            continue
-        devices_by_type.setdefault(int(device["dev_type_id"]), []).append(device)
-    for dev_type_id, typed_devices in devices_by_type.items():
-        for group in [typed_devices[index : index + 10] for index in range(0, len(typed_devices), 10)]:
-            if calls_made and call_delay_seconds > 0:
-                sleeper(call_delay_seconds)
-            payload = post_fusionsolar_json(
-                session,
-                url,
-                {
-                    "devIds": ",".join(str(device["external_device_id"]) for device in group),
-                    "devTypeId": dev_type_id,
-                    "startTime": start_time,
-                    "endTime": end_time,
-                },
-                expected_message="Falha ao obter o historico dos inversores FusionSolar.",
-            )
-            calls_made += 1
-            rows.extend(normalize_fusionsolar_device_history_rows(payload.get("data"), group))
-    return rows
+    try:
+        return fusionsolar_client_module.fetch_device_history(
+            session,
+            base_url=base_url,
+            endpoint=endpoint,
+            devices=devices,
+            target_date=target_date,
+            call_delay_seconds=call_delay_seconds,
+            sleeper=sleeper,
+            allow_sleep=not has_request_context(),
+            normalizer=normalize_fusionsolar_device_history_rows,
+        )
+    except FusionSolarRateLimitError as exc:
+        raise_fusionsolar_rate_limit(exc, API_AREA_DIAGNOSTICS)
 
 
 def normalize_fusionsolar_device_history_rows(
@@ -11149,74 +11758,33 @@ def fetch_fusionsolar_alarm_map(
     endpoint: str,
     station_codes: list[str],
 ) -> dict[str, list[dict[str, Any]]]:
-    url = build_provider_url(base_url, endpoint)
-    alarm_map: dict[str, list[dict[str, Any]]] = {}
-    now_ms = int(datetime.now().timestamp() * 1000)
-
-    for group in chunked(station_codes, 100):
-        payload = post_fusionsolar_json(
+    try:
+        return fusionsolar_client_module.fetch_alarm_map(
             session,
-            url,
-            {
-                "stationCodes": ",".join(group),
-                "beginTime": 0,
-                "endTime": now_ms,
-                "language": DEFAULT_FUSIONSOLAR_ALARMS_LANGUAGE,
-            },
-            expected_message="Falha ao obter alarmes ativos FusionSolar.",
+            base_url=base_url,
+            endpoint=endpoint,
+            station_codes=station_codes,
+            language=DEFAULT_FUSIONSOLAR_ALARMS_LANGUAGE,
+            **fusionsolar_retry_options(),
         )
-        alarm_rows = payload.get("data") or []
-        if not isinstance(alarm_rows, list):
-            raise ValueError("A resposta FusionSolar de alarmes nao trouxe uma lista em data.")
-        for row in alarm_rows:
-            if not isinstance(row, dict):
-                continue
-            station_code = str(row.get("stationCode") or "").strip()
-            if not station_code:
-                continue
-            alarm_map.setdefault(station_code, []).append(row)
-
-    return alarm_map
+    except FusionSolarRateLimitError as exc:
+        raise_fusionsolar_rate_limit(exc, API_AREA_DIAGNOSTICS)
 
 
 def collect_time_ms(collect_date: date) -> int:
-    return int(datetime.combine(collect_date, datetime.min.time()).timestamp() * 1000)
+    return collect_time_start_of_day_ms(collect_date)
 
 
 def collect_time_noon_ms(collect_date: date) -> int:
-    return int(datetime.combine(collect_date, datetime.min.time().replace(hour=12)).timestamp() * 1000)
+    return collect_time_noon_of_month_ms(collect_date)
 
 
 def normalize_fusionsolar_kpi_rows(data: Any) -> list[dict[str, Any]]:
-    if isinstance(data, list):
-        return [row for row in data if isinstance(row, dict)]
-    if isinstance(data, dict):
-        rows = data.get("list")
-        if isinstance(rows, list):
-            return [row for row in rows if isinstance(row, dict)]
-        return [data]
-    return []
+    return normalize_client_kpi_rows(data)
 
 
 def parse_fusionsolar_collect_date(row: dict[str, Any], fallback_date: date | None = None) -> date | None:
-    for key in ("collectTime", "collect_time", "time", "timestamp"):
-        raw_value = row.get(key)
-        if raw_value in (None, ""):
-            continue
-        try:
-            timestamp = int(float(str(raw_value).strip()))
-            if timestamp > 10_000_000_000:
-                timestamp = timestamp // 1000
-            return datetime.fromtimestamp(timestamp).date()
-        except (TypeError, ValueError, OSError, OverflowError):
-            parsed = parse_date_value(str(raw_value))
-            if parsed:
-                return parsed
-    for key in ("collectDate", "date", "day", "periodDate"):
-        parsed = parse_date_value(str(row.get(key) or "").strip())
-        if parsed:
-            return parsed
-    return fallback_date
+    return parse_client_collect_date(row, fallback_date)
 
 
 def fetch_fusionsolar_kpi_map(
@@ -11228,27 +11796,18 @@ def fetch_fusionsolar_kpi_map(
     collect_date: date,
     expected_message: str,
 ) -> dict[str, dict[str, Any]]:
-    url = build_provider_url(base_url, endpoint)
-    kpi_map: dict[str, dict[str, Any]] = {}
-
-    for group in chunked(station_codes, 100):
-        payload = post_fusionsolar_json(
+    try:
+        return fusionsolar_client_module.fetch_kpi_map(
             session,
-            url,
-            {
-                "stationCodes": ",".join(group),
-                "collectTime": collect_time_ms(collect_date),
-            },
+            base_url=base_url,
+            endpoint=endpoint,
+            station_codes=station_codes,
+            collect_date=collect_date,
             expected_message=expected_message,
+            **fusionsolar_retry_options(),
         )
-        for row in normalize_fusionsolar_kpi_rows(payload.get("data")):
-            station_code = str(row.get("stationCode") or row.get("plantCode") or "").strip()
-            if station_code:
-                enriched = dict(row)
-                enriched["payload_json"] = json.dumps(row, ensure_ascii=True)
-                kpi_map[station_code] = enriched
-
-    return kpi_map
+    except FusionSolarRateLimitError as exc:
+        raise_fusionsolar_rate_limit(exc, API_AREA_PRODUCTION)
 
 
 def fetch_fusionsolar_kpi_rows(
@@ -11260,22 +11819,18 @@ def fetch_fusionsolar_kpi_rows(
     collect_date: date,
     expected_message: str,
 ) -> list[dict[str, Any]]:
-    url = build_provider_url(base_url, endpoint)
-    payload = post_fusionsolar_json(
-        session,
-        url,
-        {
-            "stationCodes": ",".join(station_codes),
-            "collectTime": collect_time_noon_ms(collect_date.replace(day=1)),
-        },
-        expected_message=expected_message,
-    )
-    rows: list[dict[str, Any]] = []
-    for row in normalize_fusionsolar_kpi_rows(payload.get("data")):
-        enriched = dict(row)
-        enriched["payload_json"] = json.dumps(row, ensure_ascii=True)
-        rows.append(enriched)
-    return rows
+    try:
+        return fusionsolar_client_module.fetch_kpi_rows(
+            session,
+            base_url=base_url,
+            endpoint=endpoint,
+            station_codes=station_codes,
+            collect_date=collect_date.replace(day=1),
+            expected_message=expected_message,
+            **fusionsolar_retry_options(),
+        )
+    except FusionSolarRateLimitError as exc:
+        raise_fusionsolar_rate_limit(exc, API_AREA_PRODUCTION)
 
 
 def fetch_fusionsolar_kpi_day_rows(
@@ -11440,6 +11995,10 @@ def is_fusionsolar_invalid_json_error(exc: Exception | str) -> bool:
 
 
 def is_fusionsolar_rate_limit_error(exc: Exception | str) -> bool:
+    if isinstance(exc, ApiRateLimitError) and exc.provider == INTEGRATION_PROVIDER_FUSIONSOLAR:
+        return True
+    if isinstance(exc, FusionSolarRateLimitError):
+        return True
     if isinstance(exc, FusionSolarApiError) and is_fusionsolar_rate_limit_payload(exc.payload):
         return True
     message = str(exc)
@@ -11447,6 +12006,8 @@ def is_fusionsolar_rate_limit_error(exc: Exception | str) -> bool:
 
 
 def is_fusionsolar_session_expired_error(exc: Exception | str) -> bool:
+    if isinstance(exc, FusionSolarSessionExpiredError):
+        return True
     if isinstance(exc, FusionSolarApiError) and is_fusionsolar_session_expired_payload(exc.payload):
         return True
     message = str(exc)
@@ -11614,6 +12175,10 @@ def get_fusionsolar_rate_limit_until(
         close_conn = conn is not None
     try:
         if conn is not None:
+            for area in (API_AREA_STATE, API_AREA_PRODUCTION, API_AREA_DIAGNOSTICS):
+                area_until = active_cooldown_until(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, area)
+                if area_until and (cooldown_until is None or area_until > cooldown_until):
+                    cooldown_until = area_until
             for key in (FUSIONSOLAR_RATE_LIMIT_COOLDOWN_KEY, FUSIONSOLAR_LEGACY_PERFORMANCE_COOLDOWN_KEY):
                 raw_value = get_app_state_value(conn, key)
                 if raw_value:
@@ -11685,6 +12250,41 @@ def mark_fusionsolar_rate_limited(
         FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL.isoformat(timespec="minutes"),
     )
     return message
+
+
+def mark_fusionsolar_api_cooldown(
+    conn: sqlite3.Connection | None,
+    api_area: str,
+    *,
+    reason: str = "FusionSolar rate limit",
+    now_value: datetime | None = None,
+) -> datetime:
+    global FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL
+    now_value = now_value or datetime.now()
+    until = now_value + timedelta(minutes=fusionsolar_rate_limit_minutes())
+    FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL = until
+    close_conn = False
+    if conn is None:
+        conn = _current_app_db_connection()
+        close_conn = conn is not None
+    try:
+        if conn is not None:
+            mark_api_cooldown(
+                conn,
+                INTEGRATION_PROVIDER_FUSIONSOLAR,
+                api_area,
+                reason,
+                cooldown_until=until,
+                now=now_value,
+            )
+            set_app_state_value(conn, FUSIONSOLAR_RATE_LIMIT_COOLDOWN_KEY, until.isoformat(timespec="seconds"))
+            notify_fusionsolar_rate_limit(conn, until, get_provider_cooldown_reason(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, api_area))
+            conn.commit()
+    finally:
+        if close_conn and conn is not None:
+            conn.close()
+    LOGGER.warning("FusionSolar %s cooldown activated until %s", api_area, until.isoformat(timespec="minutes"))
+    return until
 
 
 def mark_fusionsolar_performance_rate_limited(
@@ -13594,7 +14194,7 @@ def run_sigenergy_check(conn: sqlite3.Connection, provider: str, dry_run: bool =
     service_config = build_sigenergy_service_config(config)
     session = requests.Session()
     client = sigenergy_service.SigenergyClient(service_config, session=session)
-    systems = client.list_systems()
+    systems = retry_api_call(client.list_systems, allow_sleep=not has_request_context(), sleeper=time.sleep)
     available_system_ids = [first_non_empty(row, ["systemId", "id", "stationId", "plantId"]) for row in systems if first_non_empty(row, ["systemId", "id", "stationId", "plantId"])]
     normalized_rows: list[dict[str, Any]] = []
     energy_flow_count = 0
@@ -13606,9 +14206,15 @@ def run_sigenergy_check(conn: sqlite3.Connection, provider: str, dry_run: bool =
         energy_flow: dict[str, Any] = {}
         row = normalize_sigenergy_system_row(system_row, {}, energy_flow)
         try:
-            energy_flow = client.get_energy_flow(system_id)
+            energy_flow = retry_api_call(
+                lambda system_id=system_id: client.get_energy_flow(system_id),
+                allow_sleep=not has_request_context(),
+                sleeper=time.sleep,
+            )
             energy_flow_count += 1
             row = normalize_sigenergy_system_row(system_row, {}, energy_flow)
+        except ApiRateLimitError:
+            raise
         except Exception as exc:
             sanitized_error = sigenergy_service.sanitize_sigenergy_error(exc)
             energy_flow_errors.append(f"{system_id}: {sanitized_error}")
@@ -13876,6 +14482,35 @@ def run_sigenergy_sync(conn: sqlite3.Connection, provider: str = "Sigenergy", tr
             process_monitoring_alerts(conn, alert_events, batch_id, now)
             conn.commit()
             return {"matched": matched, "unresolved": unresolved, "auto_resolved": 0, "snapshots": len(rows), "status": sync_status}
+        except ApiRateLimitError as exc:
+            until = mark_api_cooldown(
+                conn,
+                provider,
+                API_AREA_STATE,
+                exc.message,
+                cooldown_until=exc.cooldown_until,
+            )
+            notify_api_rate_limit(conn, provider, API_AREA_STATE, until, exc.message)
+            sanitized_error = sigenergy_service.sanitize_sigenergy_error(exc.message)
+            conn.execute(
+                """
+                UPDATE integration_configs
+                SET last_sync_status = 'waiting_rate_limit', last_error = ?, updated_at = ?
+                WHERE provider = ?
+                """,
+                (sanitized_error, datetime.now().isoformat(timespec="seconds"), provider),
+            )
+            finalize_integration_run(
+                conn,
+                run_id,
+                status="waiting_rate_limit",
+                matched_count=0,
+                unresolved_count=0,
+                auto_resolved_count=0,
+                error_message=sanitized_error,
+            )
+            conn.commit()
+            raise ApiRateLimitError(provider, API_AREA_STATE, until, get_provider_cooldown_reason(conn, provider, API_AREA_STATE)) from exc
         except Exception as exc:
             sanitized_error = sigenergy_service.sanitize_sigenergy_error(exc)
             conn.execute(
@@ -13899,7 +14534,12 @@ def run_sigenergy_sync(conn: sqlite3.Connection, provider: str = "Sigenergy", tr
             raise
 
 
-def run_fusionsolar_check(conn: sqlite3.Connection, provider: str, dry_run: bool = False) -> dict[str, Any]:
+def run_fusionsolar_check(
+    conn: sqlite3.Connection,
+    provider: str,
+    dry_run: bool = False,
+    include_diagnostics: bool = True,
+) -> dict[str, Any]:
     config = get_integration_config(conn, provider)
     if config is None:
         raise ValueError("Configuracao FusionSolar nao encontrada.")
@@ -13932,15 +14572,18 @@ def run_fusionsolar_check(conn: sqlite3.Connection, provider: str, dry_run: bool
             )
             alarm_map: dict[str, list[dict[str, Any]]] = {}
             alarm_error = ""
-            try:
-                alarm_map = fetch_fusionsolar_alarm_map(
-                    session,
-                    base_url=endpoints["base_url"],
-                    endpoint=endpoints["alarms_endpoint"],
-                    station_codes=station_codes,
-                )
-            except Exception as exc:
-                alarm_error = str(exc)
+            if include_diagnostics:
+                try:
+                    alarm_map = fetch_fusionsolar_alarm_map(
+                        session,
+                        base_url=endpoints["base_url"],
+                        endpoint=endpoints["alarms_endpoint"],
+                        station_codes=station_codes,
+                    )
+                except ApiRateLimitError:
+                    raise
+                except Exception as exc:
+                    alarm_error = str(exc)
             normalized_rows = [
                 normalize_fusionsolar_plant_row(
                     station_row,
@@ -14067,6 +14710,8 @@ def run_fusionsolar_production_sync(
                     invalidate_fusionsolar_session(config)
                     session_obj, _ = get_fusionsolar_session(config, force_login=True)
                     continue
+                if isinstance(exc, ApiRateLimitError):
+                    raise
                 if is_fusionsolar_rate_limit_error(exc):
                     reason = mark_fusionsolar_performance_rate_limited(conn)
                     conn.commit()
@@ -14815,6 +15460,8 @@ def run_fusionsolar_production_backfill(
                         break
                     except Exception as exc:
                         summary["api_errors"] += 1
+                        if isinstance(exc, ApiRateLimitError):
+                            raise
                         if is_fusionsolar_rate_limit_error(exc):
                             reason = mark_fusionsolar_performance_rate_limited(conn)
                             logger.warning(
@@ -14882,6 +15529,8 @@ def run_fusionsolar_production_backfill(
                     break
                 except Exception as exc:
                     summary["api_errors"] += 1
+                    if isinstance(exc, ApiRateLimitError):
+                        raise
                     if is_fusionsolar_rate_limit_error(exc):
                         reason = mark_fusionsolar_performance_rate_limited(conn)
                         if wait_after_rate_limit(reason, current_month):
@@ -14936,6 +15585,8 @@ def run_fusionsolar_production_backfill(
                 stored_current_date = True
                 break
             except Exception as exc:
+                if isinstance(exc, ApiRateLimitError):
+                    raise
                 if is_fusionsolar_rate_limit_error(exc):
                     summary["api_errors"] += 1
                     reason = mark_fusionsolar_performance_rate_limited(conn)
@@ -14995,6 +15646,8 @@ def run_fusionsolar_production_backfill(
                     break
                 except Exception as asset_exc:
                     summary["api_errors"] += 1
+                    if isinstance(asset_exc, ApiRateLimitError):
+                        raise
                     if is_fusionsolar_rate_limit_error(asset_exc):
                         reason = mark_fusionsolar_performance_rate_limited(conn)
                         logger.warning(
@@ -15062,6 +15715,8 @@ def run_fusionsolar_production_backfill(
                 break
             except Exception as exc:
                 summary["api_errors"] += 1
+                if isinstance(exc, ApiRateLimitError):
+                    raise
                 if is_fusionsolar_rate_limit_error(exc):
                     reason = mark_fusionsolar_performance_rate_limited(conn)
                     if wait_after_rate_limit(reason, current_month):
@@ -15210,6 +15865,8 @@ def run_fusionsolar_month_cycle(
                 break
             except Exception as exc:
                 summary["api_errors"] += 1
+                if isinstance(exc, ApiRateLimitError):
+                    raise
                 if is_fusionsolar_rate_limit_error(exc):
                     wait_after_rate_limit(mark_fusionsolar_performance_rate_limited(conn))
                     continue
@@ -15255,6 +15912,8 @@ def run_fusionsolar_month_cycle(
                 break
             except Exception as exc:
                 summary["api_errors"] += 1
+                if isinstance(exc, ApiRateLimitError):
+                    raise
                 if is_fusionsolar_rate_limit_error(exc):
                     wait_after_rate_limit(mark_fusionsolar_performance_rate_limited(conn))
                     continue
@@ -15908,6 +16567,8 @@ def run_fusionsolar_inverter_availability_backfill(
                 )
             except Exception as exc:
                 summary["api_errors"] += 1
+                if isinstance(exc, ApiRateLimitError):
+                    raise
                 if is_fusionsolar_rate_limit_error(exc):
                     reason = mark_fusionsolar_performance_rate_limited(conn)
                     if not wait_after_rate_limit(reason, from_date):
@@ -15973,6 +16634,8 @@ def run_fusionsolar_inverter_availability_backfill(
                 break
             except Exception as exc:
                 summary["api_errors"] += 1
+                if isinstance(exc, ApiRateLimitError):
+                    raise
                 if is_fusionsolar_rate_limit_error(exc):
                     reason = mark_fusionsolar_performance_rate_limited(conn)
                     if not wait_after_rate_limit(reason, current):
@@ -16353,7 +17016,10 @@ def run_fusionsolar_sync(conn: sqlite3.Connection, provider: str, trigger_type: 
         conn.commit()
 
         try:
-            result = run_provider_check(conn, provider, dry_run=True)
+            if trigger_type == "scheduled_state":
+                result = run_fusionsolar_check(conn, provider, dry_run=True, include_diagnostics=False)
+            else:
+                result = run_fusionsolar_check(conn, provider, dry_run=True)
             rows = result["rows"]
             matched = 0
             unresolved = 0
@@ -16527,7 +17193,7 @@ def run_fusionsolar_sync(conn: sqlite3.Connection, provider: str, trigger_type: 
             process_monitoring_alerts(conn, alert_events, batch_id, now)
             conn.commit()
             device_availability: dict[str, Any] | None = None
-            if provider == INTEGRATION_PROVIDER_FUSIONSOLAR:
+            if provider == INTEGRATION_PROVIDER_FUSIONSOLAR and trigger_type not in {"scheduled_state", "manual_background"}:
                 try:
                     device_availability = run_fusionsolar_device_availability_sync(conn, provider, trigger_type=trigger_type)
                 except Exception as exc:
@@ -16538,6 +17204,26 @@ def run_fusionsolar_sync(conn: sqlite3.Connection, provider: str, trigger_type: 
                 "auto_resolved": auto_resolved,
                 "device_availability": device_availability,
             }
+        except ApiRateLimitError as exc:
+            conn.execute(
+                """
+                UPDATE integration_configs
+                SET last_sync_status = 'waiting_rate_limit', last_error = ?, updated_at = ?
+                WHERE provider = ?
+                """,
+                (exc.message, datetime.now().isoformat(timespec="seconds"), provider),
+            )
+            finalize_integration_run(
+                conn,
+                run_id,
+                status="waiting_rate_limit",
+                matched_count=0,
+                unresolved_count=0,
+                auto_resolved_count=0,
+                error_message=exc.message,
+            )
+            conn.commit()
+            raise
         except Exception as exc:
             conn.execute(
                 """
