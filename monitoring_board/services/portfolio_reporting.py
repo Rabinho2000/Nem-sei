@@ -141,6 +141,11 @@ def accumulate_month(target: dict[str, Any], monthly: dict[str, Any]) -> None:
     for key in (
         "actual_production_kwh",
         "helioscope_expected_kwh",
+        "expected_production_kwh",
+        "expected_consumption_kwh",
+        "expected_self_use_kwh",
+        "expected_export_kwh",
+        "expected_grid_import_kwh",
         "adjusted_expected_kwh",
         "production_ponta_kwh",
         "production_cheia_kwh",
@@ -168,6 +173,14 @@ def accumulate_month(target: dict[str, Any], monthly: dict[str, Any]) -> None:
     ):
         if monthly.get(key) is not None:
             target[key] = Decimal(str(target.get(key) or 0)) + Decimal(str(monthly[key]))
+    for key in (
+        "expected_self_consumption_rate_pct",
+        "expected_self_sufficiency_rate_pct",
+        "expected_specific_yield",
+        "expected_production_source",
+    ):
+        if monthly.get(key) is not None and target.get(key) is None:
+            target[key] = monthly.get(key)
     if monthly.get("availability_pct") is not None and monthly.get("installed_power_kwp"):
         target["_availability_weighted"] += Decimal(str(monthly["availability_pct"])) * Decimal(str(monthly["installed_power_kwp"]))
         target["_availability_weight"] += Decimal(str(monthly["installed_power_kwp"]))
@@ -193,23 +206,29 @@ def accumulate_source_coverage(target: dict[str, Any], monthly: dict[str, Any]) 
 
 
 def finalize_values(values: dict[str, Any]) -> None:
-    actual = Decimal(str(values.get("actual_production_kwh") or 0))
-    adjusted = Decimal(str(values.get("adjusted_expected_kwh") or 0))
-    installed = Decimal(str(values.get("installed_power_kwp") or 0))
-    self_use = Decimal(str(values.get("self_use_kwh") or 0))
-    export = Decimal(str(values.get("export_kwh") or 0))
-    consumption = Decimal(str(values.get("consumption_kwh") or 0))
-    values["deviation_kwh"] = actual - adjusted if actual or adjusted else None
-    values["deviation_pct"] = ((actual - adjusted) / adjusted * Decimal("100")) if adjusted else None
-    values["specific_yield"] = actual / installed if installed else None
-    values["self_consumption_rate_pct"] = self_use / (self_use + export) * Decimal("100") if (self_use + export) else None
-    values["self_sufficiency_rate_pct"] = self_use / consumption * Decimal("100") if consumption else None
+    actual = _decimal_or_none(values.get("actual_production_kwh"))
+    adjusted = _decimal_or_none(values.get("adjusted_expected_kwh"))
+    installed = _decimal_or_none(values.get("installed_power_kwp"))
+    self_use = _decimal_or_none(values.get("self_use_kwh"))
+    export = _decimal_or_none(values.get("export_kwh"))
+    consumption = _decimal_or_none(values.get("consumption_kwh"))
+    values["deviation_kwh"] = actual - adjusted if actual is not None and adjusted is not None else None
+    values["deviation_pct"] = ((actual - adjusted) / adjusted * Decimal("100")) if actual is not None and adjusted else None
+    values["specific_yield"] = actual / installed if actual is not None and installed else None
+    values["self_consumption_rate_pct"] = self_use / (self_use + export) * Decimal("100") if self_use is not None and export is not None and (self_use + export) else None
+    values["self_sufficiency_rate_pct"] = self_use / consumption * Decimal("100") if self_use is not None and consumption else None
     values["availability_pct"] = values["_availability_weighted"] / values["_availability_weight"] if values["_availability_weight"] else None
     values.pop("_availability_weighted", None)
     values.pop("_availability_weight", None)
     for key, definition in METRIC_CATALOG.items():
         if key in values and isinstance(values[key], Decimal):
             values[key] = values[key].quantize(Decimal("1") if definition.decimals <= 0 else Decimal("1." + ("0" * definition.decimals)))
+
+
+def _decimal_or_none(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    return Decimal(str(value))
 
 
 def missing_sources_for_values(values: dict[str, Any], warnings: set[str]) -> set[str]:

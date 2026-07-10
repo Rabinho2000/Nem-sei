@@ -137,22 +137,32 @@ def test_asset_detail_renders_financial_model_summary(tmp_path) -> None:
     try:
         cursor = conn.execute("INSERT INTO assets (project_name) VALUES (?)", ("Central A",))
         asset_id = int(cursor.lastrowid)
-        cursor = conn.execute(
+        source_file_id = int(conn.execute(
             """
             INSERT INTO source_files (
-                asset_id, file_type, original_filename, stored_path, uploaded_at, notes
-            ) VALUES (?, 'financial_model', 'financial.xlsm', 'uploads/financial.xlsm', '2026-07-10T10:00:00', ?)
+                asset_id, file_type, original_filename, stored_path, uploaded_at, sha256
+            ) VALUES (?, 'financial_model', 'financial.xlsm', 'uploads/financial_models/1/financial.xlsm', '2026-07-10T10:00:00', 'abc')
             """,
-            (asset_id, '{"project_name": "Central A", "installed_power_kwp": 10, "months": 12, "tariff_action": "created"}'),
-        )
-        source_file_id = int(cursor.lastrowid)
+            (asset_id,),
+        ).lastrowid)
+        model_id = int(conn.execute(
+            """
+            INSERT INTO financial_models (
+                source_file_id, asset_id, base_year, version, status, active,
+                detected_name, detected_kwp, parser_name, parser_version, file_sha256,
+                warnings_json, validation_json, confirmed_at, created_at, updated_at
+            ) VALUES (?, ?, 2026, 1, 'confirmed', 1, 'Central A', 10, 'test', '1', 'abc', '[]', '{}',
+                      '2026-07-10T10:00:00', '2026-07-10T10:00:00', '2026-07-10T10:00:00')
+            """,
+            (source_file_id, asset_id),
+        ).lastrowid)
         conn.execute(
             """
-            INSERT INTO helioscope_expected_production (
-                asset_id, source_file_id, base_year, month, expected_kwh, imported_at
-            ) VALUES (?, ?, 2026, 1, 123.45, '2026-07-10T10:00:00')
+            INSERT INTO financial_model_monthly (
+                financial_model_id, asset_id, base_year, month, expected_production_kwh
+            ) VALUES (?, ?, 2026, 1, 123.45)
             """,
-            (asset_id, source_file_id),
+            (model_id, asset_id),
         )
         conn.commit()
     finally:

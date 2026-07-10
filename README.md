@@ -71,6 +71,12 @@ python -m monitoring_board.reporting_storage_check --database .\data\monitoring_
 
 Guia operacional: [docs/reporting_operations.md](docs/reporting_operations.md).
 
+Modelos financeiros carregados por instalacao ficam em
+`DATA_DIR/uploads/financial_models/<asset_id>/` e sao referenciados pela tabela
+`source_files`. Um backup apenas da base SQLite nao inclui estes ficheiros
+originais. Para um backup completo, inclui tambem `DATA_DIR/uploads`; o script
+`scripts/backup.sh` faz isso quando `INCLUDE_UPLOADS=1`.
+
 ## Integracao FusionSolar
 
 No `.env`, preencher as credenciais e, se quiseres controlar os jobs diarios

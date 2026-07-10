@@ -36,7 +36,6 @@ from monitoring_board.portfolio_reports import (
     build_portfolio_report_rows,
     export_portfolio_report_workbook,
     filter_report_rows,
-    import_financial_model_file,
     import_helioscope_file,
     map_external_portfolio_entity,
     seed_external_portfolio_rows,
@@ -65,6 +64,12 @@ from monitoring_board.customer_reports import (
     build_customer_report_pdf,
     detect_report_type,
     prepare_customer_report,
+)
+from monitoring_board.financial_model_repository import (
+    ensure_financial_model_schema,
+    get_asset_model as get_financial_model_for_asset,
+    get_model_source as get_financial_model_source,
+    list_model_monthly as list_financial_model_monthly,
 )
 from monitoring_board.portfolio_repository import (
     add_member as portfolio_add_member,
@@ -220,6 +225,18 @@ from monitoring_board.services.fusionsolar import (
     describe_fusionsolar_health_state,
     map_fusionsolar_status,
     normalize_sync_hours,
+)
+from monitoring_board.services.financial_models import (
+    FinancialModelError,
+    activate_financial_model,
+    archive_financial_model,
+    build_asset_financial_model_context,
+    cancel_financial_model_preview,
+    compare_financial_models,
+    confirm_financial_model_import,
+    create_financial_model_preview,
+    resolve_financial_model_path,
+    sha256_file as financial_model_sha256_file,
 )
 from monitoring_board.services import fusionsolar_client as fusionsolar_client_module
 from monitoring_board.services.fusionsolar_client import FusionSolarClient
@@ -1509,39 +1526,7 @@ def create_app() -> Flask:
             """,
             (current_installation_group,),
         )
-        financial_source = query_one(
-            """
-            SELECT *
-            FROM source_files
-            WHERE asset_id = ? AND file_type IN ('financial_model', 'helioscope')
-            ORDER BY uploaded_at DESC, id DESC
-            LIMIT 1
-            """,
-            (asset_id,),
-        )
-        financial_summary: dict[str, Any] = {}
-        financial_monthly = []
-        financial_interval_count = 0
-        if financial_source is not None:
-            try:
-                financial_summary = json.loads(financial_source["notes"] or "{}")
-            except json.JSONDecodeError:
-                financial_summary = {}
-            financial_monthly = query_all(
-                g.db,
-                """
-                SELECT month, expected_kwh
-                FROM helioscope_expected_production
-                WHERE source_file_id = ?
-                ORDER BY month
-                """,
-                (financial_source["id"],),
-            )
-            financial_interval_count = query_scalar(
-                g.db,
-                "SELECT COUNT(*) FROM helioscope_expected_interval_production WHERE source_file_id = ?",
-                (financial_source["id"],),
-            ) or 0
+        financial_model = build_asset_financial_model_context(g.db, asset_id=asset_id)
         return render_template(
             "asset_detail.html",
             asset=asset,
@@ -1564,10 +1549,130 @@ def create_app() -> Flask:
             latest_availability=latest_availability,
             latest_device_rows=latest_device_rows,
             expected_strings_by_device=expected_strings_by_device,
-            financial_source=financial_source,
-            financial_summary=financial_summary,
-            financial_monthly=financial_monthly,
-            financial_interval_count=financial_interval_count,
+            financial_model=financial_model,
+        )
+
+    @app.route("/asset/<int:asset_id>/financial-model/upload", methods=["POST"])
+    def upload_asset_financial_model(asset_id: int):
+        upload = request.files.get("file")
+        base_year_raw = request.form.get("base_year", "").strip()
+        if upload is None or not upload.filename:
+            flash("Escolhe um ficheiro financeiro .xlsx ou .xlsm.", "error")
+            return redirect(url_for("asset_detail", asset_id=asset_id))
+        try:
+            model_id = create_financial_model_preview(
+                g.db,
+                upload_dir=UPLOAD_DIR,
+                file_storage=upload,
+                asset_id=asset_id,
+                base_year=int(base_year_raw) if base_year_raw.isdigit() else None,
+            )
+            g.db.commit()
+            return redirect(url_for("financial_model_preview", asset_id=asset_id, model_id=model_id))
+        except (FinancialModelError, ValueError) as exc:
+            g.db.rollback()
+            flash(f"Falha ao analisar modelo financeiro: {exc}", "error")
+            return redirect(url_for("asset_detail", asset_id=asset_id))
+
+    @app.route("/asset/<int:asset_id>/financial-model/<int:model_id>/preview")
+    def financial_model_preview(asset_id: int, model_id: int):
+        model = get_financial_model_for_asset(g.db, asset_id=asset_id, model_id=model_id)
+        if model is None:
+            abort(404)
+        source = get_financial_model_source(g.db, model_id)
+        monthly = list_financial_model_monthly(g.db, model_id=model_id)
+        return render_template(
+            "financial_model_preview.html",
+            title="Preview modelo financeiro",
+            asset=query_one("SELECT * FROM assets WHERE id = ?", (asset_id,)),
+            model=model,
+            source=source,
+            monthly=monthly,
+            validation=json.loads(model["validation_json"] or "{}"),
+            warnings=json.loads(model["warnings_json"] or "[]"),
+        )
+
+    @app.route("/asset/<int:asset_id>/financial-model/<int:model_id>/confirm", methods=["POST"])
+    def confirm_asset_financial_model(asset_id: int, model_id: int):
+        try:
+            version = confirm_financial_model_import(
+                g.db,
+                model_id=model_id,
+                asset_id=asset_id,
+                override=bool(request.form.get("override")),
+                override_reason=request.form.get("override_reason", ""),
+            )
+            g.db.commit()
+            flash(f"Modelo financeiro confirmado como versao {version}.", "success")
+        except (FinancialModelError, ValueError) as exc:
+            g.db.rollback()
+            flash(f"Falha ao confirmar modelo financeiro: {exc}", "error")
+            return redirect(url_for("financial_model_preview", asset_id=asset_id, model_id=model_id))
+        return redirect(url_for("asset_detail", asset_id=asset_id))
+
+    @app.route("/asset/<int:asset_id>/financial-model/<int:model_id>/cancel", methods=["POST"])
+    def cancel_asset_financial_model(asset_id: int, model_id: int):
+        try:
+            cancel_financial_model_preview(g.db, model_id=model_id, asset_id=asset_id)
+            g.db.commit()
+            flash("Preview de modelo financeiro cancelado.", "success")
+        except FinancialModelError as exc:
+            g.db.rollback()
+            flash(f"Falha ao cancelar modelo financeiro: {exc}", "error")
+        return redirect(url_for("asset_detail", asset_id=asset_id))
+
+    @app.route("/asset/<int:asset_id>/financial-model/<int:model_id>/activate", methods=["POST"])
+    def activate_asset_financial_model(asset_id: int, model_id: int):
+        try:
+            activate_financial_model(g.db, model_id=model_id, asset_id=asset_id)
+            g.db.commit()
+            flash("Modelo financeiro ativado.", "success")
+        except FinancialModelError as exc:
+            g.db.rollback()
+            flash(f"Falha ao ativar modelo financeiro: {exc}", "error")
+        return redirect(url_for("asset_detail", asset_id=asset_id))
+
+    @app.route("/asset/<int:asset_id>/financial-model/<int:model_id>/archive", methods=["POST"])
+    def archive_asset_financial_model(asset_id: int, model_id: int):
+        try:
+            archive_financial_model(g.db, model_id=model_id, asset_id=asset_id)
+            g.db.commit()
+            flash("Modelo financeiro arquivado.", "success")
+        except FinancialModelError as exc:
+            g.db.rollback()
+            flash(f"Falha ao arquivar modelo financeiro: {exc}", "error")
+        return redirect(url_for("asset_detail", asset_id=asset_id))
+
+    @app.route("/asset/<int:asset_id>/financial-model/<int:model_id>/download")
+    def download_asset_financial_model(asset_id: int, model_id: int):
+        model = get_financial_model_for_asset(g.db, asset_id=asset_id, model_id=model_id)
+        source = get_financial_model_source(g.db, model_id) if model else None
+        if model is None or source is None:
+            abort(404)
+        try:
+            path = resolve_financial_model_path(source)
+            if model["file_sha256"] and financial_model_sha256_file(path) != model["file_sha256"]:
+                abort(409)
+        except FinancialModelError:
+            abort(404)
+        return send_file(path, as_attachment=True, download_name=source["original_filename"], max_age=0)
+
+    @app.route("/asset/<int:asset_id>/financial-model/compare")
+    def compare_asset_financial_models(asset_id: int):
+        left_raw = request.args.get("left", "")
+        right_raw = request.args.get("right", "")
+        if not left_raw.isdigit() or not right_raw.isdigit():
+            flash("Escolhe duas versoes para comparar.", "error")
+            return redirect(url_for("asset_detail", asset_id=asset_id))
+        try:
+            comparison = compare_financial_models(g.db, asset_id=asset_id, left_id=int(left_raw), right_id=int(right_raw))
+        except FinancialModelError:
+            abort(404)
+        return render_template(
+            "financial_model_compare.html",
+            title="Comparar modelos financeiros",
+            asset=query_one("SELECT * FROM assets WHERE id = ?", (asset_id,)),
+            comparison=comparison,
         )
 
     @app.route("/asset/<int:asset_id>/performance-settings", methods=["POST"])
@@ -3676,7 +3781,7 @@ def create_app() -> Flask:
             flash("Escolhe a instalacao e o ficheiro financeiro/Helioscope.", "error")
             return redirect(url_for("portfolios"))
         try:
-            result = import_financial_model_file(
+            result = import_helioscope_file(
                 g.db,
                 upload_dir=UPLOAD_DIR,
                 file_storage=upload,
@@ -3684,14 +3789,10 @@ def create_app() -> Flask:
                 portfolio_id=int(portfolio_id_raw) if portfolio_id_raw.isdigit() else None,
             )
             g.db.commit()
-            flash(
-                f"Modelo financeiro importado: {result['months']} meses, {result['intervals_15m']} intervalos 15 min, tarifa {result['tariff_action']}.",
-                "success",
-            )
-            return redirect(url_for("portfolio_financial_import_review", source_file_id=result["source_file_id"], portfolio_id=portfolio_id_raw, report_month=report_month))
+            flash(f"Helioscope importado: {result['months']} meses.", "success")
         except Exception as exc:
             g.db.rollback()
-            flash(f"Falha ao importar modelo financeiro: {exc}", "error")
+            flash(f"Falha ao importar Helioscope: {exc}", "error")
         return redirect(url_for("portfolios", tab="config", portfolio_id=portfolio_id_raw, report_month=report_month))
 
     @app.route("/portfolios/financial-import/<int:source_file_id>")
@@ -5926,6 +6027,7 @@ def ensure_database(path: str) -> None:
         ensure_portfolio_management_schema(conn)
         ensure_portfolio_reporting_schema(conn)
         ensure_report_template_schema(conn)
+        ensure_financial_model_schema(conn)
         ensure_portfolio_seed_data(conn)
         ensure_alert_settings_defaults(conn)
         ensure_billing_config_schema(conn)

@@ -2406,6 +2406,27 @@ button.small {
   color: #75d3bd;
 }
 
+.financial-chart-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.financial-chart-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+  background: var(--panel-strong);
+}
+
+.financial-chart-card svg {
+  display: block;
+  width: 100%;
+  height: 120px;
+  margin-top: 8px;
+}
+
 @media (max-width: 1080px) {
   .shell,
   .cards,

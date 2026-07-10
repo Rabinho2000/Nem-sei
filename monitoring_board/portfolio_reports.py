@@ -38,6 +38,7 @@ from monitoring_board.reporting.repositories import (
     save_asset_tariff,
     upsert_asset_billing_config,
 )
+from monitoring_board.services.financial_models import get_active_expected_for_month
 from monitoring_board.reporting.tariffs import (
     classify_tariff_period as tariff_classify_tariff_period,
     result_to_legacy_dict,
@@ -68,6 +69,18 @@ WARNING_LABELS = {
     "missing_hourly_production": "Sem producao horaria FusionSolar",
     "missing_hourly_self_use": "Sem autoconsumo horario",
     "missing_helioscope_expected": "Sem Helioscope",
+    "missing_financial_model": "Sem modelo financeiro",
+    "ambiguous_financial_model": "Modelo financeiro ambiguo",
+    "financial_model_missing_year": "Modelo sem ano base",
+    "financial_model_missing_nif": "Modelo sem NIF",
+    "financial_model_nif_mismatch": "NIF do modelo diferente",
+    "financial_model_name_mismatch": "Nome do modelo diferente",
+    "financial_model_kwp_mismatch": "Potencia do modelo diferente",
+    "financial_model_missing_month": "Modelo com meses em falta",
+    "financial_model_missing_cached_formula": "Formula sem valor guardado",
+    "financial_model_unknown_unit": "Unidade desconhecida",
+    "financial_model_calculated_export": "Excedente previsto calculado",
+    "financial_model_calculated_grid_import": "Importacao prevista calculada",
     "missing_mounting_date": "Sem data de montagem",
     "invalid_mounting_date": "Sem data de montagem",
     "missing_tariff": "Sem tarifa",
@@ -275,6 +288,11 @@ def parse_helioscope_monthly_expected(path: Path) -> dict[int, float]:
                         candidates.append(parsed)
         if not candidates:
             raise ValueError("Nao foi possivel identificar valores mensais no ficheiro Helioscope.")
+        complete_candidates = [candidate for candidate in candidates if len(candidate) == 12]
+        if len(complete_candidates) > 1:
+            unique_candidates = {tuple(round(candidate[month], 6) for month in range(1, 13)) for candidate in complete_candidates}
+            if len(unique_candidates) > 1:
+                raise ValueError("O ficheiro Helioscope contem varias series mensais plausiveis.")
         best = max(candidates, key=len)
         if len(best) != 12:
             raise ValueError("O ficheiro Helioscope nao contem 12 valores mensais confiaveis.")
@@ -798,8 +816,22 @@ def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, rep
             actual = daily_totals["production_kwh"]
         if actual is None:
             warnings.append("missing_monthly_production")
-        expected = get_latest_helioscope_expected(conn, asset_id, start.month)
-        expected_kwh = float(expected["expected_kwh"]) if expected else None
+        financial_expected = get_active_expected_for_month(conn, asset_id=asset_id, year=start.year, month=start.month)
+        expected_source = "financial_model" if financial_expected else "none"
+        expected_kwh = float(financial_expected["expected_production_kwh"]) if financial_expected and financial_expected["expected_production_kwh"] is not None else None
+        expected_consumption_kwh = float(financial_expected["expected_consumption_kwh"]) if financial_expected and financial_expected["expected_consumption_kwh"] is not None else None
+        expected_self_use_kwh = float(financial_expected["expected_self_use_kwh"]) if financial_expected and financial_expected["expected_self_use_kwh"] is not None else None
+        expected_export_kwh = float(financial_expected["expected_export_kwh"]) if financial_expected and financial_expected["expected_export_kwh"] is not None else None
+        expected_grid_import_kwh = float(financial_expected["expected_grid_import_kwh"]) if financial_expected and financial_expected["expected_grid_import_kwh"] is not None else None
+        expected_self_consumption_rate_pct = float(financial_expected["expected_self_consumption_rate_pct"]) if financial_expected and financial_expected["expected_self_consumption_rate_pct"] is not None else None
+        expected_self_sufficiency_rate_pct = float(financial_expected["expected_self_sufficiency_rate_pct"]) if financial_expected and financial_expected["expected_self_sufficiency_rate_pct"] is not None else None
+        expected_specific_yield = None
+        if expected_kwh is not None and parse_float(asset["kwp"]):
+            expected_specific_yield = expected_kwh / parse_float(asset["kwp"])
+        if expected_kwh is None:
+            expected = get_latest_helioscope_expected(conn, asset_id, start.month)
+            expected_kwh = float(expected["expected_kwh"]) if expected else None
+            expected_source = "helioscope" if expected else "none"
         if expected_kwh is None:
             warnings.append("missing_helioscope_expected")
         mount_raw = asset["mounting_date"] or asset["start_contract"]
@@ -861,7 +893,7 @@ def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, rep
             item.period_name: float(item.energy_kwh)
             for item in tariff_result.get("breakdown", [])
         }
-        simple_self_use = energy_by_period.get("simple")
+        simple_self_use = energy_by_period.get("simple") if tariff else None
         multi_self_use = sum(energy_by_period.get(period, 0.0) for period in PERIOD_NAMES)
         self_use_total = simple_self_use if simple_self_use is not None else (multi_self_use if hourly else monthly_self_use)
         if self_use_total is None and "missing_hourly_self_use" not in tariff_result["warnings"] and actual is not None:
@@ -946,6 +978,15 @@ def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, rep
                 "consumption_kwh": round(consumption_kwh, 2) if consumption_kwh is not None else None,
                 "grid_import_kwh": round(grid_import_kwh, 2) if grid_import_kwh is not None else None,
                 "helioscope_expected_kwh": round(expected_kwh, 2) if expected_kwh is not None else None,
+                "expected_production_kwh": round(expected_kwh, 2) if expected_kwh is not None else None,
+                "expected_consumption_kwh": round(expected_consumption_kwh, 2) if expected_consumption_kwh is not None else None,
+                "expected_self_use_kwh": round(expected_self_use_kwh, 2) if expected_self_use_kwh is not None else None,
+                "expected_export_kwh": round(expected_export_kwh, 2) if expected_export_kwh is not None else None,
+                "expected_grid_import_kwh": round(expected_grid_import_kwh, 2) if expected_grid_import_kwh is not None else None,
+                "expected_self_consumption_rate_pct": round(expected_self_consumption_rate_pct, 2) if expected_self_consumption_rate_pct is not None else None,
+                "expected_self_sufficiency_rate_pct": round(expected_self_sufficiency_rate_pct, 2) if expected_self_sufficiency_rate_pct is not None else None,
+                "expected_specific_yield": round(expected_specific_yield, 2) if expected_specific_yield is not None else None,
+                "expected_production_source": expected_source,
                 "adjusted_expected_kwh": round(adjusted, 2) if adjusted is not None else None,
                 "degradation_factor": round(factor, 6),
                 "deviation_kwh": round(deviation, 2) if deviation is not None else None,
@@ -1005,6 +1046,15 @@ def aggregate_portfolio_total(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "self_use_value_vazio_eur": total("self_use_value_vazio_eur"),
         "self_use_value_super_vazio_eur": total("self_use_value_super_vazio_eur"),
         "helioscope_expected_kwh": total("helioscope_expected_kwh"),
+        "expected_production_kwh": total("expected_production_kwh"),
+        "expected_consumption_kwh": total("expected_consumption_kwh"),
+        "expected_self_use_kwh": total("expected_self_use_kwh"),
+        "expected_export_kwh": total("expected_export_kwh"),
+        "expected_grid_import_kwh": total("expected_grid_import_kwh"),
+        "expected_self_consumption_rate_pct": "",
+        "expected_self_sufficiency_rate_pct": "",
+        "expected_specific_yield": "",
+        "expected_production_source": "",
         "adjusted_expected_kwh": adjusted_total,
         "degradation_factor": "",
         "deviation_kwh": deviation,
@@ -1110,6 +1160,15 @@ def export_portfolio_report_workbook(rows: list[dict[str, Any]]) -> Workbook:
         ("self_use_value_vazio_eur", "Valor autoconsumo vazio EUR"),
         ("self_use_value_super_vazio_eur", "Valor autoconsumo super vazio EUR"),
         ("helioscope_expected_kwh", "Producao Helioscope base kWh"),
+        ("expected_production_kwh", "Producao prevista base kWh"),
+        ("expected_consumption_kwh", "Consumo previsto kWh"),
+        ("expected_self_use_kwh", "Autoconsumo previsto kWh"),
+        ("expected_export_kwh", "Excedente previsto kWh"),
+        ("expected_grid_import_kwh", "Importacao rede prevista kWh"),
+        ("expected_self_consumption_rate_pct", "Taxa autoconsumo prevista %"),
+        ("expected_self_sufficiency_rate_pct", "Taxa autossuficiencia prevista %"),
+        ("expected_specific_yield", "Specific yield previsto"),
+        ("expected_production_source", "Origem producao prevista"),
         ("adjusted_expected_kwh", "Producao esperada ajustada kWh"),
         ("degradation_factor", "Fator degradacao"),
         ("deviation_kwh", "Desvio kWh"),
