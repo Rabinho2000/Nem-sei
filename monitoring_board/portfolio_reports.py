@@ -4,7 +4,8 @@ import json
 import re
 import sqlite3
 import unicodedata
-from datetime import date, datetime
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -30,10 +31,14 @@ from monitoring_board.reporting.repositories import (
     has_expired_tariff,
     list_hourly_production_records,
     list_portfolio_report_assets,
+    list_tariffs_intersecting_period,
     list_tariff_period_rules,
     row_to_hourly_energy_record,
     row_to_tariff_config,
+    save_asset_tariff,
+    upsert_asset_billing_config,
 )
+from monitoring_board.services.financial_models import get_active_expected_for_month
 from monitoring_board.reporting.tariffs import (
     classify_tariff_period as tariff_classify_tariff_period,
     result_to_legacy_dict,
@@ -57,12 +62,25 @@ MONTH_LABELS = {
     12: ("dez", "dezembro", "dec", "december"),
 }
 PERIOD_NAMES = ("ponta", "cheia", "vazio", "super_vazio")
+FINANCIAL_SOURCE_TYPE = "financial_model"
 WARNING_LABELS = {
     "ok": "OK",
     "missing_monthly_production": "Sem producao real FusionSolar",
     "missing_hourly_production": "Sem producao horaria FusionSolar",
     "missing_hourly_self_use": "Sem autoconsumo horario",
     "missing_helioscope_expected": "Sem Helioscope",
+    "missing_financial_model": "Sem modelo financeiro",
+    "ambiguous_financial_model": "Modelo financeiro ambiguo",
+    "financial_model_missing_year": "Modelo sem ano base",
+    "financial_model_missing_nif": "Modelo sem NIF",
+    "financial_model_nif_mismatch": "NIF do modelo diferente",
+    "financial_model_name_mismatch": "Nome do modelo diferente",
+    "financial_model_kwp_mismatch": "Potencia do modelo diferente",
+    "financial_model_missing_month": "Modelo com meses em falta",
+    "financial_model_missing_cached_formula": "Formula sem valor guardado",
+    "financial_model_unknown_unit": "Unidade desconhecida",
+    "financial_model_calculated_export": "Excedente previsto calculado",
+    "financial_model_calculated_grid_import": "Importacao prevista calculada",
     "missing_mounting_date": "Sem data de montagem",
     "invalid_mounting_date": "Sem data de montagem",
     "missing_tariff": "Sem tarifa",
@@ -212,33 +230,295 @@ def parse_float(value: Any) -> float | None:
     return parsed if parsed >= 0 else None
 
 
+@dataclass(frozen=True)
+class FinancialTariffImport:
+    tariff_type: str
+    cycle_type: str
+    simple_price_eur_kwh: float | None
+    ponta_price_eur_kwh: float | None
+    cheia_price_eur_kwh: float | None
+    vazio_price_eur_kwh: float | None
+    super_vazio_price_eur_kwh: float | None
+    export_price_eur_kwh: float | None
+    valid_from: str
+    valid_to: str
+    solcor_price_eur_kwh: float | None
+    fixed_monthly_fee_eur: float | None
+
+
+@dataclass(frozen=True)
+class FinancialIntervalExpected:
+    period_start: datetime
+    period_end: datetime
+    expected_kwh: float
+
+
+@dataclass(frozen=True)
+class FinancialModelImport:
+    project_name: str
+    installed_power_kwp: float | None
+    monthly_expected: dict[int, float]
+    interval_expected: tuple[FinancialIntervalExpected, ...]
+    tariff: FinancialTariffImport | None
+    financial_outputs: dict[str, Any]
+    warnings: tuple[str, ...] = ()
+
+
 def parse_helioscope_monthly_expected(path: Path) -> dict[int, float]:
-    workbook = load_workbook(path, data_only=True)
-    candidates: list[dict[int, float]] = []
-    for sheet in workbook.worksheets:
-        rows = list(sheet.iter_rows(values_only=True))
-        for row_index, row in enumerate(rows):
-            month_columns: dict[int, int] = {}
-            for col_index, value in enumerate(row):
-                month = parse_month(value)
-                if month:
-                    month_columns[month] = col_index
-            if len(month_columns) < 10:
-                continue
-            for values_row in rows[row_index + 1 : min(row_index + 8, len(rows))]:
-                parsed: dict[int, float] = {}
-                for month, col_index in month_columns.items():
-                    value = parse_float(values_row[col_index] if col_index < len(values_row) else None)
-                    if value is not None:
-                        parsed[month] = value
-                if len(parsed) >= 10:
-                    candidates.append(parsed)
-    if not candidates:
-        raise ValueError("Nao foi possivel identificar valores mensais no ficheiro Helioscope.")
-    best = max(candidates, key=len)
-    if len(best) != 12:
-        raise ValueError("O ficheiro Helioscope nao contem 12 valores mensais confiaveis.")
-    return {month: float(best[month]) for month in range(1, 13)}
+    workbook = load_workbook(path, data_only=True, keep_links=False)
+    try:
+        candidates: list[dict[int, float]] = []
+        for sheet in workbook.worksheets:
+            rows = list(sheet.iter_rows(values_only=True))
+            for row_index, row in enumerate(rows):
+                month_columns: dict[int, int] = {}
+                for col_index, value in enumerate(row):
+                    month = parse_month(value)
+                    if month:
+                        month_columns[month] = col_index
+                if len(month_columns) < 10:
+                    continue
+                for values_row in rows[row_index + 1 : min(row_index + 8, len(rows))]:
+                    parsed: dict[int, float] = {}
+                    for month, col_index in month_columns.items():
+                        value = parse_float(values_row[col_index] if col_index < len(values_row) else None)
+                        if value is not None:
+                            parsed[month] = value
+                    if len(parsed) >= 10:
+                        candidates.append(parsed)
+        if not candidates:
+            raise ValueError("Nao foi possivel identificar valores mensais no ficheiro Helioscope.")
+        complete_candidates = [candidate for candidate in candidates if len(candidate) == 12]
+        if len(complete_candidates) > 1:
+            unique_candidates = {tuple(round(candidate[month], 6) for month in range(1, 13)) for candidate in complete_candidates}
+            if len(unique_candidates) > 1:
+                raise ValueError("O ficheiro Helioscope contem varias series mensais plausiveis.")
+        best = max(candidates, key=len)
+        if len(best) != 12:
+            raise ValueError("O ficheiro Helioscope nao contem 12 valores mensais confiaveis.")
+        return {month: float(best[month]) for month in range(1, 13)}
+    finally:
+        workbook.close()
+
+
+def parse_financial_model_file(path: Path) -> FinancialModelImport:
+    workbook = load_workbook(path, read_only=True, data_only=True, keep_links=False)
+    try:
+        warnings: list[str] = []
+        monthly = _parse_financial_monthly_expected(workbook) or _parse_upac_monthly_expected(workbook)
+        if not monthly:
+            monthly = parse_helioscope_monthly_expected(path)
+            warnings.append("financial_monthly_fallback")
+        intervals = _parse_financial_interval_expected(workbook)
+        if not intervals:
+            warnings.append("missing_financial_interval_expected")
+        tariff = _parse_financial_tariff(workbook) or _parse_upac_tariff(workbook)
+        if tariff is None:
+            warnings.append("missing_financial_tariff")
+        outputs = _parse_financial_outputs(workbook) or _parse_upac_financial_outputs(workbook)
+        project_name = str(_cell_value(workbook, "Projeto", "C5") or _cell_value(workbook, "UPAC", "A4") or "").strip()
+        return FinancialModelImport(
+            project_name=project_name,
+            installed_power_kwp=parse_float(_cell_value(workbook, "Projeto", "H8")) or parse_float(_cell_value(workbook, "UPAC", "D4")),
+            monthly_expected=monthly,
+            interval_expected=tuple(intervals),
+            tariff=tariff,
+            financial_outputs=outputs,
+            warnings=tuple(warnings),
+        )
+    finally:
+        workbook.close()
+
+
+def _cell_value(workbook: Any, sheet_name: str, address: str) -> Any:
+    if sheet_name not in workbook.sheetnames:
+        return None
+    return workbook[sheet_name][address].value
+
+
+def _parse_financial_monthly_expected(workbook: Any) -> dict[int, float]:
+    if "Projeto" not in workbook.sheetnames:
+        return {}
+    sheet = workbook["Projeto"]
+    parsed: dict[int, float] = {}
+    for month_cell, expected_cell in sheet.iter_rows(min_row=6, max_row=17, min_col=10, max_col=11, values_only=True):
+        month = parse_month(month_cell)
+        expected = parse_float(expected_cell)
+        if month and expected is not None:
+            parsed[month] = expected
+    return parsed if len(parsed) == 12 else {}
+
+
+def _parse_upac_monthly_expected(workbook: Any) -> dict[int, float]:
+    if "Prod month" not in workbook.sheetnames:
+        return {}
+    sheet = workbook["Prod month"]
+    parsed: dict[int, float] = {}
+    for row in sheet.iter_rows(min_row=1, max_row=24, values_only=True):
+        month = parse_month(row[0] if row else None)
+        expected = parse_float(row[2] if len(row) > 2 else None)
+        if month and expected is not None:
+            parsed[month] = expected
+    return parsed if len(parsed) == 12 else {}
+
+
+def _parse_financial_interval_expected(workbook: Any) -> list[FinancialIntervalExpected]:
+    if "Helio&Cons" not in workbook.sheetnames:
+        return []
+    sheet = workbook["Helio&Cons"]
+    records: list[FinancialIntervalExpected] = []
+    for row in sheet.iter_rows(min_row=2, min_col=12, max_col=14, values_only=True):
+        raw_expected = row[0]
+        raw_start = row[2]
+        expected_wh = parse_float(raw_expected)
+        started_at = _parse_excel_datetime(raw_start)
+        if expected_wh is None or started_at is None:
+            continue
+        records.append(
+            FinancialIntervalExpected(
+                period_start=started_at,
+                period_end=started_at + timedelta(minutes=15),
+                expected_kwh=expected_wh / 1000,
+            )
+        )
+    return records
+
+
+def _parse_excel_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    if value is None or value == "":
+        return None
+    try:
+        return datetime.fromisoformat(str(value).strip())
+    except ValueError:
+        return None
+
+
+def _parse_financial_tariff(workbook: Any) -> FinancialTariffImport | None:
+    if "Projeto" not in workbook.sheetnames:
+        return None
+    sheet = workbook["Projeto"]
+    tariff_type = _map_financial_tariff_type(sheet["C44"].value)
+    if tariff_type is None:
+        return None
+    totals = {
+        "super_vazio": parse_float(sheet["H41"].value),
+        "vazio": parse_float(sheet["H42"].value),
+        "cheia": parse_float(sheet["H43"].value),
+        "ponta": parse_float(sheet["H44"].value),
+    }
+    simple_price = totals["super_vazio"] if tariff_type == "simple" else None
+    return FinancialTariffImport(
+        tariff_type=tariff_type,
+        cycle_type=_map_financial_cycle_type(sheet["C45"].value),
+        simple_price_eur_kwh=simple_price,
+        ponta_price_eur_kwh=totals["ponta"] if tariff_type in {"tri-hourly", "tetra-hourly"} else None,
+        cheia_price_eur_kwh=totals["cheia"] if tariff_type in {"bi-hourly", "tri-hourly", "tetra-hourly"} else None,
+        vazio_price_eur_kwh=totals["vazio"] if tariff_type in {"bi-hourly", "tri-hourly", "tetra-hourly"} else None,
+        super_vazio_price_eur_kwh=totals["super_vazio"] if tariff_type == "tetra-hourly" else None,
+        export_price_eur_kwh=parse_float(sheet["F46"].value),
+        valid_from=_date_iso(sheet["C41"].value),
+        valid_to=_date_iso(sheet["C42"].value),
+        solcor_price_eur_kwh=parse_float(sheet["L33"].value),
+        fixed_monthly_fee_eur=parse_float(sheet["M33"].value),
+    )
+
+
+def _parse_upac_tariff(workbook: Any) -> FinancialTariffImport | None:
+    if "UPAC" not in workbook.sheetnames:
+        return None
+    sheet = workbook["UPAC"]
+    prices = {
+        "super_vazio": parse_float(sheet["H13"].value),
+        "vazio": parse_float(sheet["H14"].value),
+        "cheia": parse_float(sheet["H15"].value),
+        "ponta": parse_float(sheet["H16"].value),
+    }
+    if not any(value is not None for value in prices.values()):
+        return None
+    if prices["super_vazio"] is not None:
+        tariff_type = "tetra-hourly"
+    elif prices["ponta"] is not None:
+        tariff_type = "tri-hourly"
+    elif prices["cheia"] is not None and prices["vazio"] is not None:
+        tariff_type = "bi-hourly"
+    else:
+        tariff_type = "simple"
+    return FinancialTariffImport(
+        tariff_type=tariff_type,
+        cycle_type=_map_financial_cycle_type(sheet["H12"].value),
+        simple_price_eur_kwh=prices["vazio"] if tariff_type == "simple" else None,
+        ponta_price_eur_kwh=prices["ponta"] if tariff_type in {"tri-hourly", "tetra-hourly"} else None,
+        cheia_price_eur_kwh=prices["cheia"] if tariff_type in {"bi-hourly", "tri-hourly", "tetra-hourly"} else None,
+        vazio_price_eur_kwh=prices["vazio"] if tariff_type in {"bi-hourly", "tri-hourly", "tetra-hourly"} else None,
+        super_vazio_price_eur_kwh=prices["super_vazio"] if tariff_type == "tetra-hourly" else None,
+        export_price_eur_kwh=parse_float(sheet["H19"].value),
+        valid_from="",
+        valid_to="",
+        solcor_price_eur_kwh=parse_float(sheet["K15"].value),
+        fixed_monthly_fee_eur=None,
+    )
+
+
+def _parse_financial_outputs(workbook: Any) -> dict[str, Any]:
+    if "Projeto" not in workbook.sheetnames:
+        return {}
+    sheet = workbook["Projeto"]
+    return {
+        "sale_price_eur": parse_float(sheet["P28"].value),
+        "first_year_net_benefit_eur": parse_float(sheet["L28"].value),
+        "first_year_global_benefit_eur": parse_float(sheet["P29"].value),
+        "global_roi_years": parse_float(sheet["P30"].value),
+        "profit_margin_pct": parse_float(sheet["P32"].value),
+        "avoided_tariff_eur_kwh": parse_float(sheet["L32"].value),
+        "ppa_tariff_eur_kwh": parse_float(sheet["L33"].value),
+        "monthly_payment_eur": parse_float(sheet["M33"].value),
+    }
+
+
+def _parse_upac_financial_outputs(workbook: Any) -> dict[str, Any]:
+    if "UPAC" not in workbook.sheetnames:
+        return {}
+    sheet = workbook["UPAC"]
+    return {
+        "sale_price_eur": parse_float(sheet["D6"].value),
+        "first_year_net_benefit_eur": parse_float(sheet["N4"].value),
+        "first_year_global_benefit_eur": parse_float(sheet["N6"].value),
+        "client_npv_eur": parse_float(sheet["N9"].value),
+        "avoided_tariff_eur_kwh": parse_float(sheet["K14"].value),
+        "ppa_tariff_eur_kwh": parse_float(sheet["K15"].value),
+        "annual_pv_production_kwh": parse_float(sheet["K5"].value),
+        "annual_self_consumption_kwh": parse_float(sheet["K7"].value),
+        "annual_export_kwh": parse_float(sheet["K8"].value),
+    }
+
+
+def _map_financial_tariff_type(value: Any) -> str | None:
+    normalized = normalize_text(value)
+    if "tetra" in normalized:
+        return "tetra-hourly"
+    if "tri" in normalized:
+        return "tri-hourly"
+    if "bi" in normalized:
+        return "bi-hourly"
+    if "simples" in normalized or "simples" in normalized or "simple" in normalized:
+        return "simple"
+    return None
+
+
+def _map_financial_cycle_type(value: Any) -> str:
+    normalized = normalize_text(value)
+    if "diario" in normalized:
+        return "daily"
+    if "semanal" in normalized:
+        return "weekly"
+    return ""
+
+
+def _date_iso(value: Any) -> str:
+    parsed = _parse_excel_datetime(value)
+    return parsed.date().isoformat() if parsed else ""
 
 
 def store_source_file(
@@ -297,6 +577,119 @@ def import_helioscope_file(
             (asset_id, source_id, year, month, expected_kwh, datetime.now().isoformat(timespec="seconds"), ""),
         )
     return {"source_file_id": source_id, "months": len(monthly)}
+
+
+def import_financial_model_file(
+    conn: sqlite3.Connection,
+    *,
+    upload_dir: Path,
+    file_storage: Any,
+    asset_id: int,
+    portfolio_id: int | None,
+    base_year: int | None = None,
+) -> dict[str, Any]:
+    source_id = store_source_file(
+        conn,
+        upload_dir=upload_dir,
+        file_storage=file_storage,
+        asset_id=asset_id,
+        portfolio_id=portfolio_id,
+        file_type=FINANCIAL_SOURCE_TYPE,
+    )
+    stored = conn.execute("SELECT stored_path FROM source_files WHERE id = ?", (source_id,)).fetchone()
+    parsed = parse_financial_model_file(Path(stored["stored_path"]))
+    year = base_year or date.today().year
+    imported_at = datetime.now().isoformat(timespec="seconds")
+    conn.execute("DELETE FROM helioscope_expected_production WHERE asset_id = ? AND source_file_id != ?", (asset_id, source_id))
+    for month, expected_kwh in parsed.monthly_expected.items():
+        conn.execute(
+            """
+            INSERT INTO helioscope_expected_production (asset_id, source_file_id, base_year, month, expected_kwh, imported_at, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (asset_id, source_id, year, month, expected_kwh, imported_at, "financial_model"),
+        )
+    conn.execute("DELETE FROM helioscope_expected_interval_production WHERE asset_id = ?", (asset_id,))
+    conn.executemany(
+        """
+        INSERT INTO helioscope_expected_interval_production (
+            asset_id, source_file_id, period_start, period_end, expected_kwh, imported_at, notes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                asset_id,
+                source_id,
+                item.period_start.isoformat(timespec="seconds"),
+                item.period_end.isoformat(timespec="seconds"),
+                item.expected_kwh,
+                imported_at,
+                "financial_model",
+            )
+            for item in parsed.interval_expected
+        ],
+    )
+    tariff_action = "none"
+    tariff_id = None
+    if parsed.tariff is not None:
+        tariff_id, tariff_action = _apply_financial_tariff(conn, asset_id, parsed.tariff)
+        report_type = detect_report_type_value(conn.execute("SELECT * FROM assets WHERE id = ?", (asset_id,)).fetchone() or {})
+        upsert_asset_billing_config(
+            conn,
+            asset_id=asset_id,
+            config=_financial_billing_config(parsed.tariff, report_type),
+        )
+    summary = {
+        "source_file_id": source_id,
+        "project_name": parsed.project_name,
+        "installed_power_kwp": parsed.installed_power_kwp,
+        "months": len(parsed.monthly_expected),
+        "intervals_15m": len(parsed.interval_expected),
+        "tariff_id": tariff_id,
+        "tariff_action": tariff_action,
+        "financial_outputs": parsed.financial_outputs,
+        "warnings": list(parsed.warnings),
+    }
+    conn.execute("UPDATE source_files SET notes = ? WHERE id = ?", (json.dumps(summary, ensure_ascii=True), source_id))
+    return summary
+
+
+def _apply_financial_tariff(conn: sqlite3.Connection, asset_id: int, tariff: FinancialTariffImport) -> tuple[int, str]:
+    start = datetime.fromisoformat(tariff.valid_from).date() if tariff.valid_from else date.today()
+    end = datetime.fromisoformat(tariff.valid_to).date() if tariff.valid_to else start
+    existing = list_tariffs_intersecting_period(conn, asset_id=asset_id, start=start, end=end)
+    tariff_id = int(existing[0]["id"]) if len(existing) == 1 else None
+    action = "updated" if tariff_id is not None else "created"
+    if len(existing) > 1:
+        return int(existing[0]["id"]), "skipped_multiple_overlaps"
+    saved = save_asset_tariff(
+        conn,
+        tariff_id=tariff_id,
+        asset_id=asset_id,
+        tariff_type=tariff.tariff_type,
+        cycle_type=tariff.cycle_type,
+        simple_price_eur_kwh=tariff.simple_price_eur_kwh,
+        ponta_price_eur_kwh=tariff.ponta_price_eur_kwh,
+        cheia_price_eur_kwh=tariff.cheia_price_eur_kwh,
+        vazio_price_eur_kwh=tariff.vazio_price_eur_kwh,
+        super_vazio_price_eur_kwh=tariff.super_vazio_price_eur_kwh,
+        valid_from=tariff.valid_from,
+        valid_to=tariff.valid_to,
+        notes="Importado do modelo financeiro",
+    )
+    return saved, action
+
+
+def _financial_billing_config(tariff: FinancialTariffImport, report_type: Any) -> Any:
+    from monitoring_board.reporting.models import BillingConfig
+
+    return BillingConfig(
+        report_type=report_type,
+        solcor_price_per_kwh=decimal_from_value(tariff.solcor_price_eur_kwh),
+        fixed_monthly_fee_eur=decimal_from_value(tariff.fixed_monthly_fee_eur),
+        electricity_price_eur_kwh=decimal_from_value(tariff.simple_price_eur_kwh or tariff.cheia_price_eur_kwh or 0),
+        export_price_eur_kwh=decimal_from_value(tariff.export_price_eur_kwh),
+    )
 
 
 def map_external_portfolio_entity(conn: sqlite3.Connection, *, nif: str = "", external_name: str = "") -> dict[str, Any]:
@@ -423,8 +816,22 @@ def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, rep
             actual = daily_totals["production_kwh"]
         if actual is None:
             warnings.append("missing_monthly_production")
-        expected = get_latest_helioscope_expected(conn, asset_id, start.month)
-        expected_kwh = float(expected["expected_kwh"]) if expected else None
+        financial_expected = get_active_expected_for_month(conn, asset_id=asset_id, year=start.year, month=start.month)
+        expected_source = "financial_model" if financial_expected else "none"
+        expected_kwh = float(financial_expected["expected_production_kwh"]) if financial_expected and financial_expected["expected_production_kwh"] is not None else None
+        expected_consumption_kwh = float(financial_expected["expected_consumption_kwh"]) if financial_expected and financial_expected["expected_consumption_kwh"] is not None else None
+        expected_self_use_kwh = float(financial_expected["expected_self_use_kwh"]) if financial_expected and financial_expected["expected_self_use_kwh"] is not None else None
+        expected_export_kwh = float(financial_expected["expected_export_kwh"]) if financial_expected and financial_expected["expected_export_kwh"] is not None else None
+        expected_grid_import_kwh = float(financial_expected["expected_grid_import_kwh"]) if financial_expected and financial_expected["expected_grid_import_kwh"] is not None else None
+        expected_self_consumption_rate_pct = float(financial_expected["expected_self_consumption_rate_pct"]) if financial_expected and financial_expected["expected_self_consumption_rate_pct"] is not None else None
+        expected_self_sufficiency_rate_pct = float(financial_expected["expected_self_sufficiency_rate_pct"]) if financial_expected and financial_expected["expected_self_sufficiency_rate_pct"] is not None else None
+        expected_specific_yield = None
+        if expected_kwh is not None and parse_float(asset["kwp"]):
+            expected_specific_yield = expected_kwh / parse_float(asset["kwp"])
+        if expected_kwh is None:
+            expected = get_latest_helioscope_expected(conn, asset_id, start.month)
+            expected_kwh = float(expected["expected_kwh"]) if expected else None
+            expected_source = "helioscope" if expected else "none"
         if expected_kwh is None:
             warnings.append("missing_helioscope_expected")
         mount_raw = asset["mounting_date"] or asset["start_contract"]
@@ -486,7 +893,7 @@ def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, rep
             item.period_name: float(item.energy_kwh)
             for item in tariff_result.get("breakdown", [])
         }
-        simple_self_use = energy_by_period.get("simple")
+        simple_self_use = energy_by_period.get("simple") if tariff else None
         multi_self_use = sum(energy_by_period.get(period, 0.0) for period in PERIOD_NAMES)
         self_use_total = simple_self_use if simple_self_use is not None else (multi_self_use if hourly else monthly_self_use)
         if self_use_total is None and "missing_hourly_self_use" not in tariff_result["warnings"] and actual is not None:
@@ -571,6 +978,15 @@ def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, rep
                 "consumption_kwh": round(consumption_kwh, 2) if consumption_kwh is not None else None,
                 "grid_import_kwh": round(grid_import_kwh, 2) if grid_import_kwh is not None else None,
                 "helioscope_expected_kwh": round(expected_kwh, 2) if expected_kwh is not None else None,
+                "expected_production_kwh": round(expected_kwh, 2) if expected_kwh is not None else None,
+                "expected_consumption_kwh": round(expected_consumption_kwh, 2) if expected_consumption_kwh is not None else None,
+                "expected_self_use_kwh": round(expected_self_use_kwh, 2) if expected_self_use_kwh is not None else None,
+                "expected_export_kwh": round(expected_export_kwh, 2) if expected_export_kwh is not None else None,
+                "expected_grid_import_kwh": round(expected_grid_import_kwh, 2) if expected_grid_import_kwh is not None else None,
+                "expected_self_consumption_rate_pct": round(expected_self_consumption_rate_pct, 2) if expected_self_consumption_rate_pct is not None else None,
+                "expected_self_sufficiency_rate_pct": round(expected_self_sufficiency_rate_pct, 2) if expected_self_sufficiency_rate_pct is not None else None,
+                "expected_specific_yield": round(expected_specific_yield, 2) if expected_specific_yield is not None else None,
+                "expected_production_source": expected_source,
                 "adjusted_expected_kwh": round(adjusted, 2) if adjusted is not None else None,
                 "degradation_factor": round(factor, 6),
                 "deviation_kwh": round(deviation, 2) if deviation is not None else None,
@@ -630,6 +1046,15 @@ def aggregate_portfolio_total(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "self_use_value_vazio_eur": total("self_use_value_vazio_eur"),
         "self_use_value_super_vazio_eur": total("self_use_value_super_vazio_eur"),
         "helioscope_expected_kwh": total("helioscope_expected_kwh"),
+        "expected_production_kwh": total("expected_production_kwh"),
+        "expected_consumption_kwh": total("expected_consumption_kwh"),
+        "expected_self_use_kwh": total("expected_self_use_kwh"),
+        "expected_export_kwh": total("expected_export_kwh"),
+        "expected_grid_import_kwh": total("expected_grid_import_kwh"),
+        "expected_self_consumption_rate_pct": "",
+        "expected_self_sufficiency_rate_pct": "",
+        "expected_specific_yield": "",
+        "expected_production_source": "",
         "adjusted_expected_kwh": adjusted_total,
         "degradation_factor": "",
         "deviation_kwh": deviation,
@@ -735,6 +1160,15 @@ def export_portfolio_report_workbook(rows: list[dict[str, Any]]) -> Workbook:
         ("self_use_value_vazio_eur", "Valor autoconsumo vazio EUR"),
         ("self_use_value_super_vazio_eur", "Valor autoconsumo super vazio EUR"),
         ("helioscope_expected_kwh", "Producao Helioscope base kWh"),
+        ("expected_production_kwh", "Producao prevista base kWh"),
+        ("expected_consumption_kwh", "Consumo previsto kWh"),
+        ("expected_self_use_kwh", "Autoconsumo previsto kWh"),
+        ("expected_export_kwh", "Excedente previsto kWh"),
+        ("expected_grid_import_kwh", "Importacao rede prevista kWh"),
+        ("expected_self_consumption_rate_pct", "Taxa autoconsumo prevista %"),
+        ("expected_self_sufficiency_rate_pct", "Taxa autossuficiencia prevista %"),
+        ("expected_specific_yield", "Specific yield previsto"),
+        ("expected_production_source", "Origem producao prevista"),
         ("adjusted_expected_kwh", "Producao esperada ajustada kWh"),
         ("degradation_factor", "Fator degradacao"),
         ("deviation_kwh", "Desvio kWh"),

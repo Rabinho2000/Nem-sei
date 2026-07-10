@@ -12,6 +12,12 @@
   </div>
 </section>
 
+<datalist id="installation-group-options">
+  {% for group in installation_groups %}
+    <option value="{{ group.name }}">{{ group.member_count }} central{{ '' if group.member_count == 1 else 's' }}</option>
+  {% endfor %}
+</datalist>
+
 <section class="card maintenance-calendar-card">
   <div class="section-title">
     <div>
@@ -71,7 +77,9 @@
         <input type="text" name="project_name" value="{{ asset.project_name }}">
       </label>
       <label>Instalacao
-        <input type="text" name="installation_group" value="{{ asset.installation_group or asset.project_name }}">
+        <input type="text" name="installation_group" list="installation-group-options" value="{{ current_installation_group }}">
+        <small class="muted">Escolhe uma instalacao existente para juntar esta central ao grupo, ou escreve um novo nome.</small>
+        <small class="muted">Ao guardar, campos comuns vazios podem ser preenchidos a partir de outra central dessa instalacao.</small>
       </label>
       <label>Empresa
         <input type="text" name="company_name" value="{{ asset.company_name or '' }}">
@@ -150,14 +158,37 @@
   </details>
 
   <article class="card">
-    <div class="section-title"><h3>Instalacao</h3></div>
-    <form class="stack-form" method="post" action="{{ url_for('update_asset_installation_group', asset_id=asset.id) }}">
-      <label>Grupo de instalacao
-        <input type="text" name="installation_group" value="{{ asset.installation_group or asset.project_name }}" placeholder="Ex. Sicobrita">
-      </label>
-      <p class="muted">Usa este campo para agrupar varias centrais da mesma instalacao. Os tickets continuam ligados a esta central especifica.</p>
-      <button class="button secondary" type="submit">Guardar grupo</button>
-    </form>
+    <div class="section-title">
+      <div>
+        <h3>Instalacao</h3>
+        <p class="muted">{{ current_installation_group }} | {{ group_members|length }} central{{ '' if group_members|length == 1 else 's' }}</p>
+      </div>
+    </div>
+    <div class="list compact-list">
+      {% for member in group_members %}
+        <div class="list-row">
+          <div>
+            <strong>
+              {% if member.id == asset.id %}
+                {{ member.project_name }}
+              {% else %}
+                <a class="table-link" href="{{ url_for('asset_detail', asset_id=member.id) }}">{{ member.project_name }}</a>
+              {% endif %}
+            </strong>
+            <p>{{ member.location or "-" }} | {{ om_status_label(member.active_contract) }}</p>
+          </div>
+          <div class="hero-actions">
+            {% if member.latest_status %}
+              <span class="chip {{ status_colors.get(member.latest_status, 'muted') }}">{{ member.latest_status }}</span>
+              <small>{{ member.latest_status_date or "-" }}</small>
+            {% else %}
+              <span class="muted">Sem estado</span>
+            {% endif %}
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+    <p class="muted">Para mover esta central para outra instalacao, usa o campo Instalacao em Editar informacoes.</p>
   </article>
 
   <article class="card">
@@ -225,6 +256,138 @@
       <div><dt>Estado alertas</dt><dd>{{ asset.monitoring_status or "active" }}</dd></div>
       <div><dt>Silenciada ate</dt><dd>{{ asset.silenced_until or "-" }}</dd></div>
     </dl>
+  </article>
+
+  <article class="card">
+    <div class="section-title">
+      <div>
+        <h3>Modelo financeiro</h3>
+        <p class="muted">Previsoes por instalacao, separadas dos dados reais.</p>
+      </div>
+    </div>
+    <form class="stack-form" method="post" action="{{ url_for('upload_asset_financial_model', asset_id=asset.id) }}" enctype="multipart/form-data">
+      <label>Ficheiro financeiro
+        <input type="file" name="file" accept=".xlsx,.xlsm" required>
+      </label>
+      <label>Ano base
+        <input type="number" name="base_year" min="2000" max="2100" placeholder="Ex. 2026">
+      </label>
+      <button class="button secondary" type="submit">Analisar ficheiro</button>
+    </form>
+
+    {% set active_model = financial_model.active %}
+    {% if active_model %}
+      <dl class="details">
+        <div><dt>Modelo ativo</dt><dd>v{{ active_model.version }} | {{ active_model.base_year }}</dd></div>
+        <div><dt>Ficheiro</dt><dd>{{ active_model.original_filename }}</dd></div>
+        <div><dt>Importado em</dt><dd>{{ active_model.confirmed_at or active_model.uploaded_at or "-" }}</dd></div>
+        <div><dt>Nome detetado</dt><dd>{{ active_model.detected_name or "-" }}</dd></div>
+        <div><dt>NIF detetado</dt><dd>{{ active_model.detected_nif or "-" }}</dd></div>
+        <div><dt>Potencia detetada</dt><dd>{{ format_number(active_model.detected_kwp, 2) }} kWp</dd></div>
+        <div><dt>Producao anual prevista</dt><dd>{{ format_number(financial_model.annual.expected_production_kwh, 2) }} kWh</dd></div>
+        <div><dt>Consumo anual previsto</dt><dd>{{ format_number(financial_model.annual.expected_consumption_kwh, 2) }} kWh</dd></div>
+      </dl>
+      {% if financial_model.warnings %}
+        <p class="muted">Avisos: {{ financial_model.warnings|join(", ") }}</p>
+      {% endif %}
+      <div class="financial-chart" data-financial-chart='{{ financial_model.chart_series|tojson }}'></div>
+      <div class="table-wrap compact-top-space">
+        <table>
+          <thead>
+            <tr>
+              <th>Mes</th>
+              <th>Prod. prev.</th>
+              <th>Prod. real</th>
+              <th>Desvio</th>
+              <th>Cons. prev.</th>
+              <th>Cons. real</th>
+              <th>Auto prev.</th>
+              <th>Auto real</th>
+              <th>Exced. prev.</th>
+              <th>Exced. real</th>
+              <th>Imp. rede prev.</th>
+              <th>Imp. rede real</th>
+              <th>Origem real</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in financial_model.comparison_rows %}
+              <tr>
+                <td>{{ row.month }}</td>
+                <td>{{ format_number(row.expected_production_kwh, 2) }}</td>
+                <td>{{ format_number(row.actual_production_kwh, 2) if row.actual_production_kwh is not none else "Sem dados" }}</td>
+                <td>{{ format_number(row.deviation_kwh, 2) if row.deviation_kwh is not none else "-" }}{% if row.deviation_pct is not none %} ({{ format_number(row.deviation_pct, 1) }}%){% endif %}</td>
+                <td>{{ format_number(row.expected_consumption_kwh, 2) }}</td>
+                <td>{{ format_number(row.consumption_kwh, 2) if row.consumption_kwh is not none else "Sem dados" }}</td>
+                <td>{{ format_number(row.expected_self_use_kwh, 2) }}</td>
+                <td>{{ format_number(row.self_use_kwh, 2) if row.self_use_kwh is not none else "Sem dados" }}</td>
+                <td>{{ format_number(row.expected_export_kwh, 2) }}</td>
+                <td>{{ format_number(row.export_kwh, 2) if row.export_kwh is not none else "Sem dados" }}</td>
+                <td>{{ format_number(row.expected_grid_import_kwh, 2) }}</td>
+                <td>{{ format_number(row.grid_import_kwh, 2) if row.grid_import_kwh is not none else "Sem dados" }}</td>
+                <td>{{ row.real_source or "-" }}</td>
+              </tr>
+            {% else %}
+              <tr><td colspan="13" class="muted">Sem previsoes mensais confirmadas.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="muted">Ainda nao existe modelo financeiro ativo para esta instalacao.</p>
+    {% endif %}
+
+    <div class="section-title top-space"><h3>Historico de versoes</h3></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Versao</th><th>Ano</th><th>Estado</th><th>Ficheiro</th><th>Acoes</th></tr></thead>
+        <tbody>
+          {% for model in financial_model.versions %}
+            <tr>
+              <td>{{ model.version or "-" }}{% if model.active %} · ativa{% endif %}</td>
+              <td>{{ model.base_year }}</td>
+              <td>{{ model.status }}</td>
+              <td>{{ model.original_filename }}</td>
+              <td>
+                <div class="hero-actions">
+                  {% if model.status == 'preview' %}
+                    <a class="button secondary small" href="{{ url_for('financial_model_preview', asset_id=asset.id, model_id=model.id) }}">Preview</a>
+                  {% endif %}
+                  <a class="button secondary small" href="{{ url_for('download_asset_financial_model', asset_id=asset.id, model_id=model.id) }}">Download</a>
+                  {% if model.status == 'confirmed' and not model.active and not model.archived_at %}
+                    <form method="post" action="{{ url_for('activate_asset_financial_model', asset_id=asset.id, model_id=model.id) }}">
+                      <button class="button secondary small" type="submit">Ativar</button>
+                    </form>
+                  {% endif %}
+                  {% if not model.archived_at and model.status in ['preview', 'confirmed'] %}
+                    <form method="post" action="{{ url_for('archive_asset_financial_model', asset_id=asset.id, model_id=model.id) }}">
+                      <button class="button secondary small" type="submit">Arquivar</button>
+                    </form>
+                  {% endif %}
+                </div>
+              </td>
+            </tr>
+          {% else %}
+            <tr><td colspan="5" class="muted">Sem versoes importadas.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% if financial_model.versions|length >= 2 %}
+      <form class="inline-form compact-top-space" method="get" action="{{ url_for('compare_asset_financial_models', asset_id=asset.id) }}">
+        <select name="left">
+          {% for model in financial_model.versions if model.status == 'confirmed' %}
+            <option value="{{ model.id }}">v{{ model.version }} {{ model.base_year }}</option>
+          {% endfor %}
+        </select>
+        <select name="right">
+          {% for model in financial_model.versions if model.status == 'confirmed' %}
+            <option value="{{ model.id }}">v{{ model.version }} {{ model.base_year }}</option>
+          {% endfor %}
+        </select>
+        <button class="button secondary" type="submit">Comparar</button>
+      </form>
+    {% endif %}
   </article>
 
   <article class="card">
@@ -401,4 +564,77 @@
     </table>
   </div>
 </section>
+<script>
+  document.querySelectorAll(".financial-chart").forEach((target) => {
+    let payload = null;
+    try { payload = JSON.parse(target.dataset.financialChart || "{}"); } catch { payload = null; }
+    if (!payload || !payload.series) return;
+    const labels = payload.labels || [];
+    const metrics = [
+      ["production", "Producao"],
+      ["consumption", "Consumo"],
+      ["self_use", "Autoconsumo"],
+      ["export", "Excedente"],
+      ["grid_import", "Importacao rede"],
+    ];
+    const wrap = document.createElement("div");
+    wrap.className = "financial-chart-grid";
+    metrics.forEach(([key, label]) => {
+      const series = payload.series[key] || {};
+      const expected = series.expected || [];
+      const actual = series.actual || [];
+      const values = expected.concat(actual).filter((value) => value !== null && value !== undefined);
+      const max = Math.max(...values, 1);
+      const width = 360;
+      const height = 120;
+      const step = labels.length > 1 ? width / (labels.length - 1) : width;
+      const points = (items) => items.map((value, index) => {
+        if (value === null || value === undefined) return null;
+        return [index * step, height - (Number(value) / max * (height - 16)) - 8];
+      });
+      const toSegments = (items) => {
+        const segments = [];
+        let current = [];
+        items.forEach((point) => {
+          if (!point) {
+            if (current.length) segments.push(current);
+            current = [];
+          } else {
+            current.push(point);
+          }
+        });
+        if (current.length) segments.push(current);
+        return segments;
+      };
+      const card = document.createElement("div");
+      card.className = "financial-chart-card";
+      const title = document.createElement("strong");
+      title.textContent = label;
+      card.appendChild(title);
+      const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+      svg.setAttribute("role", "img");
+      svg.setAttribute("aria-label", `${label}: previsto vs real`);
+      const draw = (segments, color) => {
+        segments.forEach((segment) => {
+          const polyline = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+          polyline.setAttribute("points", segment.map(([x, y]) => `${x},${y}`).join(" "));
+          polyline.setAttribute("fill", "none");
+          polyline.setAttribute("stroke", color);
+          polyline.setAttribute("stroke-width", "3");
+          svg.appendChild(polyline);
+        });
+      };
+      draw(toSegments(points(expected)), "#2f9e8f");
+      draw(toSegments(points(actual)), "#d97706");
+      card.appendChild(svg);
+      const legend = document.createElement("small");
+      legend.className = "muted";
+      legend.textContent = "Verde: previsto | Laranja: real";
+      card.appendChild(legend);
+      wrap.appendChild(card);
+    });
+    target.appendChild(wrap);
+  });
+</script>
 {% endblock %}

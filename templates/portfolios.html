@@ -185,7 +185,7 @@
             <th>Nome externo</th>
             <th>Instalacao local</th>
             <th>Estado mapping</th>
-            <th>Helioscope</th>
+            <th>Financeiro/Helioscope</th>
             <th>Fatura</th>
             <th>Tarifa</th>
             <th>Acoes</th>
@@ -213,9 +213,10 @@
                   <div class="grid two">
                     <form method="post" action="{{ url_for('upload_portfolio_helioscope') }}" enctype="multipart/form-data" class="stack-form">
                       <input type="hidden" name="portfolio_id" value="{{ item.portfolio_id }}">
+                      <input type="hidden" name="report_month" value="{{ report_month }}">
                       <input type="hidden" name="asset_id" value="{{ item.asset_id }}">
                       <input type="file" name="file" accept=".xlsx,.xlsm,.xltx,.xltm" required>
-                      <button class="button secondary" type="submit">Upload Helioscope</button>
+                      <button class="button secondary" type="submit">Upload financeiro</button>
                     </form>
                     <form method="post" action="{{ url_for('upload_portfolio_invoice') }}" enctype="multipart/form-data" class="stack-form">
                       <input type="hidden" name="portfolio_id" value="{{ item.portfolio_id }}">

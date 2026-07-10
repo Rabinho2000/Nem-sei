@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 import app as app_module
+from monitoring_board.db import get_db
 from monitoring_board.services.fusionsolar import map_fusionsolar_status
 
 
@@ -21,6 +22,7 @@ def load_fixture(name: str) -> dict[str, Any]:
 class FakeResponse:
     def __init__(self, payload: dict[str, Any]) -> None:
         self.payload = payload
+        self.headers: dict[str, str] = {}
 
     def raise_for_status(self) -> None:
         return None
@@ -190,3 +192,117 @@ def test_post_fusionsolar_json_error_payloads_feed_existing_error_recognizers(
         )
 
     assert recognizer(exc_info.value)
+
+
+def test_fusionsolar_rate_limit_payload_persists_cooldown_and_blocks_next_http(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_path = tmp_path / "fusion-cooldown.db"
+    app_module.ensure_database(str(db_path))
+    flask_app = app_module.app
+    original_database = flask_app.config["DATABASE"]
+    original_until = app_module.FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL
+    app_module.FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL = None
+    monkeypatch.setenv("FUSIONSOLAR_RATE_LIMIT_MINUTES", "60")
+    try:
+        flask_app.config["DATABASE"] = str(db_path)
+        with flask_app.app_context():
+            session = FakeSession(
+                {
+                    "https://fusion.test/thirdData/fail": {
+                        "success": False,
+                        "failCode": 407,
+                        "message": "API call limit exceeded",
+                    }
+                }
+            )
+            with pytest.raises(ValueError) as first_exc:
+                app_module.post_fusionsolar_json(
+                    session,
+                    "https://fusion.test/thirdData/fail",
+                    {"stationCodes": "FS-PLANT-001"},
+                    expected_message="FusionSolar fixture failure",
+                )
+            assert "Nova tentativa disponivel apos" in str(first_exc.value)
+            assert len(session.posts) == 1
+
+            with get_db(str(db_path)) as conn:
+                persisted = app_module.get_app_state_value(conn, app_module.FUSIONSOLAR_RATE_LIMIT_COOLDOWN_KEY)
+            assert persisted
+
+            with pytest.raises(ValueError) as second_exc:
+                app_module.post_fusionsolar_json(
+                    session,
+                    "https://fusion.test/thirdData/fail",
+                    {"stationCodes": "FS-PLANT-001"},
+                    expected_message="FusionSolar fixture failure",
+                )
+            assert "temporariamente limitado" in str(second_exc.value)
+            assert len(session.posts) == 1
+    finally:
+        flask_app.config["DATABASE"] = original_database
+        app_module.FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL = original_until
+
+
+def test_fusionsolar_login_rate_limit_does_not_retry_or_leak_credentials(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_path = tmp_path / "fusion-login-cooldown.db"
+    app_module.ensure_database(str(db_path))
+    flask_app = app_module.app
+    original_database = flask_app.config["DATABASE"]
+    original_until = app_module.FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL
+    app_module.FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL = None
+    posts: list[tuple[str, dict[str, Any]]] = []
+
+    class LoginLimitedSession:
+        cookies: dict[str, str] = {}
+
+        def post(self, url: str, json: dict[str, Any], headers: dict[str, str], timeout: int) -> FakeResponse:
+            posts.append((url, json))
+            return FakeResponse({"success": False, "failCode": 407, "message": "API call limit exceeded"})
+
+    monkeypatch.setattr(app_module.requests, "Session", LoginLimitedSession)
+    try:
+        flask_app.config["DATABASE"] = str(db_path)
+        with flask_app.app_context():
+            with pytest.raises(ValueError) as exc_info:
+                app_module.get_fusionsolar_session(
+                    {
+                        "username": "real-user@example.test",
+                        "password": "super-secret",
+                        "base_url": "https://fusion.test",
+                        "login_endpoint": "/thirdData/login",
+                        "plants_endpoint": "/thirdData/stations",
+                        "real_time_endpoint": "/thirdData/getStationRealKpi",
+                        "device_list_endpoint": "/thirdData/getDevList",
+                        "device_real_time_endpoint": "/thirdData/getDevRealKpi",
+                        "device_history_endpoint": "/thirdData/getDevHistoryKpi",
+                        "alarms_endpoint": "/thirdData/getAlarmList",
+                        "day_kpi_endpoint": "/thirdData/getKpiStationDay",
+                        "month_kpi_endpoint": "/thirdData/getKpiStationMonth",
+                    }
+                )
+            message = str(exc_info.value)
+            assert "Nova tentativa disponivel apos" in message
+            assert "real-user@example.test" not in message
+            assert "super-secret" not in message
+            assert len(posts) == 1
+
+            with pytest.raises(ValueError):
+                app_module.get_fusionsolar_session(
+                    {
+                        "username": "real-user@example.test",
+                        "password": "super-secret",
+                        "base_url": "https://fusion.test",
+                        "login_endpoint": "/thirdData/login",
+                        "plants_endpoint": "/thirdData/stations",
+                        "real_time_endpoint": "/thirdData/getStationRealKpi",
+                        "device_list_endpoint": "/thirdData/getDevList",
+                        "device_real_time_endpoint": "/thirdData/getDevRealKpi",
+                        "device_history_endpoint": "/thirdData/getDevHistoryKpi",
+                        "alarms_endpoint": "/thirdData/getAlarmList",
+                        "day_kpi_endpoint": "/thirdData/getKpiStationDay",
+                        "month_kpi_endpoint": "/thirdData/getKpiStationMonth",
+                    }
+                )
+            assert len(posts) == 1
+    finally:
+        flask_app.config["DATABASE"] = original_database
+        app_module.FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL = original_until

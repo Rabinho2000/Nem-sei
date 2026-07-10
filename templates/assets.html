@@ -4,18 +4,26 @@
   <div>
     <p class="eyebrow">Instalacoes</p>
     <h2>Todas as instalacoes do Project Overview</h2>
-    <p class="muted">Consulta rapida dos parametros principais, do grupo de instalacao e do ultimo estado monitorizado.</p>
+    <p class="muted">Consulta rapida das centrais, da instalacao a que pertencem e do ultimo estado monitorizado.</p>
   </div>
 </section>
 
+<datalist id="installation-group-options">
+  {% for group in installation_groups %}
+    <option value="{{ group.name }}">{{ group.member_count }} central{{ '' if group.member_count == 1 else 's' }}</option>
+  {% endfor %}
+</datalist>
+
 <details class="card asset-edit-details" id="new-asset">
-  <summary class="asset-edit-summary">Acrescentar nova instalacao</summary>
+  <summary class="asset-edit-summary">Acrescentar nova central</summary>
   <form class="stack-form asset-edit-form" method="post">
     <label>Central
       <input type="text" name="project_name" placeholder="Nome da central" required>
     </label>
     <label>Instalacao
-      <input type="text" name="installation_group" placeholder="Grupo/instalacao, se aplicavel">
+      <input type="text" name="installation_group" list="installation-group-options" placeholder="Escolher existente ou criar nova">
+      <small class="muted">Usa o mesmo nome para agrupar varias centrais da mesma instalacao.</small>
+      <small class="muted">Ao guardar, campos comuns vazios podem ser preenchidos a partir de outra central dessa instalacao.</small>
     </label>
     <label>Empresa
       <input type="text" name="company_name" placeholder="Cliente ou empresa">
@@ -64,7 +72,7 @@
     <label>Notas
       <textarea name="notes" rows="4" placeholder="Observacoes iniciais"></textarea>
     </label>
-    <button class="button" type="submit">Criar instalacao</button>
+    <button class="button" type="submit">Criar central</button>
   </form>
 </details>
 

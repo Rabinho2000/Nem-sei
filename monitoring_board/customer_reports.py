@@ -327,6 +327,7 @@ def kpi_icon_kind(key: str) -> str:
         "net_benefit_eur": "wallet",
         "savings_eur": "money",
         "export_revenue_eur": "wallet",
+        "availability_pct": "target",
     }.get(key, "money")
 
 
@@ -358,11 +359,14 @@ def draw_report_header(pdf: canvas.Canvas, report: dict[str, Any], logo_path: Pa
 
 def draw_kpi_cards(pdf: canvas.Canvas, report: dict[str, Any], page_width: float, page_height: float) -> None:
     config = REPORT_TYPES[report["report_type"]]
+    items = list(config["kpis"])
+    if report.get("include_availability_kpi") and report.get("availability_pct") is not None:
+        items.append(("Disponibilidade (%)", "availability_pct", "pct", GREEN))
     gap = 6
     x0 = 20
     y = page_height - 134
-    card_w = (page_width - 40 - gap * 5) / 6
-    for index, (label, key, kind, accent) in enumerate(config["kpis"]):
+    card_w = (page_width - 40 - gap * (len(items) - 1)) / len(items)
+    for index, (label, key, kind, accent) in enumerate(items):
         x = x0 + index * (card_w + gap)
         _card(pdf, x, y, card_w, 52)
         pdf.setFillColor(accent)
@@ -371,7 +375,12 @@ def draw_kpi_cards(pdf: canvas.Canvas, report: dict[str, Any], page_width: float
         pdf.setFillColor(NAVY)
         pdf.setFont("Helvetica-Bold", 7)
         pdf.drawString(x + 38, y + 33, label)
-        value = format_kwh(report[key]) if kind == "kwh" else format_eur(report[key])
+        if kind == "kwh":
+            value = format_kwh(report[key])
+        elif kind == "pct":
+            value = format_pct(report[key])
+        else:
+            value = format_eur(report[key])
         _scaled_text(pdf, value, x + 38, y + 14, card_w - 43, size=11, color=accent)
 
 

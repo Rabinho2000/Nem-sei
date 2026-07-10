@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">Modelo financeiro</p>
+    <h2>Preview · {{ asset.project_name }}</h2>
+    <p class="muted">{{ source.original_filename if source else "-" }} | SHA-256 {{ model.file_sha256[:12] }}...</p>
+  </div>
+  <div class="hero-actions">
+    <a class="button secondary" href="{{ url_for('asset_detail', asset_id=asset.id) }}">Voltar</a>
+  </div>
+</section>
+
+<section class="cards dashboard-kpis">
+  <article class="card stat-card"><span>Ano base</span><strong>{{ model.base_year }}</strong></article>
+  <article class="card stat-card"><span>Potencia detetada</span><strong>{{ format_number(model.detected_kwp, 2) }} kWp</strong></article>
+  <article class="card stat-card"><span>Estado</span><strong>{{ model.status }}</strong></article>
+  <article class="card stat-card"><span>Parser</span><strong>{{ model.parser_name }} v{{ model.parser_version }}</strong></article>
+</section>
+
+<section class="grid two">
+  <article class="card">
+    <div class="section-title"><h3>Validacao</h3></div>
+    <dl class="details">
+      <div><dt>Nome detetado</dt><dd>{{ model.detected_name or "-" }}</dd></div>
+      <div><dt>NIF detetado</dt><dd>{{ model.detected_nif or "-" }}</dd></div>
+      <div><dt>Warnings</dt><dd>{{ (warnings + validation.get('warnings', []))|unique|join(', ') if warnings or validation.get('warnings') else "-" }}</dd></div>
+      <div><dt>Bloqueios</dt><dd>{{ validation.get('blocking', [])|join(', ') if validation.get('blocking') else "-" }}</dd></div>
+    </dl>
+  </article>
+
+  <article class="card">
+    <div class="section-title"><h3>Confirmacao</h3></div>
+    <form method="post" action="{{ url_for('confirm_asset_financial_model', asset_id=asset.id, model_id=model.id) }}" class="stack-form">
+      {% if validation.get('blocking') %}
+        <label class="checkbox-inline">
+          <input type="checkbox" name="override" value="1">
+          <span>Confirmar com override</span>
+        </label>
+        <label>Motivo do override
+          <textarea name="override_reason" rows="3"></textarea>
+        </label>
+      {% endif %}
+      <button class="button" type="submit">Confirmar e ativar</button>
+    </form>
+    <form method="post" action="{{ url_for('cancel_asset_financial_model', asset_id=asset.id, model_id=model.id) }}" class="compact-top-space">
+      <button class="button secondary" type="submit">Cancelar preview</button>
+    </form>
+  </article>
+</section>
+
+<section class="card">
+  <div class="section-title"><h3>Previsoes mensais</h3></div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Mes</th>
+          <th>Producao</th>
+          <th>Consumo</th>
+          <th>Autoconsumo</th>
+          <th>Excedente</th>
+          <th>Importacao rede</th>
+          <th>Taxa AC</th>
+          <th>Taxa AS</th>
+          <th>Warnings</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in monthly %}
+          <tr>
+            <td>{{ row.month }}</td>
+            <td>{{ format_number(row.expected_production_kwh, 2) }}</td>
+            <td>{{ format_number(row.expected_consumption_kwh, 2) }}</td>
+            <td>{{ format_number(row.expected_self_use_kwh, 2) }}</td>
+            <td>{{ format_number(row.expected_export_kwh, 2) }}</td>
+            <td>{{ format_number(row.expected_grid_import_kwh, 2) }}</td>
+            <td>{{ format_number(row.expected_self_consumption_rate_pct, 2) }}</td>
+            <td>{{ format_number(row.expected_self_sufficiency_rate_pct, 2) }}</td>
+            <td>{{ row.warnings_json or "-" }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

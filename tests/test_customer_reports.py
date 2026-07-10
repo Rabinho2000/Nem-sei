@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from io import BytesIO
 from datetime import date
 from decimal import Decimal
 
 import pytest
+from pypdf import PdfReader
 
 from monitoring_board.customer_reports import (
     REPORT_TYPES,
@@ -118,6 +120,22 @@ def test_both_report_types_render_as_single_page_pdf() -> None:
         assert pdf.startswith(b"%PDF-")
         assert len(pdf) > 4000
         assert pdf.count(b"/Type /Page") >= 1
+
+
+def test_availability_kpi_is_optional_in_customer_pdf() -> None:
+    hidden = build_customer_report_pdf(prepare_customer_report(sample_report("EPC")))
+    hidden_text = "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(hidden)).pages)
+
+    raw = sample_report("EPC")
+    report = prepare_customer_report(raw)
+    report["include_availability_kpi"] = True
+    report["availability_pct"] = 98.5
+    visible = build_customer_report_pdf(report)
+    visible_text = "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(visible)).pages)
+
+    assert "Disponibilidade (%)" not in hidden_text
+    assert "Disponibilidade (%)" in visible_text
+    assert "98%" in visible_text
 
 
 def test_reporting_periods_cover_month_quarters_semesters_and_years() -> None:

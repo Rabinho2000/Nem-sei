@@ -71,6 +71,24 @@ python -m monitoring_board.reporting_storage_check --database .\data\monitoring_
 
 Guia operacional: [docs/reporting_operations.md](docs/reporting_operations.md).
 
+Modelos financeiros carregados por instalacao ficam em
+`DATA_DIR/uploads/financial_models/<asset_id>/` e sao referenciados pela tabela
+`source_files`. Um backup apenas da base SQLite nao inclui estes ficheiros
+originais. Para um backup completo, inclui tambem `DATA_DIR/uploads`; o script
+`scripts/backup.sh` faz isso quando `INCLUDE_UPLOADS=1`.
+
+## Integracao FusionSolar
+
+No `.env`, preencher as credenciais e, se quiseres controlar os jobs diarios
+por variavel de ambiente:
+
+```text
+FUSIONSOLAR_PRODUCTION_SYNC_ENABLED=true
+FUSIONSOLAR_PRODUCTION_SYNC_TIME=00:10
+FUSIONSOLAR_DIAGNOSTICS_SYNC_ENABLED=true
+FUSIONSOLAR_DIAGNOSTICS_SYNC_TIME=00:30
+```
+
 ## Integracao Sigenergy
 
 Esta fase suporta apenas monitorizacao atual Sigenergy: autenticacao por App
@@ -88,8 +106,10 @@ SIGENERGY_BASE_URL=https://api-eu.sigencloud.com
 SIGENERGY_AUTH_ENDPOINT=/openapi/auth/login/key
 SIGENERGY_SYSTEMS_ENDPOINT=/openapi/system
 SIGENERGY_ENERGY_FLOW_ENDPOINT=/openapi/systems/{system_id}/energyFlow
+SIGENERGY_ONBOARD_ENDPOINT=/openapi/board/onboard
 SIGENERGY_REGION=eu
-SIGENERGY_SYNC_HOURS=08:00,14:00
+SIGENERGY_STATE_SYNC_INTERVAL_HOURS=1
+SIGENERGY_SNAPSHOT_RETENTION_DAYS=90
 ```
 
 Se a conta nao devolver a lista de sistemas, usar `SIGENERGY_SYSTEM_IDS` com os
@@ -99,6 +119,91 @@ dados, logs ou exports para Git.
 Na interface, abrir `Integracoes > Sigenergy`, guardar a configuracao, usar
 `Testar ligacao` para validar autenticacao/lista/energy flow sem escrever dados
 e `Sincronizar agora` para gravar snapshots e registos de monitorizacao.
+
+Para pedir acesso a uma nova instalacao, usar o bloco `Onboarding Sigenergy` na
+mesma pagina e enviar um unico System ID. O pedido chama
+`POST /openapi/board/onboard` com payload `["SYSTEM_ID"]`; a app guarda o
+codigo e mensagem devolvidos pelo provider sem tokens nem secrets. O proprietario
+da instalacao podera ter de aprovar o acesso na Sigenergy. Usar `Atualizar
+estado` ou uma sincronizacao futura para reconciliar: quando o System ID aparecer
+em `/openapi/system`, o pedido passa para `approved`.
+
+Estados de onboarding principais:
+
+- `requested`: pedido enviado.
+- `already_requested_or_onboarded`: codigo conservador para respostas como
+  `1401` ate o sistema aparecer na lista autorizada.
+- `approved`: sistema encontrado na lista Sigenergy.
+- `failed`: pedido rejeitado ou erro do provider.
+
+Nao existe suporte a Bearer token estatico (`SIGENERGY_BEARER`); a integracao
+usa sempre App Key/App Secret, token temporario em cache e renovacao automatica
+apos HTTP 401. Se parte das chamadas `energyFlow` falhar, a sincronizacao fica
+com estado `partial`, preserva o ultimo estado valido e guarda o erro sanitizado.
+Snapshots Sigenergy sao limpos uma vez por dia conforme
+`SIGENERGY_SNAPSHOT_RETENTION_DAYS`, mantendo sempre o snapshot mais recente de
+cada sistema.
+
+## Politica de chamadas API das integracoes
+
+O APScheduler corre dentro do processo Flask/Gunicorn e o deployment atual deve
+continuar com exatamente 1 worker. Os jobs usam IDs estaveis e `replace_existing`
+para evitar duplicados apos restart ou alteracao da configuracao.
+
+FusionSolar:
+
+- `integration-state-fusionsolar-hourly`: estado/monitorizacao, no maximo uma
+  vez por hora. So e agendado se a integracao estiver ativa e
+  `auto_sync_enabled` estiver ligado na UI.
+- `integration-production-fusionsolar-daily`: producao diaria, uma vez por dia,
+  sempre para o dia anterior. Controlado por `production_sync_enabled` e
+  `production_sync_time`.
+- `integration-diagnostics-fusionsolar-daily`: chamadas pesadas de diagnostico,
+  como disponibilidade/inversores/device history/alarmes, uma vez por dia e em
+  job separado da producao. Controlado por `diagnostics_sync_enabled` e
+  `diagnostics_sync_time`.
+
+Sigenergy:
+
+- `integration-state-sigenergy-hourly`: estado atual/`energyFlow`, no maximo uma
+  vez por hora. So e agendado se a integracao estiver ativa e
+  `auto_sync_enabled` estiver ligado na UI.
+- A app nao agenda producao nem historico Sigenergy enquanto nao houver
+  endpoints/configuracao validados para isso.
+
+Rate limit e backoff:
+
+- O estado de cooldown fica persistido por `provider` e `api_area`
+  (`state`, `production`, `diagnostics`) em `api_call_state`.
+- FusionSolar `failCode=407` e HTTP 429 criam cooldown persistente de 60
+  minutos por defeito. `failCode=305`/`USER_MUST_RELOGIN` invalida a sessao e
+  tenta login uma vez.
+- Sigenergy HTTP 401 invalida o token e autentica novamente uma vez. HTTP 429
+  cria cooldown persistente.
+- HTTP 5xx e falhas de rede usam backoff curto finito em background
+  (`15s`, `60s`, `180s`, maximo 3 retries). Requests Flask nao fazem sleeps
+  longos.
+- Se um background job encontrar cooldown ativo, fica em
+  `waiting_rate_limit`, grava `next_attempt_at` e e reagendado para depois do
+  cooldown.
+- A UI mostra o estado das APIs e jobs em espera, incluindo a proxima tentativa.
+
+Pagina `Integracoes`:
+
+- O separador `Resumo` mostra uma linha por provider com estado enabled,
+  auto-sync, frequencia do estado, hora de producao/diagnostics FusionSolar,
+  ultima tentativa, ultimo sucesso, proxima tentativa e ultimo erro.
+- Os estados API aparecem como `OK`, `Em cooldown`, `Falhou ultima tentativa`,
+  `Sem credenciais` ou `Disabled`.
+- Os botoes de sync manual apenas criam jobs em background:
+  `Estado agora`, `Producao agora` e `Diagnostics agora`. Se existir cooldown,
+  o botao indica que o job fica em fila.
+- `Limpar cooldown` aparece quando existe cooldown ativo e pede confirmacao no
+  browser antes de alterar o estado.
+- Passwords e secrets nunca sao mostrados. Quando configurados por variavel de
+  ambiente, a UI mostra essa origem e bloqueia a sobrescrita no campo secreto.
+- O separador `Historico` junta os ultimos sync runs e os ultimos background
+  jobs, incluindo `waiting_rate_limit` e `next_attempt_at`.
 
 ## Docker / Raspberry Pi
 

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import threading
 from datetime import datetime
-from typing import Any
 from zoneinfo import ZoneInfo
 
 INTEGRATION_PROVIDER_FUSIONSOLAR = "FusionSolar"
@@ -29,10 +27,11 @@ DEFAULT_FUSIONSOLAR_MONTH_KPI_ENDPOINT = "/thirdData/getKpiStationMonth"
 DEFAULT_FUSIONSOLAR_ALARMS_LANGUAGE = "en_US"
 DEFAULT_SIGENERGY_BASE_URL = "https://api-eu.sigencloud.com"
 DEFAULT_SIGENERGY_AUTH_ENDPOINT = "/openapi/auth/login/key"
-DEFAULT_SIGENERGY_SYSTEMS_ENDPOINT = "/openapi/system/list"
-DEFAULT_SIGENERGY_REALTIME_ENDPOINT = "/openapi/system/realtime/data"
+DEFAULT_SIGENERGY_SYSTEMS_ENDPOINT = "/openapi/system"
 DEFAULT_SIGENERGY_ENERGY_FLOW_ENDPOINT = "/openapi/systems/{system_id}/energyFlow"
+DEFAULT_SIGENERGY_ONBOARD_ENDPOINT = "/openapi/board/onboard"
 DEFAULT_SIGENERGY_REGION = "eu"
+DEFAULT_SIGENERGY_SNAPSHOT_RETENTION_DAYS = 90
 FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_MINUTES = 60
 FUSIONSOLAR_PERFORMANCE_KPI_DELAY_SECONDS = 65
 FUSIONSOLAR_PERFORMANCE_MAX_API_CALLS = 20
@@ -45,9 +44,6 @@ LOW_INVERTER_AVAILABILITY_PCT = 90.0
 LISBON_TIMEZONE = ZoneInfo("Europe/Lisbon")
 DEFAULT_STRING_PRESENT_VOLTAGE_THRESHOLD = 100.0
 DEFAULT_STRING_AUTO_LEARN_OBSERVATIONS = 2
-SIGENERGY_TOKEN_CACHE: dict[str, dict[str, Any]] = {}
-SIGENERGY_TOKEN_LOCK = threading.Lock()
-
 STATUS_COLORS = {
     "Erro": "danger",
     "Desconectada": "warning",

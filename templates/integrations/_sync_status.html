@@ -1,9 +1,135 @@
-<section class="cards">
-  {% for item in integration_configs %}
-    <article class="card stat-card">
-      <span>{{ item.provider }}</span>
-      <strong>{{ item.last_sync_status or 'sem sync' }}</strong>
-      <p class="muted">{{ item.last_sync_at or '-' }} | auto-sync {{ 'ativo' if item.auto_sync_enabled else 'desligado' }} | {{ item.sync_hours or '-' }}</p>
-    </article>
-  {% endfor %}
+<section class="card">
+  <div class="section-title">
+    <h3>Estado das chamadas API</h3>
+    <a class="button secondary" href="#integrations-history">Ver historico dos ultimos jobs</a>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Provider</th>
+          <th>Configuracao</th>
+          <th>Estado</th>
+          <th>Producao</th>
+          <th>Diagnostics</th>
+          <th>Ultimas chamadas</th>
+          <th>Proximo sync</th>
+          <th>Estado API</th>
+          <th>Acoes</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in integration_api_controls %}
+          {% set cfg = item.config %}
+          <tr>
+            <td>
+              <strong>{{ item.provider }}</strong>
+              <p class="muted">{{ 'enabled' if item.enabled else 'disabled' }}</p>
+              {% if not item.credentials_ok %}
+                <p class="muted">Sem credenciais completas</p>
+              {% endif %}
+            </td>
+            <td>
+              <p>Estado: {{ 'ativo' if item.state_enabled else 'desligado' }}</p>
+              <p>Auto sync: {{ 'ativo' if item.auto_sync_enabled else 'desligado' }}</p>
+              <p>Frequencia estado: {{ item.state_interval_hours }}h</p>
+            </td>
+            <td>
+              <span class="chip {{ 'success' if item.state_enabled else 'muted' }}">{{ 'ativo' if item.state_enabled else 'desligado' }}</span>
+              <p class="muted">Ultima tentativa: {{ item.state_area.last_attempt_at or '-' }}</p>
+              <p class="muted">Ultimo sucesso: {{ item.state_area.last_success_at or '-' }}</p>
+            </td>
+            <td>
+              {% if item.provider == 'FusionSolar' %}
+                <span class="chip {{ 'success' if item.production_enabled else 'muted' }}">{{ 'ativo' if item.production_enabled else 'desligado' }}</span>
+                <p class="muted">Hora: {{ item.production_sync_time }}</p>
+                <p class="muted">Ultima tentativa: {{ item.production_area.last_attempt_at or '-' }}</p>
+                <p class="muted">Ultimo sucesso: {{ item.production_area.last_success_at or '-' }}</p>
+              {% else %}
+                <span class="chip muted">nao disponivel</span>
+                <p class="muted">Sigenergy nesta fase so tem estado/energyFlow atual.</p>
+              {% endif %}
+            </td>
+            <td>
+              {% if item.provider == 'FusionSolar' %}
+                <span class="chip {{ 'success' if item.diagnostics_enabled else 'muted' }}">{{ 'ativo' if item.diagnostics_enabled else 'desligado' }}</span>
+                <p class="muted">Hora: {{ item.diagnostics_sync_time }}</p>
+                <p class="muted">Ultima tentativa: {{ item.diagnostics_area.last_attempt_at or '-' }}</p>
+                <p class="muted">Ultimo sucesso: {{ item.diagnostics_area.last_success_at or '-' }}</p>
+              {% else %}
+                <span class="chip muted">nao disponivel</span>
+                <p class="muted">Sem historico, alarmes ou diagnostics Sigenergy.</p>
+              {% endif %}
+            </td>
+            <td>
+              <p>Estado: {{ item.state_area.latest_job.status if item.state_area.latest_job else '-' }}</p>
+              {% if item.provider == 'FusionSolar' %}
+                <p>Producao: {{ item.production_area.latest_job.status if item.production_area.latest_job else '-' }}</p>
+                <p>Diagnostics: {{ item.diagnostics_area.latest_job.status if item.diagnostics_area.latest_job else '-' }}</p>
+              {% endif %}
+            </td>
+            <td>
+              <p>Estado: {{ item.state_area.next_attempt_at or item.state_area.next_scheduled_at or '-' }}</p>
+              {% if item.provider == 'FusionSolar' %}
+                <p>Producao: {{ item.production_area.next_attempt_at or item.production_area.next_scheduled_at or '-' }}</p>
+                <p>Diagnostics: {{ item.diagnostics_area.next_attempt_at or item.diagnostics_area.next_scheduled_at or '-' }}</p>
+              {% endif %}
+            </td>
+            <td>
+              <p><span class="chip {{ 'warning' if item.state_area.api_status == 'Em cooldown' else 'danger' if item.state_area.api_status in ['Falhou ultima tentativa', 'Sem credenciais'] else 'muted' if item.state_area.api_status == 'Disabled' else 'success' }}">Estado: {{ item.state_area.api_status }}</span></p>
+              {% if item.provider == 'FusionSolar' %}
+                <p><span class="chip {{ 'warning' if item.production_area.api_status == 'Em cooldown' else 'danger' if item.production_area.api_status in ['Falhou ultima tentativa', 'Sem credenciais'] else 'muted' if item.production_area.api_status == 'Disabled' else 'success' }}">Producao: {{ item.production_area.api_status }}</span></p>
+                <p><span class="chip {{ 'warning' if item.diagnostics_area.api_status == 'Em cooldown' else 'danger' if item.diagnostics_area.api_status in ['Falhou ultima tentativa', 'Sem credenciais'] else 'muted' if item.diagnostics_area.api_status == 'Disabled' else 'success' }}">Diagnostics: {{ item.diagnostics_area.api_status }}</span></p>
+              {% endif %}
+              {% if item.state_area.last_error %}
+                <p class="muted">Erro estado: {{ item.state_area.last_error }}</p>
+              {% endif %}
+              {% if item.production_area.last_error %}
+                <p class="muted">Erro producao: {{ item.production_area.last_error }}</p>
+              {% endif %}
+              {% if item.diagnostics_area.last_error %}
+                <p class="muted">Erro diagnostics: {{ item.diagnostics_area.last_error }}</p>
+              {% endif %}
+            </td>
+            <td>
+              <div class="hero-actions">
+                <form method="post">
+                  <input type="hidden" name="action" value="{{ 'test_fusionsolar_connection' if item.provider == 'FusionSolar' else 'test_sigenergy_connection' }}">
+                  <button class="button secondary" type="submit">Testar ligacao</button>
+                </form>
+                <form method="post">
+                  <input type="hidden" name="action" value="sync_provider_state_now">
+                  <input type="hidden" name="provider" value="{{ item.provider }}">
+                  <button class="button" type="submit">Estado agora{% if item.state_area.cooldown_active %} (fica em fila){% endif %}</button>
+                </form>
+                {% if item.provider == 'FusionSolar' %}
+                  <form method="post">
+                    <input type="hidden" name="action" value="sync_fusionsolar_production_now">
+                    <button class="button secondary" type="submit">Producao agora{% if item.production_area.cooldown_active %} (fica em fila){% endif %}</button>
+                  </form>
+                  <form method="post">
+                    <input type="hidden" name="action" value="sync_fusionsolar_diagnostics_now">
+                    <button class="button secondary" type="submit">Diagnostics agora{% if item.diagnostics_area.cooldown_active %} (fica em fila){% endif %}</button>
+                  </form>
+                {% endif %}
+                {% for area_name, area in item.areas.items() %}
+                  {% if area.cooldown_active %}
+                    <form method="post" onsubmit="return confirm('Limpar manualmente este cooldown da API?');">
+                      <input type="hidden" name="action" value="clear_api_cooldown">
+                      <input type="hidden" name="provider" value="{{ item.provider }}">
+                      <input type="hidden" name="api_area" value="{{ area_name }}">
+                      <input type="hidden" name="confirm_clear_cooldown" value="on">
+                      <button class="button secondary" type="submit">Limpar cooldown {{ area_name }}</button>
+                    </form>
+                  {% endif %}
+                {% endfor %}
+              </div>
+            </td>
+          </tr>
+        {% else %}
+          <tr><td colspan="9" class="muted">Ainda nao existem integracoes configuradas.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
 </section>

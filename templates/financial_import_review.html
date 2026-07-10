@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">Modelo financeiro</p>
+    <h2>{{ source.original_filename }}</h2>
+    <p class="muted">{{ source.project_name }}{% if source.portfolio_name %} · {{ source.portfolio_name }}{% endif %}</p>
+  </div>
+  <div class="hero-actions">
+    <a class="button" href="{{ url_for('portfolios', tab='config', portfolio_id=portfolio_id or source.portfolio_id, report_month=report_month) }}">Voltar a configuracao</a>
+  </div>
+</section>
+
+<section class="cards dashboard-kpis">
+  <article class="card stat-card"><span>Meses importados</span><strong>{{ summary.months or monthly|length }}</strong></article>
+  <article class="card stat-card"><span>Intervalos 15 min</span><strong>{{ interval_count }}</strong></article>
+  <article class="card stat-card"><span>Tarifa</span><strong>{{ summary.tariff_action or "none" }}</strong></article>
+  <article class="card stat-card"><span>Potencia kWp</span><strong>{{ format_number(summary.installed_power_kwp, 2) }}</strong></article>
+</section>
+
+{% if summary.warnings %}
+  <section class="card">
+    <div class="section-title"><h3>Avisos</h3></div>
+    <p class="muted">{{ summary.warnings|join(", ") }}</p>
+  </section>
+{% endif %}
+
+<section class="card">
+  <div class="section-title"><h3>Producao esperada mensal</h3></div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Mes</th><th>kWh</th></tr></thead>
+      <tbody>
+        {% for row in monthly %}
+          <tr><td>{{ row.month }}</td><td>{{ format_number(row.expected_kwh, 2) }}</td></tr>
+        {% else %}
+          <tr><td colspan="2" class="muted">Sem producao mensal importada.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+{% if summary.financial_outputs %}
+  <section class="card">
+    <div class="section-title"><h3>Outputs financeiros</h3></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Campo</th><th>Valor</th></tr></thead>
+        <tbody>
+          {% for key, value in summary.financial_outputs.items() %}
+            <tr><td>{{ key }}</td><td>{{ format_number(value, 2) if value is number else value }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endif %}
+{% endblock %}

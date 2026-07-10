@@ -220,7 +220,7 @@ def test_background_job_helpers_create_and_update_status(tmp_path) -> None:
     conn = get_db(str(db_path))
     try:
         job_id, created = create_background_job(conn, "fusionsolar_production_sync", {"period_type": "day"})
-        duplicate_id, duplicate_created = create_background_job(conn, "fusionsolar_production_sync", {"period_type": "month"})
+        duplicate_id, duplicate_created = create_background_job(conn, "fusionsolar_production_sync", {"period_type": "day"})
         conn.commit()
 
         assert created is True

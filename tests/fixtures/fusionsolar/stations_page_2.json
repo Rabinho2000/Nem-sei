@@ -1,0 +1,17 @@
+{
+  "success": true,
+  "failCode": 0,
+  "message": "OK",
+  "data": {
+    "pageNo": 2,
+    "pageCount": 2,
+    "total": 2,
+    "list": [
+      {
+        "plantCode": "FS-PLANT-002",
+        "plantName": "Fixture Solar Page Two",
+        "capacity": "42.5"
+      }
+    ]
+  }
+}
