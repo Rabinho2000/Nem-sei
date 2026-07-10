@@ -40,6 +40,7 @@ def _insert_enabled_config(
     provider: str,
     sync_hours: str = "08:00,14:00",
     *,
+    enabled: int = 1,
     auto_sync_enabled: int = 1,
     production_sync_enabled: int = 1,
     diagnostics_sync_enabled: int = 1,
@@ -51,10 +52,11 @@ def _insert_enabled_config(
             provider, enabled, auto_sync_enabled, sync_hours,
             production_sync_enabled, diagnostics_sync_enabled, state_sync_interval_hours,
             production_sync_time, diagnostics_sync_time, created_at, updated_at
-        ) VALUES (?, 1, ?, ?, ?, ?, 1, '00:10', '00:30', ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, 1, '00:10', '00:30', ?, ?)
         """,
         (
             provider,
+            enabled,
             auto_sync_enabled,
             sync_hours,
             production_sync_enabled,
@@ -132,6 +134,33 @@ def test_refresh_scheduler_registers_stable_single_instance_provider_jobs(tmp_pa
         app_module.SCHEDULER = original_scheduler
 
 
+def test_fusionsolar_disabled_registers_no_provider_jobs(tmp_path, monkeypatch) -> None:
+    flask_app, original_database = _make_test_app(tmp_path)
+    fake_scheduler = FakeScheduler()
+    original_scheduler = app_module.SCHEDULER
+    monkeypatch.setattr(app_module, "telegram_daily_summary_enabled", lambda: False)
+    app_module.SCHEDULER = fake_scheduler
+    try:
+        with get_db(flask_app.config["DATABASE"]) as conn:
+            _insert_enabled_config(
+                conn,
+                app_module.INTEGRATION_PROVIDER_FUSIONSOLAR,
+                enabled=0,
+                auto_sync_enabled=1,
+                production_sync_enabled=1,
+                diagnostics_sync_enabled=1,
+            )
+
+        app_module.refresh_integration_scheduler(flask_app)
+
+        assert "integration-state-fusionsolar-hourly" not in fake_scheduler.jobs
+        assert "integration-production-fusionsolar-daily" not in fake_scheduler.jobs
+        assert "integration-diagnostics-fusionsolar-daily" not in fake_scheduler.jobs
+    finally:
+        flask_app.config["DATABASE"] = original_database
+        app_module.SCHEDULER = original_scheduler
+
+
 def test_fusionsolar_enabled_with_auto_sync_disabled_does_not_register_hourly_state_job(tmp_path, monkeypatch) -> None:
     flask_app, original_database = _make_test_app(tmp_path)
     fake_scheduler = FakeScheduler()
@@ -176,6 +205,72 @@ def test_fusionsolar_enabled_with_auto_sync_enabled_registers_single_hourly_stat
         app_module.SCHEDULER = original_scheduler
 
 
+def test_fusionsolar_production_sync_flag_controls_daily_job(tmp_path, monkeypatch) -> None:
+    flask_app, original_database = _make_test_app(tmp_path)
+    original_scheduler = app_module.SCHEDULER
+    monkeypatch.setattr(app_module, "telegram_daily_summary_enabled", lambda: False)
+    try:
+        fake_scheduler = FakeScheduler()
+        app_module.SCHEDULER = fake_scheduler
+        with get_db(flask_app.config["DATABASE"]) as conn:
+            _insert_enabled_config(
+                conn,
+                app_module.INTEGRATION_PROVIDER_FUSIONSOLAR,
+                production_sync_enabled=1,
+                diagnostics_sync_enabled=0,
+            )
+        app_module.refresh_integration_scheduler(flask_app)
+        assert "integration-production-fusionsolar-daily" in fake_scheduler.jobs
+
+        fake_scheduler = FakeScheduler()
+        app_module.SCHEDULER = fake_scheduler
+        with get_db(flask_app.config["DATABASE"]) as conn:
+            _insert_enabled_config(
+                conn,
+                app_module.INTEGRATION_PROVIDER_FUSIONSOLAR,
+                production_sync_enabled=0,
+                diagnostics_sync_enabled=0,
+            )
+        app_module.refresh_integration_scheduler(flask_app)
+        assert "integration-production-fusionsolar-daily" not in fake_scheduler.jobs
+    finally:
+        flask_app.config["DATABASE"] = original_database
+        app_module.SCHEDULER = original_scheduler
+
+
+def test_fusionsolar_diagnostics_sync_flag_controls_daily_job(tmp_path, monkeypatch) -> None:
+    flask_app, original_database = _make_test_app(tmp_path)
+    original_scheduler = app_module.SCHEDULER
+    monkeypatch.setattr(app_module, "telegram_daily_summary_enabled", lambda: False)
+    try:
+        fake_scheduler = FakeScheduler()
+        app_module.SCHEDULER = fake_scheduler
+        with get_db(flask_app.config["DATABASE"]) as conn:
+            _insert_enabled_config(
+                conn,
+                app_module.INTEGRATION_PROVIDER_FUSIONSOLAR,
+                production_sync_enabled=0,
+                diagnostics_sync_enabled=1,
+            )
+        app_module.refresh_integration_scheduler(flask_app)
+        assert "integration-diagnostics-fusionsolar-daily" in fake_scheduler.jobs
+
+        fake_scheduler = FakeScheduler()
+        app_module.SCHEDULER = fake_scheduler
+        with get_db(flask_app.config["DATABASE"]) as conn:
+            _insert_enabled_config(
+                conn,
+                app_module.INTEGRATION_PROVIDER_FUSIONSOLAR,
+                production_sync_enabled=0,
+                diagnostics_sync_enabled=0,
+            )
+        app_module.refresh_integration_scheduler(flask_app)
+        assert "integration-diagnostics-fusionsolar-daily" not in fake_scheduler.jobs
+    finally:
+        flask_app.config["DATABASE"] = original_database
+        app_module.SCHEDULER = original_scheduler
+
+
 def test_sigenergy_registers_only_hourly_state_job(tmp_path, monkeypatch) -> None:
     flask_app, original_database = _make_test_app(tmp_path)
     fake_scheduler = FakeScheduler()
@@ -189,6 +284,28 @@ def test_sigenergy_registers_only_hourly_state_job(tmp_path, monkeypatch) -> Non
         app_module.refresh_integration_scheduler(flask_app)
 
         assert sorted(fake_scheduler.jobs) == ["background-jobs-reactivate-rate-limit", "integration-state-sigenergy-hourly"]
+    finally:
+        flask_app.config["DATABASE"] = original_database
+        app_module.SCHEDULER = original_scheduler
+
+
+def test_sigenergy_auto_sync_disabled_registers_no_state_job(tmp_path, monkeypatch) -> None:
+    flask_app, original_database = _make_test_app(tmp_path)
+    fake_scheduler = FakeScheduler()
+    original_scheduler = app_module.SCHEDULER
+    monkeypatch.setattr(app_module, "telegram_daily_summary_enabled", lambda: False)
+    app_module.SCHEDULER = fake_scheduler
+    try:
+        with get_db(flask_app.config["DATABASE"]) as conn:
+            _insert_enabled_config(
+                conn,
+                app_module.INTEGRATION_PROVIDER_SIGENERGY,
+                auto_sync_enabled=0,
+            )
+
+        app_module.refresh_integration_scheduler(flask_app)
+
+        assert sorted(fake_scheduler.jobs) == ["background-jobs-reactivate-rate-limit"]
     finally:
         flask_app.config["DATABASE"] = original_database
         app_module.SCHEDULER = original_scheduler

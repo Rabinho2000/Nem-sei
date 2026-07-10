@@ -71,6 +71,18 @@ python -m monitoring_board.reporting_storage_check --database .\data\monitoring_
 
 Guia operacional: [docs/reporting_operations.md](docs/reporting_operations.md).
 
+## Integracao FusionSolar
+
+No `.env`, preencher as credenciais e, se quiseres controlar os jobs diarios
+por variavel de ambiente:
+
+```text
+FUSIONSOLAR_PRODUCTION_SYNC_ENABLED=true
+FUSIONSOLAR_PRODUCTION_SYNC_TIME=00:10
+FUSIONSOLAR_DIAGNOSTICS_SYNC_ENABLED=true
+FUSIONSOLAR_DIAGNOSTICS_SYNC_TIME=00:30
+```
+
 ## Integracao Sigenergy
 
 Esta fase suporta apenas monitorizacao atual Sigenergy: autenticacao por App

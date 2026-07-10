@@ -12,6 +12,12 @@
   </div>
 </section>
 
+<datalist id="installation-group-options">
+  {% for group in installation_groups %}
+    <option value="{{ group.name }}">{{ group.member_count }} central{{ '' if group.member_count == 1 else 's' }}</option>
+  {% endfor %}
+</datalist>
+
 <section class="card maintenance-calendar-card">
   <div class="section-title">
     <div>
@@ -71,7 +77,9 @@
         <input type="text" name="project_name" value="{{ asset.project_name }}">
       </label>
       <label>Instalacao
-        <input type="text" name="installation_group" value="{{ asset.installation_group or asset.project_name }}">
+        <input type="text" name="installation_group" list="installation-group-options" value="{{ current_installation_group }}">
+        <small class="muted">Escolhe uma instalacao existente para juntar esta central ao grupo, ou escreve um novo nome.</small>
+        <small class="muted">Ao guardar, campos comuns vazios podem ser preenchidos a partir de outra central dessa instalacao.</small>
       </label>
       <label>Empresa
         <input type="text" name="company_name" value="{{ asset.company_name or '' }}">
@@ -150,14 +158,37 @@
   </details>
 
   <article class="card">
-    <div class="section-title"><h3>Instalacao</h3></div>
-    <form class="stack-form" method="post" action="{{ url_for('update_asset_installation_group', asset_id=asset.id) }}">
-      <label>Grupo de instalacao
-        <input type="text" name="installation_group" value="{{ asset.installation_group or asset.project_name }}" placeholder="Ex. Sicobrita">
-      </label>
-      <p class="muted">Usa este campo para agrupar varias centrais da mesma instalacao. Os tickets continuam ligados a esta central especifica.</p>
-      <button class="button secondary" type="submit">Guardar grupo</button>
-    </form>
+    <div class="section-title">
+      <div>
+        <h3>Instalacao</h3>
+        <p class="muted">{{ current_installation_group }} | {{ group_members|length }} central{{ '' if group_members|length == 1 else 's' }}</p>
+      </div>
+    </div>
+    <div class="list compact-list">
+      {% for member in group_members %}
+        <div class="list-row">
+          <div>
+            <strong>
+              {% if member.id == asset.id %}
+                {{ member.project_name }}
+              {% else %}
+                <a class="table-link" href="{{ url_for('asset_detail', asset_id=member.id) }}">{{ member.project_name }}</a>
+              {% endif %}
+            </strong>
+            <p>{{ member.location or "-" }} | {{ om_status_label(member.active_contract) }}</p>
+          </div>
+          <div class="hero-actions">
+            {% if member.latest_status %}
+              <span class="chip {{ status_colors.get(member.latest_status, 'muted') }}">{{ member.latest_status }}</span>
+              <small>{{ member.latest_status_date or "-" }}</small>
+            {% else %}
+              <span class="muted">Sem estado</span>
+            {% endif %}
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+    <p class="muted">Para mover esta central para outra instalacao, usa o campo Instalacao em Editar informacoes.</p>
   </article>
 
   <article class="card">

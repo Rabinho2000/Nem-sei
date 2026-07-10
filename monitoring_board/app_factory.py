@@ -1361,6 +1361,7 @@ def create_app() -> Flask:
             "assets.html",
             assets=assets_rows,
             contract_types=contract_types,
+            installation_groups=list_installation_group_options(g.db),
             search=search,
             contract_filter=contract_filter,
             om_filter=om_filter,
@@ -1490,9 +1491,30 @@ def create_app() -> Flask:
                 (asset_id,),
             )
         )
+        current_installation_group = asset["installation_group"] or asset["project_name"]
+        group_members = query_all(
+            g.db,
+            """
+            SELECT
+                a.id,
+                a.project_name,
+                a.location,
+                a.active_contract,
+                lm.status AS latest_status,
+                lm.record_date AS latest_status_date
+            FROM assets a
+            LEFT JOIN latest_monitoring_view lm ON lm.asset_id = a.id
+            WHERE COALESCE(NULLIF(TRIM(a.installation_group), ''), a.project_name) = ?
+            ORDER BY a.project_name COLLATE NOCASE
+            """,
+            (current_installation_group,),
+        )
         return render_template(
             "asset_detail.html",
             asset=asset,
+            current_installation_group=current_installation_group,
+            group_members=group_members,
+            installation_groups=list_installation_group_options(g.db),
             om_contract=om_contract,
             monitoring_history=monitoring_history,
             asset_error_calendar=asset_error_calendar,
@@ -6042,36 +6064,20 @@ def create_background_job(
     prevent_duplicate: bool = True,
 ) -> tuple[int, bool]:
     normalized_params = background_job_params_with_scope(job_type, params)
-    provider, api_area = background_job_api_scope(job_type, normalized_params)
     if prevent_duplicate:
-        if provider and api_area:
-            existing = None
-            rows = conn.execute(
-                """
-                SELECT id, params_json
-                FROM background_jobs
-                WHERE job_type = ? AND status IN ('pending', 'running', 'waiting_rate_limit')
-                ORDER BY id DESC
-                """,
-                (job_type,),
-            ).fetchall()
-            for row in rows:
-                row_params = decode_job_params(row["params_json"])
-                row_provider, row_api_area = background_job_api_scope(job_type, row_params)
-                if row_provider == provider and row_api_area == api_area:
-                    existing = row
-                    break
-        else:
-            existing = conn.execute(
-                """
-                SELECT id
-                FROM background_jobs
-                WHERE job_type = ? AND status IN ('pending', 'running', 'waiting_rate_limit')
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (job_type,),
-            ).fetchone()
+        normalized_params_json = encode_job_params(normalized_params)
+        existing = conn.execute(
+            """
+            SELECT id
+            FROM background_jobs
+            WHERE job_type = ?
+              AND params_json = ?
+              AND status IN ('pending', 'running', 'waiting_rate_limit')
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (job_type, normalized_params_json),
+        ).fetchone()
         if existing is not None:
             return int(existing["id"]), False
 
@@ -6866,6 +6872,21 @@ def apply_group_defaults(
         if all(payload.get(field) for field in available_fields):
             break
     return payload
+
+
+def list_installation_group_options(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return query_all(
+        conn,
+        """
+        SELECT
+            COALESCE(NULLIF(TRIM(installation_group), ''), project_name) AS name,
+            COUNT(*) AS member_count
+        FROM assets
+        WHERE COALESCE(NULLIF(TRIM(installation_group), ''), project_name) != ''
+        GROUP BY name
+        ORDER BY name COLLATE NOCASE
+        """,
+    )
 
 
 def apply_group_defaults_to_asset(conn: sqlite3.Connection, asset_id: int, installation_group: str) -> None:
@@ -10530,7 +10551,9 @@ def get_fusionsolar_env_config() -> dict[str, str]:
         ).strip(),
         "sync_hours": os.environ.get("FUSIONSOLAR_SYNC_HOURS", DEFAULT_FUSIONSOLAR_SYNC_HOURS).strip(),
         "state_sync_interval_hours": os.environ.get("FUSIONSOLAR_STATE_SYNC_INTERVAL_HOURS", "").strip(),
+        "production_sync_enabled": os.environ.get("FUSIONSOLAR_PRODUCTION_SYNC_ENABLED", "").strip(),
         "production_sync_time": os.environ.get("FUSIONSOLAR_PRODUCTION_SYNC_TIME", "").strip(),
+        "diagnostics_sync_enabled": os.environ.get("FUSIONSOLAR_DIAGNOSTICS_SYNC_ENABLED", "").strip(),
         "diagnostics_sync_time": os.environ.get("FUSIONSOLAR_DIAGNOSTICS_SYNC_TIME", "").strip(),
     }
 

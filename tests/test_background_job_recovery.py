@@ -179,7 +179,7 @@ def test_due_rate_limited_background_jobs_are_reactivated_and_scheduled(tmp_path
     assert future_job["status"] == "waiting_rate_limit"
 
 
-def test_create_background_job_reuses_existing_provider_api_area_job(tmp_path) -> None:
+def test_create_background_job_reuses_existing_job_with_same_type_and_params(tmp_path) -> None:
     db_path = tmp_path / "background-dedupe.db"
     ensure_database(str(db_path))
     with get_db(str(db_path)) as conn:
@@ -191,7 +191,7 @@ def test_create_background_job_reuses_existing_provider_api_area_job(tmp_path) -
         second_id, second_created = app_module.create_background_job(
             conn,
             "fusionsolar_state_sync",
-            {"provider": app_module.INTEGRATION_PROVIDER_FUSIONSOLAR, "trigger_type": "scheduled"},
+            {"provider": app_module.INTEGRATION_PROVIDER_FUSIONSOLAR, "trigger_type": "manual_background"},
         )
         job_count = conn.execute("SELECT COUNT(*) AS total FROM background_jobs").fetchone()["total"]
         params = conn.execute("SELECT params_json FROM background_jobs WHERE id = ?", (first_id,)).fetchone()["params_json"]
@@ -203,3 +203,35 @@ def test_create_background_job_reuses_existing_provider_api_area_job(tmp_path) -
     assert job_count == 1
     assert decoded["provider"] == app_module.INTEGRATION_PROVIDER_FUSIONSOLAR
     assert decoded["api_area"] == app_module.API_AREA_STATE
+
+
+def test_create_background_job_allows_same_type_with_different_params(tmp_path) -> None:
+    db_path = tmp_path / "background-dedupe-params.db"
+    ensure_database(str(db_path))
+    with get_db(str(db_path)) as conn:
+        first_id, first_created = app_module.create_background_job(
+            conn,
+            "fusionsolar_production_sync",
+            {
+                "provider": app_module.INTEGRATION_PROVIDER_FUSIONSOLAR,
+                "target_date": "2026-06-14",
+                "period_type": "day",
+                "trigger_type": "manual_background",
+            },
+        )
+        second_id, second_created = app_module.create_background_job(
+            conn,
+            "fusionsolar_production_sync",
+            {
+                "provider": app_module.INTEGRATION_PROVIDER_FUSIONSOLAR,
+                "target_date": "2026-06-15",
+                "period_type": "day",
+                "trigger_type": "manual_background",
+            },
+        )
+        job_count = conn.execute("SELECT COUNT(*) AS total FROM background_jobs").fetchone()["total"]
+
+    assert first_created is True
+    assert second_created is True
+    assert second_id != first_id
+    assert job_count == 2
