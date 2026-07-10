@@ -259,6 +259,48 @@
   </article>
 
   <article class="card">
+    <div class="section-title">
+      <div>
+        <h3>Modelo financeiro</h3>
+        <p class="muted">Producao esperada e precos importados no portfolio.</p>
+      </div>
+      {% if financial_source %}
+        <a class="button secondary" href="{{ url_for('portfolio_financial_import_review', source_file_id=financial_source.id) }}">Ver detalhe</a>
+      {% endif %}
+    </div>
+    {% if financial_source %}
+      <dl class="details">
+        <div><dt>Ficheiro</dt><dd>{{ financial_source.original_filename }}</dd></div>
+        <div><dt>Importado em</dt><dd>{{ financial_source.uploaded_at or "-" }}</dd></div>
+        <div><dt>Projeto</dt><dd>{{ financial_summary.project_name or "-" }}</dd></div>
+        <div><dt>Potencia kWp</dt><dd>{{ format_number(financial_summary.installed_power_kwp, 2) }}</dd></div>
+        <div><dt>Meses</dt><dd>{{ financial_summary.months or financial_monthly|length }}</dd></div>
+        <div><dt>Intervalos 15 min</dt><dd>{{ financial_interval_count }}</dd></div>
+        <div><dt>Tarifa</dt><dd>{{ financial_summary.tariff_action or "-" }}</dd></div>
+      </dl>
+      {% if financial_summary.warnings %}
+        <p class="muted">Avisos: {{ financial_summary.warnings|join(", ") }}</p>
+      {% endif %}
+      <div class="table-wrap compact-top-space">
+        <table>
+          <thead>
+            <tr><th>Mes</th><th>Esperado kWh</th></tr>
+          </thead>
+          <tbody>
+            {% for row in financial_monthly %}
+              <tr><td>{{ row.month }}</td><td>{{ format_number(row.expected_kwh, 2) }}</td></tr>
+            {% else %}
+              <tr><td colspan="2" class="muted">Sem producao mensal importada.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="muted">Ainda nao existe modelo financeiro associado a esta instalacao. O upload continua na configuracao do portfolio.</p>
+    {% endif %}
+  </article>
+
+  <article class="card">
     <div class="section-title"><h3>Disponibilidade de dispositivos</h3></div>
     {% if latest_availability %}
       <div class="cards">

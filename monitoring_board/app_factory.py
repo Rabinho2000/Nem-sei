@@ -1509,6 +1509,39 @@ def create_app() -> Flask:
             """,
             (current_installation_group,),
         )
+        financial_source = query_one(
+            """
+            SELECT *
+            FROM source_files
+            WHERE asset_id = ? AND file_type IN ('financial_model', 'helioscope')
+            ORDER BY uploaded_at DESC, id DESC
+            LIMIT 1
+            """,
+            (asset_id,),
+        )
+        financial_summary: dict[str, Any] = {}
+        financial_monthly = []
+        financial_interval_count = 0
+        if financial_source is not None:
+            try:
+                financial_summary = json.loads(financial_source["notes"] or "{}")
+            except json.JSONDecodeError:
+                financial_summary = {}
+            financial_monthly = query_all(
+                g.db,
+                """
+                SELECT month, expected_kwh
+                FROM helioscope_expected_production
+                WHERE source_file_id = ?
+                ORDER BY month
+                """,
+                (financial_source["id"],),
+            )
+            financial_interval_count = query_scalar(
+                g.db,
+                "SELECT COUNT(*) FROM helioscope_expected_interval_production WHERE source_file_id = ?",
+                (financial_source["id"],),
+            ) or 0
         return render_template(
             "asset_detail.html",
             asset=asset,
@@ -1531,6 +1564,10 @@ def create_app() -> Flask:
             latest_availability=latest_availability,
             latest_device_rows=latest_device_rows,
             expected_strings_by_device=expected_strings_by_device,
+            financial_source=financial_source,
+            financial_summary=financial_summary,
+            financial_monthly=financial_monthly,
+            financial_interval_count=financial_interval_count,
         )
 
     @app.route("/asset/<int:asset_id>/performance-settings", methods=["POST"])

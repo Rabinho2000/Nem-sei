@@ -12,6 +12,7 @@ os.environ["APP_PASSWORD"] = "test-password"
 
 from app import app, ensure_database
 from monitoring_board.db import get_db, query_scalar
+from monitoring_board.runtime import DEFAULT_MAX_UPLOAD_BYTES
 from monitoring_board.routes.auth import safe_local_next_url
 from monitoring_board.security import flask_secret_key
 
@@ -48,6 +49,7 @@ def test_session_cookie_defaults_are_hardened() -> None:
     assert app.config["SESSION_COOKIE_HTTPONLY"] is True
     assert app.config["SESSION_COOKIE_SAMESITE"] == "Lax"
     assert app.config["MAX_CONTENT_LENGTH"] > 0
+    assert DEFAULT_MAX_UPLOAD_BYTES >= 50 * 1024 * 1024
 
 
 def test_login_rejects_external_next_redirect() -> None:
@@ -126,6 +128,51 @@ def test_contract_upload_rejects_non_pdf_content(tmp_path) -> None:
         assert query_scalar(conn, "SELECT COUNT(*) FROM om_contracts") == 0
     finally:
         conn.close()
+
+
+def test_asset_detail_renders_financial_model_summary(tmp_path) -> None:
+    db_path = tmp_path / "asset_financial.db"
+    ensure_database(str(db_path))
+    conn = get_db(str(db_path))
+    try:
+        cursor = conn.execute("INSERT INTO assets (project_name) VALUES (?)", ("Central A",))
+        asset_id = int(cursor.lastrowid)
+        cursor = conn.execute(
+            """
+            INSERT INTO source_files (
+                asset_id, file_type, original_filename, stored_path, uploaded_at, notes
+            ) VALUES (?, 'financial_model', 'financial.xlsm', 'uploads/financial.xlsm', '2026-07-10T10:00:00', ?)
+            """,
+            (asset_id, '{"project_name": "Central A", "installed_power_kwp": 10, "months": 12, "tariff_action": "created"}'),
+        )
+        source_file_id = int(cursor.lastrowid)
+        conn.execute(
+            """
+            INSERT INTO helioscope_expected_production (
+                asset_id, source_file_id, base_year, month, expected_kwh, imported_at
+            ) VALUES (?, ?, 2026, 1, 123.45, '2026-07-10T10:00:00')
+            """,
+            (asset_id, source_file_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    previous_db = app.config["DATABASE"]
+    app.config["DATABASE"] = str(db_path)
+    try:
+        client = app.test_client()
+        with client.session_transaction() as sess:
+            sess["authenticated"] = True
+            sess["username"] = "admin"
+        response = client.get(f"/asset/{asset_id}")
+    finally:
+        app.config["DATABASE"] = previous_db
+
+    assert response.status_code == 200
+    assert b"Modelo financeiro" in response.data
+    assert b"financial.xlsm" in response.data
+    assert b"123.45" in response.data
 
 
 def test_contract_open_blocks_paths_outside_contract_directory(tmp_path) -> None:

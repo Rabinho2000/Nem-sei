@@ -252,7 +252,7 @@ class FinancialModelImport:
 
 
 def parse_helioscope_monthly_expected(path: Path) -> dict[int, float]:
-    workbook = load_workbook(path, data_only=True)
+    workbook = load_workbook(path, data_only=True, keep_links=False)
     try:
         candidates: list[dict[int, float]] = []
         for sheet in workbook.worksheets:
@@ -284,24 +284,24 @@ def parse_helioscope_monthly_expected(path: Path) -> dict[int, float]:
 
 
 def parse_financial_model_file(path: Path) -> FinancialModelImport:
-    workbook = load_workbook(path, read_only=True, data_only=True)
+    workbook = load_workbook(path, read_only=True, data_only=True, keep_links=False)
     try:
         warnings: list[str] = []
-        monthly = _parse_financial_monthly_expected(workbook)
+        monthly = _parse_financial_monthly_expected(workbook) or _parse_upac_monthly_expected(workbook)
         if not monthly:
             monthly = parse_helioscope_monthly_expected(path)
             warnings.append("financial_monthly_fallback")
         intervals = _parse_financial_interval_expected(workbook)
         if not intervals:
             warnings.append("missing_financial_interval_expected")
-        tariff = _parse_financial_tariff(workbook)
+        tariff = _parse_financial_tariff(workbook) or _parse_upac_tariff(workbook)
         if tariff is None:
             warnings.append("missing_financial_tariff")
-        outputs = _parse_financial_outputs(workbook)
-        project_name = str(_cell_value(workbook, "Projeto", "C5") or "").strip()
+        outputs = _parse_financial_outputs(workbook) or _parse_upac_financial_outputs(workbook)
+        project_name = str(_cell_value(workbook, "Projeto", "C5") or _cell_value(workbook, "UPAC", "A4") or "").strip()
         return FinancialModelImport(
             project_name=project_name,
-            installed_power_kwp=parse_float(_cell_value(workbook, "Projeto", "H8")),
+            installed_power_kwp=parse_float(_cell_value(workbook, "Projeto", "H8")) or parse_float(_cell_value(workbook, "UPAC", "D4")),
             monthly_expected=monthly,
             interval_expected=tuple(intervals),
             tariff=tariff,
@@ -326,6 +326,19 @@ def _parse_financial_monthly_expected(workbook: Any) -> dict[int, float]:
     for month_cell, expected_cell in sheet.iter_rows(min_row=6, max_row=17, min_col=10, max_col=11, values_only=True):
         month = parse_month(month_cell)
         expected = parse_float(expected_cell)
+        if month and expected is not None:
+            parsed[month] = expected
+    return parsed if len(parsed) == 12 else {}
+
+
+def _parse_upac_monthly_expected(workbook: Any) -> dict[int, float]:
+    if "Prod month" not in workbook.sheetnames:
+        return {}
+    sheet = workbook["Prod month"]
+    parsed: dict[int, float] = {}
+    for row in sheet.iter_rows(min_row=1, max_row=24, values_only=True):
+        month = parse_month(row[0] if row else None)
+        expected = parse_float(row[2] if len(row) > 2 else None)
         if month and expected is not None:
             parsed[month] = expected
     return parsed if len(parsed) == 12 else {}
@@ -394,6 +407,42 @@ def _parse_financial_tariff(workbook: Any) -> FinancialTariffImport | None:
     )
 
 
+def _parse_upac_tariff(workbook: Any) -> FinancialTariffImport | None:
+    if "UPAC" not in workbook.sheetnames:
+        return None
+    sheet = workbook["UPAC"]
+    prices = {
+        "super_vazio": parse_float(sheet["H13"].value),
+        "vazio": parse_float(sheet["H14"].value),
+        "cheia": parse_float(sheet["H15"].value),
+        "ponta": parse_float(sheet["H16"].value),
+    }
+    if not any(value is not None for value in prices.values()):
+        return None
+    if prices["super_vazio"] is not None:
+        tariff_type = "tetra-hourly"
+    elif prices["ponta"] is not None:
+        tariff_type = "tri-hourly"
+    elif prices["cheia"] is not None and prices["vazio"] is not None:
+        tariff_type = "bi-hourly"
+    else:
+        tariff_type = "simple"
+    return FinancialTariffImport(
+        tariff_type=tariff_type,
+        cycle_type=_map_financial_cycle_type(sheet["H12"].value),
+        simple_price_eur_kwh=prices["vazio"] if tariff_type == "simple" else None,
+        ponta_price_eur_kwh=prices["ponta"] if tariff_type in {"tri-hourly", "tetra-hourly"} else None,
+        cheia_price_eur_kwh=prices["cheia"] if tariff_type in {"bi-hourly", "tri-hourly", "tetra-hourly"} else None,
+        vazio_price_eur_kwh=prices["vazio"] if tariff_type in {"bi-hourly", "tri-hourly", "tetra-hourly"} else None,
+        super_vazio_price_eur_kwh=prices["super_vazio"] if tariff_type == "tetra-hourly" else None,
+        export_price_eur_kwh=parse_float(sheet["H19"].value),
+        valid_from="",
+        valid_to="",
+        solcor_price_eur_kwh=parse_float(sheet["K15"].value),
+        fixed_monthly_fee_eur=None,
+    )
+
+
 def _parse_financial_outputs(workbook: Any) -> dict[str, Any]:
     if "Projeto" not in workbook.sheetnames:
         return {}
@@ -407,6 +456,23 @@ def _parse_financial_outputs(workbook: Any) -> dict[str, Any]:
         "avoided_tariff_eur_kwh": parse_float(sheet["L32"].value),
         "ppa_tariff_eur_kwh": parse_float(sheet["L33"].value),
         "monthly_payment_eur": parse_float(sheet["M33"].value),
+    }
+
+
+def _parse_upac_financial_outputs(workbook: Any) -> dict[str, Any]:
+    if "UPAC" not in workbook.sheetnames:
+        return {}
+    sheet = workbook["UPAC"]
+    return {
+        "sale_price_eur": parse_float(sheet["D6"].value),
+        "first_year_net_benefit_eur": parse_float(sheet["N4"].value),
+        "first_year_global_benefit_eur": parse_float(sheet["N6"].value),
+        "client_npv_eur": parse_float(sheet["N9"].value),
+        "avoided_tariff_eur_kwh": parse_float(sheet["K14"].value),
+        "ppa_tariff_eur_kwh": parse_float(sheet["K15"].value),
+        "annual_pv_production_kwh": parse_float(sheet["K5"].value),
+        "annual_self_consumption_kwh": parse_float(sheet["K7"].value),
+        "annual_export_kwh": parse_float(sheet["K8"].value),
     }
 
 

@@ -109,6 +109,45 @@ def test_financial_model_parser_reads_monthly_interval_and_tariff(tmp_path: Path
     assert parsed.tariff.simple_price_eur_kwh == 0.1407
 
 
+def test_financial_model_parser_reads_upac_prod_month_format(tmp_path: Path) -> None:
+    path = tmp_path / "financial_upac.xlsm"
+    workbook = Workbook()
+    upac = workbook.active
+    upac.title = "UPAC"
+    upac["A4"] = "Usinage"
+    upac["D4"] = 138.6
+    upac["D6"] = 84546
+    upac["H12"] = "Semanal"
+    upac["H13"] = 0.064138
+    upac["H14"] = 0.06806
+    upac["H15"] = 0.099243
+    upac["H16"] = 0.116027
+    upac["H19"] = 0.045
+    upac["K5"] = 199413.42
+    upac["K7"] = 186000.02
+    upac["K8"] = 13413.4
+    upac["K14"] = 0.1142
+    upac["K15"] = 0.1099
+    upac["N4"] = 4500.33
+    prod_month = workbook.create_sheet("Prod month")
+    prod_month.append(["Row Labels", "Consumption", "PV"])
+    for month in range(1, 13):
+        prod_month.append([month, month * 1000, month * 100])
+    workbook.save(path)
+
+    parsed = parse_financial_model_file(path)
+
+    assert parsed.project_name == "Usinage"
+    assert parsed.installed_power_kwp == 138.6
+    assert parsed.monthly_expected[1] == 100
+    assert parsed.monthly_expected[12] == 1200
+    assert parsed.tariff is not None
+    assert parsed.tariff.tariff_type == "tetra-hourly"
+    assert parsed.tariff.super_vazio_price_eur_kwh == 0.064138
+    assert parsed.tariff.solcor_price_eur_kwh == 0.1099
+    assert parsed.financial_outputs["annual_pv_production_kwh"] == 199413.42
+
+
 class UploadStub:
     def __init__(self, source: Path, filename: str = "financial.xlsx") -> None:
         self.source = source

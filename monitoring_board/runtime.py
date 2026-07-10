@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 
 
 def load_local_env() -> None:
