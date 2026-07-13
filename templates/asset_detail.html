@@ -290,6 +290,9 @@
       {% if financial_model.warnings %}
         <p class="muted">Avisos: {{ financial_model.warnings|join(", ") }}</p>
       {% endif %}
+      {% with details=financial_model.details %}
+        {% include "_financial_model_details.html" %}
+      {% endwith %}
       <div class="financial-chart" data-financial-chart='{{ financial_model.chart_series|tojson }}'></div>
       <div class="table-wrap compact-top-space">
         <table>

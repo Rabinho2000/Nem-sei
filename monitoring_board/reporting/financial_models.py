@@ -31,9 +31,9 @@ MONTH_LABELS = {
 }
 
 METRIC_ALIASES = {
-    "production": ("pv production", "production", "producao", "producao pv", "producao fotovoltaica", "producao solar"),
+    "production": ("pv", "pv production", "production", "producao", "producao pv", "producao fotovoltaica", "producao solar"),
     "consumption": ("consumption", "consumo"),
-    "self_use": ("self-consumption", "self consumption", "self-c", "autoconsumo"),
+    "self_use": ("sc", "self-consumption", "self consumption", "self-c", "autoconsumo"),
     "self_consumption_rate": ("self-consumption rate", "self consumption rate", "taxa de autoconsumo", "% ac"),
     "export": ("export", "exported energy", "excedente", "injecao na rede"),
     "grid_import": ("grid import", "import from grid", "importacao da rede", "energia importada", "buy from grid"),
@@ -51,6 +51,7 @@ class ParsedFinancialModel:
     sheet_name: str
     monthly: tuple[dict[str, Any], ...]
     warnings: tuple[str, ...]
+    details: dict[str, Any]
     source_cells: dict[str, Any]
     parser_name: str = PARSER_NAME
     parser_version: str = PARSER_VERSION
@@ -123,6 +124,7 @@ def parse_financial_model_workbook(path: Path) -> ParsedFinancialModel:
         sheet = _select_monthly_sheet(workbook)
         monthly, warnings, source_cells = _parse_monthly_sheet(sheet)
         detected_name, detected_nif, detected_kwp, base_year, metadata_cells = _parse_metadata(workbook)
+        details = _parse_details(workbook)
         return ParsedFinancialModel(
             detected_name=detected_name,
             detected_nif=detected_nif,
@@ -131,6 +133,7 @@ def parse_financial_model_workbook(path: Path) -> ParsedFinancialModel:
             sheet_name=sheet.title,
             monthly=tuple(monthly),
             warnings=tuple(sorted(set(warnings))),
+            details=details,
             source_cells={**source_cells, **metadata_cells},
         )
     finally:
@@ -331,8 +334,185 @@ def _parse_metadata(workbook: Any) -> tuple[str, str, float | None, int | None, 
                 if not nif and label == "nif":
                     nif = re.sub(r"\D+", "", str(next_value or ""))
                     cells["detected_nif"] = cell_ref(sheet.title, cell.row, cell.column + 1)
-                if base_year is None and "ano base" in label:
+                if base_year is None and ("ano base" in label or label in {"year", "ano"}):
                     parsed = parse_number(next_value)
                     base_year = int(parsed) if parsed else None
                     cells["base_year"] = cell_ref(sheet.title, cell.row, cell.column + 1)
     return name, nif, kwp, base_year, cells
+
+
+def _parse_details(workbook: Any) -> dict[str, Any]:
+    details: dict[str, Any] = {}
+    if "UPAC" in workbook.sheetnames:
+        details["upac_summary"] = _parse_upac_summary(workbook["UPAC"])
+        details["tariff_periods"] = _parse_upac_tariff_periods(workbook["UPAC"])
+        details["electricity_costs"] = _parse_upac_electricity_costs(workbook["UPAC"])
+    if "Data PV Proposal" in workbook.sheetnames:
+        details["proposal_rows"] = _parse_proposal_rows(workbook["Data PV Proposal"])
+    if "Detalhes da fatura" in workbook.sheetnames:
+        invoice = _parse_invoice_details(workbook["Detalhes da fatura"])
+        details.update(invoice)
+    return {key: value for key, value in details.items() if value}
+
+
+def _parse_upac_summary(sheet: Any) -> list[dict[str, Any]]:
+    cells = (
+        ("project_name", "Project name", "A4", ""),
+        ("installed_capacity_kwp", "Installed capacity", "D4", "kWp"),
+        ("selling_price_eur_kwp", "Selling price", "D5", "EUR/kWp"),
+        ("selling_price_total_eur", "Selling price total", "D6", "EUR"),
+        ("buying_price_eur_kwp", "Buying price", "D7", "EUR/kWp"),
+        ("buying_price_total_eur", "Buying price total", "D8", "EUR"),
+        ("contract_duration_years", "Contract duration", "D9", "years"),
+        ("degradation_pct", "Degradation", "D11", "%"),
+        ("tariff_scheme", "Tariff scheme", "H12", ""),
+        ("omie_eur_kwh", "OMIE", "H19", "EUR/kWh"),
+        ("annual_consumption_kwh", "Consumption", "K4", "kWh"),
+        ("annual_pv_production_kwh", "PV production", "K5", "kWh"),
+        ("annual_grid_import_kwh", "Buy from grid", "K6", "kWh"),
+        ("annual_self_consumption_kwh", "Self-consumption", "K7", "kWh"),
+        ("annual_feed_in_kwh", "Feed-in", "K8", "kWh"),
+        ("self_consumption_rate_pct", "Self-consumption rate", "K9", "%"),
+        ("self_sufficiency_rate_pct", "Self-sufficiency rate", "K10", "%"),
+        ("specific_yield_kwh_kwp", "Specific yield", "K11", "kWh/kWp"),
+        ("self_consumption_value_eur_kwh", "Value self-consumption", "K14", "EUR/kWh"),
+        ("client_charge_eur_kwh", "Charge client", "K15", "EUR/kWh"),
+        ("all_electricity_value_eur_kwh", "Value all electricity", "K19", "EUR/kWh"),
+        ("all_electricity_charge_eur_kwh", "Charge client all electricity", "K20", "EUR/kWh"),
+        ("savings_year_1_eur", "Savings year 1", "N4", "EUR"),
+        ("savings_during_eur", "Savings during", "N6", "EUR"),
+        ("savings_after_eur", "Savings after", "N7", "EUR"),
+        ("npv_client_eur", "NPV client", "N9", "EUR"),
+        ("iberdrola_eur", "Iberdrola", "N11", "EUR"),
+        ("solcor_eur", "Solcor", "N12", "EUR"),
+        ("current_energy_cost_eur", "Current cost energy", "Q3", "EUR"),
+        ("current_power_cost_eur", "Current cost power", "Q4", "EUR"),
+        ("current_total_cost_eur", "Current total cost", "Q5", "EUR"),
+        ("savings_cost_ratio_pct", "Savings/cost ratio", "Q7", "%"),
+        ("co2_ton_year", "CO2", "Q11", "ton/year"),
+        ("trees", "Trees", "Q12", ""),
+        ("km_year", "km/year", "Q13", ""),
+    )
+    return [_detail_item(key, label, sheet[cell].value, cell_ref(sheet.title, sheet[cell].row, sheet[cell].column), unit) for key, label, cell, unit in cells if sheet[cell].value not in (None, "")]
+
+
+def _parse_upac_tariff_periods(sheet: Any) -> list[dict[str, Any]]:
+    rows = []
+    for row_index in range(13, 20):
+        label = sheet.cell(row_index, 7).value
+        value = sheet.cell(row_index, 8).value
+        if label not in (None, "") and value not in (None, ""):
+            rows.append(_detail_item(normalize_text(label).replace(" ", "_"), str(label), value, cell_ref(sheet.title, row_index, 8), "EUR/kWh"))
+    return rows
+
+
+def _parse_upac_electricity_costs(sheet: Any) -> list[dict[str, Any]]:
+    rows = []
+    for row_index in range(16, 20):
+        label = sheet.cell(row_index, 13).value
+        energy = sheet.cell(row_index, 14).value
+        network = sheet.cell(row_index, 15).value
+        if label in (None, ""):
+            continue
+        rows.append(
+            {
+                "period": str(label),
+                "energy_eur_kwh": parse_number(energy),
+                "network_eur_kwh": parse_number(network),
+                "source_cells": {
+                    "energy_eur_kwh": cell_ref(sheet.title, row_index, 14),
+                    "network_eur_kwh": cell_ref(sheet.title, row_index, 15),
+                },
+            }
+        )
+    return rows
+
+
+def _parse_proposal_rows(sheet: Any) -> list[dict[str, Any]]:
+    rows = []
+    month_columns = list(range(3, 15))
+    for row_index in range(1, min(sheet.max_row or 0, 90) + 1):
+        label = sheet.cell(row_index, 2).value
+        if label in (None, ""):
+            continue
+        month_values = [parse_number(sheet.cell(row_index, column).value) for column in month_columns]
+        annual = parse_number(sheet.cell(row_index, 16).value)
+        if not any(value is not None for value in month_values) and annual is None:
+            continue
+        rows.append(
+            {
+                "label": str(label),
+                "monthly": month_values,
+                "annual": annual,
+                "source_row": row_index,
+            }
+        )
+    return rows
+
+
+def _parse_invoice_details(sheet: Any) -> dict[str, Any]:
+    periods = []
+    for row_index in range(3, min(sheet.max_row or 0, 8) + 1):
+        label = sheet.cell(row_index, 2).value
+        if label in (None, "") or normalize_text(label) == "grand total":
+            continue
+        periods.append(
+            {
+                "period": str(label),
+                "self_consumption_kwh": parse_number(sheet.cell(row_index, 3).value),
+                "savings_energy_eur": parse_number(sheet.cell(row_index, 4).value),
+                "share_pct": _as_pct(parse_number(sheet.cell(row_index, 5).value)),
+                "source_row": row_index,
+            }
+        )
+    prices = []
+    for row_index in range(3, min(sheet.max_row or 0, 11) + 1):
+        label = sheet.cell(row_index, 6).value
+        if label in (None, ""):
+            continue
+        prices.append(
+            {
+                "label": str(label),
+                "energy_kwh": parse_number(sheet.cell(row_index, 7).value),
+                "energy_eur_kwh": parse_number(sheet.cell(row_index, 8).value),
+                "network_eur_kwh": parse_number(sheet.cell(row_index, 9).value),
+                "energy_cost_eur": parse_number(sheet.cell(row_index, 11).value),
+                "network_cost_eur": parse_number(sheet.cell(row_index, 12).value),
+                "source_row": row_index,
+            }
+        )
+    totals = []
+    for label, row_index, column, unit in (
+        ("Savings energy total", 7, 4, "EUR"),
+        ("Peak power savings", 8, 9, "EUR"),
+        ("Revenue surplus", 10, 9, "EUR"),
+        ("Total benefit", 12, 7, "EUR"),
+        ("Value", 13, 7, "EUR/kWh"),
+    ):
+        value = sheet.cell(row_index, column).value
+        if value not in (None, ""):
+            totals.append(_detail_item(normalize_text(label).replace(" ", "_"), label, value, cell_ref(sheet.title, row_index, column), unit))
+    return {
+        "invoice_periods": periods,
+        "invoice_prices": prices,
+        "invoice_totals": totals,
+    }
+
+
+def _detail_item(key: str, label: str, value: Any, source_cell: str, unit: str) -> dict[str, Any]:
+    parsed = parse_number(value)
+    if parsed is not None and unit == "%":
+        parsed = _as_pct(parsed)
+    return {
+        "key": key,
+        "label": label,
+        "value": parsed if parsed is not None else str(value),
+        "unit": unit,
+        "source_cell": source_cell,
+    }
+
+
+def _as_pct(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return value * 100 if abs(value) <= 1 else value

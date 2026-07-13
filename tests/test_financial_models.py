@@ -60,11 +60,75 @@ def financial_workbook(path: Path, *, sheet_name: str = "Prod month", unit_label
     workbook.save(path)
 
 
+def usinage_style_financial_workbook(path: Path) -> None:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Prod month"
+    sheet.append([])
+    sheet.append([])
+    sheet.append(["Row Labels", "Soma de Consumption (kWh)", "Soma de PV (kWh)", "Soma de SC (kWh)", "% AC"])
+    for month in range(1, 13):
+        production = month * 1000.0
+        self_use = month * 900.0
+        sheet.append([month, month * 1200.0, production, self_use, self_use / production])
+    sheet.append(["Grand Total", 93600.0, 78000.0, 70200.0, 0.9])
+
+    upac = workbook.create_sheet("UPAC")
+    upac["A4"] = "Usinage"
+    upac["D4"] = 138.6
+    upac["D6"] = 84546
+    upac["H12"] = "Semanal"
+    upac["G13"] = "SV"
+    upac["H13"] = 0.064138
+    upac["G14"] = "Vazio"
+    upac["H14"] = 0.06806
+    upac["G15"] = "Cheia"
+    upac["H15"] = 0.099243
+    upac["G16"] = "Ponta"
+    upac["H16"] = 0.116027
+    upac["G19"] = "OMIE"
+    upac["H19"] = 0.045
+    upac["K4"] = 93600
+    upac["K5"] = 78000
+    upac["K7"] = 70200
+    upac["K8"] = 7800
+    upac["K14"] = 0.114224
+    upac["K15"] = 0.1099
+    upac["N4"] = 4500.33
+    upac["Q11"] = 37.46
+    upac["C24"] = "Year"
+    upac["D24"] = 2019
+
+    proposal = workbook.create_sheet("Data PV Proposal")
+    proposal.append([])
+    proposal.append([None, None, "Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez", None, "Annual"])
+    proposal.append([None, "Autoconsumo (kWh)", *[month * 900.0 for month in range(1, 13)], None, 70200.0])
+    proposal.append([None, "Excedente (kWh)", *[month * 100.0 for month in range(1, 13)], None, 7800.0])
+    proposal.append([None, "Total Benefit (EUR)", *[month * 10.0 for month in range(1, 13)], None, 780.0])
+
+    invoice = workbook.create_sheet("Detalhes da fatura")
+    invoice.append([])
+    invoice.append([None, "Row Labels", "Sum of SC (kWh)", "Sum of Savings Energy"])
+    invoice.append([None, "Cheia", 1000, 100, 0.5, "Ponta", -500, 0.1, 0.05, None, -50, -25])
+    invoice.append([None, "Ponta", 500, 60, 0.25, "Cheia", -1000, 0.09, 0.04, None, -90, -40])
+    invoice.append([None, "Grand Total", 1500, 160])
+    invoice["F10"] = "Excedente"
+    invoice["G10"] = 7800
+    invoice["H10"] = 0.045
+    invoice["I10"] = 351
+    invoice["F12"] = "TOT"
+    invoice["G12"] = 511
+    invoice["F13"] = "EUR/kWh"
+    invoice["G13"] = 0.1095
+    workbook.save(path)
+
+
 def test_financial_model_schema_new_and_existing_db(tmp_path: Path) -> None:
     conn = connect(tmp_path)
     try:
         assert conn.execute("SELECT name FROM sqlite_master WHERE name = 'financial_models'").fetchone()
         assert conn.execute("SELECT name FROM sqlite_master WHERE name = 'financial_model_monthly'").fetchone()
+        assert "details_json" in {row["name"] for row in conn.execute("PRAGMA table_info(financial_models)").fetchall()}
         ensure_database(str(tmp_path / "financial_models.db"))
     finally:
         conn.close()
@@ -93,6 +157,23 @@ def test_parse_financial_model_workbook_xlsm(tmp_path: Path) -> None:
 
     assert len(parsed.monthly) == 12
     assert parsed.monthly[11]["expected_production_kwh"] == 1200
+
+
+def test_parse_usinage_style_financial_model_details(tmp_path: Path) -> None:
+    path = tmp_path / "usinage.xlsm"
+    usinage_style_financial_workbook(path)
+
+    parsed = parse_financial_model_workbook(path)
+
+    assert parsed.base_year == 2019
+    assert parsed.monthly[0]["expected_production_kwh"] == 1000
+    assert parsed.monthly[0]["expected_self_use_kwh"] == 900
+    assert parsed.monthly[0]["expected_export_kwh"] == 100
+    assert parsed.details["upac_summary"]
+    assert any(item["key"] == "selling_price_total_eur" and item["value"] == 84546 for item in parsed.details["upac_summary"])
+    assert len(parsed.details["tariff_periods"]) >= 4
+    assert any(row["label"] == "Total Benefit (EUR)" for row in parsed.details["proposal_rows"])
+    assert parsed.details["invoice_periods"][0]["period"] == "Cheia"
 
 
 def test_parse_financial_model_rejects_missing_month_and_ambiguous_sheets(tmp_path: Path) -> None:
@@ -130,6 +211,7 @@ def test_create_preview_confirm_version_and_duplicate_hash(tmp_path: Path) -> No
         model = conn.execute("SELECT * FROM financial_models WHERE id = ?", (model_id,)).fetchone()
         assert model["status"] == "confirmed"
         assert model["active"] == 1
+        assert model["details_json"]
         with pytest.raises(FinancialModelError):
             create_financial_model_preview(conn, upload_dir=tmp_path / "uploads", file_storage=UploadStub(path), asset_id=asset_id, base_year=2026)
     finally:
@@ -207,6 +289,33 @@ def test_financial_model_routes_block_idor(tmp_path: Path) -> None:
         with client.session_transaction() as sess:
             sess["authenticated"] = True
             sess["username"] = "admin"
+        assert client.get(f"/asset/{asset_a}/financial-model/{model_id}/preview").status_code == 200
         assert client.get(f"/asset/{asset_b}/financial-model/{model_id}/preview").status_code == 404
+    finally:
+        app.config["DATABASE"] = previous_db
+
+
+def test_asset_detail_renders_active_financial_model_details(tmp_path: Path) -> None:
+    conn = connect(tmp_path)
+    try:
+        asset_id = add_asset(conn)
+        path = tmp_path / "usinage.xlsm"
+        usinage_style_financial_workbook(path)
+        model_id = create_financial_model_preview(conn, upload_dir=tmp_path / "uploads", file_storage=UploadStub(path), asset_id=asset_id)
+        confirm_financial_model_import(conn, model_id=model_id, asset_id=asset_id)
+        conn.commit()
+    finally:
+        conn.close()
+    previous_db = app.config["DATABASE"]
+    app.config["DATABASE"] = str(tmp_path / "financial_models.db")
+    try:
+        client = app.test_client()
+        with client.session_transaction() as sess:
+            sess["authenticated"] = True
+            sess["username"] = "admin"
+        response = client.get(f"/asset/{asset_id}")
+        assert response.status_code == 200
+        assert "Resumo do modelo".encode() in response.data
+        assert b"Total Benefit" in response.data
     finally:
         app.config["DATABASE"] = previous_db

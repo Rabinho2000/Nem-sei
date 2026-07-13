@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import mimetypes
 import os
 import shutil
@@ -26,9 +27,11 @@ from monitoring_board.financial_model_repository import (
     get_model_source,
     list_asset_models,
     list_model_monthly,
+    model_details,
     model_validation,
     model_warnings,
     replace_monthly_rows,
+    update_model_parse_details,
 )
 from monitoring_board.portfolio_management import normalize_name, normalize_nif
 from monitoring_board.reporting.financial_models import parse_financial_model_workbook
@@ -128,6 +131,7 @@ def create_financial_model_preview(
             file_sha256=file_hash,
             warnings=list(parsed.warnings),
             validation=validation,
+            details=parsed.details,
         )
         replace_monthly_rows(conn, model_id=model_id, asset_id=asset_id, base_year=effective_year, rows=list(parsed.monthly))
         return model_id
@@ -228,6 +232,7 @@ def confirm_financial_model_import(
     blocking = set(validation.get("blocking") or [])
     if blocking and (not override or not override_reason.strip()):
         raise FinancialModelError("financial_model_override_required")
+    update_model_parse_details(conn, model_id=model_id, warnings=list(parsed.warnings), validation=validation, details=parsed.details)
     replace_monthly_rows(conn, model_id=model_id, asset_id=asset_id, base_year=int(model["base_year"]), rows=list(parsed.monthly))
     return confirm_model(conn, model_id=model_id, override_reason=override_reason if override else "")
 
@@ -276,6 +281,7 @@ def build_asset_financial_model_context(conn: sqlite3.Connection, *, asset_id: i
         "versions": versions,
         "warnings": model_warnings(active),
         "validation": model_validation(active),
+        "details": model_details(active),
         "annual": annual_totals(active_monthly),
         "comparison_rows": comparison_rows,
         "chart_series": build_chart_series(comparison_rows),
@@ -412,3 +418,12 @@ def compare_financial_models(conn: sqlite3.Connection, *, asset_id: int, left_id
 
 def get_active_expected_for_month(conn: sqlite3.Connection, *, asset_id: int | None, year: int, month: int) -> sqlite3.Row | None:
     return active_model_for_month(conn, asset_id=asset_id, year=year, month=month)
+
+
+def parse_model_details_json(model: sqlite3.Row | None) -> dict[str, Any]:
+    if model is None or "details_json" not in model.keys():
+        return {}
+    try:
+        return json.loads(model["details_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}

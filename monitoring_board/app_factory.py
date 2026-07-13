@@ -235,6 +235,7 @@ from monitoring_board.services.financial_models import (
     compare_financial_models,
     confirm_financial_model_import,
     create_financial_model_preview,
+    parse_model_details_json,
     resolve_financial_model_path,
     sha256_file as financial_model_sha256_file,
 )
@@ -1590,6 +1591,7 @@ def create_app() -> Flask:
             monthly=monthly,
             validation=json.loads(model["validation_json"] or "{}"),
             warnings=json.loads(model["warnings_json"] or "[]"),
+            details=parse_model_details_json(model),
         )
 
     @app.route("/asset/<int:asset_id>/financial-model/<int:model_id>/confirm", methods=["POST"])

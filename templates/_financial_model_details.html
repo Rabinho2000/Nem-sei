@@ -1,0 +1,105 @@
+{% if details %}
+  {% if details.upac_summary %}
+    <div class="section-title top-space"><h3>Resumo do modelo</h3></div>
+    <div class="details financial-details-grid">
+      {% for item in details.upac_summary %}
+        <div>
+          <dt>{{ item.label }}</dt>
+          <dd>
+            {% if item.value is number %}{{ format_number(item.value, 3) }}{% else %}{{ item.value }}{% endif %}
+            {% if item.unit %} {{ item.unit }}{% endif %}
+          </dd>
+        </div>
+      {% endfor %}
+    </div>
+  {% endif %}
+
+  {% if details.tariff_periods or details.electricity_costs %}
+    <div class="section-title top-space"><h3>Tarifas e precos</h3></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Periodo</th><th>Tarifa modelo</th><th>Energia</th><th>Redes</th></tr></thead>
+        <tbody>
+          {% set electricity_costs = details.electricity_costs or [] %}
+          {% for item in details.tariff_periods %}
+            {% set cost = (electricity_costs | selectattr('period', 'equalto', item.label) | list | first) %}
+            <tr>
+              <td>{{ item.label }}</td>
+              <td>{{ format_number(item.value, 5) }} {{ item.unit }}</td>
+              <td>{{ format_number(cost.energy_eur_kwh, 5) if cost else "-" }}</td>
+              <td>{{ format_number(cost.network_eur_kwh, 5) if cost else "-" }}</td>
+            </tr>
+          {% else %}
+            {% for cost in electricity_costs %}
+              <tr>
+                <td>{{ cost.period }}</td>
+                <td>-</td>
+                <td>{{ format_number(cost.energy_eur_kwh, 5) }}</td>
+                <td>{{ format_number(cost.network_eur_kwh, 5) }}</td>
+              </tr>
+            {% endfor %}
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+
+  {% if details.invoice_periods or details.invoice_prices or details.invoice_totals %}
+    <div class="section-title top-space"><h3>Detalhes da fatura</h3></div>
+    {% if details.invoice_periods %}
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Periodo</th><th>Autoconsumo</th><th>Poupanca energia</th><th>Peso</th></tr></thead>
+          <tbody>
+            {% for row in details.invoice_periods %}
+              <tr>
+                <td>{{ row.period }}</td>
+                <td>{{ format_number(row.self_consumption_kwh, 2) }} kWh</td>
+                <td>{{ format_number(row.savings_energy_eur, 2) }} EUR</td>
+                <td>{{ format_number(row.share_pct, 2) if row.share_pct is not none else "-" }}{% if row.share_pct is not none %}%{% endif %}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+    {% if details.invoice_totals %}
+      <div class="details financial-details-grid compact-top-space">
+        {% for item in details.invoice_totals %}
+          <div>
+            <dt>{{ item.label }}</dt>
+            <dd>{{ format_number(item.value, 3) if item.value is number else item.value }}{% if item.unit %} {{ item.unit }}{% endif %}</dd>
+          </div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  {% endif %}
+
+  {% if details.proposal_rows %}
+    <div class="section-title top-space"><h3>Proposta PV mensal</h3></div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Metrica</th>
+            {% for label in ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'] %}
+              <th>{{ label }}</th>
+            {% endfor %}
+            <th>Anual</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in details.proposal_rows %}
+            <tr>
+              <td>{{ row.label }}</td>
+              {% for value in row.monthly %}
+                <td>{{ format_number(value, 2) if value is not none else "-" }}</td>
+              {% endfor %}
+              <td>{{ format_number(row.annual, 2) if row.annual is not none else "-" }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+{% endif %}

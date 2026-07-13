@@ -34,6 +34,7 @@ def ensure_financial_model_schema(conn: sqlite3.Connection) -> None:
             file_sha256 TEXT NOT NULL,
             warnings_json TEXT,
             validation_json TEXT,
+            details_json TEXT,
             override_reason TEXT,
             confirmed_at TEXT,
             archived_at TEXT,
@@ -82,6 +83,14 @@ def ensure_financial_model_schema(conn: sqlite3.Connection) -> None:
             ON financial_model_monthly(asset_id, base_year, month);
         """
     )
+    _ensure_column(conn, "financial_models", "details_json TEXT")
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, definition: str) -> None:
+    column = definition.split()[0]
+    existing = {row["name"] if isinstance(row, sqlite3.Row) else row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
 
 
 def json_text(value: Any) -> str:
@@ -151,6 +160,7 @@ def create_preview_model(
     file_sha256: str,
     warnings: list[str],
     validation: dict[str, Any],
+    details: dict[str, Any] | None = None,
 ) -> int:
     current = now_text()
     cursor = conn.execute(
@@ -158,8 +168,8 @@ def create_preview_model(
         INSERT INTO financial_models (
             source_file_id, asset_id, base_year, version, status, active,
             detected_name, detected_nif, detected_kwp, parser_name, parser_version,
-            file_sha256, warnings_json, validation_json, created_at, updated_at
-        ) VALUES (?, ?, ?, NULL, 'preview', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            file_sha256, warnings_json, validation_json, details_json, created_at, updated_at
+        ) VALUES (?, ?, ?, NULL, 'preview', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             source_file_id,
@@ -173,11 +183,30 @@ def create_preview_model(
             file_sha256,
             json_text(warnings),
             json_text(validation),
+            json_text(details or {}),
             current,
             current,
         ),
     )
     return int(cursor.lastrowid)
+
+
+def update_model_parse_details(
+    conn: sqlite3.Connection,
+    *,
+    model_id: int,
+    warnings: list[str],
+    validation: dict[str, Any],
+    details: dict[str, Any] | None = None,
+) -> None:
+    conn.execute(
+        """
+        UPDATE financial_models
+        SET warnings_json = ?, validation_json = ?, details_json = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (json_text(warnings), json_text(validation), json_text(details or {}), now_text(), model_id),
+    )
 
 
 def replace_monthly_rows(conn: sqlite3.Connection, *, model_id: int, asset_id: int, base_year: int, rows: list[dict[str, Any]]) -> None:
@@ -339,3 +368,11 @@ def model_validation(model: sqlite3.Row | dict[str, Any] | None) -> dict[str, An
     if model is None:
         return {}
     return dict(json_value(model["validation_json"], {}))
+
+
+def model_details(model: sqlite3.Row | dict[str, Any] | None) -> dict[str, Any]:
+    if model is None:
+        return {}
+    if "details_json" not in model.keys():
+        return {}
+    return dict(json_value(model["details_json"], {}))

@@ -50,6 +50,14 @@
 </section>
 
 <section class="card">
+  <div class="section-title"><h3>Dados financeiros detetados</h3></div>
+  {% include "_financial_model_details.html" %}
+  {% if not details %}
+    <p class="muted">Sem detalhes financeiros adicionais detetados.</p>
+  {% endif %}
+</section>
+
+<section class="card">
   <div class="section-title"><h3>Previsoes mensais</h3></div>
   <div class="table-wrap">
     <table>
