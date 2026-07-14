@@ -15,8 +15,18 @@
           <h1>Monitoring Board</h1>
           <p class="sidebar-copy">Vista diaria de monitorizacao, instalacoes e corretivas.</p>
         </div>
+        <button
+          class="mobile-nav-toggle"
+          type="button"
+          aria-controls="site-nav"
+          aria-expanded="false"
+          aria-label="Abrir navegacao principal"
+        >
+          <span aria-hidden="true">&#9776;</span>
+          Menu
+        </button>
         <button class="theme-toggle" type="button" id="theme-toggle">Dark mode</button>
-        <nav class="nav">
+        <nav class="nav" id="site-nav">
           <a href="{{ url_for('operation') }}" class="{{ 'active' if request.endpoint == 'operation' else '' }}">Operacao</a>
           <a href="{{ url_for('dashboard') }}" class="{{ 'active' if request.endpoint == 'dashboard' else '' }}">Resumo</a>
           <a href="{{ url_for('assets') }}" class="{{ 'active' if request.endpoint in ['assets', 'asset_detail'] else '' }}">Instalacoes</a>
@@ -60,6 +70,46 @@
           input.name = "csrf_token";
           input.value = csrfToken;
           form.appendChild(input);
+        });
+      })();
+
+      (function () {
+        const toggle = document.querySelector(".mobile-nav-toggle");
+        const nav = document.getElementById("site-nav");
+        const mobileViewport = window.matchMedia("(max-width: 700px)");
+        if (!toggle || !nav) return;
+
+        function closeNavigation() {
+          nav.classList.remove("is-open");
+          toggle.setAttribute("aria-expanded", "false");
+          toggle.setAttribute("aria-label", "Abrir navegacao principal");
+        }
+
+        toggle.addEventListener("click", function () {
+          if (!mobileViewport.matches) return;
+          const isOpen = nav.classList.toggle("is-open");
+          toggle.setAttribute("aria-expanded", String(isOpen));
+          toggle.setAttribute(
+            "aria-label",
+            isOpen ? "Fechar navegacao principal" : "Abrir navegacao principal"
+          );
+        });
+
+        document.addEventListener("keydown", function (event) {
+          if (event.key === "Escape" && nav.classList.contains("is-open")) {
+            closeNavigation();
+            toggle.focus();
+          }
+        });
+
+        nav.addEventListener("click", function (event) {
+          if (mobileViewport.matches && event.target.closest("a")) {
+            closeNavigation();
+          }
+        });
+
+        mobileViewport.addEventListener("change", function (event) {
+          if (!event.matches) closeNavigation();
         });
       })();
 
