@@ -12,7 +12,7 @@ from openpyxl.utils import get_column_letter
 
 
 PARSER_NAME = "financial_model_workbook"
-PARSER_VERSION = "2"
+PARSER_VERSION = "3"
 
 
 MONTH_LABELS = {
@@ -35,8 +35,8 @@ METRIC_ALIASES = {
     "consumption": ("consumption", "consumo"),
     "self_use": ("sc", "self-consumption", "self consumption", "self-c", "autoconsumo"),
     "self_consumption_rate": ("self-consumption rate", "self consumption rate", "taxa de autoconsumo", "% ac"),
-    "export": ("export", "exported energy", "excedente", "injecao na rede"),
-    "grid_import": ("grid import", "import from grid", "importacao da rede", "energia importada", "buy from grid"),
+    "export": ("export", "exported energy", "excedente", "excess", "injecao na rede"),
+    "grid_import": ("grid import", "import from grid", "importacao da rede", "energia importada", "buy from grid", "sum of grid", "soma de grid"),
 }
 
 REQUIRED_MONTHS = set(range(1, 13))
@@ -139,6 +139,7 @@ def parse_financial_model_workbook(path: Path) -> ParsedFinancialModel:
             details = _parse_financial_automatic_details(project_sheet, savings_sheet, monthly)
         else:
             details = _parse_details(workbook)
+        warnings.extend(_annual_reconciliation_warnings(monthly, details))
         return ParsedFinancialModel(
             detected_name=detected_name,
             detected_nif=detected_nif,
@@ -154,33 +155,63 @@ def parse_financial_model_workbook(path: Path) -> ParsedFinancialModel:
         workbook.close()
 
 
+def _annual_reconciliation_warnings(monthly: list[dict[str, Any]], details: dict[str, Any]) -> list[str]:
+    references = {
+        str(item.get("key") or ""): parse_number(item.get("value"))
+        for item in details.get("upac_summary") or []
+    }
+    mappings = {
+        "expected_production_kwh": "annual_pv_production_kwh",
+        "expected_consumption_kwh": "annual_consumption_kwh",
+        "expected_self_use_kwh": "annual_self_consumption_kwh",
+        "expected_export_kwh": "annual_feed_in_kwh",
+        "expected_grid_import_kwh": "annual_grid_import_kwh",
+    }
+    warnings = []
+    for monthly_key, annual_key in mappings.items():
+        values = [parse_number(row.get(monthly_key)) for row in monthly]
+        present = [value for value in values if value is not None]
+        reference = references.get(annual_key)
+        if not present or reference is None:
+            continue
+        tolerance = max(1.0, abs(reference) * 0.001)
+        if abs(sum(present) - reference) > tolerance:
+            metric = monthly_key.removeprefix("expected_").removesuffix("_kwh")
+            warnings.append(f"financial_model_annual_total_mismatch_{metric}")
+    return warnings
+
+
 def _financial_automatic_sheets(workbook: Any) -> tuple[Any, Any] | None:
     sheets = {normalize_text(sheet.title): sheet for sheet in workbook.worksheets}
     project_sheet = sheets.get("projeto")
     savings_sheet = sheets.get("savings yr1")
     if project_sheet is None or savings_sheet is None:
         return None
-    project_headers = (
-        normalize_text(project_sheet["J5"].value),
-        normalize_text(project_sheet["K5"].value),
-        normalize_text(project_sheet["L5"].value),
-    )
-    savings_headers = (
-        normalize_text(savings_sheet["B3"].value),
-        normalize_text(savings_sheet["C3"].value),
-        normalize_text(savings_sheet["E3"].value),
-        normalize_text(savings_sheet["G3"].value),
-    )
-    if (
-        project_headers[0] == "month"
-        and "production" in project_headers[1]
-        and project_headers[2].startswith("ac")
-        and savings_headers[0] == "month"
-        and savings_headers[1].startswith("cons")
-        and savings_headers[2].startswith("ac")
-        and savings_headers[3].startswith(("exced", "export"))
+    if _find_financial_automatic_header(project_sheet, {"production", "self_use"}) and _find_financial_automatic_header(
+        savings_sheet, {"consumption", "self_use", "export"}
     ):
         return project_sheet, savings_sheet
+    return None
+
+
+def _find_financial_automatic_header(sheet: Any, required: set[str]) -> tuple[int, int, dict[str, int]] | None:
+    rows = sheet.iter_rows(
+        min_row=1,
+        max_row=min(sheet.max_row or 20, 20),
+        max_col=min(sheet.max_column or 30, 30),
+        values_only=True,
+    )
+    for row_index, row in enumerate(rows, start=1):
+        month_column = None
+        headers: dict[str, int] = {}
+        for column, value in enumerate(row, start=1):
+            if normalize_text(value) in {"month", "mes", "row labels"}:
+                month_column = column
+            key = _financial_automatic_metric_key(value)
+            if key and key not in headers:
+                headers[key] = column
+        if month_column and required.issubset(headers):
+            return row_index, month_column, headers
     return None
 
 
@@ -188,26 +219,24 @@ def _parse_financial_automatic_monthly(
     project_sheet: Any,
     savings_sheet: Any,
 ) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
+    project_header = _find_financial_automatic_header(project_sheet, {"production", "self_use"})
+    savings_header = _find_financial_automatic_header(savings_sheet, {"consumption", "self_use", "export"})
+    if project_header is None or savings_header is None:
+        raise FinancialModelParseError("financial_model_missing_month")
+    project_header_row, project_month_column, project_headers = project_header
+    savings_header_row, savings_month_column, savings_headers = savings_header
+
     project_rows: dict[int, int] = {}
-    for row_index in range(6, min(project_sheet.max_row or 17, 17) + 1):
-        month = parse_month(project_sheet.cell(row_index, 10).value)
-        if month:
+    for row_index in range(project_header_row + 1, min(project_sheet.max_row or project_header_row + 20, project_header_row + 20) + 1):
+        month = parse_month(project_sheet.cell(row_index, project_month_column).value)
+        if month and month not in project_rows:
             project_rows[month] = row_index
     savings_rows: dict[int, int] = {}
-    for row_index in range(4, min(savings_sheet.max_row or 15, 15) + 1):
-        month = parse_month(savings_sheet.cell(row_index, 2).value)
-        if month:
+    for row_index in range(savings_header_row + 1, min(savings_sheet.max_row or savings_header_row + 20, savings_header_row + 20) + 1):
+        month = parse_month(savings_sheet.cell(row_index, savings_month_column).value)
+        if month and month not in savings_rows:
             savings_rows[month] = row_index
     if set(project_rows) != REQUIRED_MONTHS or set(savings_rows) != REQUIRED_MONTHS:
-        raise FinancialModelParseError("financial_model_missing_month")
-
-    savings_headers = {
-        _financial_automatic_metric_key(savings_sheet.cell(3, column).value): column
-        for column in range(2, min(savings_sheet.max_column or 14, 20) + 1)
-        if _financial_automatic_metric_key(savings_sheet.cell(3, column).value)
-    }
-    required = {"consumption", "self_use", "export"}
-    if not required.issubset(savings_headers):
         raise FinancialModelParseError("financial_model_missing_month")
 
     monthly: list[dict[str, Any]] = []
@@ -216,8 +245,8 @@ def _parse_financial_automatic_monthly(
     for month in range(1, 13):
         project_row = project_rows[month]
         savings_row = savings_rows[month]
-        production_cell = project_sheet.cell(project_row, 11)
-        project_self_use_cell = project_sheet.cell(project_row, 12)
+        production_cell = project_sheet.cell(project_row, project_headers["production"])
+        project_self_use_cell = project_sheet.cell(project_row, project_headers["self_use"])
         consumption_cell = savings_sheet.cell(savings_row, savings_headers["consumption"])
         savings_self_use_cell = savings_sheet.cell(savings_row, savings_headers["self_use"])
         export_cell = savings_sheet.cell(savings_row, savings_headers["export"])
@@ -228,20 +257,35 @@ def _parse_financial_automatic_monthly(
             raise FinancialModelParseError("financial_model_missing_month")
         if project_self_use is not None and abs(project_self_use - savings_self_use) > 0.01:
             warnings.append("financial_model_self_use_source_mismatch")
+        export = parse_number(export_cell.value)
+        export_adjustment_cell = None
+        battery_charge_column = savings_headers.get("battery_charge")
+        if battery_charge_column and export is not None:
+            export_adjustment_cell = savings_sheet.cell(savings_row, battery_charge_column)
+            battery_charge = parse_number(export_adjustment_cell.value)
+            if battery_charge is not None:
+                export = max(export - battery_charge, 0)
+                warnings.append("financial_model_battery_export_adjusted")
         row: dict[str, Any] = {
             "month": month,
             "expected_production_kwh": production,
             "expected_consumption_kwh": parse_number(consumption_cell.value),
             "expected_self_use_kwh": savings_self_use,
-            "expected_export_kwh": parse_number(export_cell.value),
+            "expected_export_kwh": export,
             "expected_grid_import_kwh": None,
             "source_fields": {
-                "expected_production_kwh": {"cell": cell_ref(project_sheet.title, project_row, 11)},
+                "expected_production_kwh": {"cell": cell_ref(project_sheet.title, project_row, production_cell.column)},
                 "expected_consumption_kwh": {"cell": cell_ref(savings_sheet.title, savings_row, consumption_cell.column)},
                 "expected_self_use_kwh": {"cell": cell_ref(savings_sheet.title, savings_row, savings_self_use_cell.column)},
                 "expected_export_kwh": {"cell": cell_ref(savings_sheet.title, savings_row, export_cell.column)},
             },
         }
+        if export_adjustment_cell is not None:
+            row["source_fields"]["expected_export_kwh"]["adjustment_cell"] = cell_ref(
+                savings_sheet.title, savings_row, export_adjustment_cell.column
+            )
+            row["calculated_fields"] = {"expected_export_kwh": "export_minus_battery_charge"}
+            row["warnings"] = ["financial_model_battery_export_adjusted"]
         grid_import_column = savings_headers.get("grid_import")
         if grid_import_column:
             grid_import_cell = savings_sheet.cell(savings_row, grid_import_column)
@@ -258,6 +302,10 @@ def _parse_financial_automatic_monthly(
 
 def _financial_automatic_metric_key(value: Any) -> str | None:
     raw = normalize_text(value).replace("_", " ")
+    if "ess" in raw and raw.startswith(("exc", "exced")):
+        return "battery_charge"
+    if "production" in raw or "producao" in raw or raw.startswith("pv"):
+        return "production"
     if raw.startswith("cons"):
         return "consumption"
     if raw.startswith("ac") or "autoconsumo" in raw or "self consumption" in raw:
@@ -270,9 +318,10 @@ def _financial_automatic_metric_key(value: Any) -> str | None:
 
 
 def _select_monthly_sheet(workbook: Any) -> Any:
-    prod_month = [sheet for sheet in workbook.worksheets if normalize_text(sheet.title) == "prod month"]
-    if len(prod_month) == 1:
-        return prod_month[0]
+    for preferred_name in ("prod month", "monthly production", "data pv proposal"):
+        preferred = [sheet for sheet in workbook.worksheets if normalize_text(sheet.title) == preferred_name]
+        if len(preferred) == 1 and _row_or_column_month_layout(_preview_rows(preferred[0], max_rows=30, max_cols=30)):
+            return preferred[0]
     compatible = []
     for sheet in workbook.worksheets:
         rows = _preview_rows(sheet, max_rows=30, max_cols=20)
@@ -296,19 +345,32 @@ def _row_or_column_month_layout(rows: list[tuple[Any, ...]]) -> bool:
     for row in rows:
         if sum(1 for value in row if parse_month(value)) >= 10:
             return True
-    month_rows = sum(1 for row in rows if row and parse_month(row[0]))
-    return month_rows >= 10
+    max_columns = max((len(row) for row in rows), default=0)
+    return any(
+        sum(1 for row in rows if column < len(row) and parse_month(row[column])) >= 10
+        for column in range(max_columns)
+    )
 
 
 def _parse_monthly_sheet(sheet: Any) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
     rows = list(sheet.iter_rows(values_only=False))
-    parsed = _parse_metric_rows(sheet.title, rows)
-    if parsed is None:
-        parsed = _parse_month_rows(sheet.title, rows)
+    candidates = [candidate for candidate in (_parse_metric_rows(sheet.title, rows), _parse_month_rows(sheet.title, rows)) if candidate]
+    parsed = max(candidates, key=lambda candidate: _monthly_candidate_score(candidate[0]), default=None)
     if parsed is None:
         raise FinancialModelParseError("financial_model_missing_month")
     monthly, source_cells = parsed
     return _finalize_monthly(monthly, source_cells)
+
+
+def _monthly_candidate_score(monthly: list[dict[str, Any]]) -> int:
+    fields = (
+        "expected_production_kwh",
+        "expected_consumption_kwh",
+        "expected_self_use_kwh",
+        "expected_export_kwh",
+        "expected_grid_import_kwh",
+    )
+    return sum(row.get(field) is not None for row in monthly for field in fields)
 
 
 def _finalize_monthly(
@@ -323,8 +385,8 @@ def _finalize_monthly(
     if any(row.get("expected_production_kwh") is None for row in monthly):
         raise FinancialModelParseError("financial_model_missing_month")
     for row in monthly:
-        calculated: dict[str, str] = {}
-        row_warnings: list[str] = []
+        calculated: dict[str, str] = dict(row.get("calculated_fields") or {})
+        row_warnings: list[str] = list(row.get("warnings") or [])
         production = row.get("expected_production_kwh")
         consumption = row.get("expected_consumption_kwh")
         self_use = row.get("expected_self_use_kwh")
@@ -381,10 +443,20 @@ def _parse_month_rows(sheet_name: str, rows: list[tuple[Any, ...]]) -> tuple[lis
             break
     if header_index is None:
         return None
+    candidate_month_columns: dict[int, int] = {}
+    for column in range(1, max((len(row) for row in rows), default=0) + 1):
+        candidate_month_columns[column] = sum(
+            1
+            for row in rows[header_index:]
+            if column <= len(row) and parse_month(row[column - 1].value)
+        )
+    month_column = max(candidate_month_columns, key=candidate_month_columns.get, default=1)
+    if candidate_month_columns.get(month_column, 0) < 10:
+        return None
     metrics = {key: {} for key in headers}
     for row_index in range(header_index + 1, len(rows) + 1):
         row = rows[row_index - 1]
-        month = parse_month(row[0].value if row else None)
+        month = parse_month(row[month_column - 1].value if len(row) >= month_column else None)
         if not month:
             continue
         for metric, col in headers.items():
@@ -520,22 +592,34 @@ def _parse_financial_automatic_details(
         for key, label, cell, unit in upac_cells
         if project_sheet[cell].value not in (None, "")
     ]
-    annual_grid_import = savings_sheet["F45"].value
-    if annual_grid_import not in (None, ""):
+    annual_grid_import = parse_number(savings_sheet["F45"].value)
+    annual_grid_import_cell = cell_ref(savings_sheet.title, 45, 6)
+    if annual_grid_import is None:
+        grid_import_values = [parse_number(row.get("expected_grid_import_kwh")) for row in monthly]
+        present_grid_import = [value for value in grid_import_values if value is not None]
+        annual_grid_import = sum(present_grid_import) if present_grid_import else None
+        annual_grid_import_cell = "calculated:monthly_total"
+    if annual_grid_import is not None:
         upac_summary.append(
             _detail_item(
                 "annual_grid_import_kwh",
                 "Buy from grid",
                 annual_grid_import,
-                cell_ref(savings_sheet.title, 45, 6),
+                annual_grid_import_cell,
                 "kWh",
             )
         )
-    tariff_scheme = " / ".join(
-        str(value).strip()
-        for value in (project_sheet["C44"].value, project_sheet["C45"].value)
-        if value not in (None, "")
+    tariff_scheme_values = _adjacent_values_for_labels(
+        project_sheet,
+        {"tipo de tarifa", "ciclo horario", "tarifa de ciclo", "nivel de tensao"},
     )
+    if not tariff_scheme_values:
+        tariff_scheme_values = [
+            str(value).strip()
+            for value in (project_sheet["C44"].value, project_sheet["C45"].value)
+            if value not in (None, "")
+        ]
+    tariff_scheme = " / ".join(dict.fromkeys(tariff_scheme_values))
     if tariff_scheme:
         upac_summary.append(
             {
@@ -543,7 +627,7 @@ def _parse_financial_automatic_details(
                 "label": "Tariff scheme",
                 "value": tariff_scheme,
                 "unit": "",
-                "source_cell": f"{project_sheet.title}!C44:C45",
+                "source_cell": "labelled project tariff fields",
             }
         )
     details["upac_summary"] = upac_summary
@@ -551,30 +635,36 @@ def _parse_financial_automatic_details(
     tariff_periods = []
     electricity_costs = []
     project_tariff_rows: dict[str, int] = {}
-    for row_index in range(41, 45):
-        label = project_sheet.cell(row_index, 5).value
+    tariff_layout = _find_project_tariff_layout(project_sheet)
+    tariff_row_indexes = range(tariff_layout[0] + 1, tariff_layout[0] + 9) if tariff_layout else range(41, 45)
+    period_column, energy_column, network_column, total_column = tariff_layout[1:] if tariff_layout else (5, 6, 7, 8)
+    for row_index in tariff_row_indexes:
+        label = project_sheet.cell(row_index, period_column).value
         if label in (None, ""):
             continue
-        project_tariff_rows[normalize_text(label)] = row_index
-        total = project_sheet.cell(row_index, 8).value
+        normalized_label = normalize_text(label)
+        if normalized_label not in {"sv", "vazio", "cheia", "ponta"}:
+            continue
+        project_tariff_rows[normalized_label] = row_index
+        total = project_sheet.cell(row_index, total_column).value
         if total not in (None, ""):
             tariff_periods.append(
                 _detail_item(
                     normalize_text(label).replace(" ", "_"),
                     str(label),
                     total,
-                    cell_ref(project_sheet.title, row_index, 8),
+                    cell_ref(project_sheet.title, row_index, total_column),
                     "EUR/kWh",
                 )
             )
         electricity_costs.append(
             {
                 "period": str(label),
-                "energy_eur_kwh": parse_number(project_sheet.cell(row_index, 6).value),
-                "network_eur_kwh": parse_number(project_sheet.cell(row_index, 7).value),
+                "energy_eur_kwh": parse_number(project_sheet.cell(row_index, energy_column).value),
+                "network_eur_kwh": parse_number(project_sheet.cell(row_index, network_column).value),
                 "source_cells": {
-                    "energy_eur_kwh": cell_ref(project_sheet.title, row_index, 6),
-                    "network_eur_kwh": cell_ref(project_sheet.title, row_index, 7),
+                    "energy_eur_kwh": cell_ref(project_sheet.title, row_index, energy_column),
+                    "network_eur_kwh": cell_ref(project_sheet.title, row_index, network_column),
                 },
             }
         )
@@ -610,8 +700,8 @@ def _parse_financial_automatic_details(
         )
         if project_row:
             energy_kwh = parse_number(savings_sheet.cell(tariff_row, 3).value)
-            energy_price = parse_number(project_sheet.cell(project_row, 6).value)
-            network_price = parse_number(project_sheet.cell(project_row, 7).value)
+            energy_price = parse_number(project_sheet.cell(project_row, energy_column).value)
+            network_price = parse_number(project_sheet.cell(project_row, network_column).value)
             invoice_prices.append(
                 {
                     "label": label,
@@ -626,19 +716,100 @@ def _parse_financial_automatic_details(
     details["invoice_periods"] = invoice_periods
     details["invoice_prices"] = invoice_prices
     invoice_totals = []
-    for key, label, cell, unit in (
-        ("estimated_invoice_total", "Estimated annual invoice", "D16", "EUR"),
-        ("savings_energy_total", "Savings energy total", "F16", "EUR"),
-        ("total_benefit", "Total benefit", "D52", "EUR"),
+    savings_header = _find_financial_automatic_header(savings_sheet, {"consumption", "self_use", "export"})
+    total_row = None
+    money_headers: dict[str, int] = {}
+    if savings_header:
+        header_row, month_column, _ = savings_header
+        header_values = next(
+            savings_sheet.iter_rows(
+                min_row=header_row,
+                max_row=header_row,
+                max_col=min(savings_sheet.max_column or 30, 30),
+                values_only=True,
+            ),
+            (),
+        )
+        money_headers = {
+            key: column
+            for column, value in enumerate(header_values, start=1)
+            if (key := _financial_money_key(value))
+        }
+        total_candidates = savings_sheet.iter_rows(
+            min_row=header_row + 1,
+            max_row=min(savings_sheet.max_row or header_row + 20, header_row + 20),
+            min_col=month_column,
+            max_col=month_column,
+            values_only=True,
+        )
+        for row_index, (value,) in enumerate(total_candidates, start=header_row + 1):
+            if normalize_text(value) in {"total", "grand total"}:
+                total_row = row_index
+                break
+    for key, label, money_key in (
+        ("estimated_invoice_total", "Estimated annual invoice", "invoice"),
+        ("savings_energy_total", "Savings energy total", "self_use_savings"),
+        ("surplus_revenue_total", "Surplus revenue total", "export_revenue"),
     ):
-        value = savings_sheet[cell].value
+        column = money_headers.get(money_key)
+        value = savings_sheet.cell(total_row, column).value if total_row and column else None
         if value not in (None, ""):
             invoice_totals.append(
-                _detail_item(key, label, value, cell_ref(savings_sheet.title, savings_sheet[cell].row, savings_sheet[cell].column), unit)
+                _detail_item(key, label, value, cell_ref(savings_sheet.title, total_row, column), "EUR")
             )
+    total_benefit = savings_sheet["D52"].value
+    if total_benefit not in (None, ""):
+        invoice_totals.append(_detail_item("total_benefit", "Total benefit", total_benefit, cell_ref(savings_sheet.title, 52, 4), "EUR"))
     details["invoice_totals"] = invoice_totals
     details["proposal_rows"] = _proposal_rows_from_monthly(monthly)
     return {key: value for key, value in details.items() if value}
+
+
+def _adjacent_values_for_labels(sheet: Any, labels: set[str]) -> list[str]:
+    values = []
+    rows = sheet.iter_rows(
+        min_row=1,
+        max_row=min(sheet.max_row or 70, 70),
+        max_col=min(sheet.max_column or 20, 20),
+        values_only=True,
+    )
+    for row in rows:
+        for column, value in enumerate(row[:-1]):
+            if normalize_text(value) not in labels:
+                continue
+            adjacent = row[column + 1]
+            if adjacent not in (None, ""):
+                values.append(str(adjacent).strip())
+    return values
+
+
+def _find_project_tariff_layout(sheet: Any) -> tuple[int, int, int, int, int] | None:
+    rows = sheet.iter_rows(
+        min_row=1,
+        max_row=min(sheet.max_row or 70, 70),
+        max_col=min(sheet.max_column or 20, 20),
+        values_only=True,
+    )
+    for row_index, row in enumerate(rows, start=1):
+        headers = {normalize_text(value): column for column, value in enumerate(row, start=1)}
+        period_column = headers.get("periodo")
+        energy_column = headers.get("energia")
+        network_column = headers.get("redes")
+        total_column = headers.get("total")
+        if period_column and energy_column and network_column and total_column:
+            return row_index, period_column, energy_column, network_column, total_column
+    return None
+
+
+def _financial_money_key(value: Any) -> str | None:
+    raw = normalize_text(value)
+    if raw.startswith(("faturas", "invoice", "bill")):
+        return "invoice"
+    if (raw.startswith("save") or "savings" in raw) and ("ac" in raw or "self" in raw):
+        return "self_use_savings"
+    if (raw.startswith("exc") or "export" in raw or "surplus" in raw) and ("eur" in raw or "€" in str(value or "")) and "kwh" not in raw:
+        return "export_revenue"
+    return None
 
 
 def _proposal_rows_from_monthly(monthly: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -123,7 +123,7 @@ def usinage_style_financial_workbook(path: Path) -> None:
     workbook.save(path)
 
 
-def financial_automatic_as_sold_workbook(path: Path) -> None:
+def financial_automatic_as_sold_workbook(path: Path, *, battery_charge: bool = False) -> None:
     workbook = Workbook()
     project = workbook.active
     project.title = "Projeto"
@@ -174,8 +174,13 @@ def financial_automatic_as_sold_workbook(path: Path) -> None:
     savings.append([])
     savings.append([])
     savings.append([None, "Month", "Cons. [kWh]", "Faturas €", "AC [kWh]", "Save AC €", "Exced [kWh]"])
+    if battery_charge:
+        savings["I3"] = "Exc. ESS [kWh]"
     for month in range(1, 13):
         savings.append([None, month, month * 150, month * 10, month * 60, month * 4, month * 40])
+        if battery_charge:
+            savings.cell(month + 3, 9, month * 10)
+    savings["B16"] = "TOTAL"
     savings["C16"] = 11700
     savings["D16"] = 780
     savings["E16"] = 4680
@@ -208,6 +213,65 @@ def financial_automatic_as_sold_workbook(path: Path) -> None:
     noise = workbook.create_sheet("Outro resumo")
     noise.append(["Metric", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"])
     noise.append(["PV Production", *range(1, 13)])
+    workbook.save(path)
+
+
+def financial_automatic_shifted_workbook(path: Path) -> None:
+    workbook = Workbook()
+    project = workbook.active
+    project.title = "Projeto"
+    project["B5"] = "Nome do Projeto:"
+    project["C5"] = "Projeto Sanitizado"
+    project["G8"] = "Size Project"
+    project["H8"] = 25
+    project["J5"] = "Month"
+    project["K5"] = "Monthly Production [kWh]"
+    project["L5"] = "AC [kWh]"
+    for month in range(1, 13):
+        row = month + 5
+        project.cell(row, 10, month)
+        project.cell(row, 11, month * 100)
+        project.cell(row, 12, month * 70)
+    project.append([])
+    project["E33"] = "Período"
+    project["F33"] = "Energia"
+    project["G33"] = "Redes"
+    project["H33"] = "Total"
+    for row, label in enumerate(("SV", "Vazio", "Cheia", "Ponta"), start=34):
+        project.cell(row, 5, label)
+        project.cell(row, 6, 0.08)
+        project.cell(row, 7, 0.02)
+        project.cell(row, 8, 0.10)
+
+    savings = workbook.create_sheet("Savings Yr1")
+    savings.append([])
+    savings.append([])
+    savings.append([None, "Month", "Cons. [kWh]", "Faturas EUR", None, "AC [kWh]", "Save AC EUR", None, "Exced [kWh]"])
+    for month in range(1, 13):
+        savings.append([None, month, month * 150, month * 10, None, month * 70, month * 5, None, month * 30])
+    savings["B16"] = "TOTAL"
+    savings["C16"] = 11700
+    savings["D16"] = 780
+    savings["F16"] = 5460
+    savings["G16"] = 390
+    savings["I16"] = 2340
+    workbook.save(path)
+
+
+def monthly_production_legacy_workbook(path: Path) -> None:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Monthly Production"
+    sheet.append([])
+    sheet.append([])
+    sheet.append([])
+    sheet.append([None, None, "Row Labels", "Sum of Consumption (kWh)", "Sum of PV (kWh)", "Sum of SC (kWh)"])
+    for month in range(1, 13):
+        sheet.append([None, None, month, month * 150, month * 100, month * 70])
+    upac = workbook.create_sheet("UPAC")
+    upac["A4"] = "Projeto Sanitizado"
+    upac["D4"] = 25
+    upac["K5"] = 9999
     workbook.save(path)
 
 
@@ -270,7 +334,7 @@ def test_parse_financial_automatic_as_sold_layout(tmp_path: Path) -> None:
 
     parsed = parse_financial_model_workbook(path)
 
-    assert parsed.parser_version == "2"
+    assert parsed.parser_version == "3"
     assert parsed.sheet_name == "Projeto"
     assert parsed.detected_name == "Projeto Exemplo"
     assert parsed.detected_kwp == 17.5
@@ -292,6 +356,47 @@ def test_parse_financial_automatic_as_sold_layout(tmp_path: Path) -> None:
     assert parsed.details["invoice_periods"][0]["period"] == "Ponta"
     assert parsed.details["invoice_totals"][0]["value"] == 780
     assert next(row for row in parsed.details["proposal_rows"] if row["label"] == "Buy from grid (kWh)")["annual"] == 7020
+
+
+def test_parse_financial_automatic_shifted_energy_columns(tmp_path: Path) -> None:
+    path = tmp_path / "financial_automatic_shifted.xlsm"
+    financial_automatic_shifted_workbook(path)
+
+    parsed = parse_financial_model_workbook(path)
+
+    assert parsed.monthly[0]["expected_production_kwh"] == 100
+    assert parsed.monthly[0]["expected_consumption_kwh"] == 150
+    assert parsed.monthly[0]["expected_self_use_kwh"] == 70
+    assert parsed.monthly[0]["expected_export_kwh"] == 30
+    assert parsed.monthly[0]["source_fields"]["expected_self_use_kwh"]["cell"] == "Savings Yr1!F4"
+    assert parsed.monthly[0]["source_fields"]["expected_export_kwh"]["cell"] == "Savings Yr1!I4"
+    assert parsed.details["tariff_periods"][0]["source_cell"] == "Projeto!H34"
+    assert parsed.details["invoice_totals"][1]["source_cell"] == "Savings Yr1!G16"
+
+
+def test_parse_financial_automatic_adjusts_export_stored_in_battery(tmp_path: Path) -> None:
+    path = tmp_path / "financial_automatic_battery.xlsm"
+    financial_automatic_as_sold_workbook(path, battery_charge=True)
+
+    parsed = parse_financial_model_workbook(path)
+
+    assert parsed.monthly[0]["expected_export_kwh"] == 30
+    assert parsed.monthly[0]["calculated_fields"]["expected_export_kwh"] == "export_minus_battery_charge"
+    assert parsed.monthly[0]["source_fields"]["expected_export_kwh"]["adjustment_cell"] == "Savings Yr1!I4"
+    assert "financial_model_battery_export_adjusted" in parsed.warnings
+
+
+def test_parse_legacy_monthly_production_with_offset_month_column(tmp_path: Path) -> None:
+    path = tmp_path / "financial_legacy_monthly_production.xlsm"
+    monthly_production_legacy_workbook(path)
+
+    parsed = parse_financial_model_workbook(path)
+
+    assert parsed.sheet_name == "Monthly Production"
+    assert parsed.monthly[0]["expected_production_kwh"] == 100
+    assert parsed.monthly[0]["expected_consumption_kwh"] == 150
+    assert parsed.monthly[0]["expected_self_use_kwh"] == 70
+    assert "financial_model_annual_total_mismatch_production" in parsed.warnings
 
 
 def test_parse_financial_model_rejects_missing_month_and_ambiguous_sheets(tmp_path: Path) -> None:
