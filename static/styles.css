@@ -174,6 +174,10 @@ small {
   border: 1px solid var(--line);
 }
 
+.mobile-nav-toggle {
+  display: none;
+}
+
 .content {
   padding: 28px;
   display: grid;
@@ -1543,12 +1547,6 @@ button.small {
   background: var(--row-bg);
 }
 
-@media (max-width: 700px) {
-  .inverter-chart-grid {
-    grid-template-columns: 1fr;
-  }
-}
-
 .installation-card {
   border: 1px solid var(--line);
   border-radius: 18px;
@@ -2484,5 +2482,217 @@ button.small {
 
   .integration-tab-bar {
     position: static;
+  }
+}
+
+@media (max-width: 700px) {
+  .shell {
+    width: 100%;
+    max-width: 100%;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .sidebar {
+    width: 100%;
+    height: auto;
+    padding: 16px;
+    gap: 12px;
+    position: relative;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .sidebar > div:first-child,
+  .sidebar .nav,
+  .sidebar .logout-form {
+    grid-column: 1 / -1;
+  }
+
+  .sidebar h1 {
+    font-size: 1.6rem;
+  }
+
+  .sidebar-copy {
+    margin-bottom: 0;
+  }
+
+  .mobile-nav-toggle {
+    display: inline-flex;
+    width: 100%;
+    border: 1px solid var(--line);
+  }
+
+  .theme-toggle {
+    width: 100%;
+  }
+
+  .sidebar .nav {
+    display: none;
+    gap: 6px;
+  }
+
+  .sidebar .nav.is-open {
+    display: grid;
+  }
+
+  .nav a {
+    min-height: 44px;
+    padding: 12px 14px;
+  }
+
+  .content {
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    padding: 14px;
+    gap: 16px;
+  }
+
+  .hero,
+  .card,
+  .route-planner,
+  .central-ticket-card {
+    min-width: 0;
+    max-width: 100%;
+    padding: 16px;
+    border-radius: 18px;
+  }
+
+  .hero,
+  .ticket-top,
+  .list-row,
+  .central-summary,
+  .ticket-item-head,
+  .operation-item,
+  .monitoring-filters {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .cards,
+  .grid.two,
+  .workflow-strip,
+  .dashboard-kpis,
+  .dashboard-main,
+  .ticket-grid,
+  .compact-ticket-form,
+  .ticket-form-extra,
+  .checkbox-grid,
+  .inverter-chart-grid,
+  .portfolio-manager-shell,
+  .portfolio-topbar,
+  .portfolio-inline-edit,
+  .portfolio-search,
+  .portfolio-edit-grid,
+  .portfolio-secondary-grid,
+  .portfolio-readonly-row,
+  .compact-table-row,
+  .route-form-grid,
+  .route-location-form,
+  .route-stop-row,
+  .route-stop-time,
+  .route-cost-grid,
+  .route-summary-grid,
+  .route-review-correction {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .asset-edit-form {
+    padding: 0 16px 16px;
+  }
+
+  .asset-edit-summary,
+  .ticket-summary {
+    padding: 16px;
+  }
+
+  .central-ticket-list {
+    padding: 0 16px 16px;
+  }
+
+  .filters,
+  .ticket-form,
+  .hero-actions,
+  .portfolio-actions,
+  .portfolio-admin-actions,
+  .bulk-action-bar,
+  .bulk-action-bar form,
+  .row-actions,
+  .field-actions,
+  .route-toolbar,
+  .calendar-month-form,
+  .inline-form {
+    width: 100%;
+    max-width: 100%;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .filters > *,
+  .ticket-form > *,
+  .hero-actions > *,
+  .portfolio-actions > *,
+  .portfolio-admin-actions > *,
+  .bulk-action-bar > *,
+  .row-actions > *,
+  .field-actions > *,
+  .route-toolbar > *,
+  .calendar-month-form > *,
+  .inline-form > *,
+  .compact-action-form,
+  .resolve-controls,
+  .renewal-form,
+  .unresolved-action-form,
+  .route-review-actions {
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  input,
+  select,
+  textarea {
+    max-width: 100%;
+  }
+
+  .table-wrap,
+  .table-wrapper {
+    width: 100%;
+    max-width: 100%;
+    overflow-x: auto;
+    overscroll-behavior-inline: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  table {
+    width: max-content;
+    min-width: 760px;
+  }
+
+  .tab-nav,
+  .tab-bar,
+  .integration-tab-bar {
+    width: 100%;
+    max-width: 100%;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overscroll-behavior-inline: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .tab-nav a,
+  .tab-button {
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+
+  .action-menu-panel {
+    left: 0;
+    right: auto;
+    max-width: calc(100vw - 28px);
+  }
+
+  .field-map {
+    min-height: 360px;
   }
 }
