@@ -123,6 +123,94 @@ def usinage_style_financial_workbook(path: Path) -> None:
     workbook.save(path)
 
 
+def financial_automatic_as_sold_workbook(path: Path) -> None:
+    workbook = Workbook()
+    project = workbook.active
+    project.title = "Projeto"
+    project["C5"] = "Projeto Exemplo"
+    project["H8"] = 17.5
+    project["H14"] = 1234.5
+    project["H22"] = 0.02
+    project["H23"] = 0.005
+    project["D26"] = 500
+    project["E26"] = 8750
+    project["D28"] = 700
+    project["E28"] = 12250
+    project["J5"] = "Month"
+    project["K5"] = "Monthly Production [kWh]"
+    project["L5"] = "AC [kWh]"
+    project["M5"] = "% AC"
+    for month in range(1, 13):
+        row = month + 5
+        project.cell(row, 10, month)
+        project.cell(row, 11, month * 100)
+        project.cell(row, 12, month * 60)
+        project.cell(row, 13, 0.6)
+    project["K18"] = 7800
+    project["L18"] = 4680
+    project["P5"] = 11700
+    project["P6"] = 7800
+    project["P7"] = 4680
+    project["P8"] = 3120
+    project["P9"] = 0.6
+    project["P10"] = 0.4
+    project["L32"] = 0.15
+    project["G39"] = "2026/1"
+    project["C44"] = "Tetra-horário"
+    project["C45"] = "Semanal"
+    project["F46"] = 0.05
+    for row, label, energy, network in (
+        (41, "SV", 0.08, 0.02),
+        (42, "Vazio", 0.09, 0.03),
+        (43, "Cheia", 0.10, 0.04),
+        (44, "Ponta", 0.11, 0.05),
+    ):
+        project.cell(row, 5, label)
+        project.cell(row, 6, energy)
+        project.cell(row, 7, network)
+        project.cell(row, 8, energy + network)
+
+    savings = workbook.create_sheet("Savings Yr1")
+    savings.append([])
+    savings.append([])
+    savings.append([None, "Month", "Cons. [kWh]", "Faturas €", "AC [kWh]", "Save AC €", "Exced [kWh]"])
+    for month in range(1, 13):
+        savings.append([None, month, month * 150, month * 10, month * 60, month * 4, month * 40])
+    savings["C16"] = 11700
+    savings["D16"] = 780
+    savings["E16"] = 4680
+    savings["F16"] = 312
+    savings["G16"] = 3120
+    for row, label, consumption, production, self_use, grid_import, export in (
+        (41, "Ponta", 3000, 2000, 1200, 1800, 800),
+        (42, "Cheia", 4000, 3000, 1800, 2200, 1200),
+        (43, "Vazio", 3500, 2500, 1500, 2000, 1000),
+        (44, "SV", 1200, 300, 180, 1020, 120),
+    ):
+        savings.cell(row, 2, label)
+        savings.cell(row, 3, consumption)
+        savings.cell(row, 4, production)
+        savings.cell(row, 5, self_use)
+        savings.cell(row, 6, grid_import)
+        savings.cell(row, 7, export)
+    savings["E45"] = 4680
+    savings["F45"] = 7020
+    savings["D52"] = 500
+    for row, label, savings_value in (
+        (48, "Ponta", 120),
+        (49, "Cheia", 180),
+        (50, "Vazio", 150),
+        (51, "SV", 18),
+    ):
+        savings.cell(row, 2, label)
+        savings.cell(row, 5, savings_value)
+
+    noise = workbook.create_sheet("Outro resumo")
+    noise.append(["Metric", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"])
+    noise.append(["PV Production", *range(1, 13)])
+    workbook.save(path)
+
+
 def test_financial_model_schema_new_and_existing_db(tmp_path: Path) -> None:
     conn = connect(tmp_path)
     try:
@@ -174,6 +262,36 @@ def test_parse_usinage_style_financial_model_details(tmp_path: Path) -> None:
     assert len(parsed.details["tariff_periods"]) >= 4
     assert any(row["label"] == "Total Benefit (EUR)" for row in parsed.details["proposal_rows"])
     assert parsed.details["invoice_periods"][0]["period"] == "Cheia"
+
+
+def test_parse_financial_automatic_as_sold_layout(tmp_path: Path) -> None:
+    path = tmp_path / "financial_automatic_as_sold.xlsm"
+    financial_automatic_as_sold_workbook(path)
+
+    parsed = parse_financial_model_workbook(path)
+
+    assert parsed.parser_version == "2"
+    assert parsed.sheet_name == "Projeto"
+    assert parsed.detected_name == "Projeto Exemplo"
+    assert parsed.detected_kwp == 17.5
+    assert parsed.base_year == 2026
+    assert parsed.source_cells["base_year"] == "Projeto!G39"
+    assert parsed.monthly[0]["expected_production_kwh"] == 100
+    assert parsed.monthly[0]["expected_consumption_kwh"] == 150
+    assert parsed.monthly[0]["expected_self_use_kwh"] == 60
+    assert parsed.monthly[0]["expected_export_kwh"] == 40
+    assert parsed.monthly[0]["expected_grid_import_kwh"] == 90
+    assert parsed.monthly[0]["source_fields"]["expected_production_kwh"]["cell"] == "Projeto!K6"
+    assert parsed.monthly[0]["source_fields"]["expected_consumption_kwh"]["cell"] == "Savings Yr1!C4"
+    assert "financial_model_calculated_grid_import" in parsed.warnings
+    assert parsed.details["format"] == "financial_automatic_as_sold"
+    assert any(item["key"] == "installation_cost_total_eur" and item["value"] == 8750 for item in parsed.details["upac_summary"])
+    assert any(item["key"] == "annual_grid_import_kwh" and item["value"] == 7020 for item in parsed.details["upac_summary"])
+    assert parsed.details["tariff_periods"][0]["label"] == "SV"
+    assert parsed.details["electricity_costs"][0]["energy_eur_kwh"] == 0.08
+    assert parsed.details["invoice_periods"][0]["period"] == "Ponta"
+    assert parsed.details["invoice_totals"][0]["value"] == 780
+    assert next(row for row in parsed.details["proposal_rows"] if row["label"] == "Buy from grid (kWh)")["annual"] == 7020
 
 
 def test_parse_financial_model_rejects_missing_month_and_ambiguous_sheets(tmp_path: Path) -> None:
