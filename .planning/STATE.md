@@ -13,6 +13,8 @@ progress:
 
 # Project State
 
+Last activity: 2026-07-17 - Completed quick task 2: Adicionar ao pipeline de intervenções os casos AGA, Pires Lourenço 1, Alto dos Moinhos lotes 1 e 2, e Alirações
+
 ## Current Position
 
 - Codebase map exists in `.planning/codebase/`.
@@ -65,6 +67,12 @@ progress:
 - Scheduler behavior depends on single-process deployment.
 - FusionSolar and Sigenergy API assumptions need realistic fixture coverage.
 - Local runtime files must remain uncommitted; SQLite sidecars are now ignored by Git and Docker build context.
+
+### Quick Tasks Completed
+
+| # | Description | Date | Commit | Directory |
+|---|-------------|------|--------|-----------|
+| 2 | Adicionar ao pipeline de intervenções os casos AGA, Pires Lourenço 1, Alto dos Moinhos lotes 1 e 2, e Alirações | 2026-07-17 | 9332a32 | [2-adicionar-ao-pipeline-de-interven-es-os-](./quick/2-adicionar-ao-pipeline-de-interven-es-os-/) |
 
 ## Recent Activity
 
