@@ -173,7 +173,7 @@ def test_service_keeps_simple_self_use_and_real_financial_values(monkeypatch) ->
             "warnings": [],
         }
     ]
-    monkeypatch.setattr(portfolio_reporting_service, "build_portfolio_report_rows", lambda conn, portfolio_id, report_month: monthly)
+    monkeypatch.setattr(portfolio_reporting_service, "build_portfolio_report_rows", lambda conn, portfolio_id, report_month, **kwargs: monthly)
 
     result = prepare_portfolio_report(
         None,
@@ -194,7 +194,7 @@ def test_service_keeps_simple_self_use_and_real_financial_values(monkeypatch) ->
 
 def test_service_does_not_convert_missing_financial_metrics_to_zero(monkeypatch) -> None:
     monthly = [{"asset_id": 1, "installation": "A", "installed_power_kwp": 10, "warnings": ["missing_self_use", "missing_billing"]}]
-    monkeypatch.setattr(portfolio_reporting_service, "build_portfolio_report_rows", lambda conn, portfolio_id, report_month: monthly)
+    monkeypatch.setattr(portfolio_reporting_service, "build_portfolio_report_rows", lambda conn, portfolio_id, report_month, **kwargs: monthly)
 
     result = prepare_portfolio_report(
         None,
@@ -216,7 +216,7 @@ def test_partial_coverage_uses_expected_installation_month_slots(monkeypatch) ->
         "2026-02": [{"asset_id": 1, "installation": "A", "installed_power_kwp": 10, "warnings": ["missing_monthly_production", "inferred_hourly_self_use"]}],
         "2026-03": [{"asset_id": 1, "installation": "A", "installed_power_kwp": 10, "actual_production_kwh": 20, "warnings": []}],
     }
-    monkeypatch.setattr(portfolio_reporting_service, "build_portfolio_report_rows", lambda conn, portfolio_id, report_month: rows_by_month[report_month])
+    monkeypatch.setattr(portfolio_reporting_service, "build_portfolio_report_rows", lambda conn, portfolio_id, report_month, **kwargs: rows_by_month[report_month])
 
     result = prepare_portfolio_report(
         None,
@@ -239,7 +239,7 @@ def test_snapshot_preserves_comparison(tmp_path: Path, monkeypatch) -> None:
         "2026-01": [{"asset_id": 1, "installation": "A", "actual_production_kwh": 100, "adjusted_expected_kwh": 100, "warnings": []}],
         "2025-12": [{"asset_id": 1, "installation": "A", "actual_production_kwh": 50, "adjusted_expected_kwh": 100, "warnings": []}],
     }
-    monkeypatch.setattr(portfolio_reporting_service, "build_portfolio_report_rows", lambda conn, portfolio_id, report_month: rows_by_month[report_month])
+    monkeypatch.setattr(portfolio_reporting_service, "build_portfolio_report_rows", lambda conn, portfolio_id, report_month, **kwargs: rows_by_month[report_month])
     result = prepare_portfolio_report(
         conn,
         portfolio_id=portfolio_id,

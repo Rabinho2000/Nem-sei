@@ -244,6 +244,46 @@ def test_customer_pdf_report_uses_local_production_records(conn, monkeypatch: py
     assert report["daily_rows"][0]["production_kwh"] == 10
 
 
+def test_individual_monthly_report_keeps_partial_production_as_diagnostic(conn) -> None:
+    asset_id = _insert_customer_asset(conn, "Central Parcial")
+    _insert_customer_record(conn, asset_id, "day", date(2026, 4, 1), 10, 6, 4, 20)
+    conn.commit()
+
+    report = build_local_customer_production_report(
+        conn,
+        asset_id=asset_id,
+        report_month="2026-04",
+        electricity_price=0.2,
+        sell_price=0.05,
+        reference_date=date(2026, 5, 1),
+    )
+
+    assert report["production_kwh"] is None
+    assert report["raw_daily_total_kwh"] == 10
+    assert report["production_quality_status"] == "partial"
+    assert report["production_is_final"] is False
+    assert report["net_benefit_eur"] is None
+    assert any("Rascunho — produção incompleta: 1/30 dias disponíveis" in note for note in report["report_notes"])
+
+
+def test_current_month_does_not_trigger_api_fallback_only_for_being_in_progress(conn, monkeypatch: pytest.MonkeyPatch) -> None:
+    asset_id = _insert_customer_asset(conn, "Central Em Curso")
+    monkeypatch.setattr("app.get_fusionsolar_session", lambda _config: pytest.fail("API should not be called"))
+
+    report = build_fusionsolar_customer_production_report(
+        conn,
+        asset_id=asset_id,
+        report_month="2026-07",
+        electricity_price=0.2,
+        sell_price=0.05,
+        reference_date=date(2026, 7, 22),
+    )
+
+    assert report["production_quality_status"] == "in_progress"
+    assert report["production_kwh"] is None
+    assert report["months_requiring_fallback"] == []
+
+
 def _insert_customer_asset(conn, name: str = "Central Periodos") -> int:
     conn.execute(
         """
@@ -339,14 +379,13 @@ def test_semiannual_customer_report_mixes_monthly_and_daily_without_double_count
         period=period_from_form({"period_type": "semiannual", "report_year": "2026", "report_semester": "1"}),
     )
 
-    assert report["production_kwh"] == 150
-    assert report["self_use_kwh"] == 105
-    assert report["export_kwh"] == 45
-    assert report["consumption_kwh"] == 250
-    assert report["months_with_data"] == ["2026-01", "2026-02"]
-    assert report["missing_months"] == ["2026-03", "2026-04", "2026-05", "2026-06"]
-    assert report["coverage_pct"] == pytest.approx(33.33)
-    assert any("dados diarios incompletos" in note for note in report["report_notes"])
+    assert report["production_kwh"] is None
+    assert report["raw_daily_total_kwh"] == 60
+    assert report["production_quality_status"] == "partial"
+    assert report["months_with_data"] == ["2026-01"]
+    assert report["missing_months"] == ["2026-02", "2026-03", "2026-04", "2026-05", "2026-06"]
+    assert report["coverage_pct"] == pytest.approx(16.67)
+    assert any("Rascunho — produção incompleta" in note for note in report["report_notes"])
 
 
 def test_annual_customer_report_identifies_missing_months(conn, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -362,10 +401,11 @@ def test_annual_customer_report_identifies_missing_months(conn, monkeypatch: pyt
         electricity_price=0.2,
         sell_price=0.05,
         period=period_from_form({"period_type": "annual", "report_year": "2026"}),
+        reference_date=date(2027, 1, 1),
     )
 
     assert report["months_count"] == 12
-    assert report["production_kwh"] == 300
+    assert report["production_kwh"] is None
     assert report["months_with_data"] == ["2026-01", "2026-12"]
     assert report["missing_months"] == [
         "2026-02",
@@ -434,13 +474,12 @@ def test_quarterly_customer_report_fetches_only_missing_month_from_api(conn, mon
         period=period_from_form({"period_type": "quarterly", "report_year": "2026", "report_quarter": "1"}),
     )
 
-    assert fetched_months == [date(2026, 3, 1)]
-    assert report["production_kwh"] == 240
-    assert report["self_use_kwh"] == 155
-    assert report["export_kwh"] == 85
-    assert report["months_with_data"] == ["2026-01", "2026-02", "2026-03"]
-    assert report["missing_months"] == []
-    assert report["coverage_pct"] == 100
+    assert fetched_months == [date(2026, 2, 1), date(2026, 3, 1)]
+    assert report["production_kwh"] is None
+    assert report["raw_daily_total_kwh"] == 50
+    assert report["months_with_data"] == ["2026-01", "2026-03"]
+    assert report["missing_months"] == ["2026-02"]
+    assert report["coverage_pct"] == pytest.approx(66.67)
 
 
 def test_deviation_classification_with_thresholds() -> None:

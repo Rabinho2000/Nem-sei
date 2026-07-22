@@ -121,6 +121,7 @@ def prepare_customer_report(
     prepared = dict(report)
     prepared["asset"] = dict(report.get("asset") or {})
     prepared["report_type"] = detect_report_type(prepared["asset"])
+    production_is_final = bool(report.get("production_is_final", report.get("production_kwh") is not None))
     production_decimal = decimal_from_value(report.get("production_kwh"))
     export_decimal = decimal_from_value(report.get("export_kwh"))
     export_decimal = min(export_decimal, production_decimal) if production_decimal else export_decimal
@@ -179,10 +180,15 @@ def prepare_customer_report(
         missing_months=list(report.get("missing_months") or []),
         coverage_pct=_number(report.get("coverage_pct")),
         chart_granularity=str(report.get("chart_granularity") or "daily"),
-        production_kwh=decimal_to_float(production_decimal),
-        self_use_kwh=decimal_to_float(self_use_decimal),
-        export_kwh=decimal_to_float(export_decimal),
-        consumption_kwh=decimal_to_float(consumption_decimal),
+        production_kwh=decimal_to_float(production_decimal) if report.get("production_kwh") is not None else None,
+        self_use_kwh=(
+            decimal_to_float(self_use_decimal)
+            if report.get("self_use_kwh") is not None
+            or (production_is_final and report.get("production_kwh") is not None and report.get("export_kwh") is not None)
+            else None
+        ),
+        export_kwh=decimal_to_float(export_decimal) if report.get("export_kwh") is not None else None,
+        consumption_kwh=decimal_to_float(consumption_decimal) if report.get("consumption_kwh") is not None else None,
         savings_eur=decimal_to_float(savings_eur),
         export_revenue_eur=decimal_to_float(billing.export_revenue_eur),
         total_benefit_eur=decimal_to_float(gross_benefit_eur),
@@ -208,7 +214,26 @@ def prepare_customer_report(
         autoconsumption_pct=decimal_to_float(billing.autoconsumption_pct),
         export_pct=decimal_to_float(billing.export_pct),
         self_sufficiency_pct=decimal_to_float(billing.self_sufficiency_pct),
+        production_is_final=production_is_final,
     )
+    if not production_is_final:
+        for key in (
+            "savings_eur",
+            "export_revenue_eur",
+            "total_benefit_eur",
+            "gross_benefit_eur",
+            "solcor_payment_eur",
+            "net_benefit_eur",
+            "billable_energy_kwh",
+            "grid_import_kwh",
+            "exported_energy_kwh",
+            "tariff_value_eur",
+            "autoconsumption_pct",
+            "export_pct",
+            "self_sufficiency_pct",
+        ):
+            prepared[key] = None
+        prepared.setdefault("warnings", []).append("production_not_final")
     prepared["report_notes"] = list(report.get("report_notes") or [])
     warning_messages = {
         "missing_solcor_price": "Preço Solcor não indicado; pagamento calculado a 0 EUR/kWh.",
@@ -233,14 +258,20 @@ def prepare_customer_report(
 
 
 def format_kwh(value: Any) -> str:
+    if value is None:
+        return "Dados indisponíveis"
     return f"{_number(value):,.0f}".replace(",", " ") + " kWh"
 
 
 def format_eur(value: Any) -> str:
+    if value is None:
+        return "Dados indisponíveis"
     return f"{float(value or 0):,.2f}".replace(",", "X").replace(".", ",").replace("X", " ") + " €"
 
 
 def format_pct(value: Any) -> str:
+    if value is None:
+        return "Dados indisponíveis"
     return f"{_number(value):.0f}%"
 
 

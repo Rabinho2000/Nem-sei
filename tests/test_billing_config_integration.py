@@ -341,6 +341,7 @@ def test_annual_fixed_monthly_fee_uses_twelve_months_and_epc_stays_zero(tmp_path
         sell_price=0.0,
         billing_config=billing_config(mode=BillingMode.FIXED_MONTHLY_FEE, fixed_fee="33"),
         period=annual_period,
+        reference_date=date(2027, 1, 1),
     )
     epc = build_fusionsolar_customer_production_report(
         conn,
@@ -350,6 +351,7 @@ def test_annual_fixed_monthly_fee_uses_twelve_months_and_epc_stays_zero(tmp_path
         sell_price=0.0,
         billing_config=billing_config(report_type=ReportType.EPC, mode=BillingMode.FIXED_MONTHLY_FEE, fixed_fee="999"),
         period=annual_period,
+        reference_date=date(2027, 1, 1),
     )
 
     assert esco["solcor_payment_eur"] == 396
@@ -402,6 +404,7 @@ def test_annual_report_combines_simple_and_tri_hourly_without_double_counting(tm
         sell_price=0.0,
         billing_config=billing_config(report_type=ReportType.EPC, electricity_price="0.20", export_price="0.05"),
         period=period_from_form({"period_type": "annual", "report_year": "2026"}),
+        reference_date=date(2027, 1, 1),
     )
 
     assert report["tariff_type"] == "mixed"

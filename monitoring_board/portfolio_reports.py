@@ -17,6 +17,7 @@ from monitoring_board.portfolio_repository import (
 )
 from monitoring_board.reporting.availability import calculate_weighted_portfolio_availability
 from monitoring_board.reporting.billing import calculate_billing, decimal_from_value, detect_report_type_value
+from monitoring_board.reporting.data_quality import evaluate_monthly_production_quality
 from monitoring_board.reporting.degradation import calculate_degradation_factor
 from monitoring_board.reporting.models import EnergyBreakdown
 from monitoring_board.reporting.periods import month_bounds
@@ -25,10 +26,10 @@ from monitoring_board.reporting.repositories import (
     get_asset_billing_config,
     get_latest_helioscope_expected,
     get_latest_tariff,
-    get_daily_production_totals,
     get_monthly_availability,
     get_monthly_production_record,
     has_expired_tariff,
+    list_daily_production_records,
     list_hourly_production_records,
     list_portfolio_report_assets,
     list_tariffs_intersecting_period,
@@ -66,6 +67,13 @@ FINANCIAL_SOURCE_TYPE = "financial_model"
 WARNING_LABELS = {
     "ok": "OK",
     "missing_monthly_production": "Sem producao real FusionSolar",
+    "partial_monthly_production": "Producao mensal parcial",
+    "monthly_daily_production_conflict": "Conflito entre producao mensal e diaria",
+    "production_in_progress": "Mes de producao em curso",
+    "partial_daily_coverage": "Cobertura diaria parcial",
+    "missing_daily_coverage": "Sem cobertura diaria",
+    "invalid_monthly_production": "Valor mensal de producao invalido",
+    "portfolio_production_incomplete": "Total de producao do portfolio indisponivel",
     "missing_hourly_production": "Sem producao horaria FusionSolar",
     "missing_hourly_self_use": "Sem autoconsumo horario",
     "missing_helioscope_expected": "Sem Helioscope",
@@ -797,8 +805,15 @@ def calculate_tariff_value(
     return legacy
 
 
-def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, report_month: str) -> list[dict[str, Any]]:
+def build_portfolio_report_rows(
+    conn: sqlite3.Connection,
+    portfolio_id: int,
+    report_month: str,
+    *,
+    reference_date: date | None = None,
+) -> list[dict[str, Any]]:
     start, end = month_bounds(report_month)
+    reference_date = reference_date or date.today()
     assets = list_portfolio_report_assets(conn, portfolio_id)
     rows: list[dict[str, Any]] = []
     for asset in assets:
@@ -810,11 +825,17 @@ def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, rep
         if mapping_status == "mapping_conflict":
             warnings.append("mapping_conflict")
         prod = get_monthly_production_record(conn, asset_id, start)
-        daily_totals = get_daily_production_totals(conn, asset_id, start, end) if asset_id is not None else None
-        actual = float(prod["production_kwh"]) if prod and prod["production_kwh"] is not None else None
-        if actual is None and daily_totals is not None:
-            actual = daily_totals["production_kwh"]
-        if actual is None:
+        daily_records = list_daily_production_records(conn, asset_id=asset_id, start=start, end=end)
+        production_quality = evaluate_monthly_production_quality(
+            asset_id=asset_id,
+            month_start=start,
+            reference_date=reference_date,
+            monthly_records=(prod,) if prod is not None else (),
+            daily_records=daily_records,
+        )
+        actual = production_quality.production_kwh
+        warnings.extend(production_quality.warnings)
+        if production_quality.status in {"partial", "missing", "conflict"}:
             warnings.append("missing_monthly_production")
         financial_expected = get_active_expected_for_month(conn, asset_id=asset_id, year=start.year, month=start.month)
         expected_source = "financial_model" if financial_expected else "none"
@@ -903,8 +924,6 @@ def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, rep
         def monthly_field(key: str) -> float | None:
             if prod is not None and key in prod.keys() and prod[key] is not None:
                 return float(prod[key])
-            if daily_totals is not None and key in daily_totals and daily_totals[key] is not None:
-                return float(daily_totals[key])
             return None
 
         def hourly_total(key: str) -> float | None:
@@ -959,10 +978,19 @@ def build_portfolio_report_rows(conn: sqlite3.Connection, portfolio_id: int, rep
                 "sub_account": asset["sub_account"] or "",
                 "installed_power_kwp": parse_float(asset["kwp"]),
                 "actual_production_kwh": round(actual, 2) if actual is not None else None,
-                "production_ponta_kwh": round(period_kwh["ponta"], 2),
-                "production_cheia_kwh": round(period_kwh["cheia"], 2),
-                "production_vazio_kwh": round(period_kwh["vazio"], 2),
-                "production_super_vazio_kwh": round(period_kwh["super_vazio"], 2),
+                "raw_daily_production_kwh": round(production_quality.raw_daily_total_kwh, 2) if production_quality.raw_daily_total_kwh is not None else None,
+                "production_quality_status": production_quality.status,
+                "production_source": production_quality.source,
+                "production_expected_days": production_quality.expected_days,
+                "production_available_days": production_quality.available_days,
+                "production_missing_dates": [item.isoformat() for item in production_quality.missing_dates],
+                "production_coverage_ratio": production_quality.coverage_ratio,
+                "production_coverage_pct": round(production_quality.coverage_ratio * 100, 2),
+                "daily_coverage": production_quality.daily_coverage,
+                "production_ponta_kwh": round(period_kwh["ponta"], 2) if production_quality.is_final else None,
+                "production_cheia_kwh": round(period_kwh["cheia"], 2) if production_quality.is_final else None,
+                "production_vazio_kwh": round(period_kwh["vazio"], 2) if production_quality.is_final else None,
+                "production_super_vazio_kwh": round(period_kwh["super_vazio"], 2) if production_quality.is_final else None,
                 "self_use_kwh": round(self_use_total, 2) if self_use_total is not None else None,
                 "self_use_ponta_kwh": round(self_use_period_kwh["ponta"], 2),
                 "self_use_cheia_kwh": round(self_use_period_kwh["cheia"], 2),
@@ -1013,15 +1041,28 @@ def aggregate_portfolio_total(rows: list[dict[str, Any]]) -> dict[str, Any]:
         values = [row.get(key) for row in rows if row.get(key) is not None]
         return round(sum(float(value) for value in values), 2) if values else None
 
+    complete_production_rows = [
+        row
+        for row in rows
+        if row.get("production_quality_status", "complete" if row.get("actual_production_kwh") is not None else "missing") == "complete"
+        and row.get("actual_production_kwh") is not None
+    ]
+    incomplete_production = len(complete_production_rows) != len(rows)
+    complete_production_subtotal = round(
+        sum(float(row["actual_production_kwh"]) for row in complete_production_rows),
+        2,
+    ) if complete_production_rows else None
     adjusted_total = total("adjusted_expected_kwh")
     deviation = None
     deviation_pct = None
-    actual_total = total("actual_production_kwh")
+    actual_total = None if incomplete_production else complete_production_subtotal
     if actual_total is not None and adjusted_total:
         deviation = round(actual_total - adjusted_total, 2)
         deviation_pct = round(deviation / adjusted_total * 100, 2)
     availability = calculate_weighted_portfolio_availability(rows)
     warnings = sorted({warning for row in rows for warning in row.get("warnings", [])})
+    if incomplete_production:
+        warnings = sorted({*warnings, "portfolio_production_incomplete"})
     if rows and any(row.get("availability_pct") is not None and not row.get("installed_power_kwp") for row in rows):
         warnings = sorted({*warnings, "missing_installed_power"})
     return {
@@ -1033,10 +1074,14 @@ def aggregate_portfolio_total(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "sub_account": "",
         "installed_power_kwp": total("installed_power_kwp"),
         "actual_production_kwh": actual_total,
-        "production_ponta_kwh": total("production_ponta_kwh"),
-        "production_cheia_kwh": total("production_cheia_kwh"),
-        "production_vazio_kwh": total("production_vazio_kwh"),
-        "production_super_vazio_kwh": total("production_super_vazio_kwh"),
+        "complete_production_subtotal_kwh": complete_production_subtotal,
+        "complete_production_installations": len(complete_production_rows),
+        "production_installations": len(rows),
+        "production_total_status": "draft" if incomplete_production else "complete",
+        "production_ponta_kwh": None if incomplete_production else total("production_ponta_kwh"),
+        "production_cheia_kwh": None if incomplete_production else total("production_cheia_kwh"),
+        "production_vazio_kwh": None if incomplete_production else total("production_vazio_kwh"),
+        "production_super_vazio_kwh": None if incomplete_production else total("production_super_vazio_kwh"),
         "self_use_ponta_kwh": total("self_use_ponta_kwh"),
         "self_use_cheia_kwh": total("self_use_cheia_kwh"),
         "self_use_vazio_kwh": total("self_use_vazio_kwh"),
@@ -1075,6 +1120,10 @@ def build_portfolio_kpis(rows: list[dict[str, Any]], total_row: dict[str, Any] |
     total = total_row or aggregate_portfolio_total(rows)
     return {
         "actual_production_kwh": total.get("actual_production_kwh"),
+        "complete_production_subtotal_kwh": total.get("complete_production_subtotal_kwh"),
+        "complete_production_installations": total.get("complete_production_installations", 0),
+        "production_installations": total.get("production_installations", len(rows)),
+        "production_total_status": total.get("production_total_status", "complete"),
         "adjusted_expected_kwh": total.get("adjusted_expected_kwh"),
         "deviation_kwh": total.get("deviation_kwh"),
         "deviation_pct": total.get("deviation_pct"),
@@ -1147,6 +1196,12 @@ def export_portfolio_report_workbook(rows: list[dict[str, Any]]) -> Workbook:
         ("external_installation", "Instalacao externa"),
         ("local_installation", "Instalacao local"),
         ("actual_production_kwh", "Producao real mensal kWh"),
+        ("production_quality_status", "Estado da producao"),
+        ("production_source", "Origem da producao"),
+        ("production_available_days", "Dias de producao disponiveis"),
+        ("production_expected_days", "Dias de producao esperados"),
+        ("production_coverage_ratio", "Cobertura diaria"),
+        ("raw_daily_production_kwh", "Total diario bruto kWh"),
         ("production_ponta_kwh", "Producao ponta kWh"),
         ("production_cheia_kwh", "Producao cheia kWh"),
         ("production_vazio_kwh", "Producao vazio kWh"),

@@ -39,10 +39,12 @@ def prepare_portfolio_report(
     semester: int | str | None = None,
     comparison: str = "",
     profile_version: int = 1,
+    reference_date: date | None = None,
 ) -> PortfolioReportResult:
     period = build_period(period_type, report_month=report_month, year=year, month=(report_month or "")[-2:] if report_month else None, quarter=quarter, semester=semester)
     request = PortfolioReportRequest(portfolio_id=portfolio_id, period=period, profile_id=profile.id, comparison=comparison)
-    rows = load_period_rows(conn, request)
+    reference_date = reference_date or date.today()
+    rows = load_period_rows(conn, request, reference_date=reference_date)
     rows = apply_filters(rows, profile)
     rows = tuple(PortfolioReportRow(row.asset_id, row.values, row.warnings, evaluate_thresholds(row, profile.thresholds)) for row in rows)
     rows = apply_sort(rows, profile)
@@ -63,6 +65,7 @@ def prepare_portfolio_report(
             semester=previous_period.get("semester"),
             comparison="",
             profile_version=profile_version,
+            reference_date=reference_date,
         )
         comparison_result = comparison_values(summary, previous.summary, comparison)
     warnings = tuple(sorted({warning for row in rows for warning in row.warnings} | set(summary.warnings) | (set(comparison_result.warnings) if comparison_result else set())))
@@ -89,12 +92,17 @@ def prepare_portfolio_report(
     )
 
 
-def load_period_rows(conn, request: PortfolioReportRequest) -> tuple[PortfolioReportRow, ...]:
+def load_period_rows(conn, request: PortfolioReportRequest, *, reference_date: date) -> tuple[PortfolioReportRow, ...]:
     by_asset: dict[int | None, dict[str, Any]] = {}
     warnings_by_asset: dict[int | None, set[str]] = {}
     missing_months_by_asset: dict[int | None, set[str]] = {}
     for month in request.period.included_months:
-        monthly_rows = build_portfolio_report_rows(conn, request.portfolio_id, month.strftime("%Y-%m"))
+        monthly_rows = build_portfolio_report_rows(
+            conn,
+            request.portfolio_id,
+            month.strftime("%Y-%m"),
+            reference_date=reference_date,
+        )
         seen_assets: set[int | None] = set()
         for monthly in monthly_rows:
             asset_id = monthly.get("asset_id")
@@ -107,8 +115,8 @@ def load_period_rows(conn, request: PortfolioReportRequest) -> tuple[PortfolioRe
             missing_months_by_asset.setdefault(asset_id, set()).add(month.isoformat())
     rows: list[PortfolioReportRow] = []
     for asset_id, values in by_asset.items():
-        finalize_values(values)
         values["_expected_months"] = len(request.period.included_months)
+        finalize_values(values)
         missing_sources = missing_sources_for_values(values, warnings_by_asset.get(asset_id, set()))
         values["missing_sources"] = tuple(sorted(missing_sources))
         values["missing_months"] = tuple(sorted(missing_months_by_asset.get(asset_id, set())))
@@ -131,6 +139,13 @@ def base_values(monthly: dict[str, Any]) -> dict[str, Any]:
         "tariff_type": monthly.get("tariff_type"),
         "data_status": monthly.get("data_status"),
         "warning_labels": monthly.get("warning_labels", []),
+        "production_quality_status": monthly.get("production_quality_status"),
+        "production_source": monthly.get("production_source"),
+        "production_expected_days": 0,
+        "production_available_days": 0,
+        "raw_daily_production_kwh": None,
+        "_production_statuses": [],
+        "_complete_production_months": 0,
         "_source_slots": {"production": 0, "helioscope": 0, "availability": 0, "tariff": 0, "self_use": 0, "invoice": 0, "mapping": 0},
         "_availability_weighted": Decimal("0"),
         "_availability_weight": Decimal("0"),
@@ -138,6 +153,14 @@ def base_values(monthly: dict[str, Any]) -> dict[str, Any]:
 
 
 def accumulate_month(target: dict[str, Any], monthly: dict[str, Any]) -> None:
+    production_status = str(monthly.get("production_quality_status") or ("complete" if monthly.get("actual_production_kwh") is not None else "missing"))
+    target.setdefault("_production_statuses", []).append(production_status)
+    if production_status == "complete":
+        target["_complete_production_months"] = int(target.get("_complete_production_months", 0)) + 1
+    target["production_expected_days"] = int(target.get("production_expected_days") or 0) + int(monthly.get("production_expected_days") or 0)
+    target["production_available_days"] = int(target.get("production_available_days") or 0) + int(monthly.get("production_available_days") or 0)
+    if monthly.get("raw_daily_production_kwh") is not None:
+        target["raw_daily_production_kwh"] = Decimal(str(target.get("raw_daily_production_kwh") or 0)) + Decimal(str(monthly["raw_daily_production_kwh"]))
     for key in (
         "actual_production_kwh",
         "helioscope_expected_kwh",
@@ -199,7 +222,11 @@ def accumulate_source_coverage(target: dict[str, Any], monthly: dict[str, Any]) 
         "mapping": {"mapping_pending", "mapping_conflict"},
     }
     for source, missing_codes in source_warnings.items():
-        if source == "self_use" and "inferred_hourly_self_use" in warnings and not warnings.intersection(missing_codes):
+        if source == "production":
+            production_status = monthly.get("production_quality_status") or ("complete" if monthly.get("actual_production_kwh") is not None else "missing")
+            if production_status == "complete":
+                slots[source] = int(slots.get(source, 0)) + 1
+        elif source == "self_use" and "inferred_hourly_self_use" in warnings and not warnings.intersection(missing_codes):
             slots[source] = int(slots.get(source, 0)) + 1
         elif not warnings.intersection(missing_codes):
             slots[source] = int(slots.get(source, 0)) + 1
@@ -207,6 +234,22 @@ def accumulate_source_coverage(target: dict[str, Any], monthly: dict[str, Any]) 
 
 def finalize_values(values: dict[str, Any]) -> None:
     actual = _decimal_or_none(values.get("actual_production_kwh"))
+    complete_months = int(values.get("_complete_production_months") or 0)
+    expected_months = int(values.get("_expected_months") or 0)
+    statuses = list(values.get("_production_statuses") or [])
+    values["complete_production_subtotal_kwh"] = actual
+    if complete_months != expected_months:
+        values["actual_production_kwh"] = None
+        actual = None
+    status_priority = {"complete": 0, "missing": 1, "partial": 2, "in_progress": 3, "conflict": 4}
+    values["production_quality_status"] = max(statuses, key=lambda item: status_priority.get(item, 1), default="missing")
+    expected_days = int(values.get("production_expected_days") or 0)
+    values["production_coverage_ratio"] = (
+        Decimal(int(values.get("production_available_days") or 0)) / Decimal(expected_days)
+        if expected_days
+        else Decimal("0")
+    )
+    values["production_coverage_pct"] = values["production_coverage_ratio"] * Decimal("100")
     adjusted = _decimal_or_none(values.get("adjusted_expected_kwh"))
     installed = _decimal_or_none(values.get("installed_power_kwp"))
     self_use = _decimal_or_none(values.get("self_use_kwh"))
@@ -220,6 +263,8 @@ def finalize_values(values: dict[str, Any]) -> None:
     values["availability_pct"] = values["_availability_weighted"] / values["_availability_weight"] if values["_availability_weight"] else None
     values.pop("_availability_weighted", None)
     values.pop("_availability_weight", None)
+    values.pop("_production_statuses", None)
+    values.pop("_complete_production_months", None)
     for key, definition in METRIC_CATALOG.items():
         if key in values and isinstance(values[key], Decimal):
             values[key] = values[key].quantize(Decimal("1") if definition.decimals <= 0 else Decimal("1." + ("0" * definition.decimals)))
@@ -233,7 +278,7 @@ def _decimal_or_none(value: Any) -> Decimal | None:
 
 def missing_sources_for_values(values: dict[str, Any], warnings: set[str]) -> set[str]:
     missing = set()
-    if "missing_monthly_production" in warnings:
+    if values.get("production_quality_status") != "complete" or "missing_monthly_production" in warnings:
         missing.add("production")
     if "missing_helioscope_expected" in warnings:
         missing.add("helioscope")
@@ -329,10 +374,30 @@ def export_portfolio_result_workbook(result: PortfolioReportResult) -> Workbook:
     for source, value in result.coverage.by_source.items():
         quality.append([source, float(value)])
     quality.append([])
-    quality.append(["Instalacao", "Codigo", "Severidade", "Fonte", "Acao sugerida"])
+    quality.append(["Instalacao", "Estado producao", "Cobertura diaria %", "Subtotal diario bruto kWh", "Codigo", "Severidade", "Fonte", "Acao sugerida"])
     for row in result.rows:
+        if not row.warnings:
+            quality.append([
+                row.values.get("installation") or row.asset_id or "-",
+                row.values.get("production_quality_status") or "-",
+                format_cell(row.values.get("production_coverage_pct")),
+                format_cell(row.values.get("raw_daily_production_kwh")),
+                "",
+                "",
+                "production",
+                "",
+            ])
         for warning in row.warnings:
-            quality.append([row.values.get("installation") or row.asset_id or "-", warning, warning_severity(warning), warning_source(warning), warning_action(warning)])
+            quality.append([
+                row.values.get("installation") or row.asset_id or "-",
+                row.values.get("production_quality_status") or "-",
+                format_cell(row.values.get("production_coverage_pct")),
+                format_cell(row.values.get("raw_daily_production_kwh")),
+                warning,
+                warning_severity(warning),
+                warning_source(warning),
+                warning_action(warning),
+            ])
     metadata = workbook.create_sheet("Metadados")
     metadata.append(["engine_version", result.engine_version])
     metadata.append(["generated_at", result.generated_at.isoformat(timespec="seconds")])

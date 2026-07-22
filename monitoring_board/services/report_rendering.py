@@ -237,9 +237,14 @@ def render_individual_excel(report: dict[str, Any], template: ReportTemplate) ->
     for key in ("savings_eur", "export_revenue_eur", "solcor_payment_eur", "fixed_monthly_fee_eur", "net_benefit_eur"):
         financial.append([key, report.get(key)])
     quality = workbook.create_sheet("Qualidade dos dados")
-    quality.append(["Codigo"])
+    quality.append(["Campo", "Valor"])
+    quality.append(["Estado da producao", report.get("production_quality_status") or "-"])
+    quality.append(["Cobertura", report.get("coverage_pct")])
+    quality.append(["Total diario bruto kWh", report.get("raw_daily_total_kwh")])
+    for note in report.get("report_notes") or []:
+        quality.append(["Aviso", note])
     for warning in list(report.get("warnings") or []) + list(report.get("billing_warnings") or []):
-        quality.append([warning])
+        quality.append(["Codigo", warning])
     metadata = workbook.create_sheet("Metadados")
     for key in ("period_type", "period_start", "period_end", "months_count", "tariff_type", "billing_mode", "billing_energy_base"):
         metadata.append([key, str(report.get(key) or "")])
@@ -283,11 +288,17 @@ def individual_section_rows(report: dict[str, Any], key: str) -> list[list[str]]
         "cover": [["Campo", "Valor"], ["Instalacao", asset.get("project_name") or "Dados indisponiveis"], ["Periodo", report.get("period_label") or "Dados indisponiveis"]],
         "identification": [["Campo", "Valor"], ["NIF", asset.get("nif") or "Dados indisponiveis"], ["Tipo", report.get("report_type") or "Dados indisponiveis"]],
         "executive_summary": individual_rows(report),
-        "production": [["Metrica", "Valor"], ["Producao", report.get("production_kwh") or "Dados indisponiveis"]],
+        "production": [["Metrica", "Valor"], ["Producao", report.get("production_kwh") if report.get("production_kwh") is not None else "Dados indisponiveis"]],
         "self_consumption": [["Metrica", "Valor"], ["Autoconsumo", report.get("self_use_kwh") or "Dados indisponiveis"], ["Taxa", report.get("autoconsumption_pct") or "Dados indisponiveis"]],
         "financial": [["Metrica", "Valor"], ["Poupanca", report.get("savings_eur") or "Dados indisponiveis"], ["Beneficio liquido", report.get("net_benefit_eur") or "Dados indisponiveis"]],
         "tariffs": [["Campo", "Valor"], ["Tarifa", report.get("tariff_type") or "Dados indisponiveis"], ["Fonte", report.get("tariff_source") or "Dados indisponiveis"]],
-        "data_quality": [["Campo", "Valor"], ["Cobertura", report.get("coverage_pct") or "Dados indisponiveis"]],
+        "data_quality": [
+            ["Campo", "Valor"],
+            ["Estado da producao", report.get("production_quality_status") or "Dados indisponiveis"],
+            ["Cobertura", report.get("coverage_pct") if report.get("coverage_pct") is not None else "Dados indisponiveis"],
+            ["Total diario bruto kWh", report.get("raw_daily_total_kwh") if report.get("raw_daily_total_kwh") is not None else "Dados indisponiveis"],
+            *[["Aviso", note] for note in report.get("report_notes") or []],
+        ],
         "warnings": [["Codigo"], *[[warning] for warning in list(report.get("warnings") or []) + list(report.get("billing_warnings") or [])]],
         "metadata": [["Campo", "Valor"], ["Engine", report.get("engine_version") or "individual-report-v1"], ["Periodo", report.get("period_type") or "monthly"]],
     }

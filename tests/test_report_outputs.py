@@ -26,7 +26,7 @@ from monitoring_board.reporting.templates import validate_template_scope
 from monitoring_board.reporting_storage import reconcile_generated_reports
 from monitoring_board.services.portfolio_reporting import prepare_portfolio_report
 from monitoring_board.reporting.templates import TemplateSection
-from monitoring_board.services.report_rendering import render_individual_excel, render_portfolio_excel, render_portfolio_html, render_portfolio_pdf, render_zip, safe_filename
+from monitoring_board.services.report_rendering import render_individual_excel, render_individual_pdf, render_portfolio_excel, render_portfolio_html, render_portfolio_pdf, render_zip, safe_filename
 
 
 def connect(tmp_path: Path) -> sqlite3.Connection:
@@ -322,6 +322,39 @@ def test_individual_excel_reconciles_with_canonical_report(tmp_path: Path) -> No
     assert workbook.sheetnames == ["Resumo", "Energia", "Financeiro", "Qualidade dos dados", "Metadados"]
     assert values["production_kwh"] == report["production_kwh"]
     assert values["self_use_kwh"] == report["self_use_kwh"]
+
+
+def test_individual_pdf_and_excel_include_readable_incomplete_production_warning(tmp_path: Path) -> None:
+    template = default_template("Individual padrao")
+    notice = "Rascunho — produção incompleta: 23/30 dias disponíveis"
+    report = {
+        "asset": {"id": 1, "project_name": "Relatorio Parcial"},
+        "period_label": "Abril 2026",
+        "period_type": "monthly",
+        "period_start": "2026-04-01",
+        "period_end": "2026-04-30",
+        "production_kwh": None,
+        "raw_daily_total_kwh": 230,
+        "production_quality_status": "partial",
+        "coverage_pct": 0,
+        "report_notes": [notice],
+        "warnings": ["partial_monthly_production", "production_not_final"],
+    }
+
+    excel = render_individual_excel(report, template)
+    excel_path = tmp_path / excel.filename
+    excel_path.write_bytes(excel.content)
+    workbook = load_workbook(excel_path)
+    quality_values = [cell.value for row in workbook["Qualidade dos dados"].iter_rows() for cell in row]
+
+    pdf = render_individual_pdf(report, template)
+    pdf_path = tmp_path / pdf.filename
+    pdf_path.write_bytes(pdf.content)
+    pdf_text = "\n".join(page.extract_text() or "" for page in PdfReader(str(pdf_path)).pages)
+
+    assert notice in quality_values
+    assert "Rascunho" in pdf_text
+    assert "23/30 dias" in pdf_text
 
 
 def test_section_order_is_shared_by_preview_and_pdf(tmp_path: Path) -> None:

@@ -281,8 +281,52 @@ def test_report_uses_daily_production_when_monthly_row_is_missing(tmp_path: Path
 
     row = next(item for item in build_portfolio_report_rows(conn, portfolio_id, "2026-01") if item["asset_id"] == asset_id)
 
-    assert row["actual_production_kwh"] == 25
-    assert "missing_monthly_production" not in row["warnings"]
+    assert row["actual_production_kwh"] is None
+    assert row["raw_daily_production_kwh"] == 25
+    assert row["production_quality_status"] == "partial"
+    assert row["production_available_days"] == 2
+    assert "missing_monthly_production" in row["warnings"]
+
+
+def test_portfolio_monthly_value_is_final_while_partial_daily_coverage_stays_traceable(tmp_path: Path) -> None:
+    conn = connect(tmp_path)
+    asset_id = add_asset(conn)
+    portfolio_id = conn.execute("SELECT id FROM portfolio_groups WHERE name = 'Solcorelios I'").fetchone()["id"]
+    conn.execute(
+        "INSERT INTO portfolio_assets (portfolio_id, asset_id, active, mapping_status, mapping_confidence) VALUES (?, ?, 1, 'manual', 1)",
+        (portfolio_id, asset_id),
+    )
+    for period_type, period_date, production in (
+        ("month", "2026-04-01", 100),
+        ("day", "2026-04-01", 10),
+    ):
+        conn.execute(
+            """
+            INSERT INTO production_records (
+                asset_id, provider, external_id, period_type, period_date,
+                production_kwh, data_quality, created_at, updated_at
+            ) VALUES (?, 'FusionSolar', ?, ?, ?, ?, 'ok', '2026-05-01T00:00:00', '2026-05-01T00:00:00')
+            """,
+            (asset_id, f"{period_type}-1", period_type, period_date, production),
+        )
+    conn.commit()
+
+    row = next(
+        item
+        for item in build_portfolio_report_rows(
+            conn,
+            portfolio_id,
+            "2026-04",
+            reference_date=date(2026, 5, 1),
+        )
+        if item["asset_id"] == asset_id
+    )
+
+    assert row["actual_production_kwh"] == 100
+    assert row["production_quality_status"] == "complete"
+    assert row["production_source"] == "monthly"
+    assert row["daily_coverage"] == "partial"
+    assert row["production_available_days"] == 1
 
 
 def test_portfolio_total_aggregates_and_weights_availability() -> None:
@@ -299,6 +343,35 @@ def test_portfolio_total_aggregates_and_weights_availability() -> None:
     assert total["availability_pct"] == 81.0
     assert total["deviation_pct"] == -65.0
     assert total["warnings"] == ["missing_hourly_production", "missing_installed_power"]
+
+
+def test_portfolio_total_is_draft_when_one_installation_is_incomplete() -> None:
+    rows = [
+        {"actual_production_kwh": 100, "production_quality_status": "complete", "warnings": []},
+        {"actual_production_kwh": None, "raw_daily_production_kwh": 10, "production_quality_status": "partial", "warnings": ["missing_monthly_production"]},
+    ]
+
+    total = aggregate_portfolio_total(rows)
+
+    assert total["actual_production_kwh"] is None
+    assert total["production_total_status"] == "draft"
+    assert total["complete_production_subtotal_kwh"] == 100
+    assert total["complete_production_installations"] == 1
+    assert total["production_installations"] == 2
+    assert "portfolio_production_incomplete" in total["warnings"]
+
+
+def test_portfolio_total_remains_compatible_when_all_installations_are_complete() -> None:
+    rows = [
+        {"actual_production_kwh": 100, "production_quality_status": "complete", "warnings": []},
+        {"actual_production_kwh": 50, "production_quality_status": "complete", "warnings": []},
+    ]
+
+    total = aggregate_portfolio_total(rows)
+
+    assert total["actual_production_kwh"] == 150
+    assert total["production_total_status"] == "complete"
+    assert total["complete_production_subtotal_kwh"] == 150
 
 
 def test_mapping_by_nif_then_name(tmp_path: Path) -> None:

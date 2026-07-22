@@ -51,7 +51,13 @@
 
 {% if active_tab == 'report' %}
   <section class="cards dashboard-kpis">
-    <article class="card stat-card"><span>Producao real kWh</span><strong>{{ format_number(kpis.actual_production_kwh, 2) }}</strong></article>
+    <article class="card stat-card">
+      <span>Total de producao do portfolio</span>
+      <strong>{{ format_number(kpis.actual_production_kwh, 2) if kpis.production_total_status == 'complete' else 'Indisponivel — rascunho' }}</strong>
+      {% if kpis.production_total_status != 'complete' %}
+        <small>Subtotal completo: {{ format_number(kpis.complete_production_subtotal_kwh, 2) }} kWh ({{ kpis.complete_production_installations }}/{{ kpis.production_installations }})</small>
+      {% endif %}
+    </article>
     <article class="card stat-card"><span>Esperado ajustado kWh</span><strong>{{ format_number(kpis.adjusted_expected_kwh, 2) }}</strong></article>
     <article class="card stat-card"><span>Desvio kWh</span><strong>{{ format_number(kpis.deviation_kwh, 2) }}</strong></article>
     <article class="card stat-card"><span>Desvio %</span><strong>{{ format_number(kpis.deviation_pct, 2) }}</strong></article>
@@ -73,6 +79,8 @@
             <th>Instalacao externa</th>
             <th>Instalacao local</th>
             <th>Producao real mensal kWh</th>
+            <th>Estado producao</th>
+            <th>Cobertura diaria</th>
             <th>Ponta kWh</th>
             <th>Cheia kWh</th>
             <th>Vazio kWh</th>
@@ -102,6 +110,8 @@
               <td>{{ row.external_installation or row.installation or "-" }}</td>
               <td>{{ row.local_installation or "-" }}</td>
               <td>{{ format_number(row.actual_production_kwh, 2) }}</td>
+              <td>{{ row.production_quality_status }}</td>
+              <td>{{ row.production_available_days }}/{{ row.production_expected_days }} ({{ format_number(row.production_coverage_ratio * 100, 1) }}%)</td>
               <td>{{ format_number(row.production_ponta_kwh, 2) }}</td>
               <td>{{ format_number(row.production_cheia_kwh, 2) }}</td>
               <td>{{ format_number(row.production_vazio_kwh, 2) }}</td>
@@ -129,7 +139,9 @@
               <td></td>
               <td><strong>Total</strong></td>
               <td></td>
-              <td><strong>{{ format_number(total_row.actual_production_kwh, 2) }}</strong></td>
+              <td><strong>{{ format_number(total_row.actual_production_kwh, 2) if total_row.production_total_status == 'complete' else 'Indisponivel — rascunho' }}</strong></td>
+              <td>{{ total_row.production_total_status }}</td>
+              <td>{{ total_row.complete_production_installations }}/{{ total_row.production_installations }} completas</td>
               <td><strong>{{ format_number(total_row.production_ponta_kwh, 2) }}</strong></td>
               <td><strong>{{ format_number(total_row.production_cheia_kwh, 2) }}</strong></td>
               <td><strong>{{ format_number(total_row.production_vazio_kwh, 2) }}</strong></td>
@@ -151,7 +163,7 @@
               <td>{{ total_row.missing_data_count }} instalacoes com avisos</td>
             </tr>
           {% elif not rows %}
-            <tr><td colspan="19" class="muted">Sem linhas para estes filtros.</td></tr>
+            <tr><td colspan="26" class="muted">Sem linhas para estes filtros.</td></tr>
           {% endif %}
         </tbody>
       </table>

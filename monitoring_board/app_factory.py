@@ -157,6 +157,10 @@ from monitoring_board.services.report_rendering import (
 )
 from monitoring_board.services.portfolio_reporting import export_portfolio_result_workbook, prepare_portfolio_report
 from monitoring_board.reporting.billing import decimal_from_value
+from monitoring_board.reporting.data_quality import (
+    evaluate_monthly_production_quality,
+    production_quality_notice,
+)
 from monitoring_board.reporting.invoices import normalize_date, is_supported_invoice_extension, validate_invoice_values, warnings_require_override
 from monitoring_board.reporting.availability import (
     apply_inverter_edge_tolerance as reporting_apply_inverter_edge_tolerance,
@@ -9179,9 +9183,9 @@ def normalize_customer_kpi_row(row: dict[str, Any], fallback_date: date) -> dict
         export = max(production - self_use, 0)
     return {
         "date": parse_fusionsolar_collect_date(row, fallback_date) or fallback_date,
-        "production_kwh": production or 0.0,
-        "self_use_kwh": self_use or 0.0,
-        "export_kwh": export or 0.0,
+        "production_kwh": production,
+        "self_use_kwh": self_use,
+        "export_kwh": export,
         "consumption_kwh": consumption,
         "raw": row,
     }
@@ -9260,10 +9264,10 @@ def _empty_month_row(month_start: date) -> dict[str, Any]:
     return {
         "date": month_start,
         "label": f"{month_start.month:02d}/{str(month_start.year)[2:]}",
-        "production_kwh": 0.0,
-        "self_use_kwh": 0.0,
-        "export_kwh": 0.0,
-        "consumption_kwh": 0.0,
+        "production_kwh": None,
+        "self_use_kwh": None,
+        "export_kwh": None,
+        "consumption_kwh": None,
         "source": "Sem dados",
     }
 
@@ -9272,8 +9276,13 @@ def _aggregate_customer_rows_for_period(
     period: ReportingPeriod,
     monthly_rows: list[dict[str, Any]],
     daily_rows: list[dict[str, Any]],
+    *,
+    asset_id: int,
+    reference_date: date,
 ) -> dict[str, Any]:
-    monthly_by_month = {_month_key(row["date"]): row for row in monthly_rows}
+    monthly_by_month: dict[date, list[dict[str, Any]]] = {}
+    for row in monthly_rows:
+        monthly_by_month.setdefault(_month_key(row["date"]), []).append(row)
     daily_by_month: dict[date, list[dict[str, Any]]] = {}
     for row in daily_rows:
         daily_by_month.setdefault(_month_key(row["date"]), []).append(row)
@@ -9281,7 +9290,10 @@ def _aggregate_customer_rows_for_period(
     selected_month_rows: list[dict[str, Any]] = []
     months_with_data: list[str] = []
     missing_months: list[str] = []
+    months_requiring_fallback: list[str] = []
     report_notes: list[str] = []
+    production_warnings: set[str] = set()
+    monthly_quality: list[dict[str, Any]] = []
     tariff_totals = {
         "self_use_cheia_kwh": 0.0,
         "self_use_ponta_kwh": 0.0,
@@ -9290,42 +9302,84 @@ def _aggregate_customer_rows_for_period(
     }
 
     for month_start in period.included_months:
-        if month_start in monthly_by_month:
-            row = dict(monthly_by_month[month_start])
-            row["source"] = "Mensal local"
-            selected_month_rows.append(row)
-            months_with_data.append(month_start.strftime("%Y-%m"))
-            for key in tariff_totals:
-                tariff_totals[key] += float(row.get(key) or 0.0)
-            continue
-
+        month_monthly = monthly_by_month.get(month_start, [])
         month_daily = daily_by_month.get(month_start, [])
-        if month_daily:
+        quality = evaluate_monthly_production_quality(
+            asset_id=asset_id,
+            month_start=month_start,
+            reference_date=reference_date,
+            monthly_records=month_monthly,
+            daily_records=month_daily,
+        )
+        quality_dict = quality.as_dict()
+        monthly_quality.append(quality_dict)
+        production_warnings.update(quality.warnings)
+        notice = production_quality_notice(quality)
+        if notice:
+            report_notes.append(f"{month_start:%Y-%m}: {notice}")
+
+        if quality.status == "complete" and quality.source == "monthly":
+            row = dict(month_monthly[-1])
+            row["production_kwh"] = quality.production_kwh
+            row["source"] = "Mensal local"
+        elif quality.status == "complete" and quality.source == "daily":
             row = _empty_month_row(month_start)
+            distinct_daily = {item["date"]: item for item in month_daily}
+            complete_daily = list(distinct_daily.values())
             row.update(
-                production_kwh=sum(item["production_kwh"] for item in month_daily),
-                self_use_kwh=sum(item["self_use_kwh"] for item in month_daily),
-                export_kwh=sum(item["export_kwh"] for item in month_daily),
-                consumption_kwh=sum((item.get("consumption_kwh") or 0.0) for item in month_daily),
+                production_kwh=quality.production_kwh,
+                self_use_kwh=sum(float(item.get("self_use_kwh") or 0.0) for item in complete_daily),
+                export_kwh=sum(float(item.get("export_kwh") or 0.0) for item in complete_daily),
+                consumption_kwh=sum(float(item.get("consumption_kwh") or 0.0) for item in complete_daily),
                 source="Diario local",
             )
-            selected_month_rows.append(row)
             months_with_data.append(month_start.strftime("%Y-%m"))
-            expected_days = month_bounds(month_start.strftime("%Y-%m"))[1].day
-            if len({item["date"] for item in month_daily}) < expected_days:
-                report_notes.append(f"{month_start:%Y-%m}: dados diarios incompletos.")
-            continue
+        elif quality.status == "complete":
+            row = _empty_month_row(month_start)
+        else:
+            row = _empty_month_row(month_start)
+            row["source"] = "Diagnostico diario" if quality.raw_daily_total_kwh is not None else "Sem dados"
+            missing_months.append(month_start.strftime("%Y-%m"))
+            if quality.requires_fallback:
+                months_requiring_fallback.append(month_start.strftime("%Y-%m"))
+        if quality.status == "complete" and month_start.strftime("%Y-%m") not in months_with_data:
+            months_with_data.append(month_start.strftime("%Y-%m"))
+        row.update(
+            production_quality_status=quality.status,
+            production_source=quality.source,
+            raw_daily_total_kwh=quality.raw_daily_total_kwh,
+            production_expected_days=quality.expected_days,
+            production_available_days=quality.available_days,
+            production_missing_dates=[item.isoformat() for item in quality.missing_dates],
+            production_coverage_ratio=quality.coverage_ratio,
+            daily_coverage=quality.daily_coverage,
+        )
+        selected_month_rows.append(row)
+        if quality.status == "complete":
+            for key in tariff_totals:
+                tariff_totals[key] += float(row.get(key) or 0.0)
 
-        selected_month_rows.append(_empty_month_row(month_start))
-        missing_months.append(month_start.strftime("%Y-%m"))
+    all_months_final = len(months_with_data) == period.month_count
 
-    production_kwh = sum(item["production_kwh"] for item in selected_month_rows)
-    self_use_kwh = sum(item["self_use_kwh"] for item in selected_month_rows)
-    export_kwh = sum(item["export_kwh"] for item in selected_month_rows)
-    consumption_kwh = sum((item.get("consumption_kwh") or 0.0) for item in selected_month_rows)
+    def final_total(key: str) -> float | None:
+        if not all_months_final:
+            return None
+        return sum(float(item.get(key) or 0.0) for item in selected_month_rows)
+
+    production_kwh = final_total("production_kwh")
+    self_use_kwh = final_total("self_use_kwh")
+    export_kwh = final_total("export_kwh")
+    consumption_kwh = final_total("consumption_kwh")
     coverage_pct = round(len(months_with_data) / period.month_count * 100, 2) if period.month_count else 0.0
     if missing_months:
-        report_notes.append("Meses sem dados: " + ", ".join(missing_months) + ".")
+        report_notes.append("Meses sem produção final: " + ", ".join(missing_months) + ".")
+
+    status_priority = {"complete": 0, "missing": 1, "partial": 2, "in_progress": 3, "conflict": 4}
+    production_status = max(
+        (item["status"] for item in monthly_quality),
+        key=lambda item: status_priority[item],
+        default="missing",
+    )
 
     return {
         "monthly_rows": selected_month_rows,
@@ -9335,9 +9389,23 @@ def _aggregate_customer_rows_for_period(
         "consumption_kwh": consumption_kwh,
         "months_with_data": months_with_data,
         "missing_months": missing_months,
+        "months_requiring_fallback": months_requiring_fallback,
         "coverage_pct": coverage_pct,
         "report_notes": report_notes,
-        **tariff_totals,
+        "production_status": production_status,
+        "production_is_final": all_months_final,
+        "production_warnings": sorted(production_warnings),
+        "monthly_production_quality": monthly_quality,
+        "raw_daily_total_kwh": (
+            sum(
+                float(item["raw_daily_total_kwh"])
+                for item in monthly_quality
+                if item["raw_daily_total_kwh"] is not None
+            )
+            if any(item["raw_daily_total_kwh"] is not None for item in monthly_quality)
+            else None
+        ),
+        **{key: (value if all_months_final else None) for key, value in tariff_totals.items()},
     }
 
 
@@ -9573,11 +9641,17 @@ def _report_payload_for_period(
         "included_months": [month.strftime("%Y-%m") for month in period.included_months],
         "months_with_data": aggregate["months_with_data"],
         "missing_months": aggregate["missing_months"],
+        "months_requiring_fallback": aggregate["months_requiring_fallback"],
         "coverage_pct": aggregate["coverage_pct"],
         "daily_rows": daily_rows,
         "monthly_rows": aggregate["monthly_rows"],
         "chart_granularity": "daily" if period.period_type == ReportPeriodType.MONTHLY else "monthly",
         "production_kwh": aggregate["production_kwh"],
+        "raw_daily_total_kwh": aggregate["raw_daily_total_kwh"],
+        "production_quality_status": aggregate["production_status"],
+        "production_is_final": aggregate["production_is_final"],
+        "monthly_production_quality": aggregate["monthly_production_quality"],
+        "warnings": aggregate["production_warnings"],
         "self_use_kwh": aggregate["self_use_kwh"],
         "export_kwh": aggregate["export_kwh"],
         "consumption_kwh": aggregate["consumption_kwh"],
@@ -9609,14 +9683,13 @@ def build_local_customer_production_report(
     solcor_price_per_kwh: float = 0.0,
     billing_config: BillingConfig | None = None,
     period: ReportingPeriod | None = None,
+    reference_date: date | None = None,
 ) -> dict[str, Any] | None:
     period = _resolve_customer_reporting_period(report_month, period)
+    reference_date = reference_date or date.today()
     asset = _get_fusionsolar_report_asset(conn, asset_id)
     daily_records = list_daily_production_records(conn, asset_id=asset_id, start=period.start, end=period.end)
     monthly_records = list_monthly_production_records(conn, asset_id=asset_id, start=period.start, end=period.end)
-    if not monthly_records and not daily_records:
-        return None
-
     daily_rows = [normalize_customer_production_record(row, parse_date_value(row["period_date"]) or period.start) for row in daily_records]
     daily_rows.sort(key=lambda item: item["date"])
     monthly_rows = []
@@ -9625,7 +9698,13 @@ def build_local_customer_production_report(
         normalized = normalize_customer_production_record(row, fallback_date)
         normalized.update(extract_customer_tariff_values(parse_production_record_payload(row)))
         monthly_rows.append(normalized)
-    aggregate = _aggregate_customer_rows_for_period(period, monthly_rows, daily_rows)
+    aggregate = _aggregate_customer_rows_for_period(
+        period,
+        monthly_rows,
+        daily_rows,
+        asset_id=asset_id,
+        reference_date=reference_date,
+    )
     tariff_result = _build_customer_tariff_result(
         conn,
         asset_id=asset_id,
@@ -9664,8 +9743,10 @@ def build_fusionsolar_customer_production_report(
     billing_config: BillingConfig | None = None,
     force_api: bool = False,
     period: ReportingPeriod | None = None,
+    reference_date: date | None = None,
 ) -> dict[str, Any]:
     period = _resolve_customer_reporting_period(report_month, period)
+    reference_date = reference_date or date.today()
     if not force_api:
         local_report = build_local_customer_production_report(
             conn,
@@ -9676,8 +9757,9 @@ def build_fusionsolar_customer_production_report(
             solcor_price_per_kwh=solcor_price_per_kwh,
             billing_config=billing_config,
             period=period,
+            reference_date=reference_date,
         )
-        if local_report is not None and not local_report.get("missing_months"):
+        if local_report is not None and not local_report.get("months_requiring_fallback"):
             return local_report
 
     cooldown_reason = get_fusionsolar_performance_cooldown_reason(conn)
@@ -9705,8 +9787,19 @@ def build_fusionsolar_customer_production_report(
             normalized = normalize_customer_production_record(row, fallback_date)
             normalized.update(extract_customer_tariff_values(parse_production_record_payload(row)))
             local_monthly_rows.append(normalized)
-        local_aggregate = _aggregate_customer_rows_for_period(period, local_monthly_rows, local_daily_rows)
+        local_aggregate = _aggregate_customer_rows_for_period(
+            period,
+            local_monthly_rows,
+            local_daily_rows,
+            asset_id=asset_id,
+            reference_date=reference_date,
+        )
         local_months_with_data = set(local_aggregate["months_with_data"])
+        local_months_with_data.update(
+            month.strftime("%Y-%m")
+            for month in period.included_months
+            if month.strftime("%Y-%m") not in local_aggregate["months_requiring_fallback"]
+        )
         daily_rows.extend(local_daily_rows)
         monthly_rows.extend(local_monthly_rows)
 
@@ -9743,7 +9836,13 @@ def build_fusionsolar_customer_production_report(
 
     daily_rows.sort(key=lambda item: item["date"])
     monthly_rows.sort(key=lambda item: item["date"])
-    aggregate = _aggregate_customer_rows_for_period(period, monthly_rows, daily_rows)
+    aggregate = _aggregate_customer_rows_for_period(
+        period,
+        monthly_rows,
+        daily_rows,
+        asset_id=asset_id,
+        reference_date=reference_date,
+    )
     source = "FusionSolar API" if force_api or not local_months_with_data else "Dados locais + FusionSolar API"
     tariff_result = _build_customer_tariff_result(
         conn,

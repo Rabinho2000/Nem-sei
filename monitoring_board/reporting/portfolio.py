@@ -126,6 +126,9 @@ METRIC_CATALOG: dict[str, PortfolioMetricDefinition] = {
     "installed_power_kwp": PortfolioMetricDefinition("installed_power_kwp", "Potencia kWp", "Potencia instalada", "Identificacao", "kWp", "number", 2, "sum"),
     "mapping_confidence": PortfolioMetricDefinition("mapping_confidence", "Confianca mapping", "Confianca do mapping", "Qualidade dos dados", "", "number", 2, "none", False),
     "actual_production_kwh": PortfolioMetricDefinition("actual_production_kwh", "Producao real", "Producao real", "Producao", "kWh", "number", 2, "sum"),
+    "production_quality_status": PortfolioMetricDefinition("production_quality_status", "Estado producao", "Estado de fiabilidade da producao", "Qualidade dos dados", "", "text", 0, "none", False, False),
+    "production_coverage_pct": PortfolioMetricDefinition("production_coverage_pct", "Cobertura diaria", "Dias validos face aos dias esperados", "Qualidade dos dados", "%", "number", 2, "none", False, False),
+    "raw_daily_production_kwh": PortfolioMetricDefinition("raw_daily_production_kwh", "Producao diaria bruta", "Subtotal diario apenas para diagnostico", "Qualidade dos dados", "kWh", "number", 2, "none", False, False),
     "helioscope_expected_kwh": PortfolioMetricDefinition("helioscope_expected_kwh", "Helioscope", "Producao esperada", "Producao", "kWh", "number", 2, "sum"),
     "expected_production_kwh": PortfolioMetricDefinition("expected_production_kwh", "Producao prevista", "Producao prevista base", "Previsao", "kWh", "number", 2, "sum"),
     "expected_consumption_kwh": PortfolioMetricDefinition("expected_consumption_kwh", "Consumo previsto", "Consumo previsto", "Previsao", "kWh", "number", 2, "sum"),
@@ -162,10 +165,10 @@ METRIC_CATALOG: dict[str, PortfolioMetricDefinition] = {
 
 
 DEFAULT_PROFILE_COLUMNS = {
-    "Resumo operacional": ("installation", "actual_production_kwh", "adjusted_expected_kwh", "deviation_pct", "availability_pct", "estimated_value_eur", "data_status"),
+    "Resumo operacional": ("installation", "actual_production_kwh", "production_quality_status", "production_coverage_pct", "adjusted_expected_kwh", "deviation_pct", "availability_pct", "estimated_value_eur", "data_status"),
     "Performance": ("installation", "installed_power_kwp", "actual_production_kwh", "specific_yield", "adjusted_expected_kwh", "deviation_kwh", "deviation_pct", "availability_pct"),
     "Financeiro": ("installation", "self_use_kwh", "export_kwh", "estimated_value_eur", "export_revenue_eur", "esco_payment_eur", "net_benefit_eur"),
-    "Qualidade dos dados": ("installation", "mapping_confidence", "coverage_pct", "invoice_status", "tariff_type", "warning_count", "warning_labels"),
+    "Qualidade dos dados": ("installation", "mapping_confidence", "production_quality_status", "production_coverage_pct", "raw_daily_production_kwh", "coverage_pct", "invoice_status", "tariff_type", "warning_count", "warning_labels"),
     "Completo": tuple(METRIC_CATALOG.keys()),
 }
 
@@ -225,18 +228,42 @@ def validate_profile(profile: PortfolioReportProfile) -> PortfolioReportProfile:
 def aggregate_rows(rows: tuple[PortfolioReportRow, ...], columns: tuple[PortfolioReportColumn, ...]) -> PortfolioReportSummary:
     values: dict[str, Any] = {}
     warnings = sorted({warning for row in rows for warning in row.warnings})
+    complete_production_rows = tuple(row for row in rows if row_has_complete_production(row))
+    production_incomplete = len(complete_production_rows) != len(rows)
     for column in columns:
         definition = METRIC_CATALOG[column.metric_key]
         if not definition.total_allowed:
             continue
         metric_values = [row.values.get(column.metric_key) for row in rows if row.values.get(column.metric_key) is not None]
         if definition.aggregation == "sum":
-            values[column.metric_key] = _round(sum(Decimal(str(value)) for value in metric_values), definition.decimals) if metric_values else None
+            if column.metric_key == "actual_production_kwh" and production_incomplete:
+                values[column.metric_key] = None
+            else:
+                values[column.metric_key] = _round(sum(Decimal(str(value)) for value in metric_values), definition.decimals) if metric_values else None
         elif definition.aggregation == "weighted_avg":
             values[column.metric_key] = weighted_average(rows, column.metric_key, "installed_power_kwp", definition.decimals)
         elif definition.aggregation == "recalculate":
             values[column.metric_key] = recalculate_metric(rows, column.metric_key, definition.decimals)
+    complete_subtotal = sum(
+        (Decimal(str(row.values["actual_production_kwh"])) for row in complete_production_rows),
+        Decimal("0"),
+    ) if complete_production_rows else None
+    values["complete_production_subtotal_kwh"] = _round(complete_subtotal, 2) if complete_subtotal is not None else None
+    values["complete_production_installations"] = len(complete_production_rows)
+    values["production_installations"] = len(rows)
+    if production_incomplete:
+        warnings = sorted({*warnings, "portfolio_production_incomplete"})
+        for key in ("deviation_kwh", "deviation_pct", "specific_yield"):
+            if key in values:
+                values[key] = None
     return PortfolioReportSummary(values=values, warnings=tuple(warnings))
+
+
+def row_has_complete_production(row: PortfolioReportRow) -> bool:
+    status = row.values.get("production_quality_status")
+    if status is None:
+        return row.values.get("actual_production_kwh") is not None
+    return status == "complete" and row.values.get("actual_production_kwh") is not None
 
 
 def weighted_average(rows: tuple[PortfolioReportRow, ...], metric_key: str, weight_key: str, decimals: int) -> Decimal | None:
@@ -253,6 +280,9 @@ def weighted_average(rows: tuple[PortfolioReportRow, ...], metric_key: str, weig
 
 
 def recalculate_metric(rows: tuple[PortfolioReportRow, ...], metric_key: str, decimals: int) -> Decimal | None:
+    if metric_key in {"deviation_kwh", "deviation_pct", "specific_yield"} and any(not row_has_complete_production(row) for row in rows):
+        return None
+
     def total(key: str) -> Decimal:
         return sum((Decimal(str(row.values.get(key))) for row in rows if row.values.get(key) is not None), Decimal("0"))
 

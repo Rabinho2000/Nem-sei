@@ -939,7 +939,7 @@ def get_daily_production_totals(conn: sqlite3.Connection, asset_id: int | None, 
         """
         SELECT
             SUM(production_kwh) AS production_kwh,
-            COUNT(*) AS rows_with_data
+            COUNT(DISTINCT period_date) AS distinct_days_with_data
         FROM production_records
         WHERE asset_id = ?
           AND provider = 'FusionSolar'
@@ -950,10 +950,11 @@ def get_daily_production_totals(conn: sqlite3.Connection, asset_id: int | None, 
         """,
         (asset_id, start.isoformat(), end.isoformat()),
     ).fetchone()
-    if row is None or int(row["rows_with_data"] or 0) == 0:
+    if row is None or int(row["distinct_days_with_data"] or 0) == 0 or row["production_kwh"] is None:
         return None
     return {
-        "production_kwh": float(row["production_kwh"] or 0),
+        "production_kwh": float(row["production_kwh"]),
+        "available_days": int(row["distinct_days_with_data"]),
     }
 
 
@@ -975,7 +976,6 @@ def list_monthly_production_records(
           AND provider = 'FusionSolar'
           AND period_type = 'month'
           AND period_date BETWEEN ? AND ?
-          AND production_kwh IS NOT NULL
         ORDER BY period_date
         """,
         (asset_id, start.isoformat(), end.isoformat()),
@@ -1000,7 +1000,6 @@ def list_daily_production_records(
           AND provider = 'FusionSolar'
           AND period_type = 'day'
           AND period_date BETWEEN ? AND ?
-          AND production_kwh IS NOT NULL
         ORDER BY period_date
         """,
         (asset_id, start.isoformat(), end.isoformat()),
