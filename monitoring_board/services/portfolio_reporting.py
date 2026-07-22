@@ -8,6 +8,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 
 from monitoring_board.portfolio_reports import build_portfolio_report_rows
+from monitoring_board.reporting.financial_quality import apply_production_financial_gate
 from monitoring_board.reporting.periods import build_period
 from monitoring_board.reporting.portfolio import (
     ENGINE_VERSION,
@@ -261,6 +262,7 @@ def finalize_values(values: dict[str, Any]) -> None:
     values["self_consumption_rate_pct"] = self_use / (self_use + export) * Decimal("100") if self_use is not None and export is not None and (self_use + export) else None
     values["self_sufficiency_rate_pct"] = self_use / consumption * Decimal("100") if self_use is not None and consumption else None
     values["availability_pct"] = values["_availability_weighted"] / values["_availability_weight"] if values["_availability_weight"] else None
+    apply_production_financial_gate(values)
     values.pop("_availability_weighted", None)
     values.pop("_availability_weight", None)
     values.pop("_production_statuses", None)

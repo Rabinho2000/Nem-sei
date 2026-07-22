@@ -3,7 +3,9 @@ from __future__ import annotations
 import sqlite3
 from datetime import date, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 from openpyxl import Workbook
 
 from app import ensure_database
@@ -329,6 +331,121 @@ def test_portfolio_monthly_value_is_final_while_partial_daily_coverage_stays_tra
     assert row["production_available_days"] == 1
 
 
+@pytest.mark.parametrize(
+    ("expected_status", "monthly_value", "daily_value", "reference_date"),
+    [
+        ("partial", None, 10, date(2026, 5, 1)),
+        ("conflict", 100, 110, date(2026, 5, 1)),
+        ("in_progress", 100, 10, date(2026, 4, 15)),
+    ],
+)
+def test_non_final_installation_gates_source_financial_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    expected_status: str,
+    monthly_value: float | None,
+    daily_value: float,
+    reference_date: date,
+) -> None:
+    conn = connect(tmp_path)
+    asset_id = add_asset(conn)
+    portfolio_id = conn.execute("SELECT id FROM portfolio_groups WHERE name = 'Solcorelios I'").fetchone()["id"]
+    conn.execute(
+        "INSERT INTO portfolio_assets (portfolio_id, asset_id, active, mapping_status, mapping_confidence) VALUES (?, ?, 1, 'manual', 1)",
+        (portfolio_id, asset_id),
+    )
+    if monthly_value is not None:
+        conn.execute(
+            """
+            INSERT INTO production_records (
+                asset_id, provider, external_id, period_type, period_date,
+                production_kwh, data_quality, created_at, updated_at
+            ) VALUES (?, 'FusionSolar', 'month-1', 'month', '2026-04-01', ?, 'ok', '2026-05-01', '2026-05-01')
+            """,
+            (asset_id, monthly_value),
+        )
+    conn.execute(
+        """
+        INSERT INTO production_records (
+            asset_id, provider, external_id, period_type, period_date,
+            production_kwh, data_quality, created_at, updated_at
+        ) VALUES (?, 'FusionSolar', 'day-1', 'day', '2026-04-01', ?, 'ok', '2026-05-01', '2026-05-01')
+        """,
+        (asset_id, daily_value),
+    )
+    conn.commit()
+    monkeypatch.setattr(
+        "monitoring_board.portfolio_reports.calculate_tariff_value",
+        lambda *_args, **_kwargs: {
+            "warnings": [],
+            "production_period_kwh": {"ponta": 5, "cheia": 5, "vazio": 0, "super_vazio": 0},
+            "self_use_period_kwh": {"ponta": 25, "cheia": 25, "vazio": 0, "super_vazio": 0},
+            "breakdown": [SimpleNamespace(period_name="simple", value_eur=25, energy_kwh=50)],
+            "estimated_value_eur": 25,
+        },
+    )
+
+    row = next(
+        item
+        for item in build_portfolio_report_rows(conn, portfolio_id, "2026-04", reference_date=reference_date)
+        if item["asset_id"] == asset_id
+    )
+
+    assert row["production_quality_status"] == expected_status
+    assert row["self_use_kwh"] is None
+    assert row["self_use_ponta_kwh"] is None
+    assert row["self_use_value_simple_eur"] is None
+    assert row["estimated_value_eur"] is None
+    assert row["export_revenue_eur"] is None
+    assert row["esco_payment_eur"] is None
+    assert row["net_benefit_eur"] is None
+    assert "production_financials_not_final" in row["warnings"]
+
+
+def test_complete_monthly_installation_keeps_financials_with_partial_daily_coverage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = connect(tmp_path)
+    asset_id = add_asset(conn)
+    portfolio_id = conn.execute("SELECT id FROM portfolio_groups WHERE name = 'Solcorelios I'").fetchone()["id"]
+    conn.execute(
+        "INSERT INTO portfolio_assets (portfolio_id, asset_id, active, mapping_status, mapping_confidence) VALUES (?, ?, 1, 'manual', 1)",
+        (portfolio_id, asset_id),
+    )
+    for period_type, production in (("month", 100), ("day", 10)):
+        conn.execute(
+            """
+            INSERT INTO production_records (
+                asset_id, provider, external_id, period_type, period_date,
+                production_kwh, data_quality, created_at, updated_at
+            ) VALUES (?, 'FusionSolar', ?, ?, '2026-04-01', ?, 'ok', '2026-05-01', '2026-05-01')
+            """,
+            (asset_id, period_type, period_type, production),
+        )
+    conn.commit()
+    monkeypatch.setattr(
+        "monitoring_board.portfolio_reports.calculate_tariff_value",
+        lambda *_args, **_kwargs: {
+            "warnings": [],
+            "production_period_kwh": {"ponta": 5, "cheia": 5, "vazio": 0, "super_vazio": 0},
+            "self_use_period_kwh": {"ponta": 25, "cheia": 25, "vazio": 0, "super_vazio": 0},
+            "breakdown": [SimpleNamespace(period_name="simple", value_eur=25, energy_kwh=50)],
+            "estimated_value_eur": 25,
+        },
+    )
+
+    row = next(
+        item
+        for item in build_portfolio_report_rows(conn, portfolio_id, "2026-04", reference_date=date(2026, 5, 1))
+        if item["asset_id"] == asset_id
+    )
+
+    assert row["production_quality_status"] == "complete"
+    assert row["daily_coverage"] == "partial"
+    assert row["self_use_ponta_kwh"] == 25
+    assert row["self_use_value_simple_eur"] == 25
+    assert row["estimated_value_eur"] == 25
+    assert "production_financials_not_final" not in row["warnings"]
+
+
 def test_portfolio_total_aggregates_and_weights_availability() -> None:
     rows = [
         {"actual_production_kwh": 100, "adjusted_expected_kwh": 100, "installed_power_kwp": 100, "availability_pct": 90, "estimated_value_eur": 10, "production_ponta_kwh": 1, "production_cheia_kwh": 2, "production_vazio_kwh": 3, "production_super_vazio_kwh": 0, "helioscope_expected_kwh": 110, "warnings": []},
@@ -347,8 +464,8 @@ def test_portfolio_total_aggregates_and_weights_availability() -> None:
 
 def test_portfolio_total_is_draft_when_one_installation_is_incomplete() -> None:
     rows = [
-        {"actual_production_kwh": 100, "production_quality_status": "complete", "warnings": []},
-        {"actual_production_kwh": None, "raw_daily_production_kwh": 10, "production_quality_status": "partial", "warnings": ["missing_monthly_production"]},
+        {"actual_production_kwh": 100, "production_quality_status": "complete", "estimated_value_eur": 20, "self_use_value_ponta_eur": 10, "warnings": []},
+        {"actual_production_kwh": None, "raw_daily_production_kwh": 10, "production_quality_status": "partial", "estimated_value_eur": None, "self_use_value_ponta_eur": None, "warnings": ["missing_monthly_production"]},
     ]
 
     total = aggregate_portfolio_total(rows)
@@ -358,13 +475,16 @@ def test_portfolio_total_is_draft_when_one_installation_is_incomplete() -> None:
     assert total["complete_production_subtotal_kwh"] == 100
     assert total["complete_production_installations"] == 1
     assert total["production_installations"] == 2
+    assert total["estimated_value_eur"] is None
+    assert total["self_use_value_ponta_eur"] is None
     assert "portfolio_production_incomplete" in total["warnings"]
+    assert "production_financials_not_final" in total["warnings"]
 
 
 def test_portfolio_total_remains_compatible_when_all_installations_are_complete() -> None:
     rows = [
-        {"actual_production_kwh": 100, "production_quality_status": "complete", "warnings": []},
-        {"actual_production_kwh": 50, "production_quality_status": "complete", "warnings": []},
+        {"actual_production_kwh": 100, "production_quality_status": "complete", "estimated_value_eur": 20, "self_use_value_ponta_eur": 10, "warnings": []},
+        {"actual_production_kwh": 50, "production_quality_status": "complete", "estimated_value_eur": 5, "self_use_value_ponta_eur": 2, "warnings": []},
     ]
 
     total = aggregate_portfolio_total(rows)
@@ -372,6 +492,8 @@ def test_portfolio_total_remains_compatible_when_all_installations_are_complete(
     assert total["actual_production_kwh"] == 150
     assert total["production_total_status"] == "complete"
     assert total["complete_production_subtotal_kwh"] == 150
+    assert total["estimated_value_eur"] == 25
+    assert total["self_use_value_ponta_eur"] == 12
 
 
 def test_mapping_by_nif_then_name(tmp_path: Path) -> None:

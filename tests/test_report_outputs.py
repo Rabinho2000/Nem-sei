@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import struct
 import hashlib
+from datetime import date
 from pathlib import Path
 
 import app as app_module
@@ -380,6 +381,44 @@ def test_section_order_is_shared_by_preview_and_pdf(tmp_path: Path) -> None:
 
     assert html.index("Warnings First") < html.index("KPIs Second") < html.index("Table Third")
     assert text.index("Warnings First") < text.index("KPIs Second") < text.index("Table Third")
+
+
+def test_portfolio_draft_hides_financials_in_html_pdf_and_excel(tmp_path: Path) -> None:
+    conn = connect(tmp_path)
+    portfolio_id = add_portfolio(conn, add_asset(conn, "Draft Portfolio Asset"))
+    result = prepare_portfolio_report(
+        conn,
+        portfolio_id=portfolio_id,
+        portfolio_name="Draft Portfolio",
+        profile=get_default_profile(conn, portfolio_id),
+        report_month="2026-01",
+        reference_date=date(2026, 2, 1),
+    )
+    template = default_template("Portfolio executivo")
+
+    html = render_portfolio_html(result, template)
+    assert "Indisponível — rascunho" in html
+    assert result.summary.values["estimated_value_eur"] is None
+
+    excel = render_portfolio_excel(result, template)
+    excel_path = tmp_path / excel.filename
+    excel_path.write_bytes(excel.content)
+    workbook = load_workbook(excel_path)
+    summary_values = {
+        row[0].value: row[1].value
+        for row in workbook["Resumo"].iter_rows()
+        if len(row) > 1 and row[0].value
+    }
+    assert summary_values["Valor autoconsumo"] is None
+    quality_text = [cell.value for row in workbook["Qualidade dos dados"].iter_rows() for cell in row]
+    assert "production_financials_not_final" in quality_text
+
+    pdf = render_portfolio_pdf(result, template)
+    pdf_path = tmp_path / pdf.filename
+    pdf_path.write_bytes(pdf.content)
+    pdf_text = "\n".join(page.extract_text() or "" for page in PdfReader(str(pdf_path)).pages)
+    assert "Indisponível" in pdf_text
+    assert "rascunho" in pdf_text
 
 
 def test_portfolio_pdf_includes_more_than_ten_columns(tmp_path: Path) -> None:

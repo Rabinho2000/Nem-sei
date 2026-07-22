@@ -53,7 +53,7 @@
   <section class="cards dashboard-kpis">
     <article class="card stat-card">
       <span>Total de producao do portfolio</span>
-      <strong>{{ format_number(kpis.actual_production_kwh, 2) if kpis.production_total_status == 'complete' else 'Indisponivel — rascunho' }}</strong>
+      <strong>{{ format_number(kpis.actual_production_kwh, 2) if kpis.production_total_status == 'complete' else 'Indisponível — rascunho' }}</strong>
       {% if kpis.production_total_status != 'complete' %}
         <small>Subtotal completo: {{ format_number(kpis.complete_production_subtotal_kwh, 2) }} kWh ({{ kpis.complete_production_installations }}/{{ kpis.production_installations }})</small>
       {% endif %}
@@ -62,7 +62,7 @@
     <article class="card stat-card"><span>Desvio kWh</span><strong>{{ format_number(kpis.deviation_kwh, 2) }}</strong></article>
     <article class="card stat-card"><span>Desvio %</span><strong>{{ format_number(kpis.deviation_pct, 2) }}</strong></article>
     <article class="card stat-card"><span>Availability time %</span><strong>{{ format_number(kpis.availability_pct, 2) }}</strong></article>
-    <article class="card stat-card"><span>Valor estimado EUR</span><strong>{{ format_number(kpis.estimated_value_eur, 2) }}</strong></article>
+    <article class="card stat-card"><span>Valor estimado EUR</span><strong>{{ format_number(kpis.estimated_value_eur, 2) if kpis.production_total_status == 'complete' else 'Indisponível — rascunho' }}</strong></article>
     <article class="card stat-card"><span>Instalacoes com dados em falta</span><strong>{{ kpis.missing_data_installations }}</strong></article>
   </section>
 
@@ -120,7 +120,7 @@
               <td>{{ format_number(row.self_use_cheia_kwh, 2) }}</td>
               <td>{{ format_number(row.self_use_vazio_kwh, 2) }}</td>
               <td>{{ format_number(row.self_use_super_vazio_kwh, 2) }}</td>
-              <td>{{ format_number(row.estimated_value_eur, 2) }}</td>
+              <td>{{ format_number(row.estimated_value_eur, 2) if row.production_quality_status == 'complete' else 'Indisponível — rascunho' }}</td>
               <td>{{ format_number(row.helioscope_expected_kwh, 2) }}</td>
               <td>{{ format_number(row.adjusted_expected_kwh, 2) }}</td>
               <td>{{ format_number(row.degradation_factor, 4) }}</td>
@@ -128,7 +128,7 @@
               <td>{{ format_number(row.deviation_pct, 2) }}</td>
               <td>{{ format_number(row.availability_pct, 2) }}</td>
               <td>{{ row.tariff_type or "-" }}</td>
-              <td>{{ format_number(row.estimated_value_eur, 2) }}</td>
+              <td>{{ format_number(row.estimated_value_eur, 2) if row.production_quality_status == 'complete' else 'Indisponível — rascunho' }}</td>
               <td><span class="chip {{ 'success' if row.status_label == 'OK' else 'warning' }}">{{ row.status_label }}</span></td>
               <td>{{ row.warning_labels|join("; ") if row.warning_labels else "-" }}</td>
             </tr>
@@ -139,7 +139,7 @@
               <td></td>
               <td><strong>Total</strong></td>
               <td></td>
-              <td><strong>{{ format_number(total_row.actual_production_kwh, 2) if total_row.production_total_status == 'complete' else 'Indisponivel — rascunho' }}</strong></td>
+              <td><strong>{{ format_number(total_row.actual_production_kwh, 2) if total_row.production_total_status == 'complete' else 'Indisponível — rascunho' }}</strong></td>
               <td>{{ total_row.production_total_status }}</td>
               <td>{{ total_row.complete_production_installations }}/{{ total_row.production_installations }} completas</td>
               <td><strong>{{ format_number(total_row.production_ponta_kwh, 2) }}</strong></td>
@@ -150,7 +150,7 @@
               <td><strong>{{ format_number(total_row.self_use_cheia_kwh, 2) }}</strong></td>
               <td><strong>{{ format_number(total_row.self_use_vazio_kwh, 2) }}</strong></td>
               <td><strong>{{ format_number(total_row.self_use_super_vazio_kwh, 2) }}</strong></td>
-              <td><strong>{{ format_number(total_row.estimated_value_eur, 2) }}</strong></td>
+              <td><strong>{{ format_number(total_row.estimated_value_eur, 2) if total_row.production_total_status == 'complete' else 'Indisponível — rascunho' }}</strong></td>
               <td><strong>{{ format_number(total_row.helioscope_expected_kwh, 2) }}</strong></td>
               <td><strong>{{ format_number(total_row.adjusted_expected_kwh, 2) }}</strong></td>
               <td></td>
@@ -158,7 +158,7 @@
               <td><strong>{{ format_number(total_row.deviation_pct, 2) }}</strong></td>
               <td><strong>{{ format_number(total_row.availability_pct, 2) }}</strong></td>
               <td></td>
-              <td><strong>{{ format_number(total_row.estimated_value_eur, 2) }}</strong></td>
+              <td><strong>{{ format_number(total_row.estimated_value_eur, 2) if total_row.production_total_status == 'complete' else 'Indisponível — rascunho' }}</strong></td>
               <td>{{ total_row.status_label }}</td>
               <td>{{ total_row.missing_data_count }} instalacoes com avisos</td>
             </tr>

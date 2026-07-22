@@ -19,6 +19,7 @@ from reportlab.lib.units import mm
 from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 from monitoring_board.runtime import resolve_runtime_file_path
+from monitoring_board.reporting.financial_quality import PRODUCTION_FINANCIALS_NOT_FINAL_WARNING
 from monitoring_board.reporting.portfolio import METRIC_CATALOG, PortfolioReportResult
 from monitoring_board.reporting.templates import ReportTemplate, enabled_sections_in_order
 from monitoring_board.services.portfolio_reporting import export_portfolio_result_workbook, format_cell
@@ -30,6 +31,7 @@ MAX_ZIP_FILES = 80
 MAX_TOTAL_OUTPUTS = 120
 MAX_RENDERED_FILE_BYTES = 25 * 1024 * 1024
 RESERVED_WINDOWS_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{index}" for index in range(1, 10)), *(f"LPT{index}" for index in range(1, 10))}
+PORTFOLIO_FINANCIAL_DRAFT_NOTICE = "Indisponível — rascunho: valores financeiros dependentes da produção não são finais."
 
 
 @dataclass(frozen=True)
@@ -100,6 +102,8 @@ def render_portfolio_html(result: PortfolioReportResult, template: ReportTemplat
         f"<p>{html.escape(template.subtitle)}</p>",
         f"<p>{html.escape(template.branding.company_name)} - {html.escape(template.branding.client_name)} - {html.escape(result.period.label)}</p>",
     ]
+    if PRODUCTION_FINANCIALS_NOT_FINAL_WARNING in result.warnings:
+        parts.append(f"<aside class='report-warning'>{html.escape(PORTFOLIO_FINANCIAL_DRAFT_NOTICE)}</aside>")
     for section in enabled_sections_in_order(template):
         parts.append(render_portfolio_html_section(result, section.key, section.title))
     if template.branding.footer or template.branding.disclaimer:
@@ -137,6 +141,8 @@ def render_portfolio_pdf(result: PortfolioReportResult, template: ReportTemplate
         Paragraph(template.subtitle or template.branding.company_name, styles["Normal"]),
         Spacer(1, 12),
     ]
+    if PRODUCTION_FINANCIALS_NOT_FINAL_WARNING in result.warnings:
+        story.extend([Paragraph(PORTFOLIO_FINANCIAL_DRAFT_NOTICE, styles["Heading2"]), Spacer(1, 8)])
     append_logo(story, template)
     for section in enabled_sections_in_order(template):
         append_portfolio_pdf_section(story, styles, result, template, section.key, section.title)

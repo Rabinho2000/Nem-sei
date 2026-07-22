@@ -88,6 +88,47 @@ def test_domain_recalculates_totals_and_comparison_without_averaging_percentages
     assert comparison.values["actual_production_kwh"]["delta_pct"] is None
 
 
+def test_configurable_summary_gates_all_financial_totals_when_one_row_is_incomplete() -> None:
+    columns = (
+        PortfolioReportColumn("actual_production_kwh", "Producao real"),
+        PortfolioReportColumn("self_use_kwh", "Autoconsumo"),
+        PortfolioReportColumn("estimated_value_eur", "Valor"),
+        PortfolioReportColumn("export_revenue_eur", "Excedente"),
+        PortfolioReportColumn("esco_payment_eur", "ESCO"),
+        PortfolioReportColumn("net_benefit_eur", "Beneficio"),
+    )
+    rows = (
+        PortfolioReportRow(1, {
+            "production_quality_status": "complete",
+            "actual_production_kwh": Decimal("100"),
+            "self_use_kwh": Decimal("70"),
+            "estimated_value_eur": Decimal("14"),
+            "export_revenue_eur": Decimal("3"),
+            "esco_payment_eur": Decimal("7"),
+            "net_benefit_eur": Decimal("10"),
+        }),
+        PortfolioReportRow(2, {
+            "production_quality_status": "partial",
+            "actual_production_kwh": None,
+            "self_use_kwh": None,
+            "estimated_value_eur": None,
+            "export_revenue_eur": None,
+            "esco_payment_eur": None,
+            "net_benefit_eur": None,
+        }, ("production_financials_not_final",)),
+    )
+
+    summary = aggregate_rows(rows, columns)
+
+    assert summary.values["actual_production_kwh"] is None
+    assert summary.values["self_use_kwh"] is None
+    assert summary.values["estimated_value_eur"] is None
+    assert summary.values["export_revenue_eur"] is None
+    assert summary.values["esco_payment_eur"] is None
+    assert summary.values["net_benefit_eur"] is None
+    assert "production_financials_not_final" in summary.warnings
+
+
 def test_profiles_versions_archive_and_duplicate_are_persisted(tmp_path: Path) -> None:
     conn = connect(tmp_path)
     profiles = list_profiles(conn)

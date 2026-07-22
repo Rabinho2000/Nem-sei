@@ -6,6 +6,10 @@ from decimal import Decimal
 from typing import Any
 
 from monitoring_board.reporting.models import ReportingPeriod
+from monitoring_board.reporting.financial_quality import (
+    apply_production_financial_gate,
+    financial_quality_warnings,
+)
 
 
 ENGINE_VERSION = "portfolio-reporting-v1"
@@ -256,6 +260,11 @@ def aggregate_rows(rows: tuple[PortfolioReportRow, ...], columns: tuple[Portfoli
         for key in ("deviation_kwh", "deviation_pct", "specific_yield"):
             if key in values:
                 values[key] = None
+    apply_production_financial_gate(
+        values,
+        production_quality_status="draft" if production_incomplete else "complete",
+    )
+    warnings = list(financial_quality_warnings("draft" if production_incomplete else "complete", warnings))
     return PortfolioReportSummary(values=values, warnings=tuple(warnings))
 
 

@@ -19,6 +19,10 @@ from monitoring_board.reporting.availability import calculate_weighted_portfolio
 from monitoring_board.reporting.billing import calculate_billing, decimal_from_value, detect_report_type_value
 from monitoring_board.reporting.data_quality import evaluate_monthly_production_quality
 from monitoring_board.reporting.degradation import calculate_degradation_factor
+from monitoring_board.reporting.financial_quality import (
+    apply_production_financial_gate,
+    financial_quality_warnings,
+)
 from monitoring_board.reporting.models import EnergyBreakdown
 from monitoring_board.reporting.periods import month_bounds
 from monitoring_board.reporting.repositories import (
@@ -74,6 +78,7 @@ WARNING_LABELS = {
     "missing_daily_coverage": "Sem cobertura diaria",
     "invalid_monthly_production": "Valor mensal de producao invalido",
     "portfolio_production_incomplete": "Total de producao do portfolio indisponivel",
+    "production_financials_not_final": "Valores financeiros em rascunho",
     "missing_hourly_production": "Sem producao horaria FusionSolar",
     "missing_hourly_self_use": "Sem autoconsumo horario",
     "missing_helioscope_expected": "Sem Helioscope",
@@ -966,8 +971,7 @@ def build_portfolio_report_rows(
             warnings.extend(billing.warnings)
         else:
             warnings.append("missing_billing")
-        rows.append(
-            {
+        row_values = {
                 "portfolio_id": portfolio_id,
                 "asset_id": asset_id,
                 "portfolio": "",
@@ -1032,7 +1036,15 @@ def build_portfolio_report_rows(
                 "warning_labels": label_warnings(sorted(set(warnings))),
                 "status_label": data_status_label(sorted(set(warnings))),
             }
+        apply_production_financial_gate(row_values)
+        warnings = list(financial_quality_warnings(production_quality.status, warnings))
+        row_values.update(
+            warnings=warnings,
+            warning_labels=label_warnings(warnings),
+            status_label=data_status_label(warnings),
+            data_status="ok" if not warnings else ("missing_data" if any(item.startswith("missing") for item in warnings) else "warning"),
         )
+        rows.append(row_values)
     return rows
 
 
@@ -1063,9 +1075,10 @@ def aggregate_portfolio_total(rows: list[dict[str, Any]]) -> dict[str, Any]:
     warnings = sorted({warning for row in rows for warning in row.get("warnings", [])})
     if incomplete_production:
         warnings = sorted({*warnings, "portfolio_production_incomplete"})
+    warnings = list(financial_quality_warnings("draft" if incomplete_production else "complete", warnings))
     if rows and any(row.get("availability_pct") is not None and not row.get("installed_power_kwp") for row in rows):
         warnings = sorted({*warnings, "missing_installed_power"})
-    return {
+    total_row = {
         "portfolio": "",
         "installation": "TOTAL",
         "external_installation": "TOTAL",
@@ -1114,6 +1127,17 @@ def aggregate_portfolio_total(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "status_label": "OK" if not warnings else "Dados incompletos",
         "missing_data_count": sum(1 for row in rows if row.get("warnings")),
     }
+    apply_production_financial_gate(
+        total_row,
+        production_quality_status="draft" if incomplete_production else "complete",
+    )
+    total_row.update(
+        warnings=warnings,
+        warning_labels=label_warnings(warnings),
+        status_label="OK" if not warnings else "Dados incompletos",
+        data_status="ok" if not warnings else "warning",
+    )
+    return total_row
 
 
 def build_portfolio_kpis(rows: list[dict[str, Any]], total_row: dict[str, Any] | None) -> dict[str, Any]:
