@@ -474,12 +474,21 @@ def test_quarterly_customer_report_fetches_only_missing_month_from_api(conn, mon
         period=period_from_form({"period_type": "quarterly", "report_year": "2026", "report_quarter": "1"}),
     )
 
-    assert fetched_months == [date(2026, 2, 1), date(2026, 3, 1)]
+    queued_jobs = conn.execute(
+        """
+        SELECT params_json
+        FROM background_jobs
+        WHERE job_type = 'fusionsolar_report_production_request'
+        ORDER BY id
+        """
+    ).fetchall()
+
+    assert fetched_months == []
     assert report["production_kwh"] is None
     assert report["raw_daily_total_kwh"] == 50
-    assert report["months_with_data"] == ["2026-01", "2026-03"]
-    assert report["missing_months"] == ["2026-02"]
-    assert report["coverage_pct"] == pytest.approx(66.67)
+    assert report["production_is_final"] is False
+    assert report["production_refresh_queued"] is True
+    assert len(queued_jobs) == 2
 
 
 def test_deviation_classification_with_thresholds() -> None:

@@ -29,18 +29,22 @@
                 "pending": "Pendente",
                 "running": "Em execucao",
                 "waiting_rate_limit": "A aguardar limite API",
+                "waiting_api_slot": "A aguardar fila API",
                 "success": "Sucesso",
                 "failed": "Falhou",
                 "cancelled": "Cancelado"
               } %}
-              <span class="chip {{ 'success' if job.status == 'success' else 'danger' if job.status == 'failed' else 'warning' if job.status in ['running', 'waiting_rate_limit'] else 'accent' }}">
+              <span class="chip {{ 'success' if job.status == 'success' else 'danger' if job.status == 'failed' else 'warning' if job.status in ['running', 'waiting_rate_limit', 'waiting_api_slot'] else 'accent' }}">
                 {{ status_labels.get(job.status, job.status) }}
               </span>
             </td>
             <td>{{ job.created_at }}</td>
             <td>{{ job.started_at or "-" }}</td>
             <td>{{ job.finished_at or "-" }}</td>
-            <td>{{ job.next_attempt_at or "-" }}</td>
+            <td>
+              {{ job.next_attempt_at or "-" }}
+              {% if job.wait_reason %}<br><span class="muted">{{ job.wait_reason }}</span>{% endif %}
+            </td>
             <td>
               {% if job.error_message %}
                 {{ job.error_message }}

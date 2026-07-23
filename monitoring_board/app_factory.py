@@ -15,6 +15,7 @@ import threading
 import time
 import unicodedata
 import struct
+from contextvars import ContextVar
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -272,6 +273,19 @@ from monitoring_board.services.api_rate_limit import (
     record_api_success,
     require_not_in_cooldown,
 )
+from monitoring_board.services.production_api_queue import (
+    ApiQueuePolicy,
+    ApiSlotUnavailableError,
+    PRODUCTION_KPI_AREA,
+    account_key as production_api_account_key,
+    ensure_api_queue_state,
+    ensure_api_queue_schema,
+    list_api_queue_states,
+    record_api_407 as record_production_api_407,
+    recover_expired_leases,
+    release_api_lease,
+    reserve_api_slot,
+)
 
 from monitoring_board.services.telegram_service import (
     get_telegram_config,
@@ -356,8 +370,16 @@ BACKGROUND_JOB_TYPES_PERFORMANCE = (
     "fusionsolar_inverter_availability_backfill",
     "fusionsolar_month_cycle",
     "fusionsolar_month_close",
+    "fusionsolar_report_production_request",
     "sigenergy_state_sync",
     "performance_reference_recalculation",
+)
+FUSIONSOLAR_PRODUCTION_JOB_TYPES = (
+    "fusionsolar_production_sync",
+    "fusionsolar_production_backfill",
+    "fusionsolar_month_cycle",
+    "fusionsolar_month_close",
+    "fusionsolar_report_production_request",
 )
 BACKGROUND_JOB_STALE_RUNNING_MINUTES = 30
 DEFAULT_FUSIONSOLAR_SYNC_HOURS = "08:00,14:00"
@@ -384,6 +406,10 @@ DEFAULT_SIGENERGY_SYNC_HOURS = "08:00,14:00"
 DEFAULT_SIGENERGY_SNAPSHOT_RETENTION_DAYS = 90
 FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_MINUTES = 60
 FUSIONSOLAR_PERFORMANCE_KPI_DELAY_SECONDS = 65
+DEFAULT_FUSIONSOLAR_PRODUCTION_KPI_DAILY_BUDGET = 20
+DEFAULT_FUSIONSOLAR_PRODUCTION_KPI_DAILY_RESERVED_CALLS = 2
+DEFAULT_FUSIONSOLAR_PRODUCTION_KPI_MONTH_CLOSE_RESERVED_CALLS = 2
+DEFAULT_FUSIONSOLAR_PRODUCTION_KPI_MIN_INTERVAL_SECONDS = 65
 FUSIONSOLAR_PERFORMANCE_MAX_API_CALLS = 20
 FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL: datetime | None = None
 DEFAULT_FUSIONSOLAR_RATE_LIMIT_MINUTES = 60
@@ -589,6 +615,10 @@ SCHEDULER: BackgroundScheduler | None = None
 FUSIONSOLAR_SESSION_CACHE: dict[str, Any] = {}
 FUSIONSOLAR_SESSION_LOCK = threading.Lock()
 FUSIONSOLAR_SYNC_LOCK = threading.Lock()
+PRODUCTION_KPI_CALL_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
+    "production_kpi_call_context",
+    default=None,
+)
 
 
 @contextmanager
@@ -5028,6 +5058,9 @@ def create_app() -> Flask:
             alert_filter_assets=alert_filter_assets,
             alert_blacklist_rows=alert_blacklist_rows,
             api_call_states=list_api_call_states(g.db),
+            production_api_queue_states=build_production_api_queue_observability(
+                g.db
+            ),
             background_jobs=fetch_latest_background_jobs(g.db, job_types=BACKGROUND_JOB_TYPES_PERFORMANCE),
             fusionsolar_api_warning=get_fusionsolar_performance_cooldown_reason(g.db),
         )
@@ -6006,7 +6039,9 @@ def ensure_database(path: str) -> None:
         ensure_column(conn, "integration_configs", "production_sync_time TEXT")
         ensure_column(conn, "integration_configs", "diagnostics_sync_time TEXT")
         ensure_column(conn, "background_jobs", "next_attempt_at TEXT")
+        ensure_column(conn, "background_jobs", "wait_reason TEXT")
         ensure_api_call_state_schema(conn)
+        ensure_api_queue_schema(conn)
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_background_jobs_status_next_attempt
@@ -6217,7 +6252,7 @@ def create_background_job(
                 SELECT id, params_json
                 FROM background_jobs
                 WHERE job_type = ?
-                  AND status IN ('pending', 'running', 'waiting_rate_limit')
+                  AND status IN ('pending', 'running', 'waiting_rate_limit', 'waiting_api_slot')
                 ORDER BY id DESC
                 """,
                 (job_type,),
@@ -6241,7 +6276,7 @@ def create_background_job(
             FROM background_jobs
             WHERE job_type = ?
               AND params_json = ?
-              AND status IN ('pending', 'running', 'waiting_rate_limit')
+              AND status IN ('pending', 'running', 'waiting_rate_limit', 'waiting_api_slot')
             ORDER BY id DESC
             LIMIT 1
             """,
@@ -6266,11 +6301,15 @@ def mark_background_job_running(conn: sqlite3.Connection, job_id: int) -> bool:
     cursor = conn.execute(
         """
         UPDATE background_jobs
-        SET status = 'running', started_at = ?, error_message = NULL, next_attempt_at = NULL
+        SET status = 'running', started_at = ?, error_message = NULL,
+            next_attempt_at = NULL, wait_reason = NULL
         WHERE id = ?
           AND (
             status = 'pending'
-            OR (status = 'waiting_rate_limit' AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+            OR (
+                status IN ('waiting_rate_limit', 'waiting_api_slot')
+                AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+            )
           )
         """,
         (now, job_id, now),
@@ -6284,7 +6323,8 @@ def mark_background_job_success(conn: sqlite3.Connection, job_id: int, result: d
     conn.execute(
         """
         UPDATE background_jobs
-        SET status = 'success', result_json = ?, error_message = NULL, finished_at = ?, next_attempt_at = NULL
+        SET status = 'success', result_json = ?, error_message = NULL,
+            finished_at = ?, next_attempt_at = NULL, wait_reason = NULL
         WHERE id = ?
         """,
         (json.dumps(result, ensure_ascii=True, sort_keys=True), now, job_id),
@@ -6297,7 +6337,8 @@ def mark_background_job_failed(conn: sqlite3.Connection, job_id: int, error_mess
     conn.execute(
         """
         UPDATE background_jobs
-        SET status = 'failed', error_message = ?, finished_at = ?, next_attempt_at = NULL
+        SET status = 'failed', error_message = ?, finished_at = ?,
+            next_attempt_at = NULL, wait_reason = NULL
         WHERE id = ?
         """,
         (error_message[:2000], now, job_id),
@@ -6321,7 +6362,8 @@ def mark_background_job_waiting_rate_limit(
             error_message = ?,
             result_json = ?,
             finished_at = ?,
-            next_attempt_at = ?
+            next_attempt_at = ?,
+            wait_reason = 'cooldown_407'
         WHERE id = ?
         """,
         (
@@ -6333,6 +6375,76 @@ def mark_background_job_waiting_rate_limit(
         ),
     )
     conn.commit()
+
+
+def mark_background_job_waiting_api_slot(
+    conn: sqlite3.Connection,
+    job_id: int,
+    *,
+    next_attempt_at: datetime,
+    wait_reason: str,
+    error_message: str,
+    result: dict[str, Any] | None = None,
+) -> None:
+    now = datetime.now().isoformat(timespec="seconds")
+    conn.execute(
+        """
+        UPDATE background_jobs
+        SET status = 'waiting_api_slot',
+            error_message = ?,
+            result_json = ?,
+            finished_at = ?,
+            next_attempt_at = ?,
+            wait_reason = ?
+        WHERE id = ?
+        """,
+        (
+            error_message[:2000],
+            json.dumps(result or {}, ensure_ascii=True, sort_keys=True),
+            now,
+            next_attempt_at.astimezone(LISBON_TIMEZONE)
+            .replace(tzinfo=None)
+            .isoformat(timespec="seconds"),
+            wait_reason,
+            job_id,
+        ),
+    )
+    conn.commit()
+
+
+def postpone_pending_production_jobs_after_407(
+    conn: sqlite3.Connection,
+    *,
+    cooldown_until: datetime,
+    exclude_job_id: int | None = None,
+) -> int:
+    placeholders = ", ".join("?" for _ in FUSIONSOLAR_PRODUCTION_JOB_TYPES)
+    params: list[Any] = [
+        cooldown_until.isoformat(timespec="seconds"),
+        "cooldown_407",
+        "FusionSolar production KPI em cooldown global apos 407.",
+        *FUSIONSOLAR_PRODUCTION_JOB_TYPES,
+    ]
+    exclude_sql = ""
+    if exclude_job_id is not None:
+        exclude_sql = "AND id != ?"
+        params.append(exclude_job_id)
+    cursor = conn.execute(
+        f"""
+        UPDATE background_jobs
+        SET status = 'waiting_api_slot',
+            next_attempt_at = ?,
+            wait_reason = ?,
+            error_message = ?,
+            finished_at = NULL
+        WHERE job_type IN ({placeholders})
+          AND status IN ('pending', 'waiting_api_slot', 'waiting_rate_limit')
+          {exclude_sql}
+        """,
+        params,
+    )
+    conn.commit()
+    return cursor.rowcount
 
 
 def mark_stale_running_background_jobs_failed(
@@ -6368,7 +6480,7 @@ def reactivate_due_rate_limited_background_jobs(conn: sqlite3.Connection) -> int
         SET status = 'pending',
             error_message = NULL,
             finished_at = NULL
-        WHERE status = 'waiting_rate_limit'
+        WHERE status IN ('waiting_rate_limit', 'waiting_api_slot')
           AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
         """,
         (now,),
@@ -6404,7 +6516,8 @@ def fetch_latest_background_jobs(
     params.append(limit)
     rows = conn.execute(
         f"""
-        SELECT id, job_type, status, params_json, result_json, error_message, created_at, started_at, finished_at, next_attempt_at
+        SELECT id, job_type, status, params_json, result_json, error_message,
+               created_at, started_at, finished_at, next_attempt_at, wait_reason
         FROM background_jobs
         {where_sql}
         ORDER BY id DESC
@@ -9770,6 +9883,37 @@ def build_local_customer_production_report(
     )
 
 
+def enqueue_report_production_requests(
+    conn: sqlite3.Connection,
+    *,
+    asset_id: int,
+    period: ReportingPeriod,
+    months_requiring_fallback: list[str],
+    reference_date: date,
+) -> list[int]:
+    current_month = reference_date.replace(day=1)
+    job_ids: list[int] = []
+    for month_start in period.included_months:
+        month_label = month_start.strftime("%Y-%m")
+        if month_start >= current_month or month_label not in months_requiring_fallback:
+            continue
+        job_id, created = create_background_job(
+            conn,
+            "fusionsolar_report_production_request",
+            {
+                "provider": INTEGRATION_PROVIDER_FUSIONSOLAR,
+                "report_month": month_label,
+                "asset_ids": [asset_id],
+                "trigger_type": "report_draft",
+            },
+        )
+        job_ids.append(job_id)
+        if created and has_app_context():
+            schedule_background_job(current_app._get_current_object(), job_id)
+    conn.commit()
+    return job_ids
+
+
 def build_fusionsolar_customer_production_report(
     conn: sqlite3.Connection,
     *,
@@ -9785,128 +9929,32 @@ def build_fusionsolar_customer_production_report(
 ) -> dict[str, Any]:
     period = _resolve_customer_reporting_period(report_month, period)
     reference_date = reference_date or date.today()
-    if not force_api:
-        local_report = build_local_customer_production_report(
-            conn,
-            asset_id=asset_id,
-            report_month=report_month,
-            electricity_price=electricity_price,
-            sell_price=sell_price,
-            solcor_price_per_kwh=solcor_price_per_kwh,
-            billing_config=billing_config,
-            period=period,
-            reference_date=reference_date,
-        )
-        if local_report is not None and not local_report.get("months_requiring_fallback"):
-            return local_report
-
-    cooldown_reason = get_fusionsolar_performance_cooldown_reason(conn)
-    if cooldown_reason:
-        raise ValueError(cooldown_reason)
-
-    asset = _get_fusionsolar_report_asset(conn, asset_id)
-    config = get_integration_config(conn, INTEGRATION_PROVIDER_FUSIONSOLAR)
-    if config is None or not config["enabled"]:
-        raise ValueError("Configuracao FusionSolar ativa nao encontrada.")
-    endpoints = get_fusionsolar_endpoint_config(config)
-    session_obj, _ = get_fusionsolar_session(config)
-    station_code = str(asset["external_id"])
-
-    daily_rows: list[dict[str, Any]] = []
-    monthly_rows: list[dict[str, Any]] = []
-    local_months_with_data: set[str] = set()
-    if not force_api:
-        local_daily_records = list_daily_production_records(conn, asset_id=asset_id, start=period.start, end=period.end)
-        local_monthly_records = list_monthly_production_records(conn, asset_id=asset_id, start=period.start, end=period.end)
-        local_daily_rows = [normalize_customer_production_record(row, parse_date_value(row["period_date"]) or period.start) for row in local_daily_records]
-        local_monthly_rows = []
-        for row in local_monthly_records:
-            fallback_date = parse_date_value(row["period_date"]) or period.start
-            normalized = normalize_customer_production_record(row, fallback_date)
-            normalized.update(extract_customer_tariff_values(parse_production_record_payload(row)))
-            local_monthly_rows.append(normalized)
-        local_aggregate = _aggregate_customer_rows_for_period(
-            period,
-            local_monthly_rows,
-            local_daily_rows,
-            asset_id=asset_id,
-            reference_date=reference_date,
-        )
-        local_months_with_data = set(local_aggregate["months_with_data"])
-        local_months_with_data.update(
-            month.strftime("%Y-%m")
-            for month in period.included_months
-            if month.strftime("%Y-%m") not in local_aggregate["months_requiring_fallback"]
-        )
-        daily_rows.extend(local_daily_rows)
-        monthly_rows.extend(local_monthly_rows)
-
-    for month_start in period.included_months:
-        if not force_api and month_start.strftime("%Y-%m") in local_months_with_data:
-            continue
-        _, month_end = month_bounds(month_start.strftime("%Y-%m"))
-        daily_rows_raw = fetch_fusionsolar_kpi_day_rows(
-            session_obj,
-            base_url=endpoints["base_url"],
-            endpoint=endpoints["day_kpi_endpoint"],
-            station_codes=[station_code],
-            collect_date=month_start,
-        )
-        for raw_row in daily_rows_raw:
-            if str(raw_row.get("stationCode") or raw_row.get("plantCode") or "").strip() != station_code:
-                continue
-            normalized = normalize_customer_kpi_row(raw_row, month_start)
-            if month_start <= normalized["date"] <= month_end:
-                daily_rows.append(normalized)
-
-        monthly_map = fetch_fusionsolar_kpi_month_map(
-            session_obj,
-            base_url=endpoints["base_url"],
-            endpoint=endpoints["month_kpi_endpoint"],
-            station_codes=[station_code],
-            collect_date=month_start,
-        )
-        monthly_row = monthly_map.get(station_code)
-        if monthly_row:
-            normalized = normalize_customer_kpi_row(monthly_row, month_start)
-            normalized.update(extract_customer_tariff_values(monthly_row))
-            monthly_rows.append(normalized)
-
-    daily_rows.sort(key=lambda item: item["date"])
-    monthly_rows.sort(key=lambda item: item["date"])
-    aggregate = _aggregate_customer_rows_for_period(
-        period,
-        monthly_rows,
-        daily_rows,
+    local_report = build_local_customer_production_report(
+        conn,
         asset_id=asset_id,
+        report_month=report_month,
+        electricity_price=electricity_price,
+        sell_price=sell_price,
+        solcor_price_per_kwh=solcor_price_per_kwh,
+        billing_config=billing_config,
+        period=period,
         reference_date=reference_date,
     )
-    source = "FusionSolar API" if force_api or not local_months_with_data else "Dados locais + FusionSolar API"
-    tariff_result = _build_customer_tariff_result(
+    if local_report is None:
+        raise ValueError("Nao foi possivel preparar o relatorio com os dados locais.")
+    refresh_job_ids = enqueue_report_production_requests(
         conn,
         asset_id=asset_id,
         period=period,
-        aggregate=aggregate,
-        daily_rows=daily_rows,
-        billing_config=billing_config,
-        electricity_price=electricity_price,
+        months_requiring_fallback=list(
+            local_report.get("months_requiring_fallback") or []
+        ),
+        reference_date=reference_date,
     )
-    report = _report_payload_for_period(
-        asset=asset,
-        period=period,
-        station_code=station_code,
-        daily_rows=daily_rows,
-        aggregate=aggregate,
-        electricity_price=electricity_price,
-        sell_price=sell_price,
-        data_source=source,
-        tariff_result=tariff_result,
-    )
-    return prepare_customer_report(
-        report,
-        solcor_price_per_kwh=solcor_price_per_kwh,
-        billing_config=billing_config,
-    )
+    local_report["production_refresh_job_ids"] = refresh_job_ids
+    local_report["production_refresh_queued"] = bool(refresh_job_ids)
+    local_report["force_api_ignored"] = bool(force_api)
+    return local_report
 
 
 def add_customer_report_availability(
@@ -11460,6 +11508,12 @@ def schedule_background_job(app: Flask, job_id: int, run_date: datetime | None =
 
 def schedule_pending_background_jobs(app: Flask) -> dict[str, Any]:
     with closing(get_db(app.config["DATABASE"])) as conn:
+        expired_leases_recovered = recover_expired_leases(conn)
+        if expired_leases_recovered:
+            app.logger.info(
+                "Recovered %s expired production API leases",
+                expired_leases_recovered,
+            )
         recovered_count = mark_stale_running_background_jobs_failed(conn)
         if recovered_count:
             app.logger.warning("Marked %s stale running background jobs as failed on startup", recovered_count)
@@ -11498,9 +11552,31 @@ def run_background_job(app: Flask, job_id: int) -> None:
             try:
                 params = json.loads(job["params_json"] or "{}")
                 current_app.logger.info("Background job %s started: %s", job_id, job["job_type"])
-                result = run_background_job_payload(conn, str(job["job_type"]), params)
+                with production_kpi_call_context(
+                    job_id=job_id,
+                    job_type=str(job["job_type"]),
+                ):
+                    result = run_background_job_payload(conn, str(job["job_type"]), params)
                 mark_background_job_success(conn, job_id, result)
                 current_app.logger.info("Background job %s completed: %s", job_id, job["job_type"])
+            except ApiSlotUnavailableError as exc:
+                result = {
+                    "status": "waiting_api_slot",
+                    "provider": exc.provider,
+                    "api_area": exc.api_area,
+                    "wait_reason": exc.wait_reason,
+                    "next_attempt_at": exc.next_attempt_at.isoformat(timespec="seconds"),
+                    "stopped_reason": exc.message,
+                }
+                mark_background_job_waiting_api_slot(
+                    conn,
+                    job_id,
+                    next_attempt_at=exc.next_attempt_at,
+                    wait_reason=exc.wait_reason,
+                    error_message=exc.message,
+                    result=result,
+                )
+                schedule_background_job(app, job_id, run_date=exc.next_attempt_at)
             except ApiRateLimitError as exc:
                 current_app.logger.info(
                     "Background job %s waiting for %s %s rate limit until %s",
@@ -11676,6 +11752,19 @@ def run_background_job_payload(conn: sqlite3.Connection, job_type: str, params: 
         record_api_success(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_PRODUCTION)
         return result
 
+    if job_type == "fusionsolar_report_production_request":
+        raw_asset_ids = params.get("asset_ids") or []
+        asset_ids = [int(value) for value in raw_asset_ids if str(value).isdigit()]
+        result = run_fusionsolar_month_close(
+            conn,
+            provider=str(params.get("provider") or INTEGRATION_PROVIDER_FUSIONSOLAR),
+            report_month=str(params.get("report_month") or ""),
+            asset_ids=asset_ids,
+            reference_date=current_lisbon_date(),
+        )
+        record_api_success(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_PRODUCTION)
+        return result
+
     raise ValueError(f"Tipo de job desconhecido: {job_type}")
 
 
@@ -11688,6 +11777,7 @@ def background_job_api_scope(job_type: str, params: dict[str, Any]) -> tuple[str
         "fusionsolar_production_backfill",
         "fusionsolar_month_cycle",
         "fusionsolar_month_close",
+        "fusionsolar_report_production_request",
     }:
         return provider or INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_PRODUCTION
     if job_type == "fusionsolar_inverter_availability_backfill":
@@ -11759,6 +11849,72 @@ def list_api_call_states(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         )
         states.append(state)
     return states
+
+
+def build_production_api_queue_observability(
+    conn: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    fusionsolar_config = get_integration_config(
+        conn,
+        INTEGRATION_PROVIDER_FUSIONSOLAR,
+    )
+    if fusionsolar_config is not None:
+        endpoints = get_fusionsolar_endpoint_config(fusionsolar_config)
+        ensure_api_queue_state(
+            conn,
+            provider=INTEGRATION_PROVIDER_FUSIONSOLAR.lower(),
+            account_key_value=fusionsolar_production_account_key(
+                fusionsolar_config,
+                endpoints["day_kpi_endpoint"],
+            ),
+            api_area=PRODUCTION_KPI_AREA,
+            policy=fusionsolar_production_kpi_policy(),
+        )
+    sigenergy_config = get_integration_config(
+        conn,
+        INTEGRATION_PROVIDER_SIGENERGY,
+    )
+    if sigenergy_config is not None:
+        sigenergy_endpoint = str(sigenergy_config["energy_flow_endpoint"] or "")
+        ensure_api_queue_state(
+            conn,
+            provider=INTEGRATION_PROVIDER_SIGENERGY.lower(),
+            account_key_value=production_api_account_key(
+                provider=INTEGRATION_PROVIDER_SIGENERGY,
+                username=str(sigenergy_config["username"] or ""),
+                base_url=str(sigenergy_config["base_url"] or ""),
+                endpoint=sigenergy_endpoint,
+            ),
+            api_area=PRODUCTION_KPI_AREA,
+            policy=sigenergy_production_kpi_policy(),
+        )
+    waiting_fusionsolar = conn.execute(
+        f"""
+        SELECT COUNT(*) AS total
+        FROM background_jobs
+        WHERE job_type IN ({", ".join("?" for _ in FUSIONSOLAR_PRODUCTION_JOB_TYPES)})
+          AND status IN ('waiting_api_slot', 'waiting_rate_limit')
+        """,
+        FUSIONSOLAR_PRODUCTION_JOB_TYPES,
+    ).fetchone()["total"]
+    rows = list_api_queue_states(conn)
+    for row in rows:
+        row["waiting_jobs"] = (
+            int(waiting_fusionsolar)
+            if row["provider"] == INTEGRATION_PROVIDER_FUSIONSOLAR.lower()
+            else 0
+        )
+        candidates = [
+            value
+            for value in (
+                row.get("next_allowed_at"),
+                row.get("cooldown_until"),
+                row.get("lease_until"),
+            )
+            if value
+        ]
+        row["resume_forecast"] = max(candidates) if candidates else ""
+    return rows
 
 
 def clear_api_cooldown(conn: sqlite3.Connection, provider: str, api_area: str | None = None) -> None:
@@ -12207,15 +12363,20 @@ def fetch_fusionsolar_kpi_map(
     collect_date: date,
     expected_message: str,
 ) -> dict[str, dict[str, Any]]:
+    if len(station_codes) > 100:
+        raise ValueError("Cada chamada KPI FusionSolar aceita no maximo 100 instalacoes.")
     try:
-        return fusionsolar_client_module.fetch_kpi_map(
-            session,
-            base_url=base_url,
+        return execute_queued_fusionsolar_kpi_call(
+            lambda: fusionsolar_client_module.fetch_kpi_map(
+                session,
+                base_url=base_url,
+                endpoint=endpoint,
+                station_codes=station_codes,
+                collect_date=collect_date,
+                expected_message=expected_message,
+                **fusionsolar_retry_options(),
+            ),
             endpoint=endpoint,
-            station_codes=station_codes,
-            collect_date=collect_date,
-            expected_message=expected_message,
-            **fusionsolar_retry_options(),
         )
     except FusionSolarRateLimitError as exc:
         raise_fusionsolar_rate_limit(exc, API_AREA_PRODUCTION)
@@ -12230,15 +12391,20 @@ def fetch_fusionsolar_kpi_rows(
     collect_date: date,
     expected_message: str,
 ) -> list[dict[str, Any]]:
+    if len(station_codes) > 100:
+        raise ValueError("Cada chamada KPI FusionSolar aceita no maximo 100 instalacoes.")
     try:
-        return fusionsolar_client_module.fetch_kpi_rows(
-            session,
-            base_url=base_url,
+        return execute_queued_fusionsolar_kpi_call(
+            lambda: fusionsolar_client_module.fetch_kpi_rows(
+                session,
+                base_url=base_url,
+                endpoint=endpoint,
+                station_codes=station_codes,
+                collect_date=collect_date.replace(day=1),
+                expected_message=expected_message,
+                **fusionsolar_retry_options(),
+            ),
             endpoint=endpoint,
-            station_codes=station_codes,
-            collect_date=collect_date.replace(day=1),
-            expected_message=expected_message,
-            **fusionsolar_retry_options(),
         )
     except FusionSolarRateLimitError as exc:
         raise_fusionsolar_rate_limit(exc, API_AREA_PRODUCTION)
@@ -12558,6 +12724,212 @@ def fusionsolar_rate_limit_minutes() -> int:
         return max(1, int(raw_value))
     except ValueError:
         return DEFAULT_FUSIONSOLAR_RATE_LIMIT_MINUTES
+
+
+def fusionsolar_production_kpi_policy() -> ApiQueuePolicy:
+    daily_budget = parse_env_positive_int(
+        "FUSIONSOLAR_PRODUCTION_KPI_DAILY_BUDGET",
+        DEFAULT_FUSIONSOLAR_PRODUCTION_KPI_DAILY_BUDGET,
+    )
+    daily_reserved_calls = min(
+        parse_env_nonnegative_int(
+            "FUSIONSOLAR_PRODUCTION_KPI_DAILY_RESERVED_CALLS",
+            DEFAULT_FUSIONSOLAR_PRODUCTION_KPI_DAILY_RESERVED_CALLS,
+        ),
+        daily_budget,
+    )
+    month_close_reserved_calls = min(
+        parse_env_nonnegative_int(
+            "FUSIONSOLAR_PRODUCTION_KPI_MONTH_CLOSE_RESERVED_CALLS",
+            DEFAULT_FUSIONSOLAR_PRODUCTION_KPI_MONTH_CLOSE_RESERVED_CALLS,
+        ),
+        max(daily_budget - daily_reserved_calls, 0),
+    )
+    return ApiQueuePolicy(
+        min_interval_seconds=parse_env_positive_int(
+            "FUSIONSOLAR_PRODUCTION_KPI_MIN_INTERVAL_SECONDS",
+            DEFAULT_FUSIONSOLAR_PRODUCTION_KPI_MIN_INTERVAL_SECONDS,
+        ),
+        daily_budget=daily_budget,
+        reserved_calls_by_priority=(
+            (1, daily_reserved_calls),
+            (2, month_close_reserved_calls),
+        ),
+    )
+
+
+def sigenergy_production_kpi_policy() -> ApiQueuePolicy:
+    return ApiQueuePolicy(
+        min_interval_seconds=parse_env_optional_positive_int(
+            "SIGENERGY_PRODUCTION_MIN_INTERVAL_SECONDS"
+        ),
+        daily_budget=parse_env_optional_positive_int(
+            "SIGENERGY_PRODUCTION_DAILY_BUDGET"
+        ),
+    )
+
+
+def parse_env_positive_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, str(default)).strip()))
+    except ValueError:
+        return default
+
+
+def parse_env_nonnegative_int(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.environ.get(name, str(default)).strip()))
+    except ValueError:
+        return default
+
+
+def parse_env_optional_positive_int(name: str) -> int | None:
+    raw_value = os.environ.get(name, "").strip()
+    if not raw_value:
+        return None
+    try:
+        return max(1, int(raw_value))
+    except ValueError:
+        return None
+
+
+def production_job_priority(job_type: str) -> int:
+    if job_type == "fusionsolar_production_sync":
+        return 1
+    if job_type == "fusionsolar_month_close":
+        return 2
+    if job_type in {"fusionsolar_production_backfill", "fusionsolar_month_cycle"}:
+        return 3
+    return 4
+
+
+def higher_priority_production_job_types(priority: int) -> tuple[str, ...]:
+    return tuple(
+        job_type
+        for job_type in FUSIONSOLAR_PRODUCTION_JOB_TYPES
+        if production_job_priority(job_type) < priority
+    )
+
+
+@contextmanager
+def production_kpi_call_context(
+    *,
+    job_id: int,
+    job_type: str,
+) -> Any:
+    token = PRODUCTION_KPI_CALL_CONTEXT.set(
+        {
+            "job_id": job_id,
+            "job_type": job_type,
+            "priority": production_job_priority(job_type),
+            "lease_owner": f"background-job-{job_id}",
+        }
+    )
+    try:
+        yield
+    finally:
+        PRODUCTION_KPI_CALL_CONTEXT.reset(token)
+
+
+def fusionsolar_production_account_key(
+    config: sqlite3.Row | dict[str, Any],
+    _endpoint: str,
+) -> str:
+    return production_api_account_key(
+        provider=INTEGRATION_PROVIDER_FUSIONSOLAR,
+        username=str(config.get("username") if isinstance(config, dict) else config["username"] or ""),
+        base_url=str(config.get("base_url") if isinstance(config, dict) else config["base_url"] or ""),
+        endpoint=PRODUCTION_KPI_AREA,
+    )
+
+
+def execute_queued_fusionsolar_kpi_call(
+    callback: Any,
+    *,
+    endpoint: str,
+) -> Any:
+    context = PRODUCTION_KPI_CALL_CONTEXT.get()
+    if context is None or not has_app_context():
+        return callback()
+    with closing(get_db(current_app.config["DATABASE"])) as queue_conn:
+        config = get_integration_config(queue_conn, INTEGRATION_PROVIDER_FUSIONSOLAR)
+        if config is None:
+            raise ValueError("Configuracao FusionSolar nao encontrada.")
+        account_key_value = fusionsolar_production_account_key(config, endpoint)
+        higher_priority_types = higher_priority_production_job_types(
+            int(context["priority"])
+        )
+        if higher_priority_types:
+            placeholders = ", ".join("?" for _ in higher_priority_types)
+            higher_priority_job = queue_conn.execute(
+                f"""
+                SELECT id, next_attempt_at
+                FROM background_jobs
+                WHERE job_type IN ({placeholders})
+                  AND status IN ('pending', 'running', 'waiting_api_slot', 'waiting_rate_limit')
+                  AND id != ?
+                ORDER BY id
+                LIMIT 1
+                """,
+                (*higher_priority_types, int(context["job_id"])),
+            ).fetchone()
+            if higher_priority_job is not None:
+                next_attempt_at = datetime.now(LISBON_TIMEZONE) + timedelta(
+                    seconds=fusionsolar_production_kpi_policy().min_interval_seconds
+                    or 1
+                )
+                raise ApiSlotUnavailableError(
+                    provider=INTEGRATION_PROVIDER_FUSIONSOLAR,
+                    account_key=account_key_value,
+                    api_area=PRODUCTION_KPI_AREA,
+                    next_attempt_at=next_attempt_at,
+                    wait_reason="priority_queue",
+                )
+        reservation = reserve_api_slot(
+            queue_conn,
+            provider=INTEGRATION_PROVIDER_FUSIONSOLAR.lower(),
+            account_key_value=account_key_value,
+            api_area=PRODUCTION_KPI_AREA,
+            lease_owner=str(context["lease_owner"]),
+            priority=int(context["priority"]),
+            policy=fusionsolar_production_kpi_policy(),
+        )
+        if not reservation.granted:
+            raise ApiSlotUnavailableError(
+                provider=INTEGRATION_PROVIDER_FUSIONSOLAR,
+                account_key=account_key_value,
+                api_area=PRODUCTION_KPI_AREA,
+                next_attempt_at=reservation.next_attempt_at,
+                wait_reason=reservation.wait_reason,
+            )
+        try:
+            return callback()
+        except Exception as exc:
+            if is_fusionsolar_rate_limit_error(exc):
+                cooldown_until = datetime.now(LISBON_TIMEZONE) + timedelta(
+                    minutes=fusionsolar_rate_limit_minutes()
+                )
+                record_production_api_407(
+                    queue_conn,
+                    provider=INTEGRATION_PROVIDER_FUSIONSOLAR.lower(),
+                    account_key_value=account_key_value,
+                    api_area=PRODUCTION_KPI_AREA,
+                    cooldown_until=cooldown_until,
+                )
+                postpone_pending_production_jobs_after_407(
+                    queue_conn,
+                    cooldown_until=cooldown_until,
+                    exclude_job_id=int(context["job_id"]),
+                )
+            raise
+        finally:
+            release_api_lease(
+                queue_conn,
+                provider=INTEGRATION_PROVIDER_FUSIONSOLAR.lower(),
+                account_key_value=account_key_value,
+                api_area=PRODUCTION_KPI_AREA,
+                lease_owner=str(context["lease_owner"]),
+            )
 
 
 def fusionsolar_session_cache_minutes() -> int:
@@ -15090,50 +15462,94 @@ def run_fusionsolar_production_sync(
         if not mapped_assets:
             return {"processed": 0, "missing_data": 0, "no_reference": 0, "period_date": target_date.isoformat()}
 
-        station_codes = [str(row["external_id"]).strip() for row in mapped_assets if str(row["external_id"] or "").strip()]
+        already_valid_asset_ids = {
+            int(item["asset_id"])
+            for item in query_all(
+                conn,
+                """
+                SELECT asset_id
+                FROM production_records
+                WHERE provider = ? AND period_type = ? AND period_date = ?
+                  AND production_kwh IS NOT NULL
+                """,
+                (provider, period_type, target_date.isoformat()),
+            )
+        }
+        mapped_assets = [
+            row
+            for row in mapped_assets
+            if int(row["asset_id"]) not in already_valid_asset_ids
+        ]
+        station_codes = [
+            str(row["external_id"]).strip()
+            for row in mapped_assets
+            if str(row["external_id"] or "").strip()
+        ]
+        if not station_codes:
+            return {
+                "processed": 0,
+                "missing_data": 0,
+                "no_reference": 0,
+                "period_date": target_date.isoformat(),
+                "skipped_complete": len(already_valid_asset_ids),
+            }
         session_obj, _ = get_fusionsolar_session(config)
-        retry_after_relogin = False
-        while True:
-            try:
-                if period_type == "month":
-                    endpoint_used = endpoints["month_kpi_endpoint"]
-                    kpi_map = fetch_fusionsolar_kpi_month_map(
-                        session_obj,
-                        endpoints["base_url"],
-                        endpoint_used,
-                        station_codes,
-                        target_date,
-                    )
-                else:
-                    endpoint_used = endpoints["day_kpi_endpoint"]
-                    kpi_map = fetch_fusionsolar_kpi_day_map(
-                        session_obj,
-                        endpoints["base_url"],
-                        endpoint_used,
-                        station_codes,
-                        target_date,
-                    )
-                break
-            except Exception as exc:
-                if is_fusionsolar_session_expired_error(exc) and not retry_after_relogin:
-                    LOGGER.info("FusionSolar production session expired; invalidating cache and retrying login once")
-                    retry_after_relogin = True
-                    invalidate_fusionsolar_session(config)
-                    session_obj, _ = get_fusionsolar_session(config, force_login=True)
-                    continue
-                if isinstance(exc, ApiRateLimitError):
+        endpoint_used = (
+            endpoints["month_kpi_endpoint"]
+            if period_type == "month"
+            else endpoints["day_kpi_endpoint"]
+        )
+        kpi_map: dict[str, dict[str, Any]] = {}
+        requested_station_codes: set[str] = set()
+        deferred_slot_error: ApiSlotUnavailableError | None = None
+        for station_group in chunked(station_codes, 100):
+            retry_after_relogin = False
+            while True:
+                try:
+                    if period_type == "month":
+                        chunk_map = fetch_fusionsolar_kpi_month_map(
+                            session_obj,
+                            endpoints["base_url"],
+                            endpoint_used,
+                            station_group,
+                            target_date,
+                        )
+                    else:
+                        chunk_map = fetch_fusionsolar_kpi_day_map(
+                            session_obj,
+                            endpoints["base_url"],
+                            endpoint_used,
+                            station_group,
+                            target_date,
+                        )
+                    kpi_map.update(chunk_map)
+                    requested_station_codes.update(station_group)
+                    break
+                except ApiSlotUnavailableError as exc:
+                    deferred_slot_error = exc
+                    break
+                except Exception as exc:
+                    if is_fusionsolar_session_expired_error(exc) and not retry_after_relogin:
+                        LOGGER.info("FusionSolar production session expired; invalidating cache and retrying login once")
+                        retry_after_relogin = True
+                        invalidate_fusionsolar_session(config)
+                        session_obj, _ = get_fusionsolar_session(config, force_login=True)
+                        continue
+                    if isinstance(exc, (ApiRateLimitError, ApiSlotUnavailableError)):
+                        raise
+                    if is_fusionsolar_rate_limit_error(exc):
+                        reason = mark_fusionsolar_performance_rate_limited(conn)
+                        conn.commit()
+                        return {
+                            "processed": 0,
+                            "missing_data": 0,
+                            "no_reference": 0,
+                            "period_date": target_date.isoformat(),
+                            "stopped_reason": reason,
+                        }
                     raise
-                if is_fusionsolar_rate_limit_error(exc):
-                    reason = mark_fusionsolar_performance_rate_limited(conn)
-                    conn.commit()
-                    return {
-                        "processed": 0,
-                        "missing_data": 0,
-                        "no_reference": 0,
-                        "period_date": target_date.isoformat(),
-                        "stopped_reason": reason,
-                    }
-                raise
+            if deferred_slot_error is not None:
+                break
         processed = 0
         missing_data = 0
         no_reference = 0
@@ -15141,6 +15557,8 @@ def run_fusionsolar_production_sync(
         for row in mapped_assets:
             asset_id = int(row["asset_id"])
             external_id = str(row["external_id"] or "").strip()
+            if external_id not in requested_station_codes:
+                continue
             kpi_row = kpi_map.get(external_id, {})
             data_item_map = kpi_row.get("dataItemMap") if isinstance(kpi_row, dict) else {}
             if not isinstance(data_item_map, dict):
@@ -15231,6 +15649,8 @@ def run_fusionsolar_production_sync(
             missing_data,
         )
         conn.commit()
+        if deferred_slot_error is not None:
+            raise deferred_slot_error
         return {
             "processed": processed,
             "missing_data": missing_data,
@@ -15577,6 +15997,8 @@ def _run_fusionsolar_production_backfill_legacy(
                     summary["missing_production"] += 1
             except Exception as exc:
                 summary["api_errors"] += 1
+                if isinstance(exc, ApiSlotUnavailableError):
+                    raise
                 logger.warning(
                     "FusionSolar performance backfill failed: asset_id=%s stationCode=%s period_type=%s period_date=%s error=%s",
                     asset["asset_id"],
@@ -15628,6 +16050,8 @@ def _run_fusionsolar_production_backfill_legacy(
                 summary["mtd_records_updated"] += 1
             except Exception as exc:
                 summary["api_errors"] += 1
+                if isinstance(exc, ApiSlotUnavailableError):
+                    raise
                 logger.warning(
                     "FusionSolar MTD recalculation failed after backfill: asset_id=%s stationCode=%s error=%s",
                     asset["asset_id"],
@@ -15763,8 +16187,16 @@ def run_fusionsolar_production_backfill(
         session_obj, _ = get_fusionsolar_session(config, force_login=True)
         logger.warning("FusionSolar session refreshed after expired login: context=%s error=%s", context, exc)
 
-    def store_kpi_map(period_date_value: date, kpi_map_value: dict[str, dict[str, Any]], record_type: str, notes_prefix: str) -> None:
-        for external_id_value, asset in assets_by_external_id.items():
+    def store_kpi_map(
+        period_date_value: date,
+        kpi_map_value: dict[str, dict[str, Any]],
+        record_type: str,
+        notes_prefix: str,
+        external_ids: list[str] | None = None,
+    ) -> None:
+        selected_external_ids = external_ids or list(assets_by_external_id)
+        for external_id_value in selected_external_ids:
+            asset = assets_by_external_id[external_id_value]
             result = store_production_kpi_record(
                 conn,
                 asset_row=asset,
@@ -15783,13 +16215,29 @@ def run_fusionsolar_production_backfill(
                 summary["missing_production"] += 1
 
     def wait_before_next_call() -> None:
-        if kpi_call_delay_seconds and kpi_call_delay_seconds > 0:
+        if (
+            PRODUCTION_KPI_CALL_CONTEXT.get() is None
+            and kpi_call_delay_seconds
+            and kpi_call_delay_seconds > 0
+        ):
             sleep_func(kpi_call_delay_seconds)
 
     if period_type == "day":
         for month_value in dates:
             month_had_records = False
-            station_chunks = chunked(station_codes, 100)
+            month_station_codes = [
+                external_id
+                for external_id, asset in assets_by_external_id.items()
+                if evaluate_local_monthly_production_quality(
+                    conn,
+                    asset_id=int(asset["asset_id"]),
+                    provider=provider,
+                    month_start=month_value,
+                    reference_date=today_value,
+                ).status
+                != "complete"
+            ]
+            station_chunks = chunked(month_station_codes, 100)
             for chunk_index, station_group in enumerate(station_chunks, start=1):
                 session_retry_used = False
                 while True:
@@ -15871,7 +16319,7 @@ def run_fusionsolar_production_backfill(
                         break
                     except Exception as exc:
                         summary["api_errors"] += 1
-                        if isinstance(exc, ApiRateLimitError):
+                        if isinstance(exc, (ApiRateLimitError, ApiSlotUnavailableError)):
                             raise
                         if is_fusionsolar_rate_limit_error(exc):
                             reason = mark_fusionsolar_performance_rate_limited(conn)
@@ -15928,19 +16376,26 @@ def run_fusionsolar_production_backfill(
                 try:
                     if summary["api_calls_used"] > 0:
                         wait_before_next_call()
-                    kpi_map = fetch_fusionsolar_kpi_month_map(
-                        session_obj,
-                        endpoints["base_url"],
-                        endpoints["month_kpi_endpoint"],
-                        station_codes,
-                        current_month,
-                    )
-                    summary["api_calls_used"] += max(1, len(chunked(station_codes, 100)))
-                    store_kpi_map(current_month, kpi_map, "mtd", "MTD recalculado apos backfill.")
+                    for station_group in chunked(station_codes, 100):
+                        kpi_map = fetch_fusionsolar_kpi_month_map(
+                            session_obj,
+                            endpoints["base_url"],
+                            endpoints["month_kpi_endpoint"],
+                            station_group,
+                            current_month,
+                        )
+                        summary["api_calls_used"] += 1
+                        store_kpi_map(
+                            current_month,
+                            kpi_map,
+                            "mtd",
+                            "MTD recalculado apos backfill.",
+                            station_group,
+                        )
                     break
                 except Exception as exc:
                     summary["api_errors"] += 1
-                    if isinstance(exc, ApiRateLimitError):
+                    if isinstance(exc, (ApiRateLimitError, ApiSlotUnavailableError)):
                         raise
                     if is_fusionsolar_rate_limit_error(exc):
                         reason = mark_fusionsolar_performance_rate_limited(conn)
@@ -15984,19 +16439,26 @@ def run_fusionsolar_production_backfill(
                     break
                 if summary["api_calls_used"] > 0:
                     wait_before_next_call()
-                kpi_map = fetch_fusionsolar_kpi_month_map(
-                    session_obj,
-                    endpoints["base_url"],
-                    endpoints["month_kpi_endpoint"],
-                    station_codes,
-                    period_date_value,
-                )
-                summary["api_calls_used"] += max(1, len(chunked(station_codes, 100)))
-                store_kpi_map(period_date_value, kpi_map, period_type, "Backfill historico.")
+                for station_group in chunked(station_codes, 100):
+                    kpi_map = fetch_fusionsolar_kpi_month_map(
+                        session_obj,
+                        endpoints["base_url"],
+                        endpoints["month_kpi_endpoint"],
+                        station_group,
+                        period_date_value,
+                    )
+                    summary["api_calls_used"] += 1
+                    store_kpi_map(
+                        period_date_value,
+                        kpi_map,
+                        period_type,
+                        "Backfill historico.",
+                        station_group,
+                    )
                 stored_current_date = True
                 break
             except Exception as exc:
-                if isinstance(exc, ApiRateLimitError):
+                if isinstance(exc, (ApiRateLimitError, ApiSlotUnavailableError)):
                     raise
                 if is_fusionsolar_rate_limit_error(exc):
                     summary["api_errors"] += 1
@@ -16057,7 +16519,7 @@ def run_fusionsolar_production_backfill(
                     break
                 except Exception as asset_exc:
                     summary["api_errors"] += 1
-                    if isinstance(asset_exc, ApiRateLimitError):
+                    if isinstance(asset_exc, (ApiRateLimitError, ApiSlotUnavailableError)):
                         raise
                     if is_fusionsolar_rate_limit_error(asset_exc):
                         reason = mark_fusionsolar_performance_rate_limited(conn)
@@ -16114,19 +16576,26 @@ def run_fusionsolar_production_backfill(
             try:
                 if summary["api_calls_used"] > 0:
                     wait_before_next_call()
-                kpi_map = fetch_fusionsolar_kpi_month_map(
-                    session_obj,
-                    endpoints["base_url"],
-                    endpoints["month_kpi_endpoint"],
-                    station_codes,
-                    current_month,
-                )
-                summary["api_calls_used"] += max(1, len(chunked(station_codes, 100)))
-                store_kpi_map(current_month, kpi_map, "mtd", "MTD recalculado apos backfill.")
+                for station_group in chunked(station_codes, 100):
+                    kpi_map = fetch_fusionsolar_kpi_month_map(
+                        session_obj,
+                        endpoints["base_url"],
+                        endpoints["month_kpi_endpoint"],
+                        station_group,
+                        current_month,
+                    )
+                    summary["api_calls_used"] += 1
+                    store_kpi_map(
+                        current_month,
+                        kpi_map,
+                        "mtd",
+                        "MTD recalculado apos backfill.",
+                        station_group,
+                    )
                 break
             except Exception as exc:
                 summary["api_errors"] += 1
-                if isinstance(exc, ApiRateLimitError):
+                if isinstance(exc, (ApiRateLimitError, ApiSlotUnavailableError)):
                     raise
                 if is_fusionsolar_rate_limit_error(exc):
                     reason = mark_fusionsolar_performance_rate_limited(conn)
@@ -16210,6 +16679,7 @@ def run_fusionsolar_month_close(
     *,
     provider: str = "FusionSolar",
     report_month: str,
+    asset_ids: list[int] | None = None,
     reference_date: date | None = None,
     kpi_call_delay_seconds: float | None = None,
     sleeper: Any | None = None,
@@ -16225,7 +16695,11 @@ def run_fusionsolar_month_close(
     if not config["enabled"]:
         raise ValueError("A integracao FusionSolar esta desativada.")
     endpoints = get_fusionsolar_endpoint_config(config)
-    assets = get_fusionsolar_performance_assets(conn, provider)
+    assets = get_fusionsolar_performance_assets(
+        conn,
+        provider,
+        asset_ids=asset_ids,
+    )
     assets_by_id = {int(asset["asset_id"]): asset for asset in assets}
     assets_by_external_id = {
         str(asset["external_id"] or "").strip(): asset
@@ -16344,7 +16818,12 @@ def run_fusionsolar_month_close(
         nonlocal session_obj
         relogin_used = False
         while True:
-            if summary["api_calls_used"] and delay_seconds and delay_seconds > 0:
+            if (
+                PRODUCTION_KPI_CALL_CONTEXT.get() is None
+                and summary["api_calls_used"]
+                and delay_seconds
+                and delay_seconds > 0
+            ):
                 sleep_func(delay_seconds)
             summary["api_calls_attempted"] += 1
             try:
@@ -16533,7 +17012,12 @@ def run_fusionsolar_month_cycle(
         sleep_func(seconds)
 
     def wait_between_calls() -> None:
-        if summary["api_calls_used"] > 0 and kpi_call_delay_seconds and kpi_call_delay_seconds > 0:
+        if (
+            PRODUCTION_KPI_CALL_CONTEXT.get() is None
+            and summary["api_calls_used"] > 0
+            and kpi_call_delay_seconds
+            and kpi_call_delay_seconds > 0
+        ):
             sleep_func(kpi_call_delay_seconds)
 
     def refresh_session_after_expiry(exc: Exception, context: str) -> None:
@@ -16583,7 +17067,7 @@ def run_fusionsolar_month_cycle(
                 break
             except Exception as exc:
                 summary["api_errors"] += 1
-                if isinstance(exc, ApiRateLimitError):
+                if isinstance(exc, (ApiRateLimitError, ApiSlotUnavailableError)):
                     raise
                 if is_fusionsolar_rate_limit_error(exc):
                     wait_after_rate_limit(mark_fusionsolar_performance_rate_limited(conn))
@@ -16630,7 +17114,7 @@ def run_fusionsolar_month_cycle(
                 break
             except Exception as exc:
                 summary["api_errors"] += 1
-                if isinstance(exc, ApiRateLimitError):
+                if isinstance(exc, (ApiRateLimitError, ApiSlotUnavailableError)):
                     raise
                 if is_fusionsolar_rate_limit_error(exc):
                     wait_after_rate_limit(mark_fusionsolar_performance_rate_limited(conn))

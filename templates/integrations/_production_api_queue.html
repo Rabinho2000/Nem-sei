@@ -1,0 +1,39 @@
+{% if production_api_queue_states %}
+<section class="card">
+  <div class="section-title">
+    <h3>Fila de produção API</h3>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Fornecedor</th>
+          <th>Próxima chamada</th>
+          <th>Jobs em espera</th>
+          <th>Chamadas hoje</th>
+          <th>Orçamento diário</th>
+          <th>Último 407</th>
+          <th>Previsão de retoma</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for state in production_api_queue_states %}
+        <tr>
+          <td>{{ state.provider|title }}</td>
+          <td>{{ state.next_allowed_at or "Disponível" }}</td>
+          <td>{{ state.waiting_jobs }}</td>
+          <td>{{ state.daily_call_count }}</td>
+          <td>{{ state.daily_budget if state.daily_budget is not none else "Por validar" }}</td>
+          <td>{{ state.last_407_at or "-" }}</td>
+          <td>{{ state.resume_forecast or "Disponível" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="muted">
+    O orçamento e os intervalos são persistentes por fornecedor, credencial e endpoint.
+    A fila recupera automaticamente após reinícios e leases expirados.
+  </p>
+</section>
+{% endif %}
