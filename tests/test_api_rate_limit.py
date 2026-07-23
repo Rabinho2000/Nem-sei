@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -99,7 +99,9 @@ def test_background_job_waits_rate_limit_and_reschedules(tmp_path, monkeypatch) 
         flask_app.config["DATABASE"] = original_database
 
     assert job["status"] == "waiting_rate_limit"
-    assert job["next_attempt_at"] == cooldown_until.isoformat(timespec="seconds")
+    assert job["next_attempt_at"] == cooldown_until.replace(
+        tzinfo=timezone.utc
+    ).isoformat(timespec="seconds")
     assert "limitado" in job["error_message"]
     assert scheduled == [(job_id, cooldown_until)]
 

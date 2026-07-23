@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from threading import Barrier
 from zoneinfo import ZoneInfo
 
@@ -421,7 +421,7 @@ def test_waiting_api_slot_jobs_reactivate_after_restart_when_due(
     db_path = tmp_path / "waiting-jobs.db"
     ensure_database(str(db_path))
     conn = get_db(str(db_path))
-    now = datetime.now()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     due_id = conn.execute(
         """
         INSERT INTO background_jobs (

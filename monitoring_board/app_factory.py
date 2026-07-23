@@ -273,6 +273,14 @@ from monitoring_board.services.api_rate_limit import (
     record_api_success,
     require_not_in_cooldown,
 )
+from monitoring_board.services.background_job_time import (
+    as_background_job_utc,
+    background_job_timestamp_is_due,
+    background_job_timestamp_to_lisbon,
+    background_job_utc_now,
+    parse_background_job_timestamp,
+    serialize_background_job_timestamp,
+)
 from monitoring_board.services.production_api_queue import (
     ApiQueuePolicy,
     ApiSlotUnavailableError,
@@ -6285,7 +6293,7 @@ def create_background_job(
         if existing is not None:
             return int(existing["id"]), False
 
-    now = datetime.now().isoformat(timespec="seconds")
+    now = serialize_background_job_timestamp()
     cursor = conn.execute(
         """
         INSERT INTO background_jobs (job_type, status, params_json, created_at)
@@ -6297,29 +6305,51 @@ def create_background_job(
 
 
 def mark_background_job_running(conn: sqlite3.Connection, job_id: int) -> bool:
-    now = datetime.now().isoformat(timespec="seconds")
-    cursor = conn.execute(
-        """
-        UPDATE background_jobs
-        SET status = 'running', started_at = ?, error_message = NULL,
-            next_attempt_at = NULL, wait_reason = NULL
-        WHERE id = ?
-          AND (
-            status = 'pending'
-            OR (
-                status IN ('waiting_rate_limit', 'waiting_api_slot')
-                AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+    now_value = background_job_utc_now()
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        job = conn.execute(
+            "SELECT status, next_attempt_at FROM background_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        if job is None:
+            conn.commit()
+            return False
+        status = str(job["status"] or "")
+        may_start = status == "pending" or (
+            status in {"waiting_rate_limit", "waiting_api_slot"}
+            and background_job_timestamp_is_due(
+                job["next_attempt_at"],
+                now=now_value,
             )
-          )
-        """,
-        (now, job_id, now),
-    )
-    conn.commit()
-    return cursor.rowcount == 1
+        )
+        if not may_start:
+            conn.commit()
+            return False
+        cursor = conn.execute(
+            """
+            UPDATE background_jobs
+            SET status = 'running', started_at = ?, error_message = NULL,
+                next_attempt_at = NULL, wait_reason = NULL
+            WHERE id = ? AND status = ?
+            """,
+            (
+                serialize_background_job_timestamp(now_value),
+                job_id,
+                status,
+            ),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def mark_background_job_success(conn: sqlite3.Connection, job_id: int, result: dict[str, Any]) -> None:
-    now = datetime.now().isoformat(timespec="seconds")
+    now = serialize_background_job_timestamp()
     conn.execute(
         """
         UPDATE background_jobs
@@ -6333,7 +6363,7 @@ def mark_background_job_success(conn: sqlite3.Connection, job_id: int, result: d
 
 
 def mark_background_job_failed(conn: sqlite3.Connection, job_id: int, error_message: str) -> None:
-    now = datetime.now().isoformat(timespec="seconds")
+    now = serialize_background_job_timestamp()
     conn.execute(
         """
         UPDATE background_jobs
@@ -6354,7 +6384,7 @@ def mark_background_job_waiting_rate_limit(
     error_message: str,
     result: dict[str, Any] | None = None,
 ) -> None:
-    now = datetime.now().isoformat(timespec="seconds")
+    now = serialize_background_job_timestamp()
     conn.execute(
         """
         UPDATE background_jobs
@@ -6370,7 +6400,7 @@ def mark_background_job_waiting_rate_limit(
             error_message[:2000],
             json.dumps(result or {}, ensure_ascii=True, sort_keys=True),
             now,
-            next_attempt_at.isoformat(timespec="seconds"),
+            serialize_background_job_timestamp(next_attempt_at),
             job_id,
         ),
     )
@@ -6386,7 +6416,7 @@ def mark_background_job_waiting_api_slot(
     error_message: str,
     result: dict[str, Any] | None = None,
 ) -> None:
-    now = datetime.now().isoformat(timespec="seconds")
+    now = serialize_background_job_timestamp()
     conn.execute(
         """
         UPDATE background_jobs
@@ -6402,9 +6432,7 @@ def mark_background_job_waiting_api_slot(
             error_message[:2000],
             json.dumps(result or {}, ensure_ascii=True, sort_keys=True),
             now,
-            next_attempt_at.astimezone(LISBON_TIMEZONE)
-            .replace(tzinfo=None)
-            .isoformat(timespec="seconds"),
+            serialize_background_job_timestamp(next_attempt_at),
             wait_reason,
             job_id,
         ),
@@ -6420,7 +6448,7 @@ def postpone_pending_production_jobs_after_407(
 ) -> int:
     placeholders = ", ".join("?" for _ in FUSIONSOLAR_PRODUCTION_JOB_TYPES)
     params: list[Any] = [
-        cooldown_until.isoformat(timespec="seconds"),
+        serialize_background_job_timestamp(cooldown_until),
         "cooldown_407",
         "FusionSolar production KPI em cooldown global apos 407.",
         *FUSIONSOLAR_PRODUCTION_JOB_TYPES,
@@ -6451,21 +6479,38 @@ def mark_stale_running_background_jobs_failed(
     conn: sqlite3.Connection,
     stale_after_minutes: int = BACKGROUND_JOB_STALE_RUNNING_MINUTES,
 ) -> int:
-    cutoff = datetime.now() - timedelta(minutes=stale_after_minutes)
-    now = datetime.now().isoformat(timespec="seconds")
-    cursor = conn.execute(
+    now_value = background_job_utc_now()
+    cutoff = now_value - timedelta(minutes=stale_after_minutes)
+    rows = conn.execute(
         """
+        SELECT id, started_at, created_at
+        FROM background_jobs
+        WHERE status = 'running'
+        """
+    ).fetchall()
+    stale_ids: list[int] = []
+    for row in rows:
+        started_at = parse_background_job_timestamp(
+            row["started_at"] or row["created_at"]
+        )
+        if started_at is not None and started_at < cutoff:
+            stale_ids.append(int(row["id"]))
+    if not stale_ids:
+        return 0
+    placeholders = ", ".join("?" for _ in stale_ids)
+    cursor = conn.execute(
+        f"""
         UPDATE background_jobs
         SET status = 'failed',
             error_message = ?,
             finished_at = ?
         WHERE status = 'running'
-          AND COALESCE(started_at, created_at) < ?
+          AND id IN ({placeholders})
         """,
         (
             f"Job marked failed on startup after being running for more than {stale_after_minutes} minutes.",
-            now,
-            cutoff.isoformat(timespec="seconds"),
+            serialize_background_job_timestamp(now_value),
+            *stale_ids,
         ),
     )
     conn.commit()
@@ -6473,17 +6518,35 @@ def mark_stale_running_background_jobs_failed(
 
 
 def reactivate_due_rate_limited_background_jobs(conn: sqlite3.Connection) -> int:
-    now = datetime.now().isoformat(timespec="seconds")
-    cursor = conn.execute(
+    now_value = background_job_utc_now()
+    rows = conn.execute(
         """
+        SELECT id, next_attempt_at
+        FROM background_jobs
+        WHERE status IN ('waiting_rate_limit', 'waiting_api_slot')
+        """
+    ).fetchall()
+    due_ids = [
+        int(row["id"])
+        for row in rows
+        if background_job_timestamp_is_due(
+            row["next_attempt_at"],
+            now=now_value,
+        )
+    ]
+    if not due_ids:
+        return 0
+    placeholders = ", ".join("?" for _ in due_ids)
+    cursor = conn.execute(
+        f"""
         UPDATE background_jobs
         SET status = 'pending',
             error_message = NULL,
             finished_at = NULL
         WHERE status IN ('waiting_rate_limit', 'waiting_api_slot')
-          AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+          AND id IN ({placeholders})
         """,
-        (now,),
+        due_ids,
     )
     conn.commit()
     return cursor.rowcount
@@ -6500,6 +6563,31 @@ def fetch_pending_background_job_ids(conn: sqlite3.Connection) -> list[int]:
         """,
     )
     return [int(row["id"]) for row in rows]
+
+
+def fetch_future_waiting_background_jobs(
+    conn: sqlite3.Connection,
+    *,
+    now: datetime | None = None,
+) -> list[tuple[int, datetime]]:
+    now_value = as_background_job_utc(now or background_job_utc_now())
+    rows = conn.execute(
+        """
+        SELECT id, next_attempt_at
+        FROM background_jobs
+        WHERE status IN ('waiting_rate_limit', 'waiting_api_slot')
+          AND next_attempt_at IS NOT NULL
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    scheduled: list[tuple[int, datetime]] = []
+    for row in rows:
+        next_attempt_at = parse_background_job_timestamp(
+            row["next_attempt_at"]
+        )
+        if next_attempt_at is not None and next_attempt_at > now_value:
+            scheduled.append((int(row["id"]), next_attempt_at))
+    return scheduled
 
 
 def fetch_latest_background_jobs(
@@ -6528,6 +6616,15 @@ def fetch_latest_background_jobs(
     jobs: list[dict[str, Any]] = []
     for row in rows:
         job = dict(row)
+        for timestamp_field in (
+            "created_at",
+            "started_at",
+            "finished_at",
+            "next_attempt_at",
+        ):
+            job[timestamp_field] = background_job_timestamp_to_lisbon(
+                row[timestamp_field]
+            )
         params_payload = decode_job_params(row["params_json"])
         provider, api_area = background_job_api_scope(str(row["job_type"]), params_payload)
         job["provider"] = params_payload.get("provider") or provider or ""
@@ -6567,7 +6664,12 @@ def fetch_latest_background_jobs(
                 if result.get("stopped_reason"):
                     parts.append(str(result["stopped_reason"]))
                 if result.get("cooldown_until"):
-                    parts.append(f"nova tentativa: {result['cooldown_until']}")
+                    cooldown_label = background_job_timestamp_to_lisbon(
+                        result["cooldown_until"]
+                    )
+                    parts.append(
+                        f"nova tentativa: {cooldown_label or result['cooldown_until']}"
+                    )
                 elif result.get("status"):
                     parts.append(f"estado: {result['status']}")
                 result_summary = " | ".join(parts)
@@ -11494,10 +11596,13 @@ def schedule_background_job(app: Flask, job_id: int, run_date: datetime | None =
     if SCHEDULER is None:
         app.logger.error("Background job %s was queued but APScheduler is not running", job_id)
         return False
+    scheduled_at = as_background_job_utc(
+        run_date or background_job_utc_now()
+    )
     SCHEDULER.add_job(
         func=run_background_job,
         trigger="date",
-        run_date=run_date or datetime.now(),
+        run_date=scheduled_at,
         args=[app, job_id],
         id=f"background-job-{job_id}",
         replace_existing=True,
@@ -11521,21 +11626,41 @@ def schedule_pending_background_jobs(app: Flask) -> dict[str, Any]:
         if reactivated_count:
             app.logger.info("Reactivated %s background jobs after API cooldown", reactivated_count)
         pending_job_ids = fetch_pending_background_job_ids(conn)
+        future_waiting_jobs = fetch_future_waiting_background_jobs(conn)
     failed_job_ids: list[int] = []
     for job_id in pending_job_ids:
         if not schedule_background_job(app, job_id):
             failed_job_ids.append(job_id)
+    failed_waiting_job_ids: list[int] = []
+    for job_id, next_attempt_at in future_waiting_jobs:
+        if not schedule_background_job(
+            app,
+            job_id,
+            run_date=next_attempt_at,
+        ):
+            failed_waiting_job_ids.append(job_id)
     scheduled_count = len(pending_job_ids) - len(failed_job_ids)
+    waiting_scheduled_count = (
+        len(future_waiting_jobs) - len(failed_waiting_job_ids)
+    )
     if scheduled_count:
         app.logger.info("Scheduled %s pending background jobs on startup", scheduled_count)
     if failed_job_ids:
         app.logger.warning("Could not schedule pending background jobs on startup: %s", failed_job_ids)
+    if failed_waiting_job_ids:
+        app.logger.warning(
+            "Could not restore waiting background jobs on startup: %s",
+            failed_waiting_job_ids,
+        )
     return {
         "stale_running_failed": recovered_count,
         "rate_limit_reactivated": reactivated_count,
         "pending_found": len(pending_job_ids),
         "pending_scheduled": scheduled_count,
         "pending_schedule_failed_ids": failed_job_ids,
+        "waiting_found": len(future_waiting_jobs),
+        "waiting_scheduled": waiting_scheduled_count,
+        "waiting_schedule_failed_ids": failed_waiting_job_ids,
     }
 
 
@@ -11565,7 +11690,9 @@ def run_background_job(app: Flask, job_id: int) -> None:
                     "provider": exc.provider,
                     "api_area": exc.api_area,
                     "wait_reason": exc.wait_reason,
-                    "next_attempt_at": exc.next_attempt_at.isoformat(timespec="seconds"),
+                    "next_attempt_at": serialize_background_job_timestamp(
+                        exc.next_attempt_at
+                    ),
                     "stopped_reason": exc.message,
                 }
                 mark_background_job_waiting_api_slot(
@@ -11591,8 +11718,12 @@ def run_background_job(app: Flask, job_id: int) -> None:
                     "status": "waiting_rate_limit",
                     "provider": exc.provider,
                     "api_area": exc.area,
-                    "cooldown_until": exc.cooldown_until.isoformat(timespec="seconds"),
-                    "next_attempt_at": exc.cooldown_until.isoformat(timespec="seconds"),
+                    "cooldown_until": serialize_background_job_timestamp(
+                        exc.cooldown_until
+                    ),
+                    "next_attempt_at": serialize_background_job_timestamp(
+                        exc.cooldown_until
+                    ),
                     "stopped_reason": exc.message,
                 }
                 if str(job["job_type"]) == "fusionsolar_month_close":
@@ -11953,7 +12084,19 @@ def latest_background_job_for_type(conn: sqlite3.Connection, job_type: str) -> d
         """,
         (job_type,),
     ).fetchone()
-    return dict(row) if row else None
+    if row is None:
+        return None
+    job = dict(row)
+    for timestamp_field in (
+        "created_at",
+        "started_at",
+        "finished_at",
+        "next_attempt_at",
+    ):
+        job[timestamp_field] = background_job_timestamp_to_lisbon(
+            row[timestamp_field]
+        )
+    return job
 
 
 def scheduler_next_run_label(job_id: str) -> str:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import app as app_module
 from app import ensure_database, schedule_pending_background_jobs
@@ -72,6 +72,9 @@ def test_pending_background_job_recovery_schedules_every_pending_job_in_id_order
         "pending_found": 12,
         "pending_scheduled": 12,
         "pending_schedule_failed_ids": [],
+        "waiting_found": 0,
+        "waiting_scheduled": 0,
+        "waiting_schedule_failed_ids": [],
     }
 
 
@@ -81,7 +84,7 @@ def test_background_job_recovery_reports_stale_and_failed_scheduling_without_los
 ) -> None:
     db_path = tmp_path / "background-jobs.db"
     ensure_database(str(db_path))
-    now = datetime.now()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     stale_started_at = (now - timedelta(minutes=45)).isoformat(timespec="seconds")
     fresh_started_at = now.isoformat(timespec="seconds")
     conn = get_db(str(db_path))
@@ -132,6 +135,9 @@ def test_background_job_recovery_reports_stale_and_failed_scheduling_without_los
         "pending_found": 2,
         "pending_scheduled": 1,
         "pending_schedule_failed_ids": [failed_pending_id],
+        "waiting_found": 0,
+        "waiting_scheduled": 0,
+        "waiting_schedule_failed_ids": [],
     }
     assert stale_job["status"] == "failed"
     assert "running for more than 30 minutes" in stale_job["error_message"]
@@ -146,8 +152,9 @@ def test_background_job_recovery_reports_stale_and_failed_scheduling_without_los
 def test_due_rate_limited_background_jobs_are_reactivated_and_scheduled(tmp_path, monkeypatch) -> None:
     db_path = tmp_path / "background-rate-limit.db"
     ensure_database(str(db_path))
-    due = (datetime.now() - timedelta(minutes=1)).isoformat(timespec="seconds")
-    future = (datetime.now() + timedelta(minutes=10)).isoformat(timespec="seconds")
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    due = (now - timedelta(minutes=1)).isoformat(timespec="seconds")
+    future = (now + timedelta(minutes=10)).isoformat(timespec="seconds")
     conn = get_db(str(db_path))
     try:
         due_id = insert_background_job(conn, status="waiting_rate_limit", next_attempt_at=due)
@@ -156,8 +163,15 @@ def test_due_rate_limited_background_jobs_are_reactivated_and_scheduled(tmp_path
     finally:
         conn.close()
 
-    scheduled_ids: list[int] = []
-    monkeypatch.setattr(app_module, "schedule_background_job", lambda _app, job_id: scheduled_ids.append(job_id) or True)
+    scheduled: list[tuple[int, datetime | None]] = []
+    monkeypatch.setattr(
+        app_module,
+        "schedule_background_job",
+        lambda _app, job_id, run_date=None: scheduled.append(
+            (job_id, run_date)
+        )
+        or True,
+    )
 
     previous_db = app_module.app.config["DATABASE"]
     try:
@@ -172,8 +186,13 @@ def test_due_rate_limited_background_jobs_are_reactivated_and_scheduled(tmp_path
     finally:
         conn.close()
 
-    assert scheduled_ids == [due_id]
+    assert [job_id for job_id, _run_date in scheduled] == [due_id, future_id]
+    assert scheduled[0][1] is None
+    assert scheduled[1][1] == datetime.fromisoformat(future).replace(
+        tzinfo=timezone.utc
+    )
     assert summary["rate_limit_reactivated"] == 1
+    assert summary["waiting_scheduled"] == 1
     assert due_job["status"] == "pending"
     assert due_job["next_attempt_at"] == due
     assert future_job["status"] == "waiting_rate_limit"
