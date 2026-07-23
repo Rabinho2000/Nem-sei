@@ -5,6 +5,7 @@ import json
 from typing import Any
 
 import app as app_module
+import pytest
 from monitoring_board.db import get_db
 
 
@@ -101,6 +102,7 @@ def test_refresh_scheduler_registers_stable_single_instance_provider_jobs(tmp_pa
         assert "integration-state-fusionsolar-hourly" in second_ids
         assert "integration-production-fusionsolar-daily" in second_ids
         assert "integration-diagnostics-fusionsolar-daily" in second_ids
+        assert "integration-production-fusionsolar-month-close" in second_ids
         assert "integration-state-sigenergy-hourly" in second_ids
 
         recurring_calls = [
@@ -129,6 +131,15 @@ def test_refresh_scheduler_registers_stable_single_instance_provider_jobs(tmp_pa
         assert wat_call["trigger"] == "cron"
         assert wat_call["hour"] == 0
         assert wat_call["minute"] == 30
+
+        month_close_call = next(
+            call for call in fake_scheduler.add_calls
+            if call["id"] == "integration-production-fusionsolar-month-close"
+        )
+        assert month_close_call["trigger"] == "cron"
+        assert month_close_call["day"] == "1-5"
+        assert month_close_call["hour"] == 2
+        assert month_close_call["minute"] == 0
     finally:
         flask_app.config["DATABASE"] = original_database
         app_module.SCHEDULER = original_scheduler
@@ -156,6 +167,7 @@ def test_fusionsolar_disabled_registers_no_provider_jobs(tmp_path, monkeypatch) 
         assert "integration-state-fusionsolar-hourly" not in fake_scheduler.jobs
         assert "integration-production-fusionsolar-daily" not in fake_scheduler.jobs
         assert "integration-diagnostics-fusionsolar-daily" not in fake_scheduler.jobs
+        assert "integration-production-fusionsolar-month-close" not in fake_scheduler.jobs
     finally:
         flask_app.config["DATABASE"] = original_database
         app_module.SCHEDULER = original_scheduler
@@ -221,6 +233,7 @@ def test_fusionsolar_production_sync_flag_controls_daily_job(tmp_path, monkeypat
             )
         app_module.refresh_integration_scheduler(flask_app)
         assert "integration-production-fusionsolar-daily" in fake_scheduler.jobs
+        assert "integration-production-fusionsolar-month-close" in fake_scheduler.jobs
 
         fake_scheduler = FakeScheduler()
         app_module.SCHEDULER = fake_scheduler
@@ -233,6 +246,7 @@ def test_fusionsolar_production_sync_flag_controls_daily_job(tmp_path, monkeypat
             )
         app_module.refresh_integration_scheduler(flask_app)
         assert "integration-production-fusionsolar-daily" not in fake_scheduler.jobs
+        assert "integration-production-fusionsolar-month-close" not in fake_scheduler.jobs
     finally:
         flask_app.config["DATABASE"] = original_database
         app_module.SCHEDULER = original_scheduler
@@ -390,6 +404,68 @@ def test_scheduled_fusionsolar_production_queues_previous_day(tmp_path, monkeypa
         "trigger_type": "scheduled",
     }
     assert scheduled == [job["id"]]
+
+
+@pytest.mark.parametrize(
+    ("scheduler_date", "expected_month"),
+    [
+        (app_module.date(2026, 6, 1), "2026-05"),
+        (app_module.date(2026, 6, 5), "2026-05"),
+        (app_module.date(2026, 1, 3), "2025-12"),
+    ],
+)
+def test_scheduled_fusionsolar_month_close_queues_previous_month_on_days_1_to_5(
+    tmp_path,
+    monkeypatch,
+    scheduler_date,
+    expected_month,
+) -> None:
+    flask_app, original_database = _make_test_app(tmp_path)
+    scheduled: list[int] = []
+    monkeypatch.setattr(app_module, "current_lisbon_date", lambda: scheduler_date)
+    monkeypatch.setattr(app_module, "schedule_background_job", lambda _app, job_id: scheduled.append(job_id) or True)
+    try:
+        with get_db(flask_app.config["DATABASE"]) as conn:
+            _insert_enabled_config(conn, app_module.INTEGRATION_PROVIDER_FUSIONSOLAR)
+
+        app_module.run_scheduled_fusionsolar_month_close(flask_app)
+
+        with get_db(flask_app.config["DATABASE"]) as conn:
+            job = conn.execute(
+                "SELECT id, job_type, status, params_json FROM background_jobs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+    finally:
+        flask_app.config["DATABASE"] = original_database
+
+    params = json.loads(job["params_json"])
+    assert job["job_type"] == "fusionsolar_month_close"
+    assert job["status"] == "pending"
+    assert params["report_month"] == expected_month
+    assert params["report_month"] < scheduler_date.strftime("%Y-%m")
+    assert params["trigger_type"] == "scheduled_month_close"
+    assert scheduled == [job["id"]]
+
+
+def test_scheduled_fusionsolar_month_close_does_not_queue_outside_days_1_to_5(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    flask_app, original_database = _make_test_app(tmp_path)
+    monkeypatch.setattr(app_module, "current_lisbon_date", lambda: app_module.date(2026, 6, 6))
+    try:
+        with get_db(flask_app.config["DATABASE"]) as conn:
+            _insert_enabled_config(conn, app_module.INTEGRATION_PROVIDER_FUSIONSOLAR)
+
+        app_module.run_scheduled_fusionsolar_month_close(flask_app)
+
+        with get_db(flask_app.config["DATABASE"]) as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM background_jobs WHERE job_type = 'fusionsolar_month_close'"
+            ).fetchone()[0]
+    finally:
+        flask_app.config["DATABASE"] = original_database
+
+    assert count == 0
 
 
 def test_scheduled_fusionsolar_wat_reuses_pending_job(tmp_path, monkeypatch) -> None:

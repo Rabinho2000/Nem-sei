@@ -6,8 +6,14 @@ from typing import Any
 import pytest
 
 import app as app_module
-from app import ensure_database, run_fusionsolar_month_cycle, run_fusionsolar_production_backfill
+from app import (
+    ensure_database,
+    run_fusionsolar_month_close,
+    run_fusionsolar_month_cycle,
+    run_fusionsolar_production_backfill,
+)
 from monitoring_board.db import get_db
+from monitoring_board.reporting.financial_quality import apply_production_financial_gate
 
 
 @pytest.fixture()
@@ -62,6 +68,25 @@ def kpi_row(station_code: str, collect_date: date, value: float = 100) -> dict[s
 
 def kpi_map(station_code: str, collect_date: date, value: float = 100) -> dict[str, Any]:
     return {station_code: kpi_row(station_code, collect_date, value)}
+
+
+def insert_production_record(
+    conn,
+    asset_id: int,
+    period_type: str,
+    period_date: date,
+    production_kwh: float | None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO production_records (
+            asset_id, provider, external_id, period_type, period_date, production_kwh,
+            performance_status, data_quality, payload_json, created_at, updated_at
+        ) VALUES (?, 'FusionSolar', 'S1', ?, ?, ?, 'OK', 'ok', '{}', '2026-01-01', '2026-01-01')
+        """,
+        (asset_id, period_type, period_date.isoformat(), production_kwh),
+    )
+    conn.commit()
 
 
 def install_month_rows(monkeypatch: pytest.MonkeyPatch, rows_by_month: dict[str, list[dict[str, Any]]] | None = None):
@@ -521,6 +546,344 @@ def test_month_cycle_waits_and_continues_after_rate_limit(conn, monkeypatch: pyt
     assert result["wait_cycles"] == 1
     assert result["status"] == "completed"
     assert sleeps and sleeps[0] > 0
+
+
+def test_month_close_skips_api_when_monthly_value_is_valid_with_partial_daily_coverage(
+    conn,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset_id = add_asset(conn, "Central A", "S1")
+    insert_production_record(conn, asset_id, "month", date(2026, 1, 1), 100)
+    insert_production_record(conn, asset_id, "day", date(2026, 1, 1), 10)
+    monkeypatch.setattr(
+        app_module,
+        "get_fusionsolar_session",
+        lambda *_args, **_kwargs: pytest.fail("A API nao deve ser chamada para um mes ja completo."),
+    )
+
+    result = run_fusionsolar_month_close(
+        conn,
+        report_month="2026-01",
+        reference_date=date(2026, 2, 1),
+        kpi_call_delay_seconds=0,
+    )
+
+    assert result["states_before"]["complete"] == 1
+    assert result["states_after"]["complete"] == 1
+    assert result["api_calls_used"] == 0
+    assert result["daily_assets_requested"] == 0
+
+
+def test_month_close_treats_zero_monthly_production_as_complete(
+    conn,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset_id = add_asset(conn, "Central Zero", "S1")
+    insert_production_record(conn, asset_id, "month", date(2026, 1, 1), 0)
+    monkeypatch.setattr(
+        app_module,
+        "get_fusionsolar_session",
+        lambda *_args, **_kwargs: pytest.fail("Zero mensal valido nao deve acionar a API."),
+    )
+
+    result = run_fusionsolar_month_close(
+        conn,
+        report_month="2026-01",
+        reference_date=date(2026, 2, 1),
+        kpi_call_delay_seconds=0,
+    )
+
+    assert result["states_after"] == {"complete": 1, "partial": 0, "missing": 0, "conflict": 0}
+    assert result["api_calls_used"] == 0
+
+
+def test_month_close_uses_complete_daily_data_when_monthly_production_is_missing(
+    conn,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset_id = add_asset(conn, "Central A", "S1")
+    fake_session(monkeypatch)
+    monthly_calls: list[tuple[str, ...]] = []
+    daily_calls: list[tuple[str, ...]] = []
+
+    def fetch_month(_session, _base_url, _endpoint, station_codes, _collect_date):
+        monthly_calls.append(tuple(station_codes))
+        return {}
+
+    def fetch_days(_session, _base_url, _endpoint, station_codes, _collect_date):
+        daily_calls.append(tuple(station_codes))
+        return [kpi_row("S1", date(2026, 1, day), 1) for day in range(1, 32)]
+
+    monkeypatch.setattr(app_module, "fetch_fusionsolar_kpi_month_map", fetch_month)
+    monkeypatch.setattr(app_module, "fetch_fusionsolar_kpi_day_rows", fetch_days)
+
+    result = run_fusionsolar_month_close(
+        conn,
+        report_month="2026-01",
+        reference_date=date(2026, 2, 1),
+        kpi_call_delay_seconds=0,
+    )
+    quality = app_module.evaluate_local_monthly_production_quality(
+        conn,
+        asset_id=asset_id,
+        provider="FusionSolar",
+        month_start=date(2026, 1, 1),
+        reference_date=date(2026, 2, 1),
+    )
+
+    assert result["states_before"]["missing"] == 1
+    assert result["states_after"]["complete"] == 1
+    assert quality.status == "complete"
+    assert quality.source == "daily"
+    assert monthly_calls == [("S1",)]
+    assert daily_calls == [("S1",)]
+
+
+def test_month_close_chunks_monthly_requests_at_100_installations(
+    conn,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for index in range(101):
+        add_asset(conn, f"Central {index}", f"S{index}")
+    fake_session(monkeypatch)
+    chunk_sizes: list[int] = []
+
+    def fetch_month(_session, _base_url, _endpoint, station_codes, collect_date):
+        chunk_sizes.append(len(station_codes))
+        return {
+            code: kpi_row(code, collect_date, 10)
+            for code in station_codes
+        }
+
+    monkeypatch.setattr(app_module, "fetch_fusionsolar_kpi_month_map", fetch_month)
+    monkeypatch.setattr(
+        app_module,
+        "fetch_fusionsolar_kpi_day_rows",
+        lambda *_args, **_kwargs: pytest.fail("O KPI mensal valido deve evitar fallback diario."),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "recalculate_performance_references",
+        lambda *_args, **_kwargs: {
+            "records_processed": 1,
+            "references_created": 0,
+            "still_without_reference": 1,
+            "missing_kwp": 0,
+            "missing_production": 0,
+        },
+    )
+
+    result = run_fusionsolar_month_close(
+        conn,
+        report_month="2026-01",
+        reference_date=date(2026, 2, 1),
+        kpi_call_delay_seconds=0,
+    )
+
+    assert chunk_sizes == [100, 1]
+    assert result["api_calls_used"] == 2
+    assert result["states_after"]["complete"] == 101
+
+
+def test_month_close_rechecks_conflict_after_monthly_refresh_without_daily_fallback(
+    conn,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset_id = add_asset(conn, "Central A", "S1")
+    insert_production_record(conn, asset_id, "month", date(2026, 1, 1), 100)
+    for day in range(1, 32):
+        insert_production_record(conn, asset_id, "day", date(2026, 1, day), 200 / 31)
+    fake_session(monkeypatch)
+    monthly_calls: list[tuple[str, ...]] = []
+
+    def fetch_month(_session, _base_url, _endpoint, station_codes, collect_date):
+        monthly_calls.append(tuple(station_codes))
+        return kpi_map("S1", collect_date, 200)
+
+    monkeypatch.setattr(app_module, "fetch_fusionsolar_kpi_month_map", fetch_month)
+    monkeypatch.setattr(
+        app_module,
+        "fetch_fusionsolar_kpi_day_rows",
+        lambda *_args, **_kwargs: pytest.fail("O conflito resolvido pelo mensal nao deve pedir diario."),
+    )
+
+    result = run_fusionsolar_month_close(
+        conn,
+        report_month="2026-01",
+        reference_date=date(2026, 2, 1),
+        kpi_call_delay_seconds=0,
+    )
+
+    assert result["states_before"]["conflict"] == 1
+    assert result["states_after_monthly"]["complete"] == 1
+    assert result["states_after"]["complete"] == 1
+    assert result["daily_assets_requested"] == 0
+    assert monthly_calls == [("S1",)]
+
+
+@pytest.mark.parametrize("report_month", ["2026-02", "2026-03"])
+def test_month_close_never_queries_current_or_future_month(
+    conn,
+    monkeypatch: pytest.MonkeyPatch,
+    report_month: str,
+) -> None:
+    add_asset(conn, "Central A", "S1")
+    monkeypatch.setattr(
+        app_module,
+        "get_fusionsolar_session",
+        lambda *_args, **_kwargs: pytest.fail("Mes atual ou futuro nao pode consultar a API."),
+    )
+
+    with pytest.raises(ValueError, match="meses civis anteriores"):
+        run_fusionsolar_month_close(
+            conn,
+            report_month=report_month,
+            reference_date=date(2026, 2, 15),
+            kpi_call_delay_seconds=0,
+        )
+
+
+def test_month_close_relogs_once_after_305(
+    conn,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    add_asset(conn, "Central A", "S1")
+    login_calls: list[bool] = []
+    month_calls = 0
+
+    def get_session(_config, force_login=False):
+        login_calls.append(force_login)
+        return object(), "token"
+
+    def fetch_month(_session, _base_url, _endpoint, station_codes, collect_date):
+        nonlocal month_calls
+        month_calls += 1
+        if month_calls == 1:
+            raise ValueError("USER_MUST_RELOGIN (failCode=305)")
+        return {code: kpi_row(code, collect_date, 20) for code in station_codes}
+
+    monkeypatch.setattr(app_module, "get_fusionsolar_session", get_session)
+    monkeypatch.setattr(app_module, "invalidate_fusionsolar_session", lambda _config: None)
+    monkeypatch.setattr(app_module, "fetch_fusionsolar_kpi_month_map", fetch_month)
+    monkeypatch.setattr(
+        app_module,
+        "fetch_fusionsolar_kpi_day_rows",
+        lambda *_args, **_kwargs: pytest.fail("O mensal valido apos relogin deve finalizar o mes."),
+    )
+
+    result = run_fusionsolar_month_close(
+        conn,
+        report_month="2026-01",
+        reference_date=date(2026, 2, 1),
+        kpi_call_delay_seconds=0,
+    )
+
+    assert login_calls == [False, True]
+    assert month_calls == 2
+    assert result["api_calls_attempted"] == 2
+    assert result["states_after"]["complete"] == 1
+
+
+def test_month_close_407_waits_persistently_and_reuses_same_job(
+    conn,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    add_asset(conn, "Central A", "S1")
+    fake_session(monkeypatch)
+    monkeypatch.setattr(
+        app_module,
+        "fetch_fusionsolar_kpi_month_map",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("Falha ao obter os KPIs mensais FusionSolar. (failCode=407)")
+        ),
+    )
+    monkeypatch.setattr(app_module, "current_lisbon_date", lambda: date(2026, 2, 3))
+    monkeypatch.setattr(app_module, "schedule_background_job", lambda *_args, **_kwargs: True)
+    params = {
+        "provider": "FusionSolar",
+        "report_month": "2026-01",
+        "trigger_type": "scheduled_month_close",
+    }
+    job_id, created = app_module.create_background_job(conn, "fusionsolar_month_close", params)
+    conn.commit()
+    database_path = conn.execute("PRAGMA database_list").fetchone()["file"]
+    original_database = app_module.app.config["DATABASE"]
+    app_module.app.config["DATABASE"] = database_path
+    try:
+        app_module.run_background_job(app_module.app, job_id)
+    finally:
+        app_module.app.config["DATABASE"] = original_database
+
+    job = conn.execute(
+        "SELECT status, result_json, next_attempt_at FROM background_jobs WHERE id = ?",
+        (job_id,),
+    ).fetchone()
+    duplicate_id, duplicate_created = app_module.create_background_job(
+        conn,
+        "fusionsolar_month_close",
+        {**params, "trigger_type": "reactivation_probe"},
+    )
+    result = app_module.json.loads(job["result_json"])
+
+    assert created is True
+    assert job["status"] == "waiting_rate_limit"
+    assert job["next_attempt_at"]
+    assert result["month"] == "2026-01"
+    assert result["states_before"]["missing"] == 1
+    assert result["states_after"]["missing"] == 1
+    assert result["api_calls_attempted"] == 1
+    assert result["next_attempt_at"] == job["next_attempt_at"]
+    assert duplicate_created is False
+    assert duplicate_id == job_id
+
+
+def test_month_close_does_not_change_snapshots_and_keeps_financials_draft_when_missing(
+    conn,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset_id = add_asset(conn, "Central A", "S1")
+    portfolio_id = conn.execute("INSERT INTO portfolio_groups (name) VALUES ('Snapshot antigo')").lastrowid
+    snapshot_id = conn.execute(
+        """
+        INSERT INTO portfolio_report_runs (
+            portfolio_id, report_month, created_at, notes, summary_json, warnings_json, rows_json
+        ) VALUES (?, '2025-12', '2026-01-01', 'imutavel', '{"old": true}', '[]', '[{"old": true}]')
+        """,
+        (portfolio_id,),
+    ).lastrowid
+    conn.commit()
+    snapshot_before = dict(
+        conn.execute("SELECT * FROM portfolio_report_runs WHERE id = ?", (snapshot_id,)).fetchone()
+    )
+    fake_session(monkeypatch)
+    monkeypatch.setattr(app_module, "fetch_fusionsolar_kpi_month_map", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(app_module, "fetch_fusionsolar_kpi_day_rows", lambda *_args, **_kwargs: [])
+
+    result = run_fusionsolar_month_close(
+        conn,
+        report_month="2026-01",
+        reference_date=date(2026, 2, 1),
+        kpi_call_delay_seconds=0,
+    )
+    snapshot_after = dict(
+        conn.execute("SELECT * FROM portfolio_report_runs WHERE id = ?", (snapshot_id,)).fetchone()
+    )
+    quality = app_module.evaluate_local_monthly_production_quality(
+        conn,
+        asset_id=asset_id,
+        provider="FusionSolar",
+        month_start=date(2026, 1, 1),
+        reference_date=date(2026, 2, 1),
+    )
+    financial_values = {
+        "production_quality_status": quality.status,
+        "estimated_value_eur": 123.45,
+    }
+    apply_production_financial_gate(financial_values)
+
+    assert result["states_after"]["missing"] == 1
+    assert snapshot_after == snapshot_before
+    assert financial_values["estimated_value_eur"] is None
 
 
 def test_reference_recalculation_only_runs_for_imported_dates(conn, monkeypatch: pytest.MonkeyPatch) -> None:
