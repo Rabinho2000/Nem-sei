@@ -145,7 +145,11 @@ def test_device_availability_sync_inserts_devices_snapshots_and_daily_summary(tm
 
         result = app_module.run_fusionsolar_device_availability_sync(conn, "FusionSolar")
 
-        assert result == {"devices": 1, "snapshots": 1, "assets": 1}
+        assert result["devices"] == 1
+        assert result["snapshots"] == 1
+        assert result["assets"] == 1
+        assert result["sampled_days_recalculated_locally"] == 1
+        assert result["sampled_states"] == {"indeterminate": 1}
         assert conn.execute("SELECT COUNT(*) AS total FROM provider_devices").fetchone()["total"] == 1
         snapshot = conn.execute("SELECT * FROM device_realtime_snapshots").fetchone()
         assert snapshot["availability_status"] == "available"

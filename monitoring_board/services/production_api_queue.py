@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 LISBON = ZoneInfo("Europe/Lisbon")
 PRODUCTION_KPI_AREA = "production_kpi"
+WAT_HISTORY_AREA = "wat_history"
 CRITICAL_PRIORITIES = {1, 2}
 
 
@@ -45,6 +46,7 @@ class ApiSlotUnavailableError(ValueError):
         next_attempt_at: datetime,
         wait_reason: str,
         message: str = "",
+        job_result: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message or f"API slot unavailable until {next_attempt_at.isoformat()}")
         self.provider = provider
@@ -53,6 +55,7 @@ class ApiSlotUnavailableError(ValueError):
         self.next_attempt_at = next_attempt_at
         self.wait_reason = wait_reason
         self.message = str(self)
+        self.job_result = job_result or {}
 
 
 def ensure_api_queue_schema(conn: sqlite3.Connection) -> None:
@@ -76,6 +79,20 @@ def ensure_api_queue_schema(conn: sqlite3.Connection) -> None:
             min_interval_seconds INTEGER,
             updated_at TEXT NOT NULL,
             PRIMARY KEY (provider, account_key, api_area)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS provider_api_account_state (
+            provider TEXT NOT NULL,
+            account_key TEXT NOT NULL,
+            lease_until TEXT,
+            lease_owner TEXT,
+            cooldown_until TEXT,
+            last_407_at TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (provider, account_key)
         )
         """
     )
@@ -321,6 +338,189 @@ def release_api_lease(
     conn.commit()
 
 
+def reserve_account_lease(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    account_key_value: str,
+    lease_owner: str,
+    lease_seconds: int = 300,
+    now: datetime | None = None,
+) -> ApiSlotReservation:
+    now = _lisbon_now(now)
+    ensure_api_queue_schema(conn)
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO provider_api_account_state (
+                provider, account_key, updated_at
+            ) VALUES (?, ?, ?)
+            """,
+            (
+                provider,
+                account_key_value,
+                now.isoformat(timespec="seconds"),
+            ),
+        )
+        state = conn.execute(
+            """
+            SELECT *
+            FROM provider_api_account_state
+            WHERE provider = ? AND account_key = ?
+            """,
+            (provider, account_key_value),
+        ).fetchone()
+        cooldown_until = _parse_datetime(state["cooldown_until"])
+        if cooldown_until and cooldown_until > now:
+            conn.commit()
+            return _denied(
+                cooldown_until,
+                "account_cooldown_407",
+                lease_owner,
+                0,
+                None,
+            )
+        lease_until = _parse_datetime(state["lease_until"])
+        active_owner = str(state["lease_owner"] or "")
+        if (
+            lease_until
+            and lease_until > now
+            and active_owner != lease_owner
+        ):
+            conn.commit()
+            return _denied(
+                lease_until,
+                "account_lease",
+                lease_owner,
+                0,
+                None,
+            )
+        new_lease_until = now + timedelta(seconds=max(lease_seconds, 1))
+        conn.execute(
+            """
+            UPDATE provider_api_account_state
+            SET lease_until = ?, lease_owner = ?, updated_at = ?
+            WHERE provider = ? AND account_key = ?
+            """,
+            (
+                new_lease_until.isoformat(timespec="seconds"),
+                lease_owner,
+                now.isoformat(timespec="seconds"),
+                provider,
+                account_key_value,
+            ),
+        )
+        conn.commit()
+        return ApiSlotReservation(
+            granted=True,
+            next_attempt_at=now,
+            wait_reason="",
+            lease_owner=lease_owner,
+            daily_call_count=0,
+            daily_budget=None,
+        )
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def release_account_lease(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    account_key_value: str,
+    lease_owner: str,
+    now: datetime | None = None,
+) -> None:
+    now = _lisbon_now(now)
+    ensure_api_queue_schema(conn)
+    conn.execute(
+        """
+        UPDATE provider_api_account_state
+        SET lease_until = NULL, lease_owner = NULL, updated_at = ?
+        WHERE provider = ? AND account_key = ? AND lease_owner = ?
+        """,
+        (
+            now.isoformat(timespec="seconds"),
+            provider,
+            account_key_value,
+            lease_owner,
+        ),
+    )
+    conn.commit()
+
+
+def record_account_407(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    account_key_value: str,
+    cooldown_until: datetime,
+    now: datetime | None = None,
+) -> None:
+    now = _lisbon_now(now)
+    cooldown_until = _lisbon_now(cooldown_until)
+    ensure_api_queue_schema(conn)
+    conn.execute(
+        """
+        INSERT INTO provider_api_account_state (
+            provider, account_key, cooldown_until, last_407_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(provider, account_key) DO UPDATE SET
+            lease_until = NULL,
+            lease_owner = NULL,
+            cooldown_until = excluded.cooldown_until,
+            last_407_at = excluded.last_407_at,
+            updated_at = excluded.updated_at
+        """,
+        (
+            provider,
+            account_key_value,
+            cooldown_until.isoformat(timespec="seconds"),
+            now.isoformat(timespec="seconds"),
+            now.isoformat(timespec="seconds"),
+        ),
+    )
+    conn.execute(
+        """
+        UPDATE production_api_queue_state
+        SET cooldown_until = ?, next_allowed_at = ?, lease_until = NULL,
+            lease_owner = NULL, last_407_at = ?, updated_at = ?
+        WHERE provider = ? AND account_key = ?
+        """,
+        (
+            cooldown_until.isoformat(timespec="seconds"),
+            cooldown_until.isoformat(timespec="seconds"),
+            now.isoformat(timespec="seconds"),
+            now.isoformat(timespec="seconds"),
+            provider,
+            account_key_value,
+        ),
+    )
+    conn.commit()
+
+
+def get_account_queue_state(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    account_key_value: str,
+) -> dict[str, Any]:
+    ensure_api_queue_schema(conn)
+    row = conn.execute(
+        """
+        SELECT *
+        FROM provider_api_account_state
+        WHERE provider = ? AND account_key = ?
+        """,
+        (provider, account_key_value),
+    ).fetchone()
+    return dict(row) if row else {}
+
+
 def record_api_407(
     conn: sqlite3.Connection,
     *,
@@ -440,8 +640,16 @@ def recover_expired_leases(
         """,
         (now.isoformat(timespec="seconds"), now.isoformat(timespec="seconds")),
     )
+    account_cursor = conn.execute(
+        """
+        UPDATE provider_api_account_state
+        SET lease_until = NULL, lease_owner = NULL, updated_at = ?
+        WHERE lease_until IS NOT NULL AND lease_until <= ?
+        """,
+        (now.isoformat(timespec="seconds"), now.isoformat(timespec="seconds")),
+    )
     conn.commit()
-    return cursor.rowcount
+    return cursor.rowcount + account_cursor.rowcount
 
 
 def _load_or_create_state(

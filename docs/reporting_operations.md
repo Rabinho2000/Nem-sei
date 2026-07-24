@@ -1,5 +1,25 @@
 # Reporting Operations
 
+## Pedidos de dados e disponibilidade
+
+HTML, previews, PDF e Excel leem exclusivamente a SQLite. Quando um mês fechado
+não tem produção final, a geração mantém o relatório em rascunho e
+cria/reutiliza um job deduplicado; nunca espera pela API no pedido HTTP e nunca
+enfileira o mês atual.
+
+WAT contratual continua a vir apenas de `inverter_power_samples`,
+`inverter_availability_daily` e `plant_availability_daily`. A disponibilidade
+calculada de snapshots realtime é guardada separadamente com origem
+`realtime_sampled`, serve apenas de indicação operacional e nunca substitui WAT
+real.
+
+A disponibilidade amostrada só é final quando todos os inversores esperados na
+configuração histórica cobrem a janela de produção observada: extremos a até
+30 minutos, nenhum intervalo acima de 90 minutos e pelo menos
+`max(4, ceil(minutos_da_janela / 90) + 1)` amostras por inversor. Sem janela
+observada fica `no_observed_operating_window`; cobertura incompleta nunca
+produz percentagem final. Um mês com qualquer dia não final também não é final.
+
 This page covers the configurable reporting system after the roadmap hardening
 phase. It is intentionally operational: keep architecture notes in
 `docs/reporting_architecture.md`.

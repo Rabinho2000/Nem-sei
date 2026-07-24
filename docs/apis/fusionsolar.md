@@ -29,13 +29,39 @@ só usam o orçamento não reservado. Quando não existe slot, o job fica em
 `wait_reason=daily_budget` e a retoma ocorre na meia-noite local seguinte.
 
 Reservas, contadores, cooldowns e leases são persistentes. Após um reinício,
-leases expirados são libertados e os jobs vencidos voltam à fila. Um erro 407
-aplica cooldown apenas a `production_kpi`, sem bloquear estado ou diagnósticos.
+leases expirados são libertados e os jobs vencidos voltam à fila.
+
+## Coordenação global da conta e WAT
+
+Produção, estado e diagnósticos partilham uma lease persistente por conta
+FusionSolar, impedindo chamadas concorrentes e bursts entre jobs. O WAT e os
+diagnósticos usam uma área e orçamento próprios,
+`FUSIONSOLAR_WAT_DAILY_BUDGET=36`, sem consumir o orçamento KPI. Não é
+configurado um intervalo WAT artificial enquanto o limite oficial não estiver
+validado.
+
+Um 407 aplica cooldown à conta FusionSolar inteira e adia todos os jobs
+FusionSolar. Sigenergy permanece isolado. A prioridade é: produção diária,
+fecho mensal, backfill manual, pedidos de relatórios e, por fim, WAT/diagnóstico.
+O WAT é resumível: guarda data e inversores já tentados, processa no máximo dez
+inversores por chamada e retoma pelo scheduler sem dormir dentro do pedido.
+
+O inventário de centrais é atualizado uma vez por dia. Nos restantes syncs
+horários são reutilizados os IDs de `asset_integrations` e apenas o realtime é
+pedido em blocos até 100 centrais.
 
 A estrutura equivalente para Sigenergy é criada separadamente por credencial e
 endpoint. `SIGENERGY_PRODUCTION_MIN_INTERVAL_SECONDS` e
 `SIGENERGY_PRODUCTION_DAILY_BUDGET` permanecem vazios até os limites oficiais
 serem medidos e validados.
+
+## Retenção de realtime
+
+`FUSIONSOLAR_REALTIME_SNAPSHOT_RETENTION_DAYS=30` controla a retenção dos
+payloads JSON pesados. Antes da limpeza, a disponibilidade amostrada é
+materializada localmente. As linhas normalizadas, agregados, WAT real,
+produção, snapshots de relatórios e ficheiros gerados não são apagados. Não é
+executado `VACUUM` automático.
 - Se uma resposta devolver `failCode=305` ou mensagem `USER_MUST_RELOGIN`, o client invalida a cache e tenta login mais uma vez.
 - Passwords, tokens e `systemCode` não devem ser escritos em logs.
 

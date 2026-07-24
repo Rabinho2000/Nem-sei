@@ -6,6 +6,7 @@ import html
 import io
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -17,7 +18,7 @@ import unicodedata
 import struct
 from contextvars import ContextVar
 from contextlib import closing, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -141,7 +142,12 @@ from monitoring_board.report_template_repository import (
     set_default_template,
 )
 from monitoring_board.reporting_storage import reconcile_generated_reports
-from monitoring_board.reporting.portfolio import METRIC_CATALOG, profile_from_config, profile_to_config
+from monitoring_board.reporting.portfolio import (
+    METRIC_CATALOG,
+    aggregate_rows,
+    profile_from_config,
+    profile_to_config,
+)
 from monitoring_board.reporting.templates import default_template, template_from_config, template_to_config, validate_template_scope
 from monitoring_board.services.report_rendering import (
     MAX_BATCH_ASSETS,
@@ -225,11 +231,9 @@ from monitoring_board.reporting.validation import (
 from monitoring_board.reporting.tariffs import result_to_legacy_dict, value_tariff_energy, with_billing_fallback
 from monitoring_board.services.invoice_extraction import extract_invoice_file, sha256_file, validate_invoice_file_content
 from monitoring_board.services.fusionsolar import (
-    build_provider_url,
     classify_fusionsolar_inverter_availability,
     describe_fusionsolar_health_state,
     map_fusionsolar_status,
-    normalize_sync_hours,
 )
 from monitoring_board.services.financial_models import (
     FinancialModelError,
@@ -248,12 +252,10 @@ from monitoring_board.services import fusionsolar_client as fusionsolar_client_m
 from monitoring_board.services.fusionsolar_client import FusionSolarClient
 from monitoring_board.services.fusionsolar_errors import (
     FusionSolarApiError,
-    FusionSolarCredentialsError,
     FusionSolarRateLimitError,
     FusionSolarSessionExpiredError,
 )
 from monitoring_board.services.fusionsolar_models import (
-    FusionSolarCredentials,
     FusionSolarEndpoints,
     collect_time_noon_of_month_ms,
     collect_time_start_of_day_ms,
@@ -261,10 +263,9 @@ from monitoring_board.services.fusionsolar_models import (
     parse_collect_date as parse_client_collect_date,
 )
 from monitoring_board.services import sigenergy as sigenergy_service
-from monitoring_board.services.api_client_base import http_rate_limited_status, http_retryable_status, retry_api_call
+from monitoring_board.services.api_client_base import retry_api_call
 from monitoring_board.services.api_rate_limit import (
     ApiRateLimitError,
-    ApiTransientError,
     active_cooldown_until,
     ensure_api_call_state_schema,
     get_api_call_state,
@@ -285,14 +286,26 @@ from monitoring_board.services.production_api_queue import (
     ApiQueuePolicy,
     ApiSlotUnavailableError,
     PRODUCTION_KPI_AREA,
+    WAT_HISTORY_AREA,
     account_key as production_api_account_key,
     ensure_api_queue_state,
     ensure_api_queue_schema,
+    get_account_queue_state,
     list_api_queue_states,
+    record_account_407,
     record_api_407 as record_production_api_407,
     recover_expired_leases,
+    release_account_lease,
     release_api_lease,
+    reserve_account_lease,
     reserve_api_slot,
+)
+from monitoring_board.services.sampled_availability import (
+    cleanup_realtime_snapshot_payloads,
+    ensure_sampled_availability_schema,
+    expected_devices_for_date,
+    materialize_sampled_availability_day,
+    record_device_configuration,
 )
 
 from monitoring_board.services.telegram_service import (
@@ -379,6 +392,8 @@ BACKGROUND_JOB_TYPES_PERFORMANCE = (
     "fusionsolar_month_cycle",
     "fusionsolar_month_close",
     "fusionsolar_report_production_request",
+    "fusionsolar_report_wat_request",
+    "fusionsolar_realtime_materialize_cleanup",
     "sigenergy_state_sync",
     "performance_reference_recalculation",
 )
@@ -388,6 +403,16 @@ FUSIONSOLAR_PRODUCTION_JOB_TYPES = (
     "fusionsolar_month_cycle",
     "fusionsolar_month_close",
     "fusionsolar_report_production_request",
+)
+FUSIONSOLAR_WAT_JOB_TYPES = (
+    "fusionsolar_inverter_availability_backfill",
+    "fusionsolar_report_wat_request",
+)
+FUSIONSOLAR_BACKGROUND_JOB_TYPES = (
+    "fusionsolar_state_sync",
+    *FUSIONSOLAR_PRODUCTION_JOB_TYPES,
+    *FUSIONSOLAR_WAT_JOB_TYPES,
+    "fusionsolar_realtime_materialize_cleanup",
 )
 BACKGROUND_JOB_STALE_RUNNING_MINUTES = 30
 DEFAULT_FUSIONSOLAR_SYNC_HOURS = "08:00,14:00"
@@ -418,6 +443,8 @@ DEFAULT_FUSIONSOLAR_PRODUCTION_KPI_DAILY_BUDGET = 20
 DEFAULT_FUSIONSOLAR_PRODUCTION_KPI_DAILY_RESERVED_CALLS = 2
 DEFAULT_FUSIONSOLAR_PRODUCTION_KPI_MONTH_CLOSE_RESERVED_CALLS = 2
 DEFAULT_FUSIONSOLAR_PRODUCTION_KPI_MIN_INTERVAL_SECONDS = 65
+DEFAULT_FUSIONSOLAR_WAT_DAILY_BUDGET = 36
+DEFAULT_FUSIONSOLAR_REALTIME_SNAPSHOT_RETENTION_DAYS = 30
 FUSIONSOLAR_PERFORMANCE_MAX_API_CALLS = 20
 FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL: datetime | None = None
 DEFAULT_FUSIONSOLAR_RATE_LIMIT_MINUTES = 60
@@ -4017,6 +4044,11 @@ def create_app() -> Flask:
                     comparison=comparison,
                     profile_version=latest_portfolio_report_profile_version(g.db, profile.id),
                 )
+                portfolio_result = ensure_portfolio_result_data_requests(
+                    g.db,
+                    portfolio_result,
+                    request_source="portfolio_report_page",
+                )
             except Exception as exc:
                 flash(f"Falha ao preparar relatorio configuravel: {exc}", "error")
                 portfolio_result = None
@@ -4122,6 +4154,11 @@ def create_app() -> Flask:
                 comparison=comparison,
                 profile_version=latest_portfolio_report_profile_version(g.db, profile.id),
             )
+            result = ensure_portfolio_result_data_requests(
+                g.db,
+                result,
+                request_source="portfolio_report_snapshot",
+            )
             report_id = snapshot_portfolio_result(g.db, result, request.form.get("notes", "").strip())
             g.db.commit()
             flash(f"Relatorio snapshot #{report_id} gerado.", "success")
@@ -4166,6 +4203,11 @@ def create_app() -> Flask:
                 semester=request.args.get("report_semester"),
                 comparison=request.args.get("comparison", ""),
                 profile_version=latest_portfolio_report_profile_version(g.db, profile.id),
+            )
+            result = ensure_portfolio_result_data_requests(
+                g.db,
+                result,
+                request_source="portfolio_report_export",
             )
             workbook = export_portfolio_result_workbook(result)
         else:
@@ -4334,7 +4376,16 @@ def create_app() -> Flask:
                     for job in jobs:
                         try:
                             LOGGER.info("report_generation_item_started run_id=%s format=%s asset_id=%s", run_id, job["format"], job.get("asset_id"))
-                            report = build_individual_generation_report(g.db, job["asset_id"], job["period"])
+                            report = build_individual_generation_report(
+                                g.db,
+                                job["asset_id"],
+                                job["period"],
+                                include_wat=any(
+                                    section.enabled
+                                    and section.key == "availability"
+                                    for section in template.sections
+                                ),
+                            )
                             rendered = render_individual_pdf(report, template) if job["format"] == "pdf" else render_individual_excel(report, template)
                             completed_files.append(register_rendered_generation_file(g.db, output_dir, run_id, rendered))
                             completed += 1
@@ -4414,6 +4465,11 @@ def create_app() -> Flask:
             quarter=period_job.get("report_quarter"),
             semester=period_job.get("report_semester"),
             comparison=request.args.get("comparison", ""),
+        )
+        result = ensure_portfolio_result_data_requests(
+            g.db,
+            result,
+            request_source="portfolio_report_preview",
         )
         return render_portfolio_html(result, template)
 
@@ -6050,6 +6106,25 @@ def ensure_database(path: str) -> None:
         ensure_column(conn, "background_jobs", "wait_reason TEXT")
         ensure_api_call_state_schema(conn)
         ensure_api_queue_schema(conn)
+        ensure_sampled_availability_schema(conn)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS report_data_request_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_source TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                metric TEXT NOT NULL,
+                period_start TEXT NOT NULL,
+                period_end TEXT NOT NULL,
+                asset_ids_json TEXT NOT NULL,
+                background_job_id INTEGER NOT NULL,
+                reused_existing_job INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (background_job_id) REFERENCES background_jobs(id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_background_jobs_status_next_attempt
@@ -6446,12 +6521,12 @@ def postpone_pending_production_jobs_after_407(
     cooldown_until: datetime,
     exclude_job_id: int | None = None,
 ) -> int:
-    placeholders = ", ".join("?" for _ in FUSIONSOLAR_PRODUCTION_JOB_TYPES)
+    placeholders = ", ".join("?" for _ in FUSIONSOLAR_BACKGROUND_JOB_TYPES)
     params: list[Any] = [
         serialize_background_job_timestamp(cooldown_until),
         "cooldown_407",
-        "FusionSolar production KPI em cooldown global apos 407.",
-        *FUSIONSOLAR_PRODUCTION_JOB_TYPES,
+        "Conta FusionSolar em cooldown global apos 407.",
+        *FUSIONSOLAR_BACKGROUND_JOB_TYPES,
     ]
     exclude_sql = ""
     if exclude_job_id is not None:
@@ -9985,6 +10060,98 @@ def build_local_customer_production_report(
     )
 
 
+def ensure_report_data_requests(
+    conn: sqlite3.Connection,
+    *,
+    asset_ids: list[int],
+    period: ReportingPeriod,
+    include_wat: bool,
+    request_source: str,
+    reference_date: date,
+) -> dict[str, Any]:
+    current_month = reference_date.replace(day=1)
+    normalized_asset_ids = sorted({int(value) for value in asset_ids if value})
+    job_ids: list[int] = []
+    warnings: list[str] = []
+    reused_count = 0
+    queued_count = 0
+    for month_start in period.included_months:
+        month_label = month_start.strftime("%Y-%m")
+        if month_start >= current_month:
+            continue
+        missing_production_ids = [
+            asset_id
+            for asset_id in normalized_asset_ids
+            if evaluate_local_monthly_production_quality(
+                conn,
+                asset_id=asset_id,
+                provider=INTEGRATION_PROVIDER_FUSIONSOLAR,
+                month_start=month_start,
+                reference_date=reference_date,
+            ).status
+            != "complete"
+        ]
+        if missing_production_ids:
+            job_id, created = create_or_reuse_report_data_job(
+                conn,
+                job_type="fusionsolar_report_production_request",
+                provider=INTEGRATION_PROVIDER_FUSIONSOLAR,
+                metric="production",
+                period_start=month_start,
+                period_end=month_end(month_start),
+                asset_ids=missing_production_ids,
+                request_source=request_source,
+                extra_params={"report_month": month_label},
+            )
+            job_ids.append(job_id)
+            reused_count += int(not created)
+            queued_count += int(created)
+            warnings.append(
+                f"production_collection_pending:{month_label}:job_{job_id}"
+            )
+
+        if include_wat:
+            wat_end = month_end(month_start)
+            missing_wat_ids = [
+                asset_id
+                for asset_id in normalized_asset_ids
+                if not real_wat_period_is_complete(
+                    conn,
+                    asset_id=asset_id,
+                    from_date=month_start,
+                    to_date=wat_end,
+                )
+            ]
+            if missing_wat_ids:
+                job_id, created = create_or_reuse_report_data_job(
+                    conn,
+                    job_type="fusionsolar_report_wat_request",
+                    provider=INTEGRATION_PROVIDER_FUSIONSOLAR,
+                    metric="wat",
+                    period_start=month_start,
+                    period_end=wat_end,
+                    asset_ids=missing_wat_ids,
+                    request_source=request_source,
+                    extra_params={
+                        "from_date": month_start.isoformat(),
+                        "to_date": wat_end.isoformat(),
+                    },
+                )
+                job_ids.append(job_id)
+                reused_count += int(not created)
+                queued_count += int(created)
+                warnings.append(
+                    f"wat_collection_pending:{month_label}:job_{job_id}"
+                )
+    conn.commit()
+    return {
+        "job_ids": sorted(set(job_ids)),
+        "warnings": warnings,
+        "reused_count": reused_count,
+        "queued_count": queued_count,
+    }
+
+
 def enqueue_report_production_requests(
     conn: sqlite3.Connection,
     *,
@@ -9993,27 +10160,224 @@ def enqueue_report_production_requests(
     months_requiring_fallback: list[str],
     reference_date: date,
 ) -> list[int]:
-    current_month = reference_date.replace(day=1)
-    job_ids: list[int] = []
-    for month_start in period.included_months:
-        month_label = month_start.strftime("%Y-%m")
-        if month_start >= current_month or month_label not in months_requiring_fallback:
+    if not months_requiring_fallback:
+        return []
+    requests = ensure_report_data_requests(
+        conn,
+        asset_ids=[asset_id],
+        period=period,
+        include_wat=False,
+        request_source="individual_report",
+        reference_date=reference_date,
+    )
+    return list(requests["job_ids"])
+
+
+def month_end(month_start: date) -> date:
+    return (
+        month_start.replace(day=28) + timedelta(days=4)
+    ).replace(day=1) - timedelta(days=1)
+
+
+def real_wat_period_is_complete(
+    conn: sqlite3.Connection,
+    *,
+    asset_id: int,
+    from_date: date,
+    to_date: date,
+) -> bool:
+    expected_days = (to_date - from_date).days + 1
+    row = conn.execute(
+        """
+        SELECT
+            COUNT(DISTINCT availability_date) AS covered_days,
+            SUM(
+                CASE
+                    WHEN valid_slots > 0
+                     AND weighted_availability_pct IS NOT NULL
+                    THEN 0 ELSE 1
+                END
+            ) AS invalid_days
+        FROM plant_availability_daily
+        WHERE provider = ? AND asset_id = ?
+          AND availability_date BETWEEN ? AND ?
+        """,
+        (
+            INTEGRATION_PROVIDER_FUSIONSOLAR,
+            asset_id,
+            from_date.isoformat(),
+            to_date.isoformat(),
+        ),
+    ).fetchone()
+    return (
+        int(row["covered_days"] or 0) == expected_days
+        and int(row["invalid_days"] or 0) == 0
+    )
+
+
+def create_or_reuse_report_data_job(
+    conn: sqlite3.Connection,
+    *,
+    job_type: str,
+    provider: str,
+    metric: str,
+    period_start: date,
+    period_end: date,
+    asset_ids: list[int],
+    request_source: str,
+    extra_params: dict[str, Any],
+) -> tuple[int, bool]:
+    normalized_ids = sorted({int(value) for value in asset_ids})
+    active = conn.execute(
+        """
+        SELECT id, job_type, params_json
+        FROM background_jobs
+        WHERE job_type IN (?, ?)
+          AND status IN (
+            'pending', 'running', 'waiting_api_slot', 'waiting_rate_limit'
+          )
+        ORDER BY id
+        """,
+        (
+            job_type,
+            (
+                "fusionsolar_month_close"
+                if metric == "production"
+                else "fusionsolar_inverter_availability_backfill"
+            ),
+        ),
+    ).fetchall()
+    job_id: int | None = None
+    for row in active:
+        params = decode_job_params(row["params_json"])
+        existing_start = str(
+            params.get("report_month")
+            or params.get("from_date")
+            or ""
+        )
+        if metric == "production":
+            period_matches = existing_start == period_start.strftime("%Y-%m")
+        else:
+            period_matches = (
+                existing_start == period_start.isoformat()
+                and str(params.get("to_date") or "") == period_end.isoformat()
+            )
+        if not period_matches:
             continue
+        existing_ids = {
+            int(value)
+            for value in params.get("asset_ids") or []
+            if str(value).isdigit()
+        }
+        if not existing_ids or set(normalized_ids).issubset(existing_ids):
+            job_id = int(row["id"])
+            break
+    created = False
+    if job_id is None:
         job_id, created = create_background_job(
             conn,
-            "fusionsolar_report_production_request",
+            job_type,
             {
-                "provider": INTEGRATION_PROVIDER_FUSIONSOLAR,
-                "report_month": month_label,
-                "asset_ids": [asset_id],
+                "provider": provider,
+                "metric": metric,
+                "period_start": period_start.isoformat(),
+                "period_end": period_end.isoformat(),
+                "asset_ids": normalized_ids,
                 "trigger_type": "report_draft",
+                **extra_params,
             },
         )
-        job_ids.append(job_id)
-        if created and has_app_context():
-            schedule_background_job(current_app._get_current_object(), job_id)
-    conn.commit()
-    return job_ids
+    conn.execute(
+        """
+        INSERT INTO report_data_request_events (
+            request_source, provider, metric, period_start, period_end,
+            asset_ids_json, background_job_id, reused_existing_job, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            request_source,
+            provider,
+            metric,
+            period_start.isoformat(),
+            period_end.isoformat(),
+            json.dumps(normalized_ids),
+            job_id,
+            int(not created),
+            serialize_background_job_timestamp(),
+        ),
+    )
+    return job_id, created
+
+
+def ensure_portfolio_result_data_requests(
+    conn: sqlite3.Connection,
+    result: Any,
+    *,
+    request_source: str,
+) -> Any:
+    asset_ids = [
+        int(row.asset_id)
+        for row in result.rows
+        if row.asset_id is not None
+    ]
+    include_wat = any(
+        column.visible and column.metric_key == "availability_pct"
+        for column in result.profile.columns
+    )
+    requests = ensure_report_data_requests(
+        conn,
+        asset_ids=asset_ids,
+        period=result.period,
+        include_wat=include_wat,
+        request_source=request_source,
+        reference_date=current_lisbon_date(),
+    )
+    rows = result.rows
+    summary = result.summary
+    if include_wat:
+        sanitized_rows = []
+        for row in result.rows:
+            wat_complete = (
+                row.asset_id is not None
+                and real_wat_period_is_complete(
+                    conn,
+                    asset_id=int(row.asset_id),
+                    from_date=result.period.start,
+                    to_date=result.period.end,
+                )
+            )
+            if wat_complete:
+                sanitized_rows.append(row)
+                continue
+            sanitized_rows.append(
+                replace(
+                    row,
+                    values={**row.values, "availability_pct": None},
+                    warnings=tuple(
+                        sorted(
+                            set(row.warnings)
+                            | {"wat_collection_pending"}
+                        )
+                    ),
+                )
+            )
+        rows = tuple(sanitized_rows)
+        summary = aggregate_rows(rows, result.columns)
+    metadata = {
+        **dict(result.metadata),
+        "data_request_job_ids": requests["job_ids"],
+        "data_request_warnings": requests["warnings"],
+        "data_request_reused_count": requests["reused_count"],
+    }
+    return replace(
+        result,
+        rows=rows,
+        summary=summary,
+        warnings=tuple(
+            sorted(set(result.warnings) | set(requests["warnings"]))
+        ),
+        metadata=metadata,
+    )
 
 
 def build_fusionsolar_customer_production_report(
@@ -10044,17 +10408,23 @@ def build_fusionsolar_customer_production_report(
     )
     if local_report is None:
         raise ValueError("Nao foi possivel preparar o relatorio com os dados locais.")
-    refresh_job_ids = enqueue_report_production_requests(
+    data_requests = ensure_report_data_requests(
         conn,
-        asset_id=asset_id,
+        asset_ids=[asset_id],
         period=period,
-        months_requiring_fallback=list(
-            local_report.get("months_requiring_fallback") or []
-        ),
+        include_wat=False,
+        request_source="individual_report",
         reference_date=reference_date,
     )
+    refresh_job_ids = list(data_requests["job_ids"])
     local_report["production_refresh_job_ids"] = refresh_job_ids
     local_report["production_refresh_queued"] = bool(refresh_job_ids)
+    local_report["data_request_warnings"] = list(
+        data_requests["warnings"]
+    )
+    local_report.setdefault("report_notes", []).extend(
+        data_requests["warnings"]
+    )
     local_report["force_api_ignored"] = bool(force_api)
     return local_report
 
@@ -10065,7 +10435,34 @@ def add_customer_report_availability(
     *,
     asset_id: int,
     period: ReportingPeriod,
+    ensure_requests: bool = True,
 ) -> bool:
+    if ensure_requests:
+        requests = ensure_report_data_requests(
+            conn,
+            asset_ids=[asset_id],
+            period=period,
+            include_wat=True,
+            request_source="individual_report_availability",
+            reference_date=current_lisbon_date(),
+        )
+        report.setdefault("data_request_warnings", []).extend(
+            requests["warnings"]
+        )
+        report.setdefault("report_notes", []).extend(requests["warnings"])
+    if not real_wat_period_is_complete(
+        conn,
+        asset_id=asset_id,
+        from_date=period.start,
+        to_date=period.end,
+    ):
+        report["availability_error"] = "wat_collection_pending"
+        report.setdefault("report_notes", []).append(
+            "WAT indisponivel — dados em recolha; relatorio em rascunho."
+        )
+        report.pop("availability_pct", None)
+        report["include_availability_kpi"] = False
+        return False
     try:
         availability = get_monthly_availability(conn, asset_id, period.start, period.end)
     except Exception:
@@ -10079,6 +10476,10 @@ def add_customer_report_availability(
         report.setdefault("report_notes", []).append("Erro ao procurar Disponibilidade (%).")
         return False
     if availability is None:
+        report["availability_error"] = "wat_collection_pending"
+        report.setdefault("report_notes", []).append(
+            "WAT indisponivel — dados em recolha; relatorio em rascunho."
+        )
         return False
     report["include_availability_kpi"] = True
     report["availability_pct"] = availability
@@ -10272,7 +10673,7 @@ def build_portfolio_generation_result(conn: sqlite3.Connection, form: Any, portf
         raise ValueError("Portfolio invalido.")
     profile_id = int(form.get("profile_id", "0") or 0)
     profile = get_portfolio_report_profile(conn, profile_id) if profile_id else get_default_portfolio_report_profile(conn, portfolio_id)
-    return prepare_portfolio_report(
+    result = prepare_portfolio_report(
         conn,
         portfolio_id=portfolio_id,
         portfolio_name=group["name"],
@@ -10285,9 +10686,20 @@ def build_portfolio_generation_result(conn: sqlite3.Connection, form: Any, portf
         comparison=form.get("comparison", ""),
         profile_version=latest_portfolio_report_profile_version(conn, profile.id),
     )
+    return ensure_portfolio_result_data_requests(
+        conn,
+        result,
+        request_source="portfolio_report_generation",
+    )
 
 
-def build_individual_generation_report(conn: sqlite3.Connection, asset_id: int, period_job: dict[str, str]) -> dict[str, Any]:
+def build_individual_generation_report(
+    conn: sqlite3.Connection,
+    asset_id: int,
+    period_job: dict[str, str],
+    *,
+    include_wat: bool = False,
+) -> dict[str, Any]:
     period = build_period(
         period_job["period_type"],
         report_month=period_job.get("report_month"),
@@ -10309,6 +10721,25 @@ def build_individual_generation_report(conn: sqlite3.Connection, asset_id: int, 
         raise ValueError(f"Sem dados para a instalacao {asset_id}.")
     report["asset_id"] = asset_id
     report["engine_version"] = "individual-report-v1"
+    requests = ensure_report_data_requests(
+        conn,
+        asset_ids=[asset_id],
+        period=period,
+        include_wat=include_wat,
+        request_source="individual_report_generation",
+        reference_date=current_lisbon_date(),
+    )
+    report["data_request_job_ids"] = list(requests["job_ids"])
+    report["data_request_warnings"] = list(requests["warnings"])
+    report.setdefault("report_notes", []).extend(requests["warnings"])
+    if include_wat:
+        add_customer_report_availability(
+            conn,
+            report,
+            asset_id=asset_id,
+            period=period,
+            ensure_requests=False,
+        )
     return report
 
 
@@ -11285,6 +11716,7 @@ def refresh_integration_scheduler(app: Flask) -> None:
                 "integration-production-fusionsolar-daily",
                 "integration-diagnostics-fusionsolar-daily",
                 "integration-production-fusionsolar-month-close",
+                "integration-fusionsolar-realtime-cleanup",
                 "integration-state-sigenergy-hourly",
                 "background-jobs-reactivate-rate-limit",
             }
@@ -11380,6 +11812,14 @@ def register_fusionsolar_scheduler_jobs(app: Flask, config: dict[str, Any]) -> N
             args=[app],
             id="integration-production-fusionsolar-month-close",
         )
+    add_scheduler_job(
+        func=run_scheduled_fusionsolar_realtime_cleanup,
+        trigger="cron",
+        hour=3,
+        minute=30,
+        args=[app],
+        id="integration-fusionsolar-realtime-cleanup",
+    )
 
 
 def register_sigenergy_scheduler_jobs(app: Flask, config: dict[str, Any]) -> None:
@@ -11552,6 +11992,29 @@ def run_scheduled_fusionsolar_diagnostics_sync(app: Flask) -> None:
     run_scheduled_fusionsolar_wat_backfill(app)
 
 
+def run_scheduled_fusionsolar_realtime_cleanup(app: Flask) -> None:
+    with app.app_context():
+        with closing(get_db(app.config["DATABASE"])) as conn:
+            job_id, created = create_background_job(
+                conn,
+                "fusionsolar_realtime_materialize_cleanup",
+                {
+                    "provider": INTEGRATION_PROVIDER_FUSIONSOLAR,
+                    "reference_date": current_lisbon_date().isoformat(),
+                    "trigger_type": "scheduled_retention",
+                },
+            )
+            conn.commit()
+            if created:
+                schedule_background_job(app, job_id)
+            current_app.logger.info(
+                "Scheduled FusionSolar realtime materialization/cleanup queued: "
+                "job_id=%s created=%s",
+                job_id,
+                created,
+            )
+
+
 def run_scheduled_fusionsolar_month_close(app: Flask) -> None:
     scheduler_date = current_lisbon_date()
     if scheduler_date.day not in range(1, 6):
@@ -11664,6 +12127,57 @@ def schedule_pending_background_jobs(app: Flask) -> dict[str, Any]:
     }
 
 
+def is_transient_sqlite_lock(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return isinstance(exc, sqlite3.OperationalError) and (
+        "database is locked" in message
+        or "database table is locked" in message
+        or "database is busy" in message
+    )
+
+
+def defer_background_job_after_database_lock(
+    conn: sqlite3.Connection,
+    app: Flask,
+    job_id: int,
+    params: dict[str, Any],
+) -> bool:
+    attempts = int(params.get("_sqlite_lock_attempt") or 0) + 1
+    if attempts > 6:
+        return False
+    delay_seconds = min(5 * (2 ** (attempts - 1)), 300)
+    next_attempt_at = background_job_utc_now() + timedelta(
+        seconds=delay_seconds
+    )
+    params = {**params, "_sqlite_lock_attempt": attempts}
+    conn.rollback()
+    conn.execute(
+        "UPDATE background_jobs SET params_json = ? WHERE id = ?",
+        (encode_job_params(params), job_id),
+    )
+    mark_background_job_waiting_api_slot(
+        conn,
+        job_id,
+        next_attempt_at=next_attempt_at,
+        wait_reason="database_locked",
+        error_message=(
+            "SQLite temporariamente ocupada; nova tentativa automatica "
+            f"{attempts}/6."
+        ),
+        result={
+            "status": "waiting_api_slot",
+            "wait_reason": "database_locked",
+            "retry_attempt": attempts,
+            "next_attempt_at": serialize_background_job_timestamp(
+                next_attempt_at
+            ),
+            "stopped_reason": "database_locked",
+        },
+    )
+    schedule_background_job(app, job_id, run_date=next_attempt_at)
+    return True
+
+
 def run_background_job(app: Flask, job_id: int) -> None:
     with app.app_context():
         with closing(get_db(app.config["DATABASE"])) as conn:
@@ -11671,8 +12185,21 @@ def run_background_job(app: Flask, job_id: int) -> None:
             if job is None:
                 current_app.logger.error("Background job %s not found", job_id)
                 return
-            if not mark_background_job_running(conn, job_id):
-                current_app.logger.info("Background job %s skipped because it is no longer pending", job_id)
+            try:
+                if not mark_background_job_running(conn, job_id):
+                    current_app.logger.info("Background job %s skipped because it is no longer pending", job_id)
+                    return
+            except sqlite3.OperationalError as exc:
+                if not is_transient_sqlite_lock(exc):
+                    raise
+                params = decode_job_params(job["params_json"])
+                if not defer_background_job_after_database_lock(
+                    conn,
+                    app,
+                    job_id,
+                    params,
+                ):
+                    raise
                 return
             try:
                 params = json.loads(job["params_json"] or "{}")
@@ -11686,6 +12213,11 @@ def run_background_job(app: Flask, job_id: int) -> None:
                 current_app.logger.info("Background job %s completed: %s", job_id, job["job_type"])
             except ApiSlotUnavailableError as exc:
                 result = {
+                    **(
+                        exc.job_result
+                        if isinstance(exc.job_result, dict)
+                        else {}
+                    ),
                     "status": "waiting_api_slot",
                     "provider": exc.provider,
                     "api_area": exc.api_area,
@@ -11775,6 +12307,24 @@ def run_background_job(app: Flask, job_id: int) -> None:
                     result=result,
                 )
                 schedule_background_job(app, job_id, run_date=exc.cooldown_until)
+            except sqlite3.OperationalError as exc:
+                if is_transient_sqlite_lock(exc) and defer_background_job_after_database_lock(
+                    conn,
+                    app,
+                    job_id,
+                    params,
+                ):
+                    current_app.logger.info(
+                        "Background job %s deferred after transient SQLite lock",
+                        job_id,
+                    )
+                    return
+                current_app.logger.exception(
+                    "Background job %s failed after SQLite lock retries: %s",
+                    job_id,
+                    job["job_type"],
+                )
+                mark_background_job_failed(conn, job_id, str(exc))
             except Exception as exc:
                 current_app.logger.exception("Background job %s failed: %s", job_id, job["job_type"])
                 mark_background_job_failed(conn, job_id, str(exc))
@@ -11848,7 +12398,10 @@ def run_background_job_payload(conn: sqlite3.Connection, job_type: str, params: 
         record_api_success(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_PRODUCTION)
         return result
 
-    if job_type == "fusionsolar_inverter_availability_backfill":
+    if job_type in {
+        "fusionsolar_inverter_availability_backfill",
+        "fusionsolar_report_wat_request",
+    }:
         from_date = parse_date_value(str(params.get("from_date") or ""))
         to_date = parse_date_value(str(params.get("to_date") or ""))
         if from_date is None or to_date is None or from_date > to_date:
@@ -11860,6 +12413,18 @@ def run_background_job_payload(conn: sqlite3.Connection, job_type: str, params: 
         )
         record_api_success(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_DIAGNOSTICS)
         return result
+
+    if job_type == "fusionsolar_realtime_materialize_cleanup":
+        retention_days = parse_env_positive_int(
+            "FUSIONSOLAR_REALTIME_SNAPSHOT_RETENTION_DAYS",
+            DEFAULT_FUSIONSOLAR_REALTIME_SNAPSHOT_RETENTION_DAYS,
+        )
+        return cleanup_realtime_snapshot_payloads(
+            conn,
+            provider=INTEGRATION_PROVIDER_FUSIONSOLAR,
+            retention_days=retention_days,
+            reference_date=current_lisbon_date(),
+        )
 
     if job_type == "fusionsolar_month_cycle":
         raw_asset_ids = params.get("asset_ids") or []
@@ -11911,7 +12476,10 @@ def background_job_api_scope(job_type: str, params: dict[str, Any]) -> tuple[str
         "fusionsolar_report_production_request",
     }:
         return provider or INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_PRODUCTION
-    if job_type == "fusionsolar_inverter_availability_backfill":
+    if job_type in {
+        "fusionsolar_inverter_availability_backfill",
+        "fusionsolar_report_wat_request",
+    }:
         return provider or INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_DIAGNOSTICS
     if job_type == "sigenergy_state_sync":
         return provider or INTEGRATION_PROVIDER_SIGENERGY, API_AREA_STATE
@@ -11991,16 +12559,31 @@ def build_production_api_queue_observability(
     )
     if fusionsolar_config is not None:
         endpoints = get_fusionsolar_endpoint_config(fusionsolar_config)
+        fusion_account_key = fusionsolar_production_account_key(
+            fusionsolar_config,
+            endpoints["day_kpi_endpoint"],
+        )
         ensure_api_queue_state(
             conn,
             provider=INTEGRATION_PROVIDER_FUSIONSOLAR.lower(),
-            account_key_value=fusionsolar_production_account_key(
-                fusionsolar_config,
-                endpoints["day_kpi_endpoint"],
-            ),
+            account_key_value=fusion_account_key,
             api_area=PRODUCTION_KPI_AREA,
             policy=fusionsolar_production_kpi_policy(),
         )
+        ensure_api_queue_state(
+            conn,
+            provider=INTEGRATION_PROVIDER_FUSIONSOLAR.lower(),
+            account_key_value=fusion_account_key,
+            api_area=WAT_HISTORY_AREA,
+            policy=fusionsolar_wat_policy(),
+        )
+        fusion_account_state = get_account_queue_state(
+            conn,
+            provider=INTEGRATION_PROVIDER_FUSIONSOLAR.lower(),
+            account_key_value=fusion_account_key,
+        )
+    else:
+        fusion_account_state = {}
     sigenergy_config = get_integration_config(
         conn,
         INTEGRATION_PROVIDER_SIGENERGY,
@@ -12019,28 +12602,106 @@ def build_production_api_queue_observability(
             api_area=PRODUCTION_KPI_AREA,
             policy=sigenergy_production_kpi_policy(),
         )
-    waiting_fusionsolar = conn.execute(
+    waiting_rows = conn.execute(
         f"""
-        SELECT COUNT(*) AS total
+        SELECT job_type, COUNT(*) AS total
         FROM background_jobs
-        WHERE job_type IN ({", ".join("?" for _ in FUSIONSOLAR_PRODUCTION_JOB_TYPES)})
+        WHERE job_type IN ({", ".join("?" for _ in FUSIONSOLAR_BACKGROUND_JOB_TYPES)})
           AND status IN ('waiting_api_slot', 'waiting_rate_limit')
+        GROUP BY job_type
         """,
-        FUSIONSOLAR_PRODUCTION_JOB_TYPES,
-    ).fetchone()["total"]
+        FUSIONSOLAR_BACKGROUND_JOB_TYPES,
+    ).fetchall()
+    waiting_by_type = {
+        str(item["job_type"]): int(item["total"])
+        for item in waiting_rows
+    }
+    waiting_by_priority: dict[int, int] = {}
+    for job_type, count in waiting_by_type.items():
+        priority = production_job_priority(job_type)
+        waiting_by_priority[priority] = (
+            waiting_by_priority.get(priority, 0) + count
+        )
+    reused_report_requests = int(
+        conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM report_data_request_events
+            WHERE reused_existing_job = 1
+            """
+        ).fetchone()[0]
+    )
+    locally_recalculated_days = int(
+        conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM plant_availability_sampled_daily
+            WHERE source = 'realtime_sampled'
+            """
+        ).fetchone()[0]
+    )
+    sampled_state_rows = conn.execute(
+        """
+        SELECT coverage_status, COUNT(*) AS total
+        FROM plant_availability_sampled_daily
+        GROUP BY coverage_status
+        ORDER BY coverage_status
+        """
+    ).fetchall()
+    sampled_states = {
+        str(item["coverage_status"]): int(item["total"])
+        for item in sampled_state_rows
+    }
+    real_wat_days = int(
+        conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM plant_availability_daily
+            WHERE valid_slots > 0 AND weighted_availability_pct IS NOT NULL
+            """
+        ).fetchone()[0]
+    )
     rows = list_api_queue_states(conn)
     for row in rows:
-        row["waiting_jobs"] = (
-            int(waiting_fusionsolar)
-            if row["provider"] == INTEGRATION_PROVIDER_FUSIONSOLAR.lower()
-            else 0
-        )
+        if row["provider"] == INTEGRATION_PROVIDER_FUSIONSOLAR.lower():
+            relevant_types = (
+                FUSIONSOLAR_WAT_JOB_TYPES
+                if row["api_area"] == WAT_HISTORY_AREA
+                else FUSIONSOLAR_PRODUCTION_JOB_TYPES
+            )
+            row["waiting_jobs"] = sum(
+                waiting_by_type.get(job_type, 0)
+                for job_type in relevant_types
+            )
+            row["waiting_jobs_by_priority"] = dict(
+                sorted(waiting_by_priority.items())
+            )
+            row["account_last_407_at"] = fusion_account_state.get(
+                "last_407_at"
+            )
+            row["account_cooldown_until"] = fusion_account_state.get(
+                "cooldown_until"
+            )
+            row["report_requests_reused"] = reused_report_requests
+            row["days_recalculated_from_db"] = locally_recalculated_days
+            row["sampled_availability_states"] = sampled_states
+            row["real_wat_days"] = real_wat_days
+        else:
+            row["waiting_jobs"] = 0
+            row["waiting_jobs_by_priority"] = {}
+            row["account_last_407_at"] = None
+            row["account_cooldown_until"] = None
+            row["report_requests_reused"] = 0
+            row["days_recalculated_from_db"] = 0
+            row["sampled_availability_states"] = {}
+            row["real_wat_days"] = 0
         candidates = [
             value
             for value in (
                 row.get("next_allowed_at"),
                 row.get("cooldown_until"),
                 row.get("lease_until"),
+                row.get("account_cooldown_until"),
             )
             if value
         ]
@@ -12320,7 +12981,14 @@ def chunked(values: list[str], size: int) -> list[list[str]]:
 
 def fetch_fusionsolar_stations(session: requests.Session, *, base_url: str, endpoint: str) -> list[dict[str, Any]]:
     try:
-        return fusionsolar_client_module.fetch_stations(session, base_url=base_url, endpoint=endpoint, **fusionsolar_retry_options())
+        return execute_queued_fusionsolar_account_call(
+            lambda: fusionsolar_client_module.fetch_stations(
+                session,
+                base_url=base_url,
+                endpoint=endpoint,
+                **fusionsolar_retry_options(),
+            )
+        )
     except FusionSolarRateLimitError as exc:
         raise_fusionsolar_rate_limit(exc, API_AREA_STATE)
 
@@ -12333,13 +13001,20 @@ def fetch_fusionsolar_realtime_map(
     station_codes: list[str],
 ) -> dict[str, dict[str, Any]]:
     try:
-        return fusionsolar_client_module.fetch_realtime_map(
-            session,
-            base_url=base_url,
-            endpoint=endpoint,
-            station_codes=station_codes,
-            **fusionsolar_retry_options(),
-        )
+        result: dict[str, dict[str, Any]] = {}
+        for station_group in chunked(station_codes, 100):
+            result.update(
+                execute_queued_fusionsolar_account_call(
+                    lambda group=station_group: fusionsolar_client_module.fetch_realtime_map(
+                        session,
+                        base_url=base_url,
+                        endpoint=endpoint,
+                        station_codes=group,
+                        **fusionsolar_retry_options(),
+                    )
+                )
+            )
+        return result
     except FusionSolarRateLimitError as exc:
         raise_fusionsolar_rate_limit(exc, API_AREA_STATE)
 
@@ -12352,13 +13027,20 @@ def fetch_fusionsolar_device_list(
     station_codes: list[str],
 ) -> list[dict[str, Any]]:
     try:
-        return fusionsolar_client_module.fetch_device_list(
-            session,
-            base_url=base_url,
-            endpoint=endpoint,
-            station_codes=station_codes,
-            **fusionsolar_retry_options(),
-        )
+        devices: list[dict[str, Any]] = []
+        for station_group in chunked(station_codes, 100):
+            devices.extend(
+                execute_queued_fusionsolar_diagnostics_call(
+                    lambda group=station_group: fusionsolar_client_module.fetch_device_list(
+                        session,
+                        base_url=base_url,
+                        endpoint=endpoint,
+                        station_codes=group,
+                        **fusionsolar_retry_options(),
+                    )
+                )
+            )
+        return devices
     except FusionSolarRateLimitError as exc:
         raise_fusionsolar_rate_limit(exc, API_AREA_DIAGNOSTICS)
 
@@ -12371,13 +13053,31 @@ def fetch_fusionsolar_device_realtime_map(
     devices: list[dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
     try:
-        return fusionsolar_client_module.fetch_device_realtime_map(
-            session,
-            base_url=base_url,
-            endpoint=endpoint,
-            devices=devices,
-            **fusionsolar_retry_options(),
-        )
+        result: dict[str, dict[str, Any]] = {}
+        devices_by_type: dict[int, list[dict[str, Any]]] = {}
+        for device in devices:
+            if device.get("dev_type_id") is not None:
+                devices_by_type.setdefault(
+                    int(device["dev_type_id"]),
+                    [],
+                ).append(device)
+        for typed_devices in devices_by_type.values():
+            for device_group in [
+                typed_devices[index : index + 100]
+                for index in range(0, len(typed_devices), 100)
+            ]:
+                result.update(
+                    execute_queued_fusionsolar_diagnostics_call(
+                        lambda group=device_group: fusionsolar_client_module.fetch_device_realtime_map(
+                            session,
+                            base_url=base_url,
+                            endpoint=endpoint,
+                            devices=group,
+                            **fusionsolar_retry_options(),
+                        )
+                    )
+                )
+        return result
     except FusionSolarRateLimitError as exc:
         raise_fusionsolar_rate_limit(exc, API_AREA_DIAGNOSTICS)
 
@@ -12393,16 +13093,18 @@ def fetch_fusionsolar_device_history(
     sleeper: Any = time.sleep,
 ) -> list[dict[str, Any]]:
     try:
-        return fusionsolar_client_module.fetch_device_history(
-            session,
-            base_url=base_url,
-            endpoint=endpoint,
-            devices=devices,
-            target_date=target_date,
-            call_delay_seconds=call_delay_seconds,
-            sleeper=sleeper,
-            allow_sleep=not has_request_context(),
-            normalizer=normalize_fusionsolar_device_history_rows,
+        return execute_queued_fusionsolar_diagnostics_call(
+            lambda: fusionsolar_client_module.fetch_device_history(
+                session,
+                base_url=base_url,
+                endpoint=endpoint,
+                devices=devices,
+                target_date=target_date,
+                call_delay_seconds=call_delay_seconds,
+                sleeper=sleeper,
+                allow_sleep=False,
+                normalizer=normalize_fusionsolar_device_history_rows,
+            )
         )
     except FusionSolarRateLimitError as exc:
         raise_fusionsolar_rate_limit(exc, API_AREA_DIAGNOSTICS)
@@ -12469,14 +13171,21 @@ def fetch_fusionsolar_alarm_map(
     station_codes: list[str],
 ) -> dict[str, list[dict[str, Any]]]:
     try:
-        return fusionsolar_client_module.fetch_alarm_map(
-            session,
-            base_url=base_url,
-            endpoint=endpoint,
-            station_codes=station_codes,
-            language=DEFAULT_FUSIONSOLAR_ALARMS_LANGUAGE,
-            **fusionsolar_retry_options(),
-        )
+        result: dict[str, list[dict[str, Any]]] = {}
+        for station_group in chunked(station_codes, 100):
+            partial = execute_queued_fusionsolar_diagnostics_call(
+                lambda group=station_group: fusionsolar_client_module.fetch_alarm_map(
+                    session,
+                    base_url=base_url,
+                    endpoint=endpoint,
+                    station_codes=group,
+                    language=DEFAULT_FUSIONSOLAR_ALARMS_LANGUAGE,
+                    **fusionsolar_retry_options(),
+                )
+            )
+            for station_code, rows in partial.items():
+                result.setdefault(station_code, []).extend(rows)
+        return result
     except FusionSolarRateLimitError as exc:
         raise_fusionsolar_rate_limit(exc, API_AREA_DIAGNOSTICS)
 
@@ -12664,21 +13373,12 @@ def build_missing_production_note(
     )
 
 
-def is_fusionsolar_rate_limit_error(exc: Exception | str) -> bool:
-    message = str(exc)
-    return "failCode=407" in message or "error code 407" in message or "código 407" in message
-
-
-def is_fusionsolar_session_expired_error(exc: Exception | str) -> bool:
-    message = str(exc)
-    return "failCode=305" in message or "USER_MUST_RELOGIN" in message
-
-
 FUSIONSOLAR_RATE_LIMIT_COOLDOWN_KEY = "fusionsolar_rate_limit_cooldown_until"
 FUSIONSOLAR_LEGACY_PERFORMANCE_COOLDOWN_KEY = "fusionsolar_performance_cooldown_until"
 FUSIONSOLAR_PERFORMANCE_COOLDOWN_KEY = FUSIONSOLAR_RATE_LIMIT_COOLDOWN_KEY
 FUSIONSOLAR_RATE_LIMIT_LAST_ALERT_KEY = "fusionsolar_rate_limit_last_alert_key"
 FUSIONSOLAR_RATE_LIMIT_LAST_ALERT_AT_KEY = "fusionsolar_rate_limit_last_alert_at"
+FUSIONSOLAR_STATION_INVENTORY_DATE_KEY = "fusionsolar_station_inventory_date"
 
 
 def _fusionsolar_fail_code(payload: dict[str, Any] | None) -> int | None:
@@ -12751,28 +13451,6 @@ def set_app_state_value(conn: sqlite3.Connection, key: str, value: str) -> None:
     )
 
 
-def mark_fusionsolar_performance_rate_limited(
-    conn: sqlite3.Connection | None = None,
-    now_value: datetime | None = None,
-) -> str:
-    global FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL
-    now_value = now_value or datetime.now()
-    FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL = now_value + timedelta(minutes=FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_MINUTES)
-    if conn is not None:
-        set_app_state_value(
-            conn,
-            FUSIONSOLAR_PERFORMANCE_COOLDOWN_KEY,
-            FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL.isoformat(timespec="seconds"),
-        )
-    message = (
-        "FusionSolar API temporariamente limitada. "
-        f"Tenta novamente depois de {FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL.isoformat(timespec='minutes')}."
-    )
-    if conn is not None:
-        notify_fusionsolar_rate_limit(conn, FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL, message)
-    return message
-
-
 def notify_fusionsolar_rate_limit(conn: sqlite3.Connection, cooldown_until: datetime, message: str) -> None:
     now_value = datetime.now()
     recent_cutoff = (now_value - timedelta(minutes=fusionsolar_rate_limit_minutes())).isoformat(timespec="seconds")
@@ -12814,51 +13492,6 @@ def notify_fusionsolar_rate_limit(conn: sqlite3.Connection, cooldown_until: date
         alert_key,
         telegram_message,
     )
-
-
-def get_fusionsolar_performance_cooldown_reason(
-    conn: sqlite3.Connection | None = None,
-    now_value: datetime | None = None,
-) -> str:
-    now_value = now_value or datetime.now()
-    cooldown_until = FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL
-    if conn is not None:
-        raw_value = get_app_state_value(conn, FUSIONSOLAR_PERFORMANCE_COOLDOWN_KEY)
-        if raw_value:
-            try:
-                persisted_until = datetime.fromisoformat(raw_value)
-                if cooldown_until is None or persisted_until > cooldown_until:
-                    cooldown_until = persisted_until
-            except ValueError:
-                pass
-    if cooldown_until and cooldown_until > now_value:
-        remaining_seconds = int((cooldown_until - now_value).total_seconds())
-        remaining_minutes = max(1, (remaining_seconds + 59) // 60)
-        return (
-            "FusionSolar API temporariamente limitada. "
-            f"Tenta novamente depois de {cooldown_until.isoformat(timespec='minutes')} ({remaining_minutes} min)."
-        )
-    return ""
-
-
-def fusionsolar_cooldown_sleep_seconds(
-    conn: sqlite3.Connection | None = None,
-    now_value: datetime | None = None,
-) -> int:
-    now_value = now_value or datetime.now()
-    cooldown_until = FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL
-    if conn is not None:
-        raw_value = get_app_state_value(conn, FUSIONSOLAR_PERFORMANCE_COOLDOWN_KEY)
-        if raw_value:
-            try:
-                persisted_until = datetime.fromisoformat(raw_value)
-                if cooldown_until is None or persisted_until > cooldown_until:
-                    cooldown_until = persisted_until
-            except ValueError:
-                pass
-    if cooldown_until and cooldown_until > now_value:
-        return max(1, int((cooldown_until - now_value).total_seconds()) + 5)
-    return 0
 
 
 def fusionsolar_rate_limit_minutes() -> int:
@@ -12912,6 +13545,16 @@ def sigenergy_production_kpi_policy() -> ApiQueuePolicy:
     )
 
 
+def fusionsolar_wat_policy() -> ApiQueuePolicy:
+    return ApiQueuePolicy(
+        min_interval_seconds=None,
+        daily_budget=parse_env_positive_int(
+            "FUSIONSOLAR_WAT_DAILY_BUDGET",
+            DEFAULT_FUSIONSOLAR_WAT_DAILY_BUDGET,
+        ),
+    )
+
+
 def parse_env_positive_int(name: str, default: int) -> int:
     try:
         return max(1, int(os.environ.get(name, str(default)).strip()))
@@ -12943,6 +13586,10 @@ def production_job_priority(job_type: str) -> int:
         return 2
     if job_type in {"fusionsolar_production_backfill", "fusionsolar_month_cycle"}:
         return 3
+    if job_type == "fusionsolar_report_production_request":
+        return 4
+    if job_type in FUSIONSOLAR_WAT_JOB_TYPES or job_type == "fusionsolar_state_sync":
+        return 5
     return 4
 
 
@@ -12978,11 +13625,17 @@ def fusionsolar_production_account_key(
     config: sqlite3.Row | dict[str, Any],
     _endpoint: str,
 ) -> str:
+    return fusionsolar_account_key(config)
+
+
+def fusionsolar_account_key(
+    config: sqlite3.Row | dict[str, Any],
+) -> str:
     return production_api_account_key(
         provider=INTEGRATION_PROVIDER_FUSIONSOLAR,
         username=str(config.get("username") if isinstance(config, dict) else config["username"] or ""),
         base_url=str(config.get("base_url") if isinstance(config, dict) else config["base_url"] or ""),
-        endpoint=PRODUCTION_KPI_AREA,
+        endpoint="account",
     )
 
 
@@ -12991,6 +13644,39 @@ def execute_queued_fusionsolar_kpi_call(
     *,
     endpoint: str,
 ) -> Any:
+    return execute_queued_fusionsolar_call(
+        callback,
+        api_area=PRODUCTION_KPI_AREA,
+        policy=fusionsolar_production_kpi_policy(),
+        enforce_production_priority=True,
+    )
+
+
+def execute_queued_fusionsolar_diagnostics_call(callback: Any) -> Any:
+    return execute_queued_fusionsolar_call(
+        callback,
+        api_area=WAT_HISTORY_AREA,
+        policy=fusionsolar_wat_policy(),
+        enforce_production_priority=True,
+    )
+
+
+def execute_queued_fusionsolar_account_call(callback: Any) -> Any:
+    return execute_queued_fusionsolar_call(
+        callback,
+        api_area=API_AREA_STATE,
+        policy=None,
+        enforce_production_priority=True,
+    )
+
+
+def execute_queued_fusionsolar_call(
+    callback: Any,
+    *,
+    api_area: str,
+    policy: ApiQueuePolicy | None,
+    enforce_production_priority: bool,
+) -> Any:
     context = PRODUCTION_KPI_CALL_CONTEXT.get()
     if context is None or not has_app_context():
         return callback()
@@ -12998,9 +13684,11 @@ def execute_queued_fusionsolar_kpi_call(
         config = get_integration_config(queue_conn, INTEGRATION_PROVIDER_FUSIONSOLAR)
         if config is None:
             raise ValueError("Configuracao FusionSolar nao encontrada.")
-        account_key_value = fusionsolar_production_account_key(config, endpoint)
-        higher_priority_types = higher_priority_production_job_types(
-            int(context["priority"])
+        account_key_value = fusionsolar_account_key(config)
+        higher_priority_types = (
+            higher_priority_production_job_types(int(context["priority"]))
+            if enforce_production_priority
+            else ()
         )
         if higher_priority_types:
             placeholders = ", ".join("?" for _ in higher_priority_types)
@@ -13024,41 +13712,65 @@ def execute_queued_fusionsolar_kpi_call(
                 raise ApiSlotUnavailableError(
                     provider=INTEGRATION_PROVIDER_FUSIONSOLAR,
                     account_key=account_key_value,
-                    api_area=PRODUCTION_KPI_AREA,
+                    api_area=api_area,
                     next_attempt_at=next_attempt_at,
                     wait_reason="priority_queue",
                 )
-        reservation = reserve_api_slot(
+        account_reservation = reserve_account_lease(
             queue_conn,
             provider=INTEGRATION_PROVIDER_FUSIONSOLAR.lower(),
             account_key_value=account_key_value,
-            api_area=PRODUCTION_KPI_AREA,
             lease_owner=str(context["lease_owner"]),
-            priority=int(context["priority"]),
-            policy=fusionsolar_production_kpi_policy(),
         )
-        if not reservation.granted:
+        if not account_reservation.granted:
             raise ApiSlotUnavailableError(
                 provider=INTEGRATION_PROVIDER_FUSIONSOLAR,
                 account_key=account_key_value,
-                api_area=PRODUCTION_KPI_AREA,
-                next_attempt_at=reservation.next_attempt_at,
-                wait_reason=reservation.wait_reason,
+                api_area=api_area,
+                next_attempt_at=account_reservation.next_attempt_at,
+                wait_reason=account_reservation.wait_reason,
             )
+        area_reserved = False
         try:
+            if policy is not None:
+                reservation = reserve_api_slot(
+                    queue_conn,
+                    provider=INTEGRATION_PROVIDER_FUSIONSOLAR.lower(),
+                    account_key_value=account_key_value,
+                    api_area=api_area,
+                    lease_owner=str(context["lease_owner"]),
+                    priority=int(context["priority"]),
+                    policy=policy,
+                )
+                if not reservation.granted:
+                    raise ApiSlotUnavailableError(
+                        provider=INTEGRATION_PROVIDER_FUSIONSOLAR,
+                        account_key=account_key_value,
+                        api_area=api_area,
+                        next_attempt_at=reservation.next_attempt_at,
+                        wait_reason=reservation.wait_reason,
+                    )
+                area_reserved = True
             return callback()
         except Exception as exc:
             if is_fusionsolar_rate_limit_error(exc):
                 cooldown_until = datetime.now(LISBON_TIMEZONE) + timedelta(
                     minutes=fusionsolar_rate_limit_minutes()
                 )
-                record_production_api_407(
+                record_account_407(
                     queue_conn,
                     provider=INTEGRATION_PROVIDER_FUSIONSOLAR.lower(),
                     account_key_value=account_key_value,
-                    api_area=PRODUCTION_KPI_AREA,
                     cooldown_until=cooldown_until,
                 )
+                if policy is not None:
+                    record_production_api_407(
+                        queue_conn,
+                        provider=INTEGRATION_PROVIDER_FUSIONSOLAR.lower(),
+                        account_key_value=account_key_value,
+                        api_area=api_area,
+                        cooldown_until=cooldown_until,
+                    )
                 postpone_pending_production_jobs_after_407(
                     queue_conn,
                     cooldown_until=cooldown_until,
@@ -13066,11 +13778,18 @@ def execute_queued_fusionsolar_kpi_call(
                 )
             raise
         finally:
-            release_api_lease(
+            if area_reserved:
+                release_api_lease(
+                    queue_conn,
+                    provider=INTEGRATION_PROVIDER_FUSIONSOLAR.lower(),
+                    account_key_value=account_key_value,
+                    api_area=api_area,
+                    lease_owner=str(context["lease_owner"]),
+                )
+            release_account_lease(
                 queue_conn,
                 provider=INTEGRATION_PROVIDER_FUSIONSOLAR.lower(),
                 account_key_value=account_key_value,
-                api_area=PRODUCTION_KPI_AREA,
                 lease_owner=str(context["lease_owner"]),
             )
 
@@ -13981,6 +14700,13 @@ def disable_removed_inverter_devices(conn: sqlite3.Connection) -> int:
             "UPDATE provider_devices SET enabled = 0 WHERE id = ?",
             [(device_id,) for device_id in removed_ids],
         )
+        for device_id in removed_ids:
+            record_device_configuration(
+                conn,
+                provider_device_id=device_id,
+                active=False,
+                effective_date=current_lisbon_date(),
+            )
     return len(removed_ids)
 
 
@@ -15460,11 +16186,40 @@ def run_sigenergy_sync(conn: sqlite3.Connection, provider: str = "Sigenergy", tr
             raise
 
 
+def load_local_fusionsolar_stations(
+    conn: sqlite3.Connection,
+    provider: str = INTEGRATION_PROVIDER_FUSIONSOLAR,
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT ai.external_id, ai.external_name, a.project_name
+        FROM asset_integrations ai
+        JOIN assets a ON a.id = ai.asset_id
+        WHERE ai.provider = ?
+          AND ai.enabled = 1
+          AND COALESCE(ai.external_id, '') != ''
+          AND COALESCE(a.monitoring_status, 'active') != 'disabled'
+        ORDER BY a.project_name COLLATE NOCASE
+        """,
+        (provider,),
+    ).fetchall()
+    return [
+        {
+            "plantCode": str(row["external_id"]),
+            "plantName": str(
+                row["external_name"] or row["project_name"] or row["external_id"]
+            ),
+        }
+        for row in rows
+    ]
+
+
 def run_fusionsolar_check(
     conn: sqlite3.Connection,
     provider: str,
     dry_run: bool = False,
     include_diagnostics: bool = True,
+    prefer_local_station_inventory: bool = False,
 ) -> dict[str, Any]:
     config = get_integration_config(conn, provider)
     if config is None:
@@ -15477,11 +16232,33 @@ def run_fusionsolar_check(
     for attempt in range(2):
         try:
             session, _ = get_fusionsolar_session(config, force_login=attempt == 1)
-            stations = fetch_fusionsolar_stations(
-                session,
-                base_url=endpoints["base_url"],
-                endpoint=endpoints["plants_endpoint"],
+            inventory_date = get_app_state_value(
+                conn,
+                FUSIONSOLAR_STATION_INVENTORY_DATE_KEY,
             )
+            use_local_inventory = (
+                prefer_local_station_inventory
+                and inventory_date == current_lisbon_date().isoformat()
+            )
+            stations = (
+                load_local_fusionsolar_stations(conn, provider)
+                if use_local_inventory
+                else []
+            )
+            station_list_api_calls = 0
+            if not stations:
+                stations = fetch_fusionsolar_stations(
+                    session,
+                    base_url=endpoints["base_url"],
+                    endpoint=endpoints["plants_endpoint"],
+                )
+                station_list_api_calls = max(1, math.ceil(len(stations) / 100))
+                set_app_state_value(
+                    conn,
+                    FUSIONSOLAR_STATION_INVENTORY_DATE_KEY,
+                    current_lisbon_date().isoformat(),
+                )
+                conn.commit()
             if not stations:
                 raise ValueError("A API FusionSolar nao devolveu centrais para esta conta.")
 
@@ -15544,6 +16321,18 @@ def run_fusionsolar_check(
         "realtime_count": len(realtime_map),
         "alarm_count": sum(len(items) for items in alarm_map.values()),
         "alarm_error": alarm_error,
+        "station_inventory_source": (
+            "local" if use_local_inventory else "api"
+        ),
+        "api_calls_used": (
+            station_list_api_calls
+            + math.ceil(len(station_codes) / 100)
+            + (
+                math.ceil(len(station_codes) / 100)
+                if include_diagnostics
+                else 0
+            )
+        ),
     }
 
 
@@ -17534,7 +18323,7 @@ def upsert_provider_device(conn: sqlite3.Connection, asset_id: int, provider: st
     now = datetime.now().isoformat(timespec="seconds")
     enabled = int(row.get("enabled", 1))
     existing = conn.execute(
-        "SELECT id FROM provider_devices WHERE provider = ? AND external_device_id = ?",
+        "SELECT id, enabled FROM provider_devices WHERE provider = ? AND external_device_id = ?",
         (provider, row["external_device_id"]),
     ).fetchone()
     payload_json = json.dumps(row["payload"], ensure_ascii=True)
@@ -17561,7 +18350,14 @@ def upsert_provider_device(conn: sqlite3.Connection, asset_id: int, provider: st
                 existing["id"],
             ),
         )
-        return int(existing["id"])
+        device_id = int(existing["id"])
+        record_device_configuration(
+            conn,
+            provider_device_id=device_id,
+            active=bool(enabled),
+            effective_date=current_lisbon_date(),
+        )
+        return device_id
     cursor = conn.execute(
         """
         INSERT INTO provider_devices (
@@ -17586,7 +18382,14 @@ def upsert_provider_device(conn: sqlite3.Connection, asset_id: int, provider: st
             now,
         ),
     )
-    return int(cursor.lastrowid)
+    device_id = int(cursor.lastrowid)
+    record_device_configuration(
+        conn,
+        provider_device_id=device_id,
+        active=bool(enabled),
+        effective_date=current_lisbon_date(),
+    )
+    return device_id
 
 
 def prepare_fusionsolar_inverter_history_context(
@@ -17659,7 +18462,7 @@ def sync_fusionsolar_inverter_availability_for_date(
     *,
     context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if target_date >= date.today():
+    if target_date >= current_lisbon_date():
         raise ValueError("A disponibilidade temporal requer um dia fechado.")
     sync_context = context or prepare_fusionsolar_inverter_history_context(conn)
     devices = sync_context["devices"]
@@ -17855,6 +18658,362 @@ def sync_fusionsolar_inverter_availability_range(
     return totals
 
 
+def load_local_fusionsolar_wat_devices(
+    conn: sqlite3.Connection,
+    *,
+    target_date: date,
+    asset_ids: list[int] | None = None,
+) -> list[dict[str, Any]]:
+    ensure_sampled_availability_schema(conn)
+    conditions = [
+        "h.provider = ?",
+        "h.expected = 1",
+        "h.valid_from <= ?",
+        "(h.valid_to IS NULL OR h.valid_to >= ?)",
+        "pd.dev_type_id IN (1, 38)",
+    ]
+    params: list[Any] = [
+        INTEGRATION_PROVIDER_FUSIONSOLAR,
+        target_date.isoformat(),
+        target_date.isoformat(),
+    ]
+    if asset_ids:
+        placeholders = ", ".join("?" for _ in asset_ids)
+        conditions.append(f"h.asset_id IN ({placeholders})")
+        params.extend(sorted(set(asset_ids)))
+    rows = conn.execute(
+        f"""
+        SELECT
+            pd.id AS provider_device_id,
+            h.asset_id,
+            pd.station_code,
+            pd.external_device_id,
+            pd.dev_dn,
+            pd.sn,
+            pd.device_name,
+            pd.dev_type_id,
+            pd.model,
+            pd.rated_power_kw,
+            pd.updated_at
+        FROM provider_device_configuration_history h
+        JOIN provider_devices pd ON pd.id = h.provider_device_id
+        WHERE {' AND '.join(conditions)}
+        ORDER BY h.asset_id, pd.external_device_id
+        """,
+        params,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def fusionsolar_device_catalog_is_stale(
+    conn: sqlite3.Connection,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS total, MAX(updated_at) AS last_updated_at
+        FROM provider_devices
+        WHERE provider = ? AND dev_type_id IN (1, 38)
+        """,
+        (INTEGRATION_PROVIDER_FUSIONSOLAR,),
+    ).fetchone()
+    if int(row["total"] or 0) == 0:
+        return True
+    last_updated = parse_background_job_timestamp(row["last_updated_at"])
+    if last_updated is None:
+        return True
+    now_utc = as_background_job_utc(now or background_job_utc_now())
+    return now_utc - last_updated > timedelta(hours=24)
+
+
+def missing_wat_devices_for_date(
+    conn: sqlite3.Connection,
+    *,
+    target_date: date,
+    devices: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    if not devices:
+        return [], 0
+    start = datetime.combine(target_date, datetime.min.time()).isoformat(
+        timespec="seconds"
+    )
+    end = datetime.combine(
+        target_date + timedelta(days=1),
+        datetime.min.time(),
+    ).isoformat(timespec="seconds")
+    rows = conn.execute(
+        """
+        SELECT inverter_id, sample_time, active_power_kw
+        FROM inverter_power_samples
+        WHERE provider = ? AND sample_time >= ? AND sample_time < ?
+        ORDER BY sample_time
+        """,
+        (INTEGRATION_PROVIDER_FUSIONSOLAR, start, end),
+    ).fetchall()
+    valid_slots: set[datetime] = set()
+    observed_by_inverter: dict[str, set[datetime]] = {}
+    for row in rows:
+        sample_time = parse_datetime_value(row["sample_time"])
+        if sample_time is None:
+            continue
+        slot = inverter_availability_slot(sample_time)
+        observed_by_inverter.setdefault(
+            str(row["inverter_id"]),
+            set(),
+        ).add(slot)
+        if is_inverter_available(row["active_power_kw"]):
+            valid_slots.add(slot)
+    considered_slots = apply_inverter_edge_tolerance(valid_slots)
+    if not considered_slots:
+        return list(devices), 0
+    missing = [
+        device
+        for device in devices
+        if not considered_slots.issubset(
+            observed_by_inverter.get(
+                str(device["external_device_id"]),
+                set(),
+            )
+        )
+    ]
+    return missing, len(considered_slots)
+
+
+def store_fusionsolar_wat_history_batch(
+    conn: sqlite3.Connection,
+    *,
+    samples: list[dict[str, Any]],
+    provider: str = INTEGRATION_PROVIDER_FUSIONSOLAR,
+) -> int:
+    now = serialize_background_job_timestamp()
+    for sample in samples:
+        conn.execute(
+            """
+            INSERT INTO inverter_power_samples (
+                asset_id, provider, external_station_id, inverter_id,
+                inverter_name, inverter_power_kw, sample_time,
+                active_power_kw, raw_payload, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider, inverter_id, sample_time) DO UPDATE SET
+                asset_id = excluded.asset_id,
+                external_station_id = excluded.external_station_id,
+                inverter_name = excluded.inverter_name,
+                inverter_power_kw = excluded.inverter_power_kw,
+                active_power_kw = excluded.active_power_kw,
+                raw_payload = excluded.raw_payload
+            """,
+            (
+                sample["asset_id"],
+                provider,
+                sample["station_code"],
+                sample["external_device_id"],
+                sample["device_name"],
+                sample["rated_power_kw"],
+                sample["sample_time"].isoformat(timespec="seconds"),
+                sample["active_power_kw"],
+                json.dumps(sample["raw_payload"], ensure_ascii=True),
+                now,
+            ),
+        )
+    conn.commit()
+    return len(samples)
+
+
+def update_current_background_job_checkpoint(
+    conn: sqlite3.Connection,
+    updates: dict[str, Any],
+) -> dict[str, Any]:
+    context = PRODUCTION_KPI_CALL_CONTEXT.get()
+    if not context:
+        return {}
+    job_id = int(context["job_id"])
+    row = conn.execute(
+        "SELECT params_json FROM background_jobs WHERE id = ?",
+        (job_id,),
+    ).fetchone()
+    params = decode_job_params(row["params_json"] if row else "{}")
+    params.update(updates)
+    conn.execute(
+        "UPDATE background_jobs SET params_json = ? WHERE id = ?",
+        (encode_job_params(params), job_id),
+    )
+    conn.commit()
+    return params
+
+
+def run_resumable_fusionsolar_wat_backfill(
+    conn: sqlite3.Connection,
+    *,
+    from_date: date,
+    to_date: date,
+) -> dict[str, Any]:
+    context = PRODUCTION_KPI_CALL_CONTEXT.get() or {}
+    job_id = int(context.get("job_id") or 0)
+    job = conn.execute(
+        "SELECT params_json FROM background_jobs WHERE id = ?",
+        (job_id,),
+    ).fetchone()
+    params = decode_job_params(job["params_json"] if job else "{}")
+    cursor_date = (
+        parse_date_value(str(params.get("cursor_date") or ""))
+        or from_date
+    )
+    asset_ids = [
+        int(value)
+        for value in params.get("asset_ids") or []
+        if str(value).isdigit()
+    ]
+    attempted_ids = {
+        str(value)
+        for value in params.get("attempted_inverter_ids") or []
+        if str(value)
+    }
+    summary: dict[str, Any] = {
+        "days": 0,
+        "samples": 0,
+        "plants": 0,
+        "inverters": 0,
+        "api_calls_used": 0,
+        "days_recalculated_from_db": 0,
+        "resume_hint": cursor_date.isoformat(),
+        "stopped_reason": "",
+    }
+
+    if fusionsolar_device_catalog_is_stale(conn):
+        refreshed = prepare_fusionsolar_inverter_history_context(
+            conn,
+            history_call_delay_seconds=0,
+            sleeper=lambda _seconds: None,
+        )
+        station_chunks = max(
+            1,
+            math.ceil(
+                len(
+                    {
+                        str(device["station_code"])
+                        for device in refreshed["devices"]
+                        if device.get("station_code")
+                    }
+                )
+                / 100
+            ),
+        )
+        summary["api_calls_used"] += station_chunks * 2
+
+    current = cursor_date
+    while current <= to_date:
+        devices = load_local_fusionsolar_wat_devices(
+            conn,
+            target_date=current,
+            asset_ids=asset_ids or None,
+        )
+        summary["inverters"] = len(devices)
+        recalculate_stored_inverter_availability(
+            conn,
+            current,
+            current,
+        )
+        missing_devices, valid_slots = missing_wat_devices_for_date(
+            conn,
+            target_date=current,
+            devices=devices,
+        )
+        if not missing_devices:
+            summary["days"] += 1
+            summary["days_recalculated_from_db"] += 1
+            summary["plants"] += len(
+                {int(device["asset_id"]) for device in devices}
+            )
+            current += timedelta(days=1)
+            attempted_ids = set()
+            update_current_background_job_checkpoint(
+                conn,
+                {
+                    "cursor_date": current.isoformat(),
+                    "attempted_inverter_ids": [],
+                },
+            )
+            continue
+
+        pending_devices = [
+            device
+            for device in missing_devices
+            if str(device["external_device_id"]) not in attempted_ids
+        ]
+        if not pending_devices:
+            summary["days"] += 1
+            summary["stopped_reason"] = (
+                "wat_history_incomplete_after_refresh"
+                if valid_slots
+                else "no_observed_operating_window"
+            )
+            current += timedelta(days=1)
+            attempted_ids = set()
+            update_current_background_job_checkpoint(
+                conn,
+                {
+                    "cursor_date": current.isoformat(),
+                    "attempted_inverter_ids": [],
+                },
+            )
+            continue
+
+        batch = pending_devices[:10]
+        config = get_integration_config(
+            conn,
+            INTEGRATION_PROVIDER_FUSIONSOLAR,
+        )
+        if config is None:
+            raise ValueError("Configuracao FusionSolar indisponivel.")
+        endpoints = get_fusionsolar_endpoint_config(config)
+        conn.commit()
+        session, _token = get_fusionsolar_session(config)
+        history_rows = fetch_fusionsolar_device_history(
+            session,
+            base_url=endpoints["base_url"],
+            endpoint=endpoints["device_history_endpoint"],
+            devices=batch,
+            target_date=current,
+            call_delay_seconds=0,
+            sleeper=lambda _seconds: None,
+        )
+        summary["api_calls_used"] += 1
+        summary["samples"] += store_fusionsolar_wat_history_batch(
+            conn,
+            samples=history_rows,
+        )
+        attempted_ids.update(
+            str(device["external_device_id"]) for device in batch
+        )
+        recalculate_stored_inverter_availability(
+            conn,
+            current,
+            current,
+        )
+        update_current_background_job_checkpoint(
+            conn,
+            {
+                "cursor_date": current.isoformat(),
+                "attempted_inverter_ids": sorted(attempted_ids),
+            },
+        )
+        summary["resume_hint"] = current.isoformat()
+        raise ApiSlotUnavailableError(
+            provider=INTEGRATION_PROVIDER_FUSIONSOLAR,
+            account_key=fusionsolar_account_key(config),
+            api_area=WAT_HISTORY_AREA,
+            next_attempt_at=datetime.now(LISBON_TIMEZONE)
+            + timedelta(seconds=1),
+            wait_reason="checkpoint",
+            message="Lote WAT guardado; job preparado para o lote seguinte.",
+            job_result=summary,
+        )
+
+    summary["resume_hint"] = ""
+    return summary
+
+
 def run_fusionsolar_inverter_availability_backfill(
     conn: sqlite3.Connection,
     *,
@@ -17864,8 +19023,14 @@ def run_fusionsolar_inverter_availability_backfill(
     history_call_delay_seconds: float = FUSIONSOLAR_PERFORMANCE_KPI_DELAY_SECONDS,
     max_wait_cycles: int = 24,
 ) -> dict[str, Any]:
-    if from_date > to_date or to_date >= date.today():
+    if from_date > to_date or to_date >= current_lisbon_date():
         raise ValueError("O backfill WAT requer um intervalo valido de dias fechados.")
+    if PRODUCTION_KPI_CALL_CONTEXT.get() is not None:
+        return run_resumable_fusionsolar_wat_backfill(
+            conn,
+            from_date=from_date,
+            to_date=to_date,
+        )
     summary: dict[str, Any] = {
         "days": 0,
         "samples": 0,
@@ -18033,15 +19198,11 @@ def recalculate_stored_inverter_availability(
         target_date = parse_date_value(date_row["sample_date"])
         if target_date is None:
             continue
-        devices = query_all(
+        devices = expected_devices_for_date(
             conn,
-            """
-            SELECT external_device_id, device_name, rated_power_kw, model
-            FROM provider_devices
-            WHERE asset_id = ? AND provider = ? AND enabled = 1 AND dev_type_id IN (1, 38)
-            ORDER BY device_name COLLATE NOCASE, external_device_id
-            """,
-            (current_asset_id, provider),
+            asset_id=current_asset_id,
+            provider=provider,
+            target_date=target_date,
         )
         samples = query_all(
             conn,
@@ -18073,6 +19234,7 @@ def recalculate_stored_inverter_availability(
             "DELETE FROM inverter_availability_daily WHERE asset_id = ? AND provider = ? AND availability_date = ?",
             (current_asset_id, provider, target_date.isoformat()),
         )
+        tolerated_valid_slots = apply_inverter_edge_tolerance(valid_slots)
         inverter_results: list[dict[str, Any]] = []
         for device in devices:
             if is_removed_inverter_name(device["device_name"]):
@@ -18086,6 +19248,15 @@ def recalculate_stored_inverter_availability(
                 or infer_inverter_power_from_model(device["model"])
             )
             result = calculate_inverter_daily_availability(device_samples, valid_slots)
+            observed_slots = {
+                inverter_availability_slot(sample["sample_time"])
+                for sample in device_samples
+            }
+            if (
+                not tolerated_valid_slots
+                or not tolerated_valid_slots.issubset(observed_slots)
+            ):
+                result["availability_pct"] = None
             result["inverter_power_kw"] = inverter_power_kw
             inverter_results.append(result)
             conn.execute(
@@ -18110,8 +19281,15 @@ def recalculate_stored_inverter_availability(
                     now,
                 ),
             )
-        weighted_pct = calculate_weighted_plant_availability(inverter_results)
-        tolerated_valid_slots = apply_inverter_edge_tolerance(valid_slots)
+        weighted_pct = (
+            calculate_weighted_plant_availability(inverter_results)
+            if inverter_results
+            and all(
+                row.get("availability_pct") is not None
+                for row in inverter_results
+            )
+            else None
+        )
         conn.execute(
             """
             INSERT INTO plant_availability_daily (
@@ -18210,7 +19388,7 @@ def run_fusionsolar_device_availability_sync(
         devices=tracked,
     )
     collected_at_dt = datetime.now()
-    collected_at = collected_at_dt.isoformat(timespec="seconds")
+    collected_at = serialize_background_job_timestamp()
     snapshots_by_asset: dict[int, list[dict[str, Any]]] = {}
     for device in tracked:
         realtime = next(
@@ -18309,7 +19487,7 @@ def run_fusionsolar_device_availability_sync(
             (
                 asset_id,
                 provider,
-                date.today().isoformat(),
+                current_lisbon_date().isoformat(),
                 summary["inverter_availability_pct"],
                 summary["capacity_availability_pct"],
                 summary["communication_availability_pct"],
@@ -18327,8 +19505,24 @@ def run_fusionsolar_device_availability_sync(
                 now,
             ),
         )
+    sampled_states: dict[str, int] = {}
+    for asset_id in snapshots_by_asset:
+        sampled = materialize_sampled_availability_day(
+            conn,
+            asset_id=asset_id,
+            provider=provider,
+            target_date=current_lisbon_date(),
+        )
+        state = str(sampled["coverage_status"])
+        sampled_states[state] = sampled_states.get(state, 0) + 1
     conn.commit()
-    return {"devices": len(tracked), "snapshots": sum(len(rows) for rows in snapshots_by_asset.values()), "assets": len(snapshots_by_asset)}
+    return {
+        "devices": len(tracked),
+        "snapshots": sum(len(rows) for rows in snapshots_by_asset.values()),
+        "assets": len(snapshots_by_asset),
+        "sampled_days_recalculated_locally": len(snapshots_by_asset),
+        "sampled_states": sampled_states,
+    }
 
 
 def run_integration_sync(conn: sqlite3.Connection, provider: str, trigger_type: str = "manual") -> dict[str, Any]:
@@ -18362,7 +19556,13 @@ def run_fusionsolar_sync(conn: sqlite3.Connection, provider: str, trigger_type: 
 
         try:
             if trigger_type == "scheduled_state":
-                result = run_fusionsolar_check(conn, provider, dry_run=True, include_diagnostics=False)
+                result = run_fusionsolar_check(
+                    conn,
+                    provider,
+                    dry_run=True,
+                    include_diagnostics=False,
+                    prefer_local_station_inventory=True,
+                )
             else:
                 result = run_fusionsolar_check(conn, provider, dry_run=True)
             rows = result["rows"]
@@ -18533,6 +19733,11 @@ def run_fusionsolar_sync(conn: sqlite3.Connection, provider: str, trigger_type: 
                     "alarm_error": result.get("alarm_error", ""),
                     "station_rows": result.get("station_count", len(rows)),
                     "realtime_rows": result.get("realtime_count", len(rows)),
+                    "station_inventory_source": result.get(
+                        "station_inventory_source",
+                        "api",
+                    ),
+                    "api_calls_used": int(result.get("api_calls_used") or 0),
                 },
             )
             process_monitoring_alerts(conn, alert_events, batch_id, now)
@@ -18548,6 +19753,11 @@ def run_fusionsolar_sync(conn: sqlite3.Connection, provider: str, trigger_type: 
                 "unresolved": unresolved,
                 "auto_resolved": auto_resolved,
                 "device_availability": device_availability,
+                "api_calls_used": int(result.get("api_calls_used") or 0),
+                "station_inventory_source": result.get(
+                    "station_inventory_source",
+                    "api",
+                ),
             }
         except ApiRateLimitError as exc:
             conn.execute(

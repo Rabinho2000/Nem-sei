@@ -335,7 +335,7 @@ def test_restart_preserves_slot_and_recovers_expired_lease(
     restarted.close()
 
 
-def test_407_postpones_only_fusionsolar_production_jobs(
+def test_407_postpones_all_fusionsolar_jobs_for_shared_account(
     tmp_path,
 ) -> None:
     db_path = tmp_path / "queue-jobs.db"
@@ -374,6 +374,11 @@ def test_407_postpones_only_fusionsolar_production_jobs(
         "fusionsolar_state_sync",
         {"provider": "FusionSolar"},
     )
+    sigenergy_job_id, _ = app_module.create_background_job(
+        conn,
+        "sigenergy_state_sync",
+        {"provider": "Sigenergy"},
+    )
     conn.commit()
     original_database = app_module.app.config["DATABASE"]
     app_module.app.config["DATABASE"] = str(db_path)
@@ -404,12 +409,17 @@ def test_407_postpones_only_fusionsolar_production_jobs(
         "SELECT status FROM background_jobs WHERE id = ?",
         (state_job_id,),
     ).fetchone()
+    sigenergy_job = conn.execute(
+        "SELECT status FROM background_jobs WHERE id = ?",
+        (sigenergy_job_id,),
+    ).fetchone()
     queue_state = list_api_queue_states(conn)[0]
 
     assert month_job["status"] == "waiting_api_slot"
     assert month_job["wait_reason"] == "cooldown_407"
     assert month_job["next_attempt_at"]
-    assert state_job["status"] == "pending"
+    assert state_job["status"] == "waiting_api_slot"
+    assert sigenergy_job["status"] == "pending"
     assert queue_state["last_407_at"]
     assert queue_state["cooldown_until"]
     conn.close()

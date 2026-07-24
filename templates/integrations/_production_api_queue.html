@@ -1,15 +1,17 @@
 {% if production_api_queue_states %}
 <section class="card">
   <div class="section-title">
-    <h3>Fila de produção API</h3>
+    <h3>Filas API persistentes</h3>
   </div>
   <div class="table-wrap">
     <table>
       <thead>
         <tr>
           <th>Fornecedor</th>
+          <th>Área</th>
           <th>Próxima chamada</th>
           <th>Jobs em espera</th>
+          <th>Espera por prioridade</th>
           <th>Chamadas hoje</th>
           <th>Orçamento diário</th>
           <th>Último 407</th>
@@ -20,11 +22,19 @@
         {% for state in production_api_queue_states %}
         <tr>
           <td>{{ state.provider|title }}</td>
+          <td>{{ "Produção KPI" if state.api_area == "production_kpi" else ("WAT / diagnósticos" if state.api_area == "wat_history" else state.api_area) }}</td>
           <td>{{ state.next_allowed_at or "Disponível" }}</td>
           <td>{{ state.waiting_jobs }}</td>
+          <td>
+            {% if state.waiting_jobs_by_priority %}
+              {% for priority, count in state.waiting_jobs_by_priority.items() %}
+                P{{ priority }}: {{ count }}{% if not loop.last %} · {% endif %}
+              {% endfor %}
+            {% else %}-{% endif %}
+          </td>
           <td>{{ state.daily_call_count }}</td>
           <td>{{ state.daily_budget if state.daily_budget is not none else "Por validar" }}</td>
-          <td>{{ state.last_407_at or "-" }}</td>
+          <td>{{ state.account_last_407_at or state.last_407_at or "-" }}</td>
           <td>{{ state.resume_forecast or "Disponível" }}</td>
         </tr>
         {% endfor %}
@@ -35,5 +45,24 @@
     O orçamento e os intervalos são persistentes por fornecedor, credencial e endpoint.
     A fila recupera automaticamente após reinícios e leases expirados.
   </p>
+  {% set fusion = production_api_queue_states | selectattr("provider", "equalto", "fusionsolar") | list %}
+  {% if fusion %}
+  <p class="muted">
+    Pedidos de relatório reutilizados: {{ fusion[0].report_requests_reused }} ·
+    Dias recalculados apenas a partir da base de dados: {{ fusion[0].days_recalculated_from_db }} ·
+    Cooldown global: {{ fusion[0].account_cooldown_until or "inativo" }}.
+  </p>
+  <p class="muted">
+    WAT real final: {{ fusion[0].real_wat_days }} dias ·
+    Disponibilidade amostrada (não contratual):
+    {% if fusion[0].sampled_availability_states %}
+      {% for status, count in fusion[0].sampled_availability_states.items() %}
+        {{ status }}={{ count }}{% if not loop.last %}, {% endif %}
+      {% endfor %}
+    {% else %}
+      sem dados
+    {% endif %}.
+  </p>
+  {% endif %}
 </section>
 {% endif %}
