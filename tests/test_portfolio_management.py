@@ -106,6 +106,82 @@ def test_mapping_decisions_exact_fuzzy_conflict_and_manual(tmp_path: Path) -> No
     assert conn.execute("SELECT asset_id FROM portfolio_assets WHERE id = ?", (member_id,)).fetchone()[0] is None
 
 
+def test_shared_nif_requires_manual_choice_but_exact_name_can_resolve_it(tmp_path: Path) -> None:
+    conn = connect(tmp_path)
+    asset_a = add_asset(conn, "Pires Lourenco 1", "501111111")
+    asset_b = add_asset(conn, "Pires Lourenco 2", "501111111")
+
+    shared = repo.suggest_mapping(conn, external_name="Pires Lourenco", nif="501111111")
+    exact = repo.suggest_mapping(conn, external_name="Pires Lourenco 2", nif="501111111")
+
+    assert shared.asset_id is None
+    assert shared.auto_mappable is False
+    assert shared.status == "mapping_pending"
+    assert shared.method == domain.MAPPING_METHOD_NIF_SHARED
+    assert "nif_shared" in shared.warnings
+    assert {candidate.asset_id for candidate in shared.candidates} == {asset_a, asset_b}
+    assert {candidate.method for candidate in shared.candidates} == {domain.MAPPING_METHOD_NIF_SHARED}
+    assert exact.auto_mappable is True
+    assert exact.asset_id == asset_b
+    assert exact.method == domain.MAPPING_METHOD_NAME_EXACT
+
+
+def test_auto_mapping_preserves_confirmed_mapping_and_marks_shared_nif_pending(tmp_path: Path) -> None:
+    conn = connect(tmp_path)
+    asset_a = add_asset(conn, "Diaco Fabrica 1", "501111111")
+    add_asset(conn, "Diaco Fabrica 2", "501111111")
+    portfolio_id = repo.create_portfolio(conn, name="NIF partilhado")
+    confirmed_id = repo.add_member(
+        conn,
+        portfolio_id=portfolio_id,
+        asset_id=asset_a,
+        external_name="Diaco Fabrica 1",
+        nif="501111111",
+    )
+    pending_id = repo.add_member(
+        conn,
+        portfolio_id=portfolio_id,
+        asset_id=None,
+        external_name="Diaco",
+        nif="501111111",
+    )
+
+    result = repo.auto_map_portfolio_assets(conn, portfolio_id=portfolio_id)
+    confirmed = conn.execute("SELECT asset_id, mapping_status, mapping_method FROM portfolio_assets WHERE id = ?", (confirmed_id,)).fetchone()
+    pending = conn.execute("SELECT asset_id, mapping_status, mapping_method FROM portfolio_assets WHERE id = ?", (pending_id,)).fetchone()
+
+    assert result == {"mapped": 0, "pending": 1, "conflicts": 0, "shared_nif": 1, "duplicate_asset": 0}
+    assert tuple(confirmed) == (asset_a, "manual", "manual")
+    assert tuple(pending) == (None, "mapping_pending", domain.MAPPING_METHOD_NIF_SHARED)
+    assert "duplicate_asset_nif" not in {item["code"] for item in repo.detect_portfolio_conflicts(conn)}
+
+
+def test_auto_mapping_never_adds_the_same_asset_twice_to_one_portfolio(tmp_path: Path) -> None:
+    conn = connect(tmp_path)
+    asset_id = add_asset(conn, "Ze Pacheco", "501111111")
+    portfolio_id = repo.create_portfolio(conn, name="Expansao na mesma central")
+    repo.add_member(
+        conn,
+        portfolio_id=portfolio_id,
+        asset_id=asset_id,
+        external_name="Ze Pacheco",
+        nif="501111111",
+    )
+    pending_id = repo.add_member(
+        conn,
+        portfolio_id=portfolio_id,
+        asset_id=None,
+        external_name="Ze Pacheco - Expansao",
+        nif="501111111",
+    )
+
+    result = repo.auto_map_portfolio_assets(conn, portfolio_id=portfolio_id)
+    pending = conn.execute("SELECT asset_id, mapping_status, mapping_method FROM portfolio_assets WHERE id = ?", (pending_id,)).fetchone()
+
+    assert result == {"mapped": 0, "pending": 0, "conflicts": 1, "shared_nif": 0, "duplicate_asset": 1}
+    assert tuple(pending) == (None, "mapping_conflict", "asset_already_in_portfolio")
+
+
 def test_portfolio_crud_members_order_copy_move_and_delete_rules(tmp_path: Path) -> None:
     conn = connect(tmp_path)
     asset_a = add_asset(conn, "Central A")

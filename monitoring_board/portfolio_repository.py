@@ -651,17 +651,34 @@ def suggest_mapping(
 
 
 def auto_map_portfolio_assets(conn: sqlite3.Connection, portfolio_id: int | None = None) -> dict[str, int]:
-    conditions = ["active = 1"]
+    # Suggestions are advisory.  Never recalculate a row that a person has
+    # already mapped, otherwise a later import or alias change can silently
+    # replace a confirmed portfolio association.
+    conditions = ["active = 1", "asset_id IS NULL", "COALESCE(mapping_status, '') != 'missing_source'"]
     params: list[Any] = []
     if portfolio_id:
         conditions.append("portfolio_id = ?")
         params.append(portfolio_id)
     rows = query_all(conn, f"SELECT * FROM portfolio_assets WHERE {' AND '.join(conditions)}", params)
     context = mapping_context(conn)
-    mapped = pending = conflicts = 0
+    occupied_assets: dict[int, set[int]] = {}
+    for existing in query_all(conn, "SELECT portfolio_id, asset_id FROM portfolio_assets WHERE active = 1 AND asset_id IS NOT NULL"):
+        occupied_assets.setdefault(int(existing["portfolio_id"]), set()).add(int(existing["asset_id"]))
+    mapped = pending = conflicts = shared_nif = duplicate_asset = 0
     for row in rows:
         decision = suggest_mapping(conn, external_name=row["external_name"] or "", nif=row["nif"] or "", context=context)
+        if "nif_shared" in decision.warnings and not decision.auto_mappable and decision.status != "mapping_conflict":
+            shared_nif += 1
         if decision.auto_mappable and decision.asset_id is not None:
+            current_portfolio_id = int(row["portfolio_id"])
+            if decision.asset_id in occupied_assets.get(current_portfolio_id, set()):
+                conflicts += 1
+                duplicate_asset += 1
+                conn.execute(
+                    "UPDATE portfolio_assets SET mapping_status = 'mapping_conflict', mapping_method = 'asset_already_in_portfolio', mapping_confidence = ?, updated_at = ? WHERE id = ?",
+                    (decision.score, now_text(), row["id"]),
+                )
+                continue
             mapped += 1
             conn.execute(
                 """
@@ -671,13 +688,20 @@ def auto_map_portfolio_assets(conn: sqlite3.Connection, portfolio_id: int | None
                 """,
                 (decision.asset_id, "mapped", decision.method, decision.score, now_text(), now_text(), row["id"]),
             )
+            occupied_assets.setdefault(current_portfolio_id, set()).add(decision.asset_id)
         elif decision.status == "mapping_conflict":
             conflicts += 1
             conn.execute("UPDATE portfolio_assets SET mapping_status = 'mapping_conflict', mapping_method = 'conflict', mapping_confidence = ?, updated_at = ? WHERE id = ?", (decision.score, now_text(), row["id"]))
         else:
             pending += 1
             conn.execute("UPDATE portfolio_assets SET mapping_status = ?, mapping_method = ?, mapping_confidence = ?, updated_at = ? WHERE id = ?", (decision.status, decision.method, decision.score, now_text(), row["id"]))
-    return {"mapped": mapped, "pending": pending, "conflicts": conflicts}
+    return {
+        "mapped": mapped,
+        "pending": pending,
+        "conflicts": conflicts,
+        "shared_nif": shared_nif,
+        "duplicate_asset": duplicate_asset,
+    }
 
 
 def confirm_mapping(conn: sqlite3.Connection, *, member_id: int, portfolio_id: int, asset_id: int, create_alias: bool = True) -> None:
@@ -777,8 +801,6 @@ def detect_portfolio_conflicts(conn: sqlite3.Connection, portfolio_id: int | Non
         conflicts.append({"code": "duplicate_sub_account", "portfolio_id": row["portfolio_id"], "value": row["sub_account"]})
     for row in query_all(conn, "SELECT normalized_alias, COUNT(DISTINCT asset_id) AS count FROM asset_aliases WHERE active = 1 GROUP BY normalized_alias HAVING count > 1"):
         conflicts.append({"code": "duplicate_alias", "value": row["normalized_alias"]})
-    for row in query_all(conn, "SELECT nif, COUNT(DISTINCT id) AS count FROM assets WHERE COALESCE(nif, '') != '' GROUP BY nif HAVING count > 1"):
-        conflicts.append({"code": "duplicate_asset_nif", "value": row["nif"]})
     return conflicts
 
 

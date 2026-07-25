@@ -214,7 +214,7 @@
           <div class="section-title">
             <div>
               <h3>Mappings pendentes e conflitos</h3>
-              <p class="muted">Aceita a melhor sugestao ou escolhe qualquer instalacao local.</p>
+              <p class="muted">Aceita a melhor sugestao ou escolhe qualquer instalacao local. Um NIF partilhado identifica o mesmo cliente, nao a mesma instalacao; nesses casos a escolha e sempre confirmada manualmente.</p>
             </div>
             <form method="post" action="{{ url_for('portfolio_manager_mappings_suggest') }}">
               <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -234,14 +234,23 @@
                       <strong>{{ member.external_name or 'Sem nome externo' }}</strong>
                       <small>NIF {{ member.nif or '-' }} · Subconta {{ member.sub_account or '-' }}</small>
                     </td>
-                    <td>{{ member.mapping_status or 'mapping_pending' }}</td>
+                    <td>
+                      {{ member.mapping_status or 'mapping_pending' }}
+                      {% if member.mapping_method == 'asset_already_in_portfolio' %}
+                        <br><small>Central ja presente neste portfolio: escolhe outra ou consolida a entrada para evitar dupla contagem.</small>
+                      {% endif %}
+                    </td>
                     <td>{{ "%.0f%%"|format((member.mapping_confidence or 0) * 100) }}</td>
                     <td>
                       {% if decision and decision.candidates %}
                         {% for candidate in decision.candidates[:5] %}
                           <div class="candidate-line">
                             <strong>{{ candidate.asset_name }}</strong>
-                            <small>{{ candidate.method }} · {{ "%.0f%%"|format(candidate.score * 100) }}{% if candidate.reasons %} · {{ candidate.reasons|join(', ') }}{% endif %}</small>
+                            {% if candidate.method == 'nif_shared' %}
+                              <small>NIF partilhado · confirmacao manual obrigatoria</small>
+                            {% else %}
+                              <small>{{ candidate.method }} · {{ "%.0f%%"|format(candidate.score * 100) }}{% if candidate.reasons %} · {{ candidate.reasons|join(', ') }}{% endif %}</small>
+                            {% endif %}
                           </div>
                         {% endfor %}
                       {% else %}
@@ -254,10 +263,11 @@
                         <input type="hidden" name="portfolio_id" value="{{ selected.id }}">
                         <input type="hidden" name="member_id" value="{{ member.id }}">
                         <input type="hidden" name="tab" value="mappings">
+                        {% set candidate_ids = decision.candidates|map(attribute='asset_id')|list if decision and decision.candidates else [] %}
                         <label>Instalacao local
                           <select name="asset_id" required>
                             {% for asset in all_assets %}
-                              <option value="{{ asset.id }}" {{ 'selected' if decision and decision.asset_id == asset.id }}>{{ asset.project_name }}{% if asset.nif %} · {{ asset.nif }}{% endif %}</option>
+                              <option value="{{ asset.id }}" {{ 'selected' if decision and decision.asset_id == asset.id }}>{{ asset.project_name }}{% if asset.nif %} · {{ asset.nif }}{% endif %}{% if asset.id in candidate_ids %} · candidata{% endif %}</option>
                             {% endfor %}
                           </select>
                         </label>

@@ -3359,7 +3359,9 @@ def create_app() -> Flask:
         try:
             result = auto_map_portfolio_assets(g.db, portfolio_id=portfolio_id or None)
             g.db.commit()
-            flash(f"Sugestoes calculadas: {result['mapped']} auto, {result['pending']} pendentes, {result['conflicts']} conflitos.", "success")
+            shared_nif_note = f" {result.get('shared_nif', 0)} com NIF partilhado para confirmar." if result.get("shared_nif") else ""
+            duplicate_asset_note = f" {result.get('duplicate_asset', 0)} apontam para uma central ja presente neste portfolio." if result.get("duplicate_asset") else ""
+            flash(f"Sugestoes calculadas: {result['mapped']} auto, {result['pending']} pendentes, {result['conflicts']} conflitos.{shared_nif_note}{duplicate_asset_note}", "success")
         except Exception as exc:
             g.db.rollback()
             flash(f"Falha ao sugerir mappings: {_portfolio_error_message(exc)}", "error")
@@ -3503,8 +3505,10 @@ def create_app() -> Flask:
                     portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
                     result = auto_map_portfolio_assets(g.db, portfolio_id=portfolio_id or None)
                     g.db.commit()
+                    shared_nif_note = f" {result.get('shared_nif', 0)} com NIF partilhado para confirmar." if result.get("shared_nif") else ""
+                    duplicate_asset_note = f" {result.get('duplicate_asset', 0)} apontam para uma central ja presente neste portfolio." if result.get("duplicate_asset") else ""
                     flash(
-                        f"Auto-mapping concluido: {result['mapped']} mapeadas, {result['pending']} pendentes, {result['conflicts']} conflitos.",
+                        f"Auto-mapping concluido: {result['mapped']} mapeadas, {result['pending']} pendentes, {result['conflicts']} conflitos.{shared_nif_note}{duplicate_asset_note}",
                         "success",
                     )
                     return redirect(url_for("portfolios", tab="config", portfolio_id=portfolio_id, report_month=report_month_redirect))
@@ -8806,11111 +8810,4134 @@ def build_batch_insight(conn: sqlite3.Connection, batch_id: int) -> dict[str, An
             WHERE mr.asset_id = ? AND mr.id < ?
             ORDER BY mr.id DESC
             LIMIT 1
-            """,
-            (row["asset_id"], row["id"]),
-        ).fetchone()
-        previous_status = previous["status"] if previous else ""
-        current_status = row["status"]
-        item = {
-            "asset_id": row["asset_id"],
-            "project_name": row["project_name"],
-            "current_status": current_status,
-            "previous_status": previous_status or "-",
-            "record_date": row["record_date"],
-        }
-
-        if row["active_contract"] == "yes" and current_status in problem_statuses:
-            if previous_status not in problem_statuses:
-                new_problem_assets.append(item)
-            else:
-                persistent_problem_assets.append(item)
-        elif row["active_contract"] == "yes" and current_status in {"Resolvido", "Operacional"} and previous_status in problem_statuses:
-            resolved_assets.append(item)
-
-    return {
-        "batch": batch,
-        "new_problem_assets": new_problem_assets,
-        "persistent_problem_assets": persistent_problem_assets,
-        "resolved_assets": resolved_assets,
-    }
-
-
-def extract_export_filters(source: Any, dataset: str, for_query: bool = False) -> dict[str, str]:
-    get_value = source.get
-    filters = {
-        "search": get_value("search", "").strip(),
-        "asset_id": get_value("asset_id", "").strip(),
-        "om_only": get_value("om_only", "yes").strip(),
-    }
-    if dataset == "monitoring":
-        filters.update(
-            {
-                "status": get_value("status", "").strip(),
-                "source": get_value("source", "").strip(),
-                "start_date": get_value("start_date", "").strip(),
-                "end_date": get_value("end_date", "").strip(),
-            }
-        )
-    elif dataset in {"executive_report", "monitoring_report", "production_report"}:
-        filters.update(
-            {
-                "period": get_value("period", "week").strip() or "week",
-                "source": get_value("source", "").strip(),
-                "report_month": get_value("report_month", "").strip(),
-                "report_year": get_value("report_year", "").strip(),
-            }
-        )
-    else:
-        filters.update(
-            {
-                "status": get_value("status", "").strip(),
-                "urgency": get_value("urgency", "").strip(),
-            }
-        )
-    if for_query:
-        if dataset == "production_report" and filters.get("period") not in {"month", "year"}:
-            filters["period"] = "month"
-        return filters
-    if dataset == "production_report" and filters.get("period") not in {"month", "year"}:
-        filters["period"] = "month"
-    return {key: value for key, value in filters.items() if value}
-
-
-def normalize_report_month(value: str | None) -> str:
-    if value:
-        try:
-            return datetime.strptime(value.strip(), "%Y-%m").strftime("%Y-%m")
-        except ValueError:
-            pass
-    return date.today().strftime("%Y-%m")
-
-
-def normalize_report_year(value: str | None) -> int:
-    if value and value.strip().isdigit():
-        year = int(value.strip())
-        if 2000 <= year <= date.today().year + 1:
-            return year
-    return date.today().year
-
-
-def report_period_dates(period: str, report_month: str | None = None, report_year: str | None = None) -> tuple[str, str]:
-    today = date.today()
-    if period == "day":
-        return today.isoformat(), today.isoformat()
-    if period == "year":
-        year = normalize_report_year(report_year)
-        start = date(year, 1, 1)
-        end = date(year, 12, 31)
-        if year == today.year:
-            end = today
-        return start.isoformat(), end.isoformat()
-    if period == "month":
-        month_value = normalize_report_month(report_month)
-        month_start = datetime.strptime(month_value, "%Y-%m").date()
-        _, last_day = calendar.monthrange(month_start.year, month_start.month)
-        month_end = month_start.replace(day=last_day)
-        if month_start.year == today.year and month_start.month == today.month:
-            month_end = today
-        return month_start.isoformat(), month_end.isoformat()
-    return (today - timedelta(days=7)).isoformat(), today.isoformat()
-
-
-def report_period_label(period: str, report_month: str | None = None, report_year: str | None = None) -> str:
-    start_date, end_date = report_period_dates(period, report_month, report_year)
-    labels = {
-        "day": "Diario",
-        "week": "Semanal",
-        "month": "Mensal",
-        "year": "Anual",
-    }
-    return f"{labels.get(period, 'Semanal')} ({start_date} a {end_date})"
-
-
-def report_sync_bounds(filters: dict[str, str]) -> tuple[int, int, date, date]:
-    period = filters.get("period", "month")
-    start_raw, end_raw = report_period_dates(period, filters.get("report_month"), filters.get("report_year"))
-    start = datetime.strptime(start_raw, "%Y-%m-%d").date()
-    end = datetime.strptime(end_raw, "%Y-%m-%d").date()
-    return start.year, end.year, start, end
-
-
-def build_monitoring_report_rows(
-    conn: sqlite3.Connection,
-    filters: dict[str, str],
-    limit: int | None = None,
-) -> list[dict[str, Any]]:
-    period = filters.get("period", "week")
-    start_date, end_date = report_period_dates(period, filters.get("report_month"), filters.get("report_year"))
-    source_filter = filters.get("source", "")
-
-    filter_sql = []
-    params: list[Any] = []
-    if filters.get("search"):
-        wildcard = f"%{filters['search']}%"
-        filter_sql.append("(a.project_name LIKE ? OR a.alias_blob LIKE ? OR a.company_name LIKE ? OR a.location LIKE ?)")
-        params.extend([wildcard, wildcard, wildcard, wildcard])
-    if filters.get("asset_id"):
-        filter_sql.append("a.id = ?")
-        params.append(filters["asset_id"])
-    if filters.get("om_only", "yes") == "yes":
-        filter_sql.append("a.active_contract = 'yes'")
-    where_sql = f"WHERE {' AND '.join(filter_sql)}" if filter_sql else ""
-
-    assets = query_all(
-        conn,
-        f"""
-        SELECT
-            a.id,
-            a.project_name,
-            a.location,
-            a.active_contract,
-            lm.status AS current_status,
-            lm.record_date AS last_record_date,
-            lm.notes AS latest_notes
-        FROM assets a
-        LEFT JOIN latest_monitoring_view lm ON lm.asset_id = a.id
-        {where_sql}
-        ORDER BY
-            CASE a.active_contract WHEN 'yes' THEN 1 ELSE 2 END,
-            a.project_name COLLATE NOCASE
-        """,
-        params,
-    )
-
-    rows: list[dict[str, Any]] = []
-    monitoring_source_sql = "AND mr.source = ?" if source_filter else ""
-    monitoring_source_params: list[Any] = [source_filter] if source_filter else []
-    for asset in assets:
-        asset_id = int(asset["id"])
-        monitoring_metrics = conn.execute(
-            f"""
-            SELECT
-                COUNT(*) AS monitoring_records,
-                SUM(CASE WHEN mr.status IN ('Erro', 'Desconectada') THEN 1 ELSE 0 END) AS error_records,
-                COUNT(DISTINCT CASE
-                    WHEN mr.status IN ('Erro', 'Desconectada')
-                    THEN mr.status || '|' || COALESCE(NULLIF(TRIM(mr.notes), ''), '-')
-                END) AS distinct_errors,
-                MAX(mr.record_date) AS last_record_date
-            FROM monitoring_records mr
-            WHERE mr.asset_id = ?
-              AND mr.record_date BETWEEN ? AND ?
-              {monitoring_source_sql}
-            """,
-            [asset_id, start_date, end_date] + monitoring_source_params,
-        ).fetchone()
-        error_rows = query_all(
-            conn,
-            f"""
-            SELECT DISTINCT mr.status, COALESCE(NULLIF(TRIM(mr.notes), ''), '-') AS notes
-            FROM monitoring_records mr
-            WHERE mr.asset_id = ?
-              AND mr.record_date BETWEEN ? AND ?
-              AND mr.status IN ('Erro', 'Desconectada')
-              {monitoring_source_sql}
-            ORDER BY mr.status COLLATE NOCASE, notes COLLATE NOCASE
-            """,
-            [asset_id, start_date, end_date] + monitoring_source_params,
-        )
-        open_tickets = int(
-            query_scalar(
-                conn,
-                "SELECT COUNT(*) FROM tickets WHERE asset_id = ? AND status != 'Fechado'",
-                (asset_id,),
-            )
-            or 0
-        )
-        visit_metrics = conn.execute(
-            """
-            SELECT COUNT(*) AS visits_period, MAX(tv.visit_date) AS last_visit_date
-            FROM ticket_visits tv
-            JOIN tickets t ON t.id = tv.ticket_id
-            WHERE t.asset_id = ?
-              AND tv.visit_date BETWEEN ? AND ?
-            """,
-            (asset_id, start_date, end_date),
-        ).fetchone()
-
-        monitoring_count = int(monitoring_metrics["monitoring_records"] or 0)
-        error_count = int(monitoring_metrics["error_records"] or 0)
-        visits_period = int(visit_metrics["visits_period"] or 0)
-        if monitoring_count == 0 and open_tickets == 0 and visits_period == 0:
-            continue
-
-        error_types = []
-        for row in error_rows:
-            label = row["status"]
-            if row["notes"] and row["notes"] != "-":
-                label = f"{label}: {row['notes']}"
-            error_types.append(label)
-
-        rows.append(
-            {
-                "period": report_period_label(period, filters.get("report_month"), filters.get("report_year")),
-                "project_name": asset["project_name"],
-                "location": asset["location"] or "-",
-                "current_status": asset["current_status"] or "-",
-                "last_record_date": monitoring_metrics["last_record_date"] or asset["last_record_date"] or "-",
-                "monitoring_records": monitoring_count,
-                "error_records": error_count,
-                "distinct_errors": int(monitoring_metrics["distinct_errors"] or 0),
-                "error_types": "; ".join(error_types) if error_types else "-",
-                "open_tickets": open_tickets,
-                "visits_period": visits_period,
-                "last_visit_date": visit_metrics["last_visit_date"] or "-",
-                "latest_notes": asset["latest_notes"] or "",
-            }
-        )
-
-    rows.sort(
-        key=lambda row: (
-            0 if row["current_status"] in {"Erro", "Desconectada"} else 1,
-            -int(row["error_records"] or 0),
-            -int(row["open_tickets"] or 0),
-            -int(row["visits_period"] or 0),
-            row["project_name"].lower(),
-        )
-    )
-    return rows[:limit] if limit else rows
-
-
-def build_executive_report_rows(
-    conn: sqlite3.Connection,
-    filters: dict[str, str],
-    limit: int | None = None,
-) -> list[dict[str, Any]]:
-    start_date, end_date = report_period_dates(
-        filters.get("period", "week"),
-        filters.get("report_month"),
-        filters.get("report_year"),
-    )
-    source_filter = filters.get("source", "")
-    source_sql = "AND mr.source = ?" if source_filter else ""
-    source_params: list[Any] = [source_filter] if source_filter else []
-
-    active_rows = query_all(
-        conn,
-        f"""
-        SELECT
-            a.id AS asset_id,
-            a.project_name,
-            a.active_contract,
-            lm.status,
-            lm.record_date,
-            lm.notes,
-            (
-                SELECT mr.source
-                FROM monitoring_records mr
-                WHERE mr.asset_id = a.id
-                  AND mr.record_date = lm.record_date
-                  AND mr.status = lm.status
-                  {source_sql}
-                ORDER BY mr.id DESC
-                LIMIT 1
-            ) AS source
-        FROM latest_monitoring_view lm
-        JOIN assets a ON a.id = lm.asset_id
-        WHERE a.active_contract = 'yes'
-          AND lm.status IN ('Erro', 'Desconectada')
-        """,
-        source_params,
-    )
-    enriched = [
-        row for row in enrich_operational_rows(conn, active_rows)
-        if not source_filter or row.get("source")
-    ]
-    enriched.sort(
-        key=lambda row: (
-            priority_rank(row["auto_priority"]),
-            -int(row.get("problem_days") or 0),
-            -int(row.get("recurrence_count") or 0),
-            row["project_name"].lower(),
-        )
-    )
-
-    rows: list[dict[str, Any]] = []
-    for row in enriched:
-        rows.append(
-            {
-                "section": "Problemas ativos O&M",
-                "priority": row["auto_priority"],
-                "project_name": row["project_name"],
-                "status": row["status"],
-                "problem_days": row["problem_days"],
-                "recurrence_count": row["recurrence_count"],
-                "open_tickets": row["open_tickets"],
-                "source": row.get("source") or "-",
-                "notes": row.get("notes") or "",
-            }
-        )
-
-    resolved_rows = query_all(
-        conn,
-        f"""
-        SELECT
-            a.project_name,
-            mr.status,
-            mr.record_date,
-            mr.source,
-            mr.notes
-        FROM monitoring_records mr
-        JOIN assets a ON a.id = mr.asset_id
-        WHERE a.active_contract = 'yes'
-          AND mr.status = 'Resolvido'
-          AND mr.record_date BETWEEN ? AND ?
-          {source_sql}
-        ORDER BY mr.record_date DESC, a.project_name COLLATE NOCASE
-        LIMIT 50
-        """,
-        [start_date, end_date] + source_params,
-    )
-    for row in resolved_rows:
-        rows.append(
-            {
-                "section": "Resolvidos no periodo",
-                "priority": "-",
-                "project_name": row["project_name"],
-                "status": row["status"],
-                "problem_days": "",
-                "recurrence_count": "",
-                "open_tickets": "",
-                "source": row["source"] or "-",
-                "notes": row["notes"] or "",
-            }
-        )
-
-    return rows[:limit] if limit else rows
-
-
-def production_report_status(rows: list[sqlite3.Row]) -> str:
-    if not rows:
-        return "Sem dados"
-    ordered = ["Critico", "CrÃ­tico", "Alerta", "Atencao", "AtenÃ§Ã£o", "Sem dados", "Sem referencia", "Sem referÃªncia", "OK"]
-    statuses = {str(row["performance_status"] or "") for row in rows}
-    for status in ordered:
-        if status in statuses:
-            return status
-    return next(iter(statuses), "Sem dados") or "Sem dados"
-
-
-def build_production_report_rows(
-    conn: sqlite3.Connection,
-    filters: dict[str, str],
-    limit: int | None = None,
-) -> list[dict[str, Any]]:
-    period = filters.get("period", "month")
-    if period not in {"month", "year"}:
-        period = "month"
-    start_date, end_date = report_period_dates(period, filters.get("report_month"), filters.get("report_year"))
-    source_filter = filters.get("source", "")
-
-    filter_sql = []
-    params: list[Any] = []
-    if filters.get("search"):
-        wildcard = f"%{filters['search']}%"
-        filter_sql.append("(a.project_name LIKE ? OR a.alias_blob LIKE ? OR a.company_name LIKE ? OR a.location LIKE ?)")
-        params.extend([wildcard, wildcard, wildcard, wildcard])
-    if filters.get("asset_id"):
-        filter_sql.append("a.id = ?")
-        params.append(filters["asset_id"])
-    if filters.get("om_only", "yes") == "yes":
-        filter_sql.append("a.active_contract = 'yes'")
-    where_sql = f"WHERE {' AND '.join(filter_sql)}" if filter_sql else ""
-
-    assets = query_all(
-        conn,
-        f"""
-        SELECT a.id, a.project_name, a.location, a.kwp, a.active_contract
-        FROM assets a
-        {where_sql}
-        ORDER BY
-            CASE a.active_contract WHEN 'yes' THEN 1 ELSE 2 END,
-            a.project_name COLLATE NOCASE
-        """,
-        params,
-    )
-
-    provider_sql = "AND provider = ?" if source_filter else ""
-    provider_params: list[Any] = [source_filter] if source_filter else []
-    rows: list[dict[str, Any]] = []
-    for asset in assets:
-        asset_id = int(asset["id"])
-        monthly_records = query_all(
-            conn,
-            f"""
-            SELECT *
-            FROM production_records
-            WHERE asset_id = ?
-              AND period_type = 'month'
-              AND period_date BETWEEN ? AND ?
-              {provider_sql}
-            ORDER BY period_date
-            """,
-            [asset_id, start_date, end_date] + provider_params,
-        )
-        daily_records = query_all(
-            conn,
-            f"""
-            SELECT *
-            FROM production_records
-            WHERE asset_id = ?
-              AND period_type = 'day'
-              AND period_date BETWEEN ? AND ?
-              {provider_sql}
-            ORDER BY period_date
-            """,
-            [asset_id, start_date, end_date] + provider_params,
-        )
-        source_records = monthly_records if monthly_records else daily_records
-        production_values = [float(row["production_kwh"]) for row in source_records if row["production_kwh"] is not None]
-        expected_values = [float(row["expected_kwh"]) for row in source_records if row["expected_kwh"] is not None]
-        production_kwh = sum(production_values) if production_values else None
-        expected_kwh = sum(expected_values) if expected_values else None
-        kwp = parse_kwp_value(asset["kwp"])
-        specific_yield = calculate_specific_yield(production_kwh, kwp)
-        deviation_pct = None
-        if production_kwh is not None and expected_kwh:
-            deviation_pct = ((production_kwh - expected_kwh) / expected_kwh) * 100
-        providers = sorted({str(row["provider"] or "") for row in source_records if row["provider"]})
-        last_update = max((str(row["updated_at"] or "") for row in source_records), default="")
-        if not source_records and filters.get("hide_empty") == "yes":
-            continue
-
-        rows.append(
-            {
-                "period": report_period_label(period, filters.get("report_month"), filters.get("report_year")),
-                "project_name": asset["project_name"],
-                "location": asset["location"] or "-",
-                "provider": ", ".join(providers) if providers else "-",
-                "production_kwh": round(production_kwh, 2) if production_kwh is not None else "",
-                "specific_yield": round(specific_yield, 2) if specific_yield is not None else "",
-                "expected_kwh": round(expected_kwh, 2) if expected_kwh is not None else "",
-                "deviation_pct": round(deviation_pct, 2) if deviation_pct is not None else "",
-                "performance_status": production_report_status(source_records),
-                "data_points": len(source_records),
-                "data_source": "KPI mensal API" if monthly_records else ("KPI diario API" if daily_records else "Sem dados API"),
-                "last_update": last_update or "-",
-                "notes": "" if source_records else "Sem producao sincronizada para o periodo.",
-            }
-        )
-
-    rows.sort(
-        key=lambda row: (
-            1 if row["data_points"] else 0,
-            row["performance_status"] == "OK",
-            row["project_name"].lower(),
-        )
-    )
-    return rows[:limit] if limit else rows
-
-
-def build_export_dataset(
-    conn: sqlite3.Connection,
-    dataset: str,
-    filters: dict[str, str],
-    columns: list[str],
-    limit: int | None = None,
-) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
-    headers = [column for column in EXPORT_DATASETS[dataset]["columns"] if column[0] in columns]
-    if not headers:
-        headers = EXPORT_DATASETS[dataset]["columns"]
-
-    if dataset == "assets":
-        filter_sql = []
-        params: list[Any] = []
-        if filters.get("search"):
-            wildcard = f"%{filters['search']}%"
-            filter_sql.append("(a.project_name LIKE ? OR a.alias_blob LIKE ? OR a.company_name LIKE ? OR a.location LIKE ?)")
-            params.extend([wildcard, wildcard, wildcard, wildcard])
-        if filters.get("asset_id"):
-            filter_sql.append("a.id = ?")
-            params.append(filters["asset_id"])
-        if filters.get("om_only", "yes") == "yes":
-            filter_sql.append("a.active_contract = 'yes'")
-        where_sql = f"WHERE {' AND '.join(filter_sql)}" if filter_sql else ""
-        limit_sql = f"LIMIT {limit}" if limit else ""
-        rows = query_all(
-            conn,
-            f"""
-            SELECT
-                a.project_name,
-                a.location,
-                a.address,
-                a.contact_phone,
-                a.contact_name,
-                a.access_type,
-                a.coverage_type,
-                a.contract_type,
-                a.active_contract,
-                a.company_name,
-                a.contact_email
-            FROM assets a
-            {where_sql}
-            ORDER BY
-                CASE a.active_contract WHEN 'yes' THEN 1 ELSE 2 END,
-                a.project_name COLLATE NOCASE
-            {limit_sql}
-            """,
-            params,
-        )
-    elif dataset == "monitoring":
-        filter_sql = []
-        params: list[Any] = []
-        if filters.get("search"):
-            wildcard = f"%{filters['search']}%"
-            filter_sql.append("(a.project_name LIKE ? OR a.alias_blob LIKE ? OR a.company_name LIKE ?)")
-            params.extend([wildcard, wildcard, wildcard])
-        if filters.get("asset_id"):
-            filter_sql.append("a.id = ?")
-            params.append(filters["asset_id"])
-        if filters.get("status"):
-            filter_sql.append("mr.status = ?")
-            params.append(filters["status"])
-        if filters.get("source"):
-            filter_sql.append("mr.source = ?")
-            params.append(filters["source"])
-        if filters.get("om_only", "yes") == "yes":
-            filter_sql.append("a.active_contract = 'yes'")
-        if filters.get("start_date"):
-            filter_sql.append("mr.record_date >= ?")
-            params.append(filters["start_date"])
-        if filters.get("end_date"):
-            filter_sql.append("mr.record_date <= ?")
-            params.append(filters["end_date"])
-        where_sql = f"WHERE {' AND '.join(filter_sql)}" if filter_sql else ""
-        limit_sql = f"LIMIT {limit}" if limit else ""
-        rows = query_all(
-            conn,
-            f"""
-            SELECT
-                mr.record_date,
-                mib.imported_at,
-                a.project_name,
-                a.location,
-                a.contract_type,
-                a.active_contract,
-                mr.status,
-                mr.notes,
-                mr.source
-            FROM monitoring_records mr
-            JOIN assets a ON a.id = mr.asset_id
-            LEFT JOIN monitoring_import_batches mib ON mib.id = mr.batch_id
-            {where_sql}
-            ORDER BY mr.record_date DESC, a.project_name COLLATE NOCASE, mr.id DESC
-            {limit_sql}
-            """,
-            params,
-        )
-    elif dataset == "executive_report":
-        rows = build_executive_report_rows(conn, filters, limit=limit)
-    elif dataset == "monitoring_report":
-        rows = build_monitoring_report_rows(conn, filters, limit=limit)
-    elif dataset == "production_report":
-        rows = build_production_report_rows(conn, filters, limit=limit)
-    else:
-        filter_sql = []
-        params = []
-        if filters.get("search"):
-            wildcard = f"%{filters['search']}%"
-            filter_sql.append("(a.project_name LIKE ? OR a.alias_blob LIKE ? OR t.title LIKE ? OR COALESCE(t.notes, '') LIKE ?)")
-            params.extend([wildcard, wildcard, wildcard, wildcard])
-        if filters.get("asset_id"):
-            filter_sql.append("a.id = ?")
-            params.append(filters["asset_id"])
-        if filters.get("status"):
-            filter_sql.append("t.status = ?")
-            params.append(filters["status"])
-        if filters.get("urgency"):
-            filter_sql.append("t.urgency = ?")
-            params.append(filters["urgency"])
-        if filters.get("om_only", "yes") == "yes":
-            filter_sql.append("a.active_contract = 'yes'")
-        where_sql = f"WHERE {' AND '.join(filter_sql)}" if filter_sql else ""
-        limit_sql = f"LIMIT {limit}" if limit else ""
-        rows = query_all(
-            conn,
-            f"""
-            SELECT
-                a.project_name,
-                a.location,
-                a.contract_type,
-                a.active_contract,
-                t.title,
-                t.status,
-                t.urgency,
-                t.installation_ref,
-                t.next_action,
-                t.notes,
-                t.created_at,
-                t.updated_at
-            FROM tickets t
-            JOIN assets a ON a.id = t.asset_id
-            {where_sql}
-            ORDER BY
-                CASE a.active_contract WHEN 'yes' THEN 1 ELSE 2 END,
-                a.project_name COLLATE NOCASE,
-                t.updated_at DESC
-            {limit_sql}
-            """,
-            params,
-        )
-
-    normalized_rows = [dict(row) for row in rows]
-    return normalized_rows, headers
-
-
-def get_fusionsolar_report_assets(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    rows = query_all(
-        conn,
-        """
-        SELECT
-            a.id AS asset_id,
-            a.project_name,
-            a.location,
-            a.kwp,
-            a.contract_type,
-            a.asset_type,
-            a.coverage_type,
-            a.sell_to,
-            ai.external_id,
-            ai.external_name
-        FROM asset_integrations ai
-        JOIN assets a ON a.id = ai.asset_id
-        WHERE ai.provider = ?
-          AND ai.enabled = 1
-          AND COALESCE(ai.external_id, '') != ''
-        ORDER BY a.project_name COLLATE NOCASE
-        """,
-        (INTEGRATION_PROVIDER_FUSIONSOLAR,),
-    )
-    assets = [dict(row) for row in rows]
-    for asset in assets:
-        asset["report_type"] = detect_report_type(asset)
-    return assets
-
-
-def first_numeric(data: dict[str, Any], keys: list[str]) -> float | None:
-    for key in keys:
-        value = parse_float_value(data.get(key))
-        if value is not None:
-            return value
-    return None
-
-
-def normalize_customer_kpi_row(row: dict[str, Any], fallback_date: date) -> dict[str, Any]:
-    data_item_map = row.get("dataItemMap") if isinstance(row, dict) else {}
-    if not isinstance(data_item_map, dict):
-        data_item_map = {}
-    production = first_numeric(data_item_map, ["PVYield", "inverterYield", "inverter_power"])
-    export = first_numeric(data_item_map, ["ongrid_power", "total_feed_in_to_grid"])
-    self_use = first_numeric(data_item_map, ["selfUsePower", "selfProvide"])
-    consumption = first_numeric(data_item_map, ["use_power", "day_use_energy"])
-    if self_use is None and production is not None and export is not None:
-        self_use = max(production - (export or 0), 0)
-    if export is None and production is not None and self_use is not None:
-        export = max(production - self_use, 0)
-    return {
-        "date": parse_fusionsolar_collect_date(row, fallback_date) or fallback_date,
-        "production_kwh": production,
-        "self_use_kwh": self_use,
-        "export_kwh": export,
-        "consumption_kwh": consumption,
-        "raw": row,
-    }
-
-
-def parse_production_record_payload(row: sqlite3.Row) -> dict[str, Any]:
-    try:
-        payload = json.loads(row["payload_json"] or "{}")
-    except (TypeError, json.JSONDecodeError):
-        payload = {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def extract_customer_tariff_values(row: dict[str, Any] | None) -> dict[str, float]:
-    data_item_map = row.get("dataItemMap") if isinstance(row, dict) else {}
-    if not isinstance(data_item_map, dict):
-        data_item_map = {}
-    aliases = {
-        "self_use_cheia_kwh": ["self_use_cheia_kwh", "selfUsePeak", "selfUseCheia"],
-        "self_use_ponta_kwh": ["self_use_ponta_kwh", "selfUseHighPeak", "selfUsePonta"],
-        "self_use_vazio_kwh": ["self_use_vazio_kwh", "selfUseOffPeak", "selfUseVazio"],
-        "self_use_super_vazio_kwh": ["self_use_super_vazio_kwh", "selfUseSuperOffPeak", "selfUseSuperVazio"],
-    }
-    return {key: first_numeric(data_item_map, keys) or 0.0 for key, keys in aliases.items()}
-
-
-def normalize_customer_production_record(row: sqlite3.Row, fallback_date: date) -> dict[str, Any]:
-    payload = parse_production_record_payload(row)
-    normalized = normalize_customer_kpi_row(payload, fallback_date)
-    record_date = parse_date_value(row["period_date"]) or fallback_date
-    production_kwh = parse_float_value(row["production_kwh"])
-    if production_kwh is not None:
-        normalized["production_kwh"] = production_kwh
-    normalized["date"] = record_date
-    return normalized
-
-
-def _get_fusionsolar_report_asset(conn: sqlite3.Connection, asset_id: int) -> sqlite3.Row:
-    asset = conn.execute(
-        """
-        SELECT
-            a.id AS asset_id,
-            a.project_name,
-            a.location,
-            a.kwp,
-            a.contract_type,
-            a.asset_type,
-            a.coverage_type,
-            a.sell_to,
-            ai.external_id,
-            ai.external_name
-        FROM asset_integrations ai
-        JOIN assets a ON a.id = ai.asset_id
-        WHERE a.id = ?
-          AND ai.provider = ?
-          AND ai.enabled = 1
-          AND COALESCE(ai.external_id, '') != ''
-        LIMIT 1
-        """,
-        (asset_id, INTEGRATION_PROVIDER_FUSIONSOLAR),
-    ).fetchone()
-    if asset is None:
-        raise ValueError("A instalacao nao tem mapeamento FusionSolar ativo.")
-    return asset
-
-
-def _resolve_customer_reporting_period(report_month: str, period: ReportingPeriod | None) -> ReportingPeriod:
-    return period or monthly_period(report_month)
-
-
-def _month_key(value: date) -> date:
-    return value.replace(day=1)
-
-
-def _empty_month_row(month_start: date) -> dict[str, Any]:
-    return {
-        "date": month_start,
-        "label": f"{month_start.month:02d}/{str(month_start.year)[2:]}",
-        "production_kwh": None,
-        "self_use_kwh": None,
-        "export_kwh": None,
-        "consumption_kwh": None,
-        "source": "Sem dados",
-    }
-
-
-def _aggregate_customer_rows_for_period(
-    period: ReportingPeriod,
-    monthly_rows: list[dict[str, Any]],
-    daily_rows: list[dict[str, Any]],
-    *,
-    asset_id: int,
-    reference_date: date,
-) -> dict[str, Any]:
-    monthly_by_month: dict[date, list[dict[str, Any]]] = {}
-    for row in monthly_rows:
-        monthly_by_month.setdefault(_month_key(row["date"]), []).append(row)
-    daily_by_month: dict[date, list[dict[str, Any]]] = {}
-    for row in daily_rows:
-        daily_by_month.setdefault(_month_key(row["date"]), []).append(row)
-
-    selected_month_rows: list[dict[str, Any]] = []
-    months_with_data: list[str] = []
-    missing_months: list[str] = []
-    months_requiring_fallback: list[str] = []
-    report_notes: list[str] = []
-    production_warnings: set[str] = set()
-    monthly_quality: list[dict[str, Any]] = []
-    tariff_totals = {
-        "self_use_cheia_kwh": 0.0,
-        "self_use_ponta_kwh": 0.0,
-        "self_use_vazio_kwh": 0.0,
-        "self_use_super_vazio_kwh": 0.0,
-    }
-
-    for month_start in period.included_months:
-        month_monthly = monthly_by_month.get(month_start, [])
-        month_daily = daily_by_month.get(month_start, [])
-        quality = evaluate_monthly_production_quality(
-            asset_id=asset_id,
-            month_start=month_start,
-            reference_date=reference_date,
-            monthly_records=month_monthly,
-            daily_records=month_daily,
-        )
-        quality_dict = quality.as_dict()
-        monthly_quality.append(quality_dict)
-        production_warnings.update(quality.warnings)
-        notice = production_quality_notice(quality)
-        if notice:
-            report_notes.append(f"{month_start:%Y-%m}: {notice}")
-
-        if quality.status == "complete" and quality.source == "monthly":
-            row = dict(month_monthly[-1])
-            row["production_kwh"] = quality.production_kwh
-            row["source"] = "Mensal local"
-        elif quality.status == "complete" and quality.source == "daily":
-            row = _empty_month_row(month_start)
-            distinct_daily = {item["date"]: item for item in month_daily}
-            complete_daily = list(distinct_daily.values())
-            row.update(
-                production_kwh=quality.production_kwh,
-                self_use_kwh=sum(float(item.get("self_use_kwh") or 0.0) for item in complete_daily),
-                export_kwh=sum(float(item.get("export_kwh") or 0.0) for item in complete_daily),
-                consumption_kwh=sum(float(item.get("consumption_kwh") or 0.0) for item in complete_daily),
-                source="Diario local",
-            )
-            months_with_data.append(month_start.strftime("%Y-%m"))
-        elif quality.status == "complete":
-            row = _empty_month_row(month_start)
-        else:
-            row = _empty_month_row(month_start)
-            row["source"] = "Diagnostico diario" if quality.raw_daily_total_kwh is not None else "Sem dados"
-            missing_months.append(month_start.strftime("%Y-%m"))
-            if quality.requires_fallback:
-                months_requiring_fallback.append(month_start.strftime("%Y-%m"))
-        if quality.status == "complete" and month_start.strftime("%Y-%m") not in months_with_data:
-            months_with_data.append(month_start.strftime("%Y-%m"))
-        row.update(
-            production_quality_status=quality.status,
-            production_source=quality.source,
-            raw_daily_total_kwh=quality.raw_daily_total_kwh,
-            production_expected_days=quality.expected_days,
-            production_available_days=quality.available_days,
-            production_missing_dates=[item.isoformat() for item in quality.missing_dates],
-            production_coverage_ratio=quality.coverage_ratio,
-            daily_coverage=quality.daily_coverage,
-        )
-        selected_month_rows.append(row)
-        if quality.status == "complete":
-            for key in tariff_totals:
-                tariff_totals[key] += float(row.get(key) or 0.0)
-
-    all_months_final = len(months_with_data) == period.month_count
-
-    def final_total(key: str) -> float | None:
-        if not all_months_final:
-            return None
-        return sum(float(item.get(key) or 0.0) for item in selected_month_rows)
-
-    production_kwh = final_total("production_kwh")
-    self_use_kwh = final_total("self_use_kwh")
-    export_kwh = final_total("export_kwh")
-    consumption_kwh = final_total("consumption_kwh")
-    coverage_pct = round(len(months_with_data) / period.month_count * 100, 2) if period.month_count else 0.0
-    if missing_months:
-        report_notes.append("Meses sem produÃ§Ã£o final: " + ", ".join(missing_months) + ".")
-
-    status_priority = {"complete": 0, "missing": 1, "partial": 2, "in_progress": 3, "conflict": 4}
-    production_status = max(
-        (item["status"] for item in monthly_quality),
-        key=lambda item: status_priority[item],
-        default="missing",
-    )
-
-    return {
-        "monthly_rows": selected_month_rows,
-        "production_kwh": production_kwh,
-        "self_use_kwh": self_use_kwh,
-        "export_kwh": export_kwh,
-        "consumption_kwh": consumption_kwh,
-        "months_with_data": months_with_data,
-        "missing_months": missing_months,
-        "months_requiring_fallback": months_requiring_fallback,
-        "coverage_pct": coverage_pct,
-        "report_notes": report_notes,
-        "production_status": production_status,
-        "production_is_final": all_months_final,
-        "production_warnings": sorted(production_warnings),
-        "monthly_production_quality": monthly_quality,
-        "raw_daily_total_kwh": (
-            sum(
-                float(item["raw_daily_total_kwh"])
-                for item in monthly_quality
-                if item["raw_daily_total_kwh"] is not None
-            )
-            if any(item["raw_daily_total_kwh"] is not None for item in monthly_quality)
-            else None
-        ),
-        **{key: (value if all_months_final else None) for key, value in tariff_totals.items()},
-    }
-
-
-def _build_customer_tariff_result(
-    conn: sqlite3.Connection,
-    *,
-    asset_id: int,
-    period: ReportingPeriod,
-    aggregate: dict[str, Any],
-    daily_rows: list[dict[str, Any]],
-    billing_config: BillingConfig | None,
-    electricity_price: float,
-) -> dict[str, Any]:
-    validity_warnings = set(detect_tariff_validity_warnings(conn, asset_id=asset_id, start=period.start, end=period.end))
-    if "overlapping_tariffs" in validity_warnings:
-        result = value_tariff_energy(None)
-        from dataclasses import replace
-
-        result = replace(result, warnings=tuple(sorted({*result.warnings, *validity_warnings})))
-        fallback_price = billing_config.electricity_price_eur_kwh if billing_config else decimal_from_value(electricity_price)
-        result = with_billing_fallback(result, self_use_kwh=decimal_from_value(aggregate.get("self_use_kwh")), default_price=fallback_price)
-        legacy = result_to_legacy_dict(result)
-        return {
-            "tariff_type": result.tariff_type.value if result.tariff_type else "",
-            "tariff_types_used": [],
-            "tariff_source": result.source,
-            "tariff_period_breakdown": [
-                {
-                    "period_name": item.period_name,
-                    "energy_kwh": float(item.energy_kwh),
-                    "production_kwh": float(item.production_kwh),
-                    "price_eur_kwh": float(item.price_eur_kwh) if item.price_eur_kwh is not None else None,
-                    "value_eur": float(item.value_eur),
-                }
-                for item in result.breakdown
-            ],
-            "tariff_value_eur": legacy["estimated_value_eur"],
-            "tariff_coverage_pct": legacy["coverage_pct"],
-            "tariff_warnings": legacy["warnings"],
-        }
-    hourly_rows = list_hourly_production_records(
-        conn,
-        asset_id=asset_id,
-        start_iso=datetime.combine(period.start, datetime.min.time()).isoformat(),
-        end_iso=(datetime.combine(period.end, datetime.max.time())).isoformat(),
-    )
-    hourly_records = [row_to_hourly_energy_record(row) for row in hourly_rows]
-    month_results = []
-    hourly_results = []
-    daily_by_month: dict[date, list[dict[str, Any]]] = {}
-    for row in daily_rows:
-        if isinstance(row.get("date"), date):
-            daily_by_month.setdefault(row["date"].replace(day=1), []).append(row)
-    for month_row in aggregate.get("monthly_rows", []):
-        month_start = month_row.get("date") if isinstance(month_row.get("date"), date) else period.start
-        month_end = month_bounds(month_start.strftime("%Y-%m"))[1]
-        intersecting = list_tariffs_intersecting_period(conn, asset_id=asset_id, start=month_start, end=month_end)
-        if len(intersecting) > 1:
-            month_daily = daily_by_month.get(month_start, [])
-            if month_daily:
-                for day_row in month_daily:
-                    config = get_tariff_config_for_date(conn, asset_id=asset_id, moment=day_row["date"])
-                    if config is None or config.tariff_type != TariffType.SIMPLE:
-                        continue
-                    month_results.append(
-                        value_tariff_energy(
-                            config,
-                            aggregate_self_use_kwh=decimal_from_value(day_row.get("self_use_kwh")),
-                            period_start=day_row["date"],
-                            period_end=day_row["date"],
-                        )
-                    )
-            else:
-                validity_warnings.add("tariff_change_within_month")
-            continue
-        config = get_tariff_config_for_date(conn, asset_id=asset_id, moment=month_start)
-        if config is None:
-            continue
-        if config.tariff_type == TariffType.SIMPLE:
-            month_results.append(
-                value_tariff_energy(
-                    config,
-                    aggregate_self_use_kwh=decimal_from_value(month_row.get("self_use_kwh")),
-                    period_start=month_start,
-                    period_end=month_start,
-                )
-            )
-    if hourly_records:
-        grouped: dict[int, list[Any]] = {}
-        configs: dict[int, Any] = {}
-        for record in hourly_records:
-            if get_tariff_resolution_warnings(conn, asset_id=asset_id, moment=record.period_start):
-                continue
-            config = get_tariff_config_for_date(conn, asset_id=asset_id, moment=record.period_start)
-            if config is None or config.tariff_id is None or config.tariff_type == TariffType.SIMPLE:
-                continue
-            grouped.setdefault(config.tariff_id, []).append(record)
-            configs[config.tariff_id] = config
-        for tariff_id, records in grouped.items():
-            hourly_results.append(
-                value_tariff_energy(
-                    configs[tariff_id],
-                    hourly_records=records,
-                    period_start=period.start,
-                    period_end=period.end,
-                )
-            )
-    applicable_results = month_results + hourly_results
-    result_types = sorted({result.tariff_type.value for result in applicable_results if result.tariff_type})
-    result = _combine_tariff_results(applicable_results)
-    if result is not None:
-        if validity_warnings:
-            from dataclasses import replace
-
-            result = replace(result, warnings=tuple(sorted({*result.warnings, *validity_warnings})))
-    elif "tariff_change_within_month" in validity_warnings:
-        result = value_tariff_energy(None)
-        from dataclasses import replace
-
-        result = replace(result, warnings=tuple(sorted({*result.warnings, *validity_warnings})))
-    else:
-        config = get_tariff_config_for_date(conn, asset_id=asset_id, moment=period.start)
-        result = value_tariff_energy(
-            config,
-            hourly_records=hourly_records,
-            aggregate_self_use_kwh=decimal_from_value(aggregate.get("self_use_kwh")),
-            period_start=period.start,
-            period_end=period.end,
-        )
-        if validity_warnings:
-            from dataclasses import replace
-
-            result = replace(result, warnings=tuple(sorted({*result.warnings, *validity_warnings})))
-    fallback_price = billing_config.electricity_price_eur_kwh if billing_config else decimal_from_value(electricity_price)
-    result = with_billing_fallback(
-        result,
-        self_use_kwh=decimal_from_value(aggregate.get("self_use_kwh")),
-        default_price=fallback_price,
-    )
-    legacy = result_to_legacy_dict(result)
-    return {
-        "tariff_type": "mixed" if len(result_types) > 1 else (result.tariff_type.value if result.tariff_type else ""),
-        "tariff_types_used": result_types,
-        "tariff_source": result.source,
-        "tariff_period_breakdown": [
-            {
-                "period_name": item.period_name,
-                "energy_kwh": float(item.energy_kwh),
-                "production_kwh": float(item.production_kwh),
-                "price_eur_kwh": float(item.price_eur_kwh) if item.price_eur_kwh is not None else None,
-                "value_eur": float(item.value_eur),
-            }
-            for item in result.breakdown
-        ],
-        "tariff_value_eur": legacy["estimated_value_eur"],
-        "tariff_coverage_pct": legacy["coverage_pct"],
-        "tariff_warnings": legacy["warnings"],
-    }
-
-
-def _combine_tariff_results(results: list[Any]) -> Any | None:
-    if not results:
-        return None
-    from dataclasses import replace
-    from monitoring_board.reporting.models import TariffPeriodBreakdown
-
-    by_period: dict[str, dict[str, Any]] = {}
-    warnings: set[str] = set()
-    total_value = decimal_from_value(0)
-    total_is_available = True
-    for result in results:
-        warnings.update(result.warnings)
-        if result.total_value_eur is None:
-            total_is_available = False
-        else:
-            total_value += result.total_value_eur
-        for item in result.breakdown:
-            current = by_period.setdefault(
-                item.period_name,
-                {"energy": decimal_from_value(0), "production": decimal_from_value(0), "value": decimal_from_value(0), "price": item.price_eur_kwh},
-            )
-            current["energy"] += item.energy_kwh
-            current["production"] += item.production_kwh
-            current["value"] += item.value_eur
-            if current["price"] != item.price_eur_kwh:
-                current["price"] = None
-    breakdown = tuple(
-        TariffPeriodBreakdown(name, values["energy"], values["production"], values["price"], values["value"])
-        for name, values in by_period.items()
-    )
-    first = results[0]
-    expected_slots = sum(result.expected_slots for result in results)
-    classified = sum(result.hours_classified for result in results)
-    coverage = (decimal_from_value(classified) / decimal_from_value(expected_slots) * decimal_from_value(100)) if expected_slots else first.coverage_pct
-    return replace(
-        first,
-        total_energy_kwh=sum((item.energy_kwh for item in breakdown), decimal_from_value(0)),
-        breakdown=breakdown,
-        total_value_eur=total_value if total_is_available else None,
-        hours_classified=classified,
-        hours_unclassified=sum(result.hours_unclassified for result in results),
-        expected_slots=expected_slots,
-        slots_with_data=sum(result.slots_with_data for result in results),
-        coverage_pct=coverage,
-        warnings=tuple(sorted(warnings)),
-    )
-
-
-def _report_payload_for_period(
-    *,
-    asset: sqlite3.Row,
-    period: ReportingPeriod,
-    station_code: str,
-    daily_rows: list[dict[str, Any]],
-    aggregate: dict[str, Any],
-    electricity_price: float,
-    sell_price: float,
-    data_source: str,
-    tariff_result: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    tariff_result = tariff_result or {}
-    return {
-        "asset": dict(asset),
-        "station_code": station_code,
-        "month_start": period.start,
-        "month_end": period.end,
-        "month_label": period.label,
-        "period_type": period.period_type.value,
-        "period_start": period.start,
-        "period_end": period.end,
-        "period_label": period.label,
-        "months_count": period.month_count,
-        "included_months": [month.strftime("%Y-%m") for month in period.included_months],
-        "months_with_data": aggregate["months_with_data"],
-        "missing_months": aggregate["missing_months"],
-        "months_requiring_fallback": aggregate["months_requiring_fallback"],
-        "coverage_pct": aggregate["coverage_pct"],
-        "daily_rows": daily_rows,
-        "monthly_rows": aggregate["monthly_rows"],
-        "chart_granularity": "daily" if period.period_type == ReportPeriodType.MONTHLY else "monthly",
-        "production_kwh": aggregate["production_kwh"],
-        "raw_daily_total_kwh": aggregate["raw_daily_total_kwh"],
-        "production_quality_status": aggregate["production_status"],
-        "production_is_final": aggregate["production_is_final"],
-        "monthly_production_quality": aggregate["monthly_production_quality"],
-        "warnings": aggregate["production_warnings"],
-        "self_use_kwh": aggregate["self_use_kwh"],
-        "export_kwh": aggregate["export_kwh"],
-        "consumption_kwh": aggregate["consumption_kwh"],
-        "electricity_price": electricity_price,
-        "sell_price": sell_price,
-        "data_source": data_source,
-        "report_notes": aggregate["report_notes"],
-        "tariff_type": tariff_result.get("tariff_type", ""),
-        "tariff_types_used": tariff_result.get("tariff_types_used", []),
-        "tariff_source": tariff_result.get("tariff_source", ""),
-        "tariff_period_breakdown": tariff_result.get("tariff_period_breakdown", []),
-        "tariff_value_eur": tariff_result.get("tariff_value_eur"),
-        "tariff_coverage_pct": tariff_result.get("tariff_coverage_pct"),
-        "tariff_warnings": tariff_result.get("tariff_warnings", []),
-        "self_use_cheia_kwh": aggregate["self_use_cheia_kwh"],
-        "self_use_ponta_kwh": aggregate["self_use_ponta_kwh"],
-        "self_use_vazio_kwh": aggregate["self_use_vazio_kwh"],
-        "self_use_super_vazio_kwh": aggregate["self_use_super_vazio_kwh"],
-    }
-
-
-def build_local_customer_production_report(
-    conn: sqlite3.Connection,
-    *,
-    asset_id: int,
-    report_month: str,
-    electricity_price: float,
-    sell_price: float,
-    solcor_price_per_kwh: float = 0.0,
-    billing_config: BillingConfig | None = None,
-    period: ReportingPeriod | None = None,
-    reference_date: date | None = None,
-) -> dict[str, Any] | None:
-    period = _resolve_customer_reporting_period(report_month, period)
-    reference_date = reference_date or date.today()
-    asset = _get_fusionsolar_report_asset(conn, asset_id)
-    daily_records = list_daily_production_records(conn, asset_id=asset_id, start=period.start, end=period.end)
-    monthly_records = list_monthly_production_records(conn, asset_id=asset_id, start=period.start, end=period.end)
-    daily_rows = [normalize_customer_production_record(row, parse_date_value(row["period_date"]) or period.start) for row in daily_records]
-    daily_rows.sort(key=lambda item: item["date"])
-    monthly_rows = []
-    for row in monthly_records:
-        fallback_date = parse_date_value(row["period_date"]) or period.start
-        normalized = normalize_customer_production_record(row, fallback_date)
-        normalized.update(extract_customer_tariff_values(parse_production_record_payload(row)))
-        monthly_rows.append(normalized)
-    aggregate = _aggregate_customer_rows_for_period(
-        period,
-        monthly_rows,
-        daily_rows,
-        asset_id=asset_id,
-        reference_date=reference_date,
-    )
-    tariff_result = _build_customer_tariff_result(
-        conn,
-        asset_id=asset_id,
-        period=period,
-        aggregate=aggregate,
-        daily_rows=daily_rows,
-        billing_config=billing_config,
-        electricity_price=electricity_price,
-    )
-    report = _report_payload_for_period(
-        asset=asset,
-        period=period,
-        station_code=str(asset["external_id"]),
-        daily_rows=daily_rows,
-        aggregate=aggregate,
-        electricity_price=electricity_price,
-        sell_price=sell_price,
-        data_source="Dados locais",
-        tariff_result=tariff_result,
-    )
-    return prepare_customer_report(
-        report,
-        solcor_price_per_kwh=solcor_price_per_kwh,
-        billing_config=billing_config,
-    )
-
-
-def ensure_report_data_requests(
-    conn: sqlite3.Connection,
-    *,
-    asset_ids: list[int],
-    period: ReportingPeriod,
-    include_wat: bool,
-    request_source: str,
-    reference_date: date,
-) -> dict[str, Any]:
-    current_month = reference_date.replace(day=1)
-    normalized_asset_ids = sorted({int(value) for value in asset_ids if value})
-    job_ids: list[int] = []
-    warnings: list[str] = []
-    reused_count = 0
-    queued_count = 0
-    for month_start in period.included_months:
-        month_label = month_start.strftime("%Y-%m")
-        if month_start >= current_month:
-            continue
-        missing_production_ids = [
-            asset_id
-            for asset_id in normalized_asset_ids
-            if evaluate_local_monthly_production_quality(
-                conn,
-                asset_id=asset_id,
-                provider=INTEGRATION_PROVIDER_FUSIONSOLAR,
-                month_start=month_start,
-                reference_date=reference_date,
-            ).status
-            != "complete"
-        ]
-        if missing_production_ids:
-            job_id, created = create_or_reuse_report_data_job(
-                conn,
-                job_type="fusionsolar_report_production_request",
-                provider=INTEGRATION_PROVIDER_FUSIONSOLAR,
-                metric="production",
-                period_start=month_start,
-                period_end=month_end(month_start),
-                asset_ids=missing_production_ids,
-                request_source=request_source,
-                extra_params={"report_month": month_label},
-            )
-            job_ids.append(job_id)
-            reused_count += int(not created)
-            queued_count += int(created)
-            warnings.append(
-                f"production_collection_pending:{month_label}:job_{job_id}"
-            )
-
-        if include_wat:
-            wat_end = month_end(month_start)
-            missing_wat_ids = [
-                asset_id
-                for asset_id in normalized_asset_ids
-                if not real_wat_period_is_complete(
-                    conn,
-                    asset_id=asset_id,
-                    from_date=month_start,
-                    to_date=wat_end,
-                )
-            ]
-            if missing_wat_ids:
-                job_id, created = create_or_reuse_report_data_job(
-                    conn,
-                    job_type="fusionsolar_report_wat_request",
-                    provider=INTEGRATION_PROVIDER_FUSIONSOLAR,
-                    metric="wat",
-                    period_start=month_start,
-                    period_end=wat_end,
-                    asset_ids=missing_wat_ids,
-                    request_source=request_source,
-                    extra_params={
-                        "from_date": month_start.isoformat(),
-                        "to_date": wat_end.isoformat(),
-                    },
-                )
-                job_ids.append(job_id)
-                reused_count += int(not created)
-                queued_count += int(created)
-                warnings.append(
-                    f"wat_collection_pending:{month_label}:job_{job_id}"
-                )
-    conn.commit()
-    return {
-        "job_ids": sorted(set(job_ids)),
-        "warnings": warnings,
-        "reused_count": reused_count,
-        "queued_count": queued_count,
-    }
-
-
-def enqueue_report_production_requests(
-    conn: sqlite3.Connection,
-    *,
-    asset_id: int,
-    period: ReportingPeriod,
-    months_requiring_fallback: list[str],
-    reference_date: date,
-) -> list[int]:
-    if not months_requiring_fallback:
-        return []
-    requests = ensure_report_data_requests(
-        conn,
-        asset_ids=[asset_id],
-        period=period,
-        include_wat=False,
-        request_source="individual_report",
-        reference_date=reference_date,
-    )
-    return list(requests["job_ids"])
-
-
-def month_end(month_start: date) -> date:
-    return (
-        month_start.replace(day=28) + timedelta(days=4)
-    ).replace(day=1) - timedelta(days=1)
-
-
-def real_wat_period_is_complete(
-    conn: sqlite3.Connection,
-    *,
-    asset_id: int,
-    from_date: date,
-    to_date: date,
-) -> bool:
-    expected_days = (to_date - from_date).days + 1
-    row = conn.execute(
-        """
-        SELECT
-            COUNT(DISTINCT availability_date) AS covered_days,
-            SUM(
-                CASE
-                    WHEN valid_slots > 0
-                     AND weighted_availability_pct IS NOT NULL
-                    THEN 0 ELSE 1
-                END
-            ) AS invalid_days
-        FROM plant_availability_daily
-        WHERE provider = ? AND asset_id = ?
-          AND availability_date BETWEEN ? AND ?
-        """,
-        (
-            INTEGRATION_PROVIDER_FUSIONSOLAR,
-            asset_id,
-            from_date.isoformat(),
-            to_date.isoformat(),
-        ),
-    ).fetchone()
-    return (
-        int(row["covered_days"] or 0) == expected_days
-        and int(row["invalid_days"] or 0) == 0
-    )
-
-
-def create_or_reuse_report_data_job(
-    conn: sqlite3.Connection,
-    *,
-    job_type: str,
-    provider: str,
-    metric: str,
-    period_start: date,
-    period_end: date,
-    asset_ids: list[int],
-    request_source: str,
-    extra_params: dict[str, Any],
-) -> tuple[int, bool]:
-    normalized_ids = sorted({int(value) for value in asset_ids})
-    active = conn.execute(
-        """
-        SELECT id, job_type, params_json
-        FROM background_jobs
-        WHERE job_type IN (?, ?)
-          AND status IN (
-            'pending', 'running', 'waiting_api_slot', 'waiting_rate_limit'
-          )
-        ORDER BY id
-        """,
-        (
-            job_type,
-            (
-                "fusionsolar_month_close"
-                if metric == "production"
-                else "fusionsolar_inverter_availability_backfill"
-            ),
-        ),
-    ).fetchall()
-    job_id: int | None = None
-    for row in active:
-        params = decode_job_params(row["params_json"])
-        existing_start = str(
-            params.get("report_month")
-            or params.get("from_date")
-            or ""
-        )
-        if metric == "production":
-            period_matches = existing_start == period_start.strftime("%Y-%m")
-        else:
-            period_matches = (
-                existing_start == period_start.isoformat()
-                and str(params.get("to_date") or "") == period_end.isoformat()
-            )
-        if not period_matches:
-            continue
-        existing_ids = {
-            int(value)
-            for value in params.get("asset_ids") or []
-            if str(value).isdigit()
-        }
-        if not existing_ids or set(normalized_ids).issubset(existing_ids):
-            job_id = int(row["id"])
-            break
-    created = False
-    if job_id is None:
-        job_id, created = create_background_job(
-            conn,
-            job_type,
-            {
-                "provider": provider,
-                "metric": metric,
-                "period_start": period_start.isoformat(),
-                "period_end": period_end.isoformat(),
-                "asset_ids": normalized_ids,
-                "trigger_type": "report_draft",
-                **extra_params,
-            },
-        )
-    conn.execute(
-        """
-        INSERT INTO report_data_request_events (
-            request_source, provider, metric, period_start, period_end,
-            asset_ids_json, background_job_id, reused_existing_job, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            request_source,
-            provider,
-            metric,
-            period_start.isoformat(),
-            period_end.isoformat(),
-            json.dumps(normalized_ids),
-            job_id,
-            int(not created),
-            serialize_background_job_timestamp(),
-        ),
-    )
-    return job_id, created
-
-
-def ensure_portfolio_result_data_requests(
-    conn: sqlite3.Connection,
-    result: Any,
-    *,
-    request_source: str,
-) -> Any:
-    asset_ids = [
-        int(row.asset_id)
-        for row in result.rows
-        if row.asset_id is not None
-    ]
-    include_wat = any(
-        column.visible and column.metric_key == "availability_pct"
-        for column in result.profile.columns
-    )
-    requests = ensure_report_data_requests(
-        conn,
-        asset_ids=asset_ids,
-        period=result.period,
-        include_wat=include_wat,
-        request_source=request_source,
-        reference_date=current_lisbon_date(),
-    )
-    rows = result.rows
-    summary = result.summary
-    if include_wat:
-        sanitized_rows = []
-        for row in result.rows:
-            wat_complete = (
-                row.asset_id is not None
-                and real_wat_period_is_complete(
-                    conn,
-                    asset_id=int(row.asset_id),
-                    from_date=result.period.start,
-                    to_date=result.period.end,
-                )
-            )
-            if wat_complete:
-                sanitized_rows.append(row)
-                continue
-            sanitized_rows.append(
-                replace(
-                    row,
-                    values={**row.values, "availability_pct": None},
-                    warnings=tuple(
-                        sorted(
-                            set(row.warnings)
-                            | {"wat_collection_pending"}
-                        )
-                    ),
-                )
-            )
-        rows = tuple(sanitized_rows)
-        summary = aggregate_rows(rows, result.columns)
-    metadata = {
-        **dict(result.metadata),
-        "data_request_job_ids": requests["job_ids"],
-        "data_request_warnings": requests["warnings"],
-        "data_request_reused_count": requests["reused_count"],
-    }
-    return replace(
-        result,
-        rows=rows,
-        summary=summary,
-        warnings=tuple(
-            sorted(set(result.warnings) | set(requests["warnings"]))
-        ),
-        metadata=metadata,
-    )
-
-
-def build_fusionsolar_customer_production_report(
-    conn: sqlite3.Connection,
-    *,
-    asset_id: int,
-    report_month: str,
-    electricity_price: float,
-    sell_price: float,
-    solcor_price_per_kwh: float = 0.0,
-    billing_config: BillingConfig | None = None,
-    force_api: bool = False,
-    period: ReportingPeriod | None = None,
-    reference_date: date | None = None,
-) -> dict[str, Any]:
-    period = _resolve_customer_reporting_period(report_month, period)
-    reference_date = reference_date or date.today()
-    local_report = build_local_customer_production_report(
-        conn,
-        asset_id=asset_id,
-        report_month=report_month,
-        electricity_price=electricity_price,
-        sell_price=sell_price,
-        solcor_price_per_kwh=solcor_price_per_kwh,
-        billing_config=billing_config,
-        period=period,
-        reference_date=reference_date,
-    )
-    if local_report is None:
-        raise ValueError("Nao foi possivel preparar o relatorio com os dados locais.")
-    data_requests = ensure_report_data_requests(
-        conn,
-        asset_ids=[asset_id],
-        period=period,
-        include_wat=False,
-        request_source="individual_report",
-        reference_date=reference_date,
-    )
-    refresh_job_ids = list(data_requests["job_ids"])
-    local_report["production_refresh_job_ids"] = refresh_job_ids
-    local_report["production_refresh_queued"] = bool(refresh_job_ids)
-    local_report["data_request_warnings"] = list(
-        data_requests["warnings"]
-    )
-    local_report.setdefault("report_notes", []).extend(
-        data_requests["warnings"]
-    )
-    local_report["force_api_ignored"] = bool(force_api)
-    return local_report
-
-
-def add_customer_report_availability(
-    conn: sqlite3.Connection,
-    report: dict[str, Any],
-    *,
-    asset_id: int,
-    period: ReportingPeriod,
-    ensure_requests: bool = True,
-) -> bool:
-    if ensure_requests:
-        requests = ensure_report_data_requests(
-            conn,
-            asset_ids=[asset_id],
-            period=period,
-            include_wat=True,
-            request_source="individual_report_availability",
-            reference_date=current_lisbon_date(),
-        )
-        report.setdefault("data_request_warnings", []).extend(
-            requests["warnings"]
-        )
-        report.setdefault("report_notes", []).extend(requests["warnings"])
-    if not real_wat_period_is_complete(
-        conn,
-        asset_id=asset_id,
-        from_date=period.start,
-        to_date=period.end,
-    ):
-        report["availability_error"] = "wat_collection_pending"
-        report.setdefault("report_notes", []).append(
-            "WAT indisponivel â€” dados em recolha; relatorio em rascunho."
-        )
-        report.pop("availability_pct", None)
-        report["include_availability_kpi"] = False
-        return False
-    try:
-        availability = get_monthly_availability(conn, asset_id, period.start, period.end)
-    except Exception:
-        LOGGER.exception(
-            "Failed to load customer report availability asset_id=%s period_start=%s period_end=%s",
-            asset_id,
-            period.start.isoformat(),
-            period.end.isoformat(),
-        )
-        report["availability_error"] = "availability_lookup_failed"
-        report.setdefault("report_notes", []).append("Erro ao procurar Disponibilidade (%).")
-        return False
-    if availability is None:
-        report["availability_error"] = "wat_collection_pending"
-        report.setdefault("report_notes", []).append(
-            "WAT indisponivel â€” dados em recolha; relatorio em rascunho."
-        )
-        return False
-    report["include_availability_kpi"] = True
-    report["availability_pct"] = availability
-    return True
-
-
-def export_customer_production_pdf(report: dict[str, Any]):
-    pdf_bytes = build_customer_report_pdf(report, logo_path=BASE_DIR / "static" / "solcor-logo.png")
-    buffer = io.BytesIO(pdf_bytes)
-    safe_name = normalize_name(report["asset"]["project_name"]).replace(" ", "_") or "relatorio"
-    model = str(report.get("report_type") or "epc").upper()
-    period_slug = str(report.get("period_label") or report["month_start"].strftime("%m-%Y")).replace(" ", "_").replace("/", "-")
-    filename = f"Relatorio_{model}_{safe_name}_{period_slug}.pdf"
-    return send_file(buffer, as_attachment=True, download_name=filename, mimetype="application/pdf")
-
-
-def store_report_logo(file_storage, *, old_logo_path: str = "") -> str:
-    filename = safe_upload_filename(file_storage.filename or "")
-    extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    if extension not in {"png", "jpg", "jpeg"}:
-        raise ValueError("invalid_logo_extension")
-    payload = file_storage.read()
-    if not payload or len(payload) > 512 * 1024:
-        raise ValueError("invalid_logo_size")
-    width, height = image_dimensions(payload, extension)
-    if width <= 0 or height <= 0 or width > 2400 or height > 1200:
-        raise ValueError("invalid_logo_dimensions")
-    logo_dir = UPLOAD_DIR / "report_logos"
-    logo_dir.mkdir(parents=True, exist_ok=True)
-    target = logo_dir / f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{filename}"
-    target.write_bytes(payload)
-    return store_runtime_relative_path(target)
-
-
-def safe_upload_filename(filename: str) -> str:
-    cleaned = secure_filename(filename)
-    if not cleaned or any(item in cleaned for item in {"..", "/", "\\"}):
-        raise ValueError("invalid_upload_filename")
-    return cleaned
-
-
-def image_dimensions(payload: bytes, extension: str) -> tuple[int, int]:
-    if extension == "png":
-        if not payload.startswith(b"\x89PNG\r\n\x1a\n") or len(payload) < 24:
-            raise ValueError("invalid_logo_content")
-        width, height = struct.unpack(">II", payload[16:24])
-        return int(width), int(height)
-    if extension in {"jpg", "jpeg"}:
-        if not payload.startswith(b"\xff\xd8"):
-            raise ValueError("invalid_logo_content")
-        index = 2
-        while index + 9 < len(payload):
-            if payload[index] != 0xFF:
-                index += 1
-                continue
-            marker = payload[index + 1]
-            index += 2
-            if marker in {0xD8, 0xD9}:
-                continue
-            length = int.from_bytes(payload[index : index + 2], "big")
-            if length < 2:
-                raise ValueError("invalid_logo_content")
-            if marker in {0xC0, 0xC2} and index + 7 < len(payload):
-                height = int.from_bytes(payload[index + 3 : index + 5], "big")
-                width = int.from_bytes(payload[index + 5 : index + 7], "big")
-                return int(width), int(height)
-            index += length
-    raise ValueError("invalid_logo_content")
-
-
-def build_generation_jobs(form: Any, report_type: str, main_formats: tuple[str, ...]) -> list[dict[str, Any]]:
-    periods = parse_generation_periods(form)
-    jobs: list[dict[str, Any]] = []
-    if report_type == "individual":
-        asset_ids = [int(item) for item in form.getlist("asset_ids") if str(item).isdigit()]
-        if not asset_ids:
-            asset_ids = [int(form.get("asset_id", "0") or 0)]
-        asset_ids = sorted({item for item in asset_ids if item})
-        if not asset_ids:
-            raise ValueError("InstalaÃ§Ã£o obrigatÃ³ria.")
-        if len(asset_ids) > MAX_BATCH_ASSETS:
-            raise ValueError("Demasiadas instalacoes no mesmo run.")
-        for asset_id in asset_ids:
-            for period in periods:
-                for fmt in main_formats:
-                    jobs.append({"asset_id": asset_id, "period": period, "format": fmt})
-    else:
-        for period in periods:
-            for fmt in main_formats:
-                jobs.append({"period": period, "format": fmt})
-    if len(jobs) > MAX_TOTAL_OUTPUTS:
-        raise ValueError("Demasiados outputs no mesmo run.")
-    return jobs
-
-
-def build_snapshot_generation_jobs(snapshot_result, main_formats: tuple[str, ...]) -> list[dict[str, Any]]:
-    period = {
-        "period_type": snapshot_result.period.period_type.value,
-        "report_month": snapshot_result.period.start.strftime("%Y-%m"),
-        "period_start": snapshot_result.period.start.isoformat(),
-        "period_end": snapshot_result.period.end.isoformat(),
-    }
-    return [{"period": period, "format": fmt} for fmt in main_formats]
-
-
-def reject_snapshot_period_overrides(form: Any, snapshot_result) -> None:
-    raw_months = [part for item in form.getlist("report_months") for part in re.split(r"[\s,;]+", str(item)) if part]
-    if len(set(raw_months)) > 1:
-        raise ValueError("snapshot_rejects_multiple_periods")
-    submitted_type = str(form.get("period_type") or snapshot_result.period.period_type.value)
-    if submitted_type != snapshot_result.period.period_type.value:
-        raise ValueError("snapshot_period_mismatch")
-    submitted_month = form.get("report_month")
-    if submitted_month and normalize_report_month(submitted_month) != snapshot_result.period.start.strftime("%Y-%m"):
-        raise ValueError("snapshot_period_mismatch")
-
-
-def resolve_report_client_key(conn: sqlite3.Connection, *, portfolio_id: int | None = None, asset_id: int | None = None) -> str:
-    if portfolio_id:
-        row = conn.execute("SELECT name FROM portfolio_groups WHERE id = ?", (portfolio_id,)).fetchone()
-        return normalize_name(row["name"]) if row else ""
-    if asset_id:
-        row = conn.execute("SELECT nif, project_name FROM assets WHERE id = ?", (asset_id,)).fetchone()
-        return normalize_name(row["nif"] or row["project_name"]) if row else ""
-    return ""
-
-
-def resolve_generation_client_key(conn: sqlite3.Connection, report_type: str, form: Any, portfolio_id: int | None) -> str:
-    if report_type == "portfolio":
-        return resolve_report_client_key(conn, portfolio_id=portfolio_id)
-    asset_ids = [int(item) for item in form.getlist("asset_ids") if str(item).isdigit()]
-    if not asset_ids and str(form.get("asset_id", "")).isdigit():
-        asset_ids = [int(form.get("asset_id"))]
-    keys = {resolve_report_client_key(conn, asset_id=asset_id) for asset_id in asset_ids if asset_id}
-    keys.discard("")
-    if len(keys) > 1:
-        raise ValueError("mixed_client_batch")
-    return next(iter(keys), "")
-
-
-def parse_generation_periods(form: Any) -> list[dict[str, str]]:
-    period_type = str(form.get("period_type", "monthly") or "monthly")
-    raw_months = form.getlist("report_months")
-    if raw_months:
-        raw_months = [part for item in raw_months for part in re.split(r"[\s,;]+", str(item)) if part]
-    elif form.get("report_months"):
-        raw_months = re.split(r"[\s,;]+", str(form.get("report_months")))
-    if period_type == "monthly":
-        months = [normalize_report_month(item) for item in raw_months if str(item).strip()]
-        if not months:
-            months = [normalize_report_month(form.get("report_month", ""))]
-        months = list(dict.fromkeys(months))
-        if len(months) > MAX_BATCH_PERIODS:
-            raise ValueError("Demasiados periodos no mesmo run.")
-        periods = []
-        for month in months:
-            period = build_period("monthly", report_month=month)
-            periods.append({"period_type": "monthly", "report_month": month, "period_start": period.start.isoformat(), "period_end": period.end.isoformat()})
-        return periods
-    if len(raw_months) > 1:
-        raise ValueError("Periodos estruturados multiplos devem ser submetidos separadamente.")
-    period = build_period(
-        period_type,
-        year=form.get("report_year") or normalize_report_month(form.get("report_month", ""))[:4],
-        quarter=form.get("report_quarter"),
-        semester=form.get("report_semester"),
-    )
-    return [
-        {
-            "period_type": period_type,
-            "report_month": period.start.strftime("%Y-%m"),
-            "report_year": str(period.start.year),
-            "report_quarter": str(((period.start.month - 1) // 3) + 1),
-            "report_semester": "1" if period.start.month == 1 else "2",
-            "period_start": period.start.isoformat(),
-            "period_end": period.end.isoformat(),
-        }
-    ]
-
-
-def build_portfolio_generation_result(conn: sqlite3.Connection, form: Any, portfolio_id: int | None, snapshot_id: int | None, period_job: dict[str, str]):
-    if snapshot_id:
-        result = get_portfolio_snapshot_result(conn, snapshot_id)
-        if result is None or (portfolio_id and result.portfolio_id != portfolio_id):
-            raise ValueError("Snapshot invalido.")
-        return result
-    if not portfolio_id:
-        raise ValueError("Portfolio obrigatorio.")
-    group = conn.execute("SELECT * FROM portfolio_groups WHERE id = ?", (portfolio_id,)).fetchone()
-    if not group:
-        raise ValueError("Portfolio invalido.")
-    profile_id = int(form.get("profile_id", "0") or 0)
-    profile = get_portfolio_report_profile(conn, profile_id) if profile_id else get_default_portfolio_report_profile(conn, portfolio_id)
-    result = prepare_portfolio_report(
-        conn,
-        portfolio_id=portfolio_id,
-        portfolio_name=group["name"],
-        profile=profile,
-        period_type=period_job["period_type"],
-        report_month=period_job.get("report_month"),
-        year=period_job.get("report_year") or period_job["period_start"][:4],
-        quarter=period_job.get("report_quarter"),
-        semester=period_job.get("report_semester"),
-        comparison=form.get("comparison", ""),
-        profile_version=latest_portfolio_report_profile_version(conn, profile.id),
-    )
-    return ensure_portfolio_result_data_requests(
-        conn,
-        result,
-        request_source="portfolio_report_generation",
-    )
-
-
-def build_individual_generation_report(
-    conn: sqlite3.Connection,
-    asset_id: int,
-    period_job: dict[str, str],
-    *,
-    include_wat: bool = False,
-) -> dict[str, Any]:
-    period = build_period(
-        period_job["period_type"],
-        report_month=period_job.get("report_month"),
-        year=period_job.get("report_year") or period_job["period_start"][:4],
-        quarter=period_job.get("report_quarter"),
-        semester=period_job.get("report_semester"),
-    )
-    billing_config = get_asset_billing_config(conn, asset_id, ReportType.EPC)
-    report = build_local_customer_production_report(
-        conn,
-        asset_id=asset_id,
-        report_month=period.start.strftime("%Y-%m"),
-        electricity_price=float(billing_config.electricity_price_eur_kwh),
-        sell_price=float(billing_config.export_price_eur_kwh),
-        billing_config=billing_config,
-        period=period,
-    )
-    if report is None:
-        raise ValueError(f"Sem dados para a instalacao {asset_id}.")
-    report["asset_id"] = asset_id
-    report["engine_version"] = "individual-report-v1"
-    requests = ensure_report_data_requests(
-        conn,
-        asset_ids=[asset_id],
-        period=period,
-        include_wat=include_wat,
-        request_source="individual_report_generation",
-        reference_date=current_lisbon_date(),
-    )
-    report["data_request_job_ids"] = list(requests["job_ids"])
-    report["data_request_warnings"] = list(requests["warnings"])
-    report.setdefault("report_notes", []).extend(requests["warnings"])
-    if include_wat:
-        add_customer_report_availability(
-            conn,
-            report,
-            asset_id=asset_id,
-            period=period,
-            ensure_requests=False,
-        )
-    return report
-
-
-def register_rendered_generation_file(conn: sqlite3.Connection, output_dir: Path, run_id: int, file, *, snapshot_id: int | None = None):
-    path, _ = store_rendered_file(output_dir, run_id, file)
-    add_generated_file(
-        conn,
-        run_id=run_id,
-        fmt=file.fmt,
-        filename=path.name,
-        relative_path=store_runtime_relative_path(path),
-        sha256=file.sha256,
-        size_bytes=file.size_bytes,
-        portfolio_id=file.portfolio_id,
-        asset_id=file.asset_id,
-        snapshot_id=snapshot_id or file.snapshot_id,
-        period_type=file.period_type,
-        period_start=file.period_start,
-        period_end=file.period_end,
-        is_auxiliary=1 if file.is_auxiliary else 0,
-        warnings=list(file.warnings),
-    )
-    return file
-
-
-def add_failed_generation_file(conn: sqlite3.Connection, run_id: int, job: dict[str, Any], error: str, *, portfolio_id: int | None = None, asset_id: int | None = None, snapshot_id: int | None = None) -> None:
-    period = job.get("period") or {}
-    add_generated_file(
-        conn,
-        run_id=run_id,
-        fmt=str(job.get("format") or ""),
-        filename="failed",
-        relative_path="",
-        sha256="",
-        size_bytes=0,
-        portfolio_id=portfolio_id,
-        asset_id=asset_id,
-        snapshot_id=snapshot_id,
-        period_type=period.get("period_type", ""),
-        period_start=period.get("period_start", ""),
-        period_end=period.get("period_end", ""),
-        status="failed",
-        error_message=error[:500],
-    )
-
-
-def export_rows_file(
-    rows: list[dict[str, Any]],
-    headers: list[tuple[str, str]],
-    filename: str,
-    export_format: str,
-):
-    if export_format == "pdf":
-        buffer = io.BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), leftMargin=24, rightMargin=24, topMargin=24, bottomMargin=24)
-        styles = getSampleStyleSheet()
-        data = [[header[1] for header in headers]]
-        for row in rows:
-            data.append([str(row.get(header[0], "") or "-") for header in headers])
-        table = Table(data, repeatRows=1)
-        table.setStyle(
-            TableStyle(
-                [
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f6b5c")),
-                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#c9d3d7")),
-                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.HexColor("#eef4f2")]),
-                    ("FONTSIZE", (0, 0), (-1, -1), 8),
-                ]
-            )
-        )
-        doc.build([Paragraph(filename, styles["Heading2"]), Spacer(1, 12), table])
-        buffer.seek(0)
-        return send_file(buffer, as_attachment=True, download_name=f"{filename}.pdf", mimetype="application/pdf")
-
-    workbook = Workbook()
-    worksheet = workbook.active
-    worksheet.title = "Export"
-    worksheet.append([header[1] for header in headers])
-    for row in rows:
-        worksheet.append([row.get(header[0], "") for header in headers])
-    output = io.BytesIO()
-    workbook.save(output)
-    output.seek(0)
-    return send_file(
-        output,
-        as_attachment=True,
-        download_name=f"{filename}.xlsx",
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-
-def _form_int_list(field_name: str) -> list[int]:
-    values = request.form.getlist(field_name)
-    if len(values) == 1 and "," in values[0]:
-        values = [item.strip() for item in values[0].split(",")]
-    return [int(value) for value in values if str(value).strip().isdigit()]
-
-
-def _alias_return(asset_id: int) -> Any:
-    next_url = request.form.get("next", "").strip()
-    if next_url.startswith("/"):
-        return redirect(next_url)
-    if request.referrer and "/portfolio-manager" in request.referrer:
-        return redirect(request.referrer)
-    return redirect(url_for("asset_detail", asset_id=asset_id))
-
-
-def store_invoice_upload(
-    conn: sqlite3.Connection,
-    *,
-    upload_dir: Path,
-    file_storage: Any,
-    asset_id: int,
-    portfolio_id: int | None,
-) -> tuple[int, tuple[str, ...]]:
-    if conn.execute("SELECT id FROM assets WHERE id = ?", (asset_id,)).fetchone() is None:
-        raise ValueError("Instalacao inexistente.")
-    original_filename = Path(file_storage.filename or "invoice").name
-    safe_name = secure_filename(original_filename) or "invoice"
-    if not is_supported_invoice_extension(safe_name):
-        raise ValueError("Formato de fatura nao suportado.")
-    target_dir = upload_dir / "portfolio_sources" / str(asset_id)
-    target_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    target = target_dir / f"{stamp}_{safe_name}"
-    safe_path = Path(safe_name)
-    temp_target = target_dir / f".{stamp}_{safe_path.stem}.tmp{safe_path.suffix}"
-    final_created = False
-    try:
-        file_storage.save(temp_target)
-        size_bytes = temp_target.stat().st_size
-        if size_bytes <= 0:
-            raise ValueError("Ficheiro vazio.")
-        if size_bytes > max_upload_bytes():
-            raise ValueError("Ficheiro excede o limite de upload.")
-        validate_invoice_file_content(temp_target)
-    except Exception:
-        temp_target.unlink(missing_ok=True)
-        raise
-    try:
-        digest = sha256_file(temp_target)
-        same_asset = find_invoice_by_hash(conn, asset_id=asset_id, sha256=digest)
-        if same_asset is not None:
-            temp_target.unlink(missing_ok=True)
-            return int(same_asset["id"]), ("duplicate_invoice",)
-        warnings: list[str] = []
-        if find_invoice_by_hash(conn, asset_id=None, sha256=digest) is not None:
-            warnings.append("possible_duplicate_invoice")
-        temp_target.replace(target)
-        final_created = True
-        mime_type = mimetypes.guess_type(safe_name)[0] or str(getattr(file_storage, "mimetype", "") or "")
-        source_id = create_source_file_record(
-            conn,
-            asset_id=asset_id,
-            portfolio_id=portfolio_id,
-            file_type="invoice",
-            original_filename=original_filename,
-            stored_path=str(target),
-            sha256=digest,
-            mime_type=mime_type,
-            size_bytes=size_bytes,
-        )
-        document_id = create_invoice_document(
-            conn,
-            source_file_id=source_id,
-            asset_id=asset_id,
-            sha256=digest,
-            mime_type=mime_type,
-            size_bytes=size_bytes,
-            status=InvoiceStatus.REVIEW_REQUIRED.value if warnings else InvoiceStatus.UPLOADED.value,
-            warnings=tuple(warnings),
-        )
-        return document_id, tuple(warnings)
-    except Exception:
-        temp_target.unlink(missing_ok=True)
-        if final_created:
-            target.unlink(missing_ok=True)
-        raise
-
-
-def persist_invoice_extraction_result(conn: sqlite3.Connection, invoice: sqlite3.Row, result: Any) -> None:
-    create_invoice_extraction_run(conn, invoice_document_id=int(invoice["id"]), result=result)
-    candidates = list(result.candidates)
-    if result.tariff_candidate.tariff_type is not None:
-        candidates.append(
-            InvoiceCandidate(
-                "tariff_type_candidate",
-                result.tariff_candidate.tariff_type.value,
-                result.confidence,
-                evidence="inferido dos precos extraidos",
-                source=result.method,
-            )
-        )
-    values = {candidate.field_name: candidate.value for candidate in candidates}
-    asset = conn.execute("SELECT nif FROM assets WHERE id = ?", (invoice["asset_id"],)).fetchone()
-    validation = validate_invoice_values(values, asset_nif=asset["nif"] if asset else None)
-    warnings = tuple(sorted({*result.warnings, *validation.warnings}))
-    status = InvoiceStatus.EXTRACTION_FAILED.value if result.errors or validation.errors else validation.status.value
-    update_invoice_from_candidates(
-        conn,
-        invoice_document_id=int(invoice["id"]),
-        candidates=tuple(candidates),
-        status=status,
-        confidence=result.confidence,
-        warnings=warnings,
-    )
-
-
-def invoice_values_from_form(form: Any) -> dict[str, str]:
-    fields = (
-        "supplier_name",
-        "supplier_nif",
-        "customer_name",
-        "customer_nif",
-        "invoice_number",
-        "issue_date",
-        "billing_period_start",
-        "billing_period_end",
-        "currency",
-        "total_amount",
-        "total_energy_kwh",
-        "tariff_type_candidate",
-        "simple_price_eur_kwh",
-        "ponta_price_eur_kwh",
-        "cheia_price_eur_kwh",
-        "vazio_price_eur_kwh",
-        "super_vazio_price_eur_kwh",
-    )
-    return {field: str(form.get(field, "")).strip() for field in fields}
-
-
-def apply_invoice_to_tariff(conn: sqlite3.Connection, invoice_document_id: int) -> int:
-    invoice = get_invoice_document(conn, invoice_document_id)
-    if invoice is None:
-        raise ValueError("Fatura inexistente.")
-    if invoice["status"] != InvoiceStatus.CONFIRMED.value:
-        raise ValueError("A fatura tem de estar confirmada antes de ser usada na tarifa.")
-    tariff_type = str(invoice["tariff_type_candidate"] or "simple")
-    if tariff_type != TariffType.SIMPLE.value:
-        raise ValueError("Tarifas multi-horarias exigem regras horarias manuais antes de guardar.")
-    return save_asset_tariff(
-        conn,
-        asset_id=int(invoice["asset_id"]),
-        tariff_type=tariff_type,
-        simple_price_eur_kwh=invoice["simple_price_eur_kwh"],
-        invoice_file_id=int(invoice["source_file_id"]),
-        valid_from=normalize_date(invoice["billing_period_start"]).isoformat() if invoice["billing_period_start"] else "",
-        valid_to=normalize_date(invoice["billing_period_end"]).isoformat() if invoice["billing_period_end"] else "",
-        notes=f"Criada a partir da fatura {invoice['invoice_number'] or invoice_document_id}",
-    )
-
-
-def build_visits_by_ticket(visits: list[sqlite3.Row]) -> dict[int, list[sqlite3.Row]]:
-    visits_by_ticket: dict[int, list[sqlite3.Row]] = {}
-    for visit in visits:
-        visits_by_ticket.setdefault(visit["ticket_id"], []).append(visit)
-    return visits_by_ticket
-
-
-def normalize_calendar_month(value: str | None) -> str:
-    if value:
-        try:
-            return datetime.strptime(value.strip(), "%Y-%m").strftime("%Y-%m")
-        except ValueError:
-            pass
-    return date.today().strftime("%Y-%m")
-
-
-def normalize_optional_date(value: str | None) -> str:
-    if not value:
-        return ""
-    try:
-        return datetime.strptime(value.strip(), "%Y-%m-%d").date().isoformat()
-    except ValueError:
-        return ""
-
-
-def parse_positive_int(value: str | None, default: int = 0) -> int:
-    try:
-        parsed = int(float(value or ""))
-    except (TypeError, ValueError):
-        return default
-    return max(parsed, 0)
-
-
-def normalize_choice(value: str | None, choices: list[str], default: str) -> str:
-    value = (value or "").strip()
-    return value if value in choices else default
-
-
-def calendar_month_bounds(month_value: str) -> tuple[date, date, str, str]:
-    month_start = datetime.strptime(month_value, "%Y-%m").date().replace(day=1)
-    _, last_day = calendar.monthrange(month_start.year, month_start.month)
-    month_end = month_start.replace(day=last_day)
-    previous_month_date = (month_start - timedelta(days=1)).replace(day=1)
-    next_month_date = (month_end + timedelta(days=1)).replace(day=1)
-    return month_start, month_end, previous_month_date.strftime("%Y-%m"), next_month_date.strftime("%Y-%m")
-
-
-def build_error_calendar(month_value: str, records: list[sqlite3.Row]) -> dict[str, Any]:
-    month_start, month_end, _, _ = calendar_month_bounds(month_value)
-    records_by_day: dict[str, list[sqlite3.Row]] = {}
-    for record in records:
-        records_by_day.setdefault(record["record_date"], []).append(record)
-
-    weeks = []
-    week = []
-    for _ in range(month_start.weekday()):
-        week.append({"date": None, "records": []})
-
-    current_day = month_start
-    while current_day <= month_end:
-        iso_day = current_day.isoformat()
-        week.append({"date": current_day, "records": records_by_day.get(iso_day, [])})
-        if len(week) == 7:
-            weeks.append(week)
-            week = []
-        current_day += timedelta(days=1)
-
-    if week:
-        while len(week) < 7:
-            week.append({"date": None, "records": []})
-        weeks.append(week)
-
-    return {
-        "label": f"{MONTH_NAMES_PT[month_start.month]} {month_start.year}",
-        "weeks": weeks,
-        "record_count": sum(len(rows) for rows in records_by_day.values()),
-    }
-
-
-def build_intervention_calendar(month_value: str, records: list[sqlite3.Row]) -> dict[str, Any]:
-    month_start, month_end, _, _ = calendar_month_bounds(month_value)
-    records_by_day: dict[str, list[sqlite3.Row]] = {}
-    for record in records:
-        planned_date = record["planned_date"]
-        if planned_date:
-            records_by_day.setdefault(planned_date, []).append(record)
-
-    weeks = []
-    week = []
-    for _ in range(month_start.weekday()):
-        week.append({"date": None, "records": []})
-
-    current_day = month_start
-    while current_day <= month_end:
-        iso_day = current_day.isoformat()
-        week.append({"date": current_day, "records": records_by_day.get(iso_day, [])})
-        if len(week) == 7:
-            weeks.append(week)
-            week = []
-        current_day += timedelta(days=1)
-
-    if week:
-        while len(week) < 7:
-            week.append({"date": None, "records": []})
-        weeks.append(week)
-
-    return {
-        "label": f"{MONTH_NAMES_PT[month_start.month]} {month_start.year}",
-        "weeks": weeks,
-        "record_count": sum(len(rows) for rows in records_by_day.values()),
-    }
-
-
-def intervention_ready_for_route(row: sqlite3.Row | dict[str, Any]) -> bool:
-    if row["status"] == "Fechado":
-        return False
-    if row["material_status"] == "Bloqueado":
-        return False
-    if row["latitude"] is None or row["longitude"] is None:
-        return False
-    if row["coordinates_confidence"] in {"suspect", "review"}:
-        return False
-    return True
-
-
-def build_asset_error_calendar(month_value: str, records: list[sqlite3.Row]) -> dict[str, Any]:
-    month_start, month_end, _, _ = calendar_month_bounds(month_value)
-    events_by_day: dict[str, list[dict[str, Any]]] = {}
-    previous_problem = False
-
-    for record in records:
-        record_date = record["record_date"]
-        status = record["status"]
-        is_problem = status in PROBLEM_MONITORING_STATUSES
-        event_type = ""
-        event_label = ""
-
-        if is_problem and not previous_problem:
-            event_type = "start"
-            event_label = "Apareceu"
-        elif is_problem:
-            event_type = "active"
-            event_label = "Mantem-se"
-        elif previous_problem:
-            event_type = "end"
-            event_label = "Desapareceu"
-
-        if month_start.isoformat() <= record_date <= month_end.isoformat() and event_type:
-            events_by_day.setdefault(record_date, []).append(
-                {
-                    "status": status,
-                    "label": event_label,
-                    "type": event_type,
-                    "notes": record["notes"],
-                    "source": record["source"],
-                    "record_id": record["id"],
-                }
-            )
-
-        previous_problem = is_problem
-
-    weeks = []
-    week = []
-    for _ in range(month_start.weekday()):
-        week.append({"date": None, "events": []})
-
-    current_day = month_start
-    while current_day <= month_end:
-        iso_day = current_day.isoformat()
-        week.append({"date": current_day, "events": events_by_day.get(iso_day, [])})
-        if len(week) == 7:
-            weeks.append(week)
-            week = []
-        current_day += timedelta(days=1)
-
-    if week:
-        while len(week) < 7:
-            week.append({"date": None, "events": []})
-        weeks.append(week)
-
-    return {
-        "label": f"{MONTH_NAMES_PT[month_start.month]} {month_start.year}",
-        "weeks": weeks,
-        "event_count": sum(len(rows) for rows in events_by_day.values()),
-    }
-
-
-def group_tickets_by_asset(tickets: list[sqlite3.Row]) -> list[dict[str, Any]]:
-    grouped: dict[int, dict[str, Any]] = {}
-    for ticket in tickets:
-        asset_id = int(ticket["asset_id"])
-        bucket = grouped.setdefault(
-            asset_id,
-            {
-                "asset_id": asset_id,
-                "project_name": ticket["project_name"],
-                "location": ticket["location"],
-                "active_contract": ticket["active_contract"],
-                "contract_type": ticket["contract_type"],
-                "tickets": [],
-            },
-        )
-        bucket["tickets"].append(ticket)
-
-    ordered = []
-    for asset_id, bucket in grouped.items():
-        tickets_list = bucket["tickets"]
-        bucket["open_count"] = sum(1 for ticket in tickets_list if ticket["status"] != "Fechado")
-        bucket["critical_count"] = sum(
-            1 for ticket in tickets_list if ticket["urgency"] == "Critica" and ticket["status"] != "Fechado"
-        )
-        bucket["last_update"] = max(ticket["updated_at"] for ticket in tickets_list)
-        ordered.append(bucket)
-
-    ordered.sort(
-        key=lambda item: (
-            0 if item["active_contract"] == "yes" else 1,
-            -item["critical_count"],
-            -item["open_count"],
-            item["project_name"].lower(),
-        )
-    )
-    return ordered
-
-
-def ensure_predefined_export_templates(conn: sqlite3.Connection) -> None:
-    predefined_templates = [
-        {
-            "name": "Preventiva - O&M ativo",
-            "dataset": "assets",
-            "export_format": "xlsx",
-            "columns": [
-                "project_name",
-                "location",
-                "address",
-                "contact_phone",
-                "contact_name",
-                "access_type",
-                "coverage_type",
-            ],
-            "filters": {
-                "om_only": "yes",
-            },
-        },
-        {
-            "name": "Relatorio monitorizacao - diario",
-            "dataset": "monitoring_report",
-            "export_format": "pdf",
-            "columns": [
-                "period",
-                "project_name",
-                "current_status",
-                "error_records",
-                "distinct_errors",
-                "error_types",
-                "open_tickets",
-                "visits_period",
-                "last_visit_date",
-                "latest_notes",
-            ],
-            "filters": {
-                "period": "day",
-                "om_only": "yes",
-            },
-        },
-        {
-            "name": "Relatorio monitorizacao - semanal",
-            "dataset": "monitoring_report",
-            "export_format": "pdf",
-            "columns": [
-                "period",
-                "project_name",
-                "current_status",
-                "error_records",
-                "distinct_errors",
-                "error_types",
-                "open_tickets",
-                "visits_period",
-                "last_visit_date",
-                "latest_notes",
-            ],
-            "filters": {
-                "period": "week",
-                "om_only": "yes",
-            },
-        },
-        {
-            "name": "Relatorio monitorizacao - mensal",
-            "dataset": "monitoring_report",
-            "export_format": "pdf",
-            "columns": [
-                "period",
-                "project_name",
-                "current_status",
-                "error_records",
-                "distinct_errors",
-                "error_types",
-                "open_tickets",
-                "visits_period",
-                "last_visit_date",
-                "latest_notes",
-            ],
-            "filters": {
-                "period": "month",
-                "om_only": "yes",
-            },
-        },
-        {
-            "name": "Relatorio producao - mensal",
-            "dataset": "production_report",
-            "export_format": "xlsx",
-            "columns": [
-                "period",
-                "project_name",
-                "location",
-                "provider",
-                "production_kwh",
-                "specific_yield",
-                "expected_kwh",
-                "deviation_pct",
-                "performance_status",
-                "data_points",
-                "data_source",
-                "last_update",
-                "notes",
-            ],
-            "filters": {
-                "period": "month",
-                "om_only": "yes",
-                "source": "FusionSolar",
-            },
-        },
-        {
-            "name": "Relatorio producao - anual",
-            "dataset": "production_report",
-            "export_format": "xlsx",
-            "columns": [
-                "period",
-                "project_name",
-                "location",
-                "provider",
-                "production_kwh",
-                "specific_yield",
-                "expected_kwh",
-                "deviation_pct",
-                "performance_status",
-                "data_points",
-                "data_source",
-                "last_update",
-                "notes",
-            ],
-            "filters": {
-                "period": "year",
-                "om_only": "yes",
-                "source": "FusionSolar",
-            },
-        },
-    ]
-
-    for template in predefined_templates:
-        existing = conn.execute(
-            "SELECT id FROM export_templates WHERE name = ? LIMIT 1",
-            (template["name"],),
-        ).fetchone()
-        if existing:
-            continue
-        conn.execute(
-            """
-            INSERT INTO export_templates (name, dataset, export_format, columns_json, filters_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                template["name"],
-                template["dataset"],
-                template["export_format"],
-                json.dumps(template["columns"], ensure_ascii=True),
-                json.dumps(template["filters"], ensure_ascii=True),
-                datetime.now().isoformat(timespec="seconds"),
-            ),
-        )
-
-
-def get_fusionsolar_env_config() -> dict[str, str]:
-    return {
-        "username": os.environ.get("FUSIONSOLAR_USERNAME", "").strip(),
-        "password": os.environ.get("FUSIONSOLAR_PASSWORD", "").strip(),
-        "base_url": os.environ.get("FUSIONSOLAR_BASE_URL", "").strip(),
-        "login_endpoint": os.environ.get("FUSIONSOLAR_LOGIN_ENDPOINT", DEFAULT_FUSIONSOLAR_LOGIN_ENDPOINT).strip(),
-        "plants_endpoint": os.environ.get("FUSIONSOLAR_STATIONS_ENDPOINT", DEFAULT_FUSIONSOLAR_STATIONS_ENDPOINT).strip(),
-        "real_time_endpoint": os.environ.get(
-            "FUSIONSOLAR_REALTIME_ENDPOINT",
-            DEFAULT_FUSIONSOLAR_REALTIME_ENDPOINT,
-        ).strip(),
-        "device_list_endpoint": os.environ.get(
-            "FUSIONSOLAR_DEVICES_ENDPOINT",
-            DEFAULT_FUSIONSOLAR_DEVICES_ENDPOINT,
-        ).strip(),
-        "device_real_time_endpoint": os.environ.get(
-            "FUSIONSOLAR_DEVICE_REALTIME_ENDPOINT",
-            DEFAULT_FUSIONSOLAR_DEVICE_REALTIME_ENDPOINT,
-        ).strip(),
-        "device_history_endpoint": os.environ.get(
-            "FUSIONSOLAR_DEVICE_HISTORY_ENDPOINT",
-            DEFAULT_FUSIONSOLAR_DEVICE_HISTORY_ENDPOINT,
-        ).strip(),
-        "alarms_endpoint": os.environ.get("FUSIONSOLAR_ALARMS_ENDPOINT", DEFAULT_FUSIONSOLAR_ALARMS_ENDPOINT).strip(),
-        "day_kpi_endpoint": os.environ.get(
-            "FUSIONSOLAR_DAY_KPI_ENDPOINT",
-            DEFAULT_FUSIONSOLAR_DAY_KPI_ENDPOINT,
-        ).strip(),
-        "month_kpi_endpoint": os.environ.get(
-            "FUSIONSOLAR_MONTH_KPI_ENDPOINT",
-            DEFAULT_FUSIONSOLAR_MONTH_KPI_ENDPOINT,
-        ).strip(),
-        "sync_hours": os.environ.get("FUSIONSOLAR_SYNC_HOURS", DEFAULT_FUSIONSOLAR_SYNC_HOURS).strip(),
-        "state_sync_interval_hours": os.environ.get("FUSIONSOLAR_STATE_SYNC_INTERVAL_HOURS", "").strip(),
-        "production_sync_enabled": os.environ.get("FUSIONSOLAR_PRODUCTION_SYNC_ENABLED", "").strip(),
-        "production_sync_time": os.environ.get("FUSIONSOLAR_PRODUCTION_SYNC_TIME", "").strip(),
-        "diagnostics_sync_enabled": os.environ.get("FUSIONSOLAR_DIAGNOSTICS_SYNC_ENABLED", "").strip(),
-        "diagnostics_sync_time": os.environ.get("FUSIONSOLAR_DIAGNOSTICS_SYNC_TIME", "").strip(),
-    }
-
-
-def get_sigenergy_env_config() -> dict[str, str]:
-    return {
-        "username": os.environ.get("SIGENERGY_APP_KEY", "").strip(),
-        "password": os.environ.get("SIGENERGY_APP_SECRET", "").strip(),
-        "base_url": os.environ.get("SIGENERGY_BASE_URL", DEFAULT_SIGENERGY_BASE_URL).strip(),
-        "login_endpoint": os.environ.get("SIGENERGY_AUTH_ENDPOINT", DEFAULT_SIGENERGY_AUTH_ENDPOINT).strip(),
-        "plants_endpoint": os.environ.get("SIGENERGY_SYSTEMS_ENDPOINT", DEFAULT_SIGENERGY_SYSTEMS_ENDPOINT).strip(),
-        "energy_flow_endpoint": os.environ.get("SIGENERGY_ENERGY_FLOW_ENDPOINT", DEFAULT_SIGENERGY_ENERGY_FLOW_ENDPOINT).strip(),
-        "onboard_endpoint": os.environ.get("SIGENERGY_ONBOARD_ENDPOINT", DEFAULT_SIGENERGY_ONBOARD_ENDPOINT).strip(),
-        "day_kpi_endpoint": "",
-        "month_kpi_endpoint": "",
-        "sync_hours": os.environ.get("SIGENERGY_SYNC_HOURS", DEFAULT_SIGENERGY_SYNC_HOURS).strip(),
-        "state_sync_interval_hours": os.environ.get("SIGENERGY_STATE_SYNC_INTERVAL_HOURS", "").strip(),
-        "region": os.environ.get("SIGENERGY_REGION", DEFAULT_SIGENERGY_REGION).strip() or DEFAULT_SIGENERGY_REGION,
-        "system_ids": os.environ.get("SIGENERGY_SYSTEM_IDS", os.environ.get("SIGENERGY_SYSTEM_ID", "")).strip(),
-        "snapshot_retention_days": os.environ.get("SIGENERGY_SNAPSHOT_RETENTION_DAYS", str(DEFAULT_SIGENERGY_SNAPSHOT_RETENTION_DAYS)).strip(),
-        "enabled": os.environ.get("SIGENERGY_ENABLED", "").strip(),
-    }
-
-
-def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
-    env_config = get_fusionsolar_env_config()
-    existing = conn.execute(
-        "SELECT * FROM integration_configs WHERE provider = ?",
-        (INTEGRATION_PROVIDER_FUSIONSOLAR,),
-    ).fetchone()
-    if existing:
-        conn.execute(
-            """
-            UPDATE integration_configs
-            SET username = CASE WHEN COALESCE(username, '') = '' THEN ? ELSE username END,
-                base_url = CASE WHEN COALESCE(base_url, '') = '' THEN ? ELSE base_url END,
-                login_endpoint = CASE WHEN COALESCE(login_endpoint, '') = '' THEN ? ELSE login_endpoint END,
-                plants_endpoint = CASE WHEN COALESCE(plants_endpoint, '') = '' THEN ? ELSE plants_endpoint END,
-                real_time_endpoint = CASE WHEN COALESCE(real_time_endpoint, '') = '' THEN ? ELSE real_time_endpoint END,
-                device_list_endpoint = CASE WHEN COALESCE(device_list_endpoint, '') = '' THEN ? ELSE device_list_endpoint END,
-                device_real_time_endpoint = CASE WHEN COALESCE(device_real_time_endpoint, '') = '' THEN ? ELSE device_real_time_endpoint END,
-                device_history_endpoint = CASE WHEN COALESCE(device_history_endpoint, '') = '' THEN ? ELSE device_history_endpoint END,
-                alarms_endpoint = CASE WHEN COALESCE(alarms_endpoint, '') = '' THEN ? ELSE alarms_endpoint END,
-                day_kpi_endpoint = CASE WHEN COALESCE(day_kpi_endpoint, '') = '' THEN ? ELSE day_kpi_endpoint END,
-                month_kpi_endpoint = CASE WHEN COALESCE(month_kpi_endpoint, '') = '' THEN ? ELSE month_kpi_endpoint END,
-                sync_hours = CASE WHEN COALESCE(sync_hours, '') = '' THEN ? ELSE sync_hours END,
-                production_sync_enabled = CASE WHEN production_sync_enabled IS NULL THEN 1 ELSE production_sync_enabled END,
-                diagnostics_sync_enabled = CASE WHEN diagnostics_sync_enabled IS NULL THEN 1 ELSE diagnostics_sync_enabled END,
-                state_sync_interval_hours = CASE WHEN state_sync_interval_hours IS NULL OR state_sync_interval_hours < 1 THEN ? ELSE state_sync_interval_hours END,
-                production_sync_time = CASE WHEN COALESCE(production_sync_time, '') = '' THEN ? ELSE production_sync_time END,
-                diagnostics_sync_time = CASE WHEN COALESCE(diagnostics_sync_time, '') = '' THEN ? ELSE diagnostics_sync_time END,
-                updated_at = ?
-            WHERE provider = ?
-            """,
-            (
-                env_config["username"],
-                env_config["base_url"],
-                env_config["login_endpoint"],
-                env_config["plants_endpoint"],
-                env_config["real_time_endpoint"],
-                env_config["device_list_endpoint"],
-                env_config["device_real_time_endpoint"],
-                env_config["device_history_endpoint"],
-                env_config["alarms_endpoint"],
-                env_config["day_kpi_endpoint"],
-                env_config["month_kpi_endpoint"],
-                env_config["sync_hours"],
-                DEFAULT_STATE_SYNC_INTERVAL_HOURS,
-                DEFAULT_FUSIONSOLAR_PRODUCTION_SYNC_TIME,
-                DEFAULT_FUSIONSOLAR_DIAGNOSTICS_SYNC_TIME,
-                datetime.now().isoformat(timespec="seconds"),
-                INTEGRATION_PROVIDER_FUSIONSOLAR,
-            ),
-        )
-    else:
-        conn.execute(
-            """
-            INSERT INTO integration_configs (
-                provider, username, password, base_url, login_endpoint, plants_endpoint, real_time_endpoint,
-                device_list_endpoint, device_real_time_endpoint, device_history_endpoint, alarms_endpoint,
-                day_kpi_endpoint, month_kpi_endpoint,
-                enabled, auto_sync_enabled, sync_hours, production_sync_enabled, diagnostics_sync_enabled,
-                state_sync_interval_hours, production_sync_time, diagnostics_sync_time, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                INTEGRATION_PROVIDER_FUSIONSOLAR,
-                env_config["username"],
-                "",
-                env_config["base_url"],
-                env_config["login_endpoint"],
-                env_config["plants_endpoint"],
-                env_config["real_time_endpoint"],
-                env_config["device_list_endpoint"],
-                env_config["device_real_time_endpoint"],
-                env_config["device_history_endpoint"],
-                env_config["alarms_endpoint"],
-                env_config["day_kpi_endpoint"],
-                env_config["month_kpi_endpoint"],
-                0,
-                0,
-                env_config["sync_hours"],
-                1,
-                1,
-                DEFAULT_STATE_SYNC_INTERVAL_HOURS,
-                DEFAULT_FUSIONSOLAR_PRODUCTION_SYNC_TIME,
-                DEFAULT_FUSIONSOLAR_DIAGNOSTICS_SYNC_TIME,
-                datetime.now().isoformat(timespec="seconds"),
-                datetime.now().isoformat(timespec="seconds"),
-            ),
-        )
-
-    sigenergy_env = get_sigenergy_env_config()
-    sigenergy_existing = conn.execute(
-        "SELECT * FROM integration_configs WHERE provider = ?",
-        (INTEGRATION_PROVIDER_SIGENERGY,),
-    ).fetchone()
-    sigenergy_enabled = 1 if sigenergy_env["enabled"].lower() in {"1", "true", "yes", "sim", "on"} else 0
-    if sigenergy_existing:
-        conn.execute(
-            """
-            UPDATE integration_configs
-            SET username = CASE WHEN COALESCE(username, '') = '' THEN ? ELSE username END,
-                base_url = CASE WHEN COALESCE(base_url, '') = '' THEN ? ELSE base_url END,
-                login_endpoint = CASE WHEN COALESCE(login_endpoint, '') = '' THEN ? ELSE login_endpoint END,
-                plants_endpoint = CASE WHEN COALESCE(plants_endpoint, '') = '' THEN ? ELSE plants_endpoint END,
-                energy_flow_endpoint = CASE WHEN COALESCE(energy_flow_endpoint, '') = '' THEN ? ELSE energy_flow_endpoint END,
-                onboard_endpoint = CASE WHEN COALESCE(onboard_endpoint, '') = '' THEN ? ELSE onboard_endpoint END,
-                sync_hours = CASE WHEN COALESCE(sync_hours, '') = '' THEN ? ELSE sync_hours END,
-                state_sync_interval_hours = CASE WHEN state_sync_interval_hours IS NULL OR state_sync_interval_hours < 1 THEN ? ELSE state_sync_interval_hours END,
-                production_sync_enabled = 0,
-                diagnostics_sync_enabled = 0,
-                region = CASE WHEN COALESCE(region, '') = '' THEN ? ELSE region END,
-                system_ids = CASE WHEN COALESCE(system_ids, '') = '' THEN ? ELSE system_ids END,
-                snapshot_retention_days = CASE WHEN snapshot_retention_days IS NULL OR snapshot_retention_days <= 0 THEN ? ELSE snapshot_retention_days END,
-                enabled = CASE WHEN ? = 1 THEN 1 ELSE enabled END,
-                updated_at = ?
-            WHERE provider = ?
-            """,
-            (
-                sigenergy_env["username"],
-                sigenergy_env["base_url"],
-                sigenergy_env["login_endpoint"],
-                sigenergy_env["plants_endpoint"],
-                sigenergy_env["energy_flow_endpoint"],
-                sigenergy_env["onboard_endpoint"],
-                sigenergy_env["sync_hours"],
-                DEFAULT_STATE_SYNC_INTERVAL_HOURS,
-                sigenergy_env["region"],
-                sigenergy_env["system_ids"],
-                int(sigenergy_env["snapshot_retention_days"] or DEFAULT_SIGENERGY_SNAPSHOT_RETENTION_DAYS),
-                sigenergy_enabled,
-                datetime.now().isoformat(timespec="seconds"),
-                INTEGRATION_PROVIDER_SIGENERGY,
-            ),
-        )
-        return
-
-    conn.execute(
-        """
-        INSERT INTO integration_configs (
-            provider, username, password, base_url, login_endpoint, plants_endpoint, energy_flow_endpoint, onboard_endpoint,
-            day_kpi_endpoint, month_kpi_endpoint, region, system_ids, snapshot_retention_days,
-            enabled, auto_sync_enabled, sync_hours, production_sync_enabled, diagnostics_sync_enabled,
-            state_sync_interval_hours, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            INTEGRATION_PROVIDER_SIGENERGY,
-            sigenergy_env["username"],
-            "",
-            sigenergy_env["base_url"],
-            sigenergy_env["login_endpoint"],
-            sigenergy_env["plants_endpoint"],
-            sigenergy_env["energy_flow_endpoint"],
-            sigenergy_env["onboard_endpoint"],
-            "",
-            "",
-            sigenergy_env["region"],
-            sigenergy_env["system_ids"],
-            int(sigenergy_env["snapshot_retention_days"] or DEFAULT_SIGENERGY_SNAPSHOT_RETENTION_DAYS),
-            sigenergy_enabled,
-            sigenergy_enabled,
-            sigenergy_env["sync_hours"],
-            0,
-            0,
-            DEFAULT_STATE_SYNC_INTERVAL_HOURS,
-            datetime.now().isoformat(timespec="seconds"),
-            datetime.now().isoformat(timespec="seconds"),
-        ),
-    )
-
-
-def get_integration_config(conn: sqlite3.Connection, provider: str) -> dict[str, Any] | None:
-    row = conn.execute("SELECT * FROM integration_configs WHERE provider = ?", (provider,)).fetchone()
-    if row is None:
-        return None
-    config = dict(row)
-    if provider == INTEGRATION_PROVIDER_FUSIONSOLAR:
-        env_config = get_fusionsolar_env_config()
-        config["env_overrides"] = {}
-        for key, value in env_config.items():
-            if value and key in config:
-                config[key] = value
-                config["env_overrides"][key] = True
-        config["state_sync_interval_hours"] = normalize_positive_int(
-            config.get("state_sync_interval_hours"),
-            DEFAULT_STATE_SYNC_INTERVAL_HOURS,
-            minimum=1,
-            maximum=24,
-        )
-        config["production_sync_time"] = normalize_clock_time(
-            config.get("production_sync_time"),
-            DEFAULT_FUSIONSOLAR_PRODUCTION_SYNC_TIME,
-        )
-        config["diagnostics_sync_time"] = normalize_clock_time(
-            config.get("diagnostics_sync_time"),
-            DEFAULT_FUSIONSOLAR_DIAGNOSTICS_SYNC_TIME,
-        )
-        config["production_sync_enabled"] = 1 if normalize_bool(config.get("production_sync_enabled"), True) else 0
-        config["diagnostics_sync_enabled"] = 1 if normalize_bool(config.get("diagnostics_sync_enabled"), True) else 0
-        config["password_configured"] = bool(config.get("password"))
-        config["password_source"] = "env" if env_config["password"] else ("database" if config.get("password") else "")
-    if provider == INTEGRATION_PROVIDER_SIGENERGY:
-        env_config = get_sigenergy_env_config()
-        env_key_map = {
-            "username": "SIGENERGY_APP_KEY",
-            "password": "SIGENERGY_APP_SECRET",
-            "base_url": "SIGENERGY_BASE_URL",
-            "login_endpoint": "SIGENERGY_AUTH_ENDPOINT",
-            "plants_endpoint": "SIGENERGY_SYSTEMS_ENDPOINT",
-            "energy_flow_endpoint": "SIGENERGY_ENERGY_FLOW_ENDPOINT",
-            "onboard_endpoint": "SIGENERGY_ONBOARD_ENDPOINT",
-            "sync_hours": "SIGENERGY_SYNC_HOURS",
-            "state_sync_interval_hours": "SIGENERGY_STATE_SYNC_INTERVAL_HOURS",
-            "snapshot_retention_days": "SIGENERGY_SNAPSHOT_RETENTION_DAYS",
-        }
-        config["env_overrides"] = {}
-        for key, env_key in env_key_map.items():
-            env_value = os.environ.get(env_key, "").strip()
-            if env_value and key in config:
-                config[key] = env_value
-                config["env_overrides"][key] = True
-        config["base_url"] = config.get("base_url") or DEFAULT_SIGENERGY_BASE_URL
-        config["login_endpoint"] = config.get("login_endpoint") or DEFAULT_SIGENERGY_AUTH_ENDPOINT
-        config["plants_endpoint"] = config.get("plants_endpoint") or DEFAULT_SIGENERGY_SYSTEMS_ENDPOINT
-        config["energy_flow_endpoint"] = config.get("energy_flow_endpoint") or DEFAULT_SIGENERGY_ENERGY_FLOW_ENDPOINT
-        config["onboard_endpoint"] = config.get("onboard_endpoint") or DEFAULT_SIGENERGY_ONBOARD_ENDPOINT
-        config["sync_hours"] = config.get("sync_hours") or DEFAULT_SIGENERGY_SYNC_HOURS
-        config["state_sync_interval_hours"] = normalize_positive_int(
-            config.get("state_sync_interval_hours"),
-            DEFAULT_STATE_SYNC_INTERVAL_HOURS,
-            minimum=1,
-            maximum=24,
-        )
-        config["production_sync_enabled"] = 0
-        config["diagnostics_sync_enabled"] = 0
-        config["snapshot_retention_days"] = int(config.get("snapshot_retention_days") or DEFAULT_SIGENERGY_SNAPSHOT_RETENTION_DAYS)
-        if os.environ.get("SIGENERGY_REGION", "").strip():
-            config["region"] = env_config["region"]
-            config["env_overrides"]["region"] = True
-        else:
-            config["region"] = config.get("region") or DEFAULT_SIGENERGY_REGION
-        if env_config["system_ids"]:
-            config["system_ids"] = env_config["system_ids"]
-            config["env_overrides"]["system_ids"] = True
-        else:
-            config["system_ids"] = config.get("system_ids") or ""
-        config["password_configured"] = bool(config.get("password"))
-        config["password_source"] = "env" if env_config["password"] else ("database" if config.get("password") else "")
-        if env_config["enabled"].lower() in {"1", "true", "yes", "sim", "on"}:
-            config["enabled"] = 1
-    return config
-
-
-def start_integration_scheduler(app: Flask) -> None:
-    global SCHEDULER
-    if SCHEDULER is not None:
-        return
-    SCHEDULER = BackgroundScheduler(timezone="Europe/Lisbon")
-    SCHEDULER.start()
-    refresh_integration_scheduler(app)
-    register_background_job_reactivation_scheduler(app)
-    schedule_pending_background_jobs(app)
-
-
-def refresh_integration_scheduler(app: Flask) -> None:
-    global SCHEDULER
-    if SCHEDULER is None:
-        return
-    for job in list(SCHEDULER.get_jobs()):
-        if (
-            job.id.startswith("integration-sync-")
-            or job.id.startswith("fusionsolar-sync-")
-            or job.id
-            in {
-                "telegram-daily-summary",
-                "fusionsolar-production-daily",
-                "fusionsolar-wat-daily",
-                "integration-state-fusionsolar-hourly",
-                "integration-production-fusionsolar-daily",
-                "integration-diagnostics-fusionsolar-daily",
-                "integration-production-fusionsolar-month-close",
-                "integration-fusionsolar-realtime-cleanup",
-                "integration-state-sigenergy-hourly",
-                "background-jobs-reactivate-rate-limit",
-            }
-        ):
-            SCHEDULER.remove_job(job.id)
-
-    with closing(get_db(app.config["DATABASE"])) as conn:
-        configs = [get_integration_config(conn, provider) for provider in INTEGRATION_PROVIDER_OPTIONS]
-    if telegram_daily_summary_enabled():
-        SCHEDULER.add_job(
-            func=run_scheduled_telegram_daily_summary,
-            trigger="cron",
-            hour=9,
-            minute=0,
-            args=[app],
-            id="telegram-daily-summary",
-            replace_existing=True,
-            max_instances=1,
-            coalesce=True,
-            misfire_grace_time=1800,
-        )
-    for config in configs:
-        if config is None or not config["enabled"]:
-            continue
-        provider = str(config["provider"])
-        if provider == INTEGRATION_PROVIDER_FUSIONSOLAR:
-            register_fusionsolar_scheduler_jobs(app, config)
-            continue
-        if provider == INTEGRATION_PROVIDER_SIGENERGY:
-            register_sigenergy_scheduler_jobs(app, config)
-    register_background_job_reactivation_scheduler(app)
-
-
-def add_scheduler_job(**kwargs: Any) -> None:
-    if SCHEDULER is None:
-        return
-    kwargs.setdefault("replace_existing", True)
-    kwargs.setdefault("max_instances", 1)
-    kwargs.setdefault("coalesce", True)
-    kwargs.setdefault("misfire_grace_time", 1800)
-    SCHEDULER.add_job(**kwargs)
-
-
-def register_hourly_state_sync(app: Flask, config: dict[str, Any], job_id: str) -> None:
-    if not config.get("auto_sync_enabled"):
-        return
-    interval_hours = normalize_positive_int(
-        config.get("state_sync_interval_hours"),
-        DEFAULT_STATE_SYNC_INTERVAL_HOURS,
-        minimum=1,
-        maximum=24,
-    )
-    provider = str(config["provider"])
-    app.logger.info("Registering %s state sync every %s hour(s)", provider, interval_hours)
-    add_scheduler_job(
-        func=run_scheduled_hourly_state_sync,
-        trigger="interval",
-        hours=interval_hours,
-        args=[app, provider],
-        id=job_id,
-    )
-
-
-def register_fusionsolar_scheduler_jobs(app: Flask, config: dict[str, Any]) -> None:
-    register_hourly_state_sync(app, config, "integration-state-fusionsolar-hourly")
-    if config.get("production_sync_enabled"):
-        hour, minute = split_clock_time(config.get("production_sync_time"), DEFAULT_FUSIONSOLAR_PRODUCTION_SYNC_TIME)
-        add_scheduler_job(
-            func=run_scheduled_fusionsolar_production_sync,
-            trigger="cron",
-            hour=hour,
-            minute=minute,
-            args=[app],
-            id="integration-production-fusionsolar-daily",
-        )
-    if config.get("diagnostics_sync_enabled"):
-        hour, minute = split_clock_time(config.get("diagnostics_sync_time"), DEFAULT_FUSIONSOLAR_DIAGNOSTICS_SYNC_TIME)
-        add_scheduler_job(
-            func=run_scheduled_fusionsolar_diagnostics_sync,
-            trigger="cron",
-            hour=hour,
-            minute=minute,
-            args=[app],
-            id="integration-diagnostics-fusionsolar-daily",
-        )
-    if config.get("production_sync_enabled"):
-        add_scheduler_job(
-            func=run_scheduled_fusionsolar_month_close,
-            trigger="cron",
-            day="1-5",
-            hour=2,
-            minute=0,
-            args=[app],
-            id="integration-production-fusionsolar-month-close",
-        )
-    add_scheduler_job(
-        func=run_scheduled_fusionsolar_realtime_cleanup,
-        trigger="cron",
-        hour=3,
-        minute=30,
-        args=[app],
-        id="integration-fusionsolar-realtime-cleanup",
-    )
-
-
-def register_sigenergy_scheduler_jobs(app: Flask, config: dict[str, Any]) -> None:
-    register_hourly_state_sync(app, config, "integration-state-sigenergy-hourly")
-
-
-def register_background_job_reactivation_scheduler(app: Flask) -> None:
-    add_scheduler_job(
-        func=run_scheduled_background_job_reactivation,
-        trigger="interval",
-        minutes=5,
-        args=[app],
-        id="background-jobs-reactivate-rate-limit",
-    )
-
-
-def run_scheduled_background_job_reactivation(app: Flask) -> None:
-    summary = schedule_pending_background_jobs(app)
-    if summary.get("rate_limit_reactivated") or summary.get("pending_scheduled"):
-        app.logger.info("Background job reactivation summary: %s", summary)
-
-
-def run_scheduled_telegram_daily_summary(app: Flask) -> None:
-    with app.app_context():
-        with closing(get_db(app.config["DATABASE"])) as conn:
-            try:
-                send_daily_telegram_summary(conn)
-                conn.commit()
-            except Exception:
-                current_app.logger.exception("Scheduled Telegram daily summary failed")
-
-
-def run_scheduled_integration_sync(app: Flask, provider: str) -> None:
-    with app.app_context():
-        with closing(get_db(app.config["DATABASE"])) as conn:
-            try:
-                current_app.logger.info("Scheduled %s sync started", provider)
-                result = run_integration_sync(conn, provider, trigger_type="scheduled")
-                current_app.logger.info("Scheduled %s sync completed: %s", provider, result)
-            except Exception:
-                current_app.logger.exception("Scheduled %s sync failed", provider)
-
-
-def run_scheduled_hourly_state_sync(app: Flask, provider: str) -> None:
-    with app.app_context():
-        with closing(get_db(app.config["DATABASE"])) as conn:
-            try:
-                job_type = "sigenergy_state_sync" if provider == INTEGRATION_PROVIDER_SIGENERGY else "fusionsolar_state_sync"
-                job_id, created = create_background_job(
-                    conn,
-                    job_type,
-                    {"provider": provider, "trigger_type": "scheduled_state"},
-                )
-                conn.commit()
-                if created:
-                    schedule_background_job(app, job_id)
-                current_app.logger.info("Scheduled %s state sync queued: job_id=%s created=%s", provider, job_id, created)
-            except Exception:
-                current_app.logger.exception("Scheduled %s state sync failed", provider)
-
-
-def run_scheduled_fusionsolar_sync(app: Flask) -> None:
-    run_scheduled_hourly_state_sync(app, INTEGRATION_PROVIDER_FUSIONSOLAR)
-
-
-def current_lisbon_date() -> date:
-    return datetime.now(LISBON_TIMEZONE).date()
-
-
-def run_scheduled_fusionsolar_production_sync(app: Flask) -> None:
-    scheduler_date = current_lisbon_date()
-    target_date = scheduler_date - timedelta(days=1)
-    with app.app_context():
-        with closing(get_db(app.config["DATABASE"])) as conn:
-            current_app.logger.info(
-                "Scheduled FusionSolar production preparing previous closed day: scheduler_date=%s target_date=%s",
-                scheduler_date,
-                target_date,
-            )
-            config = get_integration_config(conn, INTEGRATION_PROVIDER_FUSIONSOLAR)
-            if config is None or not config["enabled"]:
-                current_app.logger.info(
-                    "Scheduled FusionSolar production skipped because integration is disabled: target_date=%s",
-                    target_date,
-                )
-                return
-            if not config.get("production_sync_enabled"):
-                current_app.logger.info(
-                    "Scheduled FusionSolar production skipped because production sync is disabled: target_date=%s",
-                    target_date,
-                )
-                return
-            job_id, created = create_background_job(
-                conn,
-                "fusionsolar_production_sync",
-                {
-                    "provider": INTEGRATION_PROVIDER_FUSIONSOLAR,
-                    "target_date": target_date.isoformat(),
-                    "period_type": "day",
-                    "trigger_type": "scheduled",
-                },
-            )
-            conn.commit()
-            if created:
-                schedule_background_job(app, job_id)
-                current_app.logger.info(
-                    "Scheduled FusionSolar production queued: job_id=%s target_date=%s",
-                    job_id,
-                    target_date,
-                )
-            else:
-                current_app.logger.info(
-                    "Scheduled FusionSolar production reused existing pending/running job: job_id=%s target_date=%s",
-                    job_id,
-                    target_date,
-                )
-
-
-def run_scheduled_fusionsolar_wat_backfill(app: Flask) -> None:
-    scheduler_date = current_lisbon_date()
-    target_date = scheduler_date - timedelta(days=1)
-    with app.app_context():
-        with closing(get_db(app.config["DATABASE"])) as conn:
-            current_app.logger.info(
-                "Scheduled FusionSolar WAT preparing previous closed day: scheduler_date=%s target_date=%s",
-                scheduler_date,
-                target_date,
-            )
-            config = get_integration_config(conn, INTEGRATION_PROVIDER_FUSIONSOLAR)
-            if config is None or not config["enabled"]:
-                current_app.logger.info(
-                    "Scheduled FusionSolar WAT skipped because integration is disabled: target_date=%s",
-                    target_date,
-                )
-                return
-            if not config.get("diagnostics_sync_enabled"):
-                current_app.logger.info(
-                    "Scheduled FusionSolar WAT skipped because diagnostics sync is disabled: target_date=%s",
-                    target_date,
-                )
-                return
-            job_id, created = create_background_job(
-                conn,
-                "fusionsolar_inverter_availability_backfill",
-                {
-                    "provider": INTEGRATION_PROVIDER_FUSIONSOLAR,
-                    "from_date": target_date.isoformat(),
-                    "to_date": target_date.isoformat(),
-                    "trigger_type": "scheduled",
-                },
-            )
-            conn.commit()
-            if created:
-                schedule_background_job(app, job_id)
-                current_app.logger.info(
-                    "Scheduled FusionSolar WAT queued: job_id=%s target_date=%s job_type=%s",
-                    job_id,
-                    target_date,
-                    "fusionsolar_inverter_availability_backfill",
-                )
-            else:
-                current_app.logger.info(
-                    "Scheduled FusionSolar WAT reused existing pending/running job: job_id=%s target_date=%s",
-                    job_id,
-                    target_date,
-                )
-
-
-def run_scheduled_fusionsolar_diagnostics_sync(app: Flask) -> None:
-    run_scheduled_fusionsolar_wat_backfill(app)
-
-
-def run_scheduled_fusionsolar_realtime_cleanup(app: Flask) -> None:
-    with app.app_context():
-        with closing(get_db(app.config["DATABASE"])) as conn:
-            job_id, created = create_background_job(
-                conn,
-                "fusionsolar_realtime_materialize_cleanup",
-                {
-                    "provider": INTEGRATION_PROVIDER_FUSIONSOLAR,
-                    "reference_date": current_lisbon_date().isoformat(),
-                    "trigger_type": "scheduled_retention",
-                },
-            )
-            conn.commit()
-            if created:
-                schedule_background_job(app, job_id)
-            current_app.logger.info(
-                "Scheduled FusionSolar realtime materialization/cleanup queued: "
-                "job_id=%s created=%s",
-                job_id,
-                created,
-            )
-
-
-def run_scheduled_fusionsolar_month_close(app: Flask) -> None:
-    scheduler_date = current_lisbon_date()
-    if scheduler_date.day not in range(1, 6):
-        app.logger.info(
-            "Scheduled FusionSolar month close skipped outside days 1-5: scheduler_date=%s",
-            scheduler_date,
-        )
-        return
-    previous_day = scheduler_date.replace(day=1) - timedelta(days=1)
-    report_month = previous_day.strftime("%Y-%m")
-    with app.app_context():
-        with closing(get_db(app.config["DATABASE"])) as conn:
-            config = get_integration_config(conn, INTEGRATION_PROVIDER_FUSIONSOLAR)
-            if config is None or not config["enabled"] or not config.get("production_sync_enabled"):
-                current_app.logger.info(
-                    "Scheduled FusionSolar month close skipped because production integration is disabled: month=%s",
-                    report_month,
-                )
-                return
-            job_id, created = create_background_job(
-                conn,
-                "fusionsolar_month_close",
-                {
-                    "provider": INTEGRATION_PROVIDER_FUSIONSOLAR,
-                    "report_month": report_month,
-                    "trigger_type": "scheduled_month_close",
-                },
-            )
-            conn.commit()
-            if created:
-                schedule_background_job(app, job_id)
-            current_app.logger.info(
-                "Scheduled FusionSolar month close queued: job_id=%s created=%s month=%s scheduler_date=%s",
-                job_id,
-                created,
-                report_month,
-                scheduler_date,
-            )
-
-
-def schedule_background_job(app: Flask, job_id: int, run_date: datetime | None = None) -> bool:
-    if SCHEDULER is None:
-        app.logger.error("Background job %s was queued but APScheduler is not running", job_id)
-        return False
-    scheduled_at = as_background_job_utc(
-        run_date or background_job_utc_now()
-    )
-    SCHEDULER.add_job(
-        func=run_background_job,
-        trigger="date",
-        run_date=scheduled_at,
-        args=[app, job_id],
-        id=f"background-job-{job_id}",
-        replace_existing=True,
-        max_instances=1,
-    )
-    return True
-
-
-def schedule_pending_background_jobs(app: Flask) -> dict[str, Any]:
-    with closing(get_db(app.config["DATABASE"])) as conn:
-        expired_leases_recovered = recover_expired_leases(conn)
-        if expired_leases_recovered:
-            app.logger.info(
-                "Recovered %s expired production API leases",
-                expired_leases_recovered,
-            )
-        recovered_count = mark_stale_running_background_jobs_failed(conn)
-        if recovered_count:
-            app.logger.warning("Marked %s stale running background jobs as failed on startup", recovered_count)
-        reactivated_count = reactivate_due_rate_limited_background_jobs(conn)
-        if reactivated_count:
-            app.logger.info("Reactivated %s background jobs after API cooldown", reactivated_count)
-        pending_job_ids = fetch_pending_background_job_ids(conn)
-        future_waiting_jobs = fetch_future_waiting_background_jobs(conn)
-    failed_job_ids: list[int] = []
-    for job_id in pending_job_ids:
-        if not schedule_background_job(app, job_id):
-            failed_job_ids.append(job_id)
-    failed_waiting_job_ids: list[int] = []
-    for job_id, next_attempt_at in future_waiting_jobs:
-        if not schedule_background_job(
-            app,
-            job_id,
-            run_date=next_attempt_at,
-        ):
-            failed_waiting_job_ids.append(job_id)
-    scheduled_count = len(pending_job_ids) - len(failed_job_ids)
-    waiting_scheduled_count = (
-        len(future_waiting_jobs) - len(failed_waiting_job_ids)
-    )
-    if scheduled_count:
-        app.logger.info("Scheduled %s pending background jobs on startup", scheduled_count)
-    if failed_job_ids:
-        app.logger.warning("Could not schedule pending background jobs on startup: %s", failed_job_ids)
-    if failed_waiting_job_ids:
-        app.logger.warning(
-            "Could not restore waiting background jobs on startup: %s",
-            failed_waiting_job_ids,
-        )
-    return {
-        "stale_running_failed": recovered_count,
-        "rate_limit_reactivated": reactivated_count,
-        "pending_found": len(pending_job_ids),
-        "pending_scheduled": scheduled_count,
-        "pending_schedule_failed_ids": failed_job_ids,
-        "waiting_found": len(future_waiting_jobs),
-        "waiting_scheduled": waiting_scheduled_count,
-        "waiting_schedule_failed_ids": failed_waiting_job_ids,
-    }
-
-
-def is_transient_sqlite_lock(exc: BaseException) -> bool:
-    message = str(exc).lower()
-    return isinstance(exc, sqlite3.OperationalError) and (
-        "database is locked" in message
-        or "database table is locked" in message
-        or "database is busy" in message
-    )
-
-
-def defer_background_job_after_database_lock(
-    conn: sqlite3.Connection,
-    app: Flask,
-    job_id: int,
-    params: dict[str, Any],
-) -> bool:
-    attempts = int(params.get("_sqlite_lock_attempt") or 0) + 1
-    if attempts > 6:
-        return False
-    delay_seconds = min(5 * (2 ** (attempts - 1)), 300)
-    next_attempt_at = background_job_utc_now() + timedelta(
-        seconds=delay_seconds
-    )
-    params = {**params, "_sqlite_lock_attempt": attempts}
-    conn.rollback()
-    conn.execute(
-        "UPDATE background_jobs SET params_json = ? WHERE id = ?",
-        (encode_job_params(params), job_id),
-    )
-    mark_background_job_waiting_api_slot(
-        conn,
-        job_id,
-        next_attempt_at=next_attempt_at,
-        wait_reason="database_locked",
-        error_message=(
-            "SQLite temporariamente ocupada; nova tentativa automatica "
-            f"{attempts}/6."
-        ),
-        result={
-            "status": "waiting_api_slot",
-            "wait_reason": "database_locked",
-            "retry_attempt": attempts,
-            "next_attempt_at": serialize_background_job_timestamp(
-                next_attempt_at
-            ),
-            "stopped_reason": "database_locked",
-        },
-    )
-    schedule_background_job(app, job_id, run_date=next_attempt_at)
-    return True
-
-
-def run_background_job(app: Flask, job_id: int) -> None:
-    with app.app_context():
-        with closing(get_db(app.config["DATABASE"])) as conn:
-            job = conn.execute("SELECT * FROM background_jobs WHERE id = ?", (job_id,)).fetchone()
-            if job is None:
-                current_app.logger.error("Background job %s not found", job_id)
-                return
-            try:
-                if not mark_background_job_running(conn, job_id):
-                    current_app.logger.info("Background job %s skipped because it is no longer pending", job_id)
-                    return
-            except sqlite3.OperationalError as exc:
-                if not is_transient_sqlite_lock(exc):
-                    raise
-                params = decode_job_params(job["params_json"])
-                if not defer_background_job_after_database_lock(
-                    conn,
-                    app,
-                    job_id,
-                    params,
-                ):
-                    raise
-                return
-            try:
-                params = json.loads(job["params_json"] or "{}")
-                current_app.logger.info("Background job %s started: %s", job_id, job["job_type"])
-                with production_kpi_call_context(
-                    job_id=job_id,
-                    job_type=str(job["job_type"]),
-                ):
-                    result = run_background_job_payload(conn, str(job["job_type"]), params)
-                mark_background_job_success(conn, job_id, result)
-                current_app.logger.info("Background job %s completed: %s", job_id, job["job_type"])
-            except ApiSlotUnavailableError as exc:
-                result = {
-                    **(
-                        exc.job_result
-                        if isinstance(exc.job_result, dict)
-                        else {}
-                    ),
-                    "status": "waiting_api_slot",
-                    "provider": exc.provider,
-                    "api_area": exc.api_area,
-                    "wait_reason": exc.wait_reason,
-                    "next_attempt_at": serialize_background_job_timestamp(
-                        exc.next_attempt_at
-                    ),
-                    "stopped_reason": exc.message,
-                }
-                mark_background_job_waiting_api_slot(
-                    conn,
-                    job_id,
-                    next_attempt_at=exc.next_attempt_at,
-                    wait_reason=exc.wait_reason,
-                    error_message=exc.message,
-                    result=result,
-                )
-                schedule_background_job(app, job_id, run_date=exc.next_attempt_at)
-            except ApiRateLimitError as exc:
-                current_app.logger.info(
-                    "Background job %s waiting for %s %s rate limit until %s",
-                    job_id,
-                    exc.provider,
-                    exc.area,
-                    exc.cooldown_until,
-                )
-                partial_result = getattr(exc, "job_result", {})
-                result = {
-                    **(partial_result if isinstance(partial_result, dict) else {}),
-                    "status": "waiting_rate_limit",
-                    "provider": exc.provider,
-                    "api_area": exc.area,
-                    "cooldown_until": serialize_background_job_timestamp(
-                        exc.cooldown_until
-                    ),
-                    "next_attempt_at": serialize_background_job_timestamp(
-                        exc.cooldown_until
-                    ),
-                    "stopped_reason": exc.message,
-                }
-                if str(job["job_type"]) == "fusionsolar_month_close":
-                    report_month = str(params.get("report_month") or "")
-                    result.setdefault("month", report_month)
-                    if not result.get("states_before") and report_month:
-                        try:
-                            month_start = datetime.strptime(report_month, "%Y-%m").date()
-                            reference_date = current_lisbon_date()
-                            assets = get_fusionsolar_performance_assets(
-                                conn,
-                                str(params.get("provider") or INTEGRATION_PROVIDER_FUSIONSOLAR),
-                            )
-                            qualities = {
-                                int(asset["asset_id"]): evaluate_local_monthly_production_quality(
-                                    conn,
-                                    asset_id=int(asset["asset_id"]),
-                                    provider=str(
-                                        params.get("provider")
-                                        or INTEGRATION_PROVIDER_FUSIONSOLAR
-                                    ),
-                                    month_start=month_start,
-                                    reference_date=reference_date,
-                                )
-                                for asset in assets
-                            }
-                            states = count_monthly_production_states(qualities)
-                            result["states_before"] = states
-                            result["states_after"] = states
-                            result["assets_evaluated"] = len(qualities)
-                            result["assets_affected"] = sum(
-                                quality.status in {"partial", "missing", "conflict"}
-                                for quality in qualities.values()
-                            )
-                        except Exception:
-                            result.setdefault("states_before", {})
-                            result.setdefault("states_after", {})
-                    else:
-                        result.setdefault("states_before", {})
-                        result.setdefault("states_after", {})
-                    result.setdefault("api_calls_used", 0)
-                    result.setdefault("api_calls_attempted", 0)
-                    result.setdefault("assets_affected", 0)
-                mark_background_job_waiting_rate_limit(
-                    conn,
-                    job_id,
-                    next_attempt_at=exc.cooldown_until,
-                    error_message=exc.message,
-                    result=result,
-                )
-                schedule_background_job(app, job_id, run_date=exc.cooldown_until)
-            except sqlite3.OperationalError as exc:
-                if is_transient_sqlite_lock(exc) and defer_background_job_after_database_lock(
-                    conn,
-                    app,
-                    job_id,
-                    params,
-                ):
-                    current_app.logger.info(
-                        "Background job %s deferred after transient SQLite lock",
-                        job_id,
-                    )
-                    return
-                current_app.logger.exception(
-                    "Background job %s failed after SQLite lock retries: %s",
-                    job_id,
-                    job["job_type"],
-                )
-                mark_background_job_failed(conn, job_id, str(exc))
-            except Exception as exc:
-                current_app.logger.exception("Background job %s failed: %s", job_id, job["job_type"])
-                mark_background_job_failed(conn, job_id, str(exc))
-
-
-def run_background_job_payload(conn: sqlite3.Connection, job_type: str, params: dict[str, Any]) -> dict[str, Any]:
-    provider, api_area = background_job_api_scope(job_type, params)
-    if provider and api_area:
-        require_not_in_cooldown(conn, provider, api_area)
-        record_api_attempt(conn, provider, api_area)
-
-    if job_type == "fusionsolar_state_sync":
-        result = run_fusionsolar_sync(
-            conn,
-            str(params.get("provider") or INTEGRATION_PROVIDER_FUSIONSOLAR),
-            trigger_type=str(params.get("trigger_type") or "manual_background"),
-        )
-        record_api_success(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_STATE)
-        return result
-
-    if job_type == "sigenergy_state_sync":
-        result = run_sigenergy_sync(
-            conn,
-            str(params.get("provider") or INTEGRATION_PROVIDER_SIGENERGY),
-            trigger_type=str(params.get("trigger_type") or "manual_background"),
-        )
-        record_api_success(conn, INTEGRATION_PROVIDER_SIGENERGY, API_AREA_STATE)
-        return result
-
-    if job_type == "fusionsolar_production_sync":
-        target_date = parse_date_value(str(params.get("target_date") or ""))
-        if target_date is None:
-            raise ValueError("Data invalida para sync de producao.")
-        result = run_fusionsolar_production_sync(
-            conn,
-            provider=str(params.get("provider") or INTEGRATION_PROVIDER_FUSIONSOLAR),
-            target_date=target_date,
-            period_type=str(params.get("period_type") or "day"),
-        )
-        record_api_success(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_PRODUCTION)
-        return result
-
-    if job_type == "performance_reference_recalculation":
-        period_date = parse_date_value(str(params.get("period_date") or ""))
-        if period_date is None:
-            raise ValueError("Data invalida para recalculo de referencias.")
-        asset_id_value = params.get("asset_id")
-        return recalculate_performance_references(
-            conn,
-            period_type=str(params.get("period_type") or "day"),
-            period_date=period_date,
-            asset_id=int(asset_id_value) if asset_id_value else None,
-            provider=str(params.get("provider") or INTEGRATION_PROVIDER_FUSIONSOLAR),
-        )
-
-    if job_type == "fusionsolar_production_backfill":
-        date_from = parse_date_value(str(params.get("date_from") or ""))
-        date_to = parse_date_value(str(params.get("date_to") or ""))
-        asset_id_value = params.get("asset_id")
-        result = run_fusionsolar_production_backfill(
-            conn,
-            provider=str(params.get("provider") or INTEGRATION_PROVIDER_FUSIONSOLAR),
-            period_type=str(params.get("period_type") or "day"),
-            from_year=int(params["from_year"]),
-            to_year=int(params["to_year"]),
-            asset_id=int(asset_id_value) if asset_id_value else None,
-            date_from=date_from,
-            date_to=date_to,
-            max_api_calls=int(params.get("max_api_calls") or FUSIONSOLAR_PERFORMANCE_MAX_API_CALLS),
-        )
-        record_api_success(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_PRODUCTION)
-        return result
-
-    if job_type in {
-        "fusionsolar_inverter_availability_backfill",
-        "fusionsolar_report_wat_request",
-    }:
-        from_date = parse_date_value(str(params.get("from_date") or ""))
-        to_date = parse_date_value(str(params.get("to_date") or ""))
-        if from_date is None or to_date is None or from_date > to_date:
-            raise ValueError("Intervalo invalido para backfill WAT.")
-        result = run_fusionsolar_inverter_availability_backfill(
-            conn,
-            from_date=from_date,
-            to_date=to_date,
-        )
-        record_api_success(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_DIAGNOSTICS)
-        return result
-
-    if job_type == "fusionsolar_realtime_materialize_cleanup":
-        retention_days = parse_env_positive_int(
-            "FUSIONSOLAR_REALTIME_SNAPSHOT_RETENTION_DAYS",
-            DEFAULT_FUSIONSOLAR_REALTIME_SNAPSHOT_RETENTION_DAYS,
-        )
-        return cleanup_realtime_snapshot_payloads(
-            conn,
-            provider=INTEGRATION_PROVIDER_FUSIONSOLAR,
-            retention_days=retention_days,
-            reference_date=current_lisbon_date(),
-        )
-
-    if job_type == "fusionsolar_month_cycle":
-        raw_asset_ids = params.get("asset_ids") or []
-        asset_ids = [int(value) for value in raw_asset_ids if str(value).isdigit()]
-        result = run_fusionsolar_month_cycle(
-            conn,
-            provider=str(params.get("provider") or INTEGRATION_PROVIDER_FUSIONSOLAR),
-            report_month=str(params.get("report_month") or date.today().strftime("%Y-%m")),
-            asset_ids=asset_ids,
-        )
-        record_api_success(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_PRODUCTION)
-        return result
-
-    if job_type == "fusionsolar_month_close":
-        result = run_fusionsolar_month_close(
-            conn,
-            provider=str(params.get("provider") or INTEGRATION_PROVIDER_FUSIONSOLAR),
-            report_month=str(params.get("report_month") or ""),
-            reference_date=current_lisbon_date(),
-        )
-        record_api_success(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_PRODUCTION)
-        return result
-
-    if job_type == "fusionsolar_report_production_request":
-        raw_asset_ids = params.get("asset_ids") or []
-        asset_ids = [int(value) for value in raw_asset_ids if str(value).isdigit()]
-        result = run_fusionsolar_month_close(
-            conn,
-            provider=str(params.get("provider") or INTEGRATION_PROVIDER_FUSIONSOLAR),
-            report_month=str(params.get("report_month") or ""),
-            asset_ids=asset_ids,
-            reference_date=current_lisbon_date(),
-        )
-        record_api_success(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_PRODUCTION)
-        return result
-
-    raise ValueError(f"Tipo de job desconhecido: {job_type}")
-
-
-def background_job_api_scope(job_type: str, params: dict[str, Any]) -> tuple[str, str]:
-    provider = str(params.get("provider") or "")
-    if job_type == "fusionsolar_state_sync":
-        return provider or INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_STATE
-    if job_type in {
-        "fusionsolar_production_sync",
-        "fusionsolar_production_backfill",
-        "fusionsolar_month_cycle",
-        "fusionsolar_month_close",
-        "fusionsolar_report_production_request",
-    }:
-        return provider or INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_PRODUCTION
-    if job_type in {
-        "fusionsolar_inverter_availability_backfill",
-        "fusionsolar_report_wat_request",
-    }:
-        return provider or INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_DIAGNOSTICS
-    if job_type == "sigenergy_state_sync":
-        return provider or INTEGRATION_PROVIDER_SIGENERGY, API_AREA_STATE
-    return "", ""
-
-
-def fusionsolar_area_for_url(url: str) -> str:
-    lowered = url.lower()
-    if "getkpistationday" in lowered or "getkpistationmonth" in lowered:
-        return API_AREA_PRODUCTION
-    if any(token in lowered for token in ("getdevlist", "getdevrealkpi", "getdevhistorykpi", "getalarmlist")):
-        return API_AREA_DIAGNOSTICS
-    return API_AREA_STATE
-
-
-def raise_fusionsolar_rate_limit(exc: FusionSolarRateLimitError, api_area: str) -> None:
-    conn = _current_app_db_connection()
-    try:
-        until = mark_fusionsolar_api_cooldown(conn, api_area, reason=str(exc))
-        reason = get_provider_cooldown_reason(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, api_area) if conn else str(exc)
-        raise ApiRateLimitError(INTEGRATION_PROVIDER_FUSIONSOLAR, api_area, until, reason) from exc
-    finally:
-        if conn is not None:
-            conn.close()
-
-
-def get_provider_cooldown_reason(
-    conn: sqlite3.Connection,
-    provider: str,
-    area: str,
-    now_value: datetime | None = None,
-) -> str:
-    until = active_cooldown_until(conn, provider, area, now_value or datetime.now())
-    if until is None:
-        return ""
-    remaining_seconds = int((until - (now_value or datetime.now())).total_seconds())
-    remaining_minutes = max(1, (remaining_seconds + 59) // 60)
-    return (
-        f"{provider} em espera por limite da API. "
-        f"Nova tentativa disponivel apos {until.isoformat(timespec='minutes')} ({remaining_minutes} min)."
-    )
-
-
-def list_api_call_states(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    ensure_api_call_state_schema(conn)
-    rows = query_all(
-        conn,
-        """
-        SELECT provider, api_area, cooldown_until, last_error, last_success_at,
-               last_attempt_at, last_alert_at, updated_at
-        FROM api_call_state
-        ORDER BY provider, api_area
-        """,
-    )
-    now_value = datetime.now()
-    states: list[dict[str, Any]] = []
-    for row in rows:
-        state = dict(row)
-        until = active_cooldown_until(conn, str(row["provider"]), str(row["api_area"]), now_value)
-        state["cooldown_active"] = bool(until)
-        state["cooldown_message"] = get_provider_cooldown_reason(
-            conn,
-            str(row["provider"]),
-            str(row["api_area"]),
-            now_value,
-        )
-        states.append(state)
-    return states
-
-
-def build_production_api_queue_observability(
-    conn: sqlite3.Connection,
-) -> list[dict[str, Any]]:
-    fusionsolar_config = get_integration_config(
-        conn,
-        INTEGRATION_PROVIDER_FUSIONSOLAR,
-    )
-    if fusionsolar_config is not None:
-        endpoints = get_fusionsolar_endpoint_config(fusionsolar_config)
-        fusion_account_key = fusionsolar_production_account_key(
-            fusionsolar_config,
-            endpoints["day_kpi_endpoint"],
-        )
-        ensure_api_queue_state(
-            conn,
-            provider=INTEGRATION_PROVIDER_FUSIONSOLAR.lower(),
-            account_key_value=fusion_account_key,
-            api_area=PRODUCTION_KPI_AREA,
-            policy=fusionsolar_production_kpi_policy(),
-        )
-        ensure_api_queue_state(
-            conn,
-            provider=INTEGRATION_PROVIDER_FUSIONSOLAR.lower(),
-            account_key_value=fusion_account_key,
-            api_area=WAT_HISTORY_AREA,
-            policy=fusionsolar_wat_policy(),
-        )
-        fusion_account_state = get_account_queue_state(
-            conn,
-            provider=INTEGRATION_PROVIDER_FUSIONSOLAR.lower(),
-            account_key_value=fusion_account_key,
-        )
-    else:
-        fusion_account_state = {}
-    sigenergy_config = get_integration_config(
-        conn,
-        INTEGRATION_PROVIDER_SIGENERGY,
-    )
-    if sigenergy_config is not None:
-        sigenergy_endpoint = str(sigenergy_config["energy_flow_endpoint"] or "")
-        ensure_api_queue_state(
-            conn,
-            provider=INTEGRATION_PROVIDER_SIGENERGY.lower(),
-            account_key_value=production_api_account_key(
-                provider=INTEGRATION_PROVIDER_SIGENERGY,
-                username=str(sigenergy_config["username"] or ""),
-                base_url=str(sigenergy_config["base_url"] or ""),
-                endpoint=sigenergy_endpoint,
-            ),
-            api_area=PRODUCTION_KPI_AREA,
-            policy=sigenergy_production_kpi_policy(),
-        )
-    waiting_rows = conn.execute(
-        f"""
-        SELECT job_type, COUNT(*) AS total
-        FROM background_jobs
-        WHERE job_type IN ({", ".join("?" for _ in FUSIONSOLAR_BACKGROUND_JOB_TYPES)})
-          AND status IN ('waiting_api_slot', 'waiting_rate_limit')
-        GROUP BY job_type
-        """,
-        FUSIONSOLAR_BACKGROUND_JOB_TYPES,
-    ).fetchall()
-    waiting_by_type = {
-        str(item["job_type"]): int(item["total"])
-        for item in waiting_rows
-    }
-    waiting_by_priority: dict[int, int] = {}
-    for job_type, count in waiting_by_type.items():
-        priority = production_job_priority(job_type)
-        waiting_by_priority[priority] = (
-            waiting_by_priority.get(priority, 0) + count
-        )
-    reused_report_requests = int(
-        conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM report_data_request_events
-            WHERE reused_existing_job = 1
-            """
-        ).fetchone()[0]
-    )
-    locally_recalculated_days = int(
-        conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM plant_availability_sampled_daily
-            WHERE source = 'realtime_sampled'
-            """
-        ).fetchone()[0]
-    )
-    sampled_state_rows = conn.execute(
-        """
-        SELECT coverage_status, COUNT(*) AS total
-        FROM plant_availability_sampled_daily
-        GROUP BY coverage_status
-        ORDER BY coverage_status
-        """
-    ).fetchall()
-    sampled_states = {
-        str(item["coverage_status"]): int(item["total"])
-        for item in sampled_state_rows
-    }
-    real_wat_days = int(
-        conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM plant_availability_daily
-            WHERE valid_slots > 0 AND weighted_availability_pct IS NOT NULL
-            """
-        ).fetchone()[0]
-    )
-    rows = list_api_queue_states(conn)
-    for row in rows:
-        if row["provider"] == INTEGRATION_PROVIDER_FUSIONSOLAR.lower():
-            relevant_types = (
-                FUSIONSOLAR_WAT_JOB_TYPES
-                if row["api_area"] == WAT_HISTORY_AREA
-                else FUSIONSOLAR_PRODUCTION_JOB_TYPES
-            )
-            row["waiting_jobs"] = sum(
-                waiting_by_type.get(job_type, 0)
-                for job_type in relevant_types
-            )
-            row["waiting_jobs_by_priority"] = dict(
-                sorted(waiting_by_priority.items())
-            )
-            row["account_last_407_at"] = fusion_account_state.get(
-                "last_407_at"
-            )
-            row["account_cooldown_until"] = fusion_account_state.get(
-                "cooldown_until"
-            )
-            row["report_requests_reused"] = reused_report_requests
-            row["days_recalculated_from_db"] = locally_recalculated_days
-            row["sampled_availability_states"] = sampled_states
-            row["real_wat_days"] = real_wat_days
-        else:
-            row["waiting_jobs"] = 0
-            row["waiting_jobs_by_priority"] = {}
-            row["account_last_407_at"] = None
-            row["account_cooldown_until"] = None
-            row["report_requests_reused"] = 0
-            row["days_recalculated_from_db"] = 0
-            row["sampled_availability_states"] = {}
-            row["real_wat_days"] = 0
-        candidates = [
-            value
-            for value in (
-                row.get("next_allowed_at"),
-                row.get("cooldown_until"),
-                row.get("lease_until"),
-                row.get("account_cooldown_until"),
-            )
-            if value
-        ]
-        row["resume_forecast"] = max(candidates) if candidates else ""
-    return rows
-
-
-def clear_api_cooldown(conn: sqlite3.Connection, provider: str, api_area: str | None = None) -> None:
-    ensure_api_call_state_schema(conn)
-    if api_area:
-        conn.execute(
-            """
-            UPDATE api_call_state
-            SET cooldown_until = '', last_error = '', updated_at = ?
-            WHERE provider = ? AND api_area = ?
-            """,
-            (datetime.now().isoformat(timespec="seconds"), provider, api_area),
-        )
-    else:
-        conn.execute(
-            """
-            UPDATE api_call_state
-            SET cooldown_until = '', last_error = '', updated_at = ?
-            WHERE provider = ?
-            """,
-            (datetime.now().isoformat(timespec="seconds"), provider),
-        )
-    if provider == INTEGRATION_PROVIDER_FUSIONSOLAR:
-        clear_fusionsolar_rate_limit_cooldown(conn)
-
-
-def latest_background_job_for_type(conn: sqlite3.Connection, job_type: str) -> dict[str, Any] | None:
-    row = conn.execute(
-        """
-        SELECT id, job_type, status, params_json, result_json, error_message,
-               created_at, started_at, finished_at, next_attempt_at
-        FROM background_jobs
-        WHERE job_type = ?
-        ORDER BY id DESC
-        LIMIT 1
-        """,
-        (job_type,),
-    ).fetchone()
-    if row is None:
-        return None
-    job = dict(row)
-    for timestamp_field in (
-        "created_at",
-        "started_at",
-        "finished_at",
-        "next_attempt_at",
-    ):
-        job[timestamp_field] = background_job_timestamp_to_lisbon(
-            row[timestamp_field]
-        )
-    return job
-
-
-def scheduler_next_run_label(job_id: str) -> str:
-    if SCHEDULER is None:
-        return ""
-    job = SCHEDULER.get_job(job_id)
-    next_run = getattr(job, "next_run_time", None) if job else None
-    if not next_run:
-        return ""
-    try:
-        return next_run.astimezone(LISBON_TIMEZONE).isoformat(timespec="minutes")
-    except Exception:
-        return str(next_run)
-
-
-def build_integration_api_controls(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    configs = {
-        provider: get_integration_config(conn, provider)
-        for provider in INTEGRATION_PROVIDER_OPTIONS
-    }
-    state_rows = {
-        (row["provider"], row["api_area"]): row
-        for row in list_api_call_states(conn)
-    }
-    job_types = {
-        (INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_STATE): "fusionsolar_state_sync",
-        (INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_PRODUCTION): "fusionsolar_production_sync",
-        (INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_DIAGNOSTICS): "fusionsolar_inverter_availability_backfill",
-        (INTEGRATION_PROVIDER_SIGENERGY, API_AREA_STATE): "sigenergy_state_sync",
-    }
-    scheduler_jobs = {
-        (INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_STATE): "integration-state-fusionsolar-hourly",
-        (INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_PRODUCTION): "integration-production-fusionsolar-daily",
-        (INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_DIAGNOSTICS): "integration-diagnostics-fusionsolar-daily",
-        (INTEGRATION_PROVIDER_SIGENERGY, API_AREA_STATE): "integration-state-sigenergy-hourly",
-    }
-    controls: list[dict[str, Any]] = []
-    for provider in INTEGRATION_PROVIDER_OPTIONS:
-        config = configs.get(provider)
-        if config is None:
-            continue
-        credentials_ok = bool(config.get("username")) and bool(config.get("password_configured"))
-        provider_areas = [API_AREA_STATE]
-        if provider == INTEGRATION_PROVIDER_FUSIONSOLAR:
-            provider_areas.extend([API_AREA_PRODUCTION, API_AREA_DIAGNOSTICS])
-        areas: dict[str, dict[str, Any]] = {}
-        for area in provider_areas:
-            state = state_rows.get((provider, area), {})
-            job_type = job_types.get((provider, area), "")
-            latest_job = latest_background_job_for_type(conn, job_type) if job_type else None
-            cooldown_active = bool(state.get("cooldown_active"))
-            if not config.get("enabled"):
-                api_status = "Disabled"
-            elif not credentials_ok:
-                api_status = "Sem credenciais"
-            elif cooldown_active:
-                api_status = "Em cooldown"
-            elif latest_job and latest_job.get("status") == "failed":
-                api_status = "Falhou ultima tentativa"
-            else:
-                api_status = "OK"
-            areas[area] = {
-                "state": state,
-                "latest_job": latest_job,
-                "api_status": api_status,
-                "last_attempt_at": state.get("last_attempt_at") or (latest_job or {}).get("started_at") or "",
-                "last_success_at": state.get("last_success_at") or "",
-                "next_attempt_at": state.get("cooldown_until") if cooldown_active else (latest_job or {}).get("next_attempt_at") or "",
-                "next_scheduled_at": scheduler_next_run_label(scheduler_jobs.get((provider, area), "")),
-                "last_error": state.get("last_error") or (latest_job or {}).get("error_message") or "",
-                "cooldown_active": cooldown_active,
-                "cooldown_message": state.get("cooldown_message") or "",
-            }
-        controls.append(
-            {
-                "provider": provider,
-                "config": config,
-                "enabled": bool(config.get("enabled")),
-                "credentials_ok": credentials_ok,
-                "state_enabled": bool(config.get("auto_sync_enabled")),
-                "production_enabled": bool(config.get("production_sync_enabled")) if provider == INTEGRATION_PROVIDER_FUSIONSOLAR else False,
-                "diagnostics_enabled": bool(config.get("diagnostics_sync_enabled")) if provider == INTEGRATION_PROVIDER_FUSIONSOLAR else False,
-                "auto_sync_enabled": bool(config.get("auto_sync_enabled")),
-                "state_interval_hours": config.get("state_sync_interval_hours") or DEFAULT_STATE_SYNC_INTERVAL_HOURS,
-                "production_sync_time": config.get("production_sync_time") or DEFAULT_FUSIONSOLAR_PRODUCTION_SYNC_TIME,
-                "diagnostics_sync_time": config.get("diagnostics_sync_time") or DEFAULT_FUSIONSOLAR_DIAGNOSTICS_SYNC_TIME,
-                "areas": areas,
-                "state_area": areas.get(API_AREA_STATE, {}),
-                "production_area": areas.get(API_AREA_PRODUCTION, {}),
-                "diagnostics_area": areas.get(API_AREA_DIAGNOSTICS, {}),
-            }
-        )
-    return controls
-
-
-def notify_api_rate_limit(
-    conn: sqlite3.Connection,
-    provider: str,
-    api_area: str,
-    cooldown_until: datetime,
-    message: str,
-) -> None:
-    state = get_api_call_state(conn, provider, api_area)
-    last_alert_at = parse_datetime_value(str(state.get("last_alert_at") or ""))
-    if last_alert_at and last_alert_at >= datetime.now() - timedelta(minutes=DEFAULT_FUSIONSOLAR_RATE_LIMIT_MINUTES):
-        return
-    now = datetime.now().isoformat(timespec="seconds")
-    conn.execute(
-        """
-        UPDATE api_call_state
-        SET last_alert_at = ?, updated_at = ?
-        WHERE provider = ? AND api_area = ?
-        """,
-        (now, now, provider, api_area),
-    )
-    alert_key = f"api_rate_limit:{provider}:{api_area}:{cooldown_until.strftime('%Y%m%d%H%M')}"
-    telegram_message = (
-        f"<b>{html.escape(provider)} API em cooldown</b>\n\n"
-        f"Area: {html.escape(api_area)}\n"
-        f"Ate: {cooldown_until.isoformat(timespec='minutes')}\n"
-        f"{html.escape(message)}"
-    )
-    send_and_record_telegram_alert(conn, None, "api_rate_limit", alert_key, telegram_message)
-
-
-def get_fusionsolar_endpoint_config(config: sqlite3.Row | dict[str, Any]) -> dict[str, str]:
-    return {
-        "base_url": str(config["base_url"] or "").strip(),
-        "login_endpoint": str(config["login_endpoint"] or DEFAULT_FUSIONSOLAR_LOGIN_ENDPOINT).strip() or DEFAULT_FUSIONSOLAR_LOGIN_ENDPOINT,
-        "plants_endpoint": str(config["plants_endpoint"] or DEFAULT_FUSIONSOLAR_STATIONS_ENDPOINT).strip() or DEFAULT_FUSIONSOLAR_STATIONS_ENDPOINT,
-        "real_time_endpoint": str(config["real_time_endpoint"] or DEFAULT_FUSIONSOLAR_REALTIME_ENDPOINT).strip() or DEFAULT_FUSIONSOLAR_REALTIME_ENDPOINT,
-        "device_list_endpoint": str(config["device_list_endpoint"] or DEFAULT_FUSIONSOLAR_DEVICES_ENDPOINT).strip() or DEFAULT_FUSIONSOLAR_DEVICES_ENDPOINT,
-        "device_real_time_endpoint": str(config["device_real_time_endpoint"] or DEFAULT_FUSIONSOLAR_DEVICE_REALTIME_ENDPOINT).strip() or DEFAULT_FUSIONSOLAR_DEVICE_REALTIME_ENDPOINT,
-        "device_history_endpoint": str(config["device_history_endpoint"] or DEFAULT_FUSIONSOLAR_DEVICE_HISTORY_ENDPOINT).strip() or DEFAULT_FUSIONSOLAR_DEVICE_HISTORY_ENDPOINT,
-        "alarms_endpoint": str(config["alarms_endpoint"] or DEFAULT_FUSIONSOLAR_ALARMS_ENDPOINT).strip() or DEFAULT_FUSIONSOLAR_ALARMS_ENDPOINT,
-        "day_kpi_endpoint": str(config["day_kpi_endpoint"] or DEFAULT_FUSIONSOLAR_DAY_KPI_ENDPOINT).strip() or DEFAULT_FUSIONSOLAR_DAY_KPI_ENDPOINT,
-        "month_kpi_endpoint": str(config["month_kpi_endpoint"] or DEFAULT_FUSIONSOLAR_MONTH_KPI_ENDPOINT).strip() or DEFAULT_FUSIONSOLAR_MONTH_KPI_ENDPOINT,
-    }
-
-
-def build_fusionsolar_endpoints(config: sqlite3.Row | dict[str, Any]) -> FusionSolarEndpoints:
-    endpoints = get_fusionsolar_endpoint_config(config)
-    return FusionSolarEndpoints(**endpoints)
-
-
-def build_fusionsolar_client(config: sqlite3.Row | dict[str, Any]) -> FusionSolarClient:
-    return fusionsolar_client_module.client_from_config(
-        dict(config),
-        build_fusionsolar_endpoints(config),
-        session_factory=requests.Session,
-        session_cache=FUSIONSOLAR_SESSION_CACHE,
-        session_lock=FUSIONSOLAR_SESSION_LOCK,
-        session_cache_minutes=fusionsolar_session_cache_minutes(),
-        allow_sleep=not has_request_context(),
-        sleeper=time.sleep,
-    )
-
-
-def extract_fusionsolar_xsrf_token(response: requests.Response, session: requests.Session) -> str:
-    return fusionsolar_client_module.extract_xsrf_token(response, session)
-
-
-def get_fusionsolar_session(config: sqlite3.Row | dict[str, Any], *, force_login: bool = False) -> tuple[requests.Session, str]:
-    cooldown_reason = get_fusionsolar_rate_limit_cooldown_reason()
-    if cooldown_reason:
-        LOGGER.info("FusionSolar login blocked by active rate limit cooldown")
-        raise ValueError(cooldown_reason)
-    try:
-        return build_fusionsolar_client(config).login(force_login=force_login)
-    except FusionSolarRateLimitError as exc:
-        conn = _current_app_db_connection()
-        try:
-            until = mark_fusionsolar_api_cooldown(conn, API_AREA_STATE, reason=str(exc))
-            reason = get_provider_cooldown_reason(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_STATE) if conn else str(exc)
-            raise ApiRateLimitError(INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_STATE, until, reason) from exc
-        finally:
-            if conn is not None:
-                conn.close()
-
-
-def invalidate_fusionsolar_session(config: sqlite3.Row | dict[str, Any]) -> None:
-    build_fusionsolar_client(config).invalidate_session()
-
-
-def fusionsolar_retry_options() -> dict[str, Any]:
-    return {"allow_sleep": not has_request_context(), "sleeper": time.sleep}
-
-
-def post_fusionsolar_json(
-    session: requests.Session,
-    url: str,
-    payload: dict[str, Any],
-    *,
-    expected_message: str,
-) -> dict[str, Any]:
-    api_area = fusionsolar_area_for_url(url)
-    conn = _current_app_db_connection()
-    try:
-        if conn is not None:
-            require_not_in_cooldown(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, api_area)
-        return fusionsolar_client_module.post_fusionsolar_json(
-            session,
-            url,
-            payload,
-            expected_message=expected_message,
-            require_data=False,
-            **fusionsolar_retry_options(),
-        )
-    except FusionSolarRateLimitError as exc:
-        until = mark_fusionsolar_api_cooldown(conn, api_area, reason=str(exc))
-        reason = get_provider_cooldown_reason(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, api_area) if conn else str(exc)
-        raise ApiRateLimitError(INTEGRATION_PROVIDER_FUSIONSOLAR, api_area, until, reason) from exc
-    finally:
-        if conn is not None:
-            conn.close()
-
-
-def chunked(values: list[str], size: int) -> list[list[str]]:
-    return [values[index : index + size] for index in range(0, len(values), size)]
-
-
-def fetch_fusionsolar_stations(session: requests.Session, *, base_url: str, endpoint: str) -> list[dict[str, Any]]:
-    try:
-        return execute_queued_fusionsolar_account_call(
-            lambda: fusionsolar_client_module.fetch_stations(
-                session,
-                base_url=base_url,
-                endpoint=endpoint,
-                **fusionsolar_retry_options(),
-            )
-        )
-    except FusionSolarRateLimitError as exc:
-        raise_fusionsolar_rate_limit(exc, API_AREA_STATE)
-
-
-def fetch_fusionsolar_realtime_map(
-    session: requests.Session,
-    *,
-    base_url: str,
-    endpoint: str,
-    station_codes: list[str],
-) -> dict[str, dict[str, Any]]:
-    try:
-        result: dict[str, dict[str, Any]] = {}
-        for station_group in chunked(station_codes, 100):
-            result.update(
-                execute_queued_fusionsolar_account_call(
-                    lambda group=station_group: fusionsolar_client_module.fetch_realtime_map(
-                        session,
-                        base_url=base_url,
-                        endpoint=endpoint,
-                        station_codes=group,
-                        **fusionsolar_retry_options(),
-                    )
-                )
-            )
-        return result
-    except FusionSolarRateLimitError as exc:
-        raise_fusionsolar_rate_limit(exc, API_AREA_STATE)
-
-
-def fetch_fusionsolar_device_list(
-    session: requests.Session,
-    *,
-    base_url: str,
-    endpoint: str,
-    station_codes: list[str],
-) -> list[dict[str, Any]]:
-    try:
-        devices: list[dict[str, Any]] = []
-        for station_group in chunked(station_codes, 100):
-            devices.extend(
-                execute_queued_fusionsolar_diagnostics_call(
-                    lambda group=station_group: fusionsolar_client_module.fetch_device_list(
-                        session,
-                        base_url=base_url,
-                        endpoint=endpoint,
-                        station_codes=group,
-                        **fusionsolar_retry_options(),
-                    )
-                )
-            )
-        return devices
-    except FusionSolarRateLimitError as exc:
-        raise_fusionsolar_rate_limit(exc, API_AREA_DIAGNOSTICS)
-
-
-def fetch_fusionsolar_device_realtime_map(
-    session: requests.Session,
-    *,
-    base_url: str,
-    endpoint: str,
-    devices: list[dict[str, Any]],
-) -> dict[str, dict[str, Any]]:
-    try:
-        result: dict[str, dict[str, Any]] = {}
-        devices_by_type: dict[int, list[dict[str, Any]]] = {}
-        for device in devices:
-            if device.get("dev_type_id") is not None:
-                devices_by_type.setdefault(
-                    int(device["dev_type_id"]),
-                    [],
-                ).append(device)
-        for typed_devices in devices_by_type.values():
-            for device_group in [
-                typed_devices[index : index + 100]
-                for index in range(0, len(typed_devices), 100)
-            ]:
-                result.update(
-                    execute_queued_fusionsolar_diagnostics_call(
-                        lambda group=device_group: fusionsolar_client_module.fetch_device_realtime_map(
-                            session,
-                            base_url=base_url,
-                            endpoint=endpoint,
-                            devices=group,
-                            **fusionsolar_retry_options(),
-                        )
-                    )
-                )
-        return result
-    except FusionSolarRateLimitError as exc:
-        raise_fusionsolar_rate_limit(exc, API_AREA_DIAGNOSTICS)
-
-
-def fetch_fusionsolar_device_history(
-    session: requests.Session,
-    *,
-    base_url: str,
-    endpoint: str,
-    devices: list[dict[str, Any]],
-    target_date: date,
-    call_delay_seconds: float = 0,
-    sleeper: Any = time.sleep,
-) -> list[dict[str, Any]]:
-    try:
-        return execute_queued_fusionsolar_diagnostics_call(
-            lambda: fusionsolar_client_module.fetch_device_history(
-                session,
-                base_url=base_url,
-                endpoint=endpoint,
-                devices=devices,
-                target_date=target_date,
-                call_delay_seconds=call_delay_seconds,
-                sleeper=sleeper,
-                allow_sleep=False,
-                normalizer=normalize_fusionsolar_device_history_rows,
-            )
-        )
-    except FusionSolarRateLimitError as exc:
-        raise_fusionsolar_rate_limit(exc, API_AREA_DIAGNOSTICS)
-
-
-def normalize_fusionsolar_device_history_rows(
-    data: Any,
-    devices: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    device_by_id: dict[str, dict[str, Any]] = {}
-    for device in devices:
-        for key in ("external_device_id", "dev_dn", "sn"):
-            value = str(device.get(key) or "").strip()
-            if value:
-                device_by_id[value] = device
-    fallback_device = devices[0] if len(devices) == 1 else None
-    normalized: list[dict[str, Any]] = []
-
-    def visit(value: Any, inherited_device: dict[str, Any] | None = None) -> None:
-        if isinstance(value, list):
-            for item in value:
-                visit(item, inherited_device)
-            return
-        if not isinstance(value, dict):
-            return
-        raw_device_id = first_non_empty(value, ["devId", "deviceId", "devDn", "deviceDn", "esnCode", "sn"])
-        device = device_by_id.get(str(raw_device_id or "").strip()) or inherited_device or fallback_device
-        data_map = value.get("dataItemMap") if isinstance(value.get("dataItemMap"), dict) else value
-        sample_time = parse_datetime_value(first_non_empty(value, ["collectTime", "sampleTime", "time", "timestamp"]))
-        if sample_time is None and data_map is not value:
-            sample_time = parse_datetime_value(first_non_empty(data_map, ["collectTime", "sampleTime", "time", "timestamp"]))
-        active_power = first_non_empty(data_map, ["active_power", "activePower", "active_power_kw", "power"])
-        if device and sample_time is not None and active_power not in (None, ""):
-            normalized.append(
-                {
-                    **device,
-                    "sample_time": sample_time,
-                    "active_power_kw": normalize_power_to_kw(active_power),
-                    "raw_payload": value,
-                }
-            )
-            return
-        nested_found = False
-        for key in ("list", "data", "historyData", "dataList", "records", "dataItemMap"):
-            nested = value.get(key)
-            if isinstance(nested, (list, dict)) and nested is not value:
-                nested_found = True
-                visit(nested, device)
-        if not nested_found:
-            for key, nested in value.items():
-                mapped_device = device_by_id.get(str(key))
-                if mapped_device and isinstance(nested, (list, dict)):
-                    visit(nested, mapped_device)
-
-    visit(data)
-    return normalized
-
-
-def fetch_fusionsolar_alarm_map(
-    session: requests.Session,
-    *,
-    base_url: str,
-    endpoint: str,
-    station_codes: list[str],
-) -> dict[str, list[dict[str, Any]]]:
-    try:
-        result: dict[str, list[dict[str, Any]]] = {}
-        for station_group in chunked(station_codes, 100):
-            partial = execute_queued_fusionsolar_diagnostics_call(
-                lambda group=station_group: fusionsolar_client_module.fetch_alarm_map(
-                    session,
-                    base_url=base_url,
-                    endpoint=endpoint,
-                    station_codes=group,
-                    language=DEFAULT_FUSIONSOLAR_ALARMS_LANGUAGE,
-                    **fusionsolar_retry_options(),
-                )
-            )
-            for station_code, rows in partial.items():
-                result.setdefault(station_code, []).extend(rows)
-        return result
-    except FusionSolarRateLimitError as exc:
-        raise_fusionsolar_rate_limit(exc, API_AREA_DIAGNOSTICS)
-
-
-def collect_time_ms(collect_date: date) -> int:
-    return collect_time_start_of_day_ms(collect_date)
-
-
-def collect_time_noon_ms(collect_date: date) -> int:
-    return collect_time_noon_of_month_ms(collect_date)
-
-
-def normalize_fusionsolar_kpi_rows(data: Any) -> list[dict[str, Any]]:
-    return normalize_client_kpi_rows(data)
-
-
-def parse_fusionsolar_collect_date(row: dict[str, Any], fallback_date: date | None = None) -> date | None:
-    return parse_client_collect_date(row, fallback_date)
-
-
-def fetch_fusionsolar_kpi_map(
-    session: requests.Session,
-    *,
-    base_url: str,
-    endpoint: str,
-    station_codes: list[str],
-    collect_date: date,
-    expected_message: str,
-) -> dict[str, dict[str, Any]]:
-    if len(station_codes) > 100:
-        raise ValueError("Cada chamada KPI FusionSolar aceita no maximo 100 instalacoes.")
-    try:
-        return execute_queued_fusionsolar_kpi_call(
-            lambda: fusionsolar_client_module.fetch_kpi_map(
-                session,
-                base_url=base_url,
-                endpoint=endpoint,
-                station_codes=station_codes,
-                collect_date=collect_date,
-                expected_message=expected_message,
-                **fusionsolar_retry_options(),
-            ),
-            endpoint=endpoint,
-        )
-    except FusionSolarRateLimitError as exc:
-        raise_fusionsolar_rate_limit(exc, API_AREA_PRODUCTION)
-
-
-def fetch_fusionsolar_kpi_rows(
-    session: requests.Session,
-    *,
-    base_url: str,
-    endpoint: str,
-    station_codes: list[str],
-    collect_date: date,
-    expected_message: str,
-) -> list[dict[str, Any]]:
-    if len(station_codes) > 100:
-        raise ValueError("Cada chamada KPI FusionSolar aceita no maximo 100 instalacoes.")
-    try:
-        return execute_queued_fusionsolar_kpi_call(
-            lambda: fusionsolar_client_module.fetch_kpi_rows(
-                session,
-                base_url=base_url,
-                endpoint=endpoint,
-                station_codes=station_codes,
-                collect_date=collect_date.replace(day=1),
-                expected_message=expected_message,
-                **fusionsolar_retry_options(),
-            ),
-            endpoint=endpoint,
-        )
-    except FusionSolarRateLimitError as exc:
-        raise_fusionsolar_rate_limit(exc, API_AREA_PRODUCTION)
-
-
-def fetch_fusionsolar_kpi_day_rows(
-    session: requests.Session,
-    base_url: str,
-    endpoint: str,
-    station_codes: list[str],
-    collect_date: date,
-) -> list[dict[str, Any]]:
-    return fetch_fusionsolar_kpi_rows(
-        session,
-        base_url=base_url,
-        endpoint=endpoint,
-        station_codes=station_codes,
-        collect_date=collect_date,
-        expected_message="Falha ao obter os KPIs diarios FusionSolar.",
-    )
-
-
-def fetch_fusionsolar_kpi_day_map(
-    session: requests.Session,
-    base_url: str,
-    endpoint: str,
-    station_codes: list[str],
-    collect_date: date,
-) -> dict[str, dict[str, Any]]:
-    return fetch_fusionsolar_kpi_map(
-        session,
-        base_url=base_url,
-        endpoint=endpoint,
-        station_codes=station_codes,
-        collect_date=collect_date,
-        expected_message="Falha ao obter os KPIs diarios FusionSolar.",
-    )
-
-
-def fetch_fusionsolar_kpi_month_map(
-    session: requests.Session,
-    base_url: str,
-    endpoint: str,
-    station_codes: list[str],
-    collect_date: date,
-) -> dict[str, dict[str, Any]]:
-    month_date = collect_date.replace(day=1)
-    return fetch_fusionsolar_kpi_map(
-        session,
-        base_url=base_url,
-        endpoint=endpoint,
-        station_codes=station_codes,
-        collect_date=month_date,
-        expected_message="Falha ao obter os KPIs mensais FusionSolar.",
-    )
-
-
-def parse_kwp_value(value: Any) -> float | None:
-    if value is None:
-        return None
-    raw = str(value).strip().replace(",", ".")
-    if not raw or raw == "-":
-        return None
-    raw = re.sub(r"[^0-9.\-]", "", raw)
-    if raw in ("", "-", "."):
-        return None
-    try:
-        parsed = float(raw)
-    except ValueError:
-        return None
-    return parsed if parsed > 0 else None
-
-
-def parse_float_value(value: Any) -> float | None:
-    if value is None or value == "":
-        return None
-    try:
-        return float(str(value).strip().replace(",", "."))
-    except (TypeError, ValueError):
-        return None
-
-
-def parse_int_value(value: Any) -> int | None:
-    parsed = parse_float_value(value)
-    return int(parsed) if parsed is not None else None
-
-
-def select_production_value(data_item_map: dict[str, Any] | None) -> tuple[float | None, str, str]:
-    data = data_item_map or {}
-    for key in ("PVYield", "inverterYield", "inverter_power"):
-        raw_value = data.get(key)
-        value = parse_float_value(raw_value)
-        if value is not None:
-            return value, key, str(raw_value)
-    return None, "", ""
-
-
-def select_production_kwh(data_item_map: dict[str, Any] | None) -> float | None:
-    return select_production_value(data_item_map)[0]
-
-
-def build_missing_production_note(
-    data_item_map: dict[str, Any] | None,
-    *,
-    station_code: str,
-    period_type: str,
-    period_date: date,
-) -> str:
-    available_keys = sorted(str(key) for key in (data_item_map or {}).keys())
-    keys_text = ", ".join(available_keys) if available_keys else "none"
-    return (
-        f"No production key found. Available keys: {keys_text}. "
-        f"stationCode={station_code or '-'}; period_type={period_type}; period_date={period_date.isoformat()}"
-    )
-
-
-FUSIONSOLAR_RATE_LIMIT_COOLDOWN_KEY = "fusionsolar_rate_limit_cooldown_until"
-FUSIONSOLAR_LEGACY_PERFORMANCE_COOLDOWN_KEY = "fusionsolar_performance_cooldown_until"
-FUSIONSOLAR_PERFORMANCE_COOLDOWN_KEY = FUSIONSOLAR_RATE_LIMIT_COOLDOWN_KEY
-FUSIONSOLAR_RATE_LIMIT_LAST_ALERT_KEY = "fusionsolar_rate_limit_last_alert_key"
-FUSIONSOLAR_RATE_LIMIT_LAST_ALERT_AT_KEY = "fusionsolar_rate_limit_last_alert_at"
-FUSIONSOLAR_STATION_INVENTORY_DATE_KEY = "fusionsolar_station_inventory_date"
-
-
-def _fusionsolar_fail_code(payload: dict[str, Any] | None) -> int | None:
-    if not isinstance(payload, dict):
-        return None
-    try:
-        return int(payload.get("failCode"))
-    except (TypeError, ValueError):
-        return None
-
-
-def is_fusionsolar_rate_limit_payload(payload: dict[str, Any] | None) -> bool:
-    return _fusionsolar_fail_code(payload) == 407
-
-
-def is_fusionsolar_session_expired_payload(payload: dict[str, Any] | None) -> bool:
-    if _fusionsolar_fail_code(payload) == 305:
-        return True
-    return "USER_MUST_RELOGIN" in str((payload or {}).get("message") or "")
-
-
-def is_fusionsolar_invalid_credentials_payload(payload: dict[str, Any] | None) -> bool:
-    code = _fusionsolar_fail_code(payload)
-    message = str((payload or {}).get("message") or "").lower()
-    return code in {201, 302, 303, 304} or "password" in message or "credential" in message or "user name" in message
-
-
-def is_fusionsolar_http_error(exc: Exception | str) -> bool:
-    return isinstance(exc, FusionSolarApiError) and exc.error_type == "http"
-
-
-def is_fusionsolar_invalid_json_error(exc: Exception | str) -> bool:
-    return isinstance(exc, FusionSolarApiError) and exc.error_type == "invalid_json"
-
-
-def is_fusionsolar_rate_limit_error(exc: Exception | str) -> bool:
-    if isinstance(exc, ApiRateLimitError) and exc.provider == INTEGRATION_PROVIDER_FUSIONSOLAR:
-        return True
-    if isinstance(exc, FusionSolarRateLimitError):
-        return True
-    if isinstance(exc, FusionSolarApiError) and is_fusionsolar_rate_limit_payload(exc.payload):
-        return True
-    message = str(exc)
-    return "failCode=407" in message or "error code 407" in message or "codigo 407" in message or "cÃƒÂ³digo 407" in message
-
-
-def is_fusionsolar_session_expired_error(exc: Exception | str) -> bool:
-    if isinstance(exc, FusionSolarSessionExpiredError):
-        return True
-    if isinstance(exc, FusionSolarApiError) and is_fusionsolar_session_expired_payload(exc.payload):
-        return True
-    message = str(exc)
-    return "failCode=305" in message or "USER_MUST_RELOGIN" in message
-
-
-def get_app_state_value(conn: sqlite3.Connection, key: str) -> str:
-    row = conn.execute("SELECT value FROM app_state WHERE key = ?", (key,)).fetchone()
-    return str(row["value"] or "") if row else ""
-
-
-def set_app_state_value(conn: sqlite3.Connection, key: str, value: str) -> None:
-    now = datetime.now().isoformat(timespec="seconds")
-    conn.execute(
-        """
-        INSERT INTO app_state (key, value, updated_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-        """,
-        (key, value, now),
-    )
-
-
-def notify_fusionsolar_rate_limit(conn: sqlite3.Connection, cooldown_until: datetime, message: str) -> None:
-    now_value = datetime.now()
-    recent_cutoff = (now_value - timedelta(minutes=fusionsolar_rate_limit_minutes())).isoformat(timespec="seconds")
-    recent_alert = conn.execute(
-        """
-        SELECT 1
-        FROM telegram_alerts
-        WHERE alert_type = 'fusionsolar_api_limit'
-          AND status IN ('sent', 'blocked', 'failed')
-          AND sent_at >= ?
-        LIMIT 1
-        """,
-        (recent_cutoff,),
-    ).fetchone()
-    if recent_alert is not None:
-        return
-    last_alert_at = get_app_state_value(conn, FUSIONSOLAR_RATE_LIMIT_LAST_ALERT_AT_KEY)
-    if last_alert_at:
-        try:
-            if datetime.fromisoformat(last_alert_at) >= now_value - timedelta(minutes=fusionsolar_rate_limit_minutes()):
-                return
-        except ValueError:
-            pass
-
-    alert_key = f"fusionsolar_api_limit:{now_value.strftime('%Y%m%d%H%M')}"
-    set_app_state_value(conn, FUSIONSOLAR_RATE_LIMIT_LAST_ALERT_KEY, alert_key)
-    set_app_state_value(conn, FUSIONSOLAR_RATE_LIMIT_LAST_ALERT_AT_KEY, now_value.isoformat(timespec="seconds"))
-    conn.commit()
-    telegram_message = (
-        "<b>FusionSolar API limitada</b>\n\n"
-        "A API devolveu limite de chamadas/tokens esgotado para KPIs de produÃ§Ã£o.\n"
-        f"{message}\n\n"
-        "Os relatÃ³rios de produÃ§Ã£o e backfills podem falhar atÃ© o limite renovar."
-    )
-    send_and_record_telegram_alert(
-        conn,
-        None,
-        "fusionsolar_api_limit",
-        alert_key,
-        telegram_message,
-    )
-
-
-def fusionsolar_rate_limit_minutes() -> int:
-    raw_value = os.environ.get("FUSIONSOLAR_RATE_LIMIT_MINUTES", str(DEFAULT_FUSIONSOLAR_RATE_LIMIT_MINUTES)).strip()
-    try:
-        return max(1, int(raw_value))
-    except ValueError:
-        return DEFAULT_FUSIONSOLAR_RATE_LIMIT_MINUTES
-
-
-def fusionsolar_production_kpi_policy() -> ApiQueuePolicy:
-    daily_budget = parse_env_positive_int(
-        "FUSIONSOLAR_PRODUCTION_KPI_DAILY_BUDGET",
-        DEFAULT_FUSIONSOLAR_PRODUCTION_KPI_DAILY_BUDGET,
-    )
-    daily_reserved_calls = min(
-        parse_env_nonnegative_int(
-            "FUSIONSOLAR_PRODUCTION_KPI_DAILY_RESERVED_CALLS",
-            DEFAULT_FUSIONSOLAR_PRODUCTION_KPI_DAILY_RESERVED_CALLS,
-        ),
-        daily_budget,
-    )
-    month_close_reserved_calls = min(
-        parse_env_nonnegative_int(
-            "FUSIONSOLAR_PRODUCTION_KPI_MONTH_CLOSE_RESERVED_CALLS",
-            DEFAULT_FUSIONSOLAR_PRODUCTION_KPI_MONTH_CLOSE_RESERVED_CALLS,
-        ),
-        max(daily_budget - daily_reserved_calls, 0),
-    )
-    return ApiQueuePolicy(
-        min_interval_seconds=parse_env_positive_int(
-            "FUSIONSOLAR_PRODUCTION_KPI_MIN_INTERVAL_SECONDS",
-            DEFAULT_FUSIONSOLAR_PRODUCTION_KPI_MIN_INTERVAL_SECONDS,
-        ),
-        daily_budget=daily_budget,
-        reserved_calls_by_priority=(
-            (1, daily_reserved_calls),
-            (2, month_close_reserved_calls),
-        ),
-    )
-
-
-def sigenergy_production_kpi_policy() -> ApiQueuePolicy:
-    return ApiQueuePolicy(
-        min_interval_seconds=parse_env_optional_positive_int(
-            "SIGENERGY_PRODUCTION_MIN_INTERVAL_SECONDS"
-        ),
-        daily_budget=parse_env_optional_positive_int(
-            "SIGENERGY_PRODUCTION_DAILY_BUDGET"
-        ),
-    )
-
-
-def fusionsolar_wat_policy() -> ApiQueuePolicy:
-    return ApiQueuePolicy(
-        min_interval_seconds=None,
-        daily_budget=parse_env_positive_int(
-            "FUSIONSOLAR_WAT_DAILY_BUDGET",
-            DEFAULT_FUSIONSOLAR_WAT_DAILY_BUDGET,
-        ),
-    )
-
-
-def parse_env_positive_int(name: str, default: int) -> int:
-    try:
-        return max(1, int(os.environ.get(name, str(default)).strip()))
-    except ValueError:
-        return default
-
-
-def parse_env_nonnegative_int(name: str, default: int) -> int:
-    try:
-        return max(0, int(os.environ.get(name, str(default)).strip()))
-    except ValueError:
-        return default
-
-
-def parse_env_optional_positive_int(name: str) -> int | None:
-    raw_value = os.environ.get(name, "").strip()
-    if not raw_value:
-        return None
-    try:
-        return max(1, int(raw_value))
-    except ValueError:
-        return None
-
-
-def production_job_priority(job_type: str) -> int:
-    if job_type == "fusionsolar_production_sync":
-        return 1
-    if job_type == "fusionsolar_month_close":
-        return 2
-    if job_type in {"fusionsolar_production_backfill", "fusionsolar_month_cycle"}:
-        return 3
-    if job_type == "fusionsolar_report_production_request":
-        return 4
-    if job_type in FUSIONSOLAR_WAT_JOB_TYPES or job_type == "fusionsolar_state_sync":
-        return 5
-    return 4
-
-
-def higher_priority_production_job_types(priority: int) -> tuple[str, ...]:
-    return tuple(
-        job_type
-        for job_type in FUSIONSOLAR_PRODUCTION_JOB_TYPES
-        if production_job_priority(job_type) < priority
-    )
-
-
-@contextmanager
-def production_kpi_call_context(
-    *,
-    job_id: int,
-    job_type: str,
-) -> Any:
-    token = PRODUCTION_KPI_CALL_CONTEXT.set(
-        {
-            "job_id": job_id,
-            "job_type": job_type,
-            "priority": production_job_priority(job_type),
-            "lease_owner": f"background-job-{job_id}",
-        }
-    )
-    try:
-        yield
-    finally:
-        PRODUCTION_KPI_CALL_CONTEXT.reset(token)
-
-
-def fusionsolar_production_account_key(
-    config: sqlite3.Row | dict[str, Any],
-    _endpoint: str,
-) -> str:
-    return fusionsolar_account_key(config)
-
-
-def fusionsolar_account_key(
-    config: sqlite3.Row | dict[str, Any],
-) -> str:
-    return production_api_account_key(
-        provider=INTEGRATION_PROVIDER_FUSIONSOLAR,
-        username=str(config.get("username") if isinstance(config, dict) else config["username"] or ""),
-        base_url=str(config.get("base_url") if isinstance(config, dict) else config["base_url"] or ""),
-        endpoint="account",
-    )
-
-
-def execute_queued_fusionsolar_kpi_call(
-    callback: Any,
-    *,
-    endpoint: str,
-) -> Any:
-    return execute_queued_fusionsolar_call(
-        callback,
-        api_area=PRODUCTION_KPI_AREA,
-        policy=fusionsolar_production_kpi_policy(),
-        enforce_production_priority=True,
-    )
-
-
-def execute_queued_fusionsolar_diagnostics_call(callback: Any) -> Any:
-    return execute_queued_fusionsolar_call(
-        callback,
-        api_area=WAT_HISTORY_AREA,
-        policy=fusionsolar_wat_policy(),
-        enforce_production_priority=True,
-    )
-
-
-def execute_queued_fusionsolar_account_call(callback: Any) -> Any:
-    return execute_queued_fusionsolar_call(
-        callback,
-        api_area=API_AREA_STATE,
-        policy=None,
-        enforce_production_priority=True,
-    )
-
-
-def execute_queued_fusionsolar_call(
-    callback: Any,
-    *,
-    api_area: str,
-    policy: ApiQueuePolicy | None,
-    enforce_production_priority: bool,
-) -> Any:
-    context = PRODUCTION_KPI_CALL_CONTEXT.get()
-    if context is None or not has_app_context():
-        return callback()
-    with closing(get_db(current_app.config["DATABASE"])) as queue_conn:
-        config = get_integration_config(queue_conn, INTEGRATION_PROVIDER_FUSIONSOLAR)
-        if config is None:
-            raise ValueError("Configuracao FusionSolar nao encontrada.")
-        account_key_value = fusionsolar_account_key(config)
-        higher_priority_types = (
-            higher_priority_production_job_types(int(context["priority"]))
-            if enforce_production_priority
-            else ()
-        )
-        if higher_priority_types:
-            placeholders = ", ".join("?" for _ in higher_priority_types)
-            higher_priority_job = queue_conn.execute(
-                f"""
-                SELECT id, next_attempt_at
-                FROM background_jobs
-                WHERE job_type IN ({placeholders})
-                  AND status IN ('pending', 'running', 'waiting_api_slot', 'waiting_rate_limit')
-                  AND id != ?
-                ORDER BY id
-                LIMIT 1
-                """,
-                (*higher_priority_types, int(context["job_id"])),
-            ).fetchone()
-            if higher_priority_job is not None:
-                next_attempt_at = datetime.now(LISBON_TIMEZONE) + timedelta(
-                    seconds=fusionsolar_production_kpi_policy().min_interval_seconds
-                    or 1
-                )
-                raise ApiSlotUnavailableError(
-                    provider=INTEGRATION_PROVIDER_FUSIONSOLAR,
-                    account_key=account_key_value,
-                    api_area=api_area,
-                    next_attempt_at=next_attempt_at,
-                    wait_reason="priority_queue",
-                )
-        account_reservation = reserve_account_lease(
-            queue_conn,
-            provider=INTEGRATION_PROVIDER_FUSIONSOLAR.lower(),
-            account_key_value=account_key_value,
-            lease_owner=str(context["lease_owner"]),
-        )
-        if not account_reservation.granted:
-            raise ApiSlotUnavailableError(
-                provider=INTEGRATION_PROVIDER_FUSIONSOLAR,
-                account_key=account_key_value,
-                api_area=api_area,
-                next_attempt_at=account_reservation.next_attempt_at,
-                wait_reason=account_reservation.wait_reason,
-            )
-        area_reserved = False
-        try:
-            if policy is not None:
-                reservation = reserve_api_slot(
-                    queue_conn,
-                    provider=INTEGRATION_PROVIDER_FUSIONSOLAR.lower(),
-                    account_key_value=account_key_value,
-                    api_area=api_area,
-                    lease_owner=str(context["lease_owner"]),
-                    priority=int(context["priority"]),
-                    policy=policy,
-                )
-                if not reservation.granted:
-                    raise ApiSlotUnavailableError(
-                        provider=INTEGRATION_PROVIDER_FUSIONSOLAR,
-                        account_key=account_key_value,
-                        api_area=api_area,
-                        next_attempt_at=reservation.next_attempt_at,
-                        wait_reason=reservation.wait_reason,
-                    )
-                area_reserved = True
-            return callback()
-        except Exception as exc:
-            if is_fusionsolar_rate_limit_error(exc):
-                cooldown_until = datetime.now(LISBON_TIMEZONE) + timedelta(
-                    minutes=fusionsolar_rate_limit_minutes()
-                )
-                record_account_407(
-                    queue_conn,
-                    provider=INTEGRATION_PROVIDER_FUSIONSOLAR.lower(),
-                    account_key_value=account_key_value,
-                    cooldown_until=cooldown_until,
-                )
-                if policy is not None:
-                    record_production_api_407(
-                        queue_conn,
-                        provider=INTEGRATION_PROVIDER_FUSIONSOLAR.lower(),
-                        account_key_value=account_key_value,
-                        api_area=api_area,
-                        cooldown_until=cooldown_until,
-                    )
-                postpone_pending_production_jobs_after_407(
-                    queue_conn,
-                    cooldown_until=cooldown_until,
-                    exclude_job_id=int(context["job_id"]),
-                )
-            raise
-        finally:
-            if area_reserved:
-                release_api_lease(
-                    queue_conn,
-                    provider=INTEGRATION_PROVIDER_FUSIONSOLAR.lower(),
-                    account_key_value=account_key_value,
-                    api_area=api_area,
-                    lease_owner=str(context["lease_owner"]),
-                )
-            release_account_lease(
-                queue_conn,
-                provider=INTEGRATION_PROVIDER_FUSIONSOLAR.lower(),
-                account_key_value=account_key_value,
-                lease_owner=str(context["lease_owner"]),
-            )
-
-
-def fusionsolar_session_cache_minutes() -> int:
-    raw_value = os.environ.get("FUSIONSOLAR_SESSION_CACHE_MINUTES", str(DEFAULT_FUSIONSOLAR_SESSION_CACHE_MINUTES)).strip()
-    try:
-        return max(1, int(raw_value))
-    except ValueError:
-        return DEFAULT_FUSIONSOLAR_SESSION_CACHE_MINUTES
-
-
-def _current_app_db_connection() -> sqlite3.Connection | None:
-    if not has_app_context():
-        return None
-    database = current_app.config.get("DATABASE")
-    return get_db(database) if database else None
-
-
-def get_fusionsolar_rate_limit_until(
-    conn: sqlite3.Connection | None = None,
-    now_value: datetime | None = None,
-) -> datetime | None:
-    cooldown_until = FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL
-    close_conn = False
-    if conn is None:
-        conn = _current_app_db_connection()
-        close_conn = conn is not None
-    try:
-        if conn is not None:
-            for area in (API_AREA_STATE, API_AREA_PRODUCTION, API_AREA_DIAGNOSTICS):
-                area_until = active_cooldown_until(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, area)
-                if area_until and (cooldown_until is None or area_until > cooldown_until):
-                    cooldown_until = area_until
-            for key in (FUSIONSOLAR_RATE_LIMIT_COOLDOWN_KEY, FUSIONSOLAR_LEGACY_PERFORMANCE_COOLDOWN_KEY):
-                raw_value = get_app_state_value(conn, key)
-                if raw_value:
-                    try:
-                        persisted_until = datetime.fromisoformat(raw_value)
-                        if cooldown_until is None or persisted_until > cooldown_until:
-                            cooldown_until = persisted_until
-                    except ValueError:
-                        pass
-    finally:
-        if close_conn and conn is not None:
-            conn.close()
-    if cooldown_until and now_value and cooldown_until <= now_value:
-        return None
-    return cooldown_until
-
-
-def get_fusionsolar_rate_limit_cooldown_reason(
-    conn: sqlite3.Connection | None = None,
-    now_value: datetime | None = None,
-) -> str:
-    now_value = now_value or datetime.now()
-    cooldown_until = get_fusionsolar_rate_limit_until(conn, now_value)
-    if cooldown_until and cooldown_until > now_value:
-        remaining_seconds = int((cooldown_until - now_value).total_seconds())
-        remaining_minutes = max(1, (remaining_seconds + 59) // 60)
-        return (
-            "FusionSolar temporariamente limitado pela API. "
-            f"Nova tentativa disponivel apos {cooldown_until.strftime('%H:%M')} ({remaining_minutes} min)."
-        )
-    return ""
-
-
-def get_fusionsolar_performance_cooldown_reason(
-    conn: sqlite3.Connection | None = None,
-    now_value: datetime | None = None,
-) -> str:
-    return get_fusionsolar_rate_limit_cooldown_reason(conn, now_value)
-
-
-def mark_fusionsolar_rate_limited(
-    conn: sqlite3.Connection | None = None,
-    now_value: datetime | None = None,
-) -> str:
-    global FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL
-    now_value = now_value or datetime.now()
-    FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL = now_value + timedelta(minutes=fusionsolar_rate_limit_minutes())
-    close_conn = False
-    if conn is None:
-        conn = _current_app_db_connection()
-        close_conn = conn is not None
-    if conn is not None:
-        set_app_state_value(
-            conn,
-            FUSIONSOLAR_RATE_LIMIT_COOLDOWN_KEY,
-            FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL.isoformat(timespec="seconds"),
-        )
-    message = (
-        "FusionSolar temporariamente limitado pela API. "
-        f"Nova tentativa disponivel apos {FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL.strftime('%H:%M')}."
-    )
-    if conn is not None:
-        notify_fusionsolar_rate_limit(conn, FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL, message)
-        conn.commit()
-    if close_conn and conn is not None:
-        conn.close()
-    LOGGER.warning(
-        "FusionSolar rate limit cooldown activated until %s",
-        FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL.isoformat(timespec="minutes"),
-    )
-    return message
-
-
-def mark_fusionsolar_api_cooldown(
-    conn: sqlite3.Connection | None,
-    api_area: str,
-    *,
-    reason: str = "FusionSolar rate limit",
-    now_value: datetime | None = None,
-) -> datetime:
-    global FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL
-    now_value = now_value or datetime.now()
-    until = now_value + timedelta(minutes=fusionsolar_rate_limit_minutes())
-    FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL = until
-    close_conn = False
-    if conn is None:
-        conn = _current_app_db_connection()
-        close_conn = conn is not None
-    try:
-        if conn is not None:
-            mark_api_cooldown(
-                conn,
-                INTEGRATION_PROVIDER_FUSIONSOLAR,
-                api_area,
-                reason,
-                cooldown_until=until,
-                now=now_value,
-            )
-            set_app_state_value(conn, FUSIONSOLAR_RATE_LIMIT_COOLDOWN_KEY, until.isoformat(timespec="seconds"))
-            notify_fusionsolar_rate_limit(conn, until, get_provider_cooldown_reason(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, api_area))
-            conn.commit()
-    finally:
-        if close_conn and conn is not None:
-            conn.close()
-    LOGGER.warning("FusionSolar %s cooldown activated until %s", api_area, until.isoformat(timespec="minutes"))
-    return until
-
-
-def mark_fusionsolar_performance_rate_limited(
-    conn: sqlite3.Connection | None = None,
-    now_value: datetime | None = None,
-) -> str:
-    return mark_fusionsolar_rate_limited(conn, now_value)
-
-
-def clear_fusionsolar_rate_limit_cooldown(conn: sqlite3.Connection | None = None) -> None:
-    global FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL
-    FUSIONSOLAR_PERFORMANCE_RATE_LIMIT_UNTIL = None
-    if conn is not None:
-        set_app_state_value(conn, FUSIONSOLAR_RATE_LIMIT_COOLDOWN_KEY, "")
-
-
-def fusionsolar_cooldown_sleep_seconds(
-    conn: sqlite3.Connection | None = None,
-    now_value: datetime | None = None,
-) -> int:
-    now_value = now_value or datetime.now()
-    cooldown_until = get_fusionsolar_rate_limit_until(conn, now_value)
-    if cooldown_until and cooldown_until > now_value:
-        return max(1, int((cooldown_until - now_value).total_seconds()) + 5)
-    return 0
-
-
-def calculate_specific_yield(production_kwh: float | None, kwp: float | None) -> float | None:
-    if production_kwh is None or not kwp:
-        return None
-    return production_kwh / kwp
-
-
-def classify_performance_status(
-    production_kwh: float | None,
-    kwp: float | None,
-    expected_kwh: float | None,
-    *,
-    warning_deviation_pct: float = -10,
-    alert_deviation_pct: float = -20,
-    critical_deviation_pct: float = -30,
-) -> tuple[str, str, float | None]:
-    if production_kwh is None:
-        return "Sem dados", "missing_production", None
-    if not kwp:
-        return "Sem referÃªncia", "missing_kwp", None
-    if expected_kwh is None or expected_kwh <= 0:
-        return "Sem referÃªncia", "ok", None
-
-    deviation_pct = ((production_kwh - expected_kwh) / expected_kwh) * 100
-    if deviation_pct >= warning_deviation_pct:
-        return "OK", "ok", deviation_pct
-    if deviation_pct >= alert_deviation_pct:
-        return "AtenÃ§Ã£o", "ok", deviation_pct
-    if deviation_pct >= critical_deviation_pct:
-        return "Alerta", "ok", deviation_pct
-    return "CrÃ­tico", "ok", deviation_pct
-
-
-def get_performance_settings(conn: sqlite3.Connection, asset_id: int) -> dict[str, Any]:
-    row = conn.execute("SELECT * FROM performance_settings WHERE asset_id = ?", (asset_id,)).fetchone()
-    defaults = {
-        "asset_id": asset_id,
-        "enabled": 1,
-        "warning_deviation_pct": -10.0,
-        "alert_deviation_pct": -20.0,
-        "critical_deviation_pct": -30.0,
-        "baseline_years": 2,
-        "min_baseline_points": 1,
-        "monthly_budget_json": "",
-        "notes": "",
-        "updated_at": "",
-    }
-    if row is None:
-        return defaults
-    defaults.update(dict(row))
-    return defaults
-
-
-def get_monthly_budget_specific_yield(settings: dict[str, Any], period_date: date) -> float | None:
-    raw = str(settings.get("monthly_budget_json") or "").strip()
-    if not raw:
-        return None
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    return parse_float_value(payload.get(f"{period_date.month:02d}"))
-
-
-def calculate_historical_baseline(
-    conn: sqlite3.Connection,
-    *,
-    asset_id: int,
-    provider: str,
-    period_type: str,
-    period_date: date,
-    baseline_years: int,
-    min_baseline_points: int,
-) -> tuple[float | None, float | None, str, str]:
-    result = calculate_expected_production_with_diagnostic(
-        conn,
-        asset_id=asset_id,
-        provider=provider,
-        period_type=period_type,
-        period_date=period_date,
-        kwp=None,
-        settings={
-            "baseline_years": baseline_years,
-            "min_baseline_points": min_baseline_points,
-            "monthly_budget_json": "",
-        },
-    )
-    return (
-        result["expected_kwh"],
-        result["expected_specific_yield"],
-        result["expected_source"],
-        result["quality"],
-    )
-
-
-def same_date_previous_years(period_date: date, baseline_years: int) -> list[date]:
-    candidates: list[date] = []
-    for year_offset in range(1, max(int(baseline_years or 1), 1) + 1):
-        try:
-            previous = period_date.replace(year=period_date.year - year_offset)
-        except ValueError:
-            previous = period_date.replace(year=period_date.year - year_offset, day=28)
-        candidates.append(previous)
-    return candidates
-
-
-def load_valid_baseline_rows(
-    conn: sqlite3.Connection,
-    *,
-    asset_id: int,
-    provider: str,
-    period_type: str,
-    candidate_dates: list[date],
-) -> list[sqlite3.Row]:
-    if not candidate_dates:
-        return []
-    placeholders = ",".join("?" for _ in candidate_dates)
-    return query_all(
-        conn,
-        f"""
-        SELECT production_kwh, specific_yield, period_date
-        FROM production_records
-        WHERE asset_id = ? AND provider = ? AND period_type = ?
-          AND period_date IN ({placeholders})
-          AND production_kwh IS NOT NULL
-          AND specific_yield IS NOT NULL
-          AND COALESCE(data_quality, '') != 'missing_production'
-        ORDER BY period_date DESC
-        """,
-        [asset_id, provider, period_type, *[item.isoformat() for item in candidate_dates]],
-    )
-
-
-def calculate_mtd_baseline(
-    conn: sqlite3.Connection,
-    *,
-    asset_id: int,
-    provider: str,
-    period_date: date,
-    baseline_years: int,
-    min_baseline_points: int,
-    today_value: date | None = None,
-) -> dict[str, Any]:
-    today_value = today_value or date.today()
-    period_start = period_date.replace(day=1)
-    if period_start.year == today_value.year and period_start.month == today_value.month:
-        period_end = today_value
-    else:
-        period_end = period_start.replace(day=calendar.monthrange(period_start.year, period_start.month)[1])
-    day_span = period_end.day
-    candidate_ranges: list[str] = []
-    yearly_values: list[tuple[float, float]] = []
-    for year_offset in range(1, max(int(baseline_years or 1), 1) + 1):
-        start = period_start.replace(year=period_start.year - year_offset)
-        end_day = min(day_span, calendar.monthrange(start.year, start.month)[1])
-        end = start.replace(day=end_day)
-        candidate_ranges.append(f"{start.isoformat()}..{end.isoformat()}")
-        rows = query_all(
-            conn,
-            """
-            SELECT production_kwh, specific_yield
-            FROM production_records
-            WHERE asset_id = ? AND provider = ? AND period_type = 'day'
-              AND period_date BETWEEN ? AND ?
-              AND production_kwh IS NOT NULL
-              AND specific_yield IS NOT NULL
-              AND COALESCE(data_quality, '') != 'missing_production'
-            ORDER BY period_date ASC
-            """,
-            (asset_id, provider, start.isoformat(), end.isoformat()),
-        )
-        if len(rows) == end_day:
-            yearly_values.append(
-                (
-                    sum(float(row["production_kwh"]) for row in rows),
-                    sum(float(row["specific_yield"]) for row in rows),
-                )
-            )
-    if len(yearly_values) < max(int(min_baseline_points or 1), 1):
-        return {
-            "expected_kwh": None,
-            "expected_specific_yield": None,
-            "expected_source": "none",
-            "quality": "partial_history" if yearly_values else "ok",
-            "diagnostic": {
-                "historical_records_found": len(yearly_values),
-                "baseline_years": baseline_years,
-                "min_baseline_points": min_baseline_points,
-                "candidate_historical_dates": candidate_ranges,
-                "expected_source_attempted": "historical_same_period",
-                "no_reference_reason": "MTD reference requires historical daily records for same period",
-                "period_start": period_start.isoformat(),
-                "period_end": period_end.isoformat(),
-            },
-        }
-    expected_kwh = sum(item[0] for item in yearly_values) / len(yearly_values)
-    expected_specific_yield = sum(item[1] for item in yearly_values) / len(yearly_values)
-    return {
-        "expected_kwh": expected_kwh,
-        "expected_specific_yield": expected_specific_yield,
-        "expected_source": "historical_same_period",
-        "quality": "ok",
-        "diagnostic": {
-            "historical_records_found": len(yearly_values),
-            "baseline_years": baseline_years,
-            "min_baseline_points": min_baseline_points,
-            "candidate_historical_dates": candidate_ranges,
-            "expected_source_attempted": "historical_same_period",
-            "no_reference_reason": "",
-            "period_start": period_start.isoformat(),
-            "period_end": period_end.isoformat(),
-        },
-    }
-
-
-def calculate_expected_production_with_diagnostic(
-    conn: sqlite3.Connection,
-    *,
-    asset_id: int,
-    provider: str,
-    period_type: str,
-    period_date: date,
-    kwp: float | None,
-    settings: dict[str, Any],
-    asset_name: str = "",
-    today_value: date | None = None,
-) -> dict[str, Any]:
-    baseline_years = int(settings.get("baseline_years") or 2)
-    min_baseline_points = int(settings.get("min_baseline_points") or 1)
-    if period_type == "mtd":
-        result = calculate_mtd_baseline(
-            conn,
-            asset_id=asset_id,
-            provider=provider,
-            period_date=period_date,
-            baseline_years=baseline_years,
-            min_baseline_points=min_baseline_points,
-            today_value=today_value,
-        )
-    else:
-        historical_type = "month" if period_type == "month" else "day"
-        candidates = same_date_previous_years(period_date.replace(day=1) if period_type == "month" else period_date, baseline_years)
-        rows = load_valid_baseline_rows(
-            conn,
-            asset_id=asset_id,
-            provider=provider,
-            period_type=historical_type,
-            candidate_dates=candidates,
-        )
-        diagnostic = {
-            "historical_records_found": len(rows),
-            "baseline_years": baseline_years,
-            "min_baseline_points": min_baseline_points,
-            "candidate_historical_dates": [item.isoformat() for item in candidates],
-            "expected_source_attempted": "historical_same_period",
-            "no_reference_reason": "",
-        }
-        if len(rows) < min_baseline_points:
-            label = "monthly" if period_type == "month" else "daily"
-            diagnostic["no_reference_reason"] = (
-                f"No historical {label} records found for same {'month' if period_type == 'month' else 'day'} in previous years"
-                if not rows
-                else f"Only {len(rows)} baseline points found, minimum is {min_baseline_points}"
-            )
-            result = {
-                "expected_kwh": None,
-                "expected_specific_yield": None,
-                "expected_source": "none",
-                "quality": "partial_history" if rows else "ok",
-                "diagnostic": diagnostic,
-            }
-        else:
-            production_values = [float(row["production_kwh"]) for row in rows]
-            specific_values = [float(row["specific_yield"]) for row in rows]
-            result = {
-                "expected_kwh": sum(production_values) / len(production_values),
-                "expected_specific_yield": sum(specific_values) / len(specific_values),
-                "expected_source": "historical_same_period",
-                "quality": "ok",
-                "diagnostic": diagnostic,
-            }
-
-    if result["expected_kwh"] is None:
-        budget_specific = get_monthly_budget_specific_yield(settings, period_date)
-        if budget_specific is not None and kwp:
-            if period_type == "day":
-                budget_specific = budget_specific / calendar.monthrange(period_date.year, period_date.month)[1]
-            result = {
-                "expected_kwh": budget_specific * kwp,
-                "expected_specific_yield": budget_specific,
-                "expected_source": "monthly_budget",
-                "quality": "ok",
-                "diagnostic": {
-                    **result["diagnostic"],
-                    "expected_source_attempted": "monthly_budget",
-                    "no_reference_reason": "",
-                },
-            }
-    if kwp is None:
-        result["diagnostic"]["no_reference_reason"] = "Missing kWp"
-    if result["expected_specific_yield"] is None and not result["diagnostic"].get("no_reference_reason"):
-        result["diagnostic"]["no_reference_reason"] = "Missing expected_specific_yield"
-
-    logger = current_app.logger if has_app_context() else logging.getLogger(__name__)
-    logger.info(
-        "Performance reference calculation: asset_id=%s asset_name=%s period_type=%s period_date=%s baseline_years=%s candidate_dates=%s valid_baseline_records=%s expected_specific_yield=%s expected_source=%s no_reference_reason=%s",
-        asset_id,
-        asset_name,
-        period_type,
-        period_date.isoformat(),
-        baseline_years,
-        result["diagnostic"].get("candidate_historical_dates"),
-        result["diagnostic"].get("historical_records_found"),
-        result["expected_specific_yield"],
-        result["expected_source"],
-        result["diagnostic"].get("no_reference_reason", ""),
-    )
-    return result
-
-
-def calculate_expected_production(
-    conn: sqlite3.Connection,
-    *,
-    asset_id: int,
-    provider: str,
-    period_type: str,
-    period_date: date,
-    kwp: float | None,
-    settings: dict[str, Any],
-) -> tuple[float | None, float | None, str, str]:
-    result = calculate_expected_production_with_diagnostic(
-        conn,
-        asset_id=asset_id,
-        provider=provider,
-        period_type=period_type,
-        period_date=period_date,
-        kwp=kwp,
-        settings=settings,
-    )
-    return result["expected_kwh"], result["expected_specific_yield"], result["expected_source"], result["quality"]
-
-
-def upsert_production_record(
-    conn: sqlite3.Connection,
-    *,
-    asset_id: int,
-    provider: str,
-    external_id: str,
-    period_type: str,
-    period_date: date,
-    production_kwh: float | None,
-    specific_yield: float | None,
-    expected_kwh: float | None,
-    expected_specific_yield: float | None,
-    deviation_pct: float | None,
-    performance_status: str,
-    expected_source: str,
-    data_quality: str,
-    notes: str,
-    payload_json: str,
-    selected_production_key: str = "",
-    selected_production_raw_value: str = "",
-    reference_diagnostic_json: str = "",
-) -> str:
-    now = datetime.now().isoformat(timespec="seconds")
-    existing = conn.execute(
-        """
-        SELECT id
-        FROM production_records
-        WHERE asset_id = ? AND provider = ? AND period_type = ? AND period_date = ?
-        LIMIT 1
-        """,
-        (asset_id, provider, period_type, period_date.isoformat()),
-    ).fetchone()
-    conn.execute(
-        """
-        INSERT INTO production_records (
-            asset_id, provider, external_id, period_type, period_date, production_kwh, specific_yield,
-            expected_kwh, expected_specific_yield, deviation_pct, performance_status, expected_source,
-            data_quality, notes, selected_production_key, selected_production_raw_value, reference_diagnostic_json,
-            payload_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(asset_id, provider, period_type, period_date) DO UPDATE SET
-            external_id = excluded.external_id,
-            production_kwh = excluded.production_kwh,
-            specific_yield = excluded.specific_yield,
-            expected_kwh = excluded.expected_kwh,
-            expected_specific_yield = excluded.expected_specific_yield,
-            deviation_pct = excluded.deviation_pct,
-            performance_status = excluded.performance_status,
-            expected_source = excluded.expected_source,
-            data_quality = excluded.data_quality,
-            notes = excluded.notes,
-            selected_production_key = excluded.selected_production_key,
-            selected_production_raw_value = excluded.selected_production_raw_value,
-            reference_diagnostic_json = excluded.reference_diagnostic_json,
-            payload_json = excluded.payload_json,
-            updated_at = excluded.updated_at
-        """,
-        (
-            asset_id,
-            provider,
-            external_id or None,
-            period_type,
-            period_date.isoformat(),
-            production_kwh,
-            specific_yield,
-            expected_kwh,
-            expected_specific_yield,
-            deviation_pct,
-            performance_status,
-            expected_source,
-            data_quality,
-            notes,
-            selected_production_key or None,
-            selected_production_raw_value or None,
-            reference_diagnostic_json or None,
-            payload_json,
-            now,
-            now,
-        ),
-    )
-    return "updated" if existing else "inserted"
-
-
-def store_production_kpi_record(
-    conn: sqlite3.Connection,
-    *,
-    asset_row: sqlite3.Row | dict[str, Any],
-    provider: str,
-    external_id: str,
-    period_type: str,
-    period_date: date,
-    kpi_row: dict[str, Any],
-    notes_prefix: str = "",
-) -> dict[str, Any]:
-    data_item_map = kpi_row.get("dataItemMap") if isinstance(kpi_row, dict) else {}
-    if not isinstance(data_item_map, dict):
-        data_item_map = {}
-    production_kwh, selected_key, selected_raw_value = select_production_value(data_item_map)
-    kwp = parse_kwp_value(asset_row["kwp"])
-    specific_yield = calculate_specific_yield(production_kwh, kwp)
-    asset_id = int(asset_row["asset_id"] if "asset_id" in asset_row.keys() else asset_row["id"])
-    settings = get_performance_settings(conn, asset_id)
-    for key in settings:
-        try:
-            row_value = asset_row[key]
-        except (KeyError, IndexError):
-            continue
-        if row_value is not None:
-            settings[key] = row_value
-
-    reference_result = calculate_expected_production_with_diagnostic(
-        conn,
-        asset_id=asset_id,
-        provider=provider,
-        period_type=period_type,
-        period_date=period_date,
-        kwp=kwp,
-        settings=settings,
-        asset_name=str(asset_row["project_name"] if "project_name" in asset_row.keys() else ""),
-    )
-    expected_kwh = reference_result["expected_kwh"]
-    expected_specific_yield = reference_result["expected_specific_yield"]
-    expected_source = reference_result["expected_source"]
-    baseline_quality = reference_result["quality"]
-    performance_status, data_quality, deviation_pct = classify_performance_status(
-        production_kwh,
-        kwp,
-        expected_kwh,
-        warning_deviation_pct=float(settings.get("warning_deviation_pct") or -10),
-        alert_deviation_pct=float(settings.get("alert_deviation_pct") or -20),
-        critical_deviation_pct=float(settings.get("critical_deviation_pct") or -30),
-    )
-    if data_quality == "ok" and baseline_quality == "partial_history" and expected_source == "none":
-        data_quality = "partial_history"
-
-    notes_parts = [notes_prefix] if notes_prefix else []
-    if production_kwh is None:
-        notes_parts.append(
-            build_missing_production_note(
-                data_item_map,
-                station_code=external_id,
-                period_type=period_type,
-                period_date=period_date,
-            )
-        )
-    if kwp is None:
-        notes_parts.append("kWp local em falta ou invalido.")
-    if expected_source == "none":
-        notes_parts.append("Sem histÃ³rico ou orÃ§amento mensal para referÃªncia.")
-
-    if production_kwh is None:
-        existing_valid = conn.execute(
-            """
-            SELECT id
-            FROM production_records
-            WHERE asset_id = ? AND provider = ? AND period_type = ? AND period_date = ?
-              AND production_kwh IS NOT NULL
-              AND COALESCE(data_quality, '') != 'missing_production'
-            LIMIT 1
-            """,
-            (asset_id, provider, period_type, period_date.isoformat()),
-        ).fetchone()
-        if existing_valid:
-            return {
-                "upsert_status": "skipped_existing_valid",
-                "production_kwh": None,
-                "specific_yield": None,
-                "performance_status": performance_status,
-                "data_quality": data_quality,
-            }
-
-    upsert_status = upsert_production_record(
-        conn,
-        asset_id=asset_id,
-        provider=provider,
-        external_id=external_id,
-        period_type=period_type,
-        period_date=period_date,
-        production_kwh=production_kwh,
-        specific_yield=specific_yield,
-        expected_kwh=expected_kwh,
-        expected_specific_yield=expected_specific_yield,
-        deviation_pct=deviation_pct,
-        performance_status=performance_status,
-        expected_source=expected_source,
-        data_quality=data_quality,
-        notes=" ".join(notes_parts),
-        payload_json=str(kpi_row.get("payload_json") or json.dumps(kpi_row, ensure_ascii=True)),
-        selected_production_key=selected_key,
-        selected_production_raw_value=selected_raw_value,
-        reference_diagnostic_json=json.dumps(reference_result["diagnostic"], ensure_ascii=True),
-    )
-    return {
-        "upsert_status": upsert_status,
-        "production_kwh": production_kwh,
-        "performance_status": performance_status,
-        "data_quality": data_quality,
-    }
-
-
-def first_non_empty(payload: dict[str, Any], keys: list[str]) -> str:
-    for key in keys:
-        value = payload.get(key)
-        if value not in (None, ""):
-            return str(value).strip()
-    return ""
-
-
-def parse_fusionsolar_pv_inputs(row: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    currents: dict[str, Any] = {}
-    voltages: dict[str, Any] = {}
-    source = row.get("dataItemMap") if isinstance(row.get("dataItemMap"), dict) else row
-    for index in range(1, 37):
-        current_key = f"pv{index}_i"
-        voltage_key = f"pv{index}_u"
-        if current_key in source and source[current_key] not in (None, ""):
-            currents[current_key] = source[current_key]
-        if voltage_key in source and source[voltage_key] not in (None, ""):
-            voltages[voltage_key] = source[voltage_key]
-    return currents, voltages
-
-
-def calculate_pv_input_health(
-    currents: dict[str, Any],
-    voltages: dict[str, Any],
-    *,
-    expected_string_indexes: set[int],
-) -> dict[str, Any]:
-    expected_inputs = sorted(expected_string_indexes)
-    available_inputs = 0
-    unavailable_inputs = 0
-    voltage_values: dict[str, float] = {}
-    for index in expected_inputs:
-        voltage = parse_float_value(voltages.get(f"pv{index}_u"))
-        voltage_values[str(index)] = voltage or 0.0
-        if voltage is not None and voltage > DEFAULT_STRING_PRESENT_VOLTAGE_THRESHOLD:
-            available_inputs += 1
-        else:
-            unavailable_inputs += 1
-    total_inputs = len(expected_inputs)
-    return {
-        "available_strings": available_inputs,
-        "total_strings": total_inputs,
-        "unavailable_strings": unavailable_inputs,
-        "string_availability_pct": round(available_inputs / total_inputs * 100, 2) if total_inputs else None,
-        "pv_input_diagnostics": {
-            "expected_inputs": expected_inputs,
-            "voltages_v": voltage_values,
-        },
-    }
-
-
-def learn_expected_strings_from_voltage(
-    conn: sqlite3.Connection,
-    provider_device_id: int,
-    voltages: dict[str, Any],
-    observed_at: str,
-) -> set[int]:
-    learned_indexes: set[int] = set()
-    for key, raw_voltage in voltages.items():
-        voltage = parse_float_value(raw_voltage)
-        if voltage is None or voltage <= DEFAULT_STRING_PRESENT_VOLTAGE_THRESHOLD:
-            continue
-        index = parse_int_value(key.removeprefix("pv").removesuffix("_u"))
-        if index is None:
-            continue
-        existing = conn.execute(
-            """
-            SELECT *
-            FROM provider_device_expected_strings
-            WHERE provider_device_id = ? AND string_index = ?
-            """,
-            (provider_device_id, index),
-        ).fetchone()
-        now = datetime.now().isoformat(timespec="seconds")
-        if existing is None:
-            conn.execute(
-                """
-                INSERT INTO provider_device_expected_strings (
-                    provider_device_id, string_index, expected, source, observed_count,
-                    first_observed_at, last_observed_at, created_at, updated_at
-                ) VALUES (?, ?, 0, 'auto', 1, ?, ?, ?, ?)
-                """,
-                (provider_device_id, index, observed_at, observed_at, now, now),
-            )
-            continue
-        observed_count = int(existing["observed_count"] or 0) + 1
-        expected = int(existing["expected"] or 0)
-        source = existing["source"]
-        if source == "auto" and observed_count >= DEFAULT_STRING_AUTO_LEARN_OBSERVATIONS:
-            expected = 1
-        conn.execute(
-            """
-            UPDATE provider_device_expected_strings
-            SET expected = ?, observed_count = ?, last_observed_at = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (expected, observed_count, observed_at, now, existing["id"]),
-        )
-
-    rows = query_all(
-        conn,
-        """
-        SELECT string_index
-        FROM provider_device_expected_strings
-        WHERE provider_device_id = ? AND expected = 1
-        """,
-        (provider_device_id,),
-    )
-    learned_indexes.update(int(row["string_index"]) for row in rows)
-    return learned_indexes
-
-
-def normalize_fusionsolar_device_identity(row: dict[str, Any]) -> dict[str, Any]:
-    dev_type_id = parse_int_value(first_non_empty(row, ["devTypeId", "dev_type_id", "deviceTypeId"]))
-    model = first_non_empty(row, ["model", "devModel", "deviceModel", "invType"])
-    rated_power_kw = normalize_power_to_kw(first_non_empty(row, ["ratedPower", "rated_power", "capacity", "nominalPower"]))
-    return {
-        "station_code": first_non_empty(row, ["stationCode", "plantCode"]),
-        "external_device_id": first_non_empty(row, ["devId", "id", "devDn", "deviceDn", "esnCode", "sn"]),
-        "dev_dn": first_non_empty(row, ["devDn", "deviceDn"]),
-        "sn": first_non_empty(row, ["esnCode", "sn"]),
-        "device_name": first_non_empty(row, ["devName", "deviceName", "name"]),
-        "dev_type_id": dev_type_id,
-        "model": model,
-        "rated_power_kw": rated_power_kw if rated_power_kw is not None else infer_inverter_power_from_model(model),
-    }
-
-
-def normalize_power_to_kw(value: Any) -> float | None:
-    parsed = parse_float_value(value)
-    if parsed is None:
-        return None
-    return parsed / 1000 if parsed > 1000 else parsed
-
-
-def infer_inverter_power_from_model(model: str | None) -> float | None:
-    normalized = str(model or "").upper().replace(" ", "")
-    match = re.search(r"(?:SUN2000-|^)(\d+(?:[.,]\d+)?)(?:KTL|K(?:-|$))", normalized)
-    if not match:
-        return None
-    return parse_float_value(match.group(1).replace(",", "."))
-
-
-def populate_missing_inverter_rated_power(conn: sqlite3.Connection) -> int:
-    rows = conn.execute(
-        """
-        SELECT id, external_device_id, model, payload_json
-        FROM provider_devices
-        WHERE rated_power_kw IS NULL OR rated_power_kw <= 0
-        """
-    ).fetchall()
-    updated = 0
-    for row in rows:
-        model = row["model"]
-        if not model and row["payload_json"]:
-            try:
-                payload = json.loads(row["payload_json"])
-                model = first_non_empty(payload, ["model", "devModel", "deviceModel", "invType"])
-            except (TypeError, ValueError, json.JSONDecodeError):
-                model = None
-        rated_power_kw = infer_inverter_power_from_model(model)
-        if rated_power_kw is None:
-            continue
-        conn.execute(
-            "UPDATE provider_devices SET rated_power_kw = ? WHERE id = ?",
-            (rated_power_kw, row["id"]),
-        )
-        conn.execute(
-            """
-            UPDATE inverter_availability_daily
-            SET inverter_power_kw = ?
-            WHERE provider = ? AND inverter_id = ?
-              AND (inverter_power_kw IS NULL OR inverter_power_kw <= 0)
-            """,
-            (rated_power_kw, INTEGRATION_PROVIDER_FUSIONSOLAR, row["external_device_id"]),
-        )
-        conn.execute(
-            """
-            UPDATE inverter_power_samples
-            SET inverter_power_kw = ?
-            WHERE provider = ? AND inverter_id = ?
-              AND (inverter_power_kw IS NULL OR inverter_power_kw <= 0)
-            """,
-            (rated_power_kw, INTEGRATION_PROVIDER_FUSIONSOLAR, row["external_device_id"]),
-        )
-        updated += 1
-    return updated
-
-
-def disable_removed_inverter_devices(conn: sqlite3.Connection) -> int:
-    rows = conn.execute(
-        "SELECT id, device_name FROM provider_devices WHERE enabled = 1"
-    ).fetchall()
-    removed_ids = [int(row["id"]) for row in rows if is_removed_inverter_name(row["device_name"])]
-    if removed_ids:
-        conn.executemany(
-            "UPDATE provider_devices SET enabled = 0 WHERE id = ?",
-            [(device_id,) for device_id in removed_ids],
-        )
-        for device_id in removed_ids:
-            record_device_configuration(
-                conn,
-                provider_device_id=device_id,
-                active=False,
-                effective_date=current_lisbon_date(),
-            )
-    return len(removed_ids)
-
-
-def is_removed_inverter_name(device_name: str | None) -> bool:
-    normalized = normalize_name(str(device_name or ""))
-    return any(marker in normalized for marker in ("removido", "removed"))
-
-
-def is_inverter_available(active_power_kw: float | None) -> bool:
-    return reporting_is_inverter_available(active_power_kw)
-
-
-def inverter_availability_slot(sample_time: datetime) -> datetime:
-    return reporting_inverter_availability_slot(
-        sample_time,
-        slot_minutes=INVERTER_AVAILABILITY_SLOT_MINUTES,
-    )
-
-
-def apply_inverter_edge_tolerance(
-    valid_slots: set[datetime],
-    tolerance_minutes: int = INVERTER_AVAILABILITY_EDGE_TOLERANCE_MINUTES,
-) -> set[datetime]:
-    return reporting_apply_inverter_edge_tolerance(
-        valid_slots,
-        tolerance_minutes=tolerance_minutes,
-    )
-
-
-def calculate_inverter_daily_availability(
-    samples: list[dict[str, Any]],
-    valid_slots: set[datetime] | None = None,
-    edge_tolerance_minutes: int = INVERTER_AVAILABILITY_EDGE_TOLERANCE_MINUTES,
-) -> dict[str, Any]:
-    return reporting_calculate_inverter_daily_availability(
-        samples,
-        valid_slots,
-        slot_minutes=INVERTER_AVAILABILITY_SLOT_MINUTES,
-        edge_tolerance_minutes=edge_tolerance_minutes,
-    )
-
-
-def calculate_weighted_plant_availability(inverter_rows: list[dict[str, Any]]) -> float | None:
-    return reporting_calculate_weighted_plant_availability(inverter_rows)
-
-
-def resolve_inverter_availability_period(
-    period: str,
-    raw_from_date: str = "",
-    raw_to_date: str = "",
-) -> tuple[date, date]:
-    yesterday = date.today() - timedelta(days=1)
-    if period == "current_month":
-        return yesterday.replace(day=1), yesterday
-    if period == "previous_month":
-        current_month_start = date.today().replace(day=1)
-        previous_month_end = current_month_start - timedelta(days=1)
-        return previous_month_end.replace(day=1), previous_month_end
-    if period == "custom":
-        from_date = parse_date_value(raw_from_date) or yesterday
-        to_date = min(parse_date_value(raw_to_date) or yesterday, yesterday)
-        return from_date, to_date
-    return yesterday, yesterday
-
-
-def get_inverter_availability_report(
-    conn: sqlite3.Connection,
-    from_date: date,
-    to_date: date,
-    *,
-    asset_id: int | None = None,
-    om_only: bool = True,
-    search: str = "",
-) -> dict[str, Any]:
-    if from_date > to_date:
-        return {
-            "average_pct": None,
-            "plants": [],
-            "inverters": [],
-            "worst_plant": None,
-            "low_availability_count": 0,
-        }
-    conditions = [
-        "iad.provider = ?",
-        "iad.availability_date BETWEEN ? AND ?",
-    ]
-    params: list[Any] = [
-        INTEGRATION_PROVIDER_FUSIONSOLAR,
-        from_date.isoformat(),
-        to_date.isoformat(),
-    ]
-    if asset_id is not None:
-        conditions.append("iad.asset_id = ?")
-        params.append(asset_id)
-    if om_only:
-        conditions.append("a.active_contract = 'yes'")
-    if search:
-        conditions.append(
-            "(a.project_name LIKE ? OR a.location LIKE ? OR a.company_name LIKE ? OR a.alias_blob LIKE ?)"
-        )
-        wildcard = f"%{search}%"
-        params.extend([wildcard, wildcard, wildcard, wildcard])
-    rows = conn.execute(
-        f"""
-        SELECT
-            iad.asset_id,
-            a.project_name,
-            iad.inverter_id,
-            iad.inverter_name,
-            iad.inverter_power_kw,
-            MAX(pd.device_name) AS provider_device_name,
-            MAX(pd.rated_power_kw) AS provider_power_kw,
-            MAX(pd.model) AS provider_model,
-            MAX(pd.enabled) AS provider_enabled,
-            SUM(iad.valid_slots) AS valid_slots,
-            SUM(iad.available_slots) AS available_slots,
-            SUM(iad.unavailable_slots) AS unavailable_slots
-        FROM inverter_availability_daily iad
-        JOIN assets a ON a.id = iad.asset_id
-        LEFT JOIN provider_devices pd
-          ON pd.provider = iad.provider AND pd.external_device_id = iad.inverter_id
-        WHERE {' AND '.join(conditions)}
-        GROUP BY iad.asset_id, a.project_name, iad.inverter_id, iad.inverter_name, iad.inverter_power_kw
-        HAVING SUM(iad.valid_slots) > 0
-        """,
-        params,
-    ).fetchall()
-    inverter_rows: list[dict[str, Any]] = []
-    for row in rows:
-        item = dict(row)
-        device_name = item.get("provider_device_name") or item.get("inverter_name")
-        if item.get("provider_enabled") == 0 or is_removed_inverter_name(device_name):
-            continue
-        item["inverter_name"] = device_name
-        item["inverter_power_kw"] = (
-            parse_float_value(item.get("inverter_power_kw"))
-            or parse_float_value(item.get("provider_power_kw"))
-            or infer_inverter_power_from_model(item.get("provider_model"))
-        )
-        item["availability_pct"] = round(item["available_slots"] / item["valid_slots"] * 100, 2)
-        inverter_rows.append(item)
-
-    plants_by_id: dict[int, dict[str, Any]] = {}
-    for row in inverter_rows:
-        plant = plants_by_id.setdefault(
-            int(row["asset_id"]),
-            {"asset_id": row["asset_id"], "project_name": row["project_name"], "inverters": []},
-        )
-        plant["inverters"].append(row)
-    plant_rows: list[dict[str, Any]] = []
-    for plant in plants_by_id.values():
-        plant_rows.append(
-            {
-                "asset_id": plant["asset_id"],
-                "project_name": plant["project_name"],
-                "inverter_count": len(plant["inverters"]),
-                "availability_pct": calculate_weighted_plant_availability(plant["inverters"]),
-                "warnings": reporting_invalid_power_warnings(
-                    plant["inverters"],
-                    power_key="inverter_power_kw",
-                    warning_code="missing_inverter_power",
-                ),
-            }
-        )
-    plant_rows.sort(key=lambda row: (row["availability_pct"] is None, row["availability_pct"] or 0, row["project_name"]))
-    inverter_rows.sort(key=lambda row: (row["availability_pct"], row["project_name"], row["inverter_name"] or row["inverter_id"]))
-    for rank, row in enumerate(plant_rows, start=1):
-        row["rank"] = rank
-    for rank, row in enumerate(inverter_rows, start=1):
-        row["rank"] = rank
-    percentages = [float(row["availability_pct"]) for row in plant_rows if row["availability_pct"] is not None]
-    return {
-        "average_pct": round(sum(percentages) / len(percentages), 2) if percentages else None,
-        "plants": plant_rows,
-        "inverters": inverter_rows,
-        "worst_plant": plant_rows[0] if plant_rows else None,
-        "low_availability_count": sum(
-            1 for row in inverter_rows if float(row["availability_pct"]) < LOW_INVERTER_AVAILABILITY_PCT
-        ),
-    }
-
-
-def get_monthly_wat_report_data(
-    conn: sqlite3.Connection,
-    from_date: date,
-    to_date: date,
-    asset_id: int | None = None,
-) -> dict[str, Any]:
-    if from_date > to_date:
-        raise ValueError("O intervalo WAT e invalido.")
-
-    provider = INTEGRATION_PROVIDER_FUSIONSOLAR
-    from_iso = from_date.isoformat()
-    to_iso = to_date.isoformat()
-    sample_from = datetime.combine(from_date, datetime.min.time()).isoformat(timespec="seconds")
-    sample_to = datetime.combine(to_date + timedelta(days=1), datetime.min.time()).isoformat(timespec="seconds")
-    expected_days = (to_date - from_date).days + 1
-
-    asset_params: list[Any] = []
-    if asset_id is not None:
-        asset_filter = "a.id = ?"
-        asset_params.append(asset_id)
-    else:
-        asset_filter = """
-            EXISTS (
-                SELECT 1 FROM provider_devices pd
-                WHERE pd.asset_id = a.id AND pd.provider = ? AND pd.enabled = 1 AND pd.dev_type_id IN (1, 38)
-            )
-            OR EXISTS (
-                SELECT 1 FROM inverter_availability_daily iad
-                WHERE iad.asset_id = a.id AND iad.provider = ? AND iad.availability_date BETWEEN ? AND ?
-            )
-            OR EXISTS (
-                SELECT 1 FROM plant_availability_daily pad
-                WHERE pad.asset_id = a.id AND pad.provider = ? AND pad.availability_date BETWEEN ? AND ?
-            )
-            OR EXISTS (
-                SELECT 1 FROM inverter_power_samples ips
-                WHERE ips.asset_id = a.id AND ips.provider = ? AND ips.sample_time >= ? AND ips.sample_time < ?
-            )
-        """
-        asset_params.extend(
-            [provider, provider, from_iso, to_iso, provider, from_iso, to_iso, provider, sample_from, sample_to]
-        )
-    assets = conn.execute(
-        f"SELECT a.id, a.project_name FROM assets a WHERE {asset_filter} ORDER BY a.project_name COLLATE NOCASE",
-        asset_params,
-    ).fetchall()
-
-    plants: list[dict[str, Any]] = []
-    for asset in assets:
-        current_asset_id = int(asset["id"])
-        configured_devices = query_all(
-            conn,
-            """
-            SELECT external_device_id, device_name
-            FROM provider_devices
-            WHERE asset_id = ? AND provider = ? AND enabled = 1 AND dev_type_id IN (1, 38)
-            """,
-            (current_asset_id, provider),
-        )
-        configured_inverter_count = sum(
-            1 for row in configured_devices if not is_removed_inverter_name(row["device_name"])
-        )
-        inverter_rows = query_all(
-            conn,
-            """
-            SELECT
-                iad.inverter_id,
-                COALESCE(MAX(pd.device_name), MAX(iad.inverter_name), iad.inverter_id) AS inverter_name,
-                MAX(iad.inverter_power_kw) AS stored_power_kw,
-                MAX(pd.rated_power_kw) AS provider_power_kw,
-                MAX(pd.model) AS provider_model,
-                MAX(pd.enabled) AS provider_enabled,
-                COUNT(DISTINCT iad.availability_date) AS data_days,
-                SUM(iad.valid_slots) AS valid_slots,
-                SUM(iad.available_slots) AS available_slots,
-                SUM(iad.unavailable_slots) AS unavailable_slots
-            FROM inverter_availability_daily iad
-            LEFT JOIN provider_devices pd
-              ON pd.provider = iad.provider AND pd.external_device_id = iad.inverter_id
-            WHERE iad.asset_id = ? AND iad.provider = ? AND iad.availability_date BETWEEN ? AND ?
-            GROUP BY iad.inverter_id
-            ORDER BY inverter_name COLLATE NOCASE, iad.inverter_id
-            """,
-            (current_asset_id, provider, from_iso, to_iso),
-        )
-        report_inverters: list[dict[str, Any]] = []
-        for stored_row in inverter_rows:
-            row = dict(stored_row)
-            if row.get("provider_enabled") == 0 or is_removed_inverter_name(row.get("inverter_name")):
-                continue
-            valid_slots = int(row.get("valid_slots") or 0)
-            available_slots = int(row.get("available_slots") or 0)
-            report_inverters.append(
-                {
-                    "inverter_id": str(row["inverter_id"]),
-                    "inverter_name": str(row.get("inverter_name") or row["inverter_id"]),
-                    "inverter_power_kw": (
-                        parse_float_value(row.get("stored_power_kw"))
-                        or parse_float_value(row.get("provider_power_kw"))
-                        or infer_inverter_power_from_model(row.get("provider_model"))
-                    ),
-                    "data_days": int(row.get("data_days") or 0),
-                    "valid_slots": valid_slots,
-                    "available_slots": available_slots,
-                    "unavailable_slots": int(row.get("unavailable_slots") or 0),
-                    "availability_pct": round(available_slots / valid_slots * 100, 2) if valid_slots else None,
-                }
-            )
-
-        plant_days = conn.execute(
-            """
-            SELECT availability_date, valid_slots, weighted_availability_pct, inverter_count
-            FROM plant_availability_daily
-            WHERE asset_id = ? AND provider = ? AND availability_date BETWEEN ? AND ?
-            ORDER BY availability_date
-            """,
-            (current_asset_id, provider, from_iso, to_iso),
-        ).fetchall()
-        sample_summary = conn.execute(
-            """
-            SELECT COUNT(*) AS sample_count, COUNT(DISTINCT substr(sample_time, 1, 10)) AS sample_days
-            FROM inverter_power_samples
-            WHERE asset_id = ? AND provider = ? AND sample_time >= ? AND sample_time < ?
-            """,
-            (current_asset_id, provider, sample_from, sample_to),
-        ).fetchone()
-
-        sample_count = int(sample_summary["sample_count"] or 0)
-        sample_days = int(sample_summary["sample_days"] or 0)
-        plant_day_count = len(plant_days)
-        has_any_data = bool(report_inverters or plant_day_count or sample_count)
-        if not has_any_data:
-            data_status = "sem dados"
-        else:
-            daily_counts = conn.execute(
-                """
-                SELECT availability_date, COUNT(*) AS inverter_count,
-                       SUM(CASE WHEN valid_slots > 0 AND availability_pct IS NOT NULL THEN 1 ELSE 0 END) AS valid_inverters
-                FROM inverter_availability_daily
-                WHERE asset_id = ? AND provider = ? AND availability_date BETWEEN ? AND ?
-                GROUP BY availability_date
-                """,
-                (current_asset_id, provider, from_iso, to_iso),
-            ).fetchall()
-            expected_inverter_count = configured_inverter_count or max(
-                (int(row["inverter_count"] or 0) for row in daily_counts),
-                default=0,
-            )
-            complete_inverter_days = (
-                len(daily_counts) == expected_days
-                and expected_inverter_count > 0
-                and all(
-                    int(row["inverter_count"] or 0) == expected_inverter_count
-                    and int(row["valid_inverters"] or 0) == expected_inverter_count
-                    for row in daily_counts
-                )
-            )
-            complete_plant_days = (
-                plant_day_count == expected_days
-                and all(
-                    int(row["valid_slots"] or 0) > 0
-                    and row["weighted_availability_pct"] is not None
-                    and int(row["inverter_count"] or 0) == expected_inverter_count
-                    for row in plant_days
-                )
-            )
-            data_status = (
-                "ok"
-                if complete_inverter_days and complete_plant_days and sample_days == expected_days
-                else "parcial"
-            )
-
-        ranked_inverters = [row for row in report_inverters if row["availability_pct"] is not None]
-        ranked_inverters.sort(
-            key=lambda row: (float(row["availability_pct"]), row["inverter_name"].lower(), row["inverter_id"])
-        )
-        worst_inverter = ranked_inverters[0] if ranked_inverters else None
-        weighted_wat = calculate_weighted_plant_availability(report_inverters)
-        warnings = reporting_invalid_power_warnings(
-            report_inverters,
-            power_key="inverter_power_kw",
-            warning_code="missing_inverter_power",
-        )
-        plants.append(
-            {
-                "asset_id": current_asset_id,
-                "project_name": str(asset["project_name"]),
-                "weighted_wat_pct": weighted_wat,
-                "inverter_count": len(report_inverters) or configured_inverter_count,
-                "inverters_below_90_count": sum(
-                    1
-                    for row in report_inverters
-                    if row["availability_pct"] is not None
-                    and float(row["availability_pct"]) < LOW_INVERTER_AVAILABILITY_PCT
-                ),
-                "worst_inverter": worst_inverter["inverter_name"] if worst_inverter else None,
-                "worst_inverter_id": worst_inverter["inverter_id"] if worst_inverter else None,
-                "worst_inverter_wat_pct": worst_inverter["availability_pct"] if worst_inverter else None,
-                "valid_slots": sum(int(row["valid_slots"]) for row in report_inverters),
-                "unavailable_slots": sum(int(row["unavailable_slots"]) for row in report_inverters),
-                "data_status": data_status,
-                "warnings": warnings,
-            }
-        )
-
-    return {
-        "from_date": from_iso,
-        "to_date": to_iso,
-        "plants": plants,
-    }
-
-
-def get_daily_wat_report_data(conn: sqlite3.Connection, target_date: date) -> dict[str, Any]:
-    report = get_monthly_wat_report_data(conn, target_date, target_date)
-    return {
-        "target_date": target_date.isoformat(),
-        "plants": report["plants"],
-    }
-
-
-def get_inverter_availability_chart_report(
-    conn: sqlite3.Connection,
-    asset_id: int,
-    from_date: date,
-    to_date: date,
-) -> dict[str, Any] | None:
-    asset = conn.execute(
-        "SELECT id, project_name FROM assets WHERE id = ?",
-        (asset_id,),
-    ).fetchone()
-    if asset is None:
-        return None
-    device_rows = conn.execute(
-        """
-        SELECT
-            external_device_id AS inverter_id,
-            device_name AS inverter_name,
-            rated_power_kw AS inverter_power_kw,
-            model
-        FROM provider_devices
-        WHERE asset_id = ? AND provider = ? AND enabled = 1 AND dev_type_id IN (1, 38)
-        ORDER BY device_name COLLATE NOCASE, external_device_id
-        """,
-        (asset_id, INTEGRATION_PROVIDER_FUSIONSOLAR),
-    ).fetchall()
-    daily_rows = conn.execute(
-        """
-        SELECT inverter_id, inverter_name, inverter_power_kw, availability_pct
-        FROM inverter_availability_daily
-        WHERE asset_id = ? AND provider = ? AND availability_date BETWEEN ? AND ?
-        ORDER BY availability_date
-        """,
-        (asset_id, INTEGRATION_PROVIDER_FUSIONSOLAR, from_date.isoformat(), to_date.isoformat()),
-    ).fetchall()
-    inverters_by_id: dict[str, dict[str, Any]] = {}
-    for row in device_rows:
-        inverter_id = str(row["inverter_id"])
-        if is_removed_inverter_name(row["inverter_name"]):
-            continue
-        inverters_by_id[inverter_id] = {
-            "inverter_id": inverter_id,
-            "inverter_name": row["inverter_name"],
-            "inverter_power_kw": parse_float_value(row["inverter_power_kw"])
-            or infer_inverter_power_from_model(row["model"]),
-            "availability_values": [],
-        }
-    for row in daily_rows:
-        inverter_id = str(row["inverter_id"])
-        if is_removed_inverter_name(row["inverter_name"]):
-            continue
-        inverter = inverters_by_id.setdefault(
-            inverter_id,
-            {
-                "inverter_id": inverter_id,
-                "inverter_name": row["inverter_name"],
-                "inverter_power_kw": row["inverter_power_kw"],
-                "availability_values": [],
-            },
-        )
-        if row["availability_pct"] is not None:
-            inverter["availability_values"].append(float(row["availability_pct"]))
-
-    period_start = datetime.combine(from_date, datetime.min.time())
-    period_end = datetime.combine(to_date + timedelta(days=1), datetime.min.time())
-    sample_rows = conn.execute(
-        """
-        SELECT inverter_id, sample_time, active_power_kw
-        FROM inverter_power_samples
-        WHERE asset_id = ? AND provider = ? AND sample_time >= ? AND sample_time < ?
-        ORDER BY inverter_id, sample_time
-        """,
-        (
-            asset_id,
-            INTEGRATION_PROVIDER_FUSIONSOLAR,
-            period_start.isoformat(timespec="seconds"),
-            period_end.isoformat(timespec="seconds"),
-        ),
-    ).fetchall()
-    samples_by_inverter: dict[str, list[tuple[datetime, float]]] = {}
-    for row in sample_rows:
-        sample_time = parse_datetime_value(row["sample_time"])
-        active_power = parse_float_value(row["active_power_kw"])
-        if sample_time is None or active_power is None:
-            continue
-        samples_by_inverter.setdefault(str(row["inverter_id"]), []).append((sample_time, max(active_power, 0.0)))
-
-    inverters = list(inverters_by_id.values())
-    for inverter in inverters:
-        percentages = inverter.pop("availability_values")
-        inverter["average_pct"] = round(sum(percentages) / len(percentages), 2) if percentages else None
-        inverter["chart"] = build_inverter_power_chart(
-            samples_by_inverter.get(inverter["inverter_id"], []),
-            period_start,
-            period_end,
-            parse_float_value(inverter["inverter_power_kw"]),
-        )
-    inverters.sort(key=lambda row: (row["average_pct"] is None, row["average_pct"] or 0, row["inverter_name"] or row["inverter_id"]))
-    return {
-        "asset_id": int(asset["id"]),
-        "project_name": asset["project_name"],
-        "inverters": inverters,
-    }
-
-
-def build_inverter_power_chart(
-    samples: list[tuple[datetime, float]],
-    period_start: datetime,
-    period_end: datetime,
-    rated_power_kw: float | None,
-) -> dict[str, Any]:
-    chart_width = 760.0
-    chart_height = 260.0
-    plot_left = 52.0
-    plot_right = 16.0
-    plot_top = 16.0
-    plot_bottom = 36.0
-    plot_width = chart_width - plot_left - plot_right
-    plot_height = chart_height - plot_top - plot_bottom
-    total_seconds = max((period_end - period_start).total_seconds(), 1.0)
-    sorted_samples = sorted(samples, key=lambda item: item[0])
-    if len(sorted_samples) > 600:
-        step = max(len(sorted_samples) // 600, 1)
-        reduced = sorted_samples[::step]
-        if reduced[-1] != sorted_samples[-1]:
-            reduced.append(sorted_samples[-1])
-        sorted_samples = reduced
-    observed_max = max((power for _, power in sorted_samples), default=0.0)
-    y_max = max(observed_max, rated_power_kw or 0.0, 1.0)
-    if y_max > 10:
-        y_max = float((int(y_max + 4.999) // 5) * 5)
-    else:
-        y_max = float(int(y_max + 0.999))
-    coordinates: list[tuple[float, float]] = []
-    for sample_time, power in sorted_samples:
-        elapsed = min(max((sample_time - period_start).total_seconds(), 0.0), total_seconds)
-        x = plot_left + elapsed / total_seconds * plot_width
-        y = plot_top + (1 - min(power / y_max, 1.0)) * plot_height
-        coordinates.append((round(x, 2), round(y, 2)))
-    line_path = " ".join(
-        ("M" if index == 0 else "L") + f" {x} {y}"
-        for index, (x, y) in enumerate(coordinates)
-    )
-    baseline = plot_top + plot_height
-    area_path = ""
-    if coordinates:
-        area_path = (
-            f"M {coordinates[0][0]} {baseline} "
-            + " ".join(f"L {x} {y}" for x, y in coordinates)
-            + f" L {coordinates[-1][0]} {baseline} Z"
-        )
-    x_ticks = []
-    for index in range(5):
-        ratio = index / 4
-        tick_time = period_start + timedelta(seconds=total_seconds * ratio)
-        x_ticks.append(
-            {
-                "x": round(plot_left + plot_width * ratio, 2),
-                "label": tick_time.strftime("%H:%M") if (period_end - period_start).days <= 1 else tick_time.strftime("%d/%m"),
-            }
-        )
-    y_ticks = [
-        {
-            "y": round(plot_top + plot_height * index / 4, 2),
-            "label": round(y_max * (1 - index / 4), 1),
-        }
-        for index in range(5)
-    ]
-    return {
-        "width": int(chart_width),
-        "height": int(chart_height),
-        "plot_left": plot_left,
-        "plot_right": chart_width - plot_right,
-        "plot_top": plot_top,
-        "plot_bottom": baseline,
-        "line_path": line_path,
-        "area_path": area_path,
-        "x_ticks": x_ticks,
-        "y_ticks": y_ticks,
-        "sample_count": len(samples),
-        "max_power_kw": round(y_max, 1),
-    }
-
-
-def parse_datetime_value(value: Any) -> datetime | None:
-    if value in (None, ""):
-        return None
-    if isinstance(value, (int, float)):
-        timestamp = float(value)
-        if timestamp > 10_000_000_000:
-            timestamp /= 1000
-        try:
-            return datetime.fromtimestamp(timestamp)
-        except (OSError, OverflowError, ValueError):
-            return None
-    raw = str(value).strip()
-    try:
-        timestamp = float(raw)
-        if timestamp > 10_000_000_000:
-            timestamp /= 1000
-        return datetime.fromtimestamp(timestamp)
-    except (OSError, OverflowError, ValueError):
-        pass
-    raw = raw.replace("Z", "+00:00")
-    try:
-        parsed = datetime.fromisoformat(raw)
-        return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
-    except ValueError:
-        return None
-
-
-def calculate_asset_availability(device_rows: list[dict[str, Any]]) -> dict[str, Any]:
-    enabled_rows = [row for row in device_rows if int(row.get("enabled", 1) or 0) == 1]
-    total = len(enabled_rows)
-    available = sum(1 for row in enabled_rows if row.get("availability_status") == "available")
-    unavailable = sum(
-        1 for row in enabled_rows if row.get("availability_status") in {"unavailable", "no_communication"}
-    )
-    no_communication = sum(1 for row in enabled_rows if row.get("availability_status") == "no_communication")
-    recent = sum(1 for row in enabled_rows if row.get("communication_status") == "recent")
-    rated_values = [row.get("rated_power_kw") for row in enabled_rows]
-    known_rated = [float(value) for value in rated_values if value is not None]
-    affected_rows = [
-        row for row in enabled_rows if row.get("availability_status") in {"unavailable", "no_communication"}
-    ]
-    affected_power_kw = (
-        sum(float(row["rated_power_kw"]) for row in affected_rows)
-        if affected_rows and all(row.get("rated_power_kw") is not None for row in affected_rows)
-        else None
-    )
-    capacity_availability_pct = None
-    if total and len(known_rated) == total and sum(known_rated) > 0:
-        capacity_availability_pct = round(
-            sum(float(row["rated_power_kw"]) for row in enabled_rows if row.get("availability_status") == "available")
-            / sum(known_rated)
-            * 100,
-            2,
-        )
-    return {
-        "inverter_availability_pct": round(available / total * 100, 2) if total else None,
-        "capacity_availability_pct": capacity_availability_pct,
-        "communication_availability_pct": round(recent / total * 100, 2) if total else None,
-        "available_inverters": available,
-        "total_inverters": total,
-        "unavailable_inverters": unavailable,
-        "no_communication_devices": no_communication,
-        "affected_power_kw": affected_power_kw,
-        "available_strings": sum(int(row.get("available_strings") or 0) for row in enabled_rows),
-        "total_strings": sum(int(row.get("total_strings") or 0) for row in enabled_rows),
-        "unavailable_strings": sum(int(row.get("unavailable_strings") or 0) for row in enabled_rows),
-        "string_availability_pct": (
-            round(
-                sum(int(row.get("available_strings") or 0) for row in enabled_rows)
-                / sum(int(row.get("total_strings") or 0) for row in enabled_rows)
-                * 100,
-                2,
-            )
-            if sum(int(row.get("total_strings") or 0) for row in enabled_rows)
-            else None
-        ),
-    }
-
-
-def format_fusionsolar_alarm_time(value: Any) -> str:
-    if value in (None, ""):
-        return ""
-    raw = str(value).strip()
-    if raw.isdigit():
-        timestamp = int(raw)
-        if timestamp > 10_000_000_000:
-            timestamp = int(timestamp / 1000)
-        try:
-            return datetime.fromtimestamp(timestamp).isoformat(timespec="seconds")
-        except (ValueError, OSError):
-            return raw
-    return raw
-
-
-def normalize_fusionsolar_alarm(row: dict[str, Any]) -> dict[str, str]:
-    alarm_name = first_non_empty(
-        row,
-        [
-            "alarmName",
-            "alarm_name",
-            "name",
-            "alarmType",
-            "alarmTypeName",
-            "faultName",
-            "eventName",
-            "cause",
-        ],
-    )
-    device_name = first_non_empty(
-        row,
-        [
-            "devName",
-            "deviceName",
-            "device_name",
-            "equipmentName",
-            "inverterName",
-            "devAlias",
-            "devTypeName",
-            "devDn",
-            "deviceDn",
-        ],
-    )
-    return {
-        "alarm_name": alarm_name or first_non_empty(row, ["alarmId", "alarm_id", "id"]) or "Alarme ativo",
-        "device_name": device_name or "Aparelho nao identificado",
-        "severity": first_non_empty(row, ["lev", "level", "severity", "alarmLevel"]),
-        "raised_at": format_fusionsolar_alarm_time(first_non_empty(row, ["raiseTime", "startTime", "occurTime", "happenTime"])),
-        "status": first_non_empty(row, ["status", "alarmStatus", "state"]),
-    }
-
-
-def summarize_fusionsolar_alarms(alarms: list[dict[str, Any]], limit: int = 3) -> dict[str, Any]:
-    normalized = [normalize_fusionsolar_alarm(alarm) for alarm in alarms if isinstance(alarm, dict)]
-    primary = normalized[0] if normalized else {}
-    summary_parts = []
-    for alarm in normalized[:limit]:
-        label = alarm["alarm_name"]
-        if alarm["device_name"]:
-            label = f"{label} @ {alarm['device_name']}"
-        if alarm["severity"]:
-            label = f"{label} (sev. {alarm['severity']})"
-        summary_parts.append(label)
-    if len(normalized) > limit:
-        summary_parts.append(f"+{len(normalized) - limit} alarmes")
-    return {
-        "primary_alarm_name": primary.get("alarm_name", ""),
-        "primary_alarm_device": primary.get("device_name", ""),
-        "primary_alarm_severity": primary.get("severity", ""),
-        "primary_alarm_raised_at": primary.get("raised_at", ""),
-        "alarm_summary": "; ".join(summary_parts),
-        "normalized_alarms": normalized,
-    }
-
-
-def fusionsolar_alarm_severity_rank(value: Any) -> int | None:
-    normalized = normalize_name(str(value or ""))
-    if not normalized:
-        return None
-    if normalized in {"1", "1.0", "critical", "critica", "critico"}:
-        return 1
-    if normalized in {"2", "2.0", "major", "alta", "maior"}:
-        return 2
-    if normalized in {"3", "3.0", "minor", "menor", "baixa"}:
-        return 3
-    if normalized in {"4", "4.0", "warning", "aviso", "alerta"}:
-        return 4
-    return None
-
-
-def derive_fusionsolar_monitoring_status(health_raw: Any, alarms: list[dict[str, Any]]) -> str:
-    status = map_fusionsolar_status(health_raw)
-    if status == "Desconectada":
-        return status
-
-    alarm_ranks = [
-        rank
-        for alarm in alarms
-        if isinstance(alarm, dict)
-        for rank in [fusionsolar_alarm_severity_rank(first_non_empty(alarm, ["lev", "level", "severity", "alarmLevel"]))]
-        if rank is not None
-    ]
-    if any(rank <= 2 for rank in alarm_ranks):
-        return "Erro"
-    if alarm_ranks:
-        return "Alerta"
-    return status
-
-
-def normalize_fusionsolar_plant_row(
-    station_row: dict[str, Any],
-    realtime_row: dict[str, Any] | None = None,
-    alarms: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    external_id = str(station_row.get("plantCode") or station_row.get("stationCode") or "").strip()
-    external_name = str(station_row.get("plantName") or station_row.get("stationName") or "").strip()
-    if not external_name:
-        raise ValueError("A resposta FusionSolar nao trouxe nome de central numa das linhas.")
-
-    data_item_map = (realtime_row or {}).get("dataItemMap") or {}
-    health_raw = data_item_map.get("real_health_state")
-    raw_status = describe_fusionsolar_health_state(health_raw)
-
-    active_alarms = alarms or []
-    status = derive_fusionsolar_monitoring_status(health_raw, active_alarms)
-    alarm_summary = summarize_fusionsolar_alarms(active_alarms)
-    alarm_levels = sorted({str(item.get("lev")) for item in active_alarms if item.get("lev") is not None})
-    notes_parts = [f"health_state={raw_status}"]
-    if active_alarms:
-        notes_parts.append(f"active_alarms={len(active_alarms)}")
-        if alarm_levels:
-            notes_parts.append(f"levels={','.join(alarm_levels)}")
-        if alarm_summary["alarm_summary"]:
-            notes_parts.append(f"alarm_details={alarm_summary['alarm_summary']}")
-
-    return {
-        "external_id": external_id,
-        "external_name": external_name,
-        "status": status,
-        "raw_status": raw_status,
-        "health_state": raw_status,
-        "alarm_count": len(active_alarms),
-        "alarm_levels": ",".join(alarm_levels),
-        "primary_alarm_name": alarm_summary["primary_alarm_name"],
-        "primary_alarm_device": alarm_summary["primary_alarm_device"],
-        "primary_alarm_severity": alarm_summary["primary_alarm_severity"],
-        "primary_alarm_raised_at": alarm_summary["primary_alarm_raised_at"],
-        "alarm_summary": alarm_summary["alarm_summary"],
-        "notes": "; ".join(notes_parts),
-        "payload": {
-            "station": station_row,
-            "realtime": realtime_row or {},
-            "alarms": active_alarms,
-            "normalized_alarms": alarm_summary["normalized_alarms"],
-        },
-    }
-
-
-def find_suggested_asset_id(conn: sqlite3.Connection, external_name: str) -> int | None:
-    normalized_name = normalize_name(external_name)
-    exact = find_asset_id(conn, external_name)
-    if exact:
-        return exact
-    candidate = conn.execute(
-        """
-        SELECT id
-        FROM assets
-        WHERE REPLACE(LOWER(project_name), ' ', '') LIKE ?
-        ORDER BY project_name COLLATE NOCASE
-        LIMIT 1
-        """,
-        (f"%{normalized_name.replace(' ', '')}%",),
-    ).fetchone()
-    return int(candidate["id"]) if candidate else None
-
-
-def parse_provider_payload_data(payload: dict[str, Any]) -> Any:
-    data = payload.get("data")
-    if isinstance(data, str):
-        try:
-            return json.loads(data)
-        except json.JSONDecodeError:
-            return data
-    return data
-
-
-def get_sigenergy_endpoint_config(config: sqlite3.Row | dict[str, Any]) -> dict[str, str]:
-    config_map = dict(config)
-    legacy_energy_flow = config_map.get("energy_flow_endpoint") or config_map.get("alarms_endpoint")
-    return {
-        "base_url": str(config_map.get("base_url") or DEFAULT_SIGENERGY_BASE_URL).strip() or DEFAULT_SIGENERGY_BASE_URL,
-        "login_endpoint": str(config_map.get("login_endpoint") or DEFAULT_SIGENERGY_AUTH_ENDPOINT).strip() or DEFAULT_SIGENERGY_AUTH_ENDPOINT,
-        "systems_endpoint": str(config_map.get("plants_endpoint") or DEFAULT_SIGENERGY_SYSTEMS_ENDPOINT).strip() or DEFAULT_SIGENERGY_SYSTEMS_ENDPOINT,
-        "energy_flow_endpoint": str(legacy_energy_flow or DEFAULT_SIGENERGY_ENERGY_FLOW_ENDPOINT).strip() or DEFAULT_SIGENERGY_ENERGY_FLOW_ENDPOINT,
-        "region": str(config_map.get("region") or DEFAULT_SIGENERGY_REGION).strip() or DEFAULT_SIGENERGY_REGION,
-    }
-
-
-def sigenergy_configured_system_ids(config: sqlite3.Row | dict[str, Any]) -> list[str]:
-    raw_value = str(dict(config).get("system_ids") or "").strip()
-    return [item.strip() for item in re.split(r"[,;\s]+", raw_value) if item.strip()]
-
-
-def build_sigenergy_service_config(config: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
-    config_map = dict(config)
-    endpoints = get_sigenergy_endpoint_config(config_map)
-    return {
-        "username": str(config_map.get("username") or "").strip(),
-        "password": str(config_map.get("password") or "").strip(),
-        "base_url": endpoints["base_url"],
-        "login_endpoint": endpoints["login_endpoint"],
-        "systems_endpoint": endpoints["systems_endpoint"],
-        "plants_endpoint": endpoints["systems_endpoint"],
-        "energy_flow_endpoint": endpoints["energy_flow_endpoint"],
-        "onboard_endpoint": str(config_map.get("onboard_endpoint") or DEFAULT_SIGENERGY_ONBOARD_ENDPOINT).strip() or DEFAULT_SIGENERGY_ONBOARD_ENDPOINT,
-        "region": endpoints["region"],
-        "system_ids": str(config_map.get("system_ids") or "").strip(),
-    }
-
-
-def normalize_sigenergy_system_rows(data: Any) -> list[dict[str, Any]]:
-    if isinstance(data, list):
-        return [row for row in data if isinstance(row, dict)]
-    if isinstance(data, dict):
-        for key in ("list", "records", "systems", "items", "systemList", "rows"):
-            rows = data.get(key)
-            if isinstance(rows, list):
-                return [row for row in rows if isinstance(row, dict)]
-        if any(key in data for key in ("systemId", "id", "systemName", "name")):
-            return [data]
-    return []
-
-
-def map_sigenergy_status(raw_status: Any, energy_flow: dict[str, Any] | None = None) -> str:
-    del energy_flow
-    return sigenergy_service.map_sigenergy_status(raw_status)
-
-
-def format_sigenergy_kw(value: Any) -> str:
-    if value in (None, ""):
-        return "N/A"
-    try:
-        return f"{float(value):g} kW"
-    except (TypeError, ValueError):
-        return "N/A"
-
-
-def format_sigenergy_pct(value: Any) -> str:
-    if value in (None, ""):
-        return "N/A"
-    try:
-        return f"{float(value):g}%"
-    except (TypeError, ValueError):
-        return "N/A"
-
-
-def build_sigenergy_monitoring_notes(row: dict[str, Any]) -> str:
-    battery_capacity = row.get("battery_capacity_kwh")
-    try:
-        has_battery = battery_capacity not in (None, "") and float(battery_capacity or 0) > 0
-    except (TypeError, ValueError):
-        has_battery = False
-    battery_value = format_sigenergy_kw(row.get("battery_power_kw")) if has_battery else "N/A"
-    soc_value = format_sigenergy_pct(row.get("battery_soc_pct")) if has_battery else "N/A"
-    return " | ".join(
-        [
-            f"PV: {format_sigenergy_kw(row.get('pv_power_kw'))}",
-            f"Carga: {format_sigenergy_kw(row.get('load_power_kw'))}",
-            f"Rede: {format_sigenergy_kw(row.get('grid_power_kw_raw'))}",
-            f"Bateria: {battery_value}",
-            f"SOC: {soc_value}",
-        ]
-    )
-
-
-SIGENERGY_SYSTEM_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-SIGENERGY_ACTIVE_ONBOARDING_STATUSES = {"requested", "already_requested", "already_requested_or_onboarded"}
-
-
-def normalize_sigenergy_system_id_for_compare(system_id: str) -> str:
-    return system_id.strip().lower()
-
-
-def validate_sigenergy_system_id(raw_system_id: str) -> str:
-    system_id = (raw_system_id or "").strip()
-    if not system_id:
-        raise ValueError("Preenche o System ID Sigenergy.")
-    if "," in system_id or ";" in system_id or any(char.isspace() for char in system_id):
-        raise ValueError("Envia apenas um System ID por pedido.")
-    if not SIGENERGY_SYSTEM_ID_PATTERN.fullmatch(system_id):
-        raise ValueError("O System ID deve ter ate 64 caracteres e usar apenas letras, numeros, hifen ou underscore.")
-    return system_id
-
-
-def upsert_sigenergy_onboarding_request(
-    conn: sqlite3.Connection,
-    *,
-    system_id: str,
-    requested_by: str,
-    result: dict[str, Any],
-) -> int:
-    normalized = normalize_sigenergy_system_id_for_compare(system_id)
-    existing = conn.execute(
-        """
-        SELECT *
-        FROM sigenergy_onboarding_requests
-        WHERE LOWER(system_id) = ? AND status IN ('requested', 'already_requested', 'already_requested_or_onboarded')
-        ORDER BY id DESC
-        LIMIT 1
-        """,
-        (normalized,),
-    ).fetchone()
-    now = datetime.now().isoformat(timespec="seconds")
-    response_json = json.dumps(sigenergy_service.sanitize_payload(result.get("response") or result), ensure_ascii=True)
-    if existing:
-        conn.execute(
-            """
-            UPDATE sigenergy_onboarding_requests
-            SET attempt_count = attempt_count + 1, provider_code = ?, provider_message = ?,
-                last_error = ?, response_json = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                result.get("provider_code", ""),
-                result.get("message", ""),
-                "" if result.get("status") != "failed" else result.get("message", ""),
-                response_json,
-                now,
-                existing["id"],
-            ),
-        )
-        return int(existing["id"])
-    cursor = conn.execute(
-        """
-        INSERT INTO sigenergy_onboarding_requests (
-            system_id, requested_at, requested_by, status, provider_code, provider_message,
-            last_checked_at, approved_at, attempt_count, last_error, response_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 1, ?, ?, ?, ?)
-        """,
-        (
-            system_id,
-            now,
-            requested_by,
-            result.get("status", "failed"),
-            result.get("provider_code", ""),
-            result.get("message", ""),
-            "" if result.get("status") != "failed" else result.get("message", ""),
-            response_json,
-            now,
-            now,
-        ),
-    )
-    return int(cursor.lastrowid)
-
-
-def create_sigenergy_onboarding_request(
-    conn: sqlite3.Connection,
-    config: dict[str, Any],
-    system_id: str,
-    requested_by: str = "",
-) -> dict[str, Any]:
-    system_id = validate_sigenergy_system_id(system_id)
-    service_config = build_sigenergy_service_config(config)
-    result = sigenergy_service.onboard_system(service_config, system_id, session=requests.Session())
-    request_id = upsert_sigenergy_onboarding_request(conn, system_id=system_id, requested_by=requested_by, result=result)
-    conn.commit()
-    return {**result, "request_id": request_id}
-
-
-def reconcile_sigenergy_onboarding_requests(conn: sqlite3.Connection, available_system_ids: list[str]) -> int:
-    normalized_available = {normalize_sigenergy_system_id_for_compare(system_id) for system_id in available_system_ids if system_id}
-    if not normalized_available:
-        return 0
-    pending = query_all(
-        conn,
-        """
-        SELECT *
-        FROM sigenergy_onboarding_requests
-        WHERE status IN ('requested', 'already_requested', 'already_requested_or_onboarded')
-        """,
-    )
-    now = datetime.now().isoformat(timespec="seconds")
-    approved_count = 0
-    for row in pending:
-        if normalize_sigenergy_system_id_for_compare(row["system_id"]) in normalized_available:
-            conn.execute(
-                """
-                UPDATE sigenergy_onboarding_requests
-                SET status = 'approved', last_checked_at = ?, approved_at = COALESCE(approved_at, ?), updated_at = ?, last_error = ''
-                WHERE id = ?
-                """,
-                (now, now, now, row["id"]),
-            )
-            approved_count += 1
-        else:
-            conn.execute(
-                "UPDATE sigenergy_onboarding_requests SET last_checked_at = ?, updated_at = ? WHERE id = ?",
-                (now, now, row["id"]),
-            )
-    return approved_count
-
-
-def cleanup_sigenergy_snapshots(conn: sqlite3.Connection, provider: str, retention_days: int) -> int:
-    retention_days = max(int(retention_days or DEFAULT_SIGENERGY_SNAPSHOT_RETENTION_DAYS), 1)
-    today_key = f"sigenergy_snapshot_cleanup_{provider}_{current_lisbon_date().isoformat()}"
-    if query_scalar(conn, "SELECT value FROM app_state WHERE key = ?", (today_key,)):
-        return 0
-    cutoff = (datetime.now() - timedelta(days=retention_days)).isoformat(timespec="seconds")
-    cursor = conn.execute(
-        """
-        DELETE FROM integration_realtime_snapshots
-        WHERE provider = ?
-          AND collected_at < ?
-          AND id NOT IN (
-              SELECT MAX(id)
-              FROM integration_realtime_snapshots
-              WHERE provider = ?
-              GROUP BY external_id
-          )
-        """,
-        (provider, cutoff, provider),
-    )
-    conn.execute(
-        "INSERT OR REPLACE INTO app_state (key, value, updated_at) VALUES (?, 'done', ?)",
-        (today_key, datetime.now().isoformat(timespec="seconds")),
-    )
-    return int(cursor.rowcount or 0)
-
-
-def normalize_sigenergy_system_row(
-    system_row: dict[str, Any],
-    realtime_row: dict[str, Any] | None = None,
-    energy_flow: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    external_id = first_non_empty(system_row, ["systemId", "id", "stationId", "plantId"])
-    if not external_id:
-        raise ValueError("A resposta Sigenergy nao trouxe systemId numa das linhas.")
-    external_name = first_non_empty(system_row, ["systemName", "name", "stationName", "plantName"]) or external_id
-    flow = energy_flow or {}
-    realtime = realtime_row or {}
-    raw_status = first_non_empty(system_row, ["status", "systemStatus", "runningStatus", "state"]) or first_non_empty(realtime, ["status", "systemStatus", "runningStatus", "state"])
-    system_normalized = sigenergy_service.normalize_system(system_row)
-    flow_normalized = sigenergy_service.normalize_energy_flow(flow)
-    status = map_sigenergy_status(raw_status, flow)
-    notes_parts = build_sigenergy_monitoring_notes({**flow_normalized, **system_normalized})
-    debug_parts = [f"system_status={raw_status or 'unknown'}"]
-    for key in ("pvPower", "gridPower", "batteryPower", "batterySoc", "loadPower"):
-        if key in flow and flow[key] not in (None, ""):
-            debug_parts.append(f"{key}={flow[key]}")
-    return {
-        "external_id": external_id,
-        "external_name": external_name,
-        "status": status,
-        "raw_status": raw_status or "unknown",
-        "notes": f"{notes_parts} | {'; '.join(debug_parts)}",
-        "fetch_status": "ok",
-        "fetch_error": "",
-        **system_normalized,
-        **flow_normalized,
-        "payload": {
-            "system": system_row,
-            "realtime": realtime,
-            "energy_flow": flow,
-        },
-    }
-
-
-def run_sigenergy_check(conn: sqlite3.Connection, provider: str, dry_run: bool = False) -> dict[str, Any]:
-    config = get_integration_config(conn, provider)
-    if config is None:
-        raise ValueError("Configuracao Sigenergy nao encontrada.")
-    endpoints = get_sigenergy_endpoint_config(config)
-    service_config = build_sigenergy_service_config(config)
-    session = requests.Session()
-    client = sigenergy_service.SigenergyClient(service_config, session=session)
-    systems = retry_api_call(client.list_systems, allow_sleep=not has_request_context(), sleeper=time.sleep)
-    available_system_ids = [first_non_empty(row, ["systemId", "id", "stationId", "plantId"]) for row in systems if first_non_empty(row, ["systemId", "id", "stationId", "plantId"])]
-    normalized_rows: list[dict[str, Any]] = []
-    energy_flow_count = 0
-    energy_flow_errors: list[str] = []
-    for system_row in systems:
-        system_id = first_non_empty(system_row, ["systemId", "id", "stationId", "plantId"])
-        if not system_id:
-            continue
-        energy_flow: dict[str, Any] = {}
-        row = normalize_sigenergy_system_row(system_row, {}, energy_flow)
-        try:
-            energy_flow = retry_api_call(
-                lambda system_id=system_id: client.get_energy_flow(system_id),
-                allow_sleep=not has_request_context(),
-                sleeper=time.sleep,
-            )
-            energy_flow_count += 1
-            row = normalize_sigenergy_system_row(system_row, {}, energy_flow)
-        except ApiRateLimitError:
-            raise
-        except Exception as exc:
-            sanitized_error = sigenergy_service.sanitize_sigenergy_error(exc)
-            energy_flow_errors.append(f"{system_id}: {sanitized_error}")
-            row["status"] = "Sem dados"
-            row["normalized_status"] = "Sem dados"
-            row["notes"] = f"Energy flow indisponivel: {sanitized_error}"
-            row["fetch_status"] = "error"
-            row["fetch_error"] = sanitized_error
-            row["payload"]["fetch_error"] = sanitized_error
-        normalized_rows.append(row)
-        time.sleep(0.2)
-
-    if not dry_run:
-        conn.execute(
-            """
-            UPDATE integration_configs
-            SET last_sync_status = ?, last_error = ?, updated_at = ?
-            WHERE provider = ?
-            """,
-            ("success", "", datetime.now().isoformat(timespec="seconds"), provider),
-        )
-        conn.commit()
-    return {
-        "rows": normalized_rows,
-        "systems": normalized_rows,
-        "station_count": len(systems),
-        "realtime_count": energy_flow_count,
-        "failed_realtime_count": len(energy_flow_errors),
-        "alarm_count": 0,
-        "alarm_error": "; ".join(energy_flow_errors),
-        "energy_flow_count": energy_flow_count,
-        "base_url": endpoints["base_url"],
-        "available_system_ids": available_system_ids,
-    }
-
-
-def run_provider_check(conn: sqlite3.Connection, provider: str, dry_run: bool = False) -> dict[str, Any]:
-    if provider == INTEGRATION_PROVIDER_SIGENERGY:
-        return run_sigenergy_check(conn, provider, dry_run=dry_run)
-    return run_fusionsolar_check(conn, provider, dry_run=dry_run)
-
-
-def find_sigenergy_asset_id(conn: sqlite3.Connection, provider: str, external_id: str, external_name: str) -> int | None:
-    mapped = conn.execute(
-        """
-        SELECT asset_id
-        FROM asset_integrations
-        WHERE provider = ? AND external_id = ? AND enabled = 1
-        LIMIT 1
-        """,
-        (provider, external_id),
-    ).fetchone()
-    if mapped:
-        return int(mapped["asset_id"])
-
-    normalized = normalize_name(external_name)
-    if not normalized:
-        return None
-
-    project_matches = [
-        int(row["id"])
-        for row in query_all(conn, "SELECT id, project_name FROM assets WHERE project_name IS NOT NULL")
-        if normalize_name(row["project_name"] or "") == normalized
-    ]
-    if len(set(project_matches)) == 1:
-        return project_matches[0]
-    if len(set(project_matches)) > 1:
-        return None
-
-    alias_matches = [
-        int(row["asset_id"])
-        for row in query_all(
-            conn,
-            "SELECT asset_id FROM asset_aliases WHERE normalized_alias = ? AND COALESCE(active, 1) = 1",
-            (normalized,),
-        )
-    ]
-    if len(set(alias_matches)) == 1:
-        return alias_matches[0]
-    if len(set(alias_matches)) > 1:
-        return None
-
-    group_matches = [
-        int(row["id"])
-        for row in query_all(conn, "SELECT id, installation_group FROM assets WHERE COALESCE(installation_group, '') != ''")
-        if normalize_name(row["installation_group"] or "") == normalized
-    ]
-    if len(set(group_matches)) == 1:
-        return group_matches[0]
-    return None
-
-
-def insert_integration_realtime_snapshot(
-    conn: sqlite3.Connection,
-    *,
-    asset_id: int | None,
-    provider: str,
-    row: dict[str, Any],
-    collected_at: str,
-) -> None:
-    conn.execute(
-        """
-        INSERT INTO integration_realtime_snapshots (
-            asset_id, provider, external_id, collected_at, external_status, normalized_status,
-            pv_power_kw, load_power_kw, grid_power_kw_raw, battery_power_kw, battery_soc_pct,
-            ev_power_kw, ac_power_kw, heat_pump_power_kw, pv_capacity_kw, battery_capacity_kwh, payload_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            asset_id,
-            provider,
-            row["external_id"],
-            collected_at,
-            row.get("raw_status"),
-            row.get("status"),
-            row.get("pv_power_kw"),
-            row.get("load_power_kw"),
-            row.get("grid_power_kw_raw"),
-            row.get("battery_power_kw"),
-            row.get("battery_soc_pct"),
-            row.get("ev_power_kw"),
-            row.get("ac_power_kw"),
-            row.get("heat_pump_power_kw"),
-            row.get("pv_capacity_kw"),
-            row.get("battery_capacity_kwh"),
-            json.dumps(
-                {
-                    **(row.get("payload") or {}),
-                    "fetch_status": row.get("fetch_status", "ok"),
-                    "fetch_error": row.get("fetch_error", ""),
-                },
-                ensure_ascii=True,
-            ),
-        ),
-    )
-
-
-def run_sigenergy_sync(conn: sqlite3.Connection, provider: str = "Sigenergy", trigger_type: str = "manual") -> dict[str, Any]:
-    with SIGENERGY_SYNC_LOCK:
-        config = get_integration_config(conn, provider)
-        if config is None:
-            raise ValueError("Configuracao Sigenergy nao encontrada.")
-        if not config["enabled"]:
-            raise ValueError("A integracao Sigenergy esta desativada.")
-
-        run_id = create_integration_run(conn, provider, trigger_type)
-        batch_id = create_monitoring_batch(
-            conn,
-            record_date=current_lisbon_date().isoformat(),
-            default_notes=f"Sync {provider} ({trigger_type})",
-            raw_input="",
-            source=provider,
-        )
-        try:
-            result = run_provider_check(conn, provider, dry_run=True)
-            rows = result["rows"]
-            reconcile_sigenergy_onboarding_requests(conn, result.get("available_system_ids", []))
-            matched = 0
-            unresolved = 0
-            synced_asset_ids: set[int] = set()
-            alert_events: list[dict[str, Any]] = []
-            now = datetime.now()
-            collected_at = now.isoformat(timespec="seconds")
-
-            for row in rows:
-                asset_id = find_sigenergy_asset_id(conn, provider, row["external_id"], row["external_name"])
-                insert_integration_realtime_snapshot(conn, asset_id=asset_id, provider=provider, row=row, collected_at=collected_at)
-                if row.get("fetch_status") == "error":
-                    if asset_id:
-                        conn.execute(
-                            """
-                            UPDATE asset_integrations
-                            SET last_error = ?, last_sync_at = ?
-                            WHERE provider = ? AND external_id = ?
-                            """,
-                            (row.get("fetch_error", ""), collected_at, provider, row["external_id"]),
-                        )
-                    continue
-                if asset_id:
-                    synced_asset_ids.add(asset_id)
-                    previous = get_latest_monitoring_row(conn, asset_id)
-                    duplicate_latest = (
-                        previous is not None
-                        and previous["status"] == row["status"]
-                        and previous["record_date"] == current_lisbon_date().isoformat()
-                        and previous["source"] == provider
-                    )
-                    if not duplicate_latest:
-                        conn.execute(
-                            """
-                            INSERT INTO monitoring_records (asset_id, status, record_date, notes, source, batch_id)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                            """,
-                            (
-                                asset_id,
-                                row["status"],
-                                current_lisbon_date().isoformat(),
-                                row["notes"],
-                                provider,
-                                batch_id,
-                            ),
-                        )
-                        event = build_monitoring_alert_event(
-                            conn,
-                            asset_id=asset_id,
-                            previous_status=previous["status"] if previous else "",
-                            current_status=row["status"],
-                            happened_at=collected_at,
-                            alarm_context=row,
-                        )
-                        if event:
-                            alert_events.append(event)
-                    create_or_update_asset_integration(conn, asset_id, provider, row["external_id"], row["external_name"], row["status"])
-                    matched += 1
-                else:
-                    upsert_integration_unresolved(
-                        conn,
-                        provider=provider,
-                        run_id=run_id,
-                        external_id=row["external_id"],
-                        external_name=row["external_name"],
-                        status=row["status"],
-                        payload=row["payload"],
-                    )
-                    unresolved += 1
-
-            conn.execute(
-                """
-                UPDATE monitoring_import_batches
-                SET imported_count = ?, matched_count = ?, unmatched_count = ?, auto_resolved_count = 0
-                WHERE id = ?
-                """,
-                (matched + unresolved, matched, unresolved, batch_id),
-            )
-            failed_realtime_count = int(result.get("failed_realtime_count", 0) or 0)
-            sync_status = "partial" if failed_realtime_count else "success"
-            sync_error = sigenergy_service.sanitize_sigenergy_error(result.get("alarm_error", ""))
-            conn.execute(
-                """
-                UPDATE integration_configs
-                SET last_sync_at = ?, last_sync_status = ?, last_error = ?, updated_at = ?
-                WHERE provider = ?
-                """,
-                (collected_at, sync_status, sync_error, collected_at, provider),
-            )
-            finalize_integration_run(
-                conn,
-                run_id,
-                status=sync_status,
-                matched_count=matched,
-                unresolved_count=unresolved,
-                auto_resolved_count=0,
-                summary_json={
-                    "provider_rows": len(rows),
-                    "station_rows": result.get("station_count", len(rows)),
-                    "realtime_rows": result.get("realtime_count", 0),
-                    "failed_realtime_rows": failed_realtime_count,
-                    "energy_flow_error": sync_error,
-                },
-            )
-            try:
-                cleanup_sigenergy_snapshots(conn, provider, int(config.get("snapshot_retention_days") or DEFAULT_SIGENERGY_SNAPSHOT_RETENTION_DAYS))
-            except Exception as cleanup_exc:
-                LOGGER.warning("Sigenergy snapshot cleanup failed: %s", sigenergy_service.sanitize_sigenergy_error(cleanup_exc))
-            process_monitoring_alerts(conn, alert_events, batch_id, now)
-            conn.commit()
-            return {"matched": matched, "unresolved": unresolved, "auto_resolved": 0, "snapshots": len(rows), "status": sync_status}
-        except ApiRateLimitError as exc:
-            until = mark_api_cooldown(
-                conn,
-                provider,
-                API_AREA_STATE,
-                exc.message,
-                cooldown_until=exc.cooldown_until,
-            )
-            notify_api_rate_limit(conn, provider, API_AREA_STATE, until, exc.message)
-            sanitized_error = sigenergy_service.sanitize_sigenergy_error(exc.message)
-            conn.execute(
-                """
-                UPDATE integration_configs
-                SET last_sync_status = 'waiting_rate_limit', last_error = ?, updated_at = ?
-                WHERE provider = ?
-                """,
-                (sanitized_error, datetime.now().isoformat(timespec="seconds"), provider),
-            )
-            finalize_integration_run(
-                conn,
-                run_id,
-                status="waiting_rate_limit",
-                matched_count=0,
-                unresolved_count=0,
-                auto_resolved_count=0,
-                error_message=sanitized_error,
-            )
-            conn.commit()
-            raise ApiRateLimitError(provider, API_AREA_STATE, until, get_provider_cooldown_reason(conn, provider, API_AREA_STATE)) from exc
-        except Exception as exc:
-            sanitized_error = sigenergy_service.sanitize_sigenergy_error(exc)
-            conn.execute(
-                """
-                UPDATE integration_configs
-                SET last_sync_status = 'error', last_error = ?, updated_at = ?
-                WHERE provider = ?
-                """,
-                (sanitized_error, datetime.now().isoformat(timespec="seconds"), provider),
-            )
-            finalize_integration_run(
-                conn,
-                run_id,
-                status="error",
-                matched_count=0,
-                unresolved_count=0,
-                auto_resolved_count=0,
-                error_message=sanitized_error,
-            )
-            conn.commit()
-            raise
-
-
-def load_local_fusionsolar_stations(
-    conn: sqlite3.Connection,
-    provider: str = INTEGRATION_PROVIDER_FUSIONSOLAR,
-) -> list[dict[str, Any]]:
-    rows = conn.execute(
-        """
-        SELECT ai.external_id, ai.external_name, a.project_name
-        FROM asset_integrations ai
-        JOIN assets a ON a.id = ai.asset_id
-        WHERE ai.provider = ?
-          AND ai.enabled = 1
-          AND COALESCE(ai.external_id, '') != ''
-          AND COALESCE(a.monitoring_status, 'active') != 'disabled'
-        ORDER BY a.project_name COLLATE NOCASE
-        """,
-        (provider,),
-    ).fetchall()
-    return [
-        {
-            "plantCode": str(row["external_id"]),
-            "plantName": str(
-                row["external_name"] or row["project_name"] or row["external_id"]
-            ),
-        }
-        for row in rows
-    ]
-
-
-def run_fusionsolar_check(
-    conn: sqlite3.Connection,
-    provider: str,
-    dry_run: bool = False,
-    include_diagnostics: bool = True,
-    prefer_local_station_inventory: bool = False,
-) -> dict[str, Any]:
-    config = get_integration_config(conn, provider)
-    if config is None:
-        raise ValueError("Configuracao FusionSolar nao encontrada.")
-    endpoints = get_fusionsolar_endpoint_config(config)
-    if not endpoints["base_url"]:
-        raise ValueError("Falta a Base URL do FusionSolar.")
-
-    last_error: Exception | None = None
-    for attempt in range(2):
-        try:
-            session, _ = get_fusionsolar_session(config, force_login=attempt == 1)
-            inventory_date = get_app_state_value(
-                conn,
-                FUSIONSOLAR_STATION_INVENTORY_DATE_KEY,
-            )
-            use_local_inventory = (
-                prefer_local_station_inventory
-                and inventory_date == current_lisbon_date().isoformat()
-            )
-            stations = (
-                load_local_fusionsolar_stations(conn, provider)
-                if use_local_inventory
-                else []
-            )
-            station_list_api_calls = 0
-            if not stations:
-                stations = fetch_fusionsolar_stations(
-                    session,
-                    base_url=endpoints["base_url"],
-                    endpoint=endpoints["plants_endpoint"],
-                )
-                station_list_api_calls = max(1, math.ceil(len(stations) / 100))
-                set_app_state_value(
-                    conn,
-                    FUSIONSOLAR_STATION_INVENTORY_DATE_KEY,
-                    current_lisbon_date().isoformat(),
-                )
-                conn.commit()
-            if not stations:
-                raise ValueError("A API FusionSolar nao devolveu centrais para esta conta.")
-
-            station_codes = [
-                str(row.get("plantCode") or row.get("stationCode") or "").strip()
-                for row in stations
-                if str(row.get("plantCode") or row.get("stationCode") or "").strip()
-            ]
-            realtime_map = fetch_fusionsolar_realtime_map(
-                session,
-                base_url=endpoints["base_url"],
-                endpoint=endpoints["real_time_endpoint"],
-                station_codes=station_codes,
-            )
-            alarm_map: dict[str, list[dict[str, Any]]] = {}
-            alarm_error = ""
-            if include_diagnostics:
-                try:
-                    alarm_map = fetch_fusionsolar_alarm_map(
-                        session,
-                        base_url=endpoints["base_url"],
-                        endpoint=endpoints["alarms_endpoint"],
-                        station_codes=station_codes,
-                    )
-                except ApiRateLimitError:
-                    raise
-                except Exception as exc:
-                    alarm_error = str(exc)
-            normalized_rows = [
-                normalize_fusionsolar_plant_row(
-                    station_row,
-                    realtime_map.get(str(station_row.get("plantCode") or station_row.get("stationCode") or "").strip()),
-                    alarm_map.get(str(station_row.get("plantCode") or station_row.get("stationCode") or "").strip(), []),
-                )
-                for station_row in stations
-            ]
-            break
-        except Exception as exc:
-            last_error = exc
-            if not is_fusionsolar_session_expired_error(exc) or attempt == 1:
-                raise
-            LOGGER.info("FusionSolar session expired; invalidating cache and retrying login once")
-            invalidate_fusionsolar_session(config)
-    else:
-        raise last_error or ValueError("Falha desconhecida no FusionSolar.")
-
-    if not dry_run:
-        conn.execute(
-            """
-            UPDATE integration_configs
-            SET last_sync_status = ?, last_error = ?, updated_at = ?
-            WHERE provider = ?
-            """,
-            ("success", "", datetime.now().isoformat(timespec="seconds"), provider),
-        )
-        conn.commit()
-    return {
-        "rows": normalized_rows,
-        "station_count": len(stations),
-        "realtime_count": len(realtime_map),
-        "alarm_count": sum(len(items) for items in alarm_map.values()),
-        "alarm_error": alarm_error,
-        "station_inventory_source": (
-            "local" if use_local_inventory else "api"
-        ),
-        "api_calls_used": (
-            station_list_api_calls
-            + math.ceil(len(station_codes) / 100)
-            + (
-                math.ceil(len(station_codes) / 100)
-                if include_diagnostics
-                else 0
-            )
-        ),
-    }
-
-
-def run_fusionsolar_production_sync(
-    conn: sqlite3.Connection,
-    provider: str = "FusionSolar",
-    target_date: date | None = None,
-    period_type: str = "day",
-) -> dict[str, Any]:
-    if period_type not in {"day", "month"}:
-        raise ValueError("Periodo invalido para performance.")
-    if target_date is None:
-        target_date = date.today() - timedelta(days=1)
-    if period_type == "month":
-        target_date = target_date.replace(day=1)
-
-    if not FUSIONSOLAR_SYNC_LOCK.acquire(blocking=False):
-        message = "Sincronizacao FusionSolar ignorada porque ja existe outra em curso."
-        LOGGER.info(message)
-        return {"processed": 0, "missing_data": 0, "no_reference": 0, "period_date": target_date.isoformat(), "stopped_reason": message}
-
-    with release_fusionsolar_sync_lock():
-        config = get_integration_config(conn, provider)
-        if config is None:
-            raise ValueError("Configuracao FusionSolar nao encontrada.")
-        if not config["enabled"]:
-            raise ValueError("A integracao FusionSolar esta desativada.")
-        endpoints = get_fusionsolar_endpoint_config(config)
-        if not endpoints["base_url"]:
-            raise ValueError("Falta a Base URL do FusionSolar.")
-
-        mapped_assets = query_all(
-            conn,
-            """
-            SELECT
-                a.id AS asset_id,
-                a.project_name,
-                a.kwp,
-                ai.external_id,
-                COALESCE(ps.enabled, 1) AS performance_enabled,
-                ps.warning_deviation_pct,
-                ps.alert_deviation_pct,
-                ps.critical_deviation_pct,
-                ps.baseline_years,
-                ps.min_baseline_points,
-                ps.monthly_budget_json
-            FROM asset_integrations ai
-            JOIN assets a ON a.id = ai.asset_id
-            LEFT JOIN performance_settings ps ON ps.asset_id = a.id
-            WHERE ai.provider = ?
-              AND ai.enabled = 1
-              AND COALESCE(ai.external_id, '') != ''
-              AND COALESCE(a.monitoring_status, 'active') != 'disabled'
-              AND COALESCE(ps.enabled, 1) = 1
-            ORDER BY a.project_name COLLATE NOCASE
-            """,
-            (provider,),
-        )
-        if not mapped_assets:
-            return {"processed": 0, "missing_data": 0, "no_reference": 0, "period_date": target_date.isoformat()}
-
-        already_valid_asset_ids = {
-            int(item["asset_id"])
-            for item in query_all(
-                conn,
-                """
-                SELECT asset_id
-                FROM production_records
-                WHERE provider = ? AND period_type = ? AND period_date = ?
-                  AND production_kwh IS NOT NULL
-                """,
-                (provider, period_type, target_date.isoformat()),
-            )
-        }
-        mapped_assets = [
-            row
-            for row in mapped_assets
-            if int(row["asset_id"]) not in already_valid_asset_ids
-        ]
-        station_codes = [
-            str(row["external_id"]).strip()
-            for row in mapped_assets
-            if str(row["external_id"] or "").strip()
-        ]
-        if not station_codes:
-            return {
-                "processed": 0,
-                "missing_data": 0,
-                "no_reference": 0,
-                "period_date": target_date.isoformat(),
-                "skipped_complete": len(already_valid_asset_ids),
-            }
-        session_obj, _ = get_fusionsolar_session(config)
-        endpoint_used = (
-            endpoints["month_kpi_endpoint"]
-            if period_type == "month"
-            else endpoints["day_kpi_endpoint"]
-        )
-        kpi_map: dict[str, dict[str, Any]] = {}
-        requested_station_codes: set[str] = set()
-        deferred_slot_error: ApiSlotUnavailableError | None = None
-        for station_group in chunked(station_codes, 100):
-            retry_after_relogin = False
-            while True:
-                try:
-                    if period_type == "month":
-                        chunk_map = fetch_fusionsolar_kpi_month_map(
-                            session_obj,
-                            endpoints["base_url"],
-                            endpoint_used,
-                            station_group,
-                            target_date,
-                        )
-                    else:
-                        chunk_map = fetch_fusionsolar_kpi_day_map(
-                            session_obj,
-                            endpoints["base_url"],
-                            endpoint_used,
-                            station_group,
-                            target_date,
-                        )
-                    kpi_map.update(chunk_map)
-                    requested_station_codes.update(station_group)
-                    break
-                except ApiSlotUnavailableError as exc:
-                    deferred_slot_error = exc
-                    break
-                except Exception as exc:
-                    if is_fusionsolar_session_expired_error(exc) and not retry_after_relogin:
-                        LOGGER.info("FusionSolar production session expired; invalidating cache and retrying login once")
-                        retry_after_relogin = True
-                        invalidate_fusionsolar_session(config)
-                        session_obj, _ = get_fusionsolar_session(config, force_login=True)
-                        continue
-                    if isinstance(exc, (ApiRateLimitError, ApiSlotUnavailableError)):
-                        raise
-                    if is_fusionsolar_rate_limit_error(exc):
-                        reason = mark_fusionsolar_performance_rate_limited(conn)
-                        conn.commit()
-                        return {
-                            "processed": 0,
-                            "missing_data": 0,
-                            "no_reference": 0,
-                            "period_date": target_date.isoformat(),
-                            "stopped_reason": reason,
-                        }
-                    raise
-            if deferred_slot_error is not None:
-                break
-        processed = 0
-        missing_data = 0
-        no_reference = 0
-        with_production = 0
-        for row in mapped_assets:
-            asset_id = int(row["asset_id"])
-            external_id = str(row["external_id"] or "").strip()
-            if external_id not in requested_station_codes:
-                continue
-            kpi_row = kpi_map.get(external_id, {})
-            data_item_map = kpi_row.get("dataItemMap") if isinstance(kpi_row, dict) else {}
-            if not isinstance(data_item_map, dict):
-                data_item_map = {}
-            production_kwh, selected_key, selected_raw_value = select_production_value(data_item_map)
-            if production_kwh is not None:
-                with_production += 1
-            kwp = parse_kwp_value(row["kwp"])
-            specific_yield = calculate_specific_yield(production_kwh, kwp)
-            settings = get_performance_settings(conn, asset_id)
-            settings.update({key: row[key] for key in row.keys() if key in settings and row[key] is not None})
-
-            expected_kwh, expected_specific_yield, expected_source, baseline_quality = calculate_expected_production(
-                conn,
-                asset_id=asset_id,
-                provider=provider,
-                period_type=period_type,
-                period_date=target_date,
-                kwp=kwp,
-                settings=settings,
-            )
-            performance_status, data_quality, deviation_pct = classify_performance_status(
-                production_kwh,
-                kwp,
-                expected_kwh,
-                warning_deviation_pct=float(settings.get("warning_deviation_pct") or -10),
-                alert_deviation_pct=float(settings.get("alert_deviation_pct") or -20),
-                critical_deviation_pct=float(settings.get("critical_deviation_pct") or -30),
-            )
-            if data_quality == "ok" and baseline_quality == "partial_history" and expected_source == "none":
-                data_quality = "partial_history"
-            if performance_status == "Sem dados":
-                missing_data += 1
-            if performance_status == "Sem referÃªncia":
-                no_reference += 1
-
-            notes_parts = []
-            if production_kwh is None:
-                notes_parts.append(
-                    build_missing_production_note(
-                        data_item_map,
-                        station_code=external_id,
-                        period_type=period_type,
-                        period_date=target_date,
-                    )
-                )
-            if kwp is None:
-                notes_parts.append("kWp local em falta ou invalido.")
-            if expected_source == "none":
-                notes_parts.append("Sem histÃ³rico ou orÃ§amento mensal para referÃªncia.")
-            upsert_production_record(
-                conn,
-                asset_id=asset_id,
-                provider=provider,
-                external_id=external_id,
-                period_type=period_type,
-                period_date=target_date,
-                production_kwh=production_kwh,
-                specific_yield=specific_yield,
-                expected_kwh=expected_kwh,
-                expected_specific_yield=expected_specific_yield,
-                deviation_pct=deviation_pct,
-                performance_status=performance_status,
-                expected_source=expected_source,
-                data_quality=data_quality,
-                notes=" ".join(notes_parts),
-                payload_json=str(kpi_row.get("payload_json") or json.dumps(kpi_row, ensure_ascii=True)),
-                selected_production_key=selected_key,
-                selected_production_raw_value=selected_raw_value,
-            )
-            processed += 1
-
-        recalculate_performance_references(
-            conn,
-            period_type=period_type,
-            period_date=target_date,
-            provider=provider,
-        )
-        logger = current_app.logger if has_app_context() else logging.getLogger(__name__)
-        logger.info(
-            "FusionSolar performance sync: requested_station_codes=%s endpoint=%s period_type=%s target_date=%s api_rows=%s with_production=%s missing_production=%s",
-            len(station_codes),
-            endpoint_used,
-            period_type,
-            target_date.isoformat(),
-            len(kpi_map),
-            with_production,
-            missing_data,
-        )
-        conn.commit()
-        if deferred_slot_error is not None:
-            raise deferred_slot_error
-        return {
-            "processed": processed,
-            "missing_data": missing_data,
-            "no_reference": no_reference,
-            "period_date": target_date.isoformat(),
-        }
-
-
-def iter_daily_backfill_dates(from_year: int, to_year: int, *, today_value: date | None = None) -> list[date]:
-    today_value = today_value or date.today()
-    cursor = date(from_year, 1, 1)
-    end_date = min(date(to_year, 12, 31), today_value - timedelta(days=1))
-    days: list[date] = []
-    while cursor <= end_date:
-        days.append(cursor)
-        cursor += timedelta(days=1)
-    return days
-
-
-def iter_daily_backfill_months(
-    from_year: int,
-    to_year: int,
-    *,
-    today_value: date | None = None,
-    date_from: date | None = None,
-    date_to: date | None = None,
-) -> list[date]:
-    today_value = today_value or date.today()
-    start_date = date_from or date(from_year, 1, 1)
-    end_date = date_to or date(to_year, 12, 31)
-    end_date = min(end_date, today_value - timedelta(days=1))
-    if start_date > end_date:
-        return []
-    cursor = start_date.replace(day=1)
-    end_month = end_date.replace(day=1)
-    months: list[date] = []
-    while cursor <= end_month:
-        months.append(cursor)
-        year = cursor.year + (1 if cursor.month == 12 else 0)
-        month = 1 if cursor.month == 12 else cursor.month + 1
-        cursor = date(year, month, 1)
-    return months
-
-
-def date_in_backfill_window(
-    candidate: date,
-    *,
-    from_year: int,
-    to_year: int,
-    today_value: date,
-    date_from: date | None = None,
-    date_to: date | None = None,
-) -> bool:
-    start_date = date_from or date(from_year, 1, 1)
-    end_date = date_to or date(to_year, 12, 31)
-    end_date = min(end_date, today_value - timedelta(days=1))
-    return start_date <= candidate <= end_date
-
-
-def iter_monthly_backfill_dates(from_year: int, to_year: int, *, today_value: date | None = None) -> list[date]:
-    today_value = today_value or date.today()
-    current_month = today_value.replace(day=1)
-    months: list[date] = []
-    for year in range(from_year, to_year + 1):
-        for month in range(1, 13):
-            period_date = date(year, month, 1)
-            if period_date >= current_month:
-                continue
-            months.append(period_date)
-    return months
-
-
-def get_fusionsolar_performance_assets(
-    conn: sqlite3.Connection,
-    provider: str,
-    asset_id: int | None = None,
-    asset_ids: list[int] | None = None,
-) -> list[sqlite3.Row]:
-    conditions = [
-        "ai.provider = ?",
-        "ai.enabled = 1",
-        "COALESCE(ai.external_id, '') != ''",
-        "COALESCE(a.monitoring_status, 'active') != 'disabled'",
-        "COALESCE(ps.enabled, 1) = 1",
-    ]
-    params: list[Any] = [provider]
-    if asset_id:
-        conditions.append("a.id = ?")
-        params.append(asset_id)
-    if asset_ids:
-        placeholders = ", ".join("?" for _ in asset_ids)
-        conditions.append(f"a.id IN ({placeholders})")
-        params.extend(asset_ids)
-    return query_all(
-        conn,
-        f"""
-        SELECT
-            a.id AS asset_id,
-            a.project_name,
-            a.kwp,
-            ai.external_id,
-            COALESCE(ps.enabled, 1) AS performance_enabled,
-            ps.warning_deviation_pct,
-            ps.alert_deviation_pct,
-            ps.critical_deviation_pct,
-            ps.baseline_years,
-            ps.min_baseline_points,
-            ps.monthly_budget_json
-        FROM asset_integrations ai
-        JOIN assets a ON a.id = ai.asset_id
-        LEFT JOIN performance_settings ps ON ps.asset_id = a.id
-        WHERE {" AND ".join(conditions)}
-        ORDER BY a.project_name COLLATE NOCASE
-        """,
-        params,
-    )
-
-
-def recalculate_production_expectations(
-    conn: sqlite3.Connection,
-    *,
-    provider: str,
-    asset_ids: list[int],
-    period_type: str | None = None,
-) -> int:
-    if not asset_ids:
-        return 0
-    total = 0
-    for asset_id in asset_ids:
-        summary = recalculate_performance_references(
-            conn,
-            period_type=period_type,
-            asset_id=asset_id,
-            provider=provider,
-        )
-        total += summary["records_processed"]
-    return total
-
-
-def recalculate_performance_references(
-    conn: sqlite3.Connection,
-    period_type: str | None = None,
-    period_date: date | str | None = None,
-    asset_id: int | None = None,
-    provider: str = "FusionSolar",
-    today_value: date | None = None,
-) -> dict[str, int]:
-    conditions = ["pr.provider = ?"]
-    params: list[Any] = [provider]
-    if period_type:
-        conditions.append("pr.period_type = ?")
-        params.append(period_type)
-    if period_date:
-        normalized_date = period_date.isoformat() if isinstance(period_date, date) else str(period_date)
-        conditions.append("pr.period_date = ?")
-        params.append(normalized_date)
-    if asset_id:
-        conditions.append("pr.asset_id = ?")
-        params.append(asset_id)
-    rows = query_all(
-        conn,
-        f"""
-        SELECT
-            pr.*,
-            a.project_name,
-            a.kwp,
-            ps.warning_deviation_pct,
-            ps.alert_deviation_pct,
-            ps.critical_deviation_pct,
-            ps.baseline_years,
-            ps.min_baseline_points,
-            ps.monthly_budget_json
-        FROM production_records pr
-        JOIN assets a ON a.id = pr.asset_id
-        LEFT JOIN performance_settings ps ON ps.asset_id = pr.asset_id
-        WHERE {" AND ".join(conditions)}
-        ORDER BY pr.period_date ASC, pr.id ASC
-        """,
-        params,
-    )
-    summary = {
-        "records_processed": 0,
-        "references_created": 0,
-        "still_without_reference": 0,
-        "missing_kwp": 0,
-        "missing_production": 0,
-    }
-    for row in rows:
-        target_date = parse_date_value(row["period_date"])
-        if target_date is None:
-            continue
-        kwp = parse_kwp_value(row["kwp"])
-        settings = get_performance_settings(conn, int(row["asset_id"]))
-        settings.update({key: row[key] for key in row.keys() if key in settings and row[key] is not None})
-        reference_result = calculate_expected_production_with_diagnostic(
-            conn,
-            asset_id=int(row["asset_id"]),
-            provider=provider,
-            period_type=row["period_type"],
-            period_date=target_date,
-            kwp=kwp,
-            settings=settings,
-            asset_name=row["project_name"],
-            today_value=today_value,
-        )
-        expected_kwh = reference_result["expected_kwh"]
-        expected_specific_yield = reference_result["expected_specific_yield"]
-        expected_source = reference_result["expected_source"]
-        performance_status, data_quality, deviation_pct = classify_performance_status(
-            row["production_kwh"],
-            kwp,
-            expected_kwh,
-            warning_deviation_pct=float(settings.get("warning_deviation_pct") or -10),
-            alert_deviation_pct=float(settings.get("alert_deviation_pct") or -20),
-            critical_deviation_pct=float(settings.get("critical_deviation_pct") or -30),
-        )
-        if data_quality == "ok" and reference_result["quality"] == "partial_history" and expected_source == "none":
-            data_quality = "partial_history"
-        notes = row["notes"] or ""
-        reason = reference_result["diagnostic"].get("no_reference_reason") or ""
-        if reason and reason not in notes:
-            notes = f"{notes} {reason}".strip()
-        conn.execute(
-            """
-            UPDATE production_records
-            SET expected_kwh = ?, expected_specific_yield = ?, deviation_pct = ?,
-                performance_status = ?, expected_source = ?, data_quality = ?,
-                reference_diagnostic_json = ?, notes = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                expected_kwh,
-                expected_specific_yield,
-                deviation_pct,
-                performance_status,
-                expected_source,
-                data_quality,
-                json.dumps(reference_result["diagnostic"], ensure_ascii=True),
-                notes,
-                datetime.now().isoformat(timespec="seconds"),
-                row["id"],
-            ),
-        )
-        summary["records_processed"] += 1
-        if expected_kwh is not None and expected_specific_yield is not None:
-            summary["references_created"] += 1
-        else:
-            summary["still_without_reference"] += 1
-        if kwp is None:
-            summary["missing_kwp"] += 1
-        if row["production_kwh"] is None:
-            summary["missing_production"] += 1
-    conn.commit()
-    return summary
-
-
-def _run_fusionsolar_production_backfill_legacy(
-    conn: sqlite3.Connection,
-    *,
-    provider: str = "FusionSolar",
-    period_type: str = "day",
-    from_year: int,
-    to_year: int,
-    asset_id: int | None = None,
-    today_value: date | None = None,
-    date_from: date | None = None,
-    date_to: date | None = None,
-    max_days: int | None = None,
-) -> dict[str, Any]:
-    if period_type not in {"day", "month"}:
-        raise ValueError("Tipo de perÃ­odo invÃ¡lido.")
-    if from_year > to_year:
-        raise ValueError("Ano inicial nao pode ser superior ao ano final.")
-    if (to_year - from_year + 1) > 3:
-        raise ValueError("Intervalo superior a 3 anos. Reduz o perÃ­odo para executar o backfill.")
-
-    today_value = today_value or date.today()
-    config = get_integration_config(conn, provider)
-    if config is None:
-        raise ValueError("Configuracao FusionSolar nao encontrada.")
-    if not config["enabled"]:
-        raise ValueError("A integracao FusionSolar esta desativada.")
-    endpoints = get_fusionsolar_endpoint_config(config)
-    assets = get_fusionsolar_performance_assets(conn, provider, asset_id)
-    dates = (
-        iter_daily_backfill_dates(from_year, to_year, today_value=today_value)
-        if period_type == "day"
-        else iter_monthly_backfill_dates(from_year, to_year, today_value=today_value)
-    )
-    if period_type == "day":
-        if date_from is not None:
-            dates = [candidate for candidate in dates if candidate >= date_from]
-        if date_to is not None:
-            dates = [candidate for candidate in dates if candidate <= date_to]
-        if max_days is not None and max_days > 0:
-            dates = dates[:max_days]
-
-    summary = {
-        "assets_processed": 0,
-        "records_updated": 0,
-        "missing_production": 0,
-        "api_errors": 0,
-        "mtd_records_updated": 0,
-        "baselines_recalculated": 0,
-        "references_created": 0,
-        "still_without_reference": 0,
-    }
-    logger = current_app.logger if has_app_context() else logging.getLogger(__name__)
-    session_obj, _ = get_fusionsolar_session(config)
-
-    for asset in assets:
-        summary["assets_processed"] += 1
-        external_id = str(asset["external_id"] or "").strip()
-        for period_date in dates:
-            try:
-                if period_type == "month":
-                    kpi_map = fetch_fusionsolar_kpi_month_map(
-                        session_obj,
-                        endpoints["base_url"],
-                        endpoints["month_kpi_endpoint"],
-                        [external_id],
-                        period_date,
-                    )
-                else:
-                    kpi_map = fetch_fusionsolar_kpi_day_map(
-                        session_obj,
-                        endpoints["base_url"],
-                        endpoints["day_kpi_endpoint"],
-                        [external_id],
-                        period_date,
-                    )
-                result = store_production_kpi_record(
-                    conn,
-                    asset_row=asset,
-                    provider=provider,
-                    external_id=external_id,
-                    period_type=period_type,
-                    period_date=period_date,
-                    kpi_row=kpi_map.get(external_id, {}),
-                    notes_prefix="Backfill histÃ³rico.",
-                )
-                summary["records_updated"] += 1
-                if result["production_kwh"] is None:
-                    summary["missing_production"] += 1
-            except Exception as exc:
-                summary["api_errors"] += 1
-                if isinstance(exc, ApiSlotUnavailableError):
-                    raise
-                logger.warning(
-                    "FusionSolar performance backfill failed: asset_id=%s stationCode=%s period_type=%s period_date=%s error=%s",
-                    asset["asset_id"],
-                    external_id,
-                    period_type,
-                    period_date.isoformat(),
-                    exc,
-                )
-                continue
-
-    selected_asset_ids = [int(asset["asset_id"]) for asset in assets]
-    recalc_targets = dates if period_type == "month" else ([max(dates)] if dates else [])
-    if not summary["stopped_reason"]:
-        for target in recalc_targets:
-            recalc = recalculate_performance_references(
-                conn,
-                period_type=period_type,
-                period_date=target,
-                asset_id=asset_id,
-                provider=provider,
-                today_value=today_value,
-            )
-            summary["baselines_recalculated"] += recalc["records_processed"]
-            summary["references_created"] += recalc["references_created"]
-            summary["still_without_reference"] += recalc["still_without_reference"]
-
-    current_month = today_value.replace(day=1)
-    if selected_asset_ids:
-        for asset in assets:
-            external_id = str(asset["external_id"] or "").strip()
-            try:
-                kpi_map = fetch_fusionsolar_kpi_month_map(
-                    session_obj,
-                    endpoints["base_url"],
-                    endpoints["month_kpi_endpoint"],
-                    [external_id],
-                    current_month,
-                )
-                store_production_kpi_record(
-                    conn,
-                    asset_row=asset,
-                    provider=provider,
-                    external_id=external_id,
-                    period_type="mtd",
-                    period_date=current_month,
-                    kpi_row=kpi_map.get(external_id, {}),
-                    notes_prefix="MTD recalculado apÃ³s backfill.",
-                )
-                summary["mtd_records_updated"] += 1
-            except Exception as exc:
-                summary["api_errors"] += 1
-                if isinstance(exc, ApiSlotUnavailableError):
-                    raise
-                logger.warning(
-                    "FusionSolar MTD recalculation failed after backfill: asset_id=%s stationCode=%s error=%s",
-                    asset["asset_id"],
-                    external_id,
-                    exc,
-                )
-        recalc = recalculate_performance_references(
-            conn,
-            period_type="mtd",
-            period_date=current_month,
-            asset_id=asset_id,
-            provider=provider,
-            today_value=today_value,
-        )
-        summary["baselines_recalculated"] += recalc["records_processed"]
-        summary["references_created"] += recalc["references_created"]
-        summary["still_without_reference"] += recalc["still_without_reference"]
-    conn.commit()
-    return summary
-
-
-def run_fusionsolar_production_backfill(
-    conn: sqlite3.Connection,
-    *,
-    provider: str = "FusionSolar",
-    period_type: str = "day",
-    from_year: int,
-    to_year: int,
-    asset_id: int | None = None,
-    today_value: date | None = None,
-    date_from: date | None = None,
-    date_to: date | None = None,
-    max_days: int | None = None,
-    max_api_calls: int | None = None,
-    kpi_call_delay_seconds: float | None = None,
-    sleeper: Any | None = None,
-    max_wait_cycles: int = 24,
-) -> dict[str, Any]:
-    if period_type not in {"day", "month"}:
-        raise ValueError("Tipo de periodo invalido.")
-    if from_year > to_year:
-        raise ValueError("Ano inicial nao pode ser superior ao ano final.")
-    if (to_year - from_year + 1) > 3:
-        raise ValueError("Intervalo superior a 3 anos. Reduz o periodo para executar o backfill.")
-
-    today_value = today_value or date.today()
-    config = get_integration_config(conn, provider)
-    if config is None:
-        raise ValueError("Configuracao FusionSolar nao encontrada.")
-    if not config["enabled"]:
-        raise ValueError("A integracao FusionSolar esta desativada.")
-    endpoints = get_fusionsolar_endpoint_config(config)
-    assets = get_fusionsolar_performance_assets(conn, provider, asset_id)
-    dates = iter_monthly_backfill_dates(from_year, to_year, today_value=today_value)
-    if period_type == "day":
-        dates = iter_daily_backfill_months(
-            from_year,
-            to_year,
-            today_value=today_value,
-            date_from=date_from,
-            date_to=date_to,
-        )
-
-    summary = {
-        "assets_processed": 0,
-        "records_updated": 0,
-        "missing_production": 0,
-        "api_errors": 0,
-        "api_calls_used": 0,
-        "months_processed": 0,
-        "chunks_processed": 0,
-        "mtd_records_updated": 0,
-        "baselines_recalculated": 0,
-        "references_created": 0,
-        "still_without_reference": 0,
-        "stopped_reason": "",
-        "resume_hint": "",
-        "wait_cycles": 0,
-    }
-    logger = current_app.logger if has_app_context() else logging.getLogger(__name__)
-    station_codes = [str(asset["external_id"] or "").strip() for asset in assets if str(asset["external_id"] or "").strip()]
-    assets_by_external_id = {
-        str(asset["external_id"] or "").strip(): asset
-        for asset in assets
-        if str(asset["external_id"] or "").strip()
-    }
-    summary["assets_processed"] = len(assets_by_external_id)
-    max_api_calls = max_api_calls if max_api_calls is not None else max_days
-    max_api_calls = max_api_calls if max_api_calls is not None else FUSIONSOLAR_PERFORMANCE_MAX_API_CALLS
-    kpi_call_delay_seconds = (
-        FUSIONSOLAR_PERFORMANCE_KPI_DELAY_SECONDS
-        if kpi_call_delay_seconds is None
-        else kpi_call_delay_seconds
-    )
-    sleep_func = sleeper or time.sleep
-    processed_dates: list[date] = []
-
-    def wait_after_rate_limit(reason: str, resume_hint: date | None = None) -> bool:
-        summary["wait_cycles"] += 1
-        summary["resume_hint"] = resume_hint.isoformat() if resume_hint else summary["resume_hint"]
-        if summary["wait_cycles"] > max_wait_cycles:
-            summary["stopped_reason"] = f"Limite FusionSolar repetido demasiadas vezes. Ultimo estado: {reason}"
-            logger.warning(
-                "FusionSolar performance backfill stopped after repeated cooldowns: period_type=%s station_count=%s wait_cycles=%s reason=%s",
-                period_type,
-                len(station_codes),
-                summary["wait_cycles"],
-                reason,
-            )
-            return False
-        conn.commit()
-        seconds = fusionsolar_cooldown_sleep_seconds(conn)
-        logger.warning(
-            "FusionSolar performance backfill waiting for API cooldown: period_type=%s station_count=%s seconds=%s wait_cycle=%s",
-            period_type,
-            len(station_codes),
-            seconds,
-            summary["wait_cycles"],
-        )
-        sleep_func(seconds)
-        return True
-
-    cooldown_reason = get_fusionsolar_performance_cooldown_reason(conn)
-    if cooldown_reason and not wait_after_rate_limit(cooldown_reason):
-        summary["api_errors"] = 1
-        return summary
-
-    session_obj, _ = get_fusionsolar_session(config)
-
-    def refresh_session_after_expiry(exc: Exception, context: str) -> None:
-        nonlocal session_obj
-        invalidate_fusionsolar_session(config)
-        session_obj, _ = get_fusionsolar_session(config, force_login=True)
-        logger.warning("FusionSolar session refreshed after expired login: context=%s error=%s", context, exc)
-
-    def store_kpi_map(
-        period_date_value: date,
-        kpi_map_value: dict[str, dict[str, Any]],
-        record_type: str,
-        notes_prefix: str,
-        external_ids: list[str] | None = None,
-    ) -> None:
-        selected_external_ids = external_ids or list(assets_by_external_id)
-        for external_id_value in selected_external_ids:
-            asset = assets_by_external_id[external_id_value]
-            result = store_production_kpi_record(
-                conn,
-                asset_row=asset,
-                provider=provider,
-                external_id=external_id_value,
-                period_type=record_type,
-                period_date=period_date_value,
-                kpi_row=kpi_map_value.get(external_id_value, {}),
-                notes_prefix=notes_prefix,
-            )
-            if record_type == "mtd":
-                summary["mtd_records_updated"] += 1
-            else:
-                summary["records_updated"] += 1
-            if result["production_kwh"] is None:
-                summary["missing_production"] += 1
-
-    def wait_before_next_call() -> None:
-        if (
-            PRODUCTION_KPI_CALL_CONTEXT.get() is None
-            and kpi_call_delay_seconds
-            and kpi_call_delay_seconds > 0
-        ):
-            sleep_func(kpi_call_delay_seconds)
-
-    if period_type == "day":
-        for month_value in dates:
-            month_had_records = False
-            month_station_codes = [
-                external_id
-                for external_id, asset in assets_by_external_id.items()
-                if evaluate_local_monthly_production_quality(
-                    conn,
-                    asset_id=int(asset["asset_id"]),
-                    provider=provider,
-                    month_start=month_value,
-                    reference_date=today_value,
-                ).status
-                != "complete"
-            ]
-            station_chunks = chunked(month_station_codes, 100)
-            for chunk_index, station_group in enumerate(station_chunks, start=1):
-                session_retry_used = False
-                while True:
-                    if summary["api_calls_used"] >= max_api_calls:
-                        summary["stopped_reason"] = (
-                            f"Limite local de {max_api_calls} chamadas API atingido. "
-                            f"Retoma a partir de {month_value.isoformat()}."
-                        )
-                        summary["resume_hint"] = month_value.isoformat()
-                        logger.info(
-                            "FusionSolar performance backfill stopped by max calls: period_type=%s month=%s api_calls_used=%s max_api_calls=%s",
-                            period_type,
-                            month_value.isoformat(),
-                            summary["api_calls_used"],
-                            max_api_calls,
-                        )
-                        break
-                    if summary["api_calls_used"] > 0:
-                        wait_before_next_call()
-                    try:
-                        logger.info(
-                            "FusionSolar daily performance backfill request: period_type=%s month=%s station_count=%s chunk_index=%s api_calls_used=%s",
-                            period_type,
-                            month_value.isoformat(),
-                            len(station_group),
-                            chunk_index,
-                            summary["api_calls_used"],
-                        )
-                        rows = fetch_fusionsolar_kpi_day_rows(
-                            session_obj,
-                            endpoints["base_url"],
-                            endpoints["day_kpi_endpoint"],
-                            station_group,
-                            month_value,
-                        )
-                        summary["api_calls_used"] += 1
-                        summary["chunks_processed"] += 1
-                        for row in rows:
-                            external_id_value = str(row.get("stationCode") or row.get("plantCode") or "").strip()
-                            asset = assets_by_external_id.get(external_id_value)
-                            if asset is None:
-                                continue
-                            row_date = parse_fusionsolar_collect_date(row, month_value)
-                            if row_date is None or row_date.replace(day=1) != month_value:
-                                continue
-                            if not date_in_backfill_window(
-                                row_date,
-                                from_year=from_year,
-                                to_year=to_year,
-                                today_value=today_value,
-                                date_from=date_from,
-                                date_to=date_to,
-                            ):
-                                continue
-                            result = store_production_kpi_record(
-                                conn,
-                                asset_row=asset,
-                                provider=provider,
-                                external_id=external_id_value,
-                                period_type="day",
-                                period_date=row_date,
-                                kpi_row=row,
-                                notes_prefix="Backfill historico mensal diario.",
-                            )
-                            if result["upsert_status"] != "skipped_existing_valid":
-                                summary["records_updated"] += 1
-                                processed_dates.append(row_date)
-                                month_had_records = True
-                            if result["production_kwh"] is None:
-                                summary["missing_production"] += 1
-                        logger.info(
-                            "FusionSolar daily performance backfill response: month=%s chunk_index=%s rows=%s records_updated=%s api_calls_used=%s",
-                            month_value.isoformat(),
-                            chunk_index,
-                            len(rows),
-                            summary["records_updated"],
-                            summary["api_calls_used"],
-                        )
-                        break
-                    except Exception as exc:
-                        summary["api_errors"] += 1
-                        if isinstance(exc, (ApiRateLimitError, ApiSlotUnavailableError)):
-                            raise
-                        if is_fusionsolar_rate_limit_error(exc):
-                            reason = mark_fusionsolar_performance_rate_limited(conn)
-                            logger.warning(
-                                "FusionSolar performance backfill rate limited: period_type=%s month=%s station_count=%s chunk_index=%s api_calls_used=%s error=%s",
-                                period_type,
-                                month_value.isoformat(),
-                                len(station_group),
-                                chunk_index,
-                                summary["api_calls_used"],
-                                exc,
-                            )
-                            if wait_after_rate_limit(reason, month_value):
-                                continue
-                            break
-                        if is_fusionsolar_session_expired_error(exc) and not session_retry_used:
-                            session_retry_used = True
-                            refresh_session_after_expiry(exc, f"daily:{month_value.isoformat()}:chunk:{chunk_index}")
-                            continue
-                        logger.warning(
-                            "FusionSolar daily performance backfill chunk failed: period_type=%s month=%s station_count=%s chunk_index=%s error=%s",
-                            period_type,
-                            month_value.isoformat(),
-                            len(station_group),
-                            chunk_index,
-                            exc,
-                        )
-                        break
-                if summary["stopped_reason"]:
-                    break
-            if month_had_records:
-                summary["months_processed"] += 1
-            if summary["stopped_reason"]:
-                break
-
-        recalc_targets = sorted(set(processed_dates))
-        for target in recalc_targets:
-            recalc = recalculate_performance_references(
-                conn,
-                period_type="day",
-                period_date=target,
-                asset_id=asset_id,
-                provider=provider,
-                today_value=today_value,
-            )
-            summary["baselines_recalculated"] += recalc["records_processed"]
-            summary["references_created"] += recalc["references_created"]
-            summary["still_without_reference"] += recalc["still_without_reference"]
-        selected_asset_ids = [int(asset["asset_id"]) for asset in assets]
-        current_month = today_value.replace(day=1)
-        if selected_asset_ids and not summary["stopped_reason"]:
-            session_retry_used = False
-            while True:
-                try:
-                    if summary["api_calls_used"] > 0:
-                        wait_before_next_call()
-                    for station_group in chunked(station_codes, 100):
-                        kpi_map = fetch_fusionsolar_kpi_month_map(
-                            session_obj,
-                            endpoints["base_url"],
-                            endpoints["month_kpi_endpoint"],
-                            station_group,
-                            current_month,
-                        )
-                        summary["api_calls_used"] += 1
-                        store_kpi_map(
-                            current_month,
-                            kpi_map,
-                            "mtd",
-                            "MTD recalculado apos backfill.",
-                            station_group,
-                        )
-                    break
-                except Exception as exc:
-                    summary["api_errors"] += 1
-                    if isinstance(exc, (ApiRateLimitError, ApiSlotUnavailableError)):
-                        raise
-                    if is_fusionsolar_rate_limit_error(exc):
-                        reason = mark_fusionsolar_performance_rate_limited(conn)
-                        if wait_after_rate_limit(reason, current_month):
-                            continue
-                    if is_fusionsolar_session_expired_error(exc) and not session_retry_used:
-                        session_retry_used = True
-                        refresh_session_after_expiry(exc, f"daily-mtd:{current_month.isoformat()}")
-                        continue
-                    logger.warning(
-                        "FusionSolar MTD recalculation failed after backfill: station_count=%s error=%s",
-                        len(station_codes),
-                        exc,
-                    )
-                    break
-            recalc = recalculate_performance_references(
-                conn,
-                period_type="mtd",
-                period_date=current_month,
-                asset_id=asset_id,
-                provider=provider,
-                today_value=today_value,
-            )
-            summary["baselines_recalculated"] += recalc["records_processed"]
-            summary["references_created"] += recalc["references_created"]
-            summary["still_without_reference"] += recalc["still_without_reference"]
-        conn.commit()
-        return summary
-
-    for period_date_value in dates:
-        stored_current_date = False
-        session_retry_used = False
-        while True:
-            try:
-                if summary["api_calls_used"] >= max_api_calls:
-                    summary["stopped_reason"] = (
-                        f"Limite local de {max_api_calls} chamadas API atingido. "
-                        f"Retoma a partir de {period_date_value.isoformat()}."
-                    )
-                    summary["resume_hint"] = period_date_value.isoformat()
-                    break
-                if summary["api_calls_used"] > 0:
-                    wait_before_next_call()
-                for station_group in chunked(station_codes, 100):
-                    kpi_map = fetch_fusionsolar_kpi_month_map(
-                        session_obj,
-                        endpoints["base_url"],
-                        endpoints["month_kpi_endpoint"],
-                        station_group,
-                        period_date_value,
-                    )
-                    summary["api_calls_used"] += 1
-                    store_kpi_map(
-                        period_date_value,
-                        kpi_map,
-                        period_type,
-                        "Backfill historico.",
-                        station_group,
-                    )
-                stored_current_date = True
-                break
-            except Exception as exc:
-                if isinstance(exc, (ApiRateLimitError, ApiSlotUnavailableError)):
-                    raise
-                if is_fusionsolar_rate_limit_error(exc):
-                    summary["api_errors"] += 1
-                    reason = mark_fusionsolar_performance_rate_limited(conn)
-                    logger.warning(
-                        "FusionSolar performance backfill rate limited: period_type=%s period_date=%s station_count=%s error=%s",
-                        period_type,
-                        period_date_value.isoformat(),
-                        len(station_codes),
-                        exc,
-                    )
-                    if wait_after_rate_limit(reason, period_date_value):
-                        continue
-                    break
-                if is_fusionsolar_session_expired_error(exc) and not session_retry_used:
-                    session_retry_used = True
-                    summary["api_errors"] += 1
-                    refresh_session_after_expiry(exc, f"month-group:{period_date_value.isoformat()}")
-                    continue
-                logger.warning(
-                    "FusionSolar grouped performance backfill failed, retrying per asset: period_type=%s period_date=%s station_count=%s error=%s",
-                    period_type,
-                    period_date_value.isoformat(),
-                    len(station_codes),
-                    exc,
-                )
-                break
-        if summary["stopped_reason"]:
-            break
-        if stored_current_date:
-            processed_dates.append(period_date_value)
-            continue
-
-        stored_any_for_date = False
-        for external_id_value, asset in assets_by_external_id.items():
-            session_retry_used = False
-            while True:
-                try:
-                    if summary["api_calls_used"] >= max_api_calls:
-                        summary["stopped_reason"] = (
-                            f"Limite local de {max_api_calls} chamadas API atingido. "
-                            f"Retoma a partir de {period_date_value.isoformat()}."
-                        )
-                        summary["resume_hint"] = period_date_value.isoformat()
-                        break
-                    if summary["api_calls_used"] > 0:
-                        wait_before_next_call()
-                    single_map = fetch_fusionsolar_kpi_month_map(
-                        session_obj,
-                        endpoints["base_url"],
-                        endpoints["month_kpi_endpoint"],
-                        [external_id_value],
-                        period_date_value,
-                    )
-                    summary["api_calls_used"] += 1
-                    store_kpi_map(period_date_value, single_map, period_type, "Backfill historico.")
-                    stored_any_for_date = True
-                    break
-                except Exception as asset_exc:
-                    summary["api_errors"] += 1
-                    if isinstance(asset_exc, (ApiRateLimitError, ApiSlotUnavailableError)):
-                        raise
-                    if is_fusionsolar_rate_limit_error(asset_exc):
-                        reason = mark_fusionsolar_performance_rate_limited(conn)
-                        logger.warning(
-                            "FusionSolar performance backfill rate limited: asset_id=%s stationCode=%s period_type=%s period_date=%s error=%s",
-                            asset["asset_id"],
-                            external_id_value,
-                            period_type,
-                            period_date_value.isoformat(),
-                            asset_exc,
-                        )
-                        if wait_after_rate_limit(reason, period_date_value):
-                            continue
-                        break
-                    if is_fusionsolar_session_expired_error(asset_exc) and not session_retry_used:
-                        session_retry_used = True
-                        refresh_session_after_expiry(asset_exc, f"month-asset:{period_date_value.isoformat()}:{external_id_value}")
-                        continue
-                    logger.warning(
-                        "FusionSolar performance backfill failed: asset_id=%s stationCode=%s period_type=%s period_date=%s error=%s",
-                        asset["asset_id"],
-                        external_id_value,
-                        period_type,
-                        period_date_value.isoformat(),
-                        asset_exc,
-                    )
-                    break
-            if summary["stopped_reason"]:
-                break
-        if summary["stopped_reason"]:
-            break
-        if stored_any_for_date:
-            processed_dates.append(period_date_value)
-
-    selected_asset_ids = [int(asset["asset_id"]) for asset in assets]
-    recalc_targets = processed_dates
-    for target in recalc_targets:
-        recalc = recalculate_performance_references(
-            conn,
-            period_type=period_type,
-            period_date=target,
-            asset_id=asset_id,
-            provider=provider,
-            today_value=today_value,
-        )
-        summary["baselines_recalculated"] += recalc["records_processed"]
-        summary["references_created"] += recalc["references_created"]
-        summary["still_without_reference"] += recalc["still_without_reference"]
-
-    current_month = today_value.replace(day=1)
-    if selected_asset_ids and not summary["stopped_reason"]:
-        session_retry_used = False
-        while True:
-            try:
-                if summary["api_calls_used"] > 0:
-                    wait_before_next_call()
-                for station_group in chunked(station_codes, 100):
-                    kpi_map = fetch_fusionsolar_kpi_month_map(
-                        session_obj,
-                        endpoints["base_url"],
-                        endpoints["month_kpi_endpoint"],
-                        station_group,
-                        current_month,
-                    )
-                    summary["api_calls_used"] += 1
-                    store_kpi_map(
-                        current_month,
-                        kpi_map,
-                        "mtd",
-                        "MTD recalculado apos backfill.",
-                        station_group,
-                    )
-                break
-            except Exception as exc:
-                summary["api_errors"] += 1
-                if isinstance(exc, (ApiRateLimitError, ApiSlotUnavailableError)):
-                    raise
-                if is_fusionsolar_rate_limit_error(exc):
-                    reason = mark_fusionsolar_performance_rate_limited(conn)
-                    if wait_after_rate_limit(reason, current_month):
-                        continue
-                if is_fusionsolar_session_expired_error(exc) and not session_retry_used:
-                    session_retry_used = True
-                    refresh_session_after_expiry(exc, f"month-mtd:{current_month.isoformat()}")
-                    continue
-                logger.warning(
-                    "FusionSolar MTD recalculation failed after backfill: station_count=%s error=%s",
-                    len(station_codes),
-                    exc,
-                )
-                break
-        recalc = recalculate_performance_references(
-            conn,
-            period_type="mtd",
-            period_date=current_month,
-            asset_id=asset_id,
-            provider=provider,
-            today_value=today_value,
-        )
-        summary["baselines_recalculated"] += recalc["records_processed"]
-        summary["references_created"] += recalc["references_created"]
-        summary["still_without_reference"] += recalc["still_without_reference"]
-    conn.commit()
-    return summary
-
-
-def evaluate_local_monthly_production_quality(
-    conn: sqlite3.Connection,
-    *,
-    asset_id: int,
-    provider: str,
-    month_start: date,
-    reference_date: date,
-) -> Any:
-    _, last_day = calendar.monthrange(month_start.year, month_start.month)
-    month_end = month_start.replace(day=last_day)
-    monthly_records = query_all(
-        conn,
-        """
-        SELECT period_date, production_kwh
-        FROM production_records
-        WHERE asset_id = ? AND provider = ? AND period_type = 'month' AND period_date = ?
-        ORDER BY id
-        """,
-        (asset_id, provider, month_start.isoformat()),
-    )
-    daily_records = query_all(
-        conn,
-        """
-        SELECT period_date, production_kwh
-        FROM production_records
-        WHERE asset_id = ? AND provider = ? AND period_type = 'day'
-          AND period_date BETWEEN ? AND ?
-        ORDER BY period_date, id
-        """,
-        (asset_id, provider, month_start.isoformat(), month_end.isoformat()),
-    )
-    return evaluate_monthly_production_quality(
-        asset_id=asset_id,
-        month_start=month_start,
-        reference_date=reference_date,
-        monthly_records=monthly_records,
-        daily_records=daily_records,
-    )
-
-
-def count_monthly_production_states(qualities: dict[int, Any]) -> dict[str, int]:
-    counts = {"complete": 0, "partial": 0, "missing": 0, "conflict": 0}
-    for quality in qualities.values():
-        status = str(quality.status)
-        counts[status] = counts.get(status, 0) + 1
-    return counts
-
-
-def run_fusionsolar_month_close(
-    conn: sqlite3.Connection,
-    *,
-    provider: str = "FusionSolar",
-    report_month: str,
-    asset_ids: list[int] | None = None,
-    reference_date: date | None = None,
-    kpi_call_delay_seconds: float | None = None,
-    sleeper: Any | None = None,
-) -> dict[str, Any]:
-    reference_date = reference_date or current_lisbon_date()
-    month_start = datetime.strptime(normalize_report_month(report_month), "%Y-%m").date()
-    if month_start >= reference_date.replace(day=1):
-        raise ValueError("O fecho mensal automatico so pode consultar meses civis anteriores.")
-
-    config = get_integration_config(conn, provider)
-    if config is None:
-        raise ValueError("Configuracao FusionSolar nao encontrada.")
-    if not config["enabled"]:
-        raise ValueError("A integracao FusionSolar esta desativada.")
-    endpoints = get_fusionsolar_endpoint_config(config)
-    assets = get_fusionsolar_performance_assets(
-        conn,
-        provider,
-        asset_ids=asset_ids,
-    )
-    assets_by_id = {int(asset["asset_id"]): asset for asset in assets}
-    assets_by_external_id = {
-        str(asset["external_id"] or "").strip(): asset
-        for asset in assets
-        if str(asset["external_id"] or "").strip()
-    }
-
-    def evaluate_assets() -> dict[int, Any]:
-        return {
-            asset_id: evaluate_local_monthly_production_quality(
-                conn,
-                asset_id=asset_id,
-                provider=provider,
-                month_start=month_start,
-                reference_date=reference_date,
-            )
-            for asset_id in assets_by_id
-        }
-
-    qualities = evaluate_assets()
-    pending_asset_ids = [
-        asset_id
-        for asset_id, quality in qualities.items()
-        if quality.status in {"partial", "missing", "conflict"}
-    ]
-    affected_asset_ids = set(pending_asset_ids)
-    processed_daily_targets: set[tuple[int, date]] = set()
-    summary: dict[str, Any] = {
-        "status": "running",
-        "month": month_start.strftime("%Y-%m"),
-        "assets_evaluated": len(assets_by_id),
-        "assets_affected": len(affected_asset_ids),
-        "asset_ids_affected": sorted(affected_asset_ids),
-        "states_before": count_monthly_production_states(qualities),
-        "states_after_monthly": count_monthly_production_states(qualities),
-        "states_after": count_monthly_production_states(qualities),
-        "monthly_assets_requested": 0,
-        "daily_assets_requested": 0,
-        "monthly_records_updated": 0,
-        "records_updated": 0,
-        "missing_production": 0,
-        "api_calls_attempted": 0,
-        "api_calls_used": 0,
-        "api_errors": 0,
-        "stopped_reason": "",
-        "next_attempt_at": "",
-    }
-    if not pending_asset_ids:
-        summary["status"] = "completed"
-        return summary
-
-    sleep_func = sleeper or time.sleep
-    delay_seconds = (
-        FUSIONSOLAR_PERFORMANCE_KPI_DELAY_SECONDS
-        if kpi_call_delay_seconds is None
-        else kpi_call_delay_seconds
-    )
-    logger = current_app.logger if has_app_context() else logging.getLogger(__name__)
-    session_obj: Any = None
-
-    def recalculate_affected_references() -> None:
-        for asset_id, target_date in sorted(processed_daily_targets):
-            recalculate_performance_references(
-                conn,
-                period_type="day",
-                period_date=target_date,
-                asset_id=asset_id,
-                provider=provider,
-                today_value=reference_date,
-            )
-        for asset_id in sorted(affected_asset_ids):
-            recalculate_performance_references(
-                conn,
-                period_type="month",
-                period_date=month_start,
-                asset_id=asset_id,
-                provider=provider,
-                today_value=reference_date,
-            )
-
-    def stop_for_rate_limit(exc: Exception) -> None:
-        if isinstance(exc, ApiRateLimitError):
-            rate_error = exc
-        else:
-            until = mark_fusionsolar_api_cooldown(
-                conn,
-                API_AREA_PRODUCTION,
-                reason=str(exc),
-            )
-            rate_error = ApiRateLimitError(
-                provider,
-                API_AREA_PRODUCTION,
-                until,
-                get_provider_cooldown_reason(conn, provider, API_AREA_PRODUCTION),
-            )
-        recalculate_affected_references()
-        current_qualities = evaluate_assets()
-        summary["status"] = "waiting_rate_limit"
-        summary["states_after"] = count_monthly_production_states(current_qualities)
-        summary["stopped_reason"] = rate_error.message
-        summary["next_attempt_at"] = rate_error.cooldown_until.isoformat(timespec="seconds")
-        summary["cooldown_until"] = summary["next_attempt_at"]
-        conn.commit()
-        rate_error.job_result = dict(summary)
-        raise rate_error
-
-    try:
-        session_obj, _ = get_fusionsolar_session(config)
-    except Exception as exc:
-        summary["api_errors"] += 1
-        if is_fusionsolar_rate_limit_error(exc):
-            stop_for_rate_limit(exc)
-        raise
-
-    def call_kpi_api(callback: Any, context: str) -> Any:
-        nonlocal session_obj
-        relogin_used = False
-        while True:
-            if (
-                PRODUCTION_KPI_CALL_CONTEXT.get() is None
-                and summary["api_calls_used"]
-                and delay_seconds
-                and delay_seconds > 0
-            ):
-                sleep_func(delay_seconds)
-            summary["api_calls_attempted"] += 1
-            try:
-                result = callback()
-                summary["api_calls_used"] += 1
-                return result
-            except Exception as exc:
-                summary["api_errors"] += 1
-                if is_fusionsolar_rate_limit_error(exc):
-                    stop_for_rate_limit(exc)
-                if is_fusionsolar_session_expired_error(exc) and not relogin_used:
-                    relogin_used = True
-                    invalidate_fusionsolar_session(config)
-                    try:
-                        session_obj, _ = get_fusionsolar_session(config, force_login=True)
-                    except Exception as login_exc:
-                        summary["api_errors"] += 1
-                        if is_fusionsolar_rate_limit_error(login_exc):
-                            stop_for_rate_limit(login_exc)
-                        raise
-                    logger.warning(
-                        "FusionSolar month close session refreshed once: month=%s context=%s error=%s",
-                        month_start,
-                        context,
-                        exc,
-                    )
-                    continue
-                raise
-
-    pending_station_codes = [
-        str(assets_by_id[asset_id]["external_id"] or "").strip()
-        for asset_id in pending_asset_ids
-    ]
-    summary["monthly_assets_requested"] = len(pending_station_codes)
-    for chunk_index, station_group in enumerate(chunked(pending_station_codes, 100), start=1):
-        kpi_map = call_kpi_api(
-            lambda station_group=station_group: fetch_fusionsolar_kpi_month_map(
-                session_obj,
-                endpoints["base_url"],
-                endpoints["month_kpi_endpoint"],
-                station_group,
-                month_start,
-            ),
-            f"monthly:{chunk_index}",
-        )
-        for external_id in station_group:
-            asset = assets_by_external_id[external_id]
-            result = store_production_kpi_record(
-                conn,
-                asset_row=asset,
-                provider=provider,
-                external_id=external_id,
-                period_type="month",
-                period_date=month_start,
-                kpi_row=kpi_map.get(external_id, {}),
-                notes_prefix="Fecho mensal automatico.",
-            )
-            if result["upsert_status"] != "skipped_existing_valid":
-                summary["monthly_records_updated"] += 1
-            if result["production_kwh"] is None:
-                summary["missing_production"] += 1
-        conn.commit()
-
-    qualities = evaluate_assets()
-    summary["states_after_monthly"] = count_monthly_production_states(qualities)
-    daily_asset_ids = [
-        asset_id
-        for asset_id in pending_asset_ids
-        if qualities[asset_id].status in {"partial", "missing", "conflict"}
-    ]
-    daily_station_codes = [
-        str(assets_by_id[asset_id]["external_id"] or "").strip()
-        for asset_id in daily_asset_ids
-    ]
-    summary["daily_assets_requested"] = len(daily_station_codes)
-    _, last_day = calendar.monthrange(month_start.year, month_start.month)
-    month_end = month_start.replace(day=last_day)
-    for chunk_index, station_group in enumerate(chunked(daily_station_codes, 100), start=1):
-        rows = call_kpi_api(
-            lambda station_group=station_group: fetch_fusionsolar_kpi_day_rows(
-                session_obj,
-                endpoints["base_url"],
-                endpoints["day_kpi_endpoint"],
-                station_group,
-                month_start,
-            ),
-            f"daily:{chunk_index}",
-        )
-        for row in rows:
-            external_id = str(row.get("stationCode") or row.get("plantCode") or "").strip()
-            asset = assets_by_external_id.get(external_id)
-            row_date = parse_fusionsolar_collect_date(row, month_start)
-            if asset is None or row_date is None or not month_start <= row_date <= month_end:
-                continue
-            result = store_production_kpi_record(
-                conn,
-                asset_row=asset,
-                provider=provider,
-                external_id=external_id,
-                period_type="day",
-                period_date=row_date,
-                kpi_row=row,
-                notes_prefix="Reconciliacao diaria do fecho mensal.",
-            )
-            if result["upsert_status"] != "skipped_existing_valid":
-                summary["records_updated"] += 1
-                processed_daily_targets.add((int(asset["asset_id"]), row_date))
-            if result["production_kwh"] is None:
-                summary["missing_production"] += 1
-        conn.commit()
-
-    recalculate_affected_references()
-    qualities = evaluate_assets()
-    summary["states_after"] = count_monthly_production_states(qualities)
-    summary["status"] = "completed"
-    conn.commit()
-    return summary
-
-
-def run_fusionsolar_month_cycle(
-    conn: sqlite3.Connection,
-    *,
-    provider: str = "FusionSolar",
-    report_month: str,
-    asset_ids: list[int],
-    kpi_call_delay_seconds: float | None = None,
-    sleeper: Any | None = None,
-    max_wait_cycles: int = 24,
-) -> dict[str, Any]:
-    if not asset_ids:
-        raise ValueError("Escolhe pelo menos uma instalacao para o ciclo.")
-    month_start = datetime.strptime(normalize_report_month(report_month), "%Y-%m").date()
-    _, month_last_day = calendar.monthrange(month_start.year, month_start.month)
-    month_end = month_start.replace(day=month_last_day)
-    today_value = date.today()
-    date_to = min(month_end, today_value - timedelta(days=1))
-    if date_to < month_start:
-        raise ValueError("O mes escolhido ainda nao tem dias fechados para importar.")
-
-    config = get_integration_config(conn, provider)
-    if config is None:
-        raise ValueError("Configuracao FusionSolar nao encontrada.")
-    if not config["enabled"]:
-        raise ValueError("A integracao FusionSolar esta desativada.")
-    endpoints = get_fusionsolar_endpoint_config(config)
-    assets = get_fusionsolar_performance_assets(conn, provider, asset_ids=asset_ids)
-    if not assets:
-        raise ValueError("Nenhuma das instalacoes escolhidas tem mapeamento FusionSolar ativo.")
-
-    station_codes = [str(asset["external_id"] or "").strip() for asset in assets if str(asset["external_id"] or "").strip()]
-    assets_by_external_id = {str(asset["external_id"] or "").strip(): asset for asset in assets if str(asset["external_id"] or "").strip()}
-    station_chunks = chunked(station_codes, 100)
-    session_obj, _ = get_fusionsolar_session(config)
-    sleep_func = sleeper or time.sleep
-    kpi_call_delay_seconds = FUSIONSOLAR_PERFORMANCE_KPI_DELAY_SECONDS if kpi_call_delay_seconds is None else kpi_call_delay_seconds
-    logger = current_app.logger if has_app_context() else logging.getLogger(__name__)
-    summary = {
-        "assets_selected": len(asset_ids),
-        "assets_mapped": len(assets_by_external_id),
-        "month": month_start.strftime("%Y-%m"),
-        "daily_chunks_total": len(station_chunks),
-        "daily_chunks_completed": 0,
-        "monthly_chunks_completed": 0,
-        "records_updated": 0,
-        "monthly_records_updated": 0,
-        "missing_production": 0,
-        "api_calls_used": 0,
-        "api_errors": 0,
-        "wait_cycles": 0,
-        "status": "running",
-    }
-    processed_dates: set[date] = set()
-
-    def wait_after_rate_limit(reason: str) -> None:
-        summary["wait_cycles"] += 1
-        if summary["wait_cycles"] > max_wait_cycles:
-            raise ValueError(f"Limite FusionSolar repetido demasiadas vezes. Ultimo estado: {reason}")
-        conn.commit()
-        seconds = fusionsolar_cooldown_sleep_seconds(conn)
-        logger.warning(
-            "FusionSolar month cycle waiting for API cooldown: month=%s seconds=%s wait_cycle=%s",
-            month_start.isoformat(),
-            seconds,
-            summary["wait_cycles"],
-        )
-        sleep_func(seconds)
-
-    def wait_between_calls() -> None:
-        if (
-            PRODUCTION_KPI_CALL_CONTEXT.get() is None
-            and summary["api_calls_used"] > 0
-            and kpi_call_delay_seconds
-            and kpi_call_delay_seconds > 0
-        ):
-            sleep_func(kpi_call_delay_seconds)
-
-    def refresh_session_after_expiry(exc: Exception, context: str) -> None:
-        nonlocal session_obj
-        invalidate_fusionsolar_session(config)
-        session_obj, _ = get_fusionsolar_session(config, force_login=True)
-        logger.warning("FusionSolar session refreshed after expired login: context=%s error=%s", context, exc)
-
-    for chunk_index, station_group in enumerate(station_chunks, start=1):
-        session_retry_used = False
-        while True:
-            try:
-                wait_between_calls()
-                rows = fetch_fusionsolar_kpi_day_rows(
-                    session_obj,
-                    endpoints["base_url"],
-                    endpoints["day_kpi_endpoint"],
-                    station_group,
-                    month_start,
-                )
-                summary["api_calls_used"] += 1
-                for row in rows:
-                    external_id_value = str(row.get("stationCode") or row.get("plantCode") or "").strip()
-                    asset = assets_by_external_id.get(external_id_value)
-                    if asset is None:
-                        continue
-                    row_date = parse_fusionsolar_collect_date(row, month_start)
-                    if row_date is None or row_date < month_start or row_date > date_to:
-                        continue
-                    result = store_production_kpi_record(
-                        conn,
-                        asset_row=asset,
-                        provider=provider,
-                        external_id=external_id_value,
-                        period_type="day",
-                        period_date=row_date,
-                        kpi_row=row,
-                        notes_prefix="Ciclo mensal automatico.",
-                    )
-                    if result["upsert_status"] != "skipped_existing_valid":
-                        summary["records_updated"] += 1
-                        processed_dates.add(row_date)
-                    if result["production_kwh"] is None:
-                        summary["missing_production"] += 1
-                summary["daily_chunks_completed"] = chunk_index
-                conn.commit()
-                break
-            except Exception as exc:
-                summary["api_errors"] += 1
-                if isinstance(exc, (ApiRateLimitError, ApiSlotUnavailableError)):
-                    raise
-                if is_fusionsolar_rate_limit_error(exc):
-                    wait_after_rate_limit(mark_fusionsolar_performance_rate_limited(conn))
-                    continue
-                if is_fusionsolar_session_expired_error(exc) and not session_retry_used:
-                    session_retry_used = True
-                    refresh_session_after_expiry(exc, f"month-cycle-day:{month_start.isoformat()}:chunk:{chunk_index}")
-                    continue
-                raise
-
-    for chunk_index, station_group in enumerate(station_chunks, start=1):
-        session_retry_used = False
-        while True:
-            try:
-                wait_between_calls()
-                kpi_map = fetch_fusionsolar_kpi_month_map(
-                    session_obj,
-                    endpoints["base_url"],
-                    endpoints["month_kpi_endpoint"],
-                    station_group,
-                    month_start,
-                )
-                summary["api_calls_used"] += 1
-                for external_id_value in station_group:
-                    asset = assets_by_external_id.get(external_id_value)
-                    if asset is None:
-                        continue
-                    result = store_production_kpi_record(
-                        conn,
-                        asset_row=asset,
-                        provider=provider,
-                        external_id=external_id_value,
-                        period_type="month",
-                        period_date=month_start,
-                        kpi_row=kpi_map.get(external_id_value, {}),
-                        notes_prefix="Ciclo mensal automatico.",
-                    )
-                    if result["upsert_status"] != "skipped_existing_valid":
-                        summary["monthly_records_updated"] += 1
-                    if result["production_kwh"] is None:
-                        summary["missing_production"] += 1
-                summary["monthly_chunks_completed"] = chunk_index
-                conn.commit()
-                break
-            except Exception as exc:
-                summary["api_errors"] += 1
-                if isinstance(exc, (ApiRateLimitError, ApiSlotUnavailableError)):
-                    raise
-                if is_fusionsolar_rate_limit_error(exc):
-                    wait_after_rate_limit(mark_fusionsolar_performance_rate_limited(conn))
-                    continue
-                if is_fusionsolar_session_expired_error(exc) and not session_retry_used:
-                    session_retry_used = True
-                    refresh_session_after_expiry(exc, f"month-cycle-month:{month_start.isoformat()}:chunk:{chunk_index}")
-                    continue
-                raise
-
-    for target in sorted(processed_dates):
-        for selected_asset_id in asset_ids:
-            recalculate_performance_references(
-                conn,
-                period_type="day",
-                period_date=target,
-                asset_id=selected_asset_id,
-                provider=provider,
-                today_value=today_value,
-            )
-    for selected_asset_id in asset_ids:
-        recalculate_performance_references(
-            conn,
-            period_type="month",
-            period_date=month_start,
-            asset_id=selected_asset_id,
-            provider=provider,
-            today_value=today_value,
-        )
-    conn.commit()
-    summary["status"] = "completed"
-    return summary
-
-
-def create_integration_run(conn: sqlite3.Connection, provider: str, trigger_type: str) -> int:
-    cursor = conn.execute(
-        """
-        INSERT INTO integration_sync_runs (provider, started_at, trigger_type, status)
-        VALUES (?, ?, ?, ?)
-        """,
-        (provider, datetime.now().isoformat(timespec="seconds"), trigger_type, "running"),
-    )
-    return int(cursor.lastrowid)
-
-
-def finalize_integration_run(
-    conn: sqlite3.Connection,
-    run_id: int,
-    *,
-    status: str,
-    matched_count: int,
-    unresolved_count: int,
-    auto_resolved_count: int,
-    error_message: str = "",
-    summary_json: dict[str, Any] | None = None,
-) -> None:
-    conn.execute(
-        """
-        UPDATE integration_sync_runs
-        SET finished_at = ?, status = ?, matched_count = ?, unresolved_count = ?,
-            auto_resolved_count = ?, error_message = ?, summary_json = ?
-        WHERE id = ?
-        """,
-        (
-            datetime.now().isoformat(timespec="seconds"),
-            status,
-            matched_count,
-            unresolved_count,
-            auto_resolved_count,
-            error_message,
-            json.dumps(summary_json or {}, ensure_ascii=True),
-            run_id,
-        ),
-    )
-
-
-def create_or_update_asset_integration(
-    conn: sqlite3.Connection,
-    asset_id: int,
-    provider: str,
-    external_id: str,
-    external_name: str,
-    status: str,
-) -> None:
-    existing = None
-    if external_id:
-        existing = conn.execute(
-            "SELECT id FROM asset_integrations WHERE provider = ? AND external_id = ?",
-            (provider, external_id),
-        ).fetchone()
-    if existing:
-        conn.execute(
-            """
-            UPDATE asset_integrations
-            SET asset_id = ?, external_name = ?, enabled = 1, last_sync_at = ?, last_status = ?, last_error = ''
-            WHERE id = ?
-            """,
-            (asset_id, external_name, datetime.now().isoformat(timespec="seconds"), status, existing["id"]),
-        )
-        return
-
-    candidate = conn.execute(
-        """
-        SELECT id
-        FROM asset_integrations
-        WHERE provider = ? AND asset_id = ?
-        LIMIT 1
-        """,
-        (provider, asset_id),
-    ).fetchone()
-    if candidate:
-        conn.execute(
-            """
-            UPDATE asset_integrations
-            SET external_id = ?, external_name = ?, enabled = 1, last_sync_at = ?, last_status = ?, last_error = ''
-            WHERE id = ?
-            """,
-            (external_id or None, external_name, datetime.now().isoformat(timespec="seconds"), status, candidate["id"]),
-        )
-        return
-
-    conn.execute(
-        """
-        INSERT INTO asset_integrations (asset_id, provider, external_id, external_name, enabled, last_sync_at, last_status, last_error)
-        VALUES (?, ?, ?, ?, 1, ?, ?, '')
-        """,
-        (
-            asset_id,
-            provider,
-            external_id or None,
-            external_name,
-            datetime.now().isoformat(timespec="seconds"),
-            status,
-        ),
-    )
-
-
-def upsert_integration_unresolved(
-    conn: sqlite3.Connection,
-    *,
-    provider: str,
-    run_id: int,
-    external_id: str,
-    external_name: str,
-    status: str,
-    payload: dict[str, Any],
-) -> None:
-    normalized_name = normalize_name(external_name)
-    suggested_asset_id = find_suggested_asset_id(conn, external_name)
-    existing = conn.execute(
-        """
-        SELECT id
-        FROM integration_unresolved
-        WHERE provider = ? AND normalized_name = ? AND resolution_status = 'pending'
-        LIMIT 1
-        """,
-        (provider, normalized_name),
-    ).fetchone()
-    if existing:
-        conn.execute(
-            """
-            UPDATE integration_unresolved
-            SET sync_run_id = ?, external_id = ?, external_status = ?, payload_json = ?, suggested_asset_id = ?, created_at = ?
-            WHERE id = ?
-            """,
-            (
-                run_id,
-                external_id or None,
-                status,
-                json.dumps(payload, ensure_ascii=True),
-                suggested_asset_id,
-                datetime.now().isoformat(timespec="seconds"),
-                existing["id"],
-            ),
-        )
-        return
-    conn.execute(
-        """
-        INSERT INTO integration_unresolved (
-            provider, sync_run_id, external_id, external_name, normalized_name, external_status,
-            payload_json, suggested_asset_id, resolution_status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-        """,
-        (
-            provider,
-            run_id,
-            external_id or None,
-            external_name,
-            normalized_name,
-            status,
-            json.dumps(payload, ensure_ascii=True),
-            suggested_asset_id,
-            datetime.now().isoformat(timespec="seconds"),
-        ),
-    )
-
-
-def get_latest_availability_by_asset(conn: sqlite3.Connection, asset_id: int) -> dict[str, Any] | None:
-    row = conn.execute(
-        """
-        SELECT *
-        FROM availability_daily
-        WHERE asset_id = ?
-        ORDER BY period_date DESC, id DESC
-        LIMIT 1
-        """,
-        (asset_id,),
-    ).fetchone()
-    return dict(row) if row else None
-
-
-def get_dashboard_availability_summary(conn: sqlite3.Connection) -> dict[str, Any]:
-    rows = query_all(
-        conn,
-        """
-        SELECT ad.*
-        FROM availability_daily ad
-        JOIN (
-            SELECT asset_id, MAX(period_date || 'T' || printf('%09d', id)) AS marker
-            FROM availability_daily
-            GROUP BY asset_id
-        ) latest
-          ON latest.asset_id = ad.asset_id
-         AND latest.marker = ad.period_date || 'T' || printf('%09d', ad.id)
-        """
-    )
-    pct_values = [row["inverter_availability_pct"] for row in rows if row["inverter_availability_pct"] is not None]
-    affected_values = [row["affected_power_kw"] for row in rows if row["affected_power_kw"] is not None]
-    return {
-        "average_inverter_availability_pct": round(sum(pct_values) / len(pct_values), 2) if pct_values else None,
-        "unavailable_inverters": sum(int(row["unavailable_inverters"] or 0) for row in rows),
-        "no_communication_devices": sum(int(row["no_communication_devices"] or 0) for row in rows),
-        "affected_power_kw": round(sum(float(value) for value in affected_values), 2) if affected_values else None,
-        "string_availability_pct": (
-            round(
-                sum(int(row["available_strings"] or 0) for row in rows)
-                / sum(int(row["total_strings"] or 0) for row in rows)
-                * 100,
-                2,
-            )
-            if sum(int(row["total_strings"] or 0) for row in rows)
-            else None
-        ),
-        "unavailable_strings": sum(int(row["unavailable_strings"] or 0) for row in rows),
-    }
-
-
-def get_latest_device_rows_for_asset(conn: sqlite3.Connection, asset_id: int) -> list[dict[str, Any]]:
-    return query_all(
-        conn,
-        """
-        SELECT
-            pd.device_name,
-            pd.rated_power_kw,
-            pd.last_seen_at,
-            drs.*
-        FROM provider_devices pd
-        LEFT JOIN device_realtime_snapshots drs
-          ON drs.id = (
-              SELECT latest.id
-              FROM device_realtime_snapshots latest
-              WHERE latest.provider_device_id = pd.id
-              ORDER BY latest.collected_at DESC, latest.id DESC
-              LIMIT 1
-          )
-        WHERE pd.asset_id = ? AND pd.enabled = 1
-        ORDER BY pd.device_name COLLATE NOCASE, pd.id
-        """,
-        (asset_id,),
-    )
-
-
-def upsert_provider_device(conn: sqlite3.Connection, asset_id: int, provider: str, row: dict[str, Any]) -> int:
-    now = datetime.now().isoformat(timespec="seconds")
-    enabled = int(row.get("enabled", 1))
-    existing = conn.execute(
-        "SELECT id, enabled FROM provider_devices WHERE provider = ? AND external_device_id = ?",
-        (provider, row["external_device_id"]),
-    ).fetchone()
-    payload_json = json.dumps(row["payload"], ensure_ascii=True)
-    if existing:
-        conn.execute(
-            """
-            UPDATE provider_devices
-            SET asset_id = ?, station_code = ?, dev_dn = ?, sn = ?, device_name = ?, dev_type_id = ?,
-                model = ?, rated_power_kw = ?, enabled = ?, payload_json = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                asset_id,
-                row["station_code"],
-                row["dev_dn"],
-                row["sn"],
-                row["device_name"],
-                row["dev_type_id"],
-                row["model"],
-                row["rated_power_kw"],
-                enabled,
-                payload_json,
-                now,
-                existing["id"],
-            ),
-        )
-        device_id = int(existing["id"])
-        record_device_configuration(
-            conn,
-            provider_device_id=device_id,
-            active=bool(enabled),
-            effective_date=current_lisbon_date(),
-        )
-        return device_id
-    cursor = conn.execute(
-        """
-        INSERT INTO provider_devices (
-            asset_id, provider, station_code, external_device_id, dev_dn, sn, device_name, dev_type_id,
-            model, rated_power_kw, enabled, payload_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            asset_id,
-            provider,
-            row["station_code"],
-            row["external_device_id"],
-            row["dev_dn"],
-            row["sn"],
-            row["device_name"],
-            row["dev_type_id"],
-            row["model"],
-            row["rated_power_kw"],
-            enabled,
-            payload_json,
-            now,
-            now,
-        ),
-    )
-    device_id = int(cursor.lastrowid)
-    record_device_configuration(
-        conn,
-        provider_device_id=device_id,
-        active=bool(enabled),
-        effective_date=current_lisbon_date(),
-    )
-    return device_id
-
-
-def prepare_fusionsolar_inverter_history_context(
-    conn: sqlite3.Connection,
-    *,
-    force_login: bool = False,
-    history_call_delay_seconds: float = 0,
-    sleeper: Any = time.sleep,
-) -> dict[str, Any]:
-    provider = INTEGRATION_PROVIDER_FUSIONSOLAR
-    config = get_integration_config(conn, provider)
-    if config is None or not config["enabled"]:
-        raise ValueError("Configuracao FusionSolar indisponivel.")
-    endpoints = get_fusionsolar_endpoint_config(config)
-    mappings = query_all(
-        conn,
-        """
-        SELECT asset_id, external_id
-        FROM asset_integrations
-        WHERE provider = ? AND enabled = 1 AND COALESCE(external_id, '') != ''
-        """,
-        (provider,),
-    )
-    station_to_asset = {str(row["external_id"]): int(row["asset_id"]) for row in mappings}
-    if not station_to_asset:
-        return {"provider": provider, "config": config, "endpoints": endpoints, "session": None, "devices": []}
-    session, _ = get_fusionsolar_session(config, force_login=force_login)
-    raw_devices = fetch_fusionsolar_device_list(
-        session,
-        base_url=endpoints["base_url"],
-        endpoint=endpoints["device_list_endpoint"],
-        station_codes=sorted(station_to_asset),
-    )
-    devices: list[dict[str, Any]] = []
-    for raw_row in raw_devices:
-        device = normalize_fusionsolar_device_identity(raw_row)
-        if device["dev_type_id"] not in FUSIONSOLAR_INVERTER_DEVICE_TYPE_IDS:
-            continue
-        asset_id = station_to_asset.get(str(device["station_code"] or ""))
-        if not asset_id or not device["external_device_id"]:
-            continue
-        device["asset_id"] = asset_id
-        device["enabled"] = 0 if is_removed_inverter_name(device["device_name"]) else 1
-        device["payload"] = raw_row
-        device["provider_device_id"] = upsert_provider_device(conn, asset_id, provider, device)
-        if not device["enabled"]:
-            logging.info(
-                "FusionSolar inverter excluded because it is marked as removed: asset_id=%s inverter_id=%s name=%s",
-                asset_id,
-                device["external_device_id"],
-                device["device_name"],
-            )
-            continue
-        devices.append(device)
-    conn.commit()
-    return {
-        "provider": provider,
-        "config": config,
-        "endpoints": endpoints,
-        "session": session,
-        "devices": devices,
-        "history_call_delay_seconds": history_call_delay_seconds,
-        "sleeper": sleeper,
-    }
-
-
-def sync_fusionsolar_inverter_availability_for_date(
-    conn: sqlite3.Connection,
-    target_date: date,
-    *,
-    context: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    if target_date >= current_lisbon_date():
-        raise ValueError("A disponibilidade temporal requer um dia fechado.")
-    sync_context = context or prepare_fusionsolar_inverter_history_context(conn)
-    devices = sync_context["devices"]
-    if not devices:
-        return {"date": target_date.isoformat(), "samples": 0, "plants": 0, "inverters": 0}
-    try:
-        history_rows = fetch_fusionsolar_device_history(
-            sync_context["session"],
-            base_url=sync_context["endpoints"]["base_url"],
-            endpoint=sync_context["endpoints"]["device_history_endpoint"],
-            devices=devices,
-            target_date=target_date,
-            call_delay_seconds=float(sync_context.get("history_call_delay_seconds") or 0),
-            sleeper=sync_context.get("sleeper") or time.sleep,
-        )
-    except Exception:
-        logging.exception(
-            "FusionSolar device history request failed: target_date=%s endpoint=%s inverter_count=%s",
-            target_date,
-            sync_context["endpoints"]["device_history_endpoint"],
-            len(devices),
-        )
-        raise
-
-    now = datetime.now().isoformat(timespec="seconds")
-    for sample in history_rows:
-        conn.execute(
-            """
-            INSERT INTO inverter_power_samples (
-                asset_id, provider, external_station_id, inverter_id, inverter_name, inverter_power_kw,
-                sample_time, active_power_kw, raw_payload, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(provider, inverter_id, sample_time) DO UPDATE SET
-                asset_id = excluded.asset_id,
-                external_station_id = excluded.external_station_id,
-                inverter_name = excluded.inverter_name,
-                inverter_power_kw = excluded.inverter_power_kw,
-                active_power_kw = excluded.active_power_kw,
-                raw_payload = excluded.raw_payload
-            """,
-            (
-                sample["asset_id"],
-                sync_context["provider"],
-                sample["station_code"],
-                sample["external_device_id"],
-                sample["device_name"],
-                sample["rated_power_kw"],
-                sample["sample_time"].isoformat(timespec="seconds"),
-                sample["active_power_kw"],
-                json.dumps(sample["raw_payload"], ensure_ascii=True),
-                now,
-            ),
-        )
-
-    plants_written = 0
-    devices_by_asset: dict[int, list[dict[str, Any]]] = {}
-    for device in devices:
-        devices_by_asset.setdefault(int(device["asset_id"]), []).append(device)
-    for asset_id, plant_devices in devices_by_asset.items():
-        stored_samples = query_all(
-            conn,
-            """
-            SELECT inverter_id, sample_time, active_power_kw
-            FROM inverter_power_samples
-            WHERE asset_id = ? AND provider = ? AND sample_time >= ? AND sample_time < ?
-            """,
-            (
-                asset_id,
-                sync_context["provider"],
-                datetime.combine(target_date, datetime.min.time()).isoformat(timespec="seconds"),
-                datetime.combine(target_date + timedelta(days=1), datetime.min.time()).isoformat(timespec="seconds"),
-            ),
-        )
-        samples_by_inverter: dict[str, list[dict[str, Any]]] = {}
-        valid_slots: set[datetime] = set()
-        for row in stored_samples:
-            sample_time = parse_datetime_value(row["sample_time"])
-            if sample_time is None:
-                continue
-            sample = {"sample_time": sample_time, "active_power_kw": row["active_power_kw"]}
-            samples_by_inverter.setdefault(str(row["inverter_id"]), []).append(sample)
-            if is_inverter_available(row["active_power_kw"]):
-                valid_slots.add(inverter_availability_slot(sample_time))
-
-        conn.execute(
-            "DELETE FROM inverter_availability_daily WHERE asset_id = ? AND provider = ? AND availability_date = ?",
-            (asset_id, sync_context["provider"], target_date.isoformat()),
-        )
-        inverter_results: list[dict[str, Any]] = []
-        for device in plant_devices:
-            device_samples = samples_by_inverter.get(str(device["external_device_id"]), [])
-            result = calculate_inverter_daily_availability(
-                device_samples,
-                valid_slots,
-            )
-            result.update(
-                {
-                    "asset_id": asset_id,
-                    "inverter_id": device["external_device_id"],
-                    "inverter_name": device["device_name"],
-                    "inverter_power_kw": device["rated_power_kw"],
-                }
-            )
-            inverter_results.append(result)
-            conn.execute(
-                """
-                INSERT INTO inverter_availability_daily (
-                    asset_id, provider, availability_date, inverter_id, inverter_name, inverter_power_kw,
-                    valid_slots, available_slots, unavailable_slots, availability_pct, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(provider, inverter_id, availability_date) DO UPDATE SET
-                    asset_id = excluded.asset_id,
-                    inverter_name = excluded.inverter_name,
-                    inverter_power_kw = excluded.inverter_power_kw,
-                    valid_slots = excluded.valid_slots,
-                    available_slots = excluded.available_slots,
-                    unavailable_slots = excluded.unavailable_slots,
-                    availability_pct = excluded.availability_pct,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    asset_id,
-                    sync_context["provider"],
-                    target_date.isoformat(),
-                    device["external_device_id"],
-                    device["device_name"],
-                    device["rated_power_kw"],
-                    result["valid_slots"],
-                    result["available_slots"],
-                    result["unavailable_slots"],
-                    result["availability_pct"],
-                    now,
-                    now,
-                ),
-            )
-        weighted_pct = calculate_weighted_plant_availability(inverter_results)
-        tolerated_valid_slots = apply_inverter_edge_tolerance(valid_slots)
-        conn.execute(
-            """
-            INSERT INTO plant_availability_daily (
-                asset_id, provider, availability_date, valid_slots, weighted_availability_pct,
-                inverter_count, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(provider, asset_id, availability_date) DO UPDATE SET
-                valid_slots = excluded.valid_slots,
-                weighted_availability_pct = excluded.weighted_availability_pct,
-                inverter_count = excluded.inverter_count,
-                updated_at = excluded.updated_at
-            """,
-            (
-                asset_id,
-                sync_context["provider"],
-                target_date.isoformat(),
-                len(tolerated_valid_slots),
-                weighted_pct,
-                len(inverter_results),
-                now,
-                now,
-            ),
-        )
-        plants_written += 1
-        logging.info(
-            "FusionSolar inverter availability calculated: target_date=%s asset_id=%s inverters=%s valid_slots=%s availability_pct=%s",
-            target_date,
-            asset_id,
-            len(inverter_results),
-            len(tolerated_valid_slots),
-            weighted_pct,
-        )
-    conn.commit()
-    return {
-        "date": target_date.isoformat(),
-        "samples": len(history_rows),
-        "plants": plants_written,
-        "inverters": len(devices),
-    }
-
-
-def sync_fusionsolar_inverter_availability_range(
-    conn: sqlite3.Connection,
-    from_date: date,
-    to_date: date,
-) -> dict[str, Any]:
-    context = prepare_fusionsolar_inverter_history_context(conn)
-    totals = {"days": 0, "samples": 0, "plants": 0, "inverters": len(context["devices"])}
-    current = from_date
-    while current <= to_date:
-        result = sync_fusionsolar_inverter_availability_for_date(conn, current, context=context)
-        totals["days"] += 1
-        totals["samples"] += int(result["samples"])
-        totals["plants"] += int(result["plants"])
-        current += timedelta(days=1)
-    return totals
-
-
-def load_local_fusionsolar_wat_devices(
-    conn: sqlite3.Connection,
-    *,
-    target_date: date,
-    asset_ids: list[int] | None = None,
-) -> list[dict[str, Any]]:
-    ensure_sampled_availability_schema(conn)
-    conditions = [
-        "h.provider = ?",
-        "h.expected = 1",
-        "h.valid_from <= ?",
-        "(h.valid_to IS NULL OR h.valid_to >= ?)",
-        "pd.dev_type_id IN (1, 38)",
-    ]
-    params: list[Any] = [
-        INTEGRATION_PROVIDER_FUSIONSOLAR,
-        target_date.isoformat(),
-        target_date.isoformat(),
-    ]
-    if asset_ids:
-        placeholders = ", ".join("?" for _ in asset_ids)
-        conditions.append(f"h.asset_id IN ({placeholders})")
-        params.extend(sorted(set(asset_ids)))
-    rows = conn.execute(
-        f"""
-        SELECT
-            pd.id AS provider_device_id,
-            h.asset_id,
-            pd.station_code,
-            pd.external_device_id,
-            pd.dev_dn,
-            pd.sn,
-            pd.device_name,
-            pd.dev_type_id,
-            pd.model,
-            pd.rated_power_kw,
-            pd.updated_at
-        FROM provider_device_configuration_history h
-        JOIN provider_devices pd ON pd.id = h.provider_device_id
-        WHERE {' AND '.join(conditions)}
-        ORDER BY h.asset_id, pd.external_device_id
-        """,
-        params,
-    ).fetchall()
-    return [dict(row) for row in rows]
-
-
-def fusionsolar_device_catalog_is_stale(
-    conn: sqlite3.Connection,
-    *,
-    now: datetime | None = None,
-) -> bool:
-    row = conn.execute(
-        """
-        SELECT COUNT(*) AS total, MAX(updated_at) AS last_updated_at
-        FROM provider_devices
-        WHERE provider = ? AND dev_type_id IN (1, 38)
-        """,
-        (INTEGRATION_PROVIDER_FUSIONSOLAR,),
-    ).fetchone()
-    if int(row["total"] or 0) == 0:
-        return True
-    last_updated = parse_background_job_timestamp(row["last_updated_at"])
-    if last_updated is None:
-        return True
-    now_utc = as_background_job_utc(now or background_job_utc_now())
-    return now_utc - last_updated > timedelta(hours=24)
-
-
-def missing_wat_devices_for_date(
-    conn: sqlite3.Connection,
-    *,
-    target_date: date,
-    devices: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], int]:
-    if not devices:
-        return [], 0
-    start = datetime.combine(target_date, datetime.min.time()).isoformat(
-        timespec="seconds"
-    )
-    end = datetime.combine(
-        target_date + timedelta(days=1),
-        datetime.min.time(),
-    ).isoformat(timespec="seconds")
-    rows = conn.execute(
-        """
-        SELECT inverter_id, sample_time, active_power_kw
-        FROM inverter_power_samples
-        WHERE provider = ? AND sample_time >= ? AND sample_time < ?
-        ORDER BY sample_time
-        """,
-        (INTEGRATION_PROVIDER_FUSIONSOLAR, start, end),
-    ).fetchall()
-    valid_slots: set[datetime] = set()
-    observed_by_inverter: dict[str, set[datetime]] = {}
-    for row in rows:
-        sample_time = parse_datetime_value(row["sample_time"])
-        if sample_time is None:
-            continue
-        slot = inverter_availability_slot(sample_time)
-        observed_by_inverter.setdefault(
-            str(row["inverter_id"]),
-            set(),
-        ).add(slot)
-        if is_inverter_available(row["active_power_kw"]):
-            valid_slots.add(slot)
-    considered_slots = apply_inverter_edge_tolerance(valid_slots)
-    if not considered_slots:
-        return list(devices), 0
-    missing = [
-        device
-        for device in devices
-        if not considered_slots.issubset(
-            observed_by_inverter.get(
-                str(device["external_device_id"]),
-                set(),
-            )
-        )
-    ]
-    return missing, len(considered_slots)
-
-
-def store_fusionsolar_wat_history_batch(
-    conn: sqlite3.Connection,
-    *,
-    samples: list[dict[str, Any]],
-    provider: str = INTEGRATION_PROVIDER_FUSIONSOLAR,
-) -> int:
-    now = serialize_background_job_timestamp()
-    for sample in samples:
-        conn.execute(
-            """
-            INSERT INTO inverter_power_samples (
-                asset_id, provider, external_station_id, inverter_id,
-                inverter_name, inverter_power_kw, sample_time,
-                active_power_kw, raw_payload, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(provider, inverter_id, sample_time) DO UPDATE SET
-                asset_id = excluded.asset_id,
-                external_station_id = excluded.external_station_id,
-                inverter_name = excluded.inverter_name,
-                inverter_power_kw = excluded.inverter_power_kw,
-                active_power_kw = excluded.active_power_kw,
-                raw_payload = excluded.raw_payload
-            """,
-            (
-                sample["asset_id"],
-                provider,
-                sample["station_code"],
-                sample["external_device_id"],
-                sample["device_name"],
-                sample["rated_power_kw"],
-                sample["sample_time"].isoformat(timespec="seconds"),
-                sample["active_power_kw"],
-                json.dumps(sample["raw_payload"], ensure_ascii=True),
-                now,
-            ),
-        )
-    conn.commit()
-    return len(samples)
-
-
-def update_current_background_job_checkpoint(
-    conn: sqlite3.Connection,
-    updates: dict[str, Any],
-) -> dict[str, Any]:
-    context = PRODUCTION_KPI_CALL_CONTEXT.get()
-    if not context:
-        return {}
-    job_id = int(context["job_id"])
-    row = conn.execute(
-        "SELECT params_json FROM background_jobs WHERE id = ?",
-        (job_id,),
-    ).fetchone()
-    params = decode_job_params(row["params_json"] if row else "{}")
-    params.update(updates)
-    conn.execute(
-        "UPDATE background_jobs SET params_json = ? WHERE id = ?",
-        (encode_job_params(params), job_id),
-    )
-    conn.commit()
-    return params
-
-
-def run_resumable_fusionsolar_wat_backfill(
-    conn: sqlite3.Connection,
-    *,
-    from_date: date,
-    to_date: date,
-) -> dict[str, Any]:
-    context = PRODUCTION_KPI_CALL_CONTEXT.get() or {}
-    job_id = int(context.get("job_id") or 0)
-    job = conn.execute(
-        "SELECT params_json FROM background_jobs WHERE id = ?",
-        (job_id,),
-    ).fetchone()
-    params = decode_job_params(job["params_json"] if job else "{}")
-    cursor_date = (
-        parse_date_value(str(params.get("cursor_date") or ""))
-        or from_date
-    )
-    asset_ids = [
-        int(value)
-        for value in params.get("asset_ids") or []
-        if str(value).isdigit()
-    ]
-    attempted_ids = {
-        str(value)
-        for value in params.get("attempted_inverter_ids") or []
-        if str(value)
-    }
-    summary: dict[str, Any] = {
-        "days": 0,
-        "samples": 0,
-        "plants": 0,
-        "inverters": 0,
-        "api_calls_used": 0,
-        "days_recalculated_from_db": 0,
-        "resume_hint": cursor_date.isoformat(),
-        "stopped_reason": "",
-    }
-
-    if fusionsolar_device_catalog_is_stale(conn):
-        refreshed = prepare_fusionsolar_inverter_history_context(
-            conn,
-            history_call_delay_seconds=0,
-            sleeper=lambda _seconds: None,
-        )
-        station_chunks = max(
-            1,
-            math.ceil(
-                len(
-                    {
-                        str(device["station_code"])
-                        for device in refreshed["devices"]
-                        if device.get("station_code")
-                    }
-                )
-                / 100
-            ),
-        )
-        summary["api_calls_used"] += station_chunks * 2
-
-    current = cursor_date
-    while current <= to_date:
-        devices = load_local_fusionsolar_wat_devices(
-            conn,
-            target_date=current,
-            asset_ids=asset_ids or None,
-        )
-        summary["inverters"] = len(devices)
-        recalculate_stored_inverter_availability(
-            conn,
-            current,
-            current,
-        )
-        missing_devices, valid_slots = missing_wat_devices_for_date(
-            conn,
-            target_date=current,
-            devices=devices,
-        )
-        if not missing_devices:
-            summary["days"] += 1
-            summary["days_recalculated_from_db"] += 1
-            summary["plants"] += len(
-                {int(device["asset_id"]) for device in devices}
-            )
-            current += timedelta(days=1)
-            attempted_ids = set()
-            update_current_background_job_checkpoint(
-                conn,
-                {
-                    "cursor_date": current.isoformat(),
-                    "attempted_inverter_ids": [],
-                },
-            )
-            continue
-
-        pending_devices = [
-            device
-            for device in missing_devices
-            if str(device["external_device_id"]) not in attempted_ids
-        ]
-        if not pending_devices:
-            summary["days"] += 1
-            summary["stopped_reason"] = (
-                "wat_history_incomplete_after_refresh"
-                if valid_slots
-                else "no_observed_operating_window"
-            )
-            current += timedelta(days=1)
-            attempted_ids = set()
-            update_current_background_job_checkpoint(
-                conn,
-                {
-                    "cursor_date": current.isoformat(),
-                    "attempted_inverter_ids": [],
-                },
-            )
-            continue
-
-        batch = pending_devices[:10]
-        config = get_integration_config(
-            conn,
-            INTEGRATION_PROVIDER_FUSIONSOLAR,
-        )
-        if config is None:
-            raise ValueError("Configuracao FusionSolar indisponivel.")
-        endpoints = get_fusionsolar_endpoint_config(config)
-        conn.commit()
-        session, _token = get_fusionsolar_session(config)
-        history_rows = fetch_fusionsolar_device_history(
-            session,
-            base_url=endpoints["base_url"],
-            endpoint=endpoints["device_history_endpoint"],
-            devices=batch,
-            target_date=current,
-            call_delay_seconds=0,
-            sleeper=lambda _seconds: None,
-        )
-        summary["api_calls_used"] += 1
-        summary["samples"] += store_fusionsolar_wat_history_batch(
-            conn,
-            samples=history_rows,
-        )
-        attempted_ids.update(
-            str(device["external_device_id"]) for device in batch
-        )
-        recalculate_stored_inverter_availability(
-            conn,
-            current,
-            current,
-        )
-        update_current_background_job_checkpoint(
-            conn,
-            {
-                "cursor_date": current.isoformat(),
-                "attempted_inverter_ids": sorted(attempted_ids),
-            },
-        )
-        summary["resume_hint"] = current.isoformat()
-        raise ApiSlotUnavailableError(
-            provider=INTEGRATION_PROVIDER_FUSIONSOLAR,
-            account_key=fusionsolar_account_key(config),
-            api_area=WAT_HISTORY_AREA,
-            next_attempt_at=datetime.now(LISBON_TIMEZONE)
-            + timedelta(seconds=1),
-            wait_reason="checkpoint",
-            message="Lote WAT guardado; job preparado para o lote seguinte.",
-            job_result=summary,
-        )
-
-    summary["resume_hint"] = ""
-    return summary
-
-
-def run_fusionsolar_inverter_availability_backfill(
-    conn: sqlite3.Connection,
-    *,
-    from_date: date,
-    to_date: date,
-    sleeper: Any = time.sleep,
-    history_call_delay_seconds: float = FUSIONSOLAR_PERFORMANCE_KPI_DELAY_SECONDS,
-    max_wait_cycles: int = 24,
-) -> dict[str, Any]:
-    if from_date > to_date or to_date >= current_lisbon_date():
-        raise ValueError("O backfill WAT requer um intervalo valido de dias fechados.")
-    if PRODUCTION_KPI_CALL_CONTEXT.get() is not None:
-        return run_resumable_fusionsolar_wat_backfill(
-            conn,
-            from_date=from_date,
-            to_date=to_date,
-        )
-    summary: dict[str, Any] = {
-        "days": 0,
-        "samples": 0,
-        "plants": 0,
-        "inverters": 0,
-        "api_errors": 0,
-        "wait_cycles": 0,
-        "resume_hint": from_date.isoformat(),
-        "stopped_reason": "",
-    }
-
-    def wait_after_rate_limit(reason: str, resume_date: date) -> bool:
-        summary["wait_cycles"] += 1
-        summary["resume_hint"] = resume_date.isoformat()
-        if summary["wait_cycles"] > max_wait_cycles:
-            summary["stopped_reason"] = f"Limite FusionSolar repetido demasiadas vezes. Ultimo estado: {reason}"
-            logging.warning(
-                "FusionSolar WAT backfill stopped after repeated cooldowns: resume_date=%s wait_cycles=%s reason=%s",
-                resume_date,
-                summary["wait_cycles"],
-                reason,
-            )
-            return False
-        conn.commit()
-        seconds = fusionsolar_cooldown_sleep_seconds(conn)
-        logging.warning(
-            "FusionSolar WAT backfill waiting for API cooldown: resume_date=%s seconds=%s wait_cycle=%s",
-            resume_date,
-            seconds,
-            summary["wait_cycles"],
-        )
-        sleeper(seconds)
-        clear_fusionsolar_rate_limit_cooldown(conn)
-        return True
-
-    def prepare_context(force_login: bool = False) -> dict[str, Any] | None:
-        while True:
-            try:
-                return prepare_fusionsolar_inverter_history_context(
-                    conn,
-                    force_login=force_login,
-                    history_call_delay_seconds=history_call_delay_seconds,
-                    sleeper=sleeper,
-                )
-            except Exception as exc:
-                summary["api_errors"] += 1
-                if isinstance(exc, ApiRateLimitError):
-                    raise
-                if is_fusionsolar_rate_limit_error(exc):
-                    reason = mark_fusionsolar_performance_rate_limited(conn)
-                    if not wait_after_rate_limit(reason, from_date):
-                        return None
-                    force_login = True
-                    continue
-                if is_fusionsolar_session_expired_error(exc):
-                    force_login = True
-                    continue
-                raise
-
-    cooldown_reason = get_fusionsolar_performance_cooldown_reason(conn)
-    if cooldown_reason and not wait_after_rate_limit(cooldown_reason, from_date):
-        return summary
-    context = prepare_context()
-    if context is None:
-        return summary
-    summary["inverters"] = len(context["devices"])
-
-    current = from_date
-    while current <= to_date:
-        session_retry_used = False
-        while True:
-            try:
-                logging.info("FusionSolar WAT backfill day started: target_date=%s", current)
-                result = sync_fusionsolar_inverter_availability_for_date(conn, current, context=context)
-                stored_counts = conn.execute(
-                    """
-                    SELECT
-                        (SELECT COUNT(*) FROM inverter_power_samples
-                         WHERE provider = ? AND sample_time >= ? AND sample_time < ?) AS power_samples,
-                        (SELECT COUNT(*) FROM inverter_availability_daily
-                         WHERE provider = ? AND availability_date = ?) AS inverter_daily_rows,
-                        (SELECT COUNT(*) FROM plant_availability_daily
-                         WHERE provider = ? AND availability_date = ?) AS plant_daily_rows
-                    """,
-                    (
-                        INTEGRATION_PROVIDER_FUSIONSOLAR,
-                        datetime.combine(current, datetime.min.time()).isoformat(timespec="seconds"),
-                        datetime.combine(current + timedelta(days=1), datetime.min.time()).isoformat(timespec="seconds"),
-                        INTEGRATION_PROVIDER_FUSIONSOLAR,
-                        current.isoformat(),
-                        INTEGRATION_PROVIDER_FUSIONSOLAR,
-                        current.isoformat(),
-                    ),
-                ).fetchone()
-                summary["days"] += 1
-                summary["samples"] += int(result["samples"])
-                summary["plants"] += int(result["plants"])
-                summary["resume_hint"] = (current + timedelta(days=1)).isoformat()
-                conn.commit()
-                logging.info(
-                    "FusionSolar WAT backfill day completed: target_date=%s fetched_samples=%s "
-                    "stored_power_samples=%s stored_inverter_daily=%s stored_plant_daily=%s plants=%s inverters=%s",
-                    current,
-                    result["samples"],
-                    stored_counts["power_samples"],
-                    stored_counts["inverter_daily_rows"],
-                    stored_counts["plant_daily_rows"],
-                    result["plants"],
-                    result["inverters"],
-                )
-                break
-            except Exception as exc:
-                summary["api_errors"] += 1
-                if isinstance(exc, ApiRateLimitError):
-                    raise
-                if is_fusionsolar_rate_limit_error(exc):
-                    reason = mark_fusionsolar_performance_rate_limited(conn)
-                    if not wait_after_rate_limit(reason, current):
-                        return summary
-                    continue
-                if is_fusionsolar_session_expired_error(exc) and not session_retry_used:
-                    session_retry_used = True
-                    invalidate_fusionsolar_session(context["config"])
-                    refreshed = prepare_context(force_login=True)
-                    if refreshed is None:
-                        return summary
-                    context = refreshed
-                    continue
-                raise
-        current += timedelta(days=1)
-    summary["resume_hint"] = ""
-    return summary
-
-
-def recalculate_stored_inverter_availability(
-    conn: sqlite3.Connection,
-    from_date: date,
-    to_date: date,
-    *,
-    asset_id: int | None = None,
-) -> dict[str, int]:
-    provider = INTEGRATION_PROVIDER_FUSIONSOLAR
-    conditions = ["provider = ?", "sample_time >= ?", "sample_time < ?"]
-    params: list[Any] = [
-        provider,
-        datetime.combine(from_date, datetime.min.time()).isoformat(timespec="seconds"),
-        datetime.combine(to_date + timedelta(days=1), datetime.min.time()).isoformat(timespec="seconds"),
-    ]
-    if asset_id is not None:
-        conditions.append("asset_id = ?")
-        params.append(asset_id)
-    sample_dates = conn.execute(
-        f"""
-        SELECT DISTINCT asset_id, substr(sample_time, 1, 10) AS sample_date
-        FROM inverter_power_samples
-        WHERE {' AND '.join(conditions)}
-        ORDER BY sample_date, asset_id
-        """,
-        params,
-    ).fetchall()
-    now = datetime.now().isoformat(timespec="seconds")
-    totals = {"days": 0, "plants": 0, "inverters": 0}
-    for date_row in sample_dates:
-        current_asset_id = int(date_row["asset_id"])
-        target_date = parse_date_value(date_row["sample_date"])
-        if target_date is None:
-            continue
-        devices = expected_devices_for_date(
-            conn,
-            asset_id=current_asset_id,
-            provider=provider,
-            target_date=target_date,
-        )
-        samples = query_all(
-            conn,
-            """
-            SELECT inverter_id, sample_time, active_power_kw
-            FROM inverter_power_samples
-            WHERE asset_id = ? AND provider = ? AND sample_time >= ? AND sample_time < ?
-            ORDER BY sample_time
-            """,
-            (
-                current_asset_id,
-                provider,
-                datetime.combine(target_date, datetime.min.time()).isoformat(timespec="seconds"),
-                datetime.combine(target_date + timedelta(days=1), datetime.min.time()).isoformat(timespec="seconds"),
-            ),
-        )
-        samples_by_inverter: dict[str, list[dict[str, Any]]] = {}
-        valid_slots: set[datetime] = set()
-        for sample_row in samples:
-            sample_time = parse_datetime_value(sample_row["sample_time"])
-            if sample_time is None:
-                continue
-            sample = {"sample_time": sample_time, "active_power_kw": sample_row["active_power_kw"]}
-            samples_by_inverter.setdefault(str(sample_row["inverter_id"]), []).append(sample)
-            if is_inverter_available(sample_row["active_power_kw"]):
-                valid_slots.add(inverter_availability_slot(sample_time))
-
-        conn.execute(
-            "DELETE FROM inverter_availability_daily WHERE asset_id = ? AND provider = ? AND availability_date = ?",
-            (current_asset_id, provider, target_date.isoformat()),
-        )
-        tolerated_valid_slots = apply_inverter_edge_tolerance(valid_slots)
-        inverter_results: list[dict[str, Any]] = []
-        for device in devices:
-            if is_removed_inverter_name(device["device_name"]):
-                continue
-            inverter_id = str(device["external_device_id"] or "")
-            if not inverter_id:
-                continue
-            device_samples = samples_by_inverter.get(inverter_id, [])
-            inverter_power_kw = (
-                parse_float_value(device["rated_power_kw"])
-                or infer_inverter_power_from_model(device["model"])
-            )
-            result = calculate_inverter_daily_availability(device_samples, valid_slots)
-            observed_slots = {
-                inverter_availability_slot(sample["sample_time"])
-                for sample in device_samples
-            }
-            if (
-                not tolerated_valid_slots
-                or not tolerated_valid_slots.issubset(observed_slots)
-            ):
-                result["availability_pct"] = None
-            result["inverter_power_kw"] = inverter_power_kw
-            inverter_results.append(result)
-            conn.execute(
-                """
-                INSERT INTO inverter_availability_daily (
-                    asset_id, provider, availability_date, inverter_id, inverter_name, inverter_power_kw,
-                    valid_slots, available_slots, unavailable_slots, availability_pct, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    current_asset_id,
-                    provider,
-                    target_date.isoformat(),
-                    inverter_id,
-                    device["device_name"],
-                    inverter_power_kw,
-                    result["valid_slots"],
-                    result["available_slots"],
-                    result["unavailable_slots"],
-                    result["availability_pct"],
-                    now,
-                    now,
-                ),
-            )
-        weighted_pct = (
-            calculate_weighted_plant_availability(inverter_results)
-            if inverter_results
-            and all(
-                row.get("availability_pct") is not None
-                for row in inverter_results
-            )
-            else None
-        )
-        conn.execute(
-            """
-            INSERT INTO plant_availability_daily (
-                asset_id, provider, availability_date, valid_slots, weighted_availability_pct,
-                inverter_count, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(provider, asset_id, availability_date) DO UPDATE SET
-                valid_slots = excluded.valid_slots,
-                weighted_availability_pct = excluded.weighted_availability_pct,
-                inverter_count = excluded.inverter_count,
-                updated_at = excluded.updated_at
-            """,
-            (
-                current_asset_id,
-                provider,
-                target_date.isoformat(),
-                len(tolerated_valid_slots),
-                weighted_pct,
-                len(inverter_results),
-                now,
-                now,
-            ),
-        )
-        totals["plants"] += 1
-        totals["inverters"] += len(inverter_results)
-        totals["days"] += 1
-    conn.commit()
-    return totals
-
-
-def run_fusionsolar_device_availability_sync(
-    conn: sqlite3.Connection,
-    provider: str,
-    trigger_type: str = "manual",
-) -> dict[str, Any]:
-    config = get_integration_config(conn, provider)
-    if config is None or not config["enabled"]:
-        raise ValueError(f"Configuracao {provider} indisponivel.")
-    endpoints = get_fusionsolar_endpoint_config(config)
-    mappings = query_all(
-        conn,
-        """
-        SELECT asset_id, external_id
-        FROM asset_integrations
-        WHERE provider = ? AND enabled = 1 AND COALESCE(external_id, '') != ''
-        """,
-        (provider,),
-    )
-    station_to_asset = {str(row["external_id"]): int(row["asset_id"]) for row in mappings}
-    station_codes = sorted(station_to_asset)
-    if not station_codes:
-        return {"devices": 0, "snapshots": 0, "assets": 0}
-
-    last_error: Exception | None = None
-    for attempt in range(2):
-        try:
-            session, _ = get_fusionsolar_session(config, force_login=attempt == 1)
-            device_rows = fetch_fusionsolar_device_list(
-                session,
-                base_url=endpoints["base_url"],
-                endpoint=endpoints["device_list_endpoint"],
-                station_codes=station_codes,
-            )
-            break
-        except Exception as exc:
-            last_error = exc
-            if not is_fusionsolar_session_expired_error(exc) or attempt == 1:
-                raise
-            LOGGER.info("FusionSolar device session expired; invalidating cache and retrying login once")
-            invalidate_fusionsolar_session(config)
-    else:
-        raise last_error or ValueError("Falha desconhecida no FusionSolar.")
-
-    tracked: list[dict[str, Any]] = []
-    for raw_row in device_rows:
-        normalized = normalize_fusionsolar_device_identity(raw_row)
-        if normalized["dev_type_id"] not in FUSIONSOLAR_INVERTER_DEVICE_TYPE_IDS:
-            continue
-        if not normalized["station_code"] or not normalized["external_device_id"]:
-            continue
-        asset_id = station_to_asset.get(normalized["station_code"])
-        if not asset_id:
-            continue
-        normalized["payload"] = raw_row
-        normalized["enabled"] = 0 if is_removed_inverter_name(normalized["device_name"]) else 1
-        normalized["provider_device_id"] = upsert_provider_device(conn, asset_id, provider, normalized)
-        if not normalized["enabled"]:
-            continue
-        normalized["asset_id"] = asset_id
-        tracked.append(normalized)
-
-    realtime_map = fetch_fusionsolar_device_realtime_map(
-        session,
-        base_url=endpoints["base_url"],
-        endpoint=endpoints["device_real_time_endpoint"],
-        devices=tracked,
-    )
-    collected_at_dt = datetime.now()
-    collected_at = serialize_background_job_timestamp()
-    snapshots_by_asset: dict[int, list[dict[str, Any]]] = {}
-    for device in tracked:
-        realtime = next(
-            (realtime_map[key] for key in (device["external_device_id"], device["dev_dn"], device["sn"]) if key and key in realtime_map),
-            {},
-        )
-        data_map = realtime.get("dataItemMap") if isinstance(realtime.get("dataItemMap"), dict) else realtime
-        seen_dt = parse_datetime_value(first_non_empty(realtime, ["collectTime", "collectedAt", "lastSeen", "last_seen_at"]))
-        has_recent_data = True if realtime and seen_dt is None else bool(
-            seen_dt and collected_at_dt - seen_dt <= timedelta(minutes=DEFAULT_DEVICE_COMMUNICATION_THRESHOLD_MINUTES)
-        )
-        availability_status = classify_fusionsolar_inverter_availability(
-            {"inverter_state": first_non_empty(data_map, ["inverter_state", "inverterState"])},
-            has_recent_data=has_recent_data,
-        )
-        communication_status = "recent" if has_recent_data else "stale"
-        currents, voltages = parse_fusionsolar_pv_inputs(realtime)
-        expected_string_indexes = learn_expected_strings_from_voltage(
-            conn,
-            device["provider_device_id"],
-            voltages,
-            collected_at,
-        )
-        pv_health = calculate_pv_input_health(
-            currents,
-            voltages,
-            expected_string_indexes=expected_string_indexes,
-        )
-        snapshot = {
-            **device,
-            "availability_status": availability_status,
-            "communication_status": communication_status,
-            "rated_power_kw": device["rated_power_kw"],
-            **pv_health,
-        }
-        conn.execute(
-            """
-            INSERT INTO device_realtime_snapshots (
-                provider_device_id, asset_id, provider, station_code, collected_at, inverter_state,
-                active_power_kw, day_energy_kwh, availability_status, communication_status,
-                string_available_count, string_total_count, pv_current_json, pv_voltage_json, payload_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                device["provider_device_id"],
-                device["asset_id"],
-                provider,
-                device["station_code"],
-                collected_at,
-                parse_int_value(first_non_empty(data_map, ["inverter_state", "inverterState"])),
-                normalize_power_to_kw(first_non_empty(data_map, ["active_power", "activePower"])),
-                parse_float_value(first_non_empty(data_map, ["day_cap", "dayEnergy", "day_energy"])),
-                availability_status,
-                communication_status,
-                pv_health["available_strings"],
-                pv_health["total_strings"],
-                json.dumps(currents, ensure_ascii=True) if currents else None,
-                json.dumps(voltages, ensure_ascii=True) if voltages else None,
-                json.dumps(realtime, ensure_ascii=True),
-                collected_at,
-            ),
-        )
-        conn.execute(
-            "UPDATE provider_devices SET last_seen_at = COALESCE(?, last_seen_at), updated_at = ? WHERE id = ?",
-            (seen_dt.isoformat(timespec="seconds") if seen_dt else collected_at if realtime else None, collected_at, device["provider_device_id"]),
-        )
-        snapshots_by_asset.setdefault(device["asset_id"], []).append(snapshot)
-
-    for asset_id, rows in snapshots_by_asset.items():
-        summary = calculate_asset_availability(rows)
-        now = datetime.now().isoformat(timespec="seconds")
-        conn.execute(
-            """
-            INSERT INTO availability_daily (
-                asset_id, provider, period_date, inverter_availability_pct, capacity_availability_pct,
-                communication_availability_pct, string_availability_pct, available_inverters, total_inverters, unavailable_inverters,
-                no_communication_devices, available_strings, total_strings, unavailable_strings, affected_power_kw,
-                payload_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(asset_id, provider, period_date) DO UPDATE SET
-                inverter_availability_pct = excluded.inverter_availability_pct,
-                capacity_availability_pct = excluded.capacity_availability_pct,
-                communication_availability_pct = excluded.communication_availability_pct,
-                string_availability_pct = excluded.string_availability_pct,
-                available_inverters = excluded.available_inverters,
-                total_inverters = excluded.total_inverters,
-                unavailable_inverters = excluded.unavailable_inverters,
-                no_communication_devices = excluded.no_communication_devices,
-                available_strings = excluded.available_strings,
-                total_strings = excluded.total_strings,
-                unavailable_strings = excluded.unavailable_strings,
-                affected_power_kw = excluded.affected_power_kw,
-                payload_json = excluded.payload_json,
-                updated_at = excluded.updated_at
-            """,
-            (
-                asset_id,
-                provider,
-                current_lisbon_date().isoformat(),
-                summary["inverter_availability_pct"],
-                summary["capacity_availability_pct"],
-                summary["communication_availability_pct"],
-                summary["string_availability_pct"],
-                summary["available_inverters"],
-                summary["total_inverters"],
-                summary["unavailable_inverters"],
-                summary["no_communication_devices"],
-                summary["available_strings"],
-                summary["total_strings"],
-                summary["unavailable_strings"],
-                summary["affected_power_kw"],
-                json.dumps(summary, ensure_ascii=True),
-                now,
-                now,
-            ),
-        )
-    sampled_states: dict[str, int] = {}
-    for asset_id in snapshots_by_asset:
-        sampled = materialize_sampled_availability_day(
-            conn,
-            asset_id=asset_id,
-            provider=provider,
-            target_date=current_lisbon_date(),
-        )
-        state = str(sampled["coverage_status"])
-        sampled_states[state] = sampled_states.get(state, 0) + 1
-    conn.commit()
-    return {
-        "devices": len(tracked),
-        "snapshots": sum(len(rows) for rows in snapshots_by_asset.values()),
-        "assets": len(snapshots_by_asset),
-        "sampled_days_recalculated_locally": len(snapshots_by_asset),
-        "sampled_states": sampled_states,
-    }
-
-
-def run_integration_sync(conn: sqlite3.Connection, provider: str, trigger_type: str = "manual") -> dict[str, Any]:
-    if provider == INTEGRATION_PROVIDER_SIGENERGY:
-        return run_sigenergy_sync(conn, provider, trigger_type=trigger_type)
-    return run_fusionsolar_sync(conn, provider, trigger_type=trigger_type)
-
-
-def run_fusionsolar_sync(conn: sqlite3.Connection, provider: str, trigger_type: str = "manual") -> dict[str, Any]:
-    if not FUSIONSOLAR_SYNC_LOCK.acquire(blocking=False):
-        message = "Sincronizacao FusionSolar ignorada porque ja existe outra em curso."
-        LOGGER.info(message)
-        return {"matched": 0, "unresolved": 0, "auto_resolved": 0, "status": "skipped", "stopped_reason": message}
-
-    with release_fusionsolar_sync_lock():
-        config = get_integration_config(conn, provider)
-        if config is None:
-            raise ValueError(f"Configuracao {provider} nao encontrada.")
-        if not config["enabled"]:
-            raise ValueError(f"A integracao {provider} esta desativada.")
-
-        run_id = create_integration_run(conn, provider, trigger_type)
-        batch_id = create_monitoring_batch(
-            conn,
-            record_date=date.today().isoformat(),
-            default_notes=f"Sync {provider} ({trigger_type})",
-            raw_input="",
-            source=provider,
-        )
-        conn.commit()
-
-        try:
-            if trigger_type == "scheduled_state":
-                result = run_fusionsolar_check(
-                    conn,
-                    provider,
-                    dry_run=True,
-                    include_diagnostics=False,
-                    prefer_local_station_inventory=True,
-                )
-            else:
-                result = run_fusionsolar_check(conn, provider, dry_run=True)
-            rows = result["rows"]
-            matched = 0
-            unresolved = 0
-            auto_resolved = 0
-            synced_asset_ids: set[int] = set()
-            alert_events: list[dict[str, Any]] = []
-            now = datetime.now()
-
-            for row in rows:
-                external_id = row["external_id"]
-                external_name = row["external_name"]
-                status = row["status"]
-
-                mapped_asset = None
-                if external_id:
-                    mapped_asset = conn.execute(
-                        """
-                        SELECT ai.asset_id
-                        FROM asset_integrations ai
-                        WHERE ai.provider = ? AND ai.external_id = ? AND ai.enabled = 1
-                        LIMIT 1
-                        """,
-                        (provider, external_id),
-                    ).fetchone()
-                if mapped_asset is None:
-                    mapped_asset = conn.execute(
-                        """
-                        SELECT ai.asset_id
-                        FROM asset_integrations ai
-                        WHERE ai.provider = ? AND ai.external_name = ? AND ai.enabled = 1
-                        LIMIT 1
-                        """,
-                        (provider, external_name),
-                    ).fetchone()
-                asset_id = int(mapped_asset["asset_id"]) if mapped_asset else (find_asset_id(conn, external_name) or 0)
-
-                if asset_id:
-                    synced_asset_ids.add(asset_id)
-                    previous = get_latest_monitoring_row(conn, asset_id)
-                    duplicate_latest = (
-                        previous is not None
-                        and previous["status"] == status
-                        and previous["record_date"] == date.today().isoformat()
-                        and previous["source"] == provider
-                    )
-                    if not duplicate_latest:
-                        conn.execute(
-                            """
-                            INSERT INTO monitoring_records (asset_id, status, record_date, notes, source, batch_id)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                            """,
-                            (
-                                asset_id,
-                                status,
-                                date.today().isoformat(),
-                                f"Sync {provider}: {row['notes']}",
-                                provider,
-                                batch_id,
-                            ),
-                        )
-                        event = build_monitoring_alert_event(
-                            conn,
-                            asset_id=asset_id,
-                            previous_status=previous["status"] if previous else "",
-                            current_status=status,
-                            happened_at=now.isoformat(timespec="seconds"),
-                            alarm_context=row,
-                        )
-                        if event:
-                            alert_events.append(event)
-                    create_or_update_asset_integration(conn, asset_id, provider, external_id, external_name, status)
-                    matched += 1
-                else:
-                    upsert_integration_unresolved(
-                        conn,
-                        provider=provider,
-                        run_id=run_id,
-                        external_id=external_id,
-                        external_name=external_name,
-                        status=status,
-                        payload=row["payload"],
-                    )
-                    unresolved += 1
-
-            mapped_assets = query_all(
-                conn,
-                """
-                SELECT ai.asset_id
-                FROM asset_integrations ai
-                JOIN latest_monitoring_view lm ON lm.asset_id = ai.asset_id
-                WHERE ai.provider = ? AND ai.enabled = 1 AND lm.status IN ('Erro', 'Desconectada')
-                """,
-                (provider,),
-            )
-            for row in mapped_assets:
-                asset_id = int(row["asset_id"])
-                if asset_id in synced_asset_ids:
-                    continue
-                existing_today = conn.execute(
-                    """
-                    SELECT 1
-                    FROM monitoring_records
-                    WHERE asset_id = ? AND record_date = ? AND source = ?
-                    LIMIT 1
-                    """,
-                    (asset_id, date.today().isoformat(), provider),
-                ).fetchone()
-                if existing_today:
-                    continue
-                previous = get_latest_monitoring_row(conn, asset_id)
-                conn.execute(
-                    """
-                    INSERT INTO monitoring_records (asset_id, status, record_date, notes, source, batch_id)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        asset_id,
-                        "Resolvido",
-                        date.today().isoformat(),
-                        f"Resolvido automaticamente por ausencia no sync {provider}.",
-                        provider,
-                        batch_id,
-                    ),
-                )
-                auto_resolved += 1
-                event = build_monitoring_alert_event(
-                    conn,
-                    asset_id=asset_id,
-                    previous_status=previous["status"] if previous else "",
-                    current_status="Resolvido",
-                    happened_at=now.isoformat(timespec="seconds"),
-                )
-                if event:
-                    alert_events.append(event)
-
-            conn.execute(
-                """
-                UPDATE integration_configs
-                SET last_sync_at = ?, last_sync_status = 'success', last_error = '', updated_at = ?
-                WHERE provider = ?
-                """,
-                (
-                    datetime.now().isoformat(timespec="seconds"),
-                    datetime.now().isoformat(timespec="seconds"),
-                    provider,
-                ),
-            )
-            conn.execute(
-                """
-                UPDATE monitoring_import_batches
-                SET imported_count = ?, matched_count = ?, unmatched_count = ?, auto_resolved_count = ?
-                WHERE id = ?
-                """,
-                (matched + unresolved, matched, unresolved, auto_resolved, batch_id),
-            )
-            finalize_integration_run(
-                conn,
-                run_id,
-                status="success",
-                matched_count=matched,
-                unresolved_count=unresolved,
-                auto_resolved_count=auto_resolved,
-                summary_json={
-                    "provider_rows": len(rows),
-                    "alarm_rows": result.get("alarm_count", 0),
-                    "alarm_error": result.get("alarm_error", ""),
-                    "station_rows": result.get("station_count", len(rows)),
-                    "realtime_rows": result.get("realtime_count", len(rows)),
-                    "station_inventory_source": result.get(
-                        "station_inventory_source",
-                        "api",
-                    ),
-                    "api_calls_used": int(result.get("api_calls_used") or 0),
-                },
-            )
-            process_monitoring_alerts(conn, alert_events, batch_id, now)
-            conn.commit()
-            device_availability: dict[str, Any] | None = None
-            if provider == INTEGRATION_PROVIDER_FUSIONSOLAR and trigger_type not in {"scheduled_state", "manual_background"}:
-                try:
-                    device_availability = run_fusionsolar_device_availability_sync(conn, provider, trigger_type=trigger_type)
-                except Exception as exc:
-                    logging.getLogger(__name__).warning("FusionSolar device availability sync failed: %s", exc)
-            return {
-                "matched": matched,
-                "unresolved": unresolved,
-                "auto_resolved": auto_resolved,
-                "device_availability": device_availability,
-                "api_calls_used": int(result.get("api_calls_used") or 0),
-                "station_inventory_source": result.get(
-                    "station_inventory_source",
-                    "api",
-                ),
-            }
-        except ApiRateLimitError as exc:
-            conn.execute(
-                """
-                UPDATE integration_configs
-                SET last_sync_status = 'waiting_rate_limit', last_error = ?, updated_at = ?
-                WHERE provider = ?
-                """,
-                (exc.message, datetime.now().isoformat(timespec="seconds"), provider),
-            )
-            finalize_integration_run(
-                conn,
-                run_id,
-                status="waiting_rate_limit",
-                matched_count=0,
-                unresolved_count=0,
-                auto_resolved_count=0,
-                error_message=exc.message,
-            )
-            conn.commit()
-            raise
-        except Exception as exc:
-            conn.execute(
-                """
-                UPDATE integration_configs
-                SET last_sync_status = 'error', last_error = ?, updated_at = ?
-                WHERE provider = ?
-                """,
-                (str(exc), datetime.now().isoformat(timespec="seconds"), provider),
-            )
-            finalize_integration_run(
-                conn,
-                run_id,
-                status="error",
-                matched_count=0,
-                unresolved_count=0,
-                auto_resolved_count=0,
-                error_message=str(exc),
-            )
-            conn.commit()
-            raise
-
-
-def run_all_integration_syncs(conn: sqlite3.Connection, trigger_type: str = "manual") -> dict[str, Any]:
-    results: dict[str, Any] = {}
-    errors: dict[str, str] = {}
-    for provider in INTEGRATION_PROVIDER_OPTIONS:
-        config = get_integration_config(conn, provider)
-        if config is None or not config["enabled"]:
-            continue
-        try:
-            results[provider] = run_integration_sync(conn, provider, trigger_type=trigger_type)
-        except Exception as exc:
-            errors[provider] = str(exc)
-    if not results and errors:
-        raise ValueError("; ".join(f"{provider}: {message}" for provider, message in errors.items()))
-    return {"results": results, "errors": errors}
-
-
-def resolve_fusionsolar_unresolved(conn: sqlite3.Connection, unresolved_id: int, asset_id: int) -> None:
-    row = conn.execute(
-        "SELECT * FROM integration_unresolved WHERE id = ? AND resolution_status = 'pending'",
-        (unresolved_id,),
-    ).fetchone()
-    if row is None:
-        raise ValueError("Entrada FusionSolar por resolver nao encontrada.")
-    create_or_update_asset_integration(
-        conn,
-        asset_id,
-        row["provider"],
-        str(row["external_id"] or ""),
-        row["external_name"],
-        row["external_status"] or "Operacional",
-    )
-    conn.execute(
-        """
-        UPDATE integration_unresolved
-        SET resolution_status = 'resolved', resolved_at = ?, resolution_notes = ?
-        WHERE id = ?
-        """,
-        (
-            datetime.now().isoformat(timespec="seconds"),
-            f"Associado ao asset {asset_id}",
-            unresolved_id,
-        ),
-    )
-    conn.commit()
-
-
-def create_asset_from_unresolved(conn: sqlite3.Connection, unresolved_id: int) -> int:
-    row = conn.execute(
-        "SELECT * FROM integration_unresolved WHERE id = ? AND resolution_status = 'pending'",
-        (unresolved_id,),
-    ).fetchone()
-    if row is None:
-        raise ValueError("Entrada FusionSolar por resolver nao encontrada.")
-
-    project_name = row["external_name"]
-    installation_group = infer_installation_group(project_name)
-    cursor = conn.execute(
-        """
-        INSERT INTO assets (project_name, installation_group, active_contract, notes, alias_blob)
-        VALUES (?, ?, 'no', ?, ?)
-        """,
-        (
-            project_name,
-            installation_group,
-            f"Criado a partir do provider {row['provider']}.",
-            project_name,
-        ),
-    )
-    asset_id = int(cursor.lastrowid)
-    normalized_name = normalize_name(project_name)
-    if normalized_name:
-        conn.execute(
-            "INSERT OR IGNORE INTO asset_aliases (asset_id, alias_name, normalized_alias, source) VALUES (?, ?, ?, ?)",
-            (asset_id, project_name, normalized_name, "integration-create"),
-        )
-    resolve_fusionsolar_unresolved(conn, unresolved_id, asset_id)
-    rebuild_asset_alias_blob(conn, asset_id)
-    return asset_id
-
-
-def ignore_fusionsolar_unresolved(conn: sqlite3.Connection, unresolved_id: int) -> None:
-    conn.execute(
-        """
-        UPDATE integration_unresolved
-        SET resolution_status = 'ignored', resolved_at = ?, resolution_notes = 'Ignorado manualmente'
-        WHERE id = ?
-        """,
-        (datetime.now().isoformat(timespec="seconds"), unresolved_id),
-    )
-    conn.commit()
-
-
-app = create_app()
-
-
-def parse_cli_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Monitoring Board local app")
-    parser.add_argument("--host", default="127.0.0.1", help="Host/IP onde a app vai escutar")
-    parser.add_argument("--port", type=int, default=5000, help="Porta onde a app vai arrancar")
-    parser.add_argument("--debug", action="store_true", help="Ativa debug do Flask")
-    return parser.parse_args()
-
-
-if __name__ == "__main__":
-    args = parse_cli_args()
-    if DEFAULT_EXCEL_PATH and not DB_PATH.exists():
-        with closing(get_db(str(DB_PATH))) as conn:
-            import_excel_data(conn, DEFAULT_EXCEL_PATH)
-    elif DEFAULT_EXCEL_PATH:
-        with closing(get_db(str(DB_PATH))) as conn:
-            if query_scalar(conn, "SELECT COUNT(*) FROM assets") == 0:
-                import_excel_data(conn, DEFAULT_EXCEL_PATH)
-    app.run(host=args.host, port=args.port, debug=args.debug)
+           .»ã_Ê×¬¢h­µçBˆ™]\›ˆ™\\™WØÝ\ÝÛY\—Ü™\Ü
+ˆ™\ÜˆÛÛÛÜ—ÜšXÙWÜ\—ÚÝÚ\ÛÛÛÜ—ÜšXÙWÜ\—ÚÝÚˆš[[™×ØÛÛ™šYÏXš[[™×ØÛÛ™šYËˆ
+B‚‚™Yˆ[œÝ\™WÜ™\ÜÙ]WÜ™\]Y\ÝÊˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆ\ÜÙ]ÚYÎˆ\ÝÚ[Kˆ\š[Ùˆ™\Ü[™Ô\š[Ùˆ[˜ÛYWÝØ]ˆ›ÛÛˆ™\]Y\ÝÜÛÝ\˜ÙNˆÝ‹ˆ™Y™\™[˜ÙWÙ]Nˆ]KŠHOˆXÝÜÝ‹[žWN‚ˆÝ\œ™[Û[ÛH™Y™\™[˜ÙWÙ]Kœ™\XÙJ^OLJBˆ›Ü›X[^™YØ\ÜÙ]ÚYÈHÛÜY
+Ú[
+˜[YJH›Üˆ˜[YH[ˆ\ÜÙ]ÚYÈYˆ˜[Y_JBˆ›Ø—ÚYÎˆ\ÝÚ[HH×BˆØ\›š[™ÜÎˆ\ÝÜÝ—HH×Bˆ™]\ÙYØÛÝ[Hˆ]Y]YYØÛÝ[Hˆ›Üˆ[ÛÜÝ\[ˆ\š[Ùš[˜ÛYYÛ[ÛÎ‚ˆ[ÛÛX™[H[ÛÜÝ\œÝ™[YJ‰VKI[HŠBˆYˆ[ÛÜÝ\HÝ\œ™[Û[Û‚ˆÛÛ[YBˆZ\ÜÚ[™×Ü›ÙXÝ[Û—ÚYÈHÂˆ\ÜÙ]ÚYˆ›Üˆ\ÜÙ]ÚY[ˆ›Ü›X[^™YØ\ÜÙ]ÚYÂˆYˆ]˜[X]WÛØØ[Û[ÛWÜ›ÙXÝ[Û—Ü]X[]JˆÛÛ›‹ˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ›ÝšY\RS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ˆ[ÛÜÝ\[[ÛÜÝ\ˆ™Y™\™[˜ÙWÙ]O\™Y™\™[˜ÙWÙ]Kˆ
+KœÝ]\ÂˆOH˜ÛÛ\]H‚ˆBˆYˆZ\ÜÚ[™×Ü›ÙXÝ[Û—ÚYÎ‚ˆ›Ø—ÚYÜ™X]YHÜ™X]WÛÜ—Ü™]\ÙWÜ™\ÜÙ]WÚ›ØŠˆÛÛ›‹ˆ›Ø—Ý\OH™\Ú[ÛœÛÛ\—Ü™\ÜÜ›ÙXÝ[Û—Ü™\]Y\Ý‹ˆ›ÝšY\RS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ˆY]šXÏHœ›ÙXÝ[Ûˆ‹ˆ\š[ÙÜÝ\[[ÛÜÝ\ˆ\š[ÙÙ[™[[ÛÙ[™
+[ÛÜÝ\
+Kˆ\ÜÙ]ÚYÏ[Z\ÜÚ[™×Ü›ÙXÝ[Û—ÚYËˆ™\]Y\ÝÜÛÝ\˜ÙO\™\]Y\ÝÜÛÝ\˜ÙKˆ^˜WÜ\˜[\Ï^Èœ™\ÜÛ[ÛŽˆ[ÛÛX™[Kˆ
+Bˆ›Ø—ÚYË˜\[™
+›Ø—ÚY
+Bˆ™]\ÙYØÛÝ[
+ÏH[
+›ÝÜ™X]Y
+Bˆ]Y]YYØÛÝ[
+ÏH[
+Ü™X]Y
+BˆØ\›š[™ÜË˜\[™
+ˆˆœ›ÙXÝ[Û—ØÛÛXÝ[Û—Ü[™[™ÎžÛ[ÛÛX™[Nš›Ø—ÞÚ›Ø—ÚYH‚ˆ
+B‚ˆYˆ[˜ÛYWÝØ]‚ˆØ]Ù[™H[ÛÙ[™
+[ÛÜÝ\
+BˆZ\ÜÚ[™×ÝØ]ÚYÈHÂˆ\ÜÙ]ÚYˆ›Üˆ\ÜÙ]ÚY[ˆ›Ü›X[^™YØ\ÜÙ]ÚYÂˆYˆ›Ý™X[ÝØ]Ü\š[ÙÚ\×ØÛÛ\]JˆÛÛ›‹ˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆœ›ÛWÙ]O[[ÛÜÝ\ˆ×Ù]O]Ø]Ù[™ˆ
+BˆBˆYˆZ\ÜÚ[™×ÝØ]ÚYÎ‚ˆ›Ø—ÚYÜ™X]YHÜ™X]WÛÜ—Ü™]\ÙWÜ™\ÜÙ]WÚ›ØŠˆÛÛ›‹ˆ›Ø—Ý\OH™\Ú[ÛœÛÛ\—Ü™\ÜÝØ]Ü™\]Y\Ý‹ˆ›ÝšY\RS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ˆY]šXÏHØ]‹ˆ\š[ÙÜÝ\[[ÛÜÝ\ˆ\š[ÙÙ[™]Ø]Ù[™ˆ\ÜÙ]ÚYÏ[Z\ÜÚ[™×ÝØ]ÚYËˆ™\]Y\ÝÜÛÝ\˜ÙO\™\]Y\ÝÜÛÝ\˜ÙKˆ^˜WÜ\˜[\Ï^Âˆ™œ›ÛWÙ]HŽˆ[ÛÜÝ\š\ÛÙ›Ü›X]
+
+Kˆ×Ù]HŽˆØ]Ù[™š\ÛÙ›Ü›X]
+
+KˆKˆ
+Bˆ›Ø—ÚYË˜\[™
+›Ø—ÚY
+Bˆ™]\ÙYØÛÝ[
+ÏH[
+›ÝÜ™X]Y
+Bˆ]Y]YYØÛÝ[
+ÏH[
+Ü™X]Y
+BˆØ\›š[™ÜË˜\[™
+ˆˆØ]ØÛÛXÝ[Û—Ü[™[™ÎžÛ[ÛÛX™[Nš›Ø—ÞÚ›Ø—ÚYH‚ˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ™]\›ˆÂˆš›Ø—ÚYÈŽˆÛÜY
+Ù]
+›Ø—ÚYÊJKˆØ\›š[™ÜÈŽˆØ\›š[™ÜËˆœ™]\ÙYØÛÝ[Žˆ™]\ÙYØÛÝ[ˆœ]Y]YYØÛÝ[Žˆ]Y]YYØÛÝ[ˆB‚‚™Yˆ[œ]Y]YWÜ™\ÜÜ›ÙXÝ[Û—Ü™\]Y\ÝÊˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆ\ÜÙ]ÚYˆ[ˆ\š[Ùˆ™\Ü[™Ô\š[Ùˆ[Û×Ü™\]Z\š[™×Ù˜[˜XÚÎˆ\ÝÜÝ—Kˆ™Y™\™[˜ÙWÙ]Nˆ]KŠHOˆ\ÝÚ[N‚ˆYˆ›Ý[Û×Ü™\]Z\š[™×Ù˜[˜XÚÎ‚ˆ™]\›ˆ×Bˆ™\]Y\ÝÈH[œÝ\™WÜ™\ÜÙ]WÜ™\]Y\ÝÊˆÛÛ›‹ˆ\ÜÙ]ÚYÏVØ\ÜÙ]ÚYKˆ\š[Ù\\š[Ùˆ[˜ÛYWÝØ]Q˜[ÙKˆ™\]Y\ÝÜÛÝ\˜ÙOHš[™]šYX[Ü™\Ü‹ˆ™Y™\™[˜ÙWÙ]O\™Y™\™[˜ÙWÙ]Kˆ
+Bˆ™]\›ˆ\Ý
+™\]Y\ÝÖÈš›Ø—ÚYÈ—JB‚‚™Yˆ[ÛÙ[™
+[ÛÜÝ\ˆ]JHOˆ]N‚ˆ™]\›ˆ
+ˆ[ÛÜÝ\œ™\XÙJ^OLŽ
+H
+È[YY[J^\ÏM
+Bˆ
+Kœ™\XÙJ^OLJHH[YY[J^\ÏLJB‚‚™Yˆ™X[ÝØ]Ü\š[ÙÚ\×ØÛÛ\]JˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆ\ÜÙ]ÚYˆ[ˆœ›ÛWÙ]Nˆ]Kˆ×Ù]Nˆ]KŠHOˆ›ÛÛ‚ˆ^XÝYÙ^\ÈH
+×Ù]HHœ›ÛWÙ]JK™^\È
+ÈBˆ›ÝÈHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕˆÓÕS•
+TÕSÕ]˜Z[Xš[]WÙ]JHTÈÛÝ™\™YÙ^\ËˆÕSJˆÐTÑBˆÒSˆ˜[YÜÛÝÈˆˆS‘ÙZYÚYØ]˜Z[Xš[]WÜÝTÈ“Õ•SˆSˆSÑHBˆS‘ˆ
+HTÈ[˜[YÙ^\Âˆ”“ÓH[Ø]˜Z[Xš[]WÙZ[BˆÒT‘H›ÝšY\ˆHÈS‘\ÜÙ]ÚYHÂˆS‘]˜Z[Xš[]WÙ]H‘UÑQSˆÈS‘Âˆˆˆ‹ˆ
+ˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ˆ\ÜÙ]ÚYˆœ›ÛWÙ]Kš\ÛÙ›Ü›X]
+
+Kˆ×Ù]Kš\ÛÙ›Ü›X]
+
+Kˆ
+Kˆ
+K™™]ÚÛ™J
+Bˆ™]\›ˆ
+ˆ[
+›ÝÖÈ˜ÛÝ™\™YÙ^\È—HÜˆ
+HOH^XÝYÙ^\Âˆ[™[
+›ÝÖÈš[˜[YÙ^\È—HÜˆ
+HOHˆ
+B‚‚™YˆÜ™X]WÛÜ—Ü™]\ÙWÜ™\ÜÙ]WÚ›ØŠˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆ›Ø—Ý\NˆÝ‹ˆ›ÝšY\ŽˆÝ‹ˆY]šXÎˆÝ‹ˆ\š[ÙÜÝ\ˆ]Kˆ\š[ÙÙ[™ˆ]Kˆ\ÜÙ]ÚYÎˆ\ÝÚ[Kˆ™\]Y\ÝÜÛÝ\˜ÙNˆÝ‹ˆ^˜WÜ\˜[\ÎˆXÝÜÝ‹[žWKŠHOˆ\VÚ[›ÛÛN‚ˆ›Ü›X[^™YÚYÈHÛÜY
+Ú[
+˜[YJH›Üˆ˜[YH[ˆ\ÜÙ]ÚYßJBˆXÝ]™HHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕY›Ø—Ý\K\˜[\×ÚœÛÛ‚ˆ”“ÓH˜XÚÙÜ›Ý[™Ú›ØœÂˆÒT‘H›Ø—Ý\HSˆ
+ËÊBˆS‘Ý]\ÈSˆ
+ˆ	Ü[™[™ÉË	Ü[›š[™ÉË	ÝØZ][™×Ø\WÜÛÝ	Ë	ÝØZ][™×Ü˜]WÛ[Z]	Âˆ
+BˆÔ‘Tˆ–HYˆˆˆ‹ˆ
+ˆ›Ø—Ý\Kˆ
+ˆ™\Ú[ÛœÛÛ\—Û[ÛØÛÜÙH‚ˆYˆY]šXÈOHœ›ÙXÝ[Ûˆ‚ˆ[ÙH™\Ú[ÛœÛÛ\—Ú[™\\—Ø]˜Z[Xš[]WØ˜XÚÙš[‚ˆ
+Kˆ
+Kˆ
+K™™]Ú[
+
+Bˆ›Ø—ÚYˆ[›Û™HH›Û™Bˆ›Üˆ›ÝÈ[ˆXÝ]™N‚ˆ\˜[\ÈHXÛÙWÚ›Ø—Ü\˜[\Ê›ÝÖÈœ\˜[\×ÚœÛÛˆ—JBˆ^\Ý[™×ÜÝ\HÝŠˆ\˜[\Ë™Ù]
+œ™\ÜÛ[ÛŠBˆÜˆ\˜[\Ë™Ù]
+™œ›ÛWÙ]HŠBˆÜˆˆ‚ˆ
+BˆYˆY]šXÈOHœ›ÙXÝ[ÛˆŽ‚ˆ\š[ÙÛX]Ú\ÈH^\Ý[™×ÜÝ\OH\š[ÙÜÝ\œÝ™[YJ‰VKI[HŠBˆ[ÙN‚ˆ\š[ÙÛX]Ú\ÈH
+ˆ^\Ý[™×ÜÝ\OH\š[ÙÜÝ\š\ÛÙ›Ü›X]
+
+Bˆ[™ÝŠ\˜[\Ë™Ù]
+×Ù]HŠHÜˆˆŠHOH\š[ÙÙ[™š\ÛÙ›Ü›X]
+
+Bˆ
+BˆYˆ›Ý\š[ÙÛX]Ú\Î‚ˆÛÛ[YBˆ^\Ý[™×ÚYÈHÂˆ[
+˜[YJBˆ›Üˆ˜[YH[ˆ\˜[\Ë™Ù]
+˜\ÜÙ]ÚYÈŠHÜˆ×BˆYˆÝŠ˜[YJKš\ÙYÚ]
+
+BˆBˆYˆ›Ý^\Ý[™×ÚYÈÜˆÙ]
+›Ü›X[^™YÚYÊKš\ÜÝXœÙ]
+^\Ý[™×ÚYÊN‚ˆ›Ø—ÚYH[
+›ÝÖÈšY—JBˆœ™XZÂˆÜ™X]YH˜[ÙBˆYˆ›Ø—ÚY\È›Û™N‚ˆ›Ø—ÚYÜ™X]YHÜ™X]WØ˜XÚÙÜ›Ý[™Ú›ØŠˆÛÛ›‹ˆ›Ø—Ý\KˆÂˆœ›ÝšY\ˆŽˆ›ÝšY\‹ˆ›Y]šXÈŽˆY]šXËˆœ\š[ÙÜÝ\Žˆ\š[ÙÜÝ\š\ÛÙ›Ü›X]
+
+Kˆœ\š[ÙÙ[™Žˆ\š[ÙÙ[™š\ÛÙ›Ü›X]
+
+Kˆ˜\ÜÙ]ÚYÈŽˆ›Ü›X[^™YÚYËˆšYÙÙ\—Ý\HŽˆœ™\ÜÙ˜Y‹ˆ
+Š™^˜WÜ\˜[\ËˆKˆ
+BˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È™\ÜÙ]WÜ™\]Y\ÝÙ]™[È
+ˆ™\]Y\ÝÜÛÝ\˜ÙK›ÝšY\‹Y]šXË\š[ÙÜÝ\\š[ÙÙ[™ˆ\ÜÙ]ÚY×ÚœÛÛ‹˜XÚÙÜ›Ý[™Ú›Ø—ÚY™]\ÙYÙ^\Ý[™×Ú›Ø‹Ü™X]YØ]ˆ
+HSQTÈ
+ËËËËËËËËÊBˆˆˆ‹ˆ
+ˆ™\]Y\ÝÜÛÝ\˜ÙKˆ›ÝšY\‹ˆY]šXËˆ\š[ÙÜÝ\š\ÛÙ›Ü›X]
+
+Kˆ\š[ÙÙ[™š\ÛÙ›Ü›X]
+
+KˆœÛÛ‹™[\Ê›Ü›X[^™YÚYÊKˆ›Ø—ÚYˆ[
+›ÝÜ™X]Y
+KˆÙ\šX[^™WØ˜XÚÙÜ›Ý[™Ú›Ø—Ý[Y\Ý[\
+
+Kˆ
+Kˆ
+Bˆ™]\›ˆ›Ø—ÚYÜ™X]Y‚‚™Yˆ[œÝ\™WÜÜ›Û[×Ü™\Ý[Ù]WÜ™\]Y\ÝÊˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ™\Ý[ˆ[žKˆ
+‹ˆ™\]Y\ÝÜÛÝ\˜ÙNˆÝ‹ŠHOˆ[žN‚ˆ\ÜÙ]ÚYÈHÂˆ[
+›ÝË˜\ÜÙ]ÚY
+Bˆ›Üˆ›ÝÈ[ˆ™\Ý[œ›ÝÜÂˆYˆ›ÝË˜\ÜÙ]ÚY\È›Ý›Û™BˆBˆ[˜ÛYWÝØ]H[žJˆÛÛ[[‹š\ÚX›H[™ÛÛ[[‹›Y]šX×ÚÙ^HOH˜]˜Z[Xš[]WÜÝ‚ˆ›ÜˆÛÛ[[ˆ[ˆ™\Ý[œ›Ùš[K˜ÛÛ[[œÂˆ
+Bˆ™\]Y\ÝÈH[œÝ\™WÜ™\ÜÙ]WÜ™\]Y\ÝÊˆÛÛ›‹ˆ\ÜÙ]ÚYÏX\ÜÙ]ÚYËˆ\š[Ù\™\Ý[œ\š[Ùˆ[˜ÛYWÝØ]Z[˜ÛYWÝØ]ˆ™\]Y\ÝÜÛÝ\˜ÙO\™\]Y\ÝÜÛÝ\˜ÙKˆ™Y™\™[˜ÙWÙ]OXÝ\œ™[Û\Ø›Û—Ù]J
+Kˆ
+Bˆ›ÝÜÈH™\Ý[œ›ÝÜÂˆÝ[[X\žHH™\Ý[œÝ[[X\žBˆYˆ[˜ÛYWÝØ]‚ˆØ[š]^™YÜ›ÝÜÈH×Bˆ›Üˆ›ÝÈ[ˆ™\Ý[œ›ÝÜÎ‚ˆØ]ØÛÛ\]HH
+ˆ›ÝË˜\ÜÙ]ÚY\È›Ý›Û™Bˆ[™™X[ÝØ]Ü\š[ÙÚ\×ØÛÛ\]JˆÛÛ›‹ˆ\ÜÙ]ÚYZ[
+›ÝË˜\ÜÙ]ÚY
+Kˆœ›ÛWÙ]O\™\Ý[œ\š[ÙœÝ\ˆ×Ù]O\™\Ý[œ\š[Ù™[™ˆ
+Bˆ
+BˆYˆØ]ØÛÛ\]N‚ˆØ[š]^™YÜ›ÝÜË˜\[™
+›ÝÊBˆÛÛ[YBˆØ[š]^™YÜ›ÝÜË˜\[™
+ˆ™\XÙJˆ›ÝËˆ˜[Y\Ï^ÊŠœ›ÝË˜[Y\Ë˜]˜Z[Xš[]WÜÝŽˆ›Û™_KˆØ\›š[™ÜÏ]\JˆÛÜY
+ˆÙ]
+›ÝËØ\›š[™ÜÊBˆÈØ]ØÛÛXÝ[Û—Ü[™[™ÈŸBˆ
+Bˆ
+Kˆ
+Bˆ
+Bˆ›ÝÜÈH\JØ[š]^™YÜ›ÝÜÊBˆÝ[[X\žHHYÙÜ™YØ]WÜ›ÝÜÊ›ÝÜË™\Ý[˜ÛÛ[[œÊBˆY]Y]HHÂˆ
+Š™XÝ
+™\Ý[›Y]Y]JKˆ™]WÜ™\]Y\ÝÚ›Ø—ÚYÈŽˆ™\]Y\ÝÖÈš›Ø—ÚYÈ—Kˆ™]WÜ™\]Y\ÝÝØ\›š[™ÜÈŽˆ™\]Y\ÝÖÈØ\›š[™ÜÈ—Kˆ™]WÜ™\]Y\ÝÜ™]\ÙYØÛÝ[Žˆ™\]Y\ÝÖÈœ™]\ÙYØÛÝ[—KˆBˆ™]\›ˆ™\XÙJˆ™\Ý[ˆ›ÝÜÏ\›ÝÜËˆÝ[[X\žO\Ý[[X\žKˆØ\›š[™ÜÏ]\JˆÛÜY
+Ù]
+™\Ý[Ø\›š[™ÜÊHÙ]
+™\]Y\ÝÖÈØ\›š[™ÜÈ—JJBˆ
+KˆY]Y]O[Y]Y]Kˆ
+B‚‚™YˆZ[Ù\Ú[ÛœÛÛ\—ØÝ\ÝÛY\—Ü›ÙXÝ[Û—Ü™\Ü
+ˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆ\ÜÙ]ÚYˆ[ˆ™\ÜÛ[ÛˆÝ‹ˆ[XÝšXÚ]WÜšXÙNˆ›Ø]ˆÙ[ÜšXÙNˆ›Ø]ˆÛÛÛÜ—ÜšXÙWÜ\—ÚÝÚˆ›Ø]HŒˆš[[™×ØÛÛ™šYÎˆš[[™ÐÛÛ™šYÈ›Û™HH›Û™Kˆ›Ü˜ÙWØ\Nˆ›ÛÛH˜[ÙKˆ\š[Ùˆ™\Ü[™Ô\š[Ù›Û™HH›Û™Kˆ™Y™\™[˜ÙWÙ]Nˆ]H›Û™HH›Û™KŠHOˆXÝÜÝ‹[žWN‚ˆ\š[ÙHÜ™\ÛÛ™WØÝ\ÝÛY\—Ü™\Ü[™×Ü\š[Ù
+™\ÜÛ[Û\š[Ù
+Bˆ™Y™\™[˜ÙWÙ]HH™Y™\™[˜ÙWÙ]HÜˆ]KÙ^J
+BˆØØ[Ü™\ÜHZ[ÛØØ[ØÝ\ÝÛY\—Ü›ÙXÝ[Û—Ü™\Ü
+ˆÛÛ›‹ˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ™\ÜÛ[Û\™\ÜÛ[Ûˆ[XÝšXÚ]WÜšXÙOY[XÝšXÚ]WÜšXÙKˆÙ[ÜšXÙO\Ù[ÜšXÙKˆÛÛÛÜ—ÜšXÙWÜ\—ÚÝÚ\ÛÛÛÜ—ÜšXÙWÜ\—ÚÝÚˆš[[™×ØÛÛ™šYÏXš[[™×ØÛÛ™šYËˆ\š[Ù\\š[Ùˆ™Y™\™[˜ÙWÙ]O\™Y™\™[˜ÙWÙ]Kˆ
+BˆYˆØØ[Ü™\Ü\È›Û™N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ“˜[È›ÚHÜÜÚ]™[™\\˜\ˆÈ™[]Üš[ÈÛÛHÜÈYÜÈØØZ\ËˆŠBˆ]WÜ™\]Y\ÝÈH[œÝ\™WÜ™\ÜÙ]WÜ™\]Y\ÝÊˆÛÛ›‹ˆ\ÜÙ]ÚYÏVØ\ÜÙ]ÚYKˆ\š[Ù\\š[Ùˆ[˜ÛYWÝØ]Q˜[ÙKˆ™\]Y\ÝÜÛÝ\˜ÙOHš[™]šYX[Ü™\Ü‹ˆ™Y™\™[˜ÙWÙ]O\™Y™\™[˜ÙWÙ]Kˆ
+Bˆ™Yœ™\ÚÚ›Ø—ÚYÈH\Ý
+]WÜ™\]Y\ÝÖÈš›Ø—ÚYÈ—JBˆØØ[Ü™\ÜÈœ›ÙXÝ[Û—Ü™Yœ™\ÚÚ›Ø—ÚYÈ—HH™Yœ™\ÚÚ›Ø—ÚYÂˆØØ[Ü™\ÜÈœ›ÙXÝ[Û—Ü™Yœ™\ÚÜ]Y]YY—HH›ÛÛ
+™Yœ™\ÚÚ›Ø—ÚYÊBˆØØ[Ü™\ÜÈ™]WÜ™\]Y\ÝÝØ\›š[™ÜÈ—HH\Ý
+ˆ]WÜ™\]Y\ÝÖÈØ\›š[™ÜÈ—Bˆ
+BˆØØ[Ü™\ÜœÙ]Y˜][
+œ™\ÜÛ›Ý\È‹×JK™^[™
+ˆ]WÜ™\]Y\ÝÖÈØ\›š[™ÜÈ—Bˆ
+BˆØØ[Ü™\ÜÈ™›Ü˜ÙWØ\WÚYÛ›Ü™Y—HH›ÛÛ
+›Ü˜ÙWØ\JBˆ™]\›ˆØØ[Ü™\Ü‚‚™YˆYØÝ\ÝÛY\—Ü™\ÜØ]˜Z[Xš[]JˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ™\ÜˆXÝÜÝ‹[žWKˆ
+‹ˆ\ÜÙ]ÚYˆ[ˆ\š[Ùˆ™\Ü[™Ô\š[Ùˆ[œÝ\™WÜ™\]Y\ÝÎˆ›ÛÛHYKŠHOˆ›ÛÛ‚ˆYˆ[œÝ\™WÜ™\]Y\ÝÎ‚ˆ™\]Y\ÝÈH[œÝ\™WÜ™\ÜÙ]WÜ™\]Y\ÝÊˆÛÛ›‹ˆ\ÜÙ]ÚYÏVØ\ÜÙ]ÚYKˆ\š[Ù\\š[Ùˆ[˜ÛYWÝØ]UYKˆ™\]Y\ÝÜÛÝ\˜ÙOHš[™]šYX[Ü™\ÜØ]˜Z[Xš[]H‹ˆ™Y™\™[˜ÙWÙ]OXÝ\œ™[Û\Ø›Û—Ù]J
+Kˆ
+Bˆ™\ÜœÙ]Y˜][
+™]WÜ™\]Y\ÝÝØ\›š[™ÜÈ‹×JK™^[™
+ˆ™\]Y\ÝÖÈØ\›š[™ÜÈ—Bˆ
+Bˆ™\ÜœÙ]Y˜][
+œ™\ÜÛ›Ý\È‹×JK™^[™
+™\]Y\ÝÖÈØ\›š[™ÜÈ—JBˆYˆ›Ý™X[ÝØ]Ü\š[ÙÚ\×ØÛÛ\]JˆÛÛ›‹ˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆœ›ÛWÙ]O\\š[ÙœÝ\ˆ×Ù]O\\š[Ù™[™ˆ
+N‚ˆ™\ÜÈ˜]˜Z[Xš[]WÙ\œ›Üˆ—HHØ]ØÛÛXÝ[Û—Ü[™[™È‚ˆ™\ÜœÙ]Y˜][
+œ™\ÜÛ›Ý\È‹×JK˜\[™
+ˆ•ÐU[™\ÜÛš]™[8 %YÜÈ[H™XÛÛNÈ™[]Üš[È[H˜\ØÝ[šËˆ‚ˆ
+Bˆ™\ÜœÜ
+˜]˜Z[Xš[]WÜÝ‹›Û™JBˆ™\ÜÈš[˜ÛYWØ]˜Z[Xš[]WÚÜH—HH˜[ÙBˆ™]\›ˆ˜[ÙBˆžN‚ˆ]˜Z[Xš[]HHÙ]Û[ÛWØ]˜Z[Xš[]JÛÛ›‹\ÜÙ]ÚY\š[ÙœÝ\\š[Ù™[™
+Bˆ^Ù\^Ù\[ÛŽ‚ˆÑÑÑT‹™^Ù\[ÛŠˆ‘˜Z[YÈØYÝ\ÝÛY\ˆ™\Ü]˜Z[Xš[]H\ÜÙ]ÚYI\È\š[ÙÜÝ\I\È\š[ÙÙ[™I\È‹ˆ\ÜÙ]ÚYˆ\š[ÙœÝ\š\ÛÙ›Ü›X]
+
+Kˆ\š[Ù™[™š\ÛÙ›Ü›X]
+
+Kˆ
+Bˆ™\ÜÈ˜]˜Z[Xš[]WÙ\œ›Üˆ—HH˜]˜Z[Xš[]WÛÛÚÝ\Ù˜Z[Y‚ˆ™\ÜœÙ]Y˜][
+œ™\ÜÛ›Ý\È‹×JK˜\[™
+‘\œ›È[È›ØÝ\˜\ˆ\ÜÛšXš[YYH
+	JKˆŠBˆ™]\›ˆ˜[ÙBˆYˆ]˜Z[Xš[]H\È›Û™N‚ˆ™\ÜÈ˜]˜Z[Xš[]WÙ\œ›Üˆ—HHØ]ØÛÛXÝ[Û—Ü[™[™È‚ˆ™\ÜœÙ]Y˜][
+œ™\ÜÛ›Ý\È‹×JK˜\[™
+ˆ•ÐU[™\ÜÛš]™[8 %YÜÈ[H™XÛÛNÈ™[]Üš[È[H˜\ØÝ[šËˆ‚ˆ
+Bˆ™]\›ˆ˜[ÙBˆ™\ÜÈš[˜ÛYWØ]˜Z[Xš[]WÚÜH—HHYBˆ™\ÜÈ˜]˜Z[Xš[]WÜÝ—HH]˜Z[Xš[]Bˆ™]\›ˆYB‚‚™Yˆ^ÜØÝ\ÝÛY\—Ü›ÙXÝ[Û—ÜŠ™\ÜˆXÝÜÝ‹[žWJN‚ˆ—Øž]\ÈHZ[ØÝ\ÝÛY\—Ü™\ÜÜŠ™\ÜÙÛ×Ü]PTÑWÑTˆÈœÝ]XÈˆÈœÛÛÛÜ‹[ÙÛËœ™ÈŠBˆY™™\ˆH[Ëž]\ÒSÊ—Øž]\ÊBˆØY™WÛ˜[YHH›Ü›X[^™WÛ˜[YJ™\ÜÈ˜\ÜÙ]—VÈœ›Ú™XÝÛ˜[YH—JKœ™\XÙJˆ‹—ÈŠHÜˆœ™[]Üš[È‚ˆ[Ù[HÝŠ™\Ü™Ù]
+œ™\ÜÝ\HŠHÜˆ™\ÈŠK\\Š
+Bˆ\š[ÙÜÛYÈHÝŠ™\Ü™Ù]
+œ\š[ÙÛX™[ŠHÜˆ™\ÜÈ›[ÛÜÝ\—KœÝ™[YJ‰[KIVHŠJKœ™\XÙJˆ‹—ÈŠKœ™\XÙJ‹È‹‹HŠBˆš[[˜[YHHˆ”™[]Üš[×ÞÛ[Ù[WÞÜØY™WÛ˜[Y_WÞÜ\š[ÙÜÛYßKœˆ‚ˆ™]\›ˆÙ[™Ùš[JY™™\‹\×Ø]XÚY[UYKÝÛ›ØYÛ˜[YOYš[[˜[YKZ[Y]\OH˜\XØ][Û‹ÜˆŠB‚‚™YˆÝÜ™WÜ™\ÜÛÙÛÊš[WÜÝÜ˜YÙK
+‹ÛÛÙÛ×Ü]ˆÝˆHˆŠHOˆÝŽ‚ˆš[[˜[YHHØY™WÝ\ØYÙš[[˜[YJš[WÜÝÜ˜YÙK™š[[˜[YHÜˆˆŠBˆ^[œÚ[ÛˆHš[[˜[YKœœÜ]
+‹ˆ‹JVËLWK›ÝÙ\Š
+HYˆ‹ˆˆ[ˆš[[˜[YH[ÙHˆ‚ˆYˆ^[œÚ[Ûˆ›Ý[ˆÈœ™È‹šœÈ‹šœYÈŸN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠš[˜[YÛÙÛ×Ù^[œÚ[ÛˆŠBˆ^[ØYHš[WÜÝÜ˜YÙKœ™XY
+
+BˆYˆ›Ý^[ØYÜˆ[Š^[ØY
+HˆLLˆ
+ˆL‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠš[˜[YÛÙÛ×ÜÚ^™HŠBˆÚYZYÚH[XYÙWÙ[Y[œÚ[ÛœÊ^[ØY^[œÚ[ÛŠBˆYˆÚYHÜˆZYÚHÜˆÚYˆÜˆZYÚˆLŒ‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠš[˜[YÛÙÛ×Ù[Y[œÚ[ÛœÈŠBˆÙÛ×Ù\ˆHTÐQÑTˆÈœ™\ÜÛÙÛÜÈ‚ˆÙÛ×Ù\‹›ZÙ\Š\™[ÏUYK^\ÝÛÚÏUYJBˆ\™Ù]HÙÛ×Ù\ˆÈˆžÙ]][YK››ÝÊ
+KœÝ™[YJ	ÉVI[IY	R	SITÉÊ_WÞÙš[[˜[Y_H‚ˆ\™Ù]Üš]WØž]\Ê^[ØY
+Bˆ™]\›ˆÝÜ™WÜ[[YWÜ™[]]™WÜ]
+\™Ù]
+B‚‚™YˆØY™WÝ\ØYÙš[[˜[YJš[[˜[YNˆÝŠHOˆÝŽ‚ˆÛX[™YHÙXÝ\™WÙš[[˜[YJš[[˜[YJBˆYˆ›ÝÛX[™YÜˆ[žJ][H[ˆÛX[™Y›Üˆ][H[ˆÈ‹‹ˆ‹‹È‹—ŸJN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠš[˜[YÝ\ØYÙš[[˜[YHŠBˆ™]\›ˆÛX[™Y‚‚™Yˆ[XYÙWÙ[Y[œÚ[ÛœÊ^[ØYˆž]\Ë^[œÚ[ÛŽˆÝŠHOˆ\VÚ[[N‚ˆYˆ^[œÚ[ÛˆOHœ™ÈŽ‚ˆYˆ›Ý^[ØYœÝ\ÝÚ]
+ˆ—T‘×——XWˆŠHÜˆ[Š^[ØY
+H‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠš[˜[YÛÙÛ×ØÛÛ[ŠBˆÚYZYÚHÝXÝ[œXÚÊ’RH‹^[ØYÌMŽŒJBˆ™]\›ˆ[
+ÚY
+K[
+ZYÚ
+BˆYˆ^[œÚ[Ûˆ[ˆÈšœÈ‹šœYÈŸN‚ˆYˆ›Ý^[ØYœÝ\ÝÚ]
+ˆ—™—ŠN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠš[˜[YÛÙÛ×ØÛÛ[ŠBˆ[™^H‚ˆÚ[H[™^
+ÈH[Š^[ØY
+N‚ˆYˆ^[ØYÚ[™^HOH‘Ž‚ˆ[™^
+ÏHBˆÛÛ[YBˆX\šÙ\ˆH^[ØYÚ[™^
+ÈWBˆ[™^
+ÏH‚ˆYˆX\šÙ\ˆ[ˆÌ_N‚ˆÛÛ[YBˆ[™ÝH[™œ›ÛWØž]\Ê^[ØYÚ[™^ˆ[™^
+È—K˜šYÈŠBˆYˆ[™ÝŽ‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠš[˜[YÛÙÛ×ØÛÛ[ŠBˆYˆX\šÙ\ˆ[ˆÌÌÌŸH[™[™^
+ÈÈ[Š^[ØY
+N‚ˆZYÚH[™œ›ÛWØž]\Ê^[ØYÚ[™^
+ÈÈˆ[™^
+ÈWK˜šYÈŠBˆÚYH[™œ›ÛWØž]\Ê^[ØYÚ[™^
+ÈHˆ[™^
+È×K˜šYÈŠBˆ™]\›ˆ[
+ÚY
+K[
+ZYÚ
+Bˆ[™^
+ÏH[™Ýˆ˜Z\ÙH˜[YQ\œ›ÜŠš[˜[YÛÙÛ×ØÛÛ[ŠB‚‚™YˆZ[ÙÙ[™\˜][Û—Ú›ØœÊ›Ü›Nˆ[žK™\ÜÝ\NˆÝ‹XZ[—Ù›Ü›X]Îˆ\VÜÝ‹‹‹—JHOˆ\ÝÙXÝÜÝ‹[žWWN‚ˆ\š[ÙÈH\œÙWÙÙ[™\˜][Û—Ü\š[ÙÊ›Ü›JBˆ›ØœÎˆ\ÝÙXÝÜÝ‹[žWWHH×BˆYˆ™\ÜÝ\HOHš[™]šYX[Ž‚ˆ\ÜÙ]ÚYÈHÚ[
+][JH›Üˆ][H[ˆ›Ü›K™Ù]\Ý
+˜\ÜÙ]ÚYÈŠHYˆÝŠ][JKš\ÙYÚ]
+
+WBˆYˆ›Ý\ÜÙ]ÚYÎ‚ˆ\ÜÙ]ÚYÈHÚ[
+›Ü›K™Ù]
+˜\ÜÙ]ÚY‹ŒŠHÜˆ
+WBˆ\ÜÙ]ÚYÈHÛÜY
+Ú][H›Üˆ][H[ˆ\ÜÙ]ÚYÈYˆ][_JBˆYˆ›Ý\ÜÙ]ÚYÎ‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[œÝ[péðèÛÈØœšYØ]0ìÜšXKˆŠBˆYˆ[Š\ÜÙ]ÚYÊHˆPVÐUÒÐTÔÑUÎ‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ‘[X\ÚXY\È[œÝ[XÛÙ\È›ÈY\Û[È[‹ˆŠBˆ›Üˆ\ÜÙ]ÚY[ˆ\ÜÙ]ÚYÎ‚ˆ›Üˆ\š[Ù[ˆ\š[ÙÎ‚ˆ›Üˆ›][ˆXZ[—Ù›Ü›X]Î‚ˆ›ØœË˜\[™
+È˜\ÜÙ]ÚYŽˆ\ÜÙ]ÚYœ\š[ÙŽˆ\š[Ù™›Ü›X]Žˆ›]JBˆ[ÙN‚ˆ›Üˆ\š[Ù[ˆ\š[ÙÎ‚ˆ›Üˆ›][ˆXZ[—Ù›Ü›X]Î‚ˆ›ØœË˜\[™
+Èœ\š[ÙŽˆ\š[Ù™›Ü›X]Žˆ›]JBˆYˆ[Š›ØœÊHˆPVÕÕSÓÕUUÎ‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ‘[X\ÚXYÜÈÝ]]È›ÈY\Û[È[‹ˆŠBˆ™]\›ˆ›ØœÂ‚‚™YˆZ[ÜÛ˜\ÚÝÙÙ[™\˜][Û—Ú›ØœÊÛ˜\ÚÝÜ™\Ý[XZ[—Ù›Ü›X]Îˆ\VÜÝ‹‹‹—JHOˆ\ÝÙXÝÜÝ‹[žWWN‚ˆ\š[ÙHÂˆœ\š[ÙÝ\HŽˆÛ˜\ÚÝÜ™\Ý[œ\š[Ùœ\š[ÙÝ\K˜[YKˆœ™\ÜÛ[ÛŽˆÛ˜\ÚÝÜ™\Ý[œ\š[ÙœÝ\œÝ™[YJ‰VKI[HŠKˆœ\š[ÙÜÝ\ŽˆÛ˜\ÚÝÜ™\Ý[œ\š[ÙœÝ\š\ÛÙ›Ü›X]
+
+Kˆœ\š[ÙÙ[™ŽˆÛ˜\ÚÝÜ™\Ý[œ\š[Ù™[™š\ÛÙ›Ü›X]
+
+KˆBˆ™]\›ˆÞÈœ\š[ÙŽˆ\š[Ù™›Ü›X]Žˆ›]H›Üˆ›][ˆXZ[—Ù›Ü›X]×B‚‚™Yˆ™Z™XÝÜÛ˜\ÚÝÜ\š[ÙÛÝ™\œšY\Ê›Ü›Nˆ[žKÛ˜\ÚÝÜ™\Ý[
+HOˆ›Û™N‚ˆ˜]×Û[ÛÈHÜ\›Üˆ][H[ˆ›Ü›K™Ù]\Ý
+œ™\ÜÛ[ÛÈŠH›Üˆ\[ˆ™KœÜ]
+ˆ–×Ë×JÈ‹ÝŠ][JJHYˆ\BˆYˆ[ŠÙ]
+˜]×Û[ÛÊJHˆN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠœÛ˜\ÚÝÜ™Z™XÝ×Û][\WÜ\š[ÙÈŠBˆÝX›Z]YÝ\HHÝŠ›Ü›K™Ù]
+œ\š[ÙÝ\HŠHÜˆÛ˜\ÚÝÜ™\Ý[œ\š[Ùœ\š[ÙÝ\K˜[YJBˆYˆÝX›Z]YÝ\HOHÛ˜\ÚÝÜ™\Ý[œ\š[Ùœ\š[ÙÝ\K˜[YN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠœÛ˜\ÚÝÜ\š[ÙÛZ\ÛX]ÚŠBˆÝX›Z]YÛ[ÛH›Ü›K™Ù]
+œ™\ÜÛ[ÛŠBˆYˆÝX›Z]YÛ[Û[™›Ü›X[^™WÜ™\ÜÛ[Û
+ÝX›Z]YÛ[Û
+HOHÛ˜\ÚÝÜ™\Ý[œ\š[ÙœÝ\œÝ™[YJ‰VKI[HŠN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠœÛ˜\ÚÝÜ\š[ÙÛZ\ÛX]ÚŠB‚‚™Yˆ™\ÛÛ™WÜ™\ÜØÛY[ÚÙ^JÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹
+‹Ü›Û[×ÚYˆ[›Û™HH›Û™K\ÜÙ]ÚYˆ[›Û™HH›Û™JHOˆÝŽ‚ˆYˆÜ›Û[×ÚY‚ˆ›ÝÈHÛÛ›‹™^XÝ]J”ÑSPÕ˜[YH”“ÓHÜ›Û[×ÙÜ›Ý\ÈÒT‘HYHÈ‹
+Ü›Û[×ÚY
+JK™™]ÚÛ™J
+Bˆ™]\›ˆ›Ü›X[^™WÛ˜[YJ›ÝÖÈ›˜[YH—JHYˆ›ÝÈ[ÙHˆ‚ˆYˆ\ÜÙ]ÚY‚ˆ›ÝÈHÛÛ›‹™^XÝ]J”ÑSPÕšY‹›Ú™XÝÛ˜[YH”“ÓH\ÜÙ]ÈÒT‘HYHÈ‹
+\ÜÙ]ÚY
+JK™™]ÚÛ™J
+Bˆ™]\›ˆ›Ü›X[^™WÛ˜[YJ›ÝÖÈ›šYˆ—HÜˆ›ÝÖÈœ›Ú™XÝÛ˜[YH—JHYˆ›ÝÈ[ÙHˆ‚ˆ™]\›ˆˆ‚‚‚™Yˆ™\ÛÛ™WÙÙ[™\˜][Û—ØÛY[ÚÙ^JÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹™\ÜÝ\NˆÝ‹›Ü›Nˆ[žKÜ›Û[×ÚYˆ[›Û™JHOˆÝŽ‚ˆYˆ™\ÜÝ\HOHœÜ›Û[ÈŽ‚ˆ™]\›ˆ™\ÛÛ™WÜ™\ÜØÛY[ÚÙ^JÛÛ›‹Ü›Û[×ÚY\Ü›Û[×ÚY
+Bˆ\ÜÙ]ÚYÈHÚ[
+][JH›Üˆ][H[ˆ›Ü›K™Ù]\Ý
+˜\ÜÙ]ÚYÈŠHYˆÝŠ][JKš\ÙYÚ]
+
+WBˆYˆ›Ý\ÜÙ]ÚYÈ[™ÝŠ›Ü›K™Ù]
+˜\ÜÙ]ÚY‹ˆŠJKš\ÙYÚ]
+
+N‚ˆ\ÜÙ]ÚYÈHÚ[
+›Ü›K™Ù]
+˜\ÜÙ]ÚYŠJWBˆÙ^\ÈHÜ™\ÛÛ™WÜ™\ÜØÛY[ÚÙ^JÛÛ›‹\ÜÙ]ÚYX\ÜÙ]ÚY
+H›Üˆ\ÜÙ]ÚY[ˆ\ÜÙ]ÚYÈYˆ\ÜÙ]ÚYBˆÙ^\Ë™\ØØ\™
+ˆŠBˆYˆ[ŠÙ^\ÊHˆN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ›Z^YØÛY[Ø˜]ÚŠBˆ™]\›ˆ™^
+]\ŠÙ^\ÊKˆŠB‚‚™Yˆ\œÙWÙÙ[™\˜][Û—Ü\š[ÙÊ›Ü›Nˆ[žJHOˆ\ÝÙXÝÜÝ‹Ý—WN‚ˆ\š[ÙÝ\HHÝŠ›Ü›K™Ù]
+œ\š[ÙÝ\H‹›[ÛHŠHÜˆ›[ÛHŠBˆ˜]×Û[ÛÈH›Ü›K™Ù]\Ý
+œ™\ÜÛ[ÛÈŠBˆYˆ˜]×Û[ÛÎ‚ˆ˜]×Û[ÛÈHÜ\›Üˆ][H[ˆ˜]×Û[ÛÈ›Üˆ\[ˆ™KœÜ]
+ˆ–×Ë×JÈ‹ÝŠ][JJHYˆ\Bˆ[Yˆ›Ü›K™Ù]
+œ™\ÜÛ[ÛÈŠN‚ˆ˜]×Û[ÛÈH™KœÜ]
+ˆ–×Ë×JÈ‹ÝŠ›Ü›K™Ù]
+œ™\ÜÛ[ÛÈŠJJBˆYˆ\š[ÙÝ\HOH›[ÛHŽ‚ˆ[ÛÈHÛ›Ü›X[^™WÜ™\ÜÛ[Û
+][JH›Üˆ][H[ˆ˜]×Û[ÛÈYˆÝŠ][JKœÝš\
+
+WBˆYˆ›Ý[ÛÎ‚ˆ[ÛÈHÛ›Ü›X[^™WÜ™\ÜÛ[Û
+›Ü›K™Ù]
+œ™\ÜÛ[Û‹ˆŠJWBˆ[ÛÈH\Ý
+XÝ™œ›ÛZÙ^\Ê[ÛÊJBˆYˆ[Š[ÛÊHˆPVÐUÒÔT’SÑÎ‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ‘[X\ÚXYÜÈ\š[ÙÜÈ›ÈY\Û[È[‹ˆŠBˆ\š[ÙÈH×Bˆ›Üˆ[Û[ˆ[ÛÎ‚ˆ\š[ÙHZ[Ü\š[Ù
+›[ÛH‹™\ÜÛ[Û[[Û
+Bˆ\š[ÙË˜\[™
+Èœ\š[ÙÝ\HŽˆ›[ÛH‹œ™\ÜÛ[ÛŽˆ[Ûœ\š[ÙÜÝ\Žˆ\š[ÙœÝ\š\ÛÙ›Ü›X]
+
+Kœ\š[ÙÙ[™Žˆ\š[Ù™[™š\ÛÙ›Ü›X]
+
+_JBˆ™]\›ˆ\š[ÙÂˆYˆ[Š˜]×Û[ÛÊHˆN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ”\š[ÙÜÈ\Ý]\˜YÜÈ][\ÜÈ]™[HÙ\ˆÝX›Y]YÜÈÙ\\˜Y[Y[KˆŠBˆ\š[ÙHZ[Ü\š[Ù
+ˆ\š[ÙÝ\KˆYX\Y›Ü›K™Ù]
+œ™\ÜÞYX\ˆŠHÜˆ›Ü›X[^™WÜ™\ÜÛ[Û
+›Ü›K™Ù]
+œ™\ÜÛ[Û‹ˆŠJVÎKˆ]X\\Y›Ü›K™Ù]
+œ™\ÜÜ]X\\ˆŠKˆÙ[Y\Ý\Y›Ü›K™Ù]
+œ™\ÜÜÙ[Y\Ý\ˆŠKˆ
+Bˆ™]\›ˆÂˆÂˆœ\š[ÙÝ\HŽˆ\š[ÙÝ\Kˆœ™\ÜÛ[ÛŽˆ\š[ÙœÝ\œÝ™[YJ‰VKI[HŠKˆœ™\ÜÞYX\ˆŽˆÝŠ\š[ÙœÝ\žYX\ŠKˆœ™\ÜÜ]X\\ˆŽˆÝŠ
+
+\š[ÙœÝ\›[ÛHJHËÈÊH
+ÈJKˆœ™\ÜÜÙ[Y\Ý\ˆŽˆŒHˆYˆ\š[ÙœÝ\›[ÛOHH[ÙHŒˆ‹ˆœ\š[ÙÜÝ\Žˆ\š[ÙœÝ\š\ÛÙ›Ü›X]
+
+Kˆœ\š[ÙÙ[™Žˆ\š[Ù™[™š\ÛÙ›Ü›X]
+
+KˆBˆB‚‚™YˆZ[ÜÜ›Û[×ÙÙ[™\˜][Û—Ü™\Ý[
+ÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹›Ü›Nˆ[žKÜ›Û[×ÚYˆ[›Û™KÛ˜\ÚÝÚYˆ[›Û™K\š[ÙÚ›ØŽˆXÝÜÝ‹Ý—JN‚ˆYˆÛ˜\ÚÝÚY‚ˆ™\Ý[HÙ]ÜÜ›Û[×ÜÛ˜\ÚÝÜ™\Ý[
+ÛÛ›‹Û˜\ÚÝÚY
+BˆYˆ™\Ý[\È›Û™HÜˆ
+Ü›Û[×ÚY[™™\Ý[œÜ›Û[×ÚYOHÜ›Û[×ÚY
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ”Û˜\ÚÝ[˜[YËˆŠBˆ™]\›ˆ™\Ý[ˆYˆ›ÝÜ›Û[×ÚY‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ”Ü›Û[ÈØœšYØ]Üš[ËˆŠBˆÜ›Ý\HÛÛ›‹™^XÝ]J”ÑSPÕ
+ˆ”“ÓHÜ›Û[×ÙÜ›Ý\ÈÒT‘HYHÈ‹
+Ü›Û[×ÚY
+JK™™]ÚÛ™J
+BˆYˆ›ÝÜ›Ý\‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ”Ü›Û[È[˜[YËˆŠBˆ›Ùš[WÚYH[
+›Ü›K™Ù]
+œ›Ùš[WÚY‹ŒŠHÜˆ
+Bˆ›Ùš[HHÙ]ÜÜ›Û[×Ü™\ÜÜ›Ùš[JÛÛ›‹›Ùš[WÚY
+HYˆ›Ùš[WÚY[ÙHÙ]ÙY˜][ÜÜ›Û[×Ü™\ÜÜ›Ùš[JÛÛ›‹Ü›Û[×ÚY
+Bˆ™\Ý[H™\\™WÜÜ›Û[×Ü™\Ü
+ˆÛÛ›‹ˆÜ›Û[×ÚY\Ü›Û[×ÚYˆÜ›Û[×Û˜[YOYÜ›Ý\È›˜[YH—Kˆ›Ùš[O\›Ùš[Kˆ\š[ÙÝ\O\\š[ÙÚ›Ø–Èœ\š[ÙÝ\H—Kˆ™\ÜÛ[Û\\š[ÙÚ›Ø‹™Ù]
+œ™\ÜÛ[ÛŠKˆYX\\\š[ÙÚ›Ø‹™Ù]
+œ™\ÜÞYX\ˆŠHÜˆ\š[ÙÚ›Ø–Èœ\š[ÙÜÝ\—VÎKˆ]X\\\\š[ÙÚ›Ø‹™Ù]
+œ™\ÜÜ]X\\ˆŠKˆÙ[Y\Ý\\\š[ÙÚ›Ø‹™Ù]
+œ™\ÜÜÙ[Y\Ý\ˆŠKˆÛÛ\\š\ÛÛY›Ü›K™Ù]
+˜ÛÛ\\š\ÛÛˆ‹ˆŠKˆ›Ùš[WÝ™\œÚ[Û[]\ÝÜÜ›Û[×Ü™\ÜÜ›Ùš[WÝ™\œÚ[ÛŠÛÛ›‹›Ùš[KšY
+Kˆ
+Bˆ™]\›ˆ[œÝ\™WÜÜ›Û[×Ü™\Ý[Ù]WÜ™\]Y\ÝÊˆÛÛ›‹ˆ™\Ý[ˆ™\]Y\ÝÜÛÝ\˜ÙOHœÜ›Û[×Ü™\ÜÙÙ[™\˜][Ûˆ‹ˆ
+B‚‚™YˆZ[Ú[™]šYX[ÙÙ[™\˜][Û—Ü™\Ü
+ˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ\ÜÙ]ÚYˆ[ˆ\š[ÙÚ›ØŽˆXÝÜÝ‹Ý—Kˆ
+‹ˆ[˜ÛYWÝØ]ˆ›ÛÛH˜[ÙKŠHOˆXÝÜÝ‹[žWN‚ˆ\š[ÙHZ[Ü\š[Ù
+ˆ\š[ÙÚ›Ø–Èœ\š[ÙÝ\H—Kˆ™\ÜÛ[Û\\š[ÙÚ›Ø‹™Ù]
+œ™\ÜÛ[ÛŠKˆYX\\\š[ÙÚ›Ø‹™Ù]
+œ™\ÜÞYX\ˆŠHÜˆ\š[ÙÚ›Ø–Èœ\š[ÙÜÝ\—VÎKˆ]X\\\\š[ÙÚ›Ø‹™Ù]
+œ™\ÜÜ]X\\ˆŠKˆÙ[Y\Ý\\\š[ÙÚ›Ø‹™Ù]
+œ™\ÜÜÙ[Y\Ý\ˆŠKˆ
+Bˆš[[™×ØÛÛ™šYÈHÙ]Ø\ÜÙ]Øš[[™×ØÛÛ™šYÊÛÛ›‹\ÜÙ]ÚY™\Ü\K‘TÊBˆ™\ÜHZ[ÛØØ[ØÝ\ÝÛY\—Ü›ÙXÝ[Û—Ü™\Ü
+ˆÛÛ›‹ˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ™\ÜÛ[Û\\š[ÙœÝ\œÝ™[YJ‰VKI[HŠKˆ[XÝšXÚ]WÜšXÙOY›Ø]
+š[[™×ØÛÛ™šYË™[XÝšXÚ]WÜšXÙWÙ]\—ÚÝÚ
+KˆÙ[ÜšXÙOY›Ø]
+š[[™×ØÛÛ™šYË™^ÜÜšXÙWÙ]\—ÚÝÚ
+Kˆš[[™×ØÛÛ™šYÏXš[[™×ØÛÛ™šYËˆ\š[Ù\\š[Ùˆ
+BˆYˆ™\Ü\È›Û™N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠˆ”Ù[HYÜÈ\˜HH[œÝ[XØ[ÈØ\ÜÙ]ÚYKˆŠBˆ™\ÜÈ˜\ÜÙ]ÚY—HH\ÜÙ]ÚYˆ™\ÜÈ™[™Ú[™WÝ™\œÚ[Ûˆ—HHš[™]šYX[\™\Ü]ŒH‚ˆ™\]Y\ÝÈH[œÝ\™WÜ™\ÜÙ]WÜ™\]Y\ÝÊˆÛÛ›‹ˆ\ÜÙ]ÚYÏVØ\ÜÙ]ÚYKˆ\š[Ù\\š[Ùˆ[˜ÛYWÝØ]Z[˜ÛYWÝØ]ˆ™\]Y\ÝÜÛÝ\˜ÙOHš[™]šYX[Ü™\ÜÙÙ[™\˜][Ûˆ‹ˆ™Y™\™[˜ÙWÙ]OXÝ\œ™[Û\Ø›Û—Ù]J
+Kˆ
+Bˆ™\ÜÈ™]WÜ™\]Y\ÝÚ›Ø—ÚYÈ—HH\Ý
+™\]Y\ÝÖÈš›Ø—ÚYÈ—JBˆ™\ÜÈ™]WÜ™\]Y\ÝÝØ\›š[™ÜÈ—HH\Ý
+™\]Y\ÝÖÈØ\›š[™ÜÈ—JBˆ™\ÜœÙ]Y˜][
+œ™\ÜÛ›Ý\È‹×JK™^[™
+™\]Y\ÝÖÈØ\›š[™ÜÈ—JBˆYˆ[˜ÛYWÝØ]‚ˆYØÝ\ÝÛY\—Ü™\ÜØ]˜Z[Xš[]JˆÛÛ›‹ˆ™\Üˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ\š[Ù\\š[Ùˆ[œÝ\™WÜ™\]Y\ÝÏQ˜[ÙKˆ
+Bˆ™]\›ˆ™\Ü‚‚™Yˆ™YÚ\Ý\—Ü™[™\™YÙÙ[™\˜][Û—Ùš[JÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹Ý]]Ù\Žˆ][—ÚYˆ[š[K
+‹Û˜\ÚÝÚYˆ[›Û™HH›Û™JN‚ˆ]ÈHÝÜ™WÜ™[™\™YÙš[JÝ]]Ù\‹[—ÚYš[JBˆYÙÙ[™\˜]YÙš[JˆÛÛ›‹ˆ[—ÚY\[—ÚYˆ›]Yš[K™›]ˆš[[˜[YO\]›˜[YKˆ™[]]™WÜ]\ÝÜ™WÜ[[YWÜ™[]]™WÜ]
+]
+KˆÚLMYš[KœÚLM‹ˆÚ^™WØž]\ÏYš[KœÚ^™WØž]\ËˆÜ›Û[×ÚYYš[KœÜ›Û[×ÚYˆ\ÜÙ]ÚYYš[K˜\ÜÙ]ÚYˆÛ˜\ÚÝÚY\Û˜\ÚÝÚYÜˆš[KœÛ˜\ÚÝÚYˆ\š[ÙÝ\OYš[Kœ\š[ÙÝ\Kˆ\š[ÙÜÝ\Yš[Kœ\š[ÙÜÝ\ˆ\š[ÙÙ[™Yš[Kœ\š[ÙÙ[™ˆ\×Ø]^[X\žOLHYˆš[Kš\×Ø]^[X\žH[ÙHˆØ\›š[™ÜÏ[\Ý
+š[KØ\›š[™ÜÊKˆ
+Bˆ™]\›ˆš[B‚‚™YˆYÙ˜Z[YÙÙ[™\˜][Û—Ùš[JÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹[—ÚYˆ[›ØŽˆXÝÜÝ‹[žWK\œ›ÜŽˆÝ‹
+‹Ü›Û[×ÚYˆ[›Û™HH›Û™K\ÜÙ]ÚYˆ[›Û™HH›Û™KÛ˜\ÚÝÚYˆ[›Û™HH›Û™JHOˆ›Û™N‚ˆ\š[ÙH›Ø‹™Ù]
+œ\š[ÙŠHÜˆßBˆYÙÙ[™\˜]YÙš[JˆÛÛ›‹ˆ[—ÚY\[—ÚYˆ›]\ÝŠ›Ø‹™Ù]
+™›Ü›X]ŠHÜˆˆŠKˆš[[˜[YOH™˜Z[Y‹ˆ™[]]™WÜ]Hˆ‹ˆÚLMHˆ‹ˆÚ^™WØž]\ÏLˆÜ›Û[×ÚY\Ü›Û[×ÚYˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆÛ˜\ÚÝÚY\Û˜\ÚÝÚYˆ\š[ÙÝ\O\\š[Ù™Ù]
+œ\š[ÙÝ\H‹ˆŠKˆ\š[ÙÜÝ\\\š[Ù™Ù]
+œ\š[ÙÜÝ\‹ˆŠKˆ\š[ÙÙ[™\\š[Ù™Ù]
+œ\š[ÙÙ[™‹ˆŠKˆÝ]\ÏH™˜Z[Y‹ˆ\œ›Ü—ÛY\ÜØYÙOY\œ›Ü–ÎLKˆ
+B‚‚™Yˆ^ÜÜ›ÝÜ×Ùš[Jˆ›ÝÜÎˆ\ÝÙXÝÜÝ‹[žWWKˆXY\œÎˆ\ÝÝ\VÜÝ‹Ý—WKˆš[[˜[YNˆÝ‹ˆ^ÜÙ›Ü›X]ˆÝ‹ŠN‚ˆYˆ^ÜÙ›Ü›X]OHœˆŽ‚ˆY™™\ˆH[Ëž]\ÒSÊ
+BˆØÈHÚ[\QØÕ[\]JY™™\‹YÙ\Ú^™O[[™ØØ\JM
+KYX\™Ú[LšYÚX\™Ú[LÜX\™Ú[L›ÝÛSX\™Ú[L
+BˆÝ[\ÈHÙ]Ø[\TÝ[TÚY]
+
+Bˆ]HHÖÚXY\–ÌWH›ÜˆXY\ˆ[ˆXY\œ×WBˆ›Üˆ›ÝÈ[ˆ›ÝÜÎ‚ˆ]K˜\[™
+ÜÝŠ›ÝË™Ù]
+XY\–ÌKˆŠHÜˆ‹HŠH›ÜˆXY\ˆ[ˆXY\œ×JBˆX›HHX›J]K™\X]›ÝÜÏLJBˆX›KœÙ]Ý[JˆX›TÝ[JˆÂˆ
+PÒÑÔ“ÕS‘‹
+
+K
+LK
+KÛÛÜœË’^ÛÛÜŠˆÌY˜XÈŠJKˆ
+•VÓÓÔˆ‹
+
+K
+LK
+KÛÛÜœËÚ]JKˆ
+‘Ô’Q‹
+
+K
+LKLJKKÛÛÜœË’^ÛÛÜŠˆØÎYÙÈŠJKˆ
+‘“Ó•SQH‹
+
+K
+LK
+K’[™]XØKP›ÛŠKˆ
+”“ÕÐPÒÑÔ“ÕS‘È‹
+JK
+LKLJKØÛÛÜœËÚ]\Û[ÚÙKÛÛÜœË’^ÛÛÜŠˆÙYYŒˆŠWJKˆ
+‘“Ó•ÒV‘H‹
+
+K
+LKLJK
+KˆBˆ
+Bˆ
+BˆØË˜Z[
+Ô\˜YÜ˜\
+š[[˜[YKÝ[\ÖÈ’XY[™Ìˆ—JKÜXÙ\ŠKLŠKX›WJBˆY™™\‹œÙYZÊ
+Bˆ™]\›ˆÙ[™Ùš[JY™™\‹\×Ø]XÚY[UYKÝÛ›ØYÛ˜[YOYˆžÙš[[˜[Y_Kœˆ‹Z[Y]\OH˜\XØ][Û‹ÜˆŠB‚ˆÛÜšØ›ÛÚÈHÛÜšØ›ÛÚÊ
+BˆÛÜšÜÚY]HÛÜšØ›ÛÚË˜XÝ]™BˆÛÜšÜÚY]]HH‘^Ü‚ˆÛÜšÜÚY]˜\[™
+ÚXY\–ÌWH›ÜˆXY\ˆ[ˆXY\œ×JBˆ›Üˆ›ÝÈ[ˆ›ÝÜÎ‚ˆÛÜšÜÚY]˜\[™
+Ü›ÝË™Ù]
+XY\–ÌKˆŠH›ÜˆXY\ˆ[ˆXY\œ×JBˆÝ]]H[Ëž]\ÒSÊ
+BˆÛÜšØ›ÛÚËœØ]™JÝ]]
+BˆÝ]]œÙYZÊ
+Bˆ™]\›ˆÙ[™Ùš[JˆÝ]]ˆ\×Ø]XÚY[UYKˆÝÛ›ØYÛ˜[YOYˆžÙš[[˜[Y_KžÞ‹ˆZ[Y]\OH˜\XØ][Û‹Ý›™›Ü[ž[›Ü›X]Ë[Ù™šXÙYØÝ[Y[œÜ™XYÚY][œÚY]‹ˆ
+B‚‚™YˆÙ›Ü›WÚ[Û\Ý
+šY[Û˜[YNˆÝŠHOˆ\ÝÚ[N‚ˆ˜[Y\ÈH™\]Y\Ý™›Ü›K™Ù]\Ý
+šY[Û˜[YJBˆYˆ[Š˜[Y\ÊHOHH[™‹ˆ[ˆ˜[Y\ÖÌN‚ˆ˜[Y\ÈHÚ][KœÝš\
+
+H›Üˆ][H[ˆ˜[Y\ÖÌKœÜ]
+‹ŠWBˆ™]\›ˆÚ[
+˜[YJH›Üˆ˜[YH[ˆ˜[Y\ÈYˆÝŠ˜[YJKœÝš\
+
+Kš\ÙYÚ]
+
+WB‚‚™YˆØ[X\×Ü™]\›Š\ÜÙ]ÚYˆ[
+HOˆ[žN‚ˆ™^Ý\›H™\]Y\Ý™›Ü›K™Ù]
+›™^‹ˆŠKœÝš\
+
+BˆYˆ™^Ý\›œÝ\ÝÚ]
+‹ÈŠN‚ˆ™]\›ˆ™Y\™XÝ
+™^Ý\›
+BˆYˆ™\]Y\Ýœ™Y™\œ™\ˆ[™‹ÜÜ›Û[Ë[X[˜YÙ\ˆˆ[ˆ™\]Y\Ýœ™Y™\œ™\Ž‚ˆ™]\›ˆ™Y\™XÝ
+™\]Y\Ýœ™Y™\œ™\ŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜\ÜÙ]Ù]Z[‹\ÜÙ]ÚYX\ÜÙ]ÚY
+JB‚‚™YˆÝÜ™WÚ[›ÚXÙWÝ\ØY
+ˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆ\ØYÙ\Žˆ]ˆš[WÜÝÜ˜YÙNˆ[žKˆ\ÜÙ]ÚYˆ[ˆÜ›Û[×ÚYˆ[›Û™KŠHOˆ\VÚ[\VÜÝ‹‹‹—WN‚ˆYˆÛÛ›‹™^XÝ]J”ÑSPÕY”“ÓH\ÜÙ]ÈÒT‘HYHÈ‹
+\ÜÙ]ÚY
+JK™™]ÚÛ™J
+H\È›Û™N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[œÝ[XØ[È[™^\Ý[KˆŠBˆÜšYÚ[˜[Ùš[[˜[YHH]
+š[WÜÝÜ˜YÙK™š[[˜[YHÜˆš[›ÚXÙHŠK›˜[YBˆØY™WÛ˜[YHHÙXÝ\™WÙš[[˜[YJÜšYÚ[˜[Ùš[[˜[YJHÜˆš[›ÚXÙH‚ˆYˆ›Ý\×ÜÝ\ÜYÚ[›ÚXÙWÙ^[œÚ[ÛŠØY™WÛ˜[YJN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ‘›Ü›X]ÈH˜]\˜H˜[ÈÝ\ÜYËˆŠBˆ\™Ù]Ù\ˆH\ØYÙ\ˆÈœÜ›Û[×ÜÛÝ\˜Ù\ÈˆÈÝŠ\ÜÙ]ÚY
+Bˆ\™Ù]Ù\‹›ZÙ\Š\™[ÏUYK^\ÝÛÚÏUYJBˆÝ[\H]][YK››ÝÊ
+KœÝ™[YJ‰VI[IYÉR	SIT×ÉYˆŠBˆ\™Ù]H\™Ù]Ù\ˆÈˆžÜÝ[\WÞÜØY™WÛ˜[Y_H‚ˆØY™WÜ]H]
+ØY™WÛ˜[YJBˆ[\Ý\™Ù]H\™Ù]Ù\ˆÈˆ‹žÜÝ[\WÞÜØY™WÜ]œÝ[_K\ÜØY™WÜ]œÝY™š^H‚ˆš[˜[ØÜ™X]YH˜[ÙBˆžN‚ˆš[WÜÝÜ˜YÙKœØ]™J[\Ý\™Ù]
+BˆÚ^™WØž]\ÈH[\Ý\™Ù]œÝ]
+
+KœÝÜÚ^™BˆYˆÚ^™WØž]\ÈH‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ‘šXÚZ\›È˜^š[ËˆŠBˆYˆÚ^™WØž]\ÈˆX^Ý\ØYØž]\Ê
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ‘šXÚZ\›È^ÙYHÈ[Z]HH\ØYˆŠBˆ˜[Y]WÚ[›ÚXÙWÙš[WØÛÛ[
+[\Ý\™Ù]
+Bˆ^Ù\^Ù\[ÛŽ‚ˆ[\Ý\™Ù][›[šÊZ\ÜÚ[™×ÛÚÏUYJBˆ˜Z\ÙBˆžN‚ˆYÙ\ÝHÚLM—Ùš[J[\Ý\™Ù]
+BˆØ[YWØ\ÜÙ]Hš[™Ú[›ÚXÙWØžWÚ\Ú
+ÛÛ›‹\ÜÙ]ÚYX\ÜÙ]ÚYÚLMYYÙ\Ý
+BˆYˆØ[YWØ\ÜÙ]\È›Ý›Û™N‚ˆ[\Ý\™Ù][›[šÊZ\ÜÚ[™×ÛÚÏUYJBˆ™]\›ˆ[
+Ø[YWØ\ÜÙ]ÈšY—JK
+™\XØ]WÚ[›ÚXÙH‹
+BˆØ\›š[™ÜÎˆ\ÝÜÝ—HH×BˆYˆš[™Ú[›ÚXÙWØžWÚ\Ú
+ÛÛ›‹\ÜÙ]ÚYS›Û™KÚLMYYÙ\Ý
+H\È›Ý›Û™N‚ˆØ\›š[™ÜË˜\[™
+œÜÜÚX›WÙ\XØ]WÚ[›ÚXÙHŠBˆ[\Ý\™Ù]œ™\XÙJ\™Ù]
+Bˆš[˜[ØÜ™X]YHYBˆZ[YWÝ\HHZ[Y]\\Ë™ÝY\Ü×Ý\JØY™WÛ˜[YJVÌHÜˆÝŠÙ]]Šš[WÜÝÜ˜YÙK›Z[Y]\H‹ˆŠHÜˆˆŠBˆÛÝ\˜ÙWÚYHÜ™X]WÜÛÝ\˜ÙWÙš[WÜ™XÛÜ™
+ˆÛÛ›‹ˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆÜ›Û[×ÚY\Ü›Û[×ÚYˆš[WÝ\OHš[›ÚXÙH‹ˆÜšYÚ[˜[Ùš[[˜[YO[ÜšYÚ[˜[Ùš[[˜[YKˆÝÜ™YÜ]\ÝŠ\™Ù]
+KˆÚLMYYÙ\ÝˆZ[YWÝ\O[Z[YWÝ\KˆÚ^™WØž]\Ï\Ú^™WØž]\Ëˆ
+BˆØÝ[Y[ÚYHÜ™X]WÚ[›ÚXÙWÙØÝ[Y[
+ˆÛÛ›‹ˆÛÝ\˜ÙWÙš[WÚY\ÛÝ\˜ÙWÚYˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆÚLMYYÙ\ÝˆZ[YWÝ\O[Z[YWÝ\KˆÚ^™WØž]\Ï\Ú^™WØž]\ËˆÝ]\ÏR[›ÚXÙTÝ]\Ë”‘U’QU×Ô‘TURT‘Q˜[YHYˆØ\›š[™ÜÈ[ÙH[›ÚXÙTÝ]\Ë•TÐQQ˜[YKˆØ\›š[™ÜÏ]\JØ\›š[™ÜÊKˆ
+Bˆ™]\›ˆØÝ[Y[ÚY\JØ\›š[™ÜÊBˆ^Ù\^Ù\[ÛŽ‚ˆ[\Ý\™Ù][›[šÊZ\ÜÚ[™×ÛÚÏUYJBˆYˆš[˜[ØÜ™X]Y‚ˆ\™Ù][›[šÊZ\ÜÚ[™×ÛÚÏUYJBˆ˜Z\ÙB‚‚™Yˆ\œÚ\ÝÚ[›ÚXÙWÙ^˜XÝ[Û—Ü™\Ý[
+ÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹[›ÚXÙNˆÜ[]LË”›ÝË™\Ý[ˆ[žJHOˆ›Û™N‚ˆÜ™X]WÚ[›ÚXÙWÙ^˜XÝ[Û—Ü[ŠÛÛ›‹[›ÚXÙWÙØÝ[Y[ÚYZ[
+[›ÚXÙVÈšY—JK™\Ý[\™\Ý[
+BˆØ[™Y]\ÈH\Ý
+™\Ý[˜Ø[™Y]\ÊBˆYˆ™\Ý[\šY™—ØØ[™Y]K\šY™—Ý\H\È›Ý›Û™N‚ˆØ[™Y]\Ë˜\[™
+ˆ[›ÚXÙPØ[™Y]Jˆ\šY™—Ý\WØØ[™Y]H‹ˆ™\Ý[\šY™—ØØ[™Y]K\šY™—Ý\K˜[YKˆ™\Ý[˜ÛÛ™šY[˜ÙKˆ]šY[˜ÙOHš[™™\šYÈÜÈ™XÛÜÈ^˜ZYÜÈ‹ˆÛÝ\˜ÙO\™\Ý[›Y]Ùˆ
+Bˆ
+Bˆ˜[Y\ÈHØØ[™Y]K™šY[Û˜[YNˆØ[™Y]K˜[YH›ÜˆØ[™Y]H[ˆØ[™Y]\ßBˆ\ÜÙ]HÛÛ›‹™^XÝ]J”ÑSPÕšYˆ”“ÓH\ÜÙ]ÈÒT‘HYHÈ‹
+[›ÚXÙVÈ˜\ÜÙ]ÚY—K
+JK™™]ÚÛ™J
+Bˆ˜[Y][ÛˆH˜[Y]WÚ[›ÚXÙWÝ˜[Y\Ê˜[Y\Ë\ÜÙ]ÛšYX\ÜÙ]È›šYˆ—HYˆ\ÜÙ][ÙH›Û™JBˆØ\›š[™ÜÈH\JÛÜY
+Êœ™\Ý[Ø\›š[™ÜË
+˜[Y][Û‹Ø\›š[™ÜßJJBˆÝ]\ÈH[›ÚXÙTÝ]\Ë‘VPÕSÓ—ÑRSQ˜[YHYˆ™\Ý[™\œ›ÜœÈÜˆ˜[Y][Û‹™\œ›ÜœÈ[ÙH˜[Y][Û‹œÝ]\Ë˜[YBˆ\]WÚ[›ÚXÙWÙœ›ÛWØØ[™Y]\ÊˆÛÛ›‹ˆ[›ÚXÙWÙØÝ[Y[ÚYZ[
+[›ÚXÙVÈšY—JKˆØ[™Y]\Ï]\JØ[™Y]\ÊKˆÝ]\Ï\Ý]\ËˆÛÛ™šY[˜ÙO\™\Ý[˜ÛÛ™šY[˜ÙKˆØ\›š[™ÜÏ]Ø\›š[™ÜËˆ
+B‚‚™Yˆ[›ÚXÙWÝ˜[Y\×Ùœ›ÛWÙ›Ü›J›Ü›Nˆ[žJHOˆXÝÜÝ‹Ý—N‚ˆšY[ÈH
+ˆœÝ\Y\—Û˜[YH‹ˆœÝ\Y\—ÛšYˆ‹ˆ˜Ý\ÝÛY\—Û˜[YH‹ˆ˜Ý\ÝÛY\—ÛšYˆ‹ˆš[›ÚXÙWÛ[X™\ˆ‹ˆš\ÜÝYWÙ]H‹ˆ˜š[[™×Ü\š[ÙÜÝ\‹ˆ˜š[[™×Ü\š[ÙÙ[™‹ˆ˜Ý\œ™[˜ÞH‹ˆÝ[Ø[[Ý[‹ˆÝ[Ù[™\™ÞWÚÝÚ‹ˆ\šY™—Ý\WØØ[™Y]H‹ˆœÚ[\WÜšXÙWÙ]\—ÚÝÚ‹ˆœÛWÜšXÙWÙ]\—ÚÝÚ‹ˆ˜ÚZXWÜšXÙWÙ]\—ÚÝÚ‹ˆ˜^š[×ÜšXÙWÙ]\—ÚÝÚ‹ˆœÝ\\—Ý˜^š[×ÜšXÙWÙ]\—ÚÝÚ‹ˆ
+Bˆ™]\›ˆÙšY[ˆÝŠ›Ü›K™Ù]
+šY[ˆŠJKœÝš\
+
+H›ÜˆšY[[ˆšY[ßB‚‚™Yˆ\WÚ[›ÚXÙWÝ×Ý\šY™ŠÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹[›ÚXÙWÙØÝ[Y[ÚYˆ[
+HOˆ[‚ˆ[›ÚXÙHHÙ]Ú[›ÚXÙWÙØÝ[Y[
+ÛÛ›‹[›ÚXÙWÙØÝ[Y[ÚY
+BˆYˆ[›ÚXÙH\È›Û™N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ‘˜]\˜H[™^\Ý[KˆŠBˆYˆ[›ÚXÙVÈœÝ]\È—HOH[›ÚXÙTÝ]\ËÓÓ‘’T“QQ˜[YN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠH˜]\˜H[HH\Ý\ˆÛÛ™š\›XYH[\ÈHÙ\ˆ\ØYH˜H\šY˜KˆŠBˆ\šY™—Ý\HHÝŠ[›ÚXÙVÈ\šY™—Ý\WØØ[™Y]H—HÜˆœÚ[\HŠBˆYˆ\šY™—Ý\HOH\šY™•\K”ÒSTK˜[YN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ•\šY˜\È][KZÜ˜\šX\È^YÙ[H™YÜ˜\ÈÜ˜\šX\ÈX[XZ\È[\ÈHÝX\™\‹ˆŠBˆ™]\›ˆØ]™WØ\ÜÙ]Ý\šY™ŠˆÛÛ›‹ˆ\ÜÙ]ÚYZ[
+[›ÚXÙVÈ˜\ÜÙ]ÚY—JKˆ\šY™—Ý\O]\šY™—Ý\KˆÚ[\WÜšXÙWÙ]\—ÚÝÚZ[›ÚXÙVÈœÚ[\WÜšXÙWÙ]\—ÚÝÚ—Kˆ[›ÚXÙWÙš[WÚYZ[
+[›ÚXÙVÈœÛÝ\˜ÙWÙš[WÚY—JKˆ˜[YÙœ›ÛO[›Ü›X[^™WÙ]J[›ÚXÙVÈ˜š[[™×Ü\š[ÙÜÝ\—JKš\ÛÙ›Ü›X]
+
+HYˆ[›ÚXÙVÈ˜š[[™×Ü\š[ÙÜÝ\—H[ÙHˆ‹ˆ˜[YÝÏ[›Ü›X[^™WÙ]J[›ÚXÙVÈ˜š[[™×Ü\š[ÙÙ[™—JKš\ÛÙ›Ü›X]
+
+HYˆ[›ÚXÙVÈ˜š[[™×Ü\š[ÙÙ[™—H[ÙHˆ‹ˆ›Ý\ÏYˆÜšXYHH\\ˆH˜]\˜HÚ[›ÚXÙVÉÚ[›ÚXÙWÛ[X™\‰×HÜˆ[›ÚXÙWÙØÝ[Y[ÚYH‹ˆ
+B‚‚™YˆZ[Ýš\Ú]×ØžWÝXÚÙ]
+š\Ú]Îˆ\ÝÜÜ[]LË”›Ý×JHOˆXÝÚ[\ÝÜÜ[]LË”›Ý×WN‚ˆš\Ú]×ØžWÝXÚÙ]ˆXÝÚ[\ÝÜÜ[]LË”›Ý×WHHßBˆ›Üˆš\Ú][ˆš\Ú]Î‚ˆš\Ú]×ØžWÝXÚÙ]œÙ]Y˜][
+š\Ú]ÈXÚÙ]ÚY—K×JK˜\[™
+š\Ú]
+Bˆ™]\›ˆš\Ú]×ØžWÝXÚÙ]‚‚™Yˆ›Ü›X[^™WØØ[[™\—Û[Û
+˜[YNˆÝˆ›Û™JHOˆÝŽ‚ˆYˆ˜[YN‚ˆžN‚ˆ™]\›ˆ]][YKœÝœ[YJ˜[YKœÝš\
+
+K‰VKI[HŠKœÝ™[YJ‰VKI[HŠBˆ^Ù\˜[YQ\œ›ÜŽ‚ˆ\ÜÂˆ™]\›ˆ]KÙ^J
+KœÝ™[YJ‰VKI[HŠB‚‚™Yˆ›Ü›X[^™WÛÜ[Û˜[Ù]J˜[YNˆÝˆ›Û™JHOˆÝŽ‚ˆYˆ›Ý˜[YN‚ˆ™]\›ˆˆ‚ˆžN‚ˆ™]\›ˆ]][YKœÝœ[YJ˜[YKœÝš\
+
+K‰VKI[KIYŠK™]J
+Kš\ÛÙ›Ü›X]
+
+Bˆ^Ù\˜[YQ\œ›ÜŽ‚ˆ™]\›ˆˆ‚‚‚™Yˆ\œÙWÜÜÚ]]™WÚ[
+˜[YNˆÝˆ›Û™KY˜][ˆ[H
+HOˆ[‚ˆžN‚ˆ\œÙYH[
+›Ø]
+˜[YHÜˆˆŠJBˆ^Ù\
+\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆ™]\›ˆY˜][ˆ™]\›ˆX^
+\œÙY
+B‚‚™Yˆ›Ü›X[^™WØÚÚXÙJ˜[YNˆÝˆ›Û™KÚÚXÙ\Îˆ\ÝÜÝ—KY˜][ˆÝŠHOˆÝŽ‚ˆ˜[YHH
+˜[YHÜˆˆŠKœÝš\
+
+Bˆ™]\›ˆ˜[YHYˆ˜[YH[ˆÚÚXÙ\È[ÙHY˜][‚‚™YˆØ[[™\—Û[ÛØ›Ý[™Ê[ÛÝ˜[YNˆÝŠHOˆ\VÙ]K]KÝ‹Ý—N‚ˆ[ÛÜÝ\H]][YKœÝœ[YJ[ÛÝ˜[YK‰VKI[HŠK™]J
+Kœ™\XÙJ^OLJBˆË\ÝÙ^HHØ[[™\‹›[Û˜[™ÙJ[ÛÜÝ\žYX\‹[ÛÜÝ\›[Û
+Bˆ[ÛÙ[™H[ÛÜÝ\œ™\XÙJ^O[\ÝÙ^JBˆ™]š[Ý\×Û[ÛÙ]HH
+[ÛÜÝ\H[YY[J^\ÏLJJKœ™\XÙJ^OLJBˆ™^Û[ÛÙ]HH
+[ÛÙ[™
+È[YY[J^\ÏLJJKœ™\XÙJ^OLJBˆ™]\›ˆ[ÛÜÝ\[ÛÙ[™™]š[Ý\×Û[ÛÙ]KœÝ™[YJ‰VKI[HŠK™^Û[ÛÙ]KœÝ™[YJ‰VKI[HŠB‚‚™YˆZ[Ù\œ›Ü—ØØ[[™\Š[ÛÝ˜[YNˆÝ‹™XÛÜ™Îˆ\ÝÜÜ[]LË”›Ý×JHOˆXÝÜÝ‹[žWN‚ˆ[ÛÜÝ\[ÛÙ[™ËÈHØ[[™\—Û[ÛØ›Ý[™Ê[ÛÝ˜[YJBˆ™XÛÜ™×ØžWÙ^NˆXÝÜÝ‹\ÝÜÜ[]LË”›Ý×WHHßBˆ›Üˆ™XÛÜ™[ˆ™XÛÜ™Î‚ˆ™XÛÜ™×ØžWÙ^KœÙ]Y˜][
+™XÛÜ™Èœ™XÛÜ™Ù]H—K×JK˜\[™
+™XÛÜ™
+B‚ˆÙYZÜÈH×BˆÙYZÈH×Bˆ›ÜˆÈ[ˆ˜[™ÙJ[ÛÜÝ\ÙYZÙ^J
+JN‚ˆÙYZË˜\[™
+È™]HŽˆ›Û™Kœ™XÛÜ™ÈŽˆ×_JB‚ˆÝ\œ™[Ù^HH[ÛÜÝ\ˆÚ[HÝ\œ™[Ù^HH[ÛÙ[™‚ˆ\Û×Ù^HHÝ\œ™[Ù^Kš\ÛÙ›Ü›X]
+
+BˆÙYZË˜\[™
+È™]HŽˆÝ\œ™[Ù^Kœ™XÛÜ™ÈŽˆ™XÛÜ™×ØžWÙ^K™Ù]
+\Û×Ù^K×J_JBˆYˆ[ŠÙYZÊHOHÎ‚ˆÙYZÜË˜\[™
+ÙYZÊBˆÙYZÈH×BˆÝ\œ™[Ù^H
+ÏH[YY[J^\ÏLJB‚ˆYˆÙYZÎ‚ˆÚ[H[ŠÙYZÊHÎ‚ˆÙYZË˜\[™
+È™]HŽˆ›Û™Kœ™XÛÜ™ÈŽˆ×_JBˆÙYZÜË˜\[™
+ÙYZÊB‚ˆ™]\›ˆÂˆ›X™[ŽˆˆžÓSÓ•ÓSQT×ÔÛ[ÛÜÝ\›[Û_HÛ[ÛÜÝ\žYX\ŸH‹ˆÙYZÜÈŽˆÙYZÜËˆœ™XÛÜ™ØÛÝ[ŽˆÝ[J[Š›ÝÜÊH›Üˆ›ÝÜÈ[ˆ™XÛÜ™×ØžWÙ^K˜[Y\Ê
+JKˆB‚‚™YˆZ[Ú[\™[[Û—ØØ[[™\Š[ÛÝ˜[YNˆÝ‹™XÛÜ™Îˆ\ÝÜÜ[]LË”›Ý×JHOˆXÝÜÝ‹[žWN‚ˆ[ÛÜÝ\[ÛÙ[™ËÈHØ[[™\—Û[ÛØ›Ý[™Ê[ÛÝ˜[YJBˆ™XÛÜ™×ØžWÙ^NˆXÝÜÝ‹\ÝÜÜ[]LË”›Ý×WHHßBˆ›Üˆ™XÛÜ™[ˆ™XÛÜ™Î‚ˆ[›™YÙ]HH™XÛÜ™Èœ[›™YÙ]H—BˆYˆ[›™YÙ]N‚ˆ™XÛÜ™×ØžWÙ^KœÙ]Y˜][
+[›™YÙ]K×JK˜\[™
+™XÛÜ™
+B‚ˆÙYZÜÈH×BˆÙYZÈH×Bˆ›ÜˆÈ[ˆ˜[™ÙJ[ÛÜÝ\ÙYZÙ^J
+JN‚ˆÙYZË˜\[™
+È™]HŽˆ›Û™Kœ™XÛÜ™ÈŽˆ×_JB‚ˆÝ\œ™[Ù^HH[ÛÜÝ\ˆÚ[HÝ\œ™[Ù^HH[ÛÙ[™‚ˆ\Û×Ù^HHÝ\œ™[Ù^Kš\ÛÙ›Ü›X]
+
+BˆÙYZË˜\[™
+È™]HŽˆÝ\œ™[Ù^Kœ™XÛÜ™ÈŽˆ™XÛÜ™×ØžWÙ^K™Ù]
+\Û×Ù^K×J_JBˆYˆ[ŠÙYZÊHOHÎ‚ˆÙYZÜË˜\[™
+ÙYZÊBˆÙYZÈH×BˆÝ\œ™[Ù^H
+ÏH[YY[J^\ÏLJB‚ˆYˆÙYZÎ‚ˆÚ[H[ŠÙYZÊHÎ‚ˆÙYZË˜\[™
+È™]HŽˆ›Û™Kœ™XÛÜ™ÈŽˆ×_JBˆÙYZÜË˜\[™
+ÙYZÊB‚ˆ™]\›ˆÂˆ›X™[ŽˆˆžÓSÓ•ÓSQT×ÔÛ[ÛÜÝ\›[Û_HÛ[ÛÜÝ\žYX\ŸH‹ˆÙYZÜÈŽˆÙYZÜËˆœ™XÛÜ™ØÛÝ[ŽˆÝ[J[Š›ÝÜÊH›Üˆ›ÝÜÈ[ˆ™XÛÜ™×ØžWÙ^K˜[Y\Ê
+JKˆB‚‚™Yˆ[\™[[Û—Ü™XYWÙ›Ü—Ü›Ý]J›ÝÎˆÜ[]LË”›ÝÈXÝÜÝ‹[žWJHOˆ›ÛÛ‚ˆYˆ›ÝÖÈœÝ]\È—HOH‘™XÚYÈŽ‚ˆ™]\›ˆ˜[ÙBˆYˆ›ÝÖÈ›X]\šX[ÜÝ]\È—HOH›Ü]YXYÈŽ‚ˆ™]\›ˆ˜[ÙBˆYˆ›ÝÖÈ›]]YH—H\È›Û™HÜˆ›ÝÖÈ›Û™Ú]YH—H\È›Û™N‚ˆ™]\›ˆ˜[ÙBˆYˆ›ÝÖÈ˜ÛÛÜ™[˜]\×ØÛÛ™šY[˜ÙH—H[ˆÈœÝ\ÜXÝ‹œ™]šY]ÈŸN‚ˆ™]\›ˆ˜[ÙBˆ™]\›ˆYB‚‚™YˆZ[Ø\ÜÙ]Ù\œ›Ü—ØØ[[™\Š[ÛÝ˜[YNˆÝ‹™XÛÜ™Îˆ\ÝÜÜ[]LË”›Ý×JHOˆXÝÜÝ‹[žWN‚ˆ[ÛÜÝ\[ÛÙ[™ËÈHØ[[™\—Û[ÛØ›Ý[™Ê[ÛÝ˜[YJBˆ]™[×ØžWÙ^NˆXÝÜÝ‹\ÝÙXÝÜÝ‹[žWWWHHßBˆ™]š[Ý\×Ü›Ø›[HH˜[ÙB‚ˆ›Üˆ™XÛÜ™[ˆ™XÛÜ™Î‚ˆ™XÛÜ™Ù]HH™XÛÜ™Èœ™XÛÜ™Ù]H—BˆÝ]\ÈH™XÛÜ™ÈœÝ]\È—Bˆ\×Ü›Ø›[HHÝ]\È[ˆ“Ð“SWÓSÓ’UÔ’S‘×ÔÕUTÑTÂˆ]™[Ý\HHˆ‚ˆ]™[ÛX™[Hˆ‚‚ˆYˆ\×Ü›Ø›[H[™›Ý™]š[Ý\×Ü›Ø›[N‚ˆ]™[Ý\HHœÝ\‚ˆ]™[ÛX™[H\\™XÙ]H‚ˆ[Yˆ\×Ü›Ø›[N‚ˆ]™[Ý\HH˜XÝ]™H‚ˆ]™[ÛX™[H“X[[K\ÙH‚ˆ[Yˆ™]š[Ý\×Ü›Ø›[N‚ˆ]™[Ý\HH™[™‚ˆ]™[ÛX™[H‘\Ø\\™XÙ]H‚‚ˆYˆ[ÛÜÝ\š\ÛÙ›Ü›X]
+
+HH™XÛÜ™Ù]HH[ÛÙ[™š\ÛÙ›Ü›X]
+
+H[™]™[Ý\N‚ˆ]™[×ØžWÙ^KœÙ]Y˜][
+™XÛÜ™Ù]K×JK˜\[™
+ˆÂˆœÝ]\ÈŽˆÝ]\Ëˆ›X™[Žˆ]™[ÛX™[ˆ\HŽˆ]™[Ý\Kˆ››Ý\ÈŽˆ™XÛÜ™È››Ý\È—KˆœÛÝ\˜ÙHŽˆ™XÛÜ™ÈœÛÝ\˜ÙH—Kˆœ™XÛÜ™ÚYŽˆ™XÛÜ™ÈšY—KˆBˆ
+B‚ˆ™]š[Ý\×Ü›Ø›[HH\×Ü›Ø›[B‚ˆÙYZÜÈH×BˆÙYZÈH×Bˆ›ÜˆÈ[ˆ˜[™ÙJ[ÛÜÝ\ÙYZÙ^J
+JN‚ˆÙYZË˜\[™
+È™]HŽˆ›Û™K™]™[ÈŽˆ×_JB‚ˆÝ\œ™[Ù^HH[ÛÜÝ\ˆÚ[HÝ\œ™[Ù^HH[ÛÙ[™‚ˆ\Û×Ù^HHÝ\œ™[Ù^Kš\ÛÙ›Ü›X]
+
+BˆÙYZË˜\[™
+È™]HŽˆÝ\œ™[Ù^K™]™[ÈŽˆ]™[×ØžWÙ^K™Ù]
+\Û×Ù^K×J_JBˆYˆ[ŠÙYZÊHOHÎ‚ˆÙYZÜË˜\[™
+ÙYZÊBˆÙYZÈH×BˆÝ\œ™[Ù^H
+ÏH[YY[J^\ÏLJB‚ˆYˆÙYZÎ‚ˆÚ[H[ŠÙYZÊHÎ‚ˆÙYZË˜\[™
+È™]HŽˆ›Û™K™]™[ÈŽˆ×_JBˆÙYZÜË˜\[™
+ÙYZÊB‚ˆ™]\›ˆÂˆ›X™[ŽˆˆžÓSÓ•ÓSQT×ÔÛ[ÛÜÝ\›[Û_HÛ[ÛÜÝ\žYX\ŸH‹ˆÙYZÜÈŽˆÙYZÜËˆ™]™[ØÛÝ[ŽˆÝ[J[Š›ÝÜÊH›Üˆ›ÝÜÈ[ˆ]™[×ØžWÙ^K˜[Y\Ê
+JKˆB‚‚™YˆÜ›Ý\ÝXÚÙ]×ØžWØ\ÜÙ]
+XÚÙ]Îˆ\ÝÜÜ[]LË”›Ý×JHOˆ\ÝÙXÝÜÝ‹[žWWN‚ˆÜ›Ý\YˆXÝÚ[XÝÜÝ‹[žWWHHßBˆ›ÜˆXÚÙ][ˆXÚÙ]Î‚ˆ\ÜÙ]ÚYH[
+XÚÙ]È˜\ÜÙ]ÚY—JBˆXÚÙ]HÜ›Ý\YœÙ]Y˜][
+ˆ\ÜÙ]ÚYˆÂˆ˜\ÜÙ]ÚYŽˆ\ÜÙ]ÚYˆœ›Ú™XÝÛ˜[YHŽˆXÚÙ]Èœ›Ú™XÝÛ˜[YH—Kˆ›ØØ][ÛˆŽˆXÚÙ]È›ØØ][Ûˆ—Kˆ˜XÝ]™WØÛÛ˜XÝŽˆXÚÙ]È˜XÝ]™WØÛÛ˜XÝ—Kˆ˜ÛÛ˜XÝÝ\HŽˆXÚÙ]È˜ÛÛ˜XÝÝ\H—KˆXÚÙ]ÈŽˆ×KˆKˆ
+BˆXÚÙ]ÈXÚÙ]È—K˜\[™
+XÚÙ]
+B‚ˆÜ™\™YH×Bˆ›Üˆ\ÜÙ]ÚYXÚÙ][ˆÜ›Ý\Yš][\Ê
+N‚ˆXÚÙ]×Û\ÝHXÚÙ]ÈXÚÙ]È—BˆXÚÙ]È›Ü[—ØÛÝ[—HHÝ[JH›ÜˆXÚÙ][ˆXÚÙ]×Û\ÝYˆXÚÙ]ÈœÝ]\È—HOH‘™XÚYÈŠBˆXÚÙ]È˜Üš]XØ[ØÛÝ[—HHÝ[JˆH›ÜˆXÚÙ][ˆXÚÙ]×Û\ÝYˆXÚÙ]È\™Ù[˜ÞH—HOHÜš]XØHˆ[™XÚÙ]ÈœÝ]\È—HOH‘™XÚYÈ‚ˆ
+BˆXÚÙ]È›\ÝÝ\]H—HHX^
+XÚÙ]È\]YØ]—H›ÜˆXÚÙ][ˆXÚÙ]×Û\Ý
+BˆÜ™\™Y˜\[™
+XÚÙ]
+B‚ˆÜ™\™YœÛÜ
+ˆÙ^O[[X™H][Nˆ
+ˆYˆ][VÈ˜XÝ]™WØÛÛ˜XÝ—HOHžY\Èˆ[ÙHKˆZ][VÈ˜Üš]XØ[ØÛÝ[—KˆZ][VÈ›Ü[—ØÛÝ[—Kˆ][VÈœ›Ú™XÝÛ˜[YH—K›ÝÙ\Š
+Kˆ
+Bˆ
+Bˆ™]\›ˆÜ™\™Y‚‚™Yˆ[œÝ\™WÜ™YYš[™YÙ^ÜÝ[\]\ÊÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[ÛŠHOˆ›Û™N‚ˆ™YYš[™YÝ[\]\ÈHÂˆÂˆ›˜[YHŽˆ”™]™[]˜HHÉ“H]]›È‹ˆ™]\Ù]Žˆ˜\ÜÙ]È‹ˆ™^ÜÙ›Ü›X]ŽˆžÞ‹ˆ˜ÛÛ[[œÈŽˆÂˆœ›Ú™XÝÛ˜[YH‹ˆ›ØØ][Ûˆ‹ˆ˜Y™\ÜÈ‹ˆ˜ÛÛXÝÜÛ™H‹ˆ˜ÛÛXÝÛ˜[YH‹ˆ˜XØÙ\Ü×Ý\H‹ˆ˜ÛÝ™\˜YÙWÝ\H‹ˆKˆ™š[\œÈŽˆÂˆ›ÛWÛÛ›HŽˆžY\È‹ˆKˆKˆÂˆ›˜[YHŽˆ”™[]Üš[È[Ûš]Üš^˜XØ[ÈHX\š[È‹ˆ™]\Ù]Žˆ›[Ûš]Üš[™×Ü™\Ü‹ˆ™^ÜÙ›Ü›X]Žˆœˆ‹ˆ˜ÛÛ[[œÈŽˆÂˆœ\š[Ù‹ˆœ›Ú™XÝÛ˜[YH‹ˆ˜Ý\œ™[ÜÝ]\È‹ˆ™\œ›Ü—Ü™XÛÜ™È‹ˆ™\Ý[˜ÝÙ\œ›ÜœÈ‹ˆ™\œ›Ü—Ý\\È‹ˆ›Ü[—ÝXÚÙ]È‹ˆš\Ú]×Ü\š[Ù‹ˆ›\ÝÝš\Ú]Ù]H‹ˆ›]\ÝÛ›Ý\È‹ˆKˆ™š[\œÈŽˆÂˆœ\š[ÙŽˆ™^H‹ˆ›ÛWÛÛ›HŽˆžY\È‹ˆKˆKˆÂˆ›˜[YHŽˆ”™[]Üš[È[Ûš]Üš^˜XØ[ÈHÙ[X[˜[‹ˆ™]\Ù]Žˆ›[Ûš]Üš[™×Ü™\Ü‹ˆ™^ÜÙ›Ü›X]Žˆœˆ‹ˆ˜ÛÛ[[œÈŽˆÂˆœ\š[Ù‹ˆœ›Ú™XÝÛ˜[YH‹ˆ˜Ý\œ™[ÜÝ]\È‹ˆ™\œ›Ü—Ü™XÛÜ™È‹ˆ™\Ý[˜ÝÙ\œ›ÜœÈ‹ˆ™\œ›Ü—Ý\\È‹ˆ›Ü[—ÝXÚÙ]È‹ˆš\Ú]×Ü\š[Ù‹ˆ›\ÝÝš\Ú]Ù]H‹ˆ›]\ÝÛ›Ý\È‹ˆKˆ™š[\œÈŽˆÂˆœ\š[ÙŽˆÙYZÈ‹ˆ›ÛWÛÛ›HŽˆžY\È‹ˆKˆKˆÂˆ›˜[YHŽˆ”™[]Üš[È[Ûš]Üš^˜XØ[ÈHY[œØ[‹ˆ™]\Ù]Žˆ›[Ûš]Üš[™×Ü™\Ü‹ˆ™^ÜÙ›Ü›X]Žˆœˆ‹ˆ˜ÛÛ[[œÈŽˆÂˆœ\š[Ù‹ˆœ›Ú™XÝÛ˜[YH‹ˆ˜Ý\œ™[ÜÝ]\È‹ˆ™\œ›Ü—Ü™XÛÜ™È‹ˆ™\Ý[˜ÝÙ\œ›ÜœÈ‹ˆ™\œ›Ü—Ý\\È‹ˆ›Ü[—ÝXÚÙ]È‹ˆš\Ú]×Ü\š[Ù‹ˆ›\ÝÝš\Ú]Ù]H‹ˆ›]\ÝÛ›Ý\È‹ˆKˆ™š[\œÈŽˆÂˆœ\š[ÙŽˆ›[Û‹ˆ›ÛWÛÛ›HŽˆžY\È‹ˆKˆKˆÂˆ›˜[YHŽˆ”™[]Üš[È›ÙXØ[ÈHY[œØ[‹ˆ™]\Ù]Žˆœ›ÙXÝ[Û—Ü™\Ü‹ˆ™^ÜÙ›Ü›X]ŽˆžÞ‹ˆ˜ÛÛ[[œÈŽˆÂˆœ\š[Ù‹ˆœ›Ú™XÝÛ˜[YH‹ˆ›ØØ][Ûˆ‹ˆœ›ÝšY\ˆ‹ˆœ›ÙXÝ[Û—ÚÝÚ‹ˆœÜXÚYšX×ÞZY[‹ˆ™^XÝYÚÝÚ‹ˆ™]šX][Û—ÜÝ‹ˆœ\™›Ü›X[˜ÙWÜÝ]\È‹ˆ™]WÜÚ[È‹ˆ™]WÜÛÝ\˜ÙH‹ˆ›\ÝÝ\]H‹ˆ››Ý\È‹ˆKˆ™š[\œÈŽˆÂˆœ\š[ÙŽˆ›[Û‹ˆ›ÛWÛÛ›HŽˆžY\È‹ˆœÛÝ\˜ÙHŽˆ‘\Ú[Û”ÛÛ\ˆ‹ˆKˆKˆÂˆ›˜[YHŽˆ”™[]Üš[È›ÙXØ[ÈH[X[‹ˆ™]\Ù]Žˆœ›ÙXÝ[Û—Ü™\Ü‹ˆ™^ÜÙ›Ü›X]ŽˆžÞ‹ˆ˜ÛÛ[[œÈŽˆÂˆœ\š[Ù‹ˆœ›Ú™XÝÛ˜[YH‹ˆ›ØØ][Ûˆ‹ˆœ›ÝšY\ˆ‹ˆœ›ÙXÝ[Û—ÚÝÚ‹ˆœÜXÚYšX×ÞZY[‹ˆ™^XÝYÚÝÚ‹ˆ™]šX][Û—ÜÝ‹ˆœ\™›Ü›X[˜ÙWÜÝ]\È‹ˆ™]WÜÚ[È‹ˆ™]WÜÛÝ\˜ÙH‹ˆ›\ÝÝ\]H‹ˆ››Ý\È‹ˆKˆ™š[\œÈŽˆÂˆœ\š[ÙŽˆžYX\ˆ‹ˆ›ÛWÛÛ›HŽˆžY\È‹ˆœÛÝ\˜ÙHŽˆ‘\Ú[Û”ÛÛ\ˆ‹ˆKˆKˆB‚ˆ›Üˆ[\]H[ˆ™YYš[™YÝ[\]\Î‚ˆ^\Ý[™ÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕY”“ÓH^ÜÝ[\]\ÈÒT‘H˜[YHHÈSRUH‹ˆ
+[\]VÈ›˜[YH—K
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ^\Ý[™Î‚ˆÛÛ[YBˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È^ÜÝ[\]\È
+˜[YK]\Ù]^ÜÙ›Ü›X]ÛÛ[[œ×ÚœÛÛ‹š[\œ×ÚœÛÛ‹Ü™X]YØ]
+BˆSQTÈ
+ËËËËËÊBˆˆˆ‹ˆ
+ˆ[\]VÈ›˜[YH—Kˆ[\]VÈ™]\Ù]—Kˆ[\]VÈ™^ÜÙ›Ü›X]—KˆœÛÛ‹™[\Ê[\]VÈ˜ÛÛ[[œÈ—K[œÝ\™WØ\ØÚZOUYJKˆœÛÛ‹™[\Ê[\]VÈ™š[\œÈ—K[œÝ\™WØ\ØÚZOUYJKˆ]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆ
+Kˆ
+B‚‚™YˆÙ]Ù\Ú[ÛœÛÛ\—Ù[—ØÛÛ™šYÊ
+HOˆXÝÜÝ‹Ý—N‚ˆ™]\›ˆÂˆ\Ù\›˜[YHŽˆÜË™[š\›Û‹™Ù]
+‘•TÒSÓ”ÓÓT—ÕTÑT“SQH‹ˆŠKœÝš\
+
+Kˆœ\ÜÝÛÜ™ŽˆÜË™[š\›Û‹™Ù]
+‘•TÒSÓ”ÓÓT—ÔTÔÕÓÔ‘‹ˆŠKœÝš\
+
+Kˆ˜˜\ÙWÝ\›ŽˆÜË™[š\›Û‹™Ù]
+‘•TÒSÓ”ÓÓT—ÐTÑWÕT“‹ˆŠKœÝš\
+
+Kˆ›ÙÚ[—Ù[™Ú[ŽˆÜË™[š\›Û‹™Ù]
+‘•TÒSÓ”ÓÓT—ÓÑÒS—ÑS‘ÒS•‹QUSÑ•TÒSÓ”ÓÓT—ÓÑÒS—ÑS‘ÒS•
+KœÝš\
+
+Kˆœ[×Ù[™Ú[ŽˆÜË™[š\›Û‹™Ù]
+‘•TÒSÓ”ÓÓT—ÔÕUSÓ”×ÑS‘ÒS•‹QUSÑ•TÒSÓ”ÓÓT—ÔÕUSÓ”×ÑS‘ÒS•
+KœÝš\
+
+Kˆœ™X[Ý[YWÙ[™Ú[ŽˆÜË™[š\›Û‹™Ù]
+ˆ‘•TÒSÓ”ÓÓT—Ô‘PSSQWÑS‘ÒS•‹ˆQUSÑ•TÒSÓ”ÓÓT—Ô‘PSSQWÑS‘ÒS•ˆ
+KœÝš\
+
+Kˆ™]šXÙWÛ\ÝÙ[™Ú[ŽˆÜË™[š\›Û‹™Ù]
+ˆ‘•TÒSÓ”ÓÓT—ÑU’PÑT×ÑS‘ÒS•‹ˆQUSÑ•TÒSÓ”ÓÓT—ÑU’PÑT×ÑS‘ÒS•ˆ
+KœÝš\
+
+Kˆ™]šXÙWÜ™X[Ý[YWÙ[™Ú[ŽˆÜË™[š\›Û‹™Ù]
+ˆ‘•TÒSÓ”ÓÓT—ÑU’PÑWÔ‘PSSQWÑS‘ÒS•‹ˆQUSÑ•TÒSÓ”ÓÓT—ÑU’PÑWÔ‘PSSQWÑS‘ÒS•ˆ
+KœÝš\
+
+Kˆ™]šXÙWÚ\ÝÜžWÙ[™Ú[ŽˆÜË™[š\›Û‹™Ù]
+ˆ‘•TÒSÓ”ÓÓT—ÑU’PÑWÒTÕÔ–WÑS‘ÒS•‹ˆQUSÑ•TÒSÓ”ÓÓT—ÑU’PÑWÒTÕÔ–WÑS‘ÒS•ˆ
+KœÝš\
+
+Kˆ˜[\›\×Ù[™Ú[ŽˆÜË™[š\›Û‹™Ù]
+‘•TÒSÓ”ÓÓT—ÐST“T×ÑS‘ÒS•‹QUSÑ•TÒSÓ”ÓÓT—ÐST“T×ÑS‘ÒS•
+KœÝš\
+
+Kˆ™^WÚÜWÙ[™Ú[ŽˆÜË™[š\›Û‹™Ù]
+ˆ‘•TÒSÓ”ÓÓT—ÑVWÒÔWÑS‘ÒS•‹ˆQUSÑ•TÒSÓ”ÓÓT—ÑVWÒÔWÑS‘ÒS•ˆ
+KœÝš\
+
+Kˆ›[ÛÚÜWÙ[™Ú[ŽˆÜË™[š\›Û‹™Ù]
+ˆ‘•TÒSÓ”ÓÓT—ÓSÓ•ÒÔWÑS‘ÒS•‹ˆQUSÑ•TÒSÓ”ÓÓT—ÓSÓ•ÒÔWÑS‘ÒS•ˆ
+KœÝš\
+
+KˆœÞ[˜×ÚÝ\œÈŽˆÜË™[š\›Û‹™Ù]
+‘•TÒSÓ”ÓÓT—ÔÖS×ÒÕT”È‹QUSÑ•TÒSÓ”ÓÓT—ÔÖS×ÒÕT”ÊKœÝš\
+
+KˆœÝ]WÜÞ[˜×Ú[\˜[ÚÝ\œÈŽˆÜË™[š\›Û‹™Ù]
+‘•TÒSÓ”ÓÓT—ÔÕUWÔÖS×ÒS•T•SÒÕT”È‹ˆŠKœÝš\
+
+Kˆœ›ÙXÝ[Û—ÜÞ[˜×Ù[˜X›YŽˆÜË™[š\›Û‹™Ù]
+‘•TÒSÓ”ÓÓT—Ô“ÑPÕSÓ—ÔÖS×ÑSP“Q‹ˆŠKœÝš\
+
+Kˆœ›ÙXÝ[Û—ÜÞ[˜×Ý[YHŽˆÜË™[š\›Û‹™Ù]
+‘•TÒSÓ”ÓÓT—Ô“ÑPÕSÓ—ÔÖS×ÕSQH‹ˆŠKœÝš\
+
+Kˆ™XYÛ›ÜÝXÜ×ÜÞ[˜×Ù[˜X›YŽˆÜË™[š\›Û‹™Ù]
+‘•TÒSÓ”ÓÓT—ÑPQÓ“ÔÕPÔ×ÔÖS×ÑSP“Q‹ˆŠKœÝš\
+
+Kˆ™XYÛ›ÜÝXÜ×ÜÞ[˜×Ý[YHŽˆÜË™[š\›Û‹™Ù]
+‘•TÒSÓ”ÓÓT—ÑPQÓ“ÔÕPÔ×ÔÖS×ÕSQH‹ˆŠKœÝš\
+
+KˆB‚‚™YˆÙ]ÜÚYÙ[™\™ÞWÙ[—ØÛÛ™šYÊ
+HOˆXÝÜÝ‹Ý—N‚ˆ™]\›ˆÂˆ\Ù\›˜[YHŽˆÜË™[š\›Û‹™Ù]
+”ÒQÑS‘T‘ÖWÐTÒÑVH‹ˆŠKœÝš\
+
+Kˆœ\ÜÝÛÜ™ŽˆÜË™[š\›Û‹™Ù]
+”ÒQÑS‘T‘ÖWÐTÔÑPÔ‘U‹ˆŠKœÝš\
+
+Kˆ˜˜\ÙWÝ\›ŽˆÜË™[š\›Û‹™Ù]
+”ÒQÑS‘T‘ÖWÐTÑWÕT“‹QUSÔÒQÑS‘T‘ÖWÐTÑWÕT“
+KœÝš\
+
+Kˆ›ÙÚ[—Ù[™Ú[ŽˆÜË™[š\›Û‹™Ù]
+”ÒQÑS‘T‘ÖWÐUUÑS‘ÒS•‹QUSÔÒQÑS‘T‘ÖWÐUUÑS‘ÒS•
+KœÝš\
+
+Kˆœ[×Ù[™Ú[ŽˆÜË™[š\›Û‹™Ù]
+”ÒQÑS‘T‘ÖWÔÖTÕST×ÑS‘ÒS•‹QUSÔÒQÑS‘T‘ÖWÔÖTÕST×ÑS‘ÒS•
+KœÝš\
+
+Kˆ™[™\™ÞWÙ›Ý×Ù[™Ú[ŽˆÜË™[š\›Û‹™Ù]
+”ÒQÑS‘T‘ÖWÑS‘T‘ÖWÑ“Õ×ÑS‘ÒS•‹QUSÔÒQÑS‘T‘ÖWÑS‘T‘ÖWÑ“Õ×ÑS‘ÒS•
+KœÝš\
+
+Kˆ›Û˜›Ø\™Ù[™Ú[ŽˆÜË™[š\›Û‹™Ù]
+”ÒQÑS‘T‘ÖWÓÓ“ÐT‘ÑS‘ÒS•‹QUSÔÒQÑS‘T‘ÖWÓÓ“ÐT‘ÑS‘ÒS•
+KœÝš\
+
+Kˆ™^WÚÜWÙ[™Ú[Žˆˆ‹ˆ›[ÛÚÜWÙ[™Ú[Žˆˆ‹ˆœÞ[˜×ÚÝ\œÈŽˆÜË™[š\›Û‹™Ù]
+”ÒQÑS‘T‘ÖWÔÖS×ÒÕT”È‹QUSÔÒQÑS‘T‘ÖWÔÖS×ÒÕT”ÊKœÝš\
+
+KˆœÝ]WÜÞ[˜×Ú[\˜[ÚÝ\œÈŽˆÜË™[š\›Û‹™Ù]
+”ÒQÑS‘T‘ÖWÔÕUWÔÖS×ÒS•T•SÒÕT”È‹ˆŠKœÝš\
+
+Kˆœ™YÚ[ÛˆŽˆÜË™[š\›Û‹™Ù]
+”ÒQÑS‘T‘ÖWÔ‘QÒSÓˆ‹QUSÔÒQÑS‘T‘ÖWÔ‘QÒSÓŠKœÝš\
+
+HÜˆQUSÔÒQÑS‘T‘ÖWÔ‘QÒSÓ‹ˆœÞ\Ý[WÚYÈŽˆÜË™[š\›Û‹™Ù]
+”ÒQÑS‘T‘ÖWÔÖTÕSWÒQÈ‹ÜË™[š\›Û‹™Ù]
+”ÒQÑS‘T‘ÖWÔÖTÕSWÒQ‹ˆŠJKœÝš\
+
+KˆœÛ˜\ÚÝÜ™][[Û—Ù^\ÈŽˆÜË™[š\›Û‹™Ù]
+”ÒQÑS‘T‘ÖWÔÓTÒÕÔ‘US•SÓ—ÑVTÈ‹ÝŠQUSÔÒQÑS‘T‘ÖWÔÓTÒÕÔ‘US•SÓ—ÑVTÊJKœÝš\
+
+Kˆ™[˜X›YŽˆÜË™[š\›Û‹™Ù]
+”ÒQÑS‘T‘ÖWÑSP“Q‹ˆŠKœÝš\
+
+KˆB‚‚™Yˆ[œÝ\™WÚ[YÜ˜][Û—ÜÙYYÙ]JÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[ÛŠHOˆ›Û™N‚ˆ[—ØÛÛ™šYÈHÙ]Ù\Ú[ÛœÛÛ\—Ù[—ØÛÛ™šYÊ
+Bˆ^\Ý[™ÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕ
+ˆ”“ÓH[YÜ˜][Û—ØÛÛ™šYÜÈÒT‘H›ÝšY\ˆHÈ‹ˆ
+S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ^\Ý[™Î‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH[YÜ˜][Û—ØÛÛ™šYÜÂˆÑU\Ù\›˜[YHHÐTÑHÒSˆÓÐSTÐÑJ\Ù\›˜[YK	ÉÊHH	ÉÈSˆÈSÑH\Ù\›˜[YHS‘ˆ˜\ÙWÝ\›HÐTÑHÒSˆÓÐSTÐÑJ˜\ÙWÝ\›	ÉÊHH	ÉÈSˆÈSÑH˜\ÙWÝ\›S‘ˆÙÚ[—Ù[™Ú[HÐTÑHÒSˆÓÐSTÐÑJÙÚ[—Ù[™Ú[	ÉÊHH	ÉÈSˆÈSÑHÙÚ[—Ù[™Ú[S‘ˆ[×Ù[™Ú[HÐTÑHÒSˆÓÐSTÐÑJ[×Ù[™Ú[	ÉÊHH	ÉÈSˆÈSÑH[×Ù[™Ú[S‘ˆ™X[Ý[YWÙ[™Ú[HÐTÑHÒSˆÓÐSTÐÑJ™X[Ý[YWÙ[™Ú[	ÉÊHH	ÉÈSˆÈSÑH™X[Ý[YWÙ[™Ú[S‘ˆ]šXÙWÛ\ÝÙ[™Ú[HÐTÑHÒSˆÓÐSTÐÑJ]šXÙWÛ\ÝÙ[™Ú[	ÉÊHH	ÉÈSˆÈSÑH]šXÙWÛ\ÝÙ[™Ú[S‘ˆ]šXÙWÜ™X[Ý[YWÙ[™Ú[HÐTÑHÒSˆÓÐSTÐÑJ]šXÙWÜ™X[Ý[YWÙ[™Ú[	ÉÊHH	ÉÈSˆÈSÑH]šXÙWÜ™X[Ý[YWÙ[™Ú[S‘ˆ]šXÙWÚ\ÝÜžWÙ[™Ú[HÐTÑHÒSˆÓÐSTÐÑJ]šXÙWÚ\ÝÜžWÙ[™Ú[	ÉÊHH	ÉÈSˆÈSÑH]šXÙWÚ\ÝÜžWÙ[™Ú[S‘ˆ[\›\×Ù[™Ú[HÐTÑHÒSˆÓÐSTÐÑJ[\›\×Ù[™Ú[	ÉÊHH	ÉÈSˆÈSÑH[\›\×Ù[™Ú[S‘ˆ^WÚÜWÙ[™Ú[HÐTÑHÒSˆÓÐSTÐÑJ^WÚÜWÙ[™Ú[	ÉÊHH	ÉÈSˆÈSÑH^WÚÜWÙ[™Ú[S‘ˆ[ÛÚÜWÙ[™Ú[HÐTÑHÒSˆÓÐSTÐÑJ[ÛÚÜWÙ[™Ú[	ÉÊHH	ÉÈSˆÈSÑH[ÛÚÜWÙ[™Ú[S‘ˆÞ[˜×ÚÝ\œÈHÐTÑHÒSˆÓÐSTÐÑJÞ[˜×ÚÝ\œË	ÉÊHH	ÉÈSˆÈSÑHÞ[˜×ÚÝ\œÈS‘ˆ›ÙXÝ[Û—ÜÞ[˜×Ù[˜X›YHÐTÑHÒSˆ›ÙXÝ[Û—ÜÞ[˜×Ù[˜X›YTÈ•SSˆHSÑH›ÙXÝ[Û—ÜÞ[˜×Ù[˜X›YS‘ˆXYÛ›ÜÝXÜ×ÜÞ[˜×Ù[˜X›YHÐTÑHÒSˆXYÛ›ÜÝXÜ×ÜÞ[˜×Ù[˜X›YTÈ•SSˆHSÑHXYÛ›ÜÝXÜ×ÜÞ[˜×Ù[˜X›YS‘ˆÝ]WÜÞ[˜×Ú[\˜[ÚÝ\œÈHÐTÑHÒSˆÝ]WÜÞ[˜×Ú[\˜[ÚÝ\œÈTÈ•SÔˆÝ]WÜÞ[˜×Ú[\˜[ÚÝ\œÈHSˆÈSÑHÝ]WÜÞ[˜×Ú[\˜[ÚÝ\œÈS‘ˆ›ÙXÝ[Û—ÜÞ[˜×Ý[YHHÐTÑHÒSˆÓÐSTÐÑJ›ÙXÝ[Û—ÜÞ[˜×Ý[YK	ÉÊHH	ÉÈSˆÈSÑH›ÙXÝ[Û—ÜÞ[˜×Ý[YHS‘ˆXYÛ›ÜÝXÜ×ÜÞ[˜×Ý[YHHÐTÑHÒSˆÓÐSTÐÑJXYÛ›ÜÝXÜ×ÜÞ[˜×Ý[YK	ÉÊHH	ÉÈSˆÈSÑHXYÛ›ÜÝXÜ×ÜÞ[˜×Ý[YHS‘ˆ\]YØ]HÂˆÒT‘H›ÝšY\ˆHÂˆˆˆ‹ˆ
+ˆ[—ØÛÛ™šYÖÈ\Ù\›˜[YH—Kˆ[—ØÛÛ™šYÖÈ˜˜\ÙWÝ\›—Kˆ[—ØÛÛ™šYÖÈ›ÙÚ[—Ù[™Ú[—Kˆ[—ØÛÛ™šYÖÈœ[×Ù[™Ú[—Kˆ[—ØÛÛ™šYÖÈœ™X[Ý[YWÙ[™Ú[—Kˆ[—ØÛÛ™šYÖÈ™]šXÙWÛ\ÝÙ[™Ú[—Kˆ[—ØÛÛ™šYÖÈ™]šXÙWÜ™X[Ý[YWÙ[™Ú[—Kˆ[—ØÛÛ™šYÖÈ™]šXÙWÚ\ÝÜžWÙ[™Ú[—Kˆ[—ØÛÛ™šYÖÈ˜[\›\×Ù[™Ú[—Kˆ[—ØÛÛ™šYÖÈ™^WÚÜWÙ[™Ú[—Kˆ[—ØÛÛ™šYÖÈ›[ÛÚÜWÙ[™Ú[—Kˆ[—ØÛÛ™šYÖÈœÞ[˜×ÚÝ\œÈ—KˆQUSÔÕUWÔÖS×ÒS•T•SÒÕT”ËˆQUSÑ•TÒSÓ”ÓÓT—Ô“ÑPÕSÓ—ÔÖS×ÕSQKˆQUSÑ•TÒSÓ”ÓÓT—ÑPQÓ“ÔÕPÔ×ÔÖS×ÕSQKˆ]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ˆ
+Kˆ
+Bˆ[ÙN‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È[YÜ˜][Û—ØÛÛ™šYÜÈ
+ˆ›ÝšY\‹\Ù\›˜[YK\ÜÝÛÜ™˜\ÙWÝ\›ÙÚ[—Ù[™Ú[[×Ù[™Ú[™X[Ý[YWÙ[™Ú[ˆ]šXÙWÛ\ÝÙ[™Ú[]šXÙWÜ™X[Ý[YWÙ[™Ú[]šXÙWÚ\ÝÜžWÙ[™Ú[[\›\×Ù[™Ú[ˆ^WÚÜWÙ[™Ú[[ÛÚÜWÙ[™Ú[ˆ[˜X›Y]]×ÜÞ[˜×Ù[˜X›YÞ[˜×ÚÝ\œË›ÙXÝ[Û—ÜÞ[˜×Ù[˜X›YXYÛ›ÜÝXÜ×ÜÞ[˜×Ù[˜X›YˆÝ]WÜÞ[˜×Ú[\˜[ÚÝ\œË›ÙXÝ[Û—ÜÞ[˜×Ý[YKXYÛ›ÜÝXÜ×ÜÞ[˜×Ý[YKÜ™X]YØ]\]YØ]ˆ
+HSQTÈ
+ËËËËËËËËËËËËËËËËËËËËËËÊBˆˆˆ‹ˆ
+ˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ˆ[—ØÛÛ™šYÖÈ\Ù\›˜[YH—Kˆˆ‹ˆ[—ØÛÛ™šYÖÈ˜˜\ÙWÝ\›—Kˆ[—ØÛÛ™šYÖÈ›ÙÚ[—Ù[™Ú[—Kˆ[—ØÛÛ™šYÖÈœ[×Ù[™Ú[—Kˆ[—ØÛÛ™šYÖÈœ™X[Ý[YWÙ[™Ú[—Kˆ[—ØÛÛ™šYÖÈ™]šXÙWÛ\ÝÙ[™Ú[—Kˆ[—ØÛÛ™šYÖÈ™]šXÙWÜ™X[Ý[YWÙ[™Ú[—Kˆ[—ØÛÛ™šYÖÈ™]šXÙWÚ\ÝÜžWÙ[™Ú[—Kˆ[—ØÛÛ™šYÖÈ˜[\›\×Ù[™Ú[—Kˆ[—ØÛÛ™šYÖÈ™^WÚÜWÙ[™Ú[—Kˆ[—ØÛÛ™šYÖÈ›[ÛÚÜWÙ[™Ú[—Kˆˆˆ[—ØÛÛ™šYÖÈœÞ[˜×ÚÝ\œÈ—KˆKˆKˆQUSÔÕUWÔÖS×ÒS•T•SÒÕT”ËˆQUSÑ•TÒSÓ”ÓÓT—Ô“ÑPÕSÓ—ÔÖS×ÕSQKˆQUSÑ•TÒSÓ”ÓÓT—ÑPQÓ“ÔÕPÔ×ÔÖS×ÕSQKˆ]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆ]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆ
+Kˆ
+B‚ˆÚYÙ[™\™ÞWÙ[ˆHÙ]ÜÚYÙ[™\™ÞWÙ[—ØÛÛ™šYÊ
+BˆÚYÙ[™\™ÞWÙ^\Ý[™ÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕ
+ˆ”“ÓH[YÜ˜][Û—ØÛÛ™šYÜÈÒT‘H›ÝšY\ˆHÈ‹ˆ
+S•QÔUSÓ—Ô“Õ’QT—ÔÒQÑS‘T‘ÖK
+Kˆ
+K™™]ÚÛ™J
+BˆÚYÙ[™\™ÞWÙ[˜X›YHHYˆÚYÙ[™\™ÞWÙ[–È™[˜X›Y—K›ÝÙ\Š
+H[ˆÈŒH‹YH‹žY\È‹œÚ[H‹›ÛˆŸH[ÙHˆYˆÚYÙ[™\™ÞWÙ^\Ý[™Î‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH[YÜ˜][Û—ØÛÛ™šYÜÂˆÑU\Ù\›˜[YHHÐTÑHÒSˆÓÐSTÐÑJ\Ù\›˜[YK	ÉÊHH	ÉÈSˆÈSÑH\Ù\›˜[YHS‘ˆ˜\ÙWÝ\›HÐTÑHÒSˆÓÐSTÐÑJ˜\ÙWÝ\›	ÉÊHH	ÉÈSˆÈSÑH˜\ÙWÝ\›S‘ˆÙÚ[—Ù[™Ú[HÐTÑHÒSˆÓÐSTÐÑJÙÚ[—Ù[™Ú[	ÉÊHH	ÉÈSˆÈSÑHÙÚ[—Ù[™Ú[S‘ˆ[×Ù[™Ú[HÐTÑHÒSˆÓÐSTÐÑJ[×Ù[™Ú[	ÉÊHH	ÉÈSˆÈSÑH[×Ù[™Ú[S‘ˆ[™\™ÞWÙ›Ý×Ù[™Ú[HÐTÑHÒSˆÓÐSTÐÑJ[™\™ÞWÙ›Ý×Ù[™Ú[	ÉÊHH	ÉÈSˆÈSÑH[™\™ÞWÙ›Ý×Ù[™Ú[S‘ˆÛ˜›Ø\™Ù[™Ú[HÐTÑHÒSˆÓÐSTÐÑJÛ˜›Ø\™Ù[™Ú[	ÉÊHH	ÉÈSˆÈSÑHÛ˜›Ø\™Ù[™Ú[S‘ˆÞ[˜×ÚÝ\œÈHÐTÑHÒSˆÓÐSTÐÑJÞ[˜×ÚÝ\œË	ÉÊHH	ÉÈSˆÈSÑHÞ[˜×ÚÝ\œÈS‘ˆÝ]WÜÞ[˜×Ú[\˜[ÚÝ\œÈHÐTÑHÒSˆÝ]WÜÞ[˜×Ú[\˜[ÚÝ\œÈTÈ•SÔˆÝ]WÜÞ[˜×Ú[\˜[ÚÝ\œÈHSˆÈSÑHÝ]WÜÞ[˜×Ú[\˜[ÚÝ\œÈS‘ˆ›ÙXÝ[Û—ÜÞ[˜×Ù[˜X›YHˆXYÛ›ÜÝXÜ×ÜÞ[˜×Ù[˜X›YHˆ™YÚ[ÛˆHÐTÑHÒSˆÓÐSTÐÑJ™YÚ[Û‹	ÉÊHH	ÉÈSˆÈSÑH™YÚ[ÛˆS‘ˆÞ\Ý[WÚYÈHÐTÑHÒSˆÓÐSTÐÑJÞ\Ý[WÚYË	ÉÊHH	ÉÈSˆÈSÑHÞ\Ý[WÚYÈS‘ˆÛ˜\ÚÝÜ™][[Û—Ù^\ÈHÐTÑHÒSˆÛ˜\ÚÝÜ™][[Û—Ù^\ÈTÈ•SÔˆÛ˜\ÚÝÜ™][[Û—Ù^\ÈHSˆÈSÑHÛ˜\ÚÝÜ™][[Û—Ù^\ÈS‘ˆ[˜X›YHÐTÑHÒSˆÈHHSˆHSÑH[˜X›YS‘ˆ\]YØ]HÂˆÒT‘H›ÝšY\ˆHÂˆˆˆ‹ˆ
+ˆÚYÙ[™\™ÞWÙ[–È\Ù\›˜[YH—KˆÚYÙ[™\™ÞWÙ[–È˜˜\ÙWÝ\›—KˆÚYÙ[™\™ÞWÙ[–È›ÙÚ[—Ù[™Ú[—KˆÚYÙ[™\™ÞWÙ[–Èœ[×Ù[™Ú[—KˆÚYÙ[™\™ÞWÙ[–È™[™\™ÞWÙ›Ý×Ù[™Ú[—KˆÚYÙ[™\™ÞWÙ[–È›Û˜›Ø\™Ù[™Ú[—KˆÚYÙ[™\™ÞWÙ[–ÈœÞ[˜×ÚÝ\œÈ—KˆQUSÔÕUWÔÖS×ÒS•T•SÒÕT”ËˆÚYÙ[™\™ÞWÙ[–Èœ™YÚ[Ûˆ—KˆÚYÙ[™\™ÞWÙ[–ÈœÞ\Ý[WÚYÈ—Kˆ[
+ÚYÙ[™\™ÞWÙ[–ÈœÛ˜\ÚÝÜ™][[Û—Ù^\È—HÜˆQUSÔÒQÑS‘T‘ÖWÔÓTÒÕÔ‘US•SÓ—ÑVTÊKˆÚYÙ[™\™ÞWÙ[˜X›Yˆ]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆS•QÔUSÓ—Ô“Õ’QT—ÔÒQÑS‘T‘ÖKˆ
+Kˆ
+Bˆ™]\›‚‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È[YÜ˜][Û—ØÛÛ™šYÜÈ
+ˆ›ÝšY\‹\Ù\›˜[YK\ÜÝÛÜ™˜\ÙWÝ\›ÙÚ[—Ù[™Ú[[×Ù[™Ú[[™\™ÞWÙ›Ý×Ù[™Ú[Û˜›Ø\™Ù[™Ú[ˆ^WÚÜWÙ[™Ú[[ÛÚÜWÙ[™Ú[™YÚ[Û‹Þ\Ý[WÚYËÛ˜\ÚÝÜ™][[Û—Ù^\Ëˆ[˜X›Y]]×ÜÞ[˜×Ù[˜X›YÞ[˜×ÚÝ\œË›ÙXÝ[Û—ÜÞ[˜×Ù[˜X›YXYÛ›ÜÝXÜ×ÜÞ[˜×Ù[˜X›YˆÝ]WÜÞ[˜×Ú[\˜[ÚÝ\œËÜ™X]YØ]\]YØ]ˆ
+HSQTÈ
+ËËËËËËËËËËËËËËËËËËËËÊBˆˆˆ‹ˆ
+ˆS•QÔUSÓ—Ô“Õ’QT—ÔÒQÑS‘T‘ÖKˆÚYÙ[™\™ÞWÙ[–È\Ù\›˜[YH—Kˆˆ‹ˆÚYÙ[™\™ÞWÙ[–È˜˜\ÙWÝ\›—KˆÚYÙ[™\™ÞWÙ[–È›ÙÚ[—Ù[™Ú[—KˆÚYÙ[™\™ÞWÙ[–Èœ[×Ù[™Ú[—KˆÚYÙ[™\™ÞWÙ[–È™[™\™ÞWÙ›Ý×Ù[™Ú[—KˆÚYÙ[™\™ÞWÙ[–È›Û˜›Ø\™Ù[™Ú[—Kˆˆ‹ˆˆ‹ˆÚYÙ[™\™ÞWÙ[–Èœ™YÚ[Ûˆ—KˆÚYÙ[™\™ÞWÙ[–ÈœÞ\Ý[WÚYÈ—Kˆ[
+ÚYÙ[™\™ÞWÙ[–ÈœÛ˜\ÚÝÜ™][[Û—Ù^\È—HÜˆQUSÔÒQÑS‘T‘ÖWÔÓTÒÕÔ‘US•SÓ—ÑVTÊKˆÚYÙ[™\™ÞWÙ[˜X›YˆÚYÙ[™\™ÞWÙ[˜X›YˆÚYÙ[™\™ÞWÙ[–ÈœÞ[˜×ÚÝ\œÈ—KˆˆˆQUSÔÕUWÔÖS×ÒS•T•SÒÕT”Ëˆ]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆ]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆ
+Kˆ
+B‚‚™YˆÙ]Ú[YÜ˜][Û—ØÛÛ™šYÊÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹›ÝšY\ŽˆÝŠHOˆXÝÜÝ‹[žWH›Û™N‚ˆ›ÝÈHÛÛ›‹™^XÝ]J”ÑSPÕ
+ˆ”“ÓH[YÜ˜][Û—ØÛÛ™šYÜÈÒT‘H›ÝšY\ˆHÈ‹
+›ÝšY\‹
+JK™™]ÚÛ™J
+BˆYˆ›ÝÈ\È›Û™N‚ˆ™]\›ˆ›Û™BˆÛÛ™šYÈHXÝ
+›ÝÊBˆYˆ›ÝšY\ˆOHS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓTŽ‚ˆ[—ØÛÛ™šYÈHÙ]Ù\Ú[ÛœÛÛ\—Ù[—ØÛÛ™šYÊ
+BˆÛÛ™šYÖÈ™[—ÛÝ™\œšY\È—HHßBˆ›ÜˆÙ^K˜[YH[ˆ[—ØÛÛ™šYËš][\Ê
+N‚ˆYˆ˜[YH[™Ù^H[ˆÛÛ™šYÎ‚ˆÛÛ™šYÖÚÙ^WHH˜[YBˆÛÛ™šYÖÈ™[—ÛÝ™\œšY\È—VÚÙ^WHHYBˆÛÛ™šYÖÈœÝ]WÜÞ[˜×Ú[\˜[ÚÝ\œÈ—HH›Ü›X[^™WÜÜÚ]]™WÚ[
+ˆÛÛ™šYË™Ù]
+œÝ]WÜÞ[˜×Ú[\˜[ÚÝ\œÈŠKˆQUSÔÕUWÔÖS×ÒS•T•SÒÕT”ËˆZ[š[][OLKˆX^[][OLˆ
+BˆÛÛ™šYÖÈœ›ÙXÝ[Û—ÜÞ[˜×Ý[YH—HH›Ü›X[^™WØÛØÚ×Ý[YJˆÛÛ™šYË™Ù]
+œ›ÙXÝ[Û—ÜÞ[˜×Ý[YHŠKˆQUSÑ•TÒSÓ”ÓÓT—Ô“ÑPÕSÓ—ÔÖS×ÕSQKˆ
+BˆÛÛ™šYÖÈ™XYÛ›ÜÝXÜ×ÜÞ[˜×Ý[YH—HH›Ü›X[^™WØÛØÚ×Ý[YJˆÛÛ™šYË™Ù]
+™XYÛ›ÜÝXÜ×ÜÞ[˜×Ý[YHŠKˆQUSÑ•TÒSÓ”ÓÓT—ÑPQÓ“ÔÕPÔ×ÔÖS×ÕSQKˆ
+BˆÛÛ™šYÖÈœ›ÙXÝ[Û—ÜÞ[˜×Ù[˜X›Y—HHHYˆ›Ü›X[^™WØ›ÛÛ
+ÛÛ™šYË™Ù]
+œ›ÙXÝ[Û—ÜÞ[˜×Ù[˜X›YŠKYJH[ÙHˆÛÛ™šYÖÈ™XYÛ›ÜÝXÜ×ÜÞ[˜×Ù[˜X›Y—HHHYˆ›Ü›X[^™WØ›ÛÛ
+ÛÛ™šYË™Ù]
+™XYÛ›ÜÝXÜ×ÜÞ[˜×Ù[˜X›YŠKYJH[ÙHˆÛÛ™šYÖÈœ\ÜÝÛÜ™ØÛÛ™šYÝ\™Y—HH›ÛÛ
+ÛÛ™šYË™Ù]
+œ\ÜÝÛÜ™ŠJBˆÛÛ™šYÖÈœ\ÜÝÛÜ™ÜÛÝ\˜ÙH—HH™[ˆˆYˆ[—ØÛÛ™šYÖÈœ\ÜÝÛÜ™—H[ÙH
+™]X˜\ÙHˆYˆÛÛ™šYË™Ù]
+œ\ÜÝÛÜ™ŠH[ÙHˆŠBˆYˆ›ÝšY\ˆOHS•QÔUSÓ—Ô“Õ’QT—ÔÒQÑS‘T‘ÖN‚ˆ[—ØÛÛ™šYÈHÙ]ÜÚYÙ[™\™ÞWÙ[—ØÛÛ™šYÊ
+Bˆ[—ÚÙ^WÛX\HÂˆ\Ù\›˜[YHŽˆ”ÒQÑS‘T‘ÖWÐTÒÑVH‹ˆœ\ÜÝÛÜ™Žˆ”ÒQÑS‘T‘ÖWÐTÔÑPÔ‘U‹ˆ˜˜\ÙWÝ\›Žˆ”ÒQÑS‘T‘ÖWÐTÑWÕT“‹ˆ›ÙÚ[—Ù[™Ú[Žˆ”ÒQÑS‘T‘ÖWÐUUÑS‘ÒS•‹ˆœ[×Ù[™Ú[Žˆ”ÒQÑS‘T‘ÖWÔÖTÕST×ÑS‘ÒS•‹ˆ™[™\™ÞWÙ›Ý×Ù[™Ú[Žˆ”ÒQÑS‘T‘ÖWÑS‘T‘ÖWÑ“Õ×ÑS‘ÒS•‹ˆ›Û˜›Ø\™Ù[™Ú[Žˆ”ÒQÑS‘T‘ÖWÓÓ“ÐT‘ÑS‘ÒS•‹ˆœÞ[˜×ÚÝ\œÈŽˆ”ÒQÑS‘T‘ÖWÔÖS×ÒÕT”È‹ˆœÝ]WÜÞ[˜×Ú[\˜[ÚÝ\œÈŽˆ”ÒQÑS‘T‘ÖWÔÕUWÔÖS×ÒS•T•SÒÕT”È‹ˆœÛ˜\ÚÝÜ™][[Û—Ù^\ÈŽˆ”ÒQÑS‘T‘ÖWÔÓTÒÕÔ‘US•SÓ—ÑVTÈ‹ˆBˆÛÛ™šYÖÈ™[—ÛÝ™\œšY\È—HHßBˆ›ÜˆÙ^K[—ÚÙ^H[ˆ[—ÚÙ^WÛX\š][\Ê
+N‚ˆ[—Ý˜[YHHÜË™[š\›Û‹™Ù]
+[—ÚÙ^KˆŠKœÝš\
+
+BˆYˆ[—Ý˜[YH[™Ù^H[ˆÛÛ™šYÎ‚ˆÛÛ™šYÖÚÙ^WHH[—Ý˜[YBˆÛÛ™šYÖÈ™[—ÛÝ™\œšY\È—VÚÙ^WHHYBˆÛÛ™šYÖÈ˜˜\ÙWÝ\›—HHÛÛ™šYË™Ù]
+˜˜\ÙWÝ\›ŠHÜˆQUSÔÒQÑS‘T‘ÖWÐTÑWÕT“ˆÛÛ™šYÖÈ›ÙÚ[—Ù[™Ú[—HHÛÛ™šYË™Ù]
+›ÙÚ[—Ù[™Ú[ŠHÜˆQUSÔÒQÑS‘T‘ÖWÐUUÑS‘ÒS•ˆÛÛ™šYÖÈœ[×Ù[™Ú[—HHÛÛ™šYË™Ù]
+œ[×Ù[™Ú[ŠHÜˆQUSÔÒQÑS‘T‘ÖWÔÖTÕST×ÑS‘ÒS•ˆÛÛ™šYÖÈ™[™\™ÞWÙ›Ý×Ù[™Ú[—HHÛÛ™šYË™Ù]
+™[™\™ÞWÙ›Ý×Ù[™Ú[ŠHÜˆQUSÔÒQÑS‘T‘ÖWÑS‘T‘ÖWÑ“Õ×ÑS‘ÒS•ˆÛÛ™šYÖÈ›Û˜›Ø\™Ù[™Ú[—HHÛÛ™šYË™Ù]
+›Û˜›Ø\™Ù[™Ú[ŠHÜˆQUSÔÒQÑS‘T‘ÖWÓÓ“ÐT‘ÑS‘ÒS•ˆÛÛ™šYÖÈœÞ[˜×ÚÝ\œÈ—HHÛÛ™šYË™Ù]
+œÞ[˜×ÚÝ\œÈŠHÜˆQUSÔÒQÑS‘T‘ÖWÔÖS×ÒÕT”ÂˆÛÛ™šYÖÈœÝ]WÜÞ[˜×Ú[\˜[ÚÝ\œÈ—HH›Ü›X[^™WÜÜÚ]]™WÚ[
+ˆÛÛ™šYË™Ù]
+œÝ]WÜÞ[˜×Ú[\˜[ÚÝ\œÈŠKˆQUSÔÕUWÔÖS×ÒS•T•SÒÕT”ËˆZ[š[][OLKˆX^[][OLˆ
+BˆÛÛ™šYÖÈœ›ÙXÝ[Û—ÜÞ[˜×Ù[˜X›Y—HHˆÛÛ™šYÖÈ™XYÛ›ÜÝXÜ×ÜÞ[˜×Ù[˜X›Y—HHˆÛÛ™šYÖÈœÛ˜\ÚÝÜ™][[Û—Ù^\È—HH[
+ÛÛ™šYË™Ù]
+œÛ˜\ÚÝÜ™][[Û—Ù^\ÈŠHÜˆQUSÔÒQÑS‘T‘ÖWÔÓTÒÕÔ‘US•SÓ—ÑVTÊBˆYˆÜË™[š\›Û‹™Ù]
+”ÒQÑS‘T‘ÖWÔ‘QÒSÓˆ‹ˆŠKœÝš\
+
+N‚ˆÛÛ™šYÖÈœ™YÚ[Ûˆ—HH[—ØÛÛ™šYÖÈœ™YÚ[Ûˆ—BˆÛÛ™šYÖÈ™[—ÛÝ™\œšY\È—VÈœ™YÚ[Ûˆ—HHYBˆ[ÙN‚ˆÛÛ™šYÖÈœ™YÚ[Ûˆ—HHÛÛ™šYË™Ù]
+œ™YÚ[ÛˆŠHÜˆQUSÔÒQÑS‘T‘ÖWÔ‘QÒSÓ‚ˆYˆ[—ØÛÛ™šYÖÈœÞ\Ý[WÚYÈ—N‚ˆÛÛ™šYÖÈœÞ\Ý[WÚYÈ—HH[—ØÛÛ™šYÖÈœÞ\Ý[WÚYÈ—BˆÛÛ™šYÖÈ™[—ÛÝ™\œšY\È—VÈœÞ\Ý[WÚYÈ—HHYBˆ[ÙN‚ˆÛÛ™šYÖÈœÞ\Ý[WÚYÈ—HHÛÛ™šYË™Ù]
+œÞ\Ý[WÚYÈŠHÜˆˆ‚ˆÛÛ™šYÖÈœ\ÜÝÛÜ™ØÛÛ™šYÝ\™Y—HH›ÛÛ
+ÛÛ™šYË™Ù]
+œ\ÜÝÛÜ™ŠJBˆÛÛ™šYÖÈœ\ÜÝÛÜ™ÜÛÝ\˜ÙH—HH™[ˆˆYˆ[—ØÛÛ™šYÖÈœ\ÜÝÛÜ™—H[ÙH
+™]X˜\ÙHˆYˆÛÛ™šYË™Ù]
+œ\ÜÝÛÜ™ŠH[ÙHˆŠBˆYˆ[—ØÛÛ™šYÖÈ™[˜X›Y—K›ÝÙ\Š
+H[ˆÈŒH‹YH‹žY\È‹œÚ[H‹›ÛˆŸN‚ˆÛÛ™šYÖÈ™[˜X›Y—HHBˆ™]\›ˆÛÛ™šYÂ‚‚™YˆÝ\Ú[YÜ˜][Û—ÜØÚY[\Š\ˆ›\ÚÊHOˆ›Û™N‚ˆÛØ˜[ÐÒQST‚ˆYˆÐÒQSTˆ\È›Ý›Û™N‚ˆ™]\›‚ˆÐÒQSTˆH˜XÚÙÜ›Ý[™ØÚY[\Š[Y^›Û™OH‘]\›ÜKÓ\Ø›ÛˆŠBˆÐÒQST‹œÝ\
+
+Bˆ™Yœ™\ÚÚ[YÜ˜][Û—ÜØÚY[\Š\
+Bˆ™YÚ\Ý\—Ø˜XÚÙÜ›Ý[™Ú›Ø—Ü™XXÝ]˜][Û—ÜØÚY[\Š\
+BˆØÚY[WÜ[™[™×Ø˜XÚÙÜ›Ý[™Ú›ØœÊ\
+B‚‚™Yˆ™Yœ™\ÚÚ[YÜ˜][Û—ÜØÚY[\Š\ˆ›\ÚÊHOˆ›Û™N‚ˆÛØ˜[ÐÒQST‚ˆYˆÐÒQSTˆ\È›Û™N‚ˆ™]\›‚ˆ›Üˆ›Øˆ[ˆ\Ý
+ÐÒQST‹™Ù]Ú›ØœÊ
+JN‚ˆYˆ
+ˆ›Ø‹šYœÝ\ÝÚ]
+š[YÜ˜][Û‹\Þ[˜ËHŠBˆÜˆ›Ø‹šYœÝ\ÝÚ]
+™\Ú[ÛœÛÛ\‹\Þ[˜ËHŠBˆÜˆ›Ø‹šYˆ[ˆÂˆ[YÜ˜[KYZ[K\Ý[[X\žH‹ˆ™\Ú[ÛœÛÛ\‹\›ÙXÝ[Û‹YZ[H‹ˆ™\Ú[ÛœÛÛ\‹]Ø]YZ[H‹ˆš[YÜ˜][Û‹\Ý]KY\Ú[ÛœÛÛ\‹ZÝ\›H‹ˆš[YÜ˜][Û‹\›ÙXÝ[Û‹Y\Ú[ÛœÛÛ\‹YZ[H‹ˆš[YÜ˜][Û‹YXYÛ›ÜÝXÜËY\Ú[ÛœÛÛ\‹YZ[H‹ˆš[YÜ˜][Û‹\›ÙXÝ[Û‹Y\Ú[ÛœÛÛ\‹[[ÛXÛÜÙH‹ˆš[YÜ˜][Û‹Y\Ú[ÛœÛÛ\‹\™X[[YKXÛX[\‹ˆš[YÜ˜][Û‹\Ý]K\ÚYÙ[™\™ÞKZÝ\›H‹ˆ˜˜XÚÙÜ›Ý[™Z›ØœË\™XXÝ]˜]K\˜]K[[Z]‹ˆBˆ
+N‚ˆÐÒQST‹œ™[[Ý™WÚ›ØŠ›Ø‹šY
+B‚ˆÚ]ÛÜÚ[™ÊÙ]ÙŠ\˜ÛÛ™šYÖÈ‘UPTÑH—JJH\ÈÛÛ›Ž‚ˆÛÛ™šYÜÈHÙÙ]Ú[YÜ˜][Û—ØÛÛ™šYÊÛÛ›‹›ÝšY\ŠH›Üˆ›ÝšY\ˆ[ˆS•QÔUSÓ—Ô“Õ’QT—ÓÔSÓ”×BˆYˆ[YÜ˜[WÙZ[WÜÝ[[X\žWÙ[˜X›Y
+
+N‚ˆÐÒQST‹˜YÚ›ØŠˆ[˜Ï\[—ÜØÚY[YÝ[YÜ˜[WÙZ[WÜÝ[[X\žKˆšYÙÙ\H˜Ü›Ûˆ‹ˆÝ\NKˆZ[]OLˆ\™ÜÏVØ\KˆYH[YÜ˜[KYZ[K\Ý[[X\žH‹ˆ™\XÙWÙ^\Ý[™ÏUYKˆX^Ú[œÝ[˜Ù\ÏLKˆÛØ[\ØÙOUYKˆZ\Ùš\™WÙÜ˜XÙWÝ[YOLNˆ
+Bˆ›ÜˆÛÛ™šYÈ[ˆÛÛ™šYÜÎ‚ˆYˆÛÛ™šYÈ\È›Û™HÜˆ›ÝÛÛ™šYÖÈ™[˜X›Y—N‚ˆÛÛ[YBˆ›ÝšY\ˆHÝŠÛÛ™šYÖÈœ›ÝšY\ˆ—JBˆYˆ›ÝšY\ˆOHS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓTŽ‚ˆ™YÚ\Ý\—Ù\Ú[ÛœÛÛ\—ÜØÚY[\—Ú›ØœÊ\ÛÛ™šYÊBˆÛÛ[YBˆYˆ›ÝšY\ˆOHS•QÔUSÓ—Ô“Õ’QT—ÔÒQÑS‘T‘ÖN‚ˆ™YÚ\Ý\—ÜÚYÙ[™\™ÞWÜØÚY[\—Ú›ØœÊ\ÛÛ™šYÊBˆ™YÚ\Ý\—Ø˜XÚÙÜ›Ý[™Ú›Ø—Ü™XXÝ]˜][Û—ÜØÚY[\Š\
+B‚‚™YˆYÜØÚY[\—Ú›ØŠ
+ŠšÝØ\™ÜÎˆ[žJHOˆ›Û™N‚ˆYˆÐÒQSTˆ\È›Û™N‚ˆ™]\›‚ˆÝØ\™ÜËœÙ]Y˜][
+œ™\XÙWÙ^\Ý[™È‹YJBˆÝØ\™ÜËœÙ]Y˜][
+›X^Ú[œÝ[˜Ù\È‹JBˆÝØ\™ÜËœÙ]Y˜][
+˜ÛØ[\ØÙH‹YJBˆÝØ\™ÜËœÙ]Y˜][
+›Z\Ùš\™WÙÜ˜XÙWÝ[YH‹N
+BˆÐÒQST‹˜YÚ›ØŠ
+ŠšÝØ\™ÜÊB‚‚™Yˆ™YÚ\Ý\—ÚÝ\›WÜÝ]WÜÞ[˜Ê\ˆ›\ÚËÛÛ™šYÎˆXÝÜÝ‹[žWK›Ø—ÚYˆÝŠHOˆ›Û™N‚ˆYˆ›ÝÛÛ™šYË™Ù]
+˜]]×ÜÞ[˜×Ù[˜X›YŠN‚ˆ™]\›‚ˆ[\˜[ÚÝ\œÈH›Ü›X[^™WÜÜÚ]]™WÚ[
+ˆÛÛ™šYË™Ù]
+œÝ]WÜÞ[˜×Ú[\˜[ÚÝ\œÈŠKˆQUSÔÕUWÔÖS×ÒS•T•SÒÕT”ËˆZ[š[][OLKˆX^[][OLˆ
+Bˆ›ÝšY\ˆHÝŠÛÛ™šYÖÈœ›ÝšY\ˆ—JBˆ\›ÙÙÙ\‹š[™›Ê”™YÚ\Ý\š[™È	\ÈÝ]HÞ[˜È]™\žH	\ÈÝ\ŠÊH‹›ÝšY\‹[\˜[ÚÝ\œÊBˆYÜØÚY[\—Ú›ØŠˆ[˜Ï\[—ÜØÚY[YÚÝ\›WÜÝ]WÜÞ[˜ËˆšYÙÙ\Hš[\˜[‹ˆÝ\œÏZ[\˜[ÚÝ\œËˆ\™ÜÏVØ\›ÝšY\—KˆYZ›Ø—ÚYˆ
+B‚‚™Yˆ™YÚ\Ý\—Ù\Ú[ÛœÛÛ\—ÜØÚY[\—Ú›ØœÊ\ˆ›\ÚËÛÛ™šYÎˆXÝÜÝ‹[žWJHOˆ›Û™N‚ˆ™YÚ\Ý\—ÚÝ\›WÜÝ]WÜÞ[˜Ê\ÛÛ™šYËš[YÜ˜][Û‹\Ý]KY\Ú[ÛœÛÛ\‹ZÝ\›HŠBˆYˆÛÛ™šYË™Ù]
+œ›ÙXÝ[Û—ÜÞ[˜×Ù[˜X›YŠN‚ˆÝ\‹Z[]HHÜ]ØÛØÚ×Ý[YJÛÛ™šYË™Ù]
+œ›ÙXÝ[Û—ÜÞ[˜×Ý[YHŠKQUSÑ•TÒSÓ”ÓÓT—Ô“ÑPÕSÓ—ÔÖS×ÕSQJBˆYÜØÚY[\—Ú›ØŠˆ[˜Ï\[—ÜØÚY[YÙ\Ú[ÛœÛÛ\—Ü›ÙXÝ[Û—ÜÞ[˜ËˆšYÙÙ\H˜Ü›Ûˆ‹ˆÝ\ZÝ\‹ˆZ[]O[Z[]Kˆ\™ÜÏVØ\KˆYHš[YÜ˜][Û‹\›ÙXÝ[Û‹Y\Ú[ÛœÛÛ\‹YZ[H‹ˆ
+BˆYˆÛÛ™šYË™Ù]
+™XYÛ›ÜÝXÜ×ÜÞ[˜×Ù[˜X›YŠN‚ˆÝ\‹Z[]HHÜ]ØÛØÚ×Ý[YJÛÛ™šYË™Ù]
+™XYÛ›ÜÝXÜ×ÜÞ[˜×Ý[YHŠKQUSÑ•TÒSÓ”ÓÓT—ÑPQÓ“ÔÕPÔ×ÔÖS×ÕSQJBˆYÜØÚY[\—Ú›ØŠˆ[˜Ï\[—ÜØÚY[YÙ\Ú[ÛœÛÛ\—ÙXYÛ›ÜÝXÜ×ÜÞ[˜ËˆšYÙÙ\H˜Ü›Ûˆ‹ˆÝ\ZÝ\‹ˆZ[]O[Z[]Kˆ\™ÜÏVØ\KˆYHš[YÜ˜][Û‹YXYÛ›ÜÝXÜËY\Ú[ÛœÛÛ\‹YZ[H‹ˆ
+BˆYˆÛÛ™šYË™Ù]
+œ›ÙXÝ[Û—ÜÞ[˜×Ù[˜X›YŠN‚ˆYÜØÚY[\—Ú›ØŠˆ[˜Ï\[—ÜØÚY[YÙ\Ú[ÛœÛÛ\—Û[ÛØÛÜÙKˆšYÙÙ\H˜Ü›Ûˆ‹ˆ^OHŒKMH‹ˆÝ\L‹ˆZ[]OLˆ\™ÜÏVØ\KˆYHš[YÜ˜][Û‹\›ÙXÝ[Û‹Y\Ú[ÛœÛÛ\‹[[ÛXÛÜÙH‹ˆ
+BˆYÜØÚY[\—Ú›ØŠˆ[˜Ï\[—ÜØÚY[YÙ\Ú[ÛœÛÛ\—Ü™X[[YWØÛX[\ˆšYÙÙ\H˜Ü›Ûˆ‹ˆÝ\LËˆZ[]OLÌˆ\™ÜÏVØ\KˆYHš[YÜ˜][Û‹Y\Ú[ÛœÛÛ\‹\™X[[YKXÛX[\‹ˆ
+B‚‚™Yˆ™YÚ\Ý\—ÜÚYÙ[™\™ÞWÜØÚY[\—Ú›ØœÊ\ˆ›\ÚËÛÛ™šYÎˆXÝÜÝ‹[žWJHOˆ›Û™N‚ˆ™YÚ\Ý\—ÚÝ\›WÜÝ]WÜÞ[˜Ê\ÛÛ™šYËš[YÜ˜][Û‹\Ý]K\ÚYÙ[™\™ÞKZÝ\›HŠB‚‚™Yˆ™YÚ\Ý\—Ø˜XÚÙÜ›Ý[™Ú›Ø—Ü™XXÝ]˜][Û—ÜØÚY[\Š\ˆ›\ÚÊHOˆ›Û™N‚ˆYÜØÚY[\—Ú›ØŠˆ[˜Ï\[—ÜØÚY[YØ˜XÚÙÜ›Ý[™Ú›Ø—Ü™XXÝ]˜][Û‹ˆšYÙÙ\Hš[\˜[‹ˆZ[]\ÏMKˆ\™ÜÏVØ\KˆYH˜˜XÚÙÜ›Ý[™Z›ØœË\™XXÝ]˜]K\˜]K[[Z]‹ˆ
+B‚‚™Yˆ[—ÜØÚY[YØ˜XÚÙÜ›Ý[™Ú›Ø—Ü™XXÝ]˜][ÛŠ\ˆ›\ÚÊHOˆ›Û™N‚ˆÝ[[X\žHHØÚY[WÜ[™[™×Ø˜XÚÙÜ›Ý[™Ú›ØœÊ\
+BˆYˆÝ[[X\žK™Ù]
+œ˜]WÛ[Z]Ü™XXÝ]˜]YŠHÜˆÝ[[X\žK™Ù]
+œ[™[™×ÜØÚY[YŠN‚ˆ\›ÙÙÙ\‹š[™›Ê˜XÚÙÜ›Ý[™›Øˆ™XXÝ]˜][ÛˆÝ[[X\žNˆ	\È‹Ý[[X\žJB‚‚™Yˆ[—ÜØÚY[YÝ[YÜ˜[WÙZ[WÜÝ[[X\žJ\ˆ›\ÚÊHOˆ›Û™N‚ˆÚ]\˜\ØÛÛ^
+
+N‚ˆÚ]ÛÜÚ[™ÊÙ]ÙŠ\˜ÛÛ™šYÖÈ‘UPTÑH—JJH\ÈÛÛ›Ž‚ˆžN‚ˆÙ[™ÙZ[WÝ[YÜ˜[WÜÝ[[X\žJÛÛ›ŠBˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ^Ù\^Ù\[ÛŽ‚ˆÝ\œ™[Ø\›ÙÙÙ\‹™^Ù\[ÛŠ”ØÚY[Y[YÜ˜[HZ[HÝ[[X\žH˜Z[YŠB‚‚™Yˆ[—ÜØÚY[YÚ[YÜ˜][Û—ÜÞ[˜Ê\ˆ›\ÚË›ÝšY\ŽˆÝŠHOˆ›Û™N‚ˆÚ]\˜\ØÛÛ^
+
+N‚ˆÚ]ÛÜÚ[™ÊÙ]ÙŠ\˜ÛÛ™šYÖÈ‘UPTÑH—JJH\ÈÛÛ›Ž‚ˆžN‚ˆÝ\œ™[Ø\›ÙÙÙ\‹š[™›Ê”ØÚY[Y	\ÈÞ[˜ÈÝ\Y‹›ÝšY\ŠBˆ™\Ý[H[—Ú[YÜ˜][Û—ÜÞ[˜ÊÛÛ›‹›ÝšY\‹šYÙÙ\—Ý\OHœØÚY[YŠBˆÝ\œ™[Ø\›ÙÙÙ\‹š[™›Ê”ØÚY[Y	\ÈÞ[˜ÈÛÛ\]Yˆ	\È‹›ÝšY\‹™\Ý[
+Bˆ^Ù\^Ù\[ÛŽ‚ˆÝ\œ™[Ø\›ÙÙÙ\‹™^Ù\[ÛŠ”ØÚY[Y	\ÈÞ[˜È˜Z[Y‹›ÝšY\ŠB‚‚™Yˆ[—ÜØÚY[YÚÝ\›WÜÝ]WÜÞ[˜Ê\ˆ›\ÚË›ÝšY\ŽˆÝŠHOˆ›Û™N‚ˆÚ]\˜\ØÛÛ^
+
+N‚ˆÚ]ÛÜÚ[™ÊÙ]ÙŠ\˜ÛÛ™šYÖÈ‘UPTÑH—JJH\ÈÛÛ›Ž‚ˆžN‚ˆ›Ø—Ý\HHœÚYÙ[™\™ÞWÜÝ]WÜÞ[˜ÈˆYˆ›ÝšY\ˆOHS•QÔUSÓ—Ô“Õ’QT—ÔÒQÑS‘T‘ÖH[ÙH™\Ú[ÛœÛÛ\—ÜÝ]WÜÞ[˜È‚ˆ›Ø—ÚYÜ™X]YHÜ™X]WØ˜XÚÙÜ›Ý[™Ú›ØŠˆÛÛ›‹ˆ›Ø—Ý\KˆÈœ›ÝšY\ˆŽˆ›ÝšY\‹šYÙÙ\—Ý\HŽˆœØÚY[YÜÝ]HŸKˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+BˆYˆÜ™X]Y‚ˆØÚY[WØ˜XÚÙÜ›Ý[™Ú›ØŠ\›Ø—ÚY
+BˆÝ\œ™[Ø\›ÙÙÙ\‹š[™›Ê”ØÚY[Y	\ÈÝ]HÞ[˜È]Y]YYˆ›Ø—ÚYI\ÈÜ™X]YI\È‹›ÝšY\‹›Ø—ÚYÜ™X]Y
+Bˆ^Ù\^Ù\[ÛŽ‚ˆÝ\œ™[Ø\›ÙÙÙ\‹™^Ù\[ÛŠ”ØÚY[Y	\ÈÝ]HÞ[˜È˜Z[Y‹›ÝšY\ŠB‚‚™Yˆ[—ÜØÚY[YÙ\Ú[ÛœÛÛ\—ÜÞ[˜Ê\ˆ›\ÚÊHOˆ›Û™N‚ˆ[—ÜØÚY[YÚÝ\›WÜÝ]WÜÞ[˜Ê\S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓTŠB‚‚™YˆÝ\œ™[Û\Ø›Û—Ù]J
+HOˆ]N‚ˆ™]\›ˆ]][YK››ÝÊTÐ“Ó—ÕSQV“Ó‘JK™]J
+B‚‚™Yˆ[—ÜØÚY[YÙ\Ú[ÛœÛÛ\—Ü›ÙXÝ[Û—ÜÞ[˜Ê\ˆ›\ÚÊHOˆ›Û™N‚ˆØÚY[\—Ù]HHÝ\œ™[Û\Ø›Û—Ù]J
+Bˆ\™Ù]Ù]HHØÚY[\—Ù]HH[YY[J^\ÏLJBˆÚ]\˜\ØÛÛ^
+
+N‚ˆÚ]ÛÜÚ[™ÊÙ]ÙŠ\˜ÛÛ™šYÖÈ‘UPTÑH—JJH\ÈÛÛ›Ž‚ˆÝ\œ™[Ø\›ÙÙÙ\‹š[™›Êˆ”ØÚY[Y\Ú[Û”ÛÛ\ˆ›ÙXÝ[Ûˆ™\\š[™È™]š[Ý\ÈÛÜÙY^NˆØÚY[\—Ù]OI\È\™Ù]Ù]OI\È‹ˆØÚY[\—Ù]Kˆ\™Ù]Ù]Kˆ
+BˆÛÛ™šYÈHÙ]Ú[YÜ˜][Û—ØÛÛ™šYÊÛÛ›‹S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓTŠBˆYˆÛÛ™šYÈ\È›Û™HÜˆ›ÝÛÛ™šYÖÈ™[˜X›Y—N‚ˆÝ\œ™[Ø\›ÙÙÙ\‹š[™›Êˆ”ØÚY[Y\Ú[Û”ÛÛ\ˆ›ÙXÝ[ÛˆÚÚ\Y™XØ]\ÙH[YÜ˜][Ûˆ\È\ØX›Yˆ\™Ù]Ù]OI\È‹ˆ\™Ù]Ù]Kˆ
+Bˆ™]\›‚ˆYˆ›ÝÛÛ™šYË™Ù]
+œ›ÙXÝ[Û—ÜÞ[˜×Ù[˜X›YŠN‚ˆÝ\œ™[Ø\›ÙÙÙ\‹š[™›Êˆ”ØÚY[Y\Ú[Û”ÛÛ\ˆ›ÙXÝ[ÛˆÚÚ\Y™XØ]\ÙH›ÙXÝ[ÛˆÞ[˜È\È\ØX›Yˆ\™Ù]Ù]OI\È‹ˆ\™Ù]Ù]Kˆ
+Bˆ™]\›‚ˆ›Ø—ÚYÜ™X]YHÜ™X]WØ˜XÚÙÜ›Ý[™Ú›ØŠˆÛÛ›‹ˆ™\Ú[ÛœÛÛ\—Ü›ÙXÝ[Û—ÜÞ[˜È‹ˆÂˆœ›ÝšY\ˆŽˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ˆ\™Ù]Ù]HŽˆ\™Ù]Ù]Kš\ÛÙ›Ü›X]
+
+Kˆœ\š[ÙÝ\HŽˆ™^H‹ˆšYÙÙ\—Ý\HŽˆœØÚY[Y‹ˆKˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+BˆYˆÜ™X]Y‚ˆØÚY[WØ˜XÚÙÜ›Ý[™Ú›ØŠ\›Ø—ÚY
+BˆÝ\œ™[Ø\›ÙÙÙ\‹š[™›Êˆ”ØÚY[Y\Ú[Û”ÛÛ\ˆ›ÙXÝ[Ûˆ]Y]YYˆ›Ø—ÚYI\È\™Ù]Ù]OI\È‹ˆ›Ø—ÚYˆ\™Ù]Ù]Kˆ
+Bˆ[ÙN‚ˆÝ\œ™[Ø\›ÙÙÙ\‹š[™›Êˆ”ØÚY[Y\Ú[Û”ÛÛ\ˆ›ÙXÝ[Ûˆ™]\ÙY^\Ý[™È[™[™ËÜ[›š[™È›ØŽˆ›Ø—ÚYI\È\™Ù]Ù]OI\È‹ˆ›Ø—ÚYˆ\™Ù]Ù]Kˆ
+B‚‚™Yˆ[—ÜØÚY[YÙ\Ú[ÛœÛÛ\—ÝØ]Ø˜XÚÙš[
+\ˆ›\ÚÊHOˆ›Û™N‚ˆØÚY[\—Ù]HHÝ\œ™[Û\Ø›Û—Ù]J
+Bˆ\™Ù]Ù]HHØÚY[\—Ù]HH[YY[J^\ÏLJBˆÚ]\˜\ØÛÛ^
+
+N‚ˆÚ]ÛÜÚ[™ÊÙ]ÙŠ\˜ÛÛ™šYÖÈ‘UPTÑH—JJH\ÈÛÛ›Ž‚ˆÝ\œ™[Ø\›ÙÙÙ\‹š[™›Êˆ”ØÚY[Y\Ú[Û”ÛÛ\ˆÐU™\\š[™È™]š[Ý\ÈÛÜÙY^NˆØÚY[\—Ù]OI\È\™Ù]Ù]OI\È‹ˆØÚY[\—Ù]Kˆ\™Ù]Ù]Kˆ
+BˆÛÛ™šYÈHÙ]Ú[YÜ˜][Û—ØÛÛ™šYÊÛÛ›‹S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓTŠBˆYˆÛÛ™šYÈ\È›Û™HÜˆ›ÝÛÛ™šYÖÈ™[˜X›Y—N‚ˆÝ\œ™[Ø\›ÙÙÙ\‹š[™›Êˆ”ØÚY[Y\Ú[Û”ÛÛ\ˆÐUÚÚ\Y™XØ]\ÙH[YÜ˜][Ûˆ\È\ØX›Yˆ\™Ù]Ù]OI\È‹ˆ\™Ù]Ù]Kˆ
+Bˆ™]\›‚ˆYˆ›ÝÛÛ™šYË™Ù]
+™XYÛ›ÜÝXÜ×ÜÞ[˜×Ù[˜X›YŠN‚ˆÝ\œ™[Ø\›ÙÙÙ\‹š[™›Êˆ”ØÚY[Y\Ú[Û”ÛÛ\ˆÐUÚÚ\Y™XØ]\ÙHXYÛ›ÜÝXÜÈÞ[˜È\È\ØX›Yˆ\™Ù]Ù]OI\È‹ˆ\™Ù]Ù]Kˆ
+Bˆ™]\›‚ˆ›Ø—ÚYÜ™X]YHÜ™X]WØ˜XÚÙÜ›Ý[™Ú›ØŠˆÛÛ›‹ˆ™\Ú[ÛœÛÛ\—Ú[™\\—Ø]˜Z[Xš[]WØ˜XÚÙš[‹ˆÂˆœ›ÝšY\ˆŽˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ˆ™œ›ÛWÙ]HŽˆ\™Ù]Ù]Kš\ÛÙ›Ü›X]
+
+Kˆ×Ù]HŽˆ\™Ù]Ù]Kš\ÛÙ›Ü›X]
+
+KˆšYÙÙ\—Ý\HŽˆœØÚY[Y‹ˆKˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+BˆYˆÜ™X]Y‚ˆØÚY[WØ˜XÚÙÜ›Ý[™Ú›ØŠ\›Ø—ÚY
+BˆÝ\œ™[Ø\›ÙÙÙ\‹š[™›Êˆ”ØÚY[Y\Ú[Û”ÛÛ\ˆÐU]Y]YYˆ›Ø—ÚYI\È\™Ù]Ù]OI\È›Ø—Ý\OI\È‹ˆ›Ø—ÚYˆ\™Ù]Ù]Kˆ™\Ú[ÛœÛÛ\—Ú[™\\—Ø]˜Z[Xš[]WØ˜XÚÙš[‹ˆ
+Bˆ[ÙN‚ˆÝ\œ™[Ø\›ÙÙÙ\‹š[™›Êˆ”ØÚY[Y\Ú[Û”ÛÛ\ˆÐU™]\ÙY^\Ý[™È[™[™ËÜ[›š[™È›ØŽˆ›Ø—ÚYI\È\™Ù]Ù]OI\È‹ˆ›Ø—ÚYˆ\™Ù]Ù]Kˆ
+B‚‚™Yˆ[—ÜØÚY[YÙ\Ú[ÛœÛÛ\—ÙXYÛ›ÜÝXÜ×ÜÞ[˜Ê\ˆ›\ÚÊHOˆ›Û™N‚ˆ[—ÜØÚY[YÙ\Ú[ÛœÛÛ\—ÝØ]Ø˜XÚÙš[
+\
+B‚‚™Yˆ[—ÜØÚY[YÙ\Ú[ÛœÛÛ\—Ü™X[[YWØÛX[\
+\ˆ›\ÚÊHOˆ›Û™N‚ˆÚ]\˜\ØÛÛ^
+
+N‚ˆÚ]ÛÜÚ[™ÊÙ]ÙŠ\˜ÛÛ™šYÖÈ‘UPTÑH—JJH\ÈÛÛ›Ž‚ˆ›Ø—ÚYÜ™X]YHÜ™X]WØ˜XÚÙÜ›Ý[™Ú›ØŠˆÛÛ›‹ˆ™\Ú[ÛœÛÛ\—Ü™X[[YWÛX]\šX[^™WØÛX[\‹ˆÂˆœ›ÝšY\ˆŽˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ˆœ™Y™\™[˜ÙWÙ]HŽˆÝ\œ™[Û\Ø›Û—Ù]J
+Kš\ÛÙ›Ü›X]
+
+KˆšYÙÙ\—Ý\HŽˆœØÚY[YÜ™][[Ûˆ‹ˆKˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+BˆYˆÜ™X]Y‚ˆØÚY[WØ˜XÚÙÜ›Ý[™Ú›ØŠ\›Ø—ÚY
+BˆÝ\œ™[Ø\›ÙÙÙ\‹š[™›Êˆ”ØÚY[Y\Ú[Û”ÛÛ\ˆ™X[[YHX]\šX[^˜][Û‹ØÛX[\]Y]YYˆ‚ˆš›Ø—ÚYI\ÈÜ™X]YI\È‹ˆ›Ø—ÚYˆÜ™X]Yˆ
+B‚‚™Yˆ[—ÜØÚY[YÙ\Ú[ÛœÛÛ\—Û[ÛØÛÜÙJ\ˆ›\ÚÊHOˆ›Û™N‚ˆØÚY[\—Ù]HHÝ\œ™[Û\Ø›Û—Ù]J
+BˆYˆØÚY[\—Ù]K™^H›Ý[ˆ˜[™ÙJKŠN‚ˆ\›ÙÙÙ\‹š[™›Êˆ”ØÚY[Y\Ú[Û”ÛÛ\ˆ[ÛÛÜÙHÚÚ\YÝ]ÚYH^\ÈKMNˆØÚY[\—Ù]OI\È‹ˆØÚY[\—Ù]Kˆ
+Bˆ™]\›‚ˆ™]š[Ý\×Ù^HHØÚY[\—Ù]Kœ™\XÙJ^OLJHH[YY[J^\ÏLJBˆ™\ÜÛ[ÛH™]š[Ý\×Ù^KœÝ™[YJ‰VKI[HŠBˆÚ]\˜\ØÛÛ^
+
+N‚ˆÚ]ÛÜÚ[™ÊÙ]ÙŠ\˜ÛÛ™šYÖÈ‘UPTÑH—JJH\ÈÛÛ›Ž‚ˆÛÛ™šYÈHÙ]Ú[YÜ˜][Û—ØÛÛ™šYÊÛÛ›‹S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓTŠBˆYˆÛÛ™šYÈ\È›Û™HÜˆ›ÝÛÛ™šYÖÈ™[˜X›Y—HÜˆ›ÝÛÛ™šYË™Ù]
+œ›ÙXÝ[Û—ÜÞ[˜×Ù[˜X›YŠN‚ˆÝ\œ™[Ø\›ÙÙÙ\‹š[™›Êˆ”ØÚY[Y\Ú[Û”ÛÛ\ˆ[ÛÛÜÙHÚÚ\Y™XØ]\ÙH›ÙXÝ[Ûˆ[YÜ˜][Ûˆ\È\ØX›Yˆ[ÛI\È‹ˆ™\ÜÛ[Ûˆ
+Bˆ™]\›‚ˆ›Ø—ÚYÜ™X]YHÜ™X]WØ˜XÚÙÜ›Ý[™Ú›ØŠˆÛÛ›‹ˆ™\Ú[ÛœÛÛ\—Û[ÛØÛÜÙH‹ˆÂˆœ›ÝšY\ˆŽˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ˆœ™\ÜÛ[ÛŽˆ™\ÜÛ[ÛˆšYÙÙ\—Ý\HŽˆœØÚY[YÛ[ÛØÛÜÙH‹ˆKˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+BˆYˆÜ™X]Y‚ˆØÚY[WØ˜XÚÙÜ›Ý[™Ú›ØŠ\›Ø—ÚY
+BˆÝ\œ™[Ø\›ÙÙÙ\‹š[™›Êˆ”ØÚY[Y\Ú[Û”ÛÛ\ˆ[ÛÛÜÙH]Y]YYˆ›Ø—ÚYI\ÈÜ™X]YI\È[ÛI\ÈØÚY[\—Ù]OI\È‹ˆ›Ø—ÚYˆÜ™X]Yˆ™\ÜÛ[ÛˆØÚY[\—Ù]Kˆ
+B‚‚™YˆØÚY[WØ˜XÚÙÜ›Ý[™Ú›ØŠ\ˆ›\ÚË›Ø—ÚYˆ[[—Ù]Nˆ]][YH›Û™HH›Û™JHOˆ›ÛÛ‚ˆYˆÐÒQSTˆ\È›Û™N‚ˆ\›ÙÙÙ\‹™\œ›ÜŠ˜XÚÙÜ›Ý[™›Øˆ	\ÈØ\È]Y]YY]TØÚY[\ˆ\È›Ý[›š[™È‹›Ø—ÚY
+Bˆ™]\›ˆ˜[ÙBˆØÚY[YØ]H\×Ø˜XÚÙÜ›Ý[™Ú›Ø—Ý]Êˆ[—Ù]HÜˆ˜XÚÙÜ›Ý[™Ú›Ø—Ý]×Û›ÝÊ
+Bˆ
+BˆÐÒQST‹˜YÚ›ØŠˆ[˜Ï\[—Ø˜XÚÙÜ›Ý[™Ú›Ø‹ˆšYÙÙ\H™]H‹ˆ[—Ù]O\ØÚY[YØ]ˆ\™ÜÏVØ\›Ø—ÚYKˆYYˆ˜˜XÚÙÜ›Ý[™Z›Ø‹^Ú›Ø—ÚYH‹ˆ™\XÙWÙ^\Ý[™ÏUYKˆX^Ú[œÝ[˜Ù\ÏLKˆ
+Bˆ™]\›ˆYB‚‚™YˆØÚY[WÜ[™[™×Ø˜XÚÙÜ›Ý[™Ú›ØœÊ\ˆ›\ÚÊHOˆXÝÜÝ‹[žWN‚ˆÚ]ÛÜÚ[™ÊÙ]ÙŠ\˜ÛÛ™šYÖÈ‘UPTÑH—JJH\ÈÛÛ›Ž‚ˆ^\™YÛX\Ù\×Ü™XÛÝ™\™YH™XÛÝ™\—Ù^\™YÛX\Ù\ÊÛÛ›ŠBˆYˆ^\™YÛX\Ù\×Ü™XÛÝ™\™Y‚ˆ\›ÙÙÙ\‹š[™›Êˆ”™XÛÝ™\™Y	\È^\™Y›ÙXÝ[ÛˆTHX\Ù\È‹ˆ^\™YÛX\Ù\×Ü™XÛÝ™\™Yˆ
+Bˆ™XÛÝ™\™YØÛÝ[HX\š×ÜÝ[WÜ[›š[™×Ø˜XÚÙÜ›Ý[™Ú›Øœ×Ù˜Z[Y
+ÛÛ›ŠBˆYˆ™XÛÝ™\™YØÛÝ[‚ˆ\›ÙÙÙ\‹Ø\›š[™Ê“X\šÙY	\ÈÝ[H[›š[™È˜XÚÙÜ›Ý[™›ØœÈ\È˜Z[YÛˆÝ\\‹™XÛÝ™\™YØÛÝ[
+Bˆ™XXÝ]˜]YØÛÝ[H™XXÝ]˜]WÙYWÜ˜]WÛ[Z]YØ˜XÚÙÜ›Ý[™Ú›ØœÊÛÛ›ŠBˆYˆ™XXÝ]˜]YØÛÝ[‚ˆ\›ÙÙÙ\‹š[™›Ê”™XXÝ]˜]Y	\È˜XÚÙÜ›Ý[™›ØœÈY\ˆTHÛÛÛÝÛˆ‹™XXÝ]˜]YØÛÝ[
+Bˆ[™[™×Ú›Ø—ÚYÈH™]ÚÜ[™[™×Ø˜XÚÙÜ›Ý[™Ú›Ø—ÚYÊÛÛ›ŠBˆ]\™WÝØZ][™×Ú›ØœÈH™]ÚÙ]\™WÝØZ][™×Ø˜XÚÙÜ›Ý[™Ú›ØœÊÛÛ›ŠBˆ˜Z[YÚ›Ø—ÚYÎˆ\ÝÚ[HH×Bˆ›Üˆ›Ø—ÚY[ˆ[™[™×Ú›Ø—ÚYÎ‚ˆYˆ›ÝØÚY[WØ˜XÚÙÜ›Ý[™Ú›ØŠ\›Ø—ÚY
+N‚ˆ˜Z[YÚ›Ø—ÚYË˜\[™
+›Ø—ÚY
+Bˆ˜Z[YÝØZ][™×Ú›Ø—ÚYÎˆ\ÝÚ[HH×Bˆ›Üˆ›Ø—ÚY™^Ø][\Ø][ˆ]\™WÝØZ][™×Ú›ØœÎ‚ˆYˆ›ÝØÚY[WØ˜XÚÙÜ›Ý[™Ú›ØŠˆ\ˆ›Ø—ÚYˆ[—Ù]O[™^Ø][\Ø]ˆ
+N‚ˆ˜Z[YÝØZ][™×Ú›Ø—ÚYË˜\[™
+›Ø—ÚY
+BˆØÚY[YØÛÝ[H[Š[™[™×Ú›Ø—ÚYÊHH[Š˜Z[YÚ›Ø—ÚYÊBˆØZ][™×ÜØÚY[YØÛÝ[H
+ˆ[Š]\™WÝØZ][™×Ú›ØœÊHH[Š˜Z[YÝØZ][™×Ú›Ø—ÚYÊBˆ
+BˆYˆØÚY[YØÛÝ[‚ˆ\›ÙÙÙ\‹š[™›Ê”ØÚY[Y	\È[™[™È˜XÚÙÜ›Ý[™›ØœÈÛˆÝ\\‹ØÚY[YØÛÝ[
+BˆYˆ˜Z[YÚ›Ø—ÚYÎ‚ˆ\›ÙÙÙ\‹Ø\›š[™ÊÛÝ[›ÝØÚY[H[™[™È˜XÚÙÜ›Ý[™›ØœÈÛˆÝ\\ˆ	\È‹˜Z[YÚ›Ø—ÚYÊBˆYˆ˜Z[YÝØZ][™×Ú›Ø—ÚYÎ‚ˆ\›ÙÙÙ\‹Ø\›š[™ÊˆÛÝ[›Ý™\ÝÜ™HØZ][™È˜XÚÙÜ›Ý[™›ØœÈÛˆÝ\\ˆ	\È‹ˆ˜Z[YÝØZ][™×Ú›Ø—ÚYËˆ
+Bˆ™]\›ˆÂˆœÝ[WÜ[›š[™×Ù˜Z[YŽˆ™XÛÝ™\™YØÛÝ[ˆœ˜]WÛ[Z]Ü™XXÝ]˜]YŽˆ™XXÝ]˜]YØÛÝ[ˆœ[™[™×Ù›Ý[™Žˆ[Š[™[™×Ú›Ø—ÚYÊKˆœ[™[™×ÜØÚY[YŽˆØÚY[YØÛÝ[ˆœ[™[™×ÜØÚY[WÙ˜Z[YÚYÈŽˆ˜Z[YÚ›Ø—ÚYËˆØZ][™×Ù›Ý[™Žˆ[Š]\™WÝØZ][™×Ú›ØœÊKˆØZ][™×ÜØÚY[YŽˆØZ][™×ÜØÚY[YØÛÝ[ˆØZ][™×ÜØÚY[WÙ˜Z[YÚYÈŽˆ˜Z[YÝØZ][™×Ú›Ø—ÚYËˆB‚‚™Yˆ\×Ý˜[œÚY[ÜÜ[]WÛØÚÊ^Îˆ˜\ÙQ^Ù\[ÛŠHOˆ›ÛÛ‚ˆY\ÜØYÙHHÝŠ^ÊK›ÝÙ\Š
+Bˆ™]\›ˆ\Ú[œÝ[˜ÙJ^ËÜ[]LË“Ü\˜][Û˜[\œ›ÜŠH[™
+ˆ™]X˜\ÙH\ÈØÚÙYˆ[ˆY\ÜØYÙBˆÜˆ™]X˜\ÙHX›H\ÈØÚÙYˆ[ˆY\ÜØYÙBˆÜˆ™]X˜\ÙH\È\ÞHˆ[ˆY\ÜØYÙBˆ
+B‚‚™YˆY™\—Ø˜XÚÙÜ›Ý[™Ú›Ø—ØY\—Ù]X˜\ÙWÛØÚÊˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ\ˆ›\ÚËˆ›Ø—ÚYˆ[ˆ\˜[\ÎˆXÝÜÝ‹[žWKŠHOˆ›ÛÛ‚ˆ][\ÈH[
+\˜[\Ë™Ù]
+—ÜÜ[]WÛØÚ×Ø][\ŠHÜˆ
+H
+ÈBˆYˆ][\ÈˆŽ‚ˆ™]\›ˆ˜[ÙBˆ[^WÜÙXÛÛ™ÈHZ[ŠH
+ˆ
+ˆ
+Šˆ
+][\ÈHJJKÌ
+Bˆ™^Ø][\Ø]H˜XÚÙÜ›Ý[™Ú›Ø—Ý]×Û›ÝÊ
+H
+È[YY[JˆÙXÛÛ™ÏY[^WÜÙXÛÛ™Âˆ
+Bˆ\˜[\ÈHÊŠœ\˜[\Ë—ÜÜ[]WÛØÚ×Ø][\Žˆ][\ßBˆÛÛ›‹œ›Û˜XÚÊ
+BˆÛÛ›‹™^XÝ]Jˆ•TUH˜XÚÙÜ›Ý[™Ú›ØœÈÑU\˜[\×ÚœÛÛˆHÈÒT‘HYHÈ‹ˆ
+[˜ÛÙWÚ›Ø—Ü\˜[\Ê\˜[\ÊK›Ø—ÚY
+Kˆ
+BˆX\š×Ø˜XÚÙÜ›Ý[™Ú›Ø—ÝØZ][™×Ø\WÜÛÝ
+ˆÛÛ›‹ˆ›Ø—ÚYˆ™^Ø][\Ø][™^Ø][\Ø]ˆØZ]Ü™X\ÛÛH™]X˜\ÙWÛØÚÙY‹ˆ\œ›Ü—ÛY\ÜØYÙOJˆ”ÔS]H[\Ü˜\šX[Y[HØÝ\YNÈ›Ý˜H[]]˜H]]ÛX]XØH‚ˆˆžØ][\ßKÍ‹ˆ‚ˆ
+Kˆ™\Ý[^ÂˆœÝ]\ÈŽˆØZ][™×Ø\WÜÛÝ‹ˆØZ]Ü™X\ÛÛˆŽˆ™]X˜\ÙWÛØÚÙY‹ˆœ™]žWØ][\Žˆ][\Ëˆ›™^Ø][\Ø]ŽˆÙ\šX[^™WØ˜XÚÙÜ›Ý[™Ú›Ø—Ý[Y\Ý[\
+ˆ™^Ø][\Ø]ˆ
+KˆœÝÜYÜ™X\ÛÛˆŽˆ™]X˜\ÙWÛØÚÙY‹ˆKˆ
+BˆØÚY[WØ˜XÚÙÜ›Ý[™Ú›ØŠ\›Ø—ÚY[—Ù]O[™^Ø][\Ø]
+Bˆ™]\›ˆYB‚‚™Yˆ[—Ø˜XÚÙÜ›Ý[™Ú›ØŠ\ˆ›\ÚË›Ø—ÚYˆ[
+HOˆ›Û™N‚ˆÚ]\˜\ØÛÛ^
+
+N‚ˆÚ]ÛÜÚ[™ÊÙ]ÙŠ\˜ÛÛ™šYÖÈ‘UPTÑH—JJH\ÈÛÛ›Ž‚ˆ›ØˆHÛÛ›‹™^XÝ]J”ÑSPÕ
+ˆ”“ÓH˜XÚÙÜ›Ý[™Ú›ØœÈÒT‘HYHÈ‹
+›Ø—ÚY
+JK™™]ÚÛ™J
+BˆYˆ›Øˆ\È›Û™N‚ˆÝ\œ™[Ø\›ÙÙÙ\‹™\œ›ÜŠ˜XÚÙÜ›Ý[™›Øˆ	\È›Ý›Ý[™‹›Ø—ÚY
+Bˆ™]\›‚ˆžN‚ˆYˆ›ÝX\š×Ø˜XÚÙÜ›Ý[™Ú›Ø—Ü[›š[™ÊÛÛ›‹›Ø—ÚY
+N‚ˆÝ\œ™[Ø\›ÙÙÙ\‹š[™›Ê˜XÚÙÜ›Ý[™›Øˆ	\ÈÚÚ\Y™XØ]\ÙH]\È›ÈÛ™Ù\ˆ[™[™È‹›Ø—ÚY
+Bˆ™]\›‚ˆ^Ù\Ü[]LË“Ü\˜][Û˜[\œ›Üˆ\È^Î‚ˆYˆ›Ý\×Ý˜[œÚY[ÜÜ[]WÛØÚÊ^ÊN‚ˆ˜Z\ÙBˆ\˜[\ÈHXÛÙWÚ›Ø—Ü\˜[\Ê›Ø–Èœ\˜[\×ÚœÛÛˆ—JBˆYˆ›ÝY™\—Ø˜XÚÙÜ›Ý[™Ú›Ø—ØY\—Ù]X˜\ÙWÛØÚÊˆÛÛ›‹ˆ\ˆ›Ø—ÚYˆ\˜[\Ëˆ
+N‚ˆ˜Z\ÙBˆ™]\›‚ˆžN‚ˆ\˜[\ÈHœÛÛ‹›ØYÊ›Ø–Èœ\˜[\×ÚœÛÛˆ—HÜˆžßHŠBˆÝ\œ™[Ø\›ÙÙÙ\‹š[™›Ê˜XÚÙÜ›Ý[™›Øˆ	\ÈÝ\Yˆ	\È‹›Ø—ÚY›Ø–Èš›Ø—Ý\H—JBˆÚ]›ÙXÝ[Û—ÚÜWØØ[ØÛÛ^
+ˆ›Ø—ÚYZ›Ø—ÚYˆ›Ø—Ý\O\ÝŠ›Ø–Èš›Ø—Ý\H—JKˆ
+N‚ˆ™\Ý[H[—Ø˜XÚÙÜ›Ý[™Ú›Ø—Ü^[ØY
+ÛÛ›‹ÝŠ›Ø–Èš›Ø—Ý\H—JK\˜[\ÊBˆX\š×Ø˜XÚÙÜ›Ý[™Ú›Ø—ÜÝXØÙ\ÜÊÛÛ›‹›Ø—ÚY™\Ý[
+BˆÝ\œ™[Ø\›ÙÙÙ\‹š[™›Ê˜XÚÙÜ›Ý[™›Øˆ	\ÈÛÛ\]Yˆ	\È‹›Ø—ÚY›Ø–Èš›Ø—Ý\H—JBˆ^Ù\\TÛÝ[˜]˜Z[X›Q\œ›Üˆ\È^Î‚ˆ™\Ý[HÂˆ
+ŠŠˆ^Ëš›Ø—Ü™\Ý[ˆYˆ\Ú[œÝ[˜ÙJ^Ëš›Ø—Ü™\Ý[XÝ
+Bˆ[ÙHßBˆ
+KˆœÝ]\ÈŽˆØZ][™×Ø\WÜÛÝ‹ˆœ›ÝšY\ˆŽˆ^Ëœ›ÝšY\‹ˆ˜\WØ\™XHŽˆ^Ë˜\WØ\™XKˆØZ]Ü™X\ÛÛˆŽˆ^ËØZ]Ü™X\ÛÛ‹ˆ›™^Ø][\Ø]ŽˆÙ\šX[^™WØ˜XÚÙÜ›Ý[™Ú›Ø—Ý[Y\Ý[\
+ˆ^Ë›™^Ø][\Ø]ˆ
+KˆœÝÜYÜ™X\ÛÛˆŽˆ^Ë›Y\ÜØYÙKˆBˆX\š×Ø˜XÚÙÜ›Ý[™Ú›Ø—ÝØZ][™×Ø\WÜÛÝ
+ˆÛÛ›‹ˆ›Ø—ÚYˆ™^Ø][\Ø]Y^Ë›™^Ø][\Ø]ˆØZ]Ü™X\ÛÛY^ËØZ]Ü™X\ÛÛ‹ˆ\œ›Ü—ÛY\ÜØYÙOY^Ë›Y\ÜØYÙKˆ™\Ý[\™\Ý[ˆ
+BˆØÚY[WØ˜XÚÙÜ›Ý[™Ú›ØŠ\›Ø—ÚY[—Ù]OY^Ë›™^Ø][\Ø]
+Bˆ^Ù\\T˜]S[Z]\œ›Üˆ\È^Î‚ˆÝ\œ™[Ø\›ÙÙÙ\‹š[™›Êˆ˜XÚÙÜ›Ý[™›Øˆ	\ÈØZ][™È›Üˆ	\È	\È˜]H[Z][[	\È‹ˆ›Ø—ÚYˆ^Ëœ›ÝšY\‹ˆ^Ë˜\™XKˆ^Ë˜ÛÛÛÝÛ—Ý[[ˆ
+Bˆ\X[Ü™\Ý[HÙ]]Š^Ëš›Ø—Ü™\Ý[‹ßJBˆ™\Ý[HÂˆ
+ŠŠ\X[Ü™\Ý[Yˆ\Ú[œÝ[˜ÙJ\X[Ü™\Ý[XÝ
+H[ÙHßJKˆœÝ]\ÈŽˆØZ][™×Ü˜]WÛ[Z]‹ˆœ›ÝšY\ˆŽˆ^Ëœ›ÝšY\‹ˆ˜\WØ\™XHŽˆ^Ë˜\™XKˆ˜ÛÛÛÝÛ—Ý[[ŽˆÙ\šX[^™WØ˜XÚÙÜ›Ý[™Ú›Ø—Ý[Y\Ý[\
+ˆ^Ë˜ÛÛÛÝÛ—Ý[[ˆ
+Kˆ›™^Ø][\Ø]ŽˆÙ\šX[^™WØ˜XÚÙÜ›Ý[™Ú›Ø—Ý[Y\Ý[\
+ˆ^Ë˜ÛÛÛÝÛ—Ý[[ˆ
+KˆœÝÜYÜ™X\ÛÛˆŽˆ^Ë›Y\ÜØYÙKˆBˆYˆÝŠ›Ø–Èš›Ø—Ý\H—JHOH™\Ú[ÛœÛÛ\—Û[ÛØÛÜÙHŽ‚ˆ™\ÜÛ[ÛHÝŠ\˜[\Ë™Ù]
+œ™\ÜÛ[ÛŠHÜˆˆŠBˆ™\Ý[œÙ]Y˜][
+›[Û‹™\ÜÛ[Û
+BˆYˆ›Ý™\Ý[™Ù]
+œÝ]\×Ø™Y›Ü™HŠH[™™\ÜÛ[Û‚ˆžN‚ˆ[ÛÜÝ\H]][YKœÝœ[YJ™\ÜÛ[Û‰VKI[HŠK™]J
+Bˆ™Y™\™[˜ÙWÙ]HHÝ\œ™[Û\Ø›Û—Ù]J
+Bˆ\ÜÙ]ÈHÙ]Ù\Ú[ÛœÛÛ\—Ü\™›Ü›X[˜ÙWØ\ÜÙ]ÊˆÛÛ›‹ˆÝŠ\˜[\Ë™Ù]
+œ›ÝšY\ˆŠHÜˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓTŠKˆ
+Bˆ]X[]Y\ÈHÂˆ[
+\ÜÙ]È˜\ÜÙ]ÚY—JNˆ]˜[X]WÛØØ[Û[ÛWÜ›ÙXÝ[Û—Ü]X[]JˆÛÛ›‹ˆ\ÜÙ]ÚYZ[
+\ÜÙ]È˜\ÜÙ]ÚY—JKˆ›ÝšY\\ÝŠˆ\˜[\Ë™Ù]
+œ›ÝšY\ˆŠBˆÜˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‚ˆ
+Kˆ[ÛÜÝ\[[ÛÜÝ\ˆ™Y™\™[˜ÙWÙ]O\™Y™\™[˜ÙWÙ]Kˆ
+Bˆ›Üˆ\ÜÙ][ˆ\ÜÙ]ÂˆBˆÝ]\ÈHÛÝ[Û[ÛWÜ›ÙXÝ[Û—ÜÝ]\Ê]X[]Y\ÊBˆ™\Ý[ÈœÝ]\×Ø™Y›Ü™H—HHÝ]\Âˆ™\Ý[ÈœÝ]\×ØY\ˆ—HHÝ]\Âˆ™\Ý[È˜\ÜÙ]×Ù]˜[X]Y—HH[Š]X[]Y\ÊBˆ™\Ý[È˜\ÜÙ]×ØY™™XÝY—HHÝ[Jˆ]X[]KœÝ]\È[ˆÈœ\X[‹›Z\ÜÚ[™È‹˜ÛÛ™›XÝŸBˆ›Üˆ]X[]H[ˆ]X[]Y\Ë˜[Y\Ê
+Bˆ
+Bˆ^Ù\^Ù\[ÛŽ‚ˆ™\Ý[œÙ]Y˜][
+œÝ]\×Ø™Y›Ü™H‹ßJBˆ™\Ý[œÙ]Y˜][
+œÝ]\×ØY\ˆ‹ßJBˆ[ÙN‚ˆ™\Ý[œÙ]Y˜][
+œÝ]\×Ø™Y›Ü™H‹ßJBˆ™\Ý[œÙ]Y˜][
+œÝ]\×ØY\ˆ‹ßJBˆ™\Ý[œÙ]Y˜][
+˜\WØØ[×Ý\ÙY‹
+Bˆ™\Ý[œÙ]Y˜][
+˜\WØØ[×Ø][\Y‹
+Bˆ™\Ý[œÙ]Y˜][
+˜\ÜÙ]×ØY™™XÝY‹
+BˆX\š×Ø˜XÚÙÜ›Ý[™Ú›Ø—ÝØZ][™×Ü˜]WÛ[Z]
+ˆÛÛ›‹ˆ›Ø—ÚYˆ™^Ø][\Ø]Y^Ë˜ÛÛÛÝÛ—Ý[[ˆ\œ›Ü—ÛY\ÜØYÙOY^Ë›Y\ÜØYÙKˆ™\Ý[\™\Ý[ˆ
+BˆØÚY[WØ˜XÚÙÜ›Ý[™Ú›ØŠ\›Ø—ÚY[—Ù]OY^Ë˜ÛÛÛÝÛ—Ý[[
+Bˆ^Ù\Ü[]LË“Ü\˜][Û˜[\œ›Üˆ\È^Î‚ˆYˆ\×Ý˜[œÚY[ÜÜ[]WÛØÚÊ^ÊH[™Y™\—Ø˜XÚÙÜ›Ý[™Ú›Ø—ØY\—Ù]X˜\ÙWÛØÚÊˆÛÛ›‹ˆ\ˆ›Ø—ÚYˆ\˜[\Ëˆ
+N‚ˆÝ\œ™[Ø\›ÙÙÙ\‹š[™›Êˆ˜XÚÙÜ›Ý[™›Øˆ	\ÈY™\œ™YY\ˆ˜[œÚY[ÔS]HØÚÈ‹ˆ›Ø—ÚYˆ
+Bˆ™]\›‚ˆÝ\œ™[Ø\›ÙÙÙ\‹™^Ù\[ÛŠˆ˜XÚÙÜ›Ý[™›Øˆ	\È˜Z[YY\ˆÔS]HØÚÈ™]šY\Îˆ	\È‹ˆ›Ø—ÚYˆ›Ø–Èš›Ø—Ý\H—Kˆ
+BˆX\š×Ø˜XÚÙÜ›Ý[™Ú›Ø—Ù˜Z[Y
+ÛÛ›‹›Ø—ÚYÝŠ^ÊJBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÝ\œ™[Ø\›ÙÙÙ\‹™^Ù\[ÛŠ˜XÚÙÜ›Ý[™›Øˆ	\È˜Z[Yˆ	\È‹›Ø—ÚY›Ø–Èš›Ø—Ý\H—JBˆX\š×Ø˜XÚÙÜ›Ý[™Ú›Ø—Ù˜Z[Y
+ÛÛ›‹›Ø—ÚYÝŠ^ÊJB‚‚™Yˆ[—Ø˜XÚÙÜ›Ý[™Ú›Ø—Ü^[ØY
+ÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹›Ø—Ý\NˆÝ‹\˜[\ÎˆXÝÜÝ‹[žWJHOˆXÝÜÝ‹[žWN‚ˆ›ÝšY\‹\WØ\™XHH˜XÚÙÜ›Ý[™Ú›Ø—Ø\WÜØÛÜJ›Ø—Ý\K\˜[\ÊBˆYˆ›ÝšY\ˆ[™\WØ\™XN‚ˆ™\]Z\™WÛ›ÝÚ[—ØÛÛÛÝÛŠÛÛ›‹›ÝšY\‹\WØ\™XJBˆ™XÛÜ™Ø\WØ][\
+ÛÛ›‹›ÝšY\‹\WØ\™XJB‚ˆYˆ›Ø—Ý\HOH™\Ú[ÛœÛÛ\—ÜÝ]WÜÞ[˜ÈŽ‚ˆ™\Ý[H[—Ù\Ú[ÛœÛÛ\—ÜÞ[˜ÊˆÛÛ›‹ˆÝŠ\˜[\Ë™Ù]
+œ›ÝšY\ˆŠHÜˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓTŠKˆšYÙÙ\—Ý\O\ÝŠ\˜[\Ë™Ù]
+šYÙÙ\—Ý\HŠHÜˆ›X[X[Ø˜XÚÙÜ›Ý[™ŠKˆ
+Bˆ™XÛÜ™Ø\WÜÝXØÙ\ÜÊÛÛ›‹S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹TWÐT‘PWÔÕUJBˆ™]\›ˆ™\Ý[‚ˆYˆ›Ø—Ý\HOHœÚYÙ[™\™ÞWÜÝ]WÜÞ[˜ÈŽ‚ˆ™\Ý[H[—ÜÚYÙ[™\™ÞWÜÞ[˜ÊˆÛÛ›‹ˆÝŠ\˜[\Ë™Ù]
+œ›ÝšY\ˆŠHÜˆS•QÔUSÓ—Ô“Õ’QT—ÔÒQÑS‘T‘ÖJKˆšYÙÙ\—Ý\O\ÝŠ\˜[\Ë™Ù]
+šYÙÙ\—Ý\HŠHÜˆ›X[X[Ø˜XÚÙÜ›Ý[™ŠKˆ
+Bˆ™XÛÜ™Ø\WÜÝXØÙ\ÜÊÛÛ›‹S•QÔUSÓ—Ô“Õ’QT—ÔÒQÑS‘T‘ÖKTWÐT‘PWÔÕUJBˆ™]\›ˆ™\Ý[‚ˆYˆ›Ø—Ý\HOH™\Ú[ÛœÛÛ\—Ü›ÙXÝ[Û—ÜÞ[˜ÈŽ‚ˆ\™Ù]Ù]HH\œÙWÙ]WÝ˜[YJÝŠ\˜[\Ë™Ù]
+\™Ù]Ù]HŠHÜˆˆŠJBˆYˆ\™Ù]Ù]H\È›Û™N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ‘]H[˜[YH\˜HÞ[˜ÈH›ÙXØ[ËˆŠBˆ™\Ý[H[—Ù\Ú[ÛœÛÛ\—Ü›ÙXÝ[Û—ÜÞ[˜ÊˆÛÛ›‹ˆ›ÝšY\\ÝŠ\˜[\Ë™Ù]
+œ›ÝšY\ˆŠHÜˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓTŠKˆ\™Ù]Ù]O]\™Ù]Ù]Kˆ\š[ÙÝ\O\ÝŠ\˜[\Ë™Ù]
+œ\š[ÙÝ\HŠHÜˆ™^HŠKˆ
+Bˆ™XÛÜ™Ø\WÜÝXØÙ\ÜÊÛÛ›‹S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹TWÐT‘PWÔ“ÑPÕSÓŠBˆ™]\›ˆ™\Ý[‚ˆYˆ›Ø—Ý\HOHœ\™›Ü›X[˜ÙWÜ™Y™\™[˜ÙWÜ™XØ[Ý[][ÛˆŽ‚ˆ\š[ÙÙ]HH\œÙWÙ]WÝ˜[YJÝŠ\˜[\Ë™Ù]
+œ\š[ÙÙ]HŠHÜˆˆŠJBˆYˆ\š[ÙÙ]H\È›Û™N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ‘]H[˜[YH\˜H™XØ[Ý[ÈH™Y™\™[˜ÚX\ËˆŠBˆ\ÜÙ]ÚYÝ˜[YHH\˜[\Ë™Ù]
+˜\ÜÙ]ÚYŠBˆ™]\›ˆ™XØ[Ý[]WÜ\™›Ü›X[˜ÙWÜ™Y™\™[˜Ù\ÊˆÛÛ›‹ˆ\š[ÙÝ\O\ÝŠ\˜[\Ë™Ù]
+œ\š[ÙÝ\HŠHÜˆ™^HŠKˆ\š[ÙÙ]O\\š[ÙÙ]Kˆ\ÜÙ]ÚYZ[
+\ÜÙ]ÚYÝ˜[YJHYˆ\ÜÙ]ÚYÝ˜[YH[ÙH›Û™Kˆ›ÝšY\\ÝŠ\˜[\Ë™Ù]
+œ›ÝšY\ˆŠHÜˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓTŠKˆ
+B‚ˆYˆ›Ø—Ý\HOH™\Ú[ÛœÛÛ\—Ü›ÙXÝ[Û—Ø˜XÚÙš[Ž‚ˆ]WÙœ›ÛHH\œÙWÙ]WÝ˜[YJÝŠ\˜[\Ë™Ù]
+™]WÙœ›ÛHŠHÜˆˆŠJBˆ]WÝÈH\œÙWÙ]WÝ˜[YJÝŠ\˜[\Ë™Ù]
+™]WÝÈŠHÜˆˆŠJBˆ\ÜÙ]ÚYÝ˜[YHH\˜[\Ë™Ù]
+˜\ÜÙ]ÚYŠBˆ™\Ý[H[—Ù\Ú[ÛœÛÛ\—Ü›ÙXÝ[Û—Ø˜XÚÙš[
+ˆÛÛ›‹ˆ›ÝšY\\ÝŠ\˜[\Ë™Ù]
+œ›ÝšY\ˆŠHÜˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓTŠKˆ\š[ÙÝ\O\ÝŠ\˜[\Ë™Ù]
+œ\š[ÙÝ\HŠHÜˆ™^HŠKˆœ›ÛWÞYX\Z[
+\˜[\ÖÈ™œ›ÛWÞYX\ˆ—JKˆ×ÞYX\Z[
+\˜[\ÖÈ×ÞYX\ˆ—JKˆ\ÜÙ]ÚYZ[
+\ÜÙ]ÚYÝ˜[YJHYˆ\ÜÙ]ÚYÝ˜[YH[ÙH›Û™Kˆ]WÙœ›ÛOY]WÙœ›ÛKˆ]WÝÏY]WÝËˆX^Ø\WØØ[ÏZ[
+\˜[\Ë™Ù]
+›X^Ø\WØØ[ÈŠHÜˆ•TÒSÓ”ÓÓT—ÔT‘“Ô“PSÑWÓPVÐTWÐÐSÊKˆ
+Bˆ™XÛÜ™Ø\WÜÝXØÙ\ÜÊÛÛ›‹S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹TWÐT‘PWÔ“ÑPÕSÓŠBˆ™]\›ˆ™\Ý[‚ˆYˆ›Ø—Ý\H[ˆÂˆ™\Ú[ÛœÛÛ\—Ú[™\\—Ø]˜Z[Xš[]WØ˜XÚÙš[‹ˆ™\Ú[ÛœÛÛ\—Ü™\ÜÝØ]Ü™\]Y\Ý‹ˆN‚ˆœ›ÛWÙ]HH\œÙWÙ]WÝ˜[YJÝŠ\˜[\Ë™Ù]
+™œ›ÛWÙ]HŠHÜˆˆŠJBˆ×Ù]HH\œÙWÙ]WÝ˜[YJÝŠ\˜[\Ë™Ù]
+×Ù]HŠHÜˆˆŠJBˆYˆœ›ÛWÙ]H\È›Û™HÜˆ×Ù]H\È›Û™HÜˆœ›ÛWÙ]Hˆ×Ù]N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[\˜[È[˜[YÈ\˜H˜XÚÙš[ÐUˆŠBˆ™\Ý[H[—Ù\Ú[ÛœÛÛ\—Ú[™\\—Ø]˜Z[Xš[]WØ˜XÚÙš[
+ˆÛÛ›‹ˆœ›ÛWÙ]OYœ›ÛWÙ]Kˆ×Ù]O]×Ù]Kˆ
+Bˆ™XÛÜ™Ø\WÜÝXØÙ\ÜÊÛÛ›‹S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹TWÐT‘PWÑPQÓ“ÔÕPÔÊBˆ™]\›ˆ™\Ý[‚ˆYˆ›Ø—Ý\HOH™\Ú[ÛœÛÛ\—Ü™X[[YWÛX]\šX[^™WØÛX[\Ž‚ˆ™][[Û—Ù^\ÈH\œÙWÙ[—ÜÜÚ]]™WÚ[
+ˆ‘•TÒSÓ”ÓÓT—Ô‘PSSQWÔÓTÒÕÔ‘US•SÓ—ÑVTÈ‹ˆQUSÑ•TÒSÓ”ÓÓT—Ô‘PSSQWÔÓTÒÕÔ‘US•SÓ—ÑVTËˆ
+Bˆ™]\›ˆÛX[\Ü™X[[YWÜÛ˜\ÚÝÜ^[ØYÊˆÛÛ›‹ˆ›ÝšY\RS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ˆ™][[Û—Ù^\Ï\™][[Û—Ù^\Ëˆ™Y™\™[˜ÙWÙ]OXÝ\œ™[Û\Ø›Û—Ù]J
+Kˆ
+B‚ˆYˆ›Ø—Ý\HOH™\Ú[ÛœÛÛ\—Û[ÛØÞXÛHŽ‚ˆ˜]×Ø\ÜÙ]ÚYÈH\˜[\Ë™Ù]
+˜\ÜÙ]ÚYÈŠHÜˆ×Bˆ\ÜÙ]ÚYÈHÚ[
+˜[YJH›Üˆ˜[YH[ˆ˜]×Ø\ÜÙ]ÚYÈYˆÝŠ˜[YJKš\ÙYÚ]
+
+WBˆ™\Ý[H[—Ù\Ú[ÛœÛÛ\—Û[ÛØÞXÛJˆÛÛ›‹ˆ›ÝšY\\ÝŠ\˜[\Ë™Ù]
+œ›ÝšY\ˆŠHÜˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓTŠKˆ™\ÜÛ[Û\ÝŠ\˜[\Ë™Ù]
+œ™\ÜÛ[ÛŠHÜˆ]KÙ^J
+KœÝ™[YJ‰VKI[HŠJKˆ\ÜÙ]ÚYÏX\ÜÙ]ÚYËˆ
+Bˆ™XÛÜ™Ø\WÜÝXØÙ\ÜÊÛÛ›‹S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹TWÐT‘PWÔ“ÑPÕSÓŠBˆ™]\›ˆ™\Ý[‚ˆYˆ›Ø—Ý\HOH™\Ú[ÛœÛÛ\—Û[ÛØÛÜÙHŽ‚ˆ™\Ý[H[—Ù\Ú[ÛœÛÛ\—Û[ÛØÛÜÙJˆÛÛ›‹ˆ›ÝšY\\ÝŠ\˜[\Ë™Ù]
+œ›ÝšY\ˆŠHÜˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓTŠKˆ™\ÜÛ[Û\ÝŠ\˜[\Ë™Ù]
+œ™\ÜÛ[ÛŠHÜˆˆŠKˆ™Y™\™[˜ÙWÙ]OXÝ\œ™[Û\Ø›Û—Ù]J
+Kˆ
+Bˆ™XÛÜ™Ø\WÜÝXØÙ\ÜÊÛÛ›‹S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹TWÐT‘PWÔ“ÑPÕSÓŠBˆ™]\›ˆ™\Ý[‚ˆYˆ›Ø—Ý\HOH™\Ú[ÛœÛÛ\—Ü™\ÜÜ›ÙXÝ[Û—Ü™\]Y\ÝŽ‚ˆ˜]×Ø\ÜÙ]ÚYÈH\˜[\Ë™Ù]
+˜\ÜÙ]ÚYÈŠHÜˆ×Bˆ\ÜÙ]ÚYÈHÚ[
+˜[YJH›Üˆ˜[YH[ˆ˜]×Ø\ÜÙ]ÚYÈYˆÝŠ˜[YJKš\ÙYÚ]
+
+WBˆ™\Ý[H[—Ù\Ú[ÛœÛÛ\—Û[ÛØÛÜÙJˆÛÛ›‹ˆ›ÝšY\\ÝŠ\˜[\Ë™Ù]
+œ›ÝšY\ˆŠHÜˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓTŠKˆ™\ÜÛ[Û\ÝŠ\˜[\Ë™Ù]
+œ™\ÜÛ[ÛŠHÜˆˆŠKˆ\ÜÙ]ÚYÏX\ÜÙ]ÚYËˆ™Y™\™[˜ÙWÙ]OXÝ\œ™[Û\Ø›Û—Ù]J
+Kˆ
+Bˆ™XÛÜ™Ø\WÜÝXØÙ\ÜÊÛÛ›‹S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹TWÐT‘PWÔ“ÑPÕSÓŠBˆ™]\›ˆ™\Ý[‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠˆ•\ÈH›Øˆ\ØÛÛšXÚYÎˆÚ›Ø—Ý\_HŠB‚‚™Yˆ˜XÚÙÜ›Ý[™Ú›Ø—Ø\WÜØÛÜJ›Ø—Ý\NˆÝ‹\˜[\ÎˆXÝÜÝ‹[žWJHOˆ\VÜÝ‹Ý—N‚ˆ›ÝšY\ˆHÝŠ\˜[\Ë™Ù]
+œ›ÝšY\ˆŠHÜˆˆŠBˆYˆ›Ø—Ý\HOH™\Ú[ÛœÛÛ\—ÜÝ]WÜÞ[˜ÈŽ‚ˆ™]\›ˆ›ÝšY\ˆÜˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹TWÐT‘PWÔÕUBˆYˆ›Ø—Ý\H[ˆÂˆ™\Ú[ÛœÛÛ\—Ü›ÙXÝ[Û—ÜÞ[˜È‹ˆ™\Ú[ÛœÛÛ\—Ü›ÙXÝ[Û—Ø˜XÚÙš[‹ˆ™\Ú[ÛœÛÛ\—Û[ÛØÞXÛH‹ˆ™\Ú[ÛœÛÛ\—Û[ÛØÛÜÙH‹ˆ™\Ú[ÛœÛÛ\—Ü™\ÜÜ›ÙXÝ[Û—Ü™\]Y\Ý‹ˆN‚ˆ™]\›ˆ›ÝšY\ˆÜˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹TWÐT‘PWÔ“ÑPÕSÓ‚ˆYˆ›Ø—Ý\H[ˆÂˆ™\Ú[ÛœÛÛ\—Ú[™\\—Ø]˜Z[Xš[]WØ˜XÚÙš[‹ˆ™\Ú[ÛœÛÛ\—Ü™\ÜÝØ]Ü™\]Y\Ý‹ˆN‚ˆ™]\›ˆ›ÝšY\ˆÜˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹TWÐT‘PWÑPQÓ“ÔÕPÔÂˆYˆ›Ø—Ý\HOHœÚYÙ[™\™ÞWÜÝ]WÜÞ[˜ÈŽ‚ˆ™]\›ˆ›ÝšY\ˆÜˆS•QÔUSÓ—Ô“Õ’QT—ÔÒQÑS‘T‘ÖKTWÐT‘PWÔÕUBˆ™]\›ˆˆ‹ˆ‚‚‚™Yˆ\Ú[ÛœÛÛ\—Ø\™XWÙ›Ü—Ý\›
+\›ˆÝŠHOˆÝŽ‚ˆÝÙ\™YH\››ÝÙ\Š
+BˆYˆ™Ù]Ü\Ý][Û™^Hˆ[ˆÝÙ\™YÜˆ™Ù]Ü\Ý][Û›[Ûˆ[ˆÝÙ\™Y‚ˆ™]\›ˆTWÐT‘PWÔ“ÑPÕSÓ‚ˆYˆ[žJÚÙ[ˆ[ˆÝÙ\™Y›ÜˆÚÙ[ˆ[ˆ
+™Ù]]›\Ý‹™Ù]]œ™X[ÜH‹™Ù]]š\ÝÜžZÜH‹™Ù][\›[\ÝŠJN‚ˆ™]\›ˆTWÐT‘PWÑPQÓ“ÔÕPÔÂˆ™]\›ˆTWÐT‘PWÔÕUB‚‚™Yˆ˜Z\ÙWÙ\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]
+^Îˆ\Ú[Û”ÛÛ\”˜]S[Z]\œ›Ü‹\WØ\™XNˆÝŠHOˆ›Û™N‚ˆÛÛ›ˆHØÝ\œ™[Ø\Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆ[[HX\š×Ù\Ú[ÛœÛÛ\—Ø\WØÛÛÛÝÛŠÛÛ›‹\WØ\™XK™X\ÛÛ\ÝŠ^ÊJBˆ™X\ÛÛˆHÙ]Ü›ÝšY\—ØÛÛÛÝÛ—Ü™X\ÛÛŠÛÛ›‹S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹\WØ\™XJHYˆÛÛ›ˆ[ÙHÝŠ^ÊBˆ˜Z\ÙH\T˜]S[Z]\œ›ÜŠS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹\WØ\™XK[[™X\ÛÛŠHœ›ÛH^Âˆš[˜[N‚ˆYˆÛÛ›ˆ\È›Ý›Û™N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚‚™YˆÙ]Ü›ÝšY\—ØÛÛÛÝÛ—Ü™X\ÛÛŠˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ›ÝšY\ŽˆÝ‹ˆ\™XNˆÝ‹ˆ›Ý×Ý˜[YNˆ]][YH›Û™HH›Û™KŠHOˆÝŽ‚ˆ[[HXÝ]™WØÛÛÛÝÛ—Ý[[
+ÛÛ›‹›ÝšY\‹\™XK›Ý×Ý˜[YHÜˆ]][YK››ÝÊ
+JBˆYˆ[[\È›Û™N‚ˆ™]\›ˆˆ‚ˆ™[XZ[š[™×ÜÙXÛÛ™ÈH[
+
+[[H
+›Ý×Ý˜[YHÜˆ]][YK››ÝÊ
+JJKÝ[ÜÙXÛÛ™Ê
+JBˆ™[XZ[š[™×ÛZ[]\ÈHX^
+K
+™[XZ[š[™×ÜÙXÛÛ™È
+ÈNJHËÈŒ
+Bˆ™]\›ˆ
+ˆˆžÜ›ÝšY\ŸH[H\Ü\˜HÜˆ[Z]HHTKˆ‚ˆˆ“›Ý˜H[]]˜H\ÜÛš]™[\ÜÈÝ[[š\ÛÙ›Ü›X]
+[Y\ÜXÏIÛZ[]\ÉÊ_H
+Ü™[XZ[š[™×ÛZ[]\ßHZ[ŠKˆ‚ˆ
+B‚‚™Yˆ\ÝØ\WØØ[ÜÝ]\ÊÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[ÛŠHOˆ\ÝÙXÝÜÝ‹[žWWN‚ˆ[œÝ\™WØ\WØØ[ÜÝ]WÜØÚ[XJÛÛ›ŠBˆ›ÝÜÈH]Y\žWØ[
+ˆÛÛ›‹ˆˆˆ‚ˆÑSPÕ›ÝšY\‹\WØ\™XKÛÛÛÝÛ—Ý[[\ÝÙ\œ›Ü‹\ÝÜÝXØÙ\Ü×Ø]ˆ\ÝØ][\Ø]\ÝØ[\Ø]\]YØ]ˆ”“ÓH\WØØ[ÜÝ]BˆÔ‘Tˆ–H›ÝšY\‹\WØ\™XBˆˆˆ‹ˆ
+Bˆ›Ý×Ý˜[YHH]][YK››ÝÊ
+BˆÝ]\Îˆ\ÝÙXÝÜÝ‹[žWWHH×Bˆ›Üˆ›ÝÈ[ˆ›ÝÜÎ‚ˆÝ]HHXÝ
+›ÝÊBˆ[[HXÝ]™WØÛÛÛÝÛ—Ý[[
+ÛÛ›‹ÝŠ›ÝÖÈœ›ÝšY\ˆ—JKÝŠ›ÝÖÈ˜\WØ\™XH—JK›Ý×Ý˜[YJBˆÝ]VÈ˜ÛÛÛÝÛ—ØXÝ]™H—HH›ÛÛ
+[[
+BˆÝ]VÈ˜ÛÛÛÝÛ—ÛY\ÜØYÙH—HHÙ]Ü›ÝšY\—ØÛÛÛÝÛ—Ü™X\ÛÛŠˆÛÛ›‹ˆÝŠ›ÝÖÈœ›ÝšY\ˆ—JKˆÝŠ›ÝÖÈ˜\WØ\™XH—JKˆ›Ý×Ý˜[YKˆ
+BˆÝ]\Ë˜\[™
+Ý]JBˆ™]\›ˆÝ]\Â‚‚™YˆZ[Ü›ÙXÝ[Û—Ø\WÜ]Y]YWÛØœÙ\˜Xš[]JˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ŠHOˆ\ÝÙXÝÜÝ‹[žWWN‚ˆ\Ú[ÛœÛÛ\—ØÛÛ™šYÈHÙ]Ú[YÜ˜][Û—ØÛÛ™šYÊˆÛÛ›‹ˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ˆ
+BˆYˆ\Ú[ÛœÛÛ\—ØÛÛ™šYÈ\È›Ý›Û™N‚ˆ[™Ú[ÈHÙ]Ù\Ú[ÛœÛÛ\—Ù[™Ú[ØÛÛ™šYÊ\Ú[ÛœÛÛ\—ØÛÛ™šYÊBˆ\Ú[Û—ØXØÛÝ[ÚÙ^HH\Ú[ÛœÛÛ\—Ü›ÙXÝ[Û—ØXØÛÝ[ÚÙ^Jˆ\Ú[ÛœÛÛ\—ØÛÛ™šYËˆ[™Ú[ÖÈ™^WÚÜWÙ[™Ú[—Kˆ
+Bˆ[œÝ\™WØ\WÜ]Y]YWÜÝ]JˆÛÛ›‹ˆ›ÝšY\RS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹›ÝÙ\Š
+KˆXØÛÝ[ÚÙ^WÝ˜[YOY\Ú[Û—ØXØÛÝ[ÚÙ^Kˆ\WØ\™XOT“ÑPÕSÓ—ÒÔWÐT‘PKˆÛXÞOY\Ú[ÛœÛÛ\—Ü›ÙXÝ[Û—ÚÜWÜÛXÞJ
+Kˆ
+Bˆ[œÝ\™WØ\WÜ]Y]YWÜÝ]JˆÛÛ›‹ˆ›ÝšY\RS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹›ÝÙ\Š
+KˆXØÛÝ[ÚÙ^WÝ˜[YOY\Ú[Û—ØXØÛÝ[ÚÙ^Kˆ\WØ\™XOUÐUÒTÕÔ–WÐT‘PKˆÛXÞOY\Ú[ÛœÛÛ\—ÝØ]ÜÛXÞJ
+Kˆ
+Bˆ\Ú[Û—ØXØÛÝ[ÜÝ]HHÙ]ØXØÛÝ[Ü]Y]YWÜÝ]JˆÛÛ›‹ˆ›ÝšY\RS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹›ÝÙ\Š
+KˆXØÛÝ[ÚÙ^WÝ˜[YOY\Ú[Û—ØXØÛÝ[ÚÙ^Kˆ
+Bˆ[ÙN‚ˆ\Ú[Û—ØXØÛÝ[ÜÝ]HHßBˆÚYÙ[™\™ÞWØÛÛ™šYÈHÙ]Ú[YÜ˜][Û—ØÛÛ™šYÊˆÛÛ›‹ˆS•QÔUSÓ—Ô“Õ’QT—ÔÒQÑS‘T‘ÖKˆ
+BˆYˆÚYÙ[™\™ÞWØÛÛ™šYÈ\È›Ý›Û™N‚ˆÚYÙ[™\™ÞWÙ[™Ú[HÝŠÚYÙ[™\™ÞWØÛÛ™šYÖÈ™[™\™ÞWÙ›Ý×Ù[™Ú[—HÜˆˆŠBˆ[œÝ\™WØ\WÜ]Y]YWÜÝ]JˆÛÛ›‹ˆ›ÝšY\RS•QÔUSÓ—Ô“Õ’QT—ÔÒQÑS‘T‘ÖK›ÝÙ\Š
+KˆXØÛÝ[ÚÙ^WÝ˜[YO\›ÙXÝ[Û—Ø\WØXØÛÝ[ÚÙ^Jˆ›ÝšY\RS•QÔUSÓ—Ô“Õ’QT—ÔÒQÑS‘T‘ÖKˆ\Ù\›˜[YO\ÝŠÚYÙ[™\™ÞWØÛÛ™šYÖÈ\Ù\›˜[YH—HÜˆˆŠKˆ˜\ÙWÝ\›\ÝŠÚYÙ[™\™ÞWØÛÛ™šYÖÈ˜˜\ÙWÝ\›—HÜˆˆŠKˆ[™Ú[\ÚYÙ[™\™ÞWÙ[™Ú[ˆ
+Kˆ\WØ\™XOT“ÑPÕSÓ—ÒÔWÐT‘PKˆÛXÞO\ÚYÙ[™\™ÞWÜ›ÙXÝ[Û—ÚÜWÜÛXÞJ
+Kˆ
+BˆØZ][™×Ü›ÝÜÈHÛÛ›‹™^XÝ]Jˆˆˆˆ‚ˆÑSPÕ›Ø—Ý\KÓÕS•
+
+ŠHTÈÝ[ˆ”“ÓH˜XÚÙÜ›Ý[™Ú›ØœÂˆÒT‘H›Ø—Ý\HSˆ
+È‹‹š›Ú[ŠÈˆ›ÜˆÈ[ˆ•TÒSÓ”ÓÓT—ÐPÒÑÔ“ÕS‘Ò“Ð—ÕTTÊ_JBˆS‘Ý]\ÈSˆ
+	ÝØZ][™×Ø\WÜÛÝ	Ë	ÝØZ][™×Ü˜]WÛ[Z]	ÊBˆÔ“ÕT–H›Ø—Ý\Bˆˆˆ‹ˆ•TÒSÓ”ÓÓT—ÐPÒÑÔ“ÕS‘Ò“Ð—ÕTTËˆ
+K™™]Ú[
+
+BˆØZ][™×ØžWÝ\HHÂˆÝŠ][VÈš›Ø—Ý\H—JNˆ[
+][VÈÝ[—JBˆ›Üˆ][H[ˆØZ][™×Ü›ÝÜÂˆBˆØZ][™×ØžWÜš[Üš]NˆXÝÚ[[HHßBˆ›Üˆ›Ø—Ý\KÛÝ[[ˆØZ][™×ØžWÝ\Kš][\Ê
+N‚ˆš[Üš]HH›ÙXÝ[Û—Ú›Ø—Üš[Üš]J›Ø—Ý\JBˆØZ][™×ØžWÜš[Üš]VÜš[Üš]WHH
+ˆØZ][™×ØžWÜš[Üš]K™Ù]
+š[Üš]K
+H
+ÈÛÝ[ˆ
+Bˆ™]\ÙYÜ™\ÜÜ™\]Y\ÝÈH[
+ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕÓÕS•
+
+ŠBˆ”“ÓH™\ÜÙ]WÜ™\]Y\ÝÙ]™[ÂˆÒT‘H™]\ÙYÙ^\Ý[™×Ú›ØˆHBˆˆˆ‚ˆ
+K™™]ÚÛ™J
+VÌBˆ
+BˆØØ[WÜ™XØ[Ý[]YÙ^\ÈH[
+ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕÓÕS•
+
+ŠBˆ”“ÓH[Ø]˜Z[Xš[]WÜØ[\YÙZ[BˆÒT‘HÛÝ\˜ÙHH	Ü™X[[YWÜØ[\Y	Âˆˆˆ‚ˆ
+K™™]ÚÛ™J
+VÌBˆ
+BˆØ[\YÜÝ]WÜ›ÝÜÈHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕÛÝ™\˜YÙWÜÝ]\ËÓÕS•
+
+ŠHTÈÝ[ˆ”“ÓH[Ø]˜Z[Xš[]WÜØ[\YÙZ[BˆÔ“ÕT–HÛÝ™\˜YÙWÜÝ]\ÂˆÔ‘Tˆ–HÛÝ™\˜YÙWÜÝ]\Âˆˆˆ‚ˆ
+K™™]Ú[
+
+BˆØ[\YÜÝ]\ÈHÂˆÝŠ][VÈ˜ÛÝ™\˜YÙWÜÝ]\È—JNˆ[
+][VÈÝ[—JBˆ›Üˆ][H[ˆØ[\YÜÝ]WÜ›ÝÜÂˆBˆ™X[ÝØ]Ù^\ÈH[
+ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕÓÕS•
+
+ŠBˆ”“ÓH[Ø]˜Z[Xš[]WÙZ[BˆÒT‘H˜[YÜÛÝÈˆS‘ÙZYÚYØ]˜Z[Xš[]WÜÝTÈ“Õ•Sˆˆˆ‚ˆ
+K™™]ÚÛ™J
+VÌBˆ
+Bˆ›ÝÜÈH\ÝØ\WÜ]Y]YWÜÝ]\ÊÛÛ›ŠBˆ›Üˆ›ÝÈ[ˆ›ÝÜÎ‚ˆYˆ›ÝÖÈœ›ÝšY\ˆ—HOHS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹›ÝÙ\Š
+N‚ˆ™[]˜[Ý\\ÈH
+ˆ•TÒSÓ”ÓÓT—ÕÐUÒ“Ð—ÕTTÂˆYˆ›ÝÖÈ˜\WØ\™XH—HOHÐUÒTÕÔ–WÐT‘PBˆ[ÙH•TÒSÓ”ÓÓT—Ô“ÑPÕSÓ—Ò“Ð—ÕTTÂˆ
+Bˆ›ÝÖÈØZ][™×Ú›ØœÈ—HHÝ[JˆØZ][™×ØžWÝ\K™Ù]
+›Ø—Ý\K
+Bˆ›Üˆ›Ø—Ý\H[ˆ™[]˜[Ý\\Âˆ
+Bˆ›ÝÖÈØZ][™×Ú›Øœ×ØžWÜš[Üš]H—HHXÝ
+ˆÛÜY
+ØZ][™×ØžWÜš[Üš]Kš][\Ê
+JBˆ
+Bˆ›ÝÖÈ˜XØÛÝ[Û\ÝÍ×Ø]—HH\Ú[Û—ØXØÛÝ[ÜÝ]K™Ù]
+ˆ›\ÝÍ×Ø]‚ˆ
+Bˆ›ÝÖÈ˜XØÛÝ[ØÛÛÛÝÛ—Ý[[—HH\Ú[Û—ØXØÛÝ[ÜÝ]K™Ù]
+ˆ˜ÛÛÛÝÛ—Ý[[‚ˆ
+Bˆ›ÝÖÈœ™\ÜÜ™\]Y\Ý×Ü™]\ÙY—HH™]\ÙYÜ™\ÜÜ™\]Y\ÝÂˆ›ÝÖÈ™^\×Ü™XØ[Ý[]YÙœ›ÛWÙˆ—HHØØ[WÜ™XØ[Ý[]YÙ^\Âˆ›ÝÖÈœØ[\YØ]˜Z[Xš[]WÜÝ]\È—HHØ[\YÜÝ]\Âˆ›ÝÖÈœ™X[ÝØ]Ù^\È—HH™X[ÝØ]Ù^\Âˆ[ÙN‚ˆ›ÝÖÈØZ][™×Ú›ØœÈ—HHˆ›ÝÖÈØZ][™×Ú›Øœ×ØžWÜš[Üš]H—HHßBˆ›ÝÖÈ˜XØÛÝ[Û\ÝÍ×Ø]—HH›Û™Bˆ›ÝÖÈ˜XØÛÝ[ØÛÛÛÝÛ—Ý[[—HH›Û™Bˆ›ÝÖÈœ™\ÜÜ™\]Y\Ý×Ü™]\ÙY—HHˆ›ÝÖÈ™^\×Ü™XØ[Ý[]YÙœ›ÛWÙˆ—HHˆ›ÝÖÈœØ[\YØ]˜Z[Xš[]WÜÝ]\È—HHßBˆ›ÝÖÈœ™X[ÝØ]Ù^\È—HHˆØ[™Y]\ÈHÂˆ˜[YBˆ›Üˆ˜[YH[ˆ
+ˆ›ÝË™Ù]
+›™^Ø[ÝÙYØ]ŠKˆ›ÝË™Ù]
+˜ÛÛÛÝÛ—Ý[[ŠKˆ›ÝË™Ù]
+›X\ÙWÝ[[ŠKˆ›ÝË™Ù]
+˜XØÛÝ[ØÛÛÛÝÛ—Ý[[ŠKˆ
+BˆYˆ˜[YBˆBˆ›ÝÖÈœ™\Ý[YWÙ›Ü™XØ\Ý—HHX^
+Ø[™Y]\ÊHYˆØ[™Y]\È[ÙHˆ‚ˆ™]\›ˆ›ÝÜÂ‚‚™YˆÛX\—Ø\WØÛÛÛÝÛŠÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹›ÝšY\ŽˆÝ‹\WØ\™XNˆÝˆ›Û™HH›Û™JHOˆ›Û™N‚ˆ[œÝ\™WØ\WØØ[ÜÝ]WÜØÚ[XJÛÛ›ŠBˆYˆ\WØ\™XN‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH\WØØ[ÜÝ]BˆÑUÛÛÛÝÛ—Ý[[H	ÉË\ÝÙ\œ›ÜˆH	ÉË\]YØ]HÂˆÒT‘H›ÝšY\ˆHÈS‘\WØ\™XHHÂˆˆˆ‹ˆ
+]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠK›ÝšY\‹\WØ\™XJKˆ
+Bˆ[ÙN‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH\WØØ[ÜÝ]BˆÑUÛÛÛÝÛ—Ý[[H	ÉË\ÝÙ\œ›ÜˆH	ÉË\]YØ]HÂˆÒT‘H›ÝšY\ˆHÂˆˆˆ‹ˆ
+]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠK›ÝšY\ŠKˆ
+BˆYˆ›ÝšY\ˆOHS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓTŽ‚ˆÛX\—Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]ØÛÛÛÝÛŠÛÛ›ŠB‚‚™Yˆ]\ÝØ˜XÚÙÜ›Ý[™Ú›Ø—Ù›Ü—Ý\JÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹›Ø—Ý\NˆÝŠHOˆXÝÜÝ‹[žWH›Û™N‚ˆ›ÝÈHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕY›Ø—Ý\KÝ]\Ë\˜[\×ÚœÛÛ‹™\Ý[ÚœÛÛ‹\œ›Ü—ÛY\ÜØYÙKˆÜ™X]YØ]Ý\YØ]š[š\ÚYØ]™^Ø][\Ø]ˆ”“ÓH˜XÚÙÜ›Ý[™Ú›ØœÂˆÒT‘H›Ø—Ý\HHÂˆÔ‘Tˆ–HYTÐÂˆSRUBˆˆˆ‹ˆ
+›Ø—Ý\K
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ›ÝÈ\È›Û™N‚ˆ™]\›ˆ›Û™Bˆ›ØˆHXÝ
+›ÝÊBˆ›Üˆ[Y\Ý[\ÙšY[[ˆ
+ˆ˜Ü™X]YØ]‹ˆœÝ\YØ]‹ˆ™š[š\ÚYØ]‹ˆ›™^Ø][\Ø]‹ˆ
+N‚ˆ›Ø–Ý[Y\Ý[\ÙšY[HH˜XÚÙÜ›Ý[™Ú›Ø—Ý[Y\Ý[\Ý×Û\Ø›ÛŠˆ›ÝÖÝ[Y\Ý[\ÙšY[Bˆ
+Bˆ™]\›ˆ›Ø‚‚‚™YˆØÚY[\—Û™^Ü[—ÛX™[
+›Ø—ÚYˆÝŠHOˆÝŽ‚ˆYˆÐÒQSTˆ\È›Û™N‚ˆ™]\›ˆˆ‚ˆ›ØˆHÐÒQST‹™Ù]Ú›ØŠ›Ø—ÚY
+Bˆ™^Ü[ˆHÙ]]Š›Ø‹›™^Ü[—Ý[YH‹›Û™JHYˆ›Øˆ[ÙH›Û™BˆYˆ›Ý™^Ü[Ž‚ˆ™]\›ˆˆ‚ˆžN‚ˆ™]\›ˆ™^Ü[‹˜\Ý[Y^›Û™JTÐ“Ó—ÕSQV“Ó‘JKš\ÛÙ›Ü›X]
+[Y\ÜXÏH›Z[]\ÈŠBˆ^Ù\^Ù\[ÛŽ‚ˆ™]\›ˆÝŠ™^Ü[ŠB‚‚™YˆZ[Ú[YÜ˜][Û—Ø\WØÛÛ›ÛÊÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[ÛŠHOˆ\ÝÙXÝÜÝ‹[žWWN‚ˆÛÛ™šYÜÈHÂˆ›ÝšY\ŽˆÙ]Ú[YÜ˜][Û—ØÛÛ™šYÊÛÛ›‹›ÝšY\ŠBˆ›Üˆ›ÝšY\ˆ[ˆS•QÔUSÓ—Ô“Õ’QT—ÓÔSÓ”ÂˆBˆÝ]WÜ›ÝÜÈHÂˆ
+›ÝÖÈœ›ÝšY\ˆ—K›ÝÖÈ˜\WØ\™XH—JNˆ›ÝÂˆ›Üˆ›ÝÈ[ˆ\ÝØ\WØØ[ÜÝ]\ÊÛÛ›ŠBˆBˆ›Ø—Ý\\ÈHÂˆ
+S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹TWÐT‘PWÔÕUJNˆ™\Ú[ÛœÛÛ\—ÜÝ]WÜÞ[˜È‹ˆ
+S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹TWÐT‘PWÔ“ÑPÕSÓŠNˆ™\Ú[ÛœÛÛ\—Ü›ÙXÝ[Û—ÜÞ[˜È‹ˆ
+S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹TWÐT‘PWÑPQÓ“ÔÕPÔÊNˆ™\Ú[ÛœÛÛ\—Ú[™\\—Ø]˜Z[Xš[]WØ˜XÚÙš[‹ˆ
+S•QÔUSÓ—Ô“Õ’QT—ÔÒQÑS‘T‘ÖKTWÐT‘PWÔÕUJNˆœÚYÙ[™\™ÞWÜÝ]WÜÞ[˜È‹ˆBˆØÚY[\—Ú›ØœÈHÂˆ
+S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹TWÐT‘PWÔÕUJNˆš[YÜ˜][Û‹\Ý]KY\Ú[ÛœÛÛ\‹ZÝ\›H‹ˆ
+S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹TWÐT‘PWÔ“ÑPÕSÓŠNˆš[YÜ˜][Û‹\›ÙXÝ[Û‹Y\Ú[ÛœÛÛ\‹YZ[H‹ˆ
+S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹TWÐT‘PWÑPQÓ“ÔÕPÔÊNˆš[YÜ˜][Û‹YXYÛ›ÜÝXÜËY\Ú[ÛœÛÛ\‹YZ[H‹ˆ
+S•QÔUSÓ—Ô“Õ’QT—ÔÒQÑS‘T‘ÖKTWÐT‘PWÔÕUJNˆš[YÜ˜][Û‹\Ý]K\ÚYÙ[™\™ÞKZÝ\›H‹ˆBˆÛÛ›ÛÎˆ\ÝÙXÝÜÝ‹[žWWHH×Bˆ›Üˆ›ÝšY\ˆ[ˆS•QÔUSÓ—Ô“Õ’QT—ÓÔSÓ”Î‚ˆÛÛ™šYÈHÛÛ™šYÜË™Ù]
+›ÝšY\ŠBˆYˆÛÛ™šYÈ\È›Û™N‚ˆÛÛ[YBˆÜ™Y[X[×ÛÚÈH›ÛÛ
+ÛÛ™šYË™Ù]
+\Ù\›˜[YHŠJH[™›ÛÛ
+ÛÛ™šYË™Ù]
+œ\ÜÝÛÜ™ØÛÛ™šYÝ\™YŠJBˆ›ÝšY\—Ø\™X\ÈHÐTWÐT‘PWÔÕUWBˆYˆ›ÝšY\ˆOHS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓTŽ‚ˆ›ÝšY\—Ø\™X\Ë™^[™
+ÐTWÐT‘PWÔ“ÑPÕSÓ‹TWÐT‘PWÑPQÓ“ÔÕPÔ×JBˆ\™X\ÎˆXÝÜÝ‹XÝÜÝ‹[žWWHHßBˆ›Üˆ\™XH[ˆ›ÝšY\—Ø\™X\Î‚ˆÝ]HHÝ]WÜ›ÝÜË™Ù]
+
+›ÝšY\‹\™XJKßJBˆ›Ø—Ý\HH›Ø—Ý\\Ë™Ù]
+
+›ÝšY\‹\™XJKˆŠBˆ]\ÝÚ›ØˆH]\ÝØ˜XÚÙÜ›Ý[™Ú›Ø—Ù›Ü—Ý\JÛÛ›‹›Ø—Ý\JHYˆ›Ø—Ý\H[ÙH›Û™BˆÛÛÛÝÛ—ØXÝ]™HH›ÛÛ
+Ý]K™Ù]
+˜ÛÛÛÝÛ—ØXÝ]™HŠJBˆYˆ›ÝÛÛ™šYË™Ù]
+™[˜X›YŠN‚ˆ\WÜÝ]\ÈH‘\ØX›Y‚ˆ[Yˆ›ÝÜ™Y[X[×ÛÚÎ‚ˆ\WÜÝ]\ÈH”Ù[HÜ™Y[˜ÚXZ\È‚ˆ[YˆÛÛÛÝÛ—ØXÝ]™N‚ˆ\WÜÝ]\ÈH‘[HÛÛÛÝÛˆ‚ˆ[Yˆ]\ÝÚ›Øˆ[™]\ÝÚ›Ø‹™Ù]
+œÝ]\ÈŠHOH™˜Z[YŽ‚ˆ\WÜÝ]\ÈH‘˜[ÝH[[XH[]]˜H‚ˆ[ÙN‚ˆ\WÜÝ]\ÈH“ÒÈ‚ˆ\™X\ÖØ\™XWHHÂˆœÝ]HŽˆÝ]Kˆ›]\ÝÚ›ØˆŽˆ]\ÝÚ›Ø‹ˆ˜\WÜÝ]\ÈŽˆ\WÜÝ]\Ëˆ›\ÝØ][\Ø]ŽˆÝ]K™Ù]
+›\ÝØ][\Ø]ŠHÜˆ
+]\ÝÚ›ØˆÜˆßJK™Ù]
+œÝ\YØ]ŠHÜˆˆ‹ˆ›\ÝÜÝXØÙ\Ü×Ø]ŽˆÝ]K™Ù]
+›\ÝÜÝXØÙ\Ü×Ø]ŠHÜˆˆ‹ˆ›™^Ø][\Ø]ŽˆÝ]K™Ù]
+˜ÛÛÛÝÛ—Ý[[ŠHYˆÛÛÛÝÛ—ØXÝ]™H[ÙH
+]\ÝÚ›ØˆÜˆßJK™Ù]
+›™^Ø][\Ø]ŠHÜˆˆ‹ˆ›™^ÜØÚY[YØ]ŽˆØÚY[\—Û™^Ü[—ÛX™[
+ØÚY[\—Ú›ØœË™Ù]
+
+›ÝšY\‹\™XJKˆŠJKˆ›\ÝÙ\œ›ÜˆŽˆÝ]K™Ù]
+›\ÝÙ\œ›ÜˆŠHÜˆ
+]\ÝÚ›ØˆÜˆßJK™Ù]
+™\œ›Ü—ÛY\ÜØYÙHŠHÜˆˆ‹ˆ˜ÛÛÛÝÛ—ØXÝ]™HŽˆÛÛÛÝÛ—ØXÝ]™Kˆ˜ÛÛÛÝÛ—ÛY\ÜØYÙHŽˆÝ]K™Ù]
+˜ÛÛÛÝÛ—ÛY\ÜØYÙHŠHÜˆˆ‹ˆBˆÛÛ›ÛË˜\[™
+ˆÂˆœ›ÝšY\ˆŽˆ›ÝšY\‹ˆ˜ÛÛ™šYÈŽˆÛÛ™šYËˆ™[˜X›YŽˆ›ÛÛ
+ÛÛ™šYË™Ù]
+™[˜X›YŠJKˆ˜Ü™Y[X[×ÛÚÈŽˆÜ™Y[X[×ÛÚËˆœÝ]WÙ[˜X›YŽˆ›ÛÛ
+ÛÛ™šYË™Ù]
+˜]]×ÜÞ[˜×Ù[˜X›YŠJKˆœ›ÙXÝ[Û—Ù[˜X›YŽˆ›ÛÛ
+ÛÛ™šYË™Ù]
+œ›ÙXÝ[Û—ÜÞ[˜×Ù[˜X›YŠJHYˆ›ÝšY\ˆOHS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓTˆ[ÙH˜[ÙKˆ™XYÛ›ÜÝXÜ×Ù[˜X›YŽˆ›ÛÛ
+ÛÛ™šYË™Ù]
+™XYÛ›ÜÝXÜ×ÜÞ[˜×Ù[˜X›YŠJHYˆ›ÝšY\ˆOHS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓTˆ[ÙH˜[ÙKˆ˜]]×ÜÞ[˜×Ù[˜X›YŽˆ›ÛÛ
+ÛÛ™šYË™Ù]
+˜]]×ÜÞ[˜×Ù[˜X›YŠJKˆœÝ]WÚ[\˜[ÚÝ\œÈŽˆÛÛ™šYË™Ù]
+œÝ]WÜÞ[˜×Ú[\˜[ÚÝ\œÈŠHÜˆQUSÔÕUWÔÖS×ÒS•T•SÒÕT”Ëˆœ›ÙXÝ[Û—ÜÞ[˜×Ý[YHŽˆÛÛ™šYË™Ù]
+œ›ÙXÝ[Û—ÜÞ[˜×Ý[YHŠHÜˆQUSÑ•TÒSÓ”ÓÓT—Ô“ÑPÕSÓ—ÔÖS×ÕSQKˆ™XYÛ›ÜÝXÜ×ÜÞ[˜×Ý[YHŽˆÛÛ™šYË™Ù]
+™XYÛ›ÜÝXÜ×ÜÞ[˜×Ý[YHŠHÜˆQUSÑ•TÒSÓ”ÓÓT—ÑPQÓ“ÔÕPÔ×ÔÖS×ÕSQKˆ˜\™X\ÈŽˆ\™X\ËˆœÝ]WØ\™XHŽˆ\™X\Ë™Ù]
+TWÐT‘PWÔÕUKßJKˆœ›ÙXÝ[Û—Ø\™XHŽˆ\™X\Ë™Ù]
+TWÐT‘PWÔ“ÑPÕSÓ‹ßJKˆ™XYÛ›ÜÝXÜ×Ø\™XHŽˆ\™X\Ë™Ù]
+TWÐT‘PWÑPQÓ“ÔÕPÔËßJKˆBˆ
+Bˆ™]\›ˆÛÛ›ÛÂ‚‚™Yˆ›ÝYžWØ\WÜ˜]WÛ[Z]
+ˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ›ÝšY\ŽˆÝ‹ˆ\WØ\™XNˆÝ‹ˆÛÛÛÝÛ—Ý[[ˆ]][YKˆY\ÜØYÙNˆÝ‹ŠHOˆ›Û™N‚ˆÝ]HHÙ]Ø\WØØ[ÜÝ]JÛÛ›‹›ÝšY\‹\WØ\™XJBˆ\ÝØ[\Ø]H\œÙWÙ]][YWÝ˜[YJÝŠÝ]K™Ù]
+›\ÝØ[\Ø]ŠHÜˆˆŠJBˆYˆ\ÝØ[\Ø][™\ÝØ[\Ø]H]][YK››ÝÊ
+HH[YY[JZ[]\ÏQQUSÑ•TÒSÓ”ÓÓT—ÔUWÓSRUÓRS•UTÊN‚ˆ™]\›‚ˆ›ÝÈH]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠBˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH\WØØ[ÜÝ]BˆÑU\ÝØ[\Ø]HË\]YØ]HÂˆÒT‘H›ÝšY\ˆHÈS‘\WØ\™XHHÂˆˆˆ‹ˆ
+›ÝË›ÝË›ÝšY\‹\WØ\™XJKˆ
+Bˆ[\ÚÙ^HHˆ˜\WÜ˜]WÛ[Z]žÜ›ÝšY\ŸNžØ\WØ\™X_NžØÛÛÛÝÛ—Ý[[œÝ™[YJ	ÉVI[IY	R	SIÊ_H‚ˆ[YÜ˜[WÛY\ÜØYÙHH
+ˆˆžÚ[™\ØØ\J›ÝšY\Š_HTH[HÛÛÛÝÛØ——ˆ‚ˆˆ\™XNˆÚ[™\ØØ\J\WØ\™XJ_Wˆ‚ˆˆ]NˆØÛÛÛÝÛ—Ý[[š\ÛÙ›Ü›X]
+[Y\ÜXÏIÛZ[]\ÉÊ_Wˆ‚ˆˆžÚ[™\ØØ\JY\ÜØYÙJ_H‚ˆ
+BˆÙ[™Ø[™Ü™XÛÜ™Ý[YÜ˜[WØ[\
+ÛÛ›‹›Û™K˜\WÜ˜]WÛ[Z]‹[\ÚÙ^K[YÜ˜[WÛY\ÜØYÙJB‚‚™YˆÙ]Ù\Ú[ÛœÛÛ\—Ù[™Ú[ØÛÛ™šYÊÛÛ™šYÎˆÜ[]LË”›ÝÈXÝÜÝ‹[žWJHOˆXÝÜÝ‹Ý—N‚ˆ™]\›ˆÂˆ˜˜\ÙWÝ\›ŽˆÝŠÛÛ™šYÖÈ˜˜\ÙWÝ\›—HÜˆˆŠKœÝš\
+
+Kˆ›ÙÚ[—Ù[™Ú[ŽˆÝŠÛÛ™šYÖÈ›ÙÚ[—Ù[™Ú[—HÜˆQUSÑ•TÒSÓ”ÓÓT—ÓÑÒS—ÑS‘ÒS•
+KœÝš\
+
+HÜˆQUSÑ•TÒSÓ”ÓÓT—ÓÑÒS—ÑS‘ÒS•ˆœ[×Ù[™Ú[ŽˆÝŠÛÛ™šYÖÈœ[×Ù[™Ú[—HÜˆQUSÑ•TÒSÓ”ÓÓT—ÔÕUSÓ”×ÑS‘ÒS•
+KœÝš\
+
+HÜˆQUSÑ•TÒSÓ”ÓÓT—ÔÕUSÓ”×ÑS‘ÒS•ˆœ™X[Ý[YWÙ[™Ú[ŽˆÝŠÛÛ™šYÖÈœ™X[Ý[YWÙ[™Ú[—HÜˆQUSÑ•TÒSÓ”ÓÓT—Ô‘PSSQWÑS‘ÒS•
+KœÝš\
+
+HÜˆQUSÑ•TÒSÓ”ÓÓT—Ô‘PSSQWÑS‘ÒS•ˆ™]šXÙWÛ\ÝÙ[™Ú[ŽˆÝŠÛÛ™šYÖÈ™]šXÙWÛ\ÝÙ[™Ú[—HÜˆQUSÑ•TÒSÓ”ÓÓT—ÑU’PÑT×ÑS‘ÒS•
+KœÝš\
+
+HÜˆQUSÑ•TÒSÓ”ÓÓT—ÑU’PÑT×ÑS‘ÒS•ˆ™]šXÙWÜ™X[Ý[YWÙ[™Ú[ŽˆÝŠÛÛ™šYÖÈ™]šXÙWÜ™X[Ý[YWÙ[™Ú[—HÜˆQUSÑ•TÒSÓ”ÓÓT—ÑU’PÑWÔ‘PSSQWÑS‘ÒS•
+KœÝš\
+
+HÜˆQUSÑ•TÒSÓ”ÓÓT—ÑU’PÑWÔ‘PSSQWÑS‘ÒS•ˆ™]šXÙWÚ\ÝÜžWÙ[™Ú[ŽˆÝŠÛÛ™šYÖÈ™]šXÙWÚ\ÝÜžWÙ[™Ú[—HÜˆQUSÑ•TÒSÓ”ÓÓT—ÑU’PÑWÒTÕÔ–WÑS‘ÒS•
+KœÝš\
+
+HÜˆQUSÑ•TÒSÓ”ÓÓT—ÑU’PÑWÒTÕÔ–WÑS‘ÒS•ˆ˜[\›\×Ù[™Ú[ŽˆÝŠÛÛ™šYÖÈ˜[\›\×Ù[™Ú[—HÜˆQUSÑ•TÒSÓ”ÓÓT—ÐST“T×ÑS‘ÒS•
+KœÝš\
+
+HÜˆQUSÑ•TÒSÓ”ÓÓT—ÐST“T×ÑS‘ÒS•ˆ™^WÚÜWÙ[™Ú[ŽˆÝŠÛÛ™šYÖÈ™^WÚÜWÙ[™Ú[—HÜˆQUSÑ•TÒSÓ”ÓÓT—ÑVWÒÔWÑS‘ÒS•
+KœÝš\
+
+HÜˆQUSÑ•TÒSÓ”ÓÓT—ÑVWÒÔWÑS‘ÒS•ˆ›[ÛÚÜWÙ[™Ú[ŽˆÝŠÛÛ™šYÖÈ›[ÛÚÜWÙ[™Ú[—HÜˆQUSÑ•TÒSÓ”ÓÓT—ÓSÓ•ÒÔWÑS‘ÒS•
+KœÝš\
+
+HÜˆQUSÑ•TÒSÓ”ÓÓT—ÓSÓ•ÒÔWÑS‘ÒS•ˆB‚‚™YˆZ[Ù\Ú[ÛœÛÛ\—Ù[™Ú[ÊÛÛ™šYÎˆÜ[]LË”›ÝÈXÝÜÝ‹[žWJHOˆ\Ú[Û”ÛÛ\‘[™Ú[Î‚ˆ[™Ú[ÈHÙ]Ù\Ú[ÛœÛÛ\—Ù[™Ú[ØÛÛ™šYÊÛÛ™šYÊBˆ™]\›ˆ\Ú[Û”ÛÛ\‘[™Ú[Ê
+Š™[™Ú[ÊB‚‚™YˆZ[Ù\Ú[ÛœÛÛ\—ØÛY[
+ÛÛ™šYÎˆÜ[]LË”›ÝÈXÝÜÝ‹[žWJHOˆ\Ú[Û”ÛÛ\ÛY[‚ˆ™]\›ˆ\Ú[ÛœÛÛ\—ØÛY[Û[Ù[K˜ÛY[Ùœ›ÛWØÛÛ™šYÊˆXÝ
+ÛÛ™šYÊKˆZ[Ù\Ú[ÛœÛÛ\—Ù[™Ú[ÊÛÛ™šYÊKˆÙ\ÜÚ[Û—Ù˜XÝÜžO\™\]Y\ÝË”Ù\ÜÚ[Û‹ˆÙ\ÜÚ[Û—ØØXÚOQ•TÒSÓ”ÓÓT—ÔÑTÔÒSÓ—ÐÐPÒKˆÙ\ÜÚ[Û—ÛØÚÏQ•TÒSÓ”ÓÓT—ÔÑTÔÒSÓ—ÓÐÒËˆÙ\ÜÚ[Û—ØØXÚWÛZ[]\ÏY\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[Û—ØØXÚWÛZ[]\Ê
+Kˆ[Ý×ÜÛY\[›Ý\×Ü™\]Y\ÝØÛÛ^
+
+KˆÛY\\][YKœÛY\ˆ
+B‚‚™Yˆ^˜XÝÙ\Ú[ÛœÛÛ\—ÞÜ™—ÝÚÙ[Š™\ÜÛœÙNˆ™\]Y\ÝË”™\ÜÛœÙKÙ\ÜÚ[ÛŽˆ™\]Y\ÝË”Ù\ÜÚ[ÛŠHOˆÝŽ‚ˆ™]\›ˆ\Ú[ÛœÛÛ\—ØÛY[Û[Ù[K™^˜XÝÞÜ™—ÝÚÙ[Š™\ÜÛœÙKÙ\ÜÚ[ÛŠB‚‚™YˆÙ]Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[ÛŠÛÛ™šYÎˆÜ[]LË”›ÝÈXÝÜÝ‹[žWK
+‹›Ü˜ÙWÛÙÚ[Žˆ›ÛÛH˜[ÙJHOˆ\VÜ™\]Y\ÝË”Ù\ÜÚ[Û‹Ý—N‚ˆÛÛÛÝÛ—Ü™X\ÛÛˆHÙ]Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]ØÛÛÛÝÛ—Ü™X\ÛÛŠ
+BˆYˆÛÛÛÝÛ—Ü™X\ÛÛŽ‚ˆÑÑÑT‹š[™›Ê‘\Ú[Û”ÛÛ\ˆÙÚ[ˆ›ØÚÙYžHXÝ]™H˜]H[Z]ÛÛÛÝÛˆŠBˆ˜Z\ÙH˜[YQ\œ›ÜŠÛÛÛÝÛ—Ü™X\ÛÛŠBˆžN‚ˆ™]\›ˆZ[Ù\Ú[ÛœÛÛ\—ØÛY[
+ÛÛ™šYÊK›ÙÚ[Š›Ü˜ÙWÛÙÚ[Y›Ü˜ÙWÛÙÚ[ŠBˆ^Ù\\Ú[Û”ÛÛ\”˜]S[Z]\œ›Üˆ\È^Î‚ˆÛÛ›ˆHØÝ\œ™[Ø\Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆ[[HX\š×Ù\Ú[ÛœÛÛ\—Ø\WØÛÛÛÝÛŠÛÛ›‹TWÐT‘PWÔÕUK™X\ÛÛ\ÝŠ^ÊJBˆ™X\ÛÛˆHÙ]Ü›ÝšY\—ØÛÛÛÝÛ—Ü™X\ÛÛŠÛÛ›‹S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹TWÐT‘PWÔÕUJHYˆÛÛ›ˆ[ÙHÝŠ^ÊBˆ˜Z\ÙH\T˜]S[Z]\œ›ÜŠS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹TWÐT‘PWÔÕUK[[™X\ÛÛŠHœ›ÛH^Âˆš[˜[N‚ˆYˆÛÛ›ˆ\È›Ý›Û™N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚‚™Yˆ[˜[Y]WÙ\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[ÛŠÛÛ™šYÎˆÜ[]LË”›ÝÈXÝÜÝ‹[žWJHOˆ›Û™N‚ˆZ[Ù\Ú[ÛœÛÛ\—ØÛY[
+ÛÛ™šYÊKš[˜[Y]WÜÙ\ÜÚ[ÛŠ
+B‚‚™Yˆ\Ú[ÛœÛÛ\—Ü™]žWÛÜ[ÛœÊ
+HOˆXÝÜÝ‹[žWN‚ˆ™]\›ˆÈ˜[Ý×ÜÛY\Žˆ›Ý\×Ü™\]Y\ÝØÛÛ^
+
+KœÛY\\ˆŽˆ[YKœÛY\B‚‚™YˆÜÝÙ\Ú[ÛœÛÛ\—ÚœÛÛŠˆÙ\ÜÚ[ÛŽˆ™\]Y\ÝË”Ù\ÜÚ[Û‹ˆ\›ˆÝ‹ˆ^[ØYˆXÝÜÝ‹[žWKˆ
+‹ˆ^XÝYÛY\ÜØYÙNˆÝ‹ŠHOˆXÝÜÝ‹[žWN‚ˆ\WØ\™XHH\Ú[ÛœÛÛ\—Ø\™XWÙ›Ü—Ý\›
+\›
+BˆÛÛ›ˆHØÝ\œ™[Ø\Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆYˆÛÛ›ˆ\È›Ý›Û™N‚ˆ™\]Z\™WÛ›ÝÚ[—ØÛÛÛÝÛŠÛÛ›‹S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹\WØ\™XJBˆ™]\›ˆ\Ú[ÛœÛÛ\—ØÛY[Û[Ù[KœÜÝÙ\Ú[ÛœÛÛ\—ÚœÛÛŠˆÙ\ÜÚ[Û‹ˆ\›ˆ^[ØYˆ^XÝYÛY\ÜØYÙOY^XÝYÛY\ÜØYÙKˆ™\]Z\™WÙ]OQ˜[ÙKˆ
+Š™\Ú[ÛœÛÛ\—Ü™]žWÛÜ[ÛœÊ
+Kˆ
+Bˆ^Ù\\Ú[Û”ÛÛ\”˜]S[Z]\œ›Üˆ\È^Î‚ˆ[[HX\š×Ù\Ú[ÛœÛÛ\—Ø\WØÛÛÛÝÛŠÛÛ›‹\WØ\™XK™X\ÛÛ\ÝŠ^ÊJBˆ™X\ÛÛˆHÙ]Ü›ÝšY\—ØÛÛÛÝÛ—Ü™X\ÛÛŠÛÛ›‹S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹\WØ\™XJHYˆÛÛ›ˆ[ÙHÝŠ^ÊBˆ˜Z\ÙH\T˜]S[Z]\œ›ÜŠS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹\WØ\™XK[[™X\ÛÛŠHœ›ÛH^Âˆš[˜[N‚ˆYˆÛÛ›ˆ\È›Ý›Û™N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚‚™YˆÚ[šÙY
+˜[Y\Îˆ\ÝÜÝ—KÚ^™Nˆ[
+HOˆ\ÝÛ\ÝÜÝ—WN‚ˆ™]\›ˆÝ˜[Y\ÖÚ[™^ˆ[™^
+ÈÚ^™WH›Üˆ[™^[ˆ˜[™ÙJ[Š˜[Y\ÊKÚ^™JWB‚‚™Yˆ™]ÚÙ\Ú[ÛœÛÛ\—ÜÝ][ÛœÊÙ\ÜÚ[ÛŽˆ™\]Y\ÝË”Ù\ÜÚ[Û‹
+‹˜\ÙWÝ\›ˆÝ‹[™Ú[ˆÝŠHOˆ\ÝÙXÝÜÝ‹[žWWN‚ˆžN‚ˆ™]\›ˆ^XÝ]WÜ]Y]YYÙ\Ú[ÛœÛÛ\—ØXØÛÝ[ØØ[
+ˆ[X™Nˆ\Ú[ÛœÛÛ\—ØÛY[Û[Ù[K™™]ÚÜÝ][ÛœÊˆÙ\ÜÚ[Û‹ˆ˜\ÙWÝ\›X˜\ÙWÝ\›ˆ[™Ú[Y[™Ú[ˆ
+Š™\Ú[ÛœÛÛ\—Ü™]žWÛÜ[ÛœÊ
+Kˆ
+Bˆ
+Bˆ^Ù\\Ú[Û”ÛÛ\”˜]S[Z]\œ›Üˆ\È^Î‚ˆ˜Z\ÙWÙ\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]
+^ËTWÐT‘PWÔÕUJB‚‚™Yˆ™]ÚÙ\Ú[ÛœÛÛ\—Ü™X[[YWÛX\
+ˆÙ\ÜÚ[ÛŽˆ™\]Y\ÝË”Ù\ÜÚ[Û‹ˆ
+‹ˆ˜\ÙWÝ\›ˆÝ‹ˆ[™Ú[ˆÝ‹ˆÝ][Û—ØÛÙ\Îˆ\ÝÜÝ—KŠHOˆXÝÜÝ‹XÝÜÝ‹[žWWN‚ˆžN‚ˆ™\Ý[ˆXÝÜÝ‹XÝÜÝ‹[žWWHHßBˆ›ÜˆÝ][Û—ÙÜ›Ý\[ˆÚ[šÙY
+Ý][Û—ØÛÙ\ËL
+N‚ˆ™\Ý[\]Jˆ^XÝ]WÜ]Y]YYÙ\Ú[ÛœÛÛ\—ØXØÛÝ[ØØ[
+ˆ[X™HÜ›Ý\\Ý][Û—ÙÜ›Ý\ˆ\Ú[ÛœÛÛ\—ØÛY[Û[Ù[K™™]ÚÜ™X[[YWÛX\
+ˆÙ\ÜÚ[Û‹ˆ˜\ÙWÝ\›X˜\ÙWÝ\›ˆ[™Ú[Y[™Ú[ˆÝ][Û—ØÛÙ\ÏYÜ›Ý\ˆ
+Š™\Ú[ÛœÛÛ\—Ü™]žWÛÜ[ÛœÊ
+Kˆ
+Bˆ
+Bˆ
+Bˆ™]\›ˆ™\Ý[ˆ^Ù\\Ú[Û”ÛÛ\”˜]S[Z]\œ›Üˆ\È^Î‚ˆ˜Z\ÙWÙ\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]
+^ËTWÐT‘PWÔÕUJB‚‚™Yˆ™]ÚÙ\Ú[ÛœÛÛ\—Ù]šXÙWÛ\Ý
+ˆÙ\ÜÚ[ÛŽˆ™\]Y\ÝË”Ù\ÜÚ[Û‹ˆ
+‹ˆ˜\ÙWÝ\›ˆÝ‹ˆ[™Ú[ˆÝ‹ˆÝ][Û—ØÛÙ\Îˆ\ÝÜÝ—KŠHOˆ\ÝÙXÝÜÝ‹[žWWN‚ˆžN‚ˆ]šXÙ\Îˆ\ÝÙXÝÜÝ‹[žWWHH×Bˆ›ÜˆÝ][Û—ÙÜ›Ý\[ˆÚ[šÙY
+Ý][Û—ØÛÙ\ËL
+N‚ˆ]šXÙ\Ë™^[™
+ˆ^XÝ]WÜ]Y]YYÙ\Ú[ÛœÛÛ\—ÙXYÛ›ÜÝXÜ×ØØ[
+ˆ[X™HÜ›Ý\\Ý][Û—ÙÜ›Ý\ˆ\Ú[ÛœÛÛ\—ØÛY[Û[Ù[K™™]ÚÙ]šXÙWÛ\Ý
+ˆÙ\ÜÚ[Û‹ˆ˜\ÙWÝ\›X˜\ÙWÝ\›ˆ[™Ú[Y[™Ú[ˆÝ][Û—ØÛÙ\ÏYÜ›Ý\ˆ
+Š™\Ú[ÛœÛÛ\—Ü™]žWÛÜ[ÛœÊ
+Kˆ
+Bˆ
+Bˆ
+Bˆ™]\›ˆ]šXÙ\Âˆ^Ù\\Ú[Û”ÛÛ\”˜]S[Z]\œ›Üˆ\È^Î‚ˆ˜Z\ÙWÙ\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]
+^ËTWÐT‘PWÑPQÓ“ÔÕPÔÊB‚‚™Yˆ™]ÚÙ\Ú[ÛœÛÛ\—Ù]šXÙWÜ™X[[YWÛX\
+ˆÙ\ÜÚ[ÛŽˆ™\]Y\ÝË”Ù\ÜÚ[Û‹ˆ
+‹ˆ˜\ÙWÝ\›ˆÝ‹ˆ[™Ú[ˆÝ‹ˆ]šXÙ\Îˆ\ÝÙXÝÜÝ‹[žWWKŠHOˆXÝÜÝ‹XÝÜÝ‹[žWWN‚ˆžN‚ˆ™\Ý[ˆXÝÜÝ‹XÝÜÝ‹[žWWHHßBˆ]šXÙ\×ØžWÝ\NˆXÝÚ[\ÝÙXÝÜÝ‹[žWWWHHßBˆ›Üˆ]šXÙH[ˆ]šXÙ\Î‚ˆYˆ]šXÙK™Ù]
+™]—Ý\WÚYŠH\È›Ý›Û™N‚ˆ]šXÙ\×ØžWÝ\KœÙ]Y˜][
+ˆ[
+]šXÙVÈ™]—Ý\WÚY—JKˆ×Kˆ
+K˜\[™
+]šXÙJBˆ›Üˆ\YÙ]šXÙ\È[ˆ]šXÙ\×ØžWÝ\K˜[Y\Ê
+N‚ˆ›Üˆ]šXÙWÙÜ›Ý\[ˆÂˆ\YÙ]šXÙ\ÖÚ[™^ˆ[™^
+ÈLBˆ›Üˆ[™^[ˆ˜[™ÙJ[Š\YÙ]šXÙ\ÊKL
+BˆN‚ˆ™\Ý[\]Jˆ^XÝ]WÜ]Y]YYÙ\Ú[ÛœÛÛ\—ÙXYÛ›ÜÝXÜ×ØØ[
+ˆ[X™HÜ›Ý\Y]šXÙWÙÜ›Ý\ˆ\Ú[ÛœÛÛ\—ØÛY[Û[Ù[K™™]ÚÙ]šXÙWÜ™X[[YWÛX\
+ˆÙ\ÜÚ[Û‹ˆ˜\ÙWÝ\›X˜\ÙWÝ\›ˆ[™Ú[Y[™Ú[ˆ]šXÙ\ÏYÜ›Ý\ˆ
+Š™\Ú[ÛœÛÛ\—Ü™]žWÛÜ[ÛœÊ
+Kˆ
+Bˆ
+Bˆ
+Bˆ™]\›ˆ™\Ý[ˆ^Ù\\Ú[Û”ÛÛ\”˜]S[Z]\œ›Üˆ\È^Î‚ˆ˜Z\ÙWÙ\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]
+^ËTWÐT‘PWÑPQÓ“ÔÕPÔÊB‚‚™Yˆ™]ÚÙ\Ú[ÛœÛÛ\—Ù]šXÙWÚ\ÝÜžJˆÙ\ÜÚ[ÛŽˆ™\]Y\ÝË”Ù\ÜÚ[Û‹ˆ
+‹ˆ˜\ÙWÝ\›ˆÝ‹ˆ[™Ú[ˆÝ‹ˆ]šXÙ\Îˆ\ÝÙXÝÜÝ‹[žWWKˆ\™Ù]Ù]Nˆ]KˆØ[Ù[^WÜÙXÛÛ™Îˆ›Ø]HˆÛY\\Žˆ[žHH[YKœÛY\ŠHOˆ\ÝÙXÝÜÝ‹[žWWN‚ˆžN‚ˆ™]\›ˆ^XÝ]WÜ]Y]YYÙ\Ú[ÛœÛÛ\—ÙXYÛ›ÜÝXÜ×ØØ[
+ˆ[X™Nˆ\Ú[ÛœÛÛ\—ØÛY[Û[Ù[K™™]ÚÙ]šXÙWÚ\ÝÜžJˆÙ\ÜÚ[Û‹ˆ˜\ÙWÝ\›X˜\ÙWÝ\›ˆ[™Ú[Y[™Ú[ˆ]šXÙ\ÏY]šXÙ\Ëˆ\™Ù]Ù]O]\™Ù]Ù]KˆØ[Ù[^WÜÙXÛÛ™ÏXØ[Ù[^WÜÙXÛÛ™ËˆÛY\\\ÛY\\‹ˆ[Ý×ÜÛY\Q˜[ÙKˆ›Ü›X[^™\[›Ü›X[^™WÙ\Ú[ÛœÛÛ\—Ù]šXÙWÚ\ÝÜžWÜ›ÝÜËˆ
+Bˆ
+Bˆ^Ù\\Ú[Û”ÛÛ\”˜]S[Z]\œ›Üˆ\È^Î‚ˆ˜Z\ÙWÙ\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]
+^ËTWÐT‘PWÑPQÓ“ÔÕPÔÊB‚‚™Yˆ›Ü›X[^™WÙ\Ú[ÛœÛÛ\—Ù]šXÙWÚ\ÝÜžWÜ›ÝÜÊˆ]Nˆ[žKˆ]šXÙ\Îˆ\ÝÙXÝÜÝ‹[žWWKŠHOˆ\ÝÙXÝÜÝ‹[žWWN‚ˆ]šXÙWØžWÚYˆXÝÜÝ‹XÝÜÝ‹[žWWHHßBˆ›Üˆ]šXÙH[ˆ]šXÙ\Î‚ˆ›ÜˆÙ^H[ˆ
+™^\›˜[Ù]šXÙWÚY‹™]—Ùˆ‹œÛˆŠN‚ˆ˜[YHHÝŠ]šXÙK™Ù]
+Ù^JHÜˆˆŠKœÝš\
+
+BˆYˆ˜[YN‚ˆ]šXÙWØžWÚYÝ˜[YWHH]šXÙBˆ˜[˜XÚ×Ù]šXÙHH]šXÙ\ÖÌHYˆ[Š]šXÙ\ÊHOHH[ÙH›Û™Bˆ›Ü›X[^™Yˆ\ÝÙXÝÜÝ‹[žWWHH×B‚ˆYˆš\Ú]
+˜[YNˆ[žK[š\š]YÙ]šXÙNˆXÝÜÝ‹[žWH›Û™HH›Û™JHOˆ›Û™N‚ˆYˆ\Ú[œÝ[˜ÙJ˜[YK\Ý
+N‚ˆ›Üˆ][H[ˆ˜[YN‚ˆš\Ú]
+][K[š\š]YÙ]šXÙJBˆ™]\›‚ˆYˆ›Ý\Ú[œÝ[˜ÙJ˜[YKXÝ
+N‚ˆ™]\›‚ˆ˜]×Ù]šXÙWÚYHš\œÝÛ›Û—Ù[\J˜[YKÈ™]’Y‹™]šXÙRY‹™]‘ˆ‹™]šXÙQˆ‹™\ÛÛÙH‹œÛˆ—JBˆ]šXÙHH]šXÙWØžWÚY™Ù]
+ÝŠ˜]×Ù]šXÙWÚYÜˆˆŠKœÝš\
+
+JHÜˆ[š\š]YÙ]šXÙHÜˆ˜[˜XÚ×Ù]šXÙBˆ]WÛX\H˜[YK™Ù]
+™]R][SX\ŠHYˆ\Ú[œÝ[˜ÙJ˜[YK™Ù]
+™]R][SX\ŠKXÝ
+H[ÙH˜[YBˆØ[\WÝ[YHH\œÙWÙ]][YWÝ˜[YJš\œÝÛ›Û—Ù[\J˜[YKÈ˜ÛÛXÝ[YH‹œØ[\U[YH‹[YH‹[Y\Ý[\—JJBˆYˆØ[\WÝ[YH\È›Û™H[™]WÛX\\È›Ý˜[YN‚ˆØ[\WÝ[YHH\œÙWÙ]][YWÝ˜[YJš\œÝÛ›Û—Ù[\J]WÛX\È˜ÛÛXÝ[YH‹œØ[\U[YH‹[YH‹[Y\Ý[\—JJBˆXÝ]™WÜÝÙ\ˆHš\œÝÛ›Û—Ù[\J]WÛX\È˜XÝ]™WÜÝÙ\ˆ‹˜XÝ]™TÝÙ\ˆ‹˜XÝ]™WÜÝÙ\—ÚÝÈ‹œÝÙ\ˆ—JBˆYˆ]šXÙH[™Ø[\WÝ[YH\È›Ý›Û™H[™XÝ]™WÜÝÙ\ˆ›Ý[ˆ
+›Û™KˆŠN‚ˆ›Ü›X[^™Y˜\[™
+ˆÂˆ
+Š™]šXÙKˆœØ[\WÝ[YHŽˆØ[\WÝ[YKˆ˜XÝ]™WÜÝÙ\—ÚÝÈŽˆ›Ü›X[^™WÜÝÙ\—Ý×ÚÝÊXÝ]™WÜÝÙ\ŠKˆœ˜]×Ü^[ØYŽˆ˜[YKˆBˆ
+Bˆ™]\›‚ˆ™\ÝYÙ›Ý[™H˜[ÙBˆ›ÜˆÙ^H[ˆ
+›\Ý‹™]H‹š\ÝÜžQ]H‹™]S\Ý‹œ™XÛÜ™È‹™]R][SX\ŠN‚ˆ™\ÝYH˜[YK™Ù]
+Ù^JBˆYˆ\Ú[œÝ[˜ÙJ™\ÝY
+\ÝXÝ
+JH[™™\ÝY\È›Ý˜[YN‚ˆ™\ÝYÙ›Ý[™HYBˆš\Ú]
+™\ÝY]šXÙJBˆYˆ›Ý™\ÝYÙ›Ý[™‚ˆ›ÜˆÙ^K™\ÝY[ˆ˜[YKš][\Ê
+N‚ˆX\YÙ]šXÙHH]šXÙWØžWÚY™Ù]
+ÝŠÙ^JJBˆYˆX\YÙ]šXÙH[™\Ú[œÝ[˜ÙJ™\ÝY
+\ÝXÝ
+JN‚ˆš\Ú]
+™\ÝYX\YÙ]šXÙJB‚ˆš\Ú]
+]JBˆ™]\›ˆ›Ü›X[^™Y‚‚™Yˆ™]ÚÙ\Ú[ÛœÛÛ\—Ø[\›WÛX\
+ˆÙ\ÜÚ[ÛŽˆ™\]Y\ÝË”Ù\ÜÚ[Û‹ˆ
+‹ˆ˜\ÙWÝ\›ˆÝ‹ˆ[™Ú[ˆÝ‹ˆÝ][Û—ØÛÙ\Îˆ\ÝÜÝ—KŠHOˆXÝÜÝ‹\ÝÙXÝÜÝ‹[žWWWN‚ˆžN‚ˆ™\Ý[ˆXÝÜÝ‹\ÝÙXÝÜÝ‹[žWWWHHßBˆ›ÜˆÝ][Û—ÙÜ›Ý\[ˆÚ[šÙY
+Ý][Û—ØÛÙ\ËL
+N‚ˆ\X[H^XÝ]WÜ]Y]YYÙ\Ú[ÛœÛÛ\—ÙXYÛ›ÜÝXÜ×ØØ[
+ˆ[X™HÜ›Ý\\Ý][Û—ÙÜ›Ý\ˆ\Ú[ÛœÛÛ\—ØÛY[Û[Ù[K™™]ÚØ[\›WÛX\
+ˆÙ\ÜÚ[Û‹ˆ˜\ÙWÝ\›X˜\ÙWÝ\›ˆ[™Ú[Y[™Ú[ˆÝ][Û—ØÛÙ\ÏYÜ›Ý\ˆ[™ÝXYÙOQQUSÑ•TÒSÓ”ÓÓT—ÐST“T×ÓS‘ÕPQÑKˆ
+Š™\Ú[ÛœÛÛ\—Ü™]žWÛÜ[ÛœÊ
+Kˆ
+Bˆ
+Bˆ›ÜˆÝ][Û—ØÛÙK›ÝÜÈ[ˆ\X[š][\Ê
+N‚ˆ™\Ý[œÙ]Y˜][
+Ý][Û—ØÛÙK×JK™^[™
+›ÝÜÊBˆ™]\›ˆ™\Ý[ˆ^Ù\\Ú[Û”ÛÛ\”˜]S[Z]\œ›Üˆ\È^Î‚ˆ˜Z\ÙWÙ\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]
+^ËTWÐT‘PWÑPQÓ“ÔÕPÔÊB‚‚™YˆÛÛXÝÝ[YWÛ\ÊÛÛXÝÙ]Nˆ]JHOˆ[‚ˆ™]\›ˆÛÛXÝÝ[YWÜÝ\ÛÙ—Ù^WÛ\ÊÛÛXÝÙ]JB‚‚™YˆÛÛXÝÝ[YWÛ›ÛÛ—Û\ÊÛÛXÝÙ]Nˆ]JHOˆ[‚ˆ™]\›ˆÛÛXÝÝ[YWÛ›ÛÛ—ÛÙ—Û[ÛÛ\ÊÛÛXÝÙ]JB‚‚™Yˆ›Ü›X[^™WÙ\Ú[ÛœÛÛ\—ÚÜWÜ›ÝÜÊ]Nˆ[žJHOˆ\ÝÙXÝÜÝ‹[žWWN‚ˆ™]\›ˆ›Ü›X[^™WØÛY[ÚÜWÜ›ÝÜÊ]JB‚‚™Yˆ\œÙWÙ\Ú[ÛœÛÛ\—ØÛÛXÝÙ]J›ÝÎˆXÝÜÝ‹[žWK˜[˜XÚ×Ù]Nˆ]H›Û™HH›Û™JHOˆ]H›Û™N‚ˆ™]\›ˆ\œÙWØÛY[ØÛÛXÝÙ]J›ÝË˜[˜XÚ×Ù]JB‚‚™Yˆ™]ÚÙ\Ú[ÛœÛÛ\—ÚÜWÛX\
+ˆÙ\ÜÚ[ÛŽˆ™\]Y\ÝË”Ù\ÜÚ[Û‹ˆ
+‹ˆ˜\ÙWÝ\›ˆÝ‹ˆ[™Ú[ˆÝ‹ˆÝ][Û—ØÛÙ\Îˆ\ÝÜÝ—KˆÛÛXÝÙ]Nˆ]Kˆ^XÝYÛY\ÜØYÙNˆÝ‹ŠHOˆXÝÜÝ‹XÝÜÝ‹[žWWN‚ˆYˆ[ŠÝ][Û—ØÛÙ\ÊHˆL‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠØYHÚ[XYHÔH\Ú[Û”ÛÛ\ˆXÙZ]H›ÈX^[[ÈL[œÝ[XÛÙ\ËˆŠBˆžN‚ˆ™]\›ˆ^XÝ]WÜ]Y]YYÙ\Ú[ÛœÛÛ\—ÚÜWØØ[
+ˆ[X™Nˆ\Ú[ÛœÛÛ\—ØÛY[Û[Ù[K™™]ÚÚÜWÛX\
+ˆÙ\ÜÚ[Û‹ˆ˜\ÙWÝ\›X˜\ÙWÝ\›ˆ[™Ú[Y[™Ú[ˆÝ][Û—ØÛÙ\Ï\Ý][Û—ØÛÙ\ËˆÛÛXÝÙ]OXÛÛXÝÙ]Kˆ^XÝYÛY\ÜØYÙOY^XÝYÛY\ÜØYÙKˆ
+Š™\Ú[ÛœÛÛ\—Ü™]žWÛÜ[ÛœÊ
+Kˆ
+Kˆ[™Ú[Y[™Ú[ˆ
+Bˆ^Ù\\Ú[Û”ÛÛ\”˜]S[Z]\œ›Üˆ\È^Î‚ˆ˜Z\ÙWÙ\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]
+^ËTWÐT‘PWÔ“ÑPÕSÓŠB‚‚™Yˆ™]ÚÙ\Ú[ÛœÛÛ\—ÚÜWÜ›ÝÜÊˆÙ\ÜÚ[ÛŽˆ™\]Y\ÝË”Ù\ÜÚ[Û‹ˆ
+‹ˆ˜\ÙWÝ\›ˆÝ‹ˆ[™Ú[ˆÝ‹ˆÝ][Û—ØÛÙ\Îˆ\ÝÜÝ—KˆÛÛXÝÙ]Nˆ]Kˆ^XÝYÛY\ÜØYÙNˆÝ‹ŠHOˆ\ÝÙXÝÜÝ‹[žWWN‚ˆYˆ[ŠÝ][Û—ØÛÙ\ÊHˆL‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠØYHÚ[XYHÔH\Ú[Û”ÛÛ\ˆXÙZ]H›ÈX^[[ÈL[œÝ[XÛÙ\ËˆŠBˆžN‚ˆ™]\›ˆ^XÝ]WÜ]Y]YYÙ\Ú[ÛœÛÛ\—ÚÜWØØ[
+ˆ[X™Nˆ\Ú[ÛœÛÛ\—ØÛY[Û[Ù[K™™]ÚÚÜWÜ›ÝÜÊˆÙ\ÜÚ[Û‹ˆ˜\ÙWÝ\›X˜\ÙWÝ\›ˆ[™Ú[Y[™Ú[ˆÝ][Û—ØÛÙ\Ï\Ý][Û—ØÛÙ\ËˆÛÛXÝÙ]OXÛÛXÝÙ]Kœ™\XÙJ^OLJKˆ^XÝYÛY\ÜØYÙOY^XÝYÛY\ÜØYÙKˆ
+Š™\Ú[ÛœÛÛ\—Ü™]žWÛÜ[ÛœÊ
+Kˆ
+Kˆ[™Ú[Y[™Ú[ˆ
+Bˆ^Ù\\Ú[Û”ÛÛ\”˜]S[Z]\œ›Üˆ\È^Î‚ˆ˜Z\ÙWÙ\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]
+^ËTWÐT‘PWÔ“ÑPÕSÓŠB‚‚™Yˆ™]ÚÙ\Ú[ÛœÛÛ\—ÚÜWÙ^WÜ›ÝÜÊˆÙ\ÜÚ[ÛŽˆ™\]Y\ÝË”Ù\ÜÚ[Û‹ˆ˜\ÙWÝ\›ˆÝ‹ˆ[™Ú[ˆÝ‹ˆÝ][Û—ØÛÙ\Îˆ\ÝÜÝ—KˆÛÛXÝÙ]Nˆ]KŠHOˆ\ÝÙXÝÜÝ‹[žWWN‚ˆ™]\›ˆ™]ÚÙ\Ú[ÛœÛÛ\—ÚÜWÜ›ÝÜÊˆÙ\ÜÚ[Û‹ˆ˜\ÙWÝ\›X˜\ÙWÝ\›ˆ[™Ú[Y[™Ú[ˆÝ][Û—ØÛÙ\Ï\Ý][Û—ØÛÙ\ËˆÛÛXÝÙ]OXÛÛXÝÙ]Kˆ^XÝYÛY\ÜØYÙOH‘˜[H[ÈØ\ˆÜÈÔ\ÈX\š[ÜÈ\Ú[Û”ÛÛ\‹ˆ‹ˆ
+B‚‚™Yˆ™]ÚÙ\Ú[ÛœÛÛ\—ÚÜWÙ^WÛX\
+ˆÙ\ÜÚ[ÛŽˆ™\]Y\ÝË”Ù\ÜÚ[Û‹ˆ˜\ÙWÝ\›ˆÝ‹ˆ[™Ú[ˆÝ‹ˆÝ][Û—ØÛÙ\Îˆ\ÝÜÝ—KˆÛÛXÝÙ]Nˆ]KŠHOˆXÝÜÝ‹XÝÜÝ‹[žWWN‚ˆ™]\›ˆ™]ÚÙ\Ú[ÛœÛÛ\—ÚÜWÛX\
+ˆÙ\ÜÚ[Û‹ˆ˜\ÙWÝ\›X˜\ÙWÝ\›ˆ[™Ú[Y[™Ú[ˆÝ][Û—ØÛÙ\Ï\Ý][Û—ØÛÙ\ËˆÛÛXÝÙ]OXÛÛXÝÙ]Kˆ^XÝYÛY\ÜØYÙOH‘˜[H[ÈØ\ˆÜÈÔ\ÈX\š[ÜÈ\Ú[Û”ÛÛ\‹ˆ‹ˆ
+B‚‚™Yˆ™]ÚÙ\Ú[ÛœÛÛ\—ÚÜWÛ[ÛÛX\
+ˆÙ\ÜÚ[ÛŽˆ™\]Y\ÝË”Ù\ÜÚ[Û‹ˆ˜\ÙWÝ\›ˆÝ‹ˆ[™Ú[ˆÝ‹ˆÝ][Û—ØÛÙ\Îˆ\ÝÜÝ—KˆÛÛXÝÙ]Nˆ]KŠHOˆXÝÜÝ‹XÝÜÝ‹[žWWN‚ˆ[ÛÙ]HHÛÛXÝÙ]Kœ™\XÙJ^OLJBˆ™]\›ˆ™]ÚÙ\Ú[ÛœÛÛ\—ÚÜWÛX\
+ˆÙ\ÜÚ[Û‹ˆ˜\ÙWÝ\›X˜\ÙWÝ\›ˆ[™Ú[Y[™Ú[ˆÝ][Û—ØÛÙ\Ï\Ý][Û—ØÛÙ\ËˆÛÛXÝÙ]O[[ÛÙ]Kˆ^XÝYÛY\ÜØYÙOH‘˜[H[ÈØ\ˆÜÈÔ\ÈY[œØZ\È\Ú[Û”ÛÛ\‹ˆ‹ˆ
+B‚‚™Yˆ\œÙWÚÝÜÝ˜[YJ˜[YNˆ[žJHOˆ›Ø]›Û™N‚ˆYˆ˜[YH\È›Û™N‚ˆ™]\›ˆ›Û™Bˆ˜]ÈHÝŠ˜[YJKœÝš\
+
+Kœ™\XÙJ‹‹‹ˆŠBˆYˆ›Ý˜]ÈÜˆ˜]ÈOH‹HŽ‚ˆ™]\›ˆ›Û™Bˆ˜]ÈH™KœÝXŠˆ–×ŒNK—WH‹ˆ‹˜]ÊBˆYˆ˜]È[ˆ
+ˆ‹‹H‹‹ˆŠN‚ˆ™]\›ˆ›Û™BˆžN‚ˆ\œÙYH›Ø]
+˜]ÊBˆ^Ù\˜[YQ\œ›ÜŽ‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆ\œÙYYˆ\œÙYˆ[ÙH›Û™B‚‚™Yˆ\œÙWÙ›Ø]Ý˜[YJ˜[YNˆ[žJHOˆ›Ø]›Û™N‚ˆYˆ˜[YH\È›Û™HÜˆ˜[YHOHˆŽ‚ˆ™]\›ˆ›Û™BˆžN‚ˆ™]\›ˆ›Ø]
+ÝŠ˜[YJKœÝš\
+
+Kœ™\XÙJ‹‹‹ˆŠJBˆ^Ù\
+\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆ™]\›ˆ›Û™B‚‚™Yˆ\œÙWÚ[Ý˜[YJ˜[YNˆ[žJHOˆ[›Û™N‚ˆ\œÙYH\œÙWÙ›Ø]Ý˜[YJ˜[YJBˆ™]\›ˆ[
+\œÙY
+HYˆ\œÙY\È›Ý›Û™H[ÙH›Û™B‚‚™YˆÙ[XÝÜ›ÙXÝ[Û—Ý˜[YJ]WÚ][WÛX\ˆXÝÜÝ‹[žWH›Û™JHOˆ\VÙ›Ø]›Û™KÝ‹Ý—N‚ˆ]HH]WÚ][WÛX\ÜˆßBˆ›ÜˆÙ^H[ˆ
+”–ZY[‹š[™\\–ZY[‹š[™\\—ÜÝÙ\ˆŠN‚ˆ˜]×Ý˜[YHH]K™Ù]
+Ù^JBˆ˜[YHH\œÙWÙ›Ø]Ý˜[YJ˜]×Ý˜[YJBˆYˆ˜[YH\È›Ý›Û™N‚ˆ™]\›ˆ˜[YKÙ^KÝŠ˜]×Ý˜[YJBˆ™]\›ˆ›Û™Kˆ‹ˆ‚‚‚™YˆÙ[XÝÜ›ÙXÝ[Û—ÚÝÚ
+]WÚ][WÛX\ˆXÝÜÝ‹[žWH›Û™JHOˆ›Ø]›Û™N‚ˆ™]\›ˆÙ[XÝÜ›ÙXÝ[Û—Ý˜[YJ]WÚ][WÛX\
+VÌB‚‚™YˆZ[ÛZ\ÜÚ[™×Ü›ÙXÝ[Û—Û›ÝJˆ]WÚ][WÛX\ˆXÝÜÝ‹[žWH›Û™Kˆ
+‹ˆÝ][Û—ØÛÙNˆÝ‹ˆ\š[ÙÝ\NˆÝ‹ˆ\š[ÙÙ]Nˆ]KŠHOˆÝŽ‚ˆ]˜Z[X›WÚÙ^\ÈHÛÜY
+ÝŠÙ^JH›ÜˆÙ^H[ˆ
+]WÚ][WÛX\ÜˆßJKšÙ^\Ê
+JBˆÙ^\×Ý^H‹‹š›Ú[Š]˜Z[X›WÚÙ^\ÊHYˆ]˜Z[X›WÚÙ^\È[ÙH››Û™H‚ˆ™]\›ˆ
+ˆˆ“›È›ÙXÝ[ÛˆÙ^H›Ý[™ˆ]˜Z[X›HÙ^\ÎˆÚÙ^\×Ý^Kˆ‚ˆˆœÝ][ÛÛÙO^ÜÝ][Û—ØÛÙHÜˆ	ËIßNÈ\š[ÙÝ\O^Ü\š[ÙÝ\_NÈ\š[ÙÙ]O^Ü\š[ÙÙ]Kš\ÛÙ›Ü›X]
+
+_H‚ˆ
+B‚‚‘•TÒSÓ”ÓÓT—ÔUWÓSRUÐÓÓÓÕÓ—ÒÑVHH™\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]ØÛÛÛÝÛ—Ý[[‚‘•TÒSÓ”ÓÓT—ÓQÐPÖWÔT‘“Ô“PSÑWÐÓÓÓÕÓ—ÒÑVHH™\Ú[ÛœÛÛ\—Ü\™›Ü›X[˜ÙWØÛÛÛÝÛ—Ý[[‚‘•TÒSÓ”ÓÓT—ÔT‘“Ô“PSÑWÐÓÓÓÕÓ—ÒÑVHH•TÒSÓ”ÓÓT—ÔUWÓSRUÐÓÓÓÕÓ—ÒÑVB‘•TÒSÓ”ÓÓT—ÔUWÓSRUÓTÕÐST•ÒÑVHH™\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]Û\ÝØ[\ÚÙ^H‚‘•TÒSÓ”ÓÓT—ÔUWÓSRUÓTÕÐST•ÐUÒÑVHH™\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]Û\ÝØ[\Ø]‚‘•TÒSÓ”ÓÓT—ÔÕUSÓ—ÒS•‘S•Ô–WÑUWÒÑVHH™\Ú[ÛœÛÛ\—ÜÝ][Û—Ú[™[ÜžWÙ]H‚‚‚™YˆÙ\Ú[ÛœÛÛ\—Ù˜Z[ØÛÙJ^[ØYˆXÝÜÝ‹[žWH›Û™JHOˆ[›Û™N‚ˆYˆ›Ý\Ú[œÝ[˜ÙJ^[ØYXÝ
+N‚ˆ™]\›ˆ›Û™BˆžN‚ˆ™]\›ˆ[
+^[ØY™Ù]
+™˜Z[ÛÙHŠJBˆ^Ù\
+\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆ™]\›ˆ›Û™B‚‚™Yˆ\×Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]Ü^[ØY
+^[ØYˆXÝÜÝ‹[žWH›Û™JHOˆ›ÛÛ‚ˆ™]\›ˆÙ\Ú[ÛœÛÛ\—Ù˜Z[ØÛÙJ^[ØY
+HOHÂ‚‚™Yˆ\×Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[Û—Ù^\™YÜ^[ØY
+^[ØYˆXÝÜÝ‹[žWH›Û™JHOˆ›ÛÛ‚ˆYˆÙ\Ú[ÛœÛÛ\—Ù˜Z[ØÛÙJ^[ØY
+HOHÌN‚ˆ™]\›ˆYBˆ™]\›ˆ•TÑT—ÓUTÕÔ‘SÑÒSˆˆ[ˆÝŠ
+^[ØYÜˆßJK™Ù]
+›Y\ÜØYÙHŠHÜˆˆŠB‚‚™Yˆ\×Ù\Ú[ÛœÛÛ\—Ú[˜[YØÜ™Y[X[×Ü^[ØY
+^[ØYˆXÝÜÝ‹[žWH›Û™JHOˆ›ÛÛ‚ˆÛÙHHÙ\Ú[ÛœÛÛ\—Ù˜Z[ØÛÙJ^[ØY
+BˆY\ÜØYÙHHÝŠ
+^[ØYÜˆßJK™Ù]
+›Y\ÜØYÙHŠHÜˆˆŠK›ÝÙ\Š
+Bˆ™]\›ˆÛÙH[ˆÌŒKÌ‹ÌËÌHÜˆœ\ÜÝÛÜ™ˆ[ˆY\ÜØYÙHÜˆ˜Ü™Y[X[ˆ[ˆY\ÜØYÙHÜˆ\Ù\ˆ˜[YHˆ[ˆY\ÜØYÙB‚‚™Yˆ\×Ù\Ú[ÛœÛÛ\—ÚÙ\œ›ÜŠ^Îˆ^Ù\[ÛˆÝŠHOˆ›ÛÛ‚ˆ™]\›ˆ\Ú[œÝ[˜ÙJ^Ë\Ú[Û”ÛÛ\\Q\œ›ÜŠH[™^Ë™\œ›Ü—Ý\HOHš‚‚‚™Yˆ\×Ù\Ú[ÛœÛÛ\—Ú[˜[YÚœÛÛ—Ù\œ›ÜŠ^Îˆ^Ù\[ÛˆÝŠHOˆ›ÛÛ‚ˆ™]\›ˆ\Ú[œÝ[˜ÙJ^Ë\Ú[Û”ÛÛ\\Q\œ›ÜŠH[™^Ë™\œ›Ü—Ý\HOHš[˜[YÚœÛÛˆ‚‚‚™Yˆ\×Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]Ù\œ›ÜŠ^Îˆ^Ù\[ÛˆÝŠHOˆ›ÛÛ‚ˆYˆ\Ú[œÝ[˜ÙJ^Ë\T˜]S[Z]\œ›ÜŠH[™^Ëœ›ÝšY\ˆOHS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓTŽ‚ˆ™]\›ˆYBˆYˆ\Ú[œÝ[˜ÙJ^Ë\Ú[Û”ÛÛ\”˜]S[Z]\œ›ÜŠN‚ˆ™]\›ˆYBˆYˆ\Ú[œÝ[˜ÙJ^Ë\Ú[Û”ÛÛ\\Q\œ›ÜŠH[™\×Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]Ü^[ØY
+^Ëœ^[ØY
+N‚ˆ™]\›ˆYBˆY\ÜØYÙHHÝŠ^ÊBˆ™]\›ˆ™˜Z[ÛÙOMÈˆ[ˆY\ÜØYÙHÜˆ™\œ›ÜˆÛÙHÈˆ[ˆY\ÜØYÙHÜˆ˜ÛÙYÛÈÈˆ[ˆY\ÜØYÙHÜˆ˜ðàð¬ÙYÛÈÈˆ[ˆY\ÜØYÙB‚‚™Yˆ\×Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[Û—Ù^\™YÙ\œ›ÜŠ^Îˆ^Ù\[ÛˆÝŠHOˆ›ÛÛ‚ˆYˆ\Ú[œÝ[˜ÙJ^Ë\Ú[Û”ÛÛ\”Ù\ÜÚ[Û‘^\™Y\œ›ÜŠN‚ˆ™]\›ˆYBˆYˆ\Ú[œÝ[˜ÙJ^Ë\Ú[Û”ÛÛ\\Q\œ›ÜŠH[™\×Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[Û—Ù^\™YÜ^[ØY
+^Ëœ^[ØY
+N‚ˆ™]\›ˆYBˆY\ÜØYÙHHÝŠ^ÊBˆ™]\›ˆ™˜Z[ÛÙOLÌHˆ[ˆY\ÜØYÙHÜˆ•TÑT—ÓUTÕÔ‘SÑÒSˆˆ[ˆY\ÜØYÙB‚‚™YˆÙ]Ø\ÜÝ]WÝ˜[YJÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹Ù^NˆÝŠHOˆÝŽ‚ˆ›ÝÈHÛÛ›‹™^XÝ]J”ÑSPÕ˜[YH”“ÓH\ÜÝ]HÒT‘HÙ^HHÈ‹
+Ù^K
+JK™™]ÚÛ™J
+Bˆ™]\›ˆÝŠ›ÝÖÈ˜[YH—HÜˆˆŠHYˆ›ÝÈ[ÙHˆ‚‚‚™YˆÙ]Ø\ÜÝ]WÝ˜[YJÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹Ù^NˆÝ‹˜[YNˆÝŠHOˆ›Û™N‚ˆ›ÝÈH]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠBˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È\ÜÝ]H
+Ù^K˜[YK\]YØ]
+BˆSQTÈ
+ËËÊBˆÓˆÓÓ‘“PÕ
+Ù^JHÈTUHÑU˜[YHH^ÛYY˜[YK\]YØ]H^ÛYY\]YØ]ˆˆˆ‹ˆ
+Ù^K˜[YK›ÝÊKˆ
+B‚‚™Yˆ›ÝYžWÙ\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]
+ÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ÛÛÛÝÛ—Ý[[ˆ]][YKY\ÜØYÙNˆÝŠHOˆ›Û™N‚ˆ›Ý×Ý˜[YHH]][YK››ÝÊ
+Bˆ™XÙ[ØÝ]Ù™ˆH
+›Ý×Ý˜[YHH[YY[JZ[]\ÏY\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]ÛZ[]\Ê
+JJKš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠBˆ™XÙ[Ø[\HÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕBˆ”“ÓH[YÜ˜[WØ[\ÂˆÒT‘H[\Ý\HH	Ù\Ú[ÛœÛÛ\—Ø\WÛ[Z]	ÂˆS‘Ý]\ÈSˆ
+	ÜÙ[	Ë	Ø›ØÚÙY	Ë	Ù˜Z[Y	ÊBˆS‘Ù[Ø]HÂˆSRUBˆˆˆ‹ˆ
+™XÙ[ØÝ]Ù™‹
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ™XÙ[Ø[\\È›Ý›Û™N‚ˆ™]\›‚ˆ\ÝØ[\Ø]HÙ]Ø\ÜÝ]WÝ˜[YJÛÛ›‹•TÒSÓ”ÓÓT—ÔUWÓSRUÓTÕÐST•ÐUÒÑVJBˆYˆ\ÝØ[\Ø]‚ˆžN‚ˆYˆ]][YK™œ›ÛZ\ÛÙ›Ü›X]
+\ÝØ[\Ø]
+HH›Ý×Ý˜[YHH[YY[JZ[]\ÏY\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]ÛZ[]\Ê
+JN‚ˆ™]\›‚ˆ^Ù\˜[YQ\œ›ÜŽ‚ˆ\ÜÂ‚ˆ[\ÚÙ^HHˆ™\Ú[ÛœÛÛ\—Ø\WÛ[Z]žÛ›Ý×Ý˜[YKœÝ™[YJ	ÉVI[IY	R	SIÊ_H‚ˆÙ]Ø\ÜÝ]WÝ˜[YJÛÛ›‹•TÒSÓ”ÓÓT—ÔUWÓSRUÓTÕÐST•ÒÑVK[\ÚÙ^JBˆÙ]Ø\ÜÝ]WÝ˜[YJÛÛ›‹•TÒSÓ”ÓÓT—ÔUWÓSRUÓTÕÐST•ÐUÒÑVK›Ý×Ý˜[YKš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠJBˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ[YÜ˜[WÛY\ÜØYÙHH
+ˆ‘\Ú[Û”ÛÛ\ˆTH[Z]YOØ——ˆ‚ˆHTH]›Û™]H[Z]HHÚ[XY\ËÝÚÙ[œÈ\ÙÛÝYÈ\˜HÔ\ÈH›ÙpéðèÛË—ˆ‚ˆˆžÛY\ÜØYÙ_W—ˆ‚ˆ“ÜÈ™[]0ìÜš[ÜÈH›ÙpéðèÛÈH˜XÚÙš[ÈÙ[H˜[\ˆ]0êHÈ[Z]H™[›Ý˜\‹ˆ‚ˆ
+BˆÙ[™Ø[™Ü™XÛÜ™Ý[YÜ˜[WØ[\
+ˆÛÛ›‹ˆ›Û™Kˆ™\Ú[ÛœÛÛ\—Ø\WÛ[Z]‹ˆ[\ÚÙ^Kˆ[YÜ˜[WÛY\ÜØYÙKˆ
+B‚‚™Yˆ\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]ÛZ[]\Ê
+HOˆ[‚ˆ˜]×Ý˜[YHHÜË™[š\›Û‹™Ù]
+‘•TÒSÓ”ÓÓT—ÔUWÓSRUÓRS•UTÈ‹ÝŠQUSÑ•TÒSÓ”ÓÓT—ÔUWÓSRUÓRS•UTÊJKœÝš\
+
+BˆžN‚ˆ™]\›ˆX^
+K[
+˜]×Ý˜[YJJBˆ^Ù\˜[YQ\œ›ÜŽ‚ˆ™]\›ˆQUSÑ•TÒSÓ”ÓÓT—ÔUWÓSRUÓRS•UTÂ‚‚™Yˆ\Ú[ÛœÛÛ\—Ü›ÙXÝ[Û—ÚÜWÜÛXÞJ
+HOˆ\T]Y]YTÛXÞN‚ˆZ[WØYÙ]H\œÙWÙ[—ÜÜÚ]]™WÚ[
+ˆ‘•TÒSÓ”ÓÓT—Ô“ÑPÕSÓ—ÒÔWÑRSWÐ•QÑU‹ˆQUSÑ•TÒSÓ”ÓÓT—Ô“ÑPÕSÓ—ÒÔWÑRSWÐ•QÑUˆ
+BˆZ[WÜ™\Ù\™YØØ[ÈHZ[Šˆ\œÙWÙ[—Û›Û›™YØ]]™WÚ[
+ˆ‘•TÒSÓ”ÓÓT—Ô“ÑPÕSÓ—ÒÔWÑRSWÔ‘TÑT•‘QÐÐSÈ‹ˆQUSÑ•TÒSÓ”ÓÓT—Ô“ÑPÕSÓ—ÒÔWÑRSWÔ‘TÑT•‘QÐÐSËˆ
+KˆZ[WØYÙ]ˆ
+Bˆ[ÛØÛÜÙWÜ™\Ù\™YØØ[ÈHZ[Šˆ\œÙWÙ[—Û›Û›™YØ]]™WÚ[
+ˆ‘•TÒSÓ”ÓÓT—Ô“ÑPÕSÓ—ÒÔWÓSÓ•ÐÓÔÑWÔ‘TÑT•‘QÐÐSÈ‹ˆQUSÑ•TÒSÓ”ÓÓT—Ô“ÑPÕSÓ—ÒÔWÓSÓ•ÐÓÔÑWÔ‘TÑT•‘QÐÐSËˆ
+KˆX^
+Z[WØYÙ]HZ[WÜ™\Ù\™YØØ[Ë
+Kˆ
+Bˆ™]\›ˆ\T]Y]YTÛXÞJˆZ[—Ú[\˜[ÜÙXÛÛ™Ï\\œÙWÙ[—ÜÜÚ]]™WÚ[
+ˆ‘•TÒSÓ”ÓÓT—Ô“ÑPÕSÓ—ÒÔWÓRS—ÒS•T•SÔÑPÓÓ‘È‹ˆQUSÑ•TÒSÓ”ÓÓT—Ô“ÑPÕSÓ—ÒÔWÓRS—ÒS•T•SÔÑPÓÓ‘Ëˆ
+KˆZ[WØYÙ]YZ[WØYÙ]ˆ™\Ù\™YØØ[×ØžWÜš[Üš]OJˆ
+KZ[WÜ™\Ù\™YØØ[ÊKˆ
+‹[ÛØÛÜÙWÜ™\Ù\™YØØ[ÊKˆ
+Kˆ
+B‚‚™YˆÚYÙ[™\™ÞWÜ›ÙXÝ[Û—ÚÜWÜÛXÞJ
+HOˆ\T]Y]YTÛXÞN‚ˆ™]\›ˆ\T]Y]YTÛXÞJˆZ[—Ú[\˜[ÜÙXÛÛ™Ï\\œÙWÙ[—ÛÜ[Û˜[ÜÜÚ]]™WÚ[
+ˆ”ÒQÑS‘T‘ÖWÔ“ÑPÕSÓ—ÓRS—ÒS•T•SÔÑPÓÓ‘È‚ˆ
+KˆZ[WØYÙ]\\œÙWÙ[—ÛÜ[Û˜[ÜÜÚ]]™WÚ[
+ˆ”ÒQÑS‘T‘ÖWÔ“ÑPÕSÓ—ÑRSWÐ•QÑU‚ˆ
+Kˆ
+B‚‚™Yˆ\Ú[ÛœÛÛ\—ÝØ]ÜÛXÞJ
+HOˆ\T]Y]YTÛXÞN‚ˆ™]\›ˆ\T]Y]YTÛXÞJˆZ[—Ú[\˜[ÜÙXÛÛ™ÏS›Û™KˆZ[WØYÙ]\\œÙWÙ[—ÜÜÚ]]™WÚ[
+ˆ‘•TÒSÓ”ÓÓT—ÕÐUÑRSWÐ•QÑU‹ˆQUSÑ•TÒSÓ”ÓÓT—ÕÐUÑRSWÐ•QÑUˆ
+Kˆ
+B‚‚™Yˆ\œÙWÙ[—ÜÜÚ]]™WÚ[
+˜[YNˆÝ‹Y˜][ˆ[
+HOˆ[‚ˆžN‚ˆ™]\›ˆX^
+K[
+ÜË™[š\›Û‹™Ù]
+˜[YKÝŠY˜][
+JKœÝš\
+
+JJBˆ^Ù\˜[YQ\œ›ÜŽ‚ˆ™]\›ˆY˜][‚‚™Yˆ\œÙWÙ[—Û›Û›™YØ]]™WÚ[
+˜[YNˆÝ‹Y˜][ˆ[
+HOˆ[‚ˆžN‚ˆ™]\›ˆX^
+[
+ÜË™[š\›Û‹™Ù]
+˜[YKÝŠY˜][
+JKœÝš\
+
+JJBˆ^Ù\˜[YQ\œ›ÜŽ‚ˆ™]\›ˆY˜][‚‚™Yˆ\œÙWÙ[—ÛÜ[Û˜[ÜÜÚ]]™WÚ[
+˜[YNˆÝŠHOˆ[›Û™N‚ˆ˜]×Ý˜[YHHÜË™[š\›Û‹™Ù]
+˜[YKˆŠKœÝš\
+
+BˆYˆ›Ý˜]×Ý˜[YN‚ˆ™]\›ˆ›Û™BˆžN‚ˆ™]\›ˆX^
+K[
+˜]×Ý˜[YJJBˆ^Ù\˜[YQ\œ›ÜŽ‚ˆ™]\›ˆ›Û™B‚‚™Yˆ›ÙXÝ[Û—Ú›Ø—Üš[Üš]J›Ø—Ý\NˆÝŠHOˆ[‚ˆYˆ›Ø—Ý\HOH™\Ú[ÛœÛÛ\—Ü›ÙXÝ[Û—ÜÞ[˜ÈŽ‚ˆ™]\›ˆBˆYˆ›Ø—Ý\HOH™\Ú[ÛœÛÛ\—Û[ÛØÛÜÙHŽ‚ˆ™]\›ˆ‚ˆYˆ›Ø—Ý\H[ˆÈ™\Ú[ÛœÛÛ\—Ü›ÙXÝ[Û—Ø˜XÚÙš[‹™\Ú[ÛœÛÛ\—Û[ÛØÞXÛHŸN‚ˆ™]\›ˆÂˆYˆ›Ø—Ý\HOH™\Ú[ÛœÛÛ\—Ü™\ÜÜ›ÙXÝ[Û—Ü™\]Y\ÝŽ‚ˆ™]\›ˆˆYˆ›Ø—Ý\H[ˆ•TÒSÓ”ÓÓT—ÕÐUÒ“Ð—ÕTTÈÜˆ›Ø—Ý\HOH™\Ú[ÛœÛÛ\—ÜÝ]WÜÞ[˜ÈŽ‚ˆ™]\›ˆBˆ™]\›ˆ‚‚™YˆYÚ\—Üš[Üš]WÜ›ÙXÝ[Û—Ú›Ø—Ý\\Êš[Üš]Nˆ[
+HOˆ\VÜÝ‹‹‹—N‚ˆ™]\›ˆ\Jˆ›Ø—Ý\Bˆ›Üˆ›Ø—Ý\H[ˆ•TÒSÓ”ÓÓT—Ô“ÑPÕSÓ—Ò“Ð—ÕTTÂˆYˆ›ÙXÝ[Û—Ú›Ø—Üš[Üš]J›Ø—Ý\JHš[Üš]Bˆ
+B‚‚ÛÛ^X[˜YÙ\‚™Yˆ›ÙXÝ[Û—ÚÜWØØ[ØÛÛ^
+ˆ
+‹ˆ›Ø—ÚYˆ[ˆ›Ø—Ý\NˆÝ‹ŠHOˆ[žN‚ˆÚÙ[ˆH“ÑPÕSÓ—ÒÔWÐÐSÐÓÓ•VœÙ]
+ˆÂˆš›Ø—ÚYŽˆ›Ø—ÚYˆš›Ø—Ý\HŽˆ›Ø—Ý\Kˆœš[Üš]HŽˆ›ÙXÝ[Û—Ú›Ø—Üš[Üš]J›Ø—Ý\JKˆ›X\ÙWÛÝÛ™\ˆŽˆˆ˜˜XÚÙÜ›Ý[™Z›Ø‹^Ú›Ø—ÚYH‹ˆBˆ
+BˆžN‚ˆZY[ˆš[˜[N‚ˆ“ÑPÕSÓ—ÒÔWÐÐSÐÓÓ•Vœ™\Ù]
+ÚÙ[ŠB‚‚™Yˆ\Ú[ÛœÛÛ\—Ü›ÙXÝ[Û—ØXØÛÝ[ÚÙ^JˆÛÛ™šYÎˆÜ[]LË”›ÝÈXÝÜÝ‹[žWKˆÙ[™Ú[ˆÝ‹ŠHOˆÝŽ‚ˆ™]\›ˆ\Ú[ÛœÛÛ\—ØXØÛÝ[ÚÙ^JÛÛ™šYÊB‚‚™Yˆ\Ú[ÛœÛÛ\—ØXØÛÝ[ÚÙ^JˆÛÛ™šYÎˆÜ[]LË”›ÝÈXÝÜÝ‹[žWKŠHOˆÝŽ‚ˆ™]\›ˆ›ÙXÝ[Û—Ø\WØXØÛÝ[ÚÙ^Jˆ›ÝšY\RS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ˆ\Ù\›˜[YO\ÝŠÛÛ™šYË™Ù]
+\Ù\›˜[YHŠHYˆ\Ú[œÝ[˜ÙJÛÛ™šYËXÝ
+H[ÙHÛÛ™šYÖÈ\Ù\›˜[YH—HÜˆˆŠKˆ˜\ÙWÝ\›\ÝŠÛÛ™šYË™Ù]
+˜˜\ÙWÝ\›ŠHYˆ\Ú[œÝ[˜ÙJÛÛ™šYËXÝ
+H[ÙHÛÛ™šYÖÈ˜˜\ÙWÝ\›—HÜˆˆŠKˆ[™Ú[H˜XØÛÝ[‹ˆ
+B‚‚™Yˆ^XÝ]WÜ]Y]YYÙ\Ú[ÛœÛÛ\—ÚÜWØØ[
+ˆØ[˜XÚÎˆ[žKˆ
+‹ˆ[™Ú[ˆÝ‹ŠHOˆ[žN‚ˆ™]\›ˆ^XÝ]WÜ]Y]YYÙ\Ú[ÛœÛÛ\—ØØ[
+ˆØ[˜XÚËˆ\WØ\™XOT“ÑPÕSÓ—ÒÔWÐT‘PKˆÛXÞOY\Ú[ÛœÛÛ\—Ü›ÙXÝ[Û—ÚÜWÜÛXÞJ
+Kˆ[™›Ü˜ÙWÜ›ÙXÝ[Û—Üš[Üš]OUYKˆ
+B‚‚™Yˆ^XÝ]WÜ]Y]YYÙ\Ú[ÛœÛÛ\—ÙXYÛ›ÜÝXÜ×ØØ[
+Ø[˜XÚÎˆ[žJHOˆ[žN‚ˆ™]\›ˆ^XÝ]WÜ]Y]YYÙ\Ú[ÛœÛÛ\—ØØ[
+ˆØ[˜XÚËˆ\WØ\™XOUÐUÒTÕÔ–WÐT‘PKˆÛXÞOY\Ú[ÛœÛÛ\—ÝØ]ÜÛXÞJ
+Kˆ[™›Ü˜ÙWÜ›ÙXÝ[Û—Üš[Üš]OUYKˆ
+B‚‚™Yˆ^XÝ]WÜ]Y]YYÙ\Ú[ÛœÛÛ\—ØXØÛÝ[ØØ[
+Ø[˜XÚÎˆ[žJHOˆ[žN‚ˆ™]\›ˆ^XÝ]WÜ]Y]YYÙ\Ú[ÛœÛÛ\—ØØ[
+ˆØ[˜XÚËˆ\WØ\™XOPTWÐT‘PWÔÕUKˆÛXÞOS›Û™Kˆ[™›Ü˜ÙWÜ›ÙXÝ[Û—Üš[Üš]OUYKˆ
+B‚‚™Yˆ^XÝ]WÜ]Y]YYÙ\Ú[ÛœÛÛ\—ØØ[
+ˆØ[˜XÚÎˆ[žKˆ
+‹ˆ\WØ\™XNˆÝ‹ˆÛXÞNˆ\T]Y]YTÛXÞH›Û™Kˆ[™›Ü˜ÙWÜ›ÙXÝ[Û—Üš[Üš]Nˆ›ÛÛŠHOˆ[žN‚ˆÛÛ^H“ÑPÕSÓ—ÒÔWÐÐSÐÓÓ•V™Ù]
+
+BˆYˆÛÛ^\È›Û™HÜˆ›Ý\×Ø\ØÛÛ^
+
+N‚ˆ™]\›ˆØ[˜XÚÊ
+BˆÚ]ÛÜÚ[™ÊÙ]ÙŠÝ\œ™[Ø\˜ÛÛ™šYÖÈ‘UPTÑH—JJH\È]Y]YWØÛÛ›Ž‚ˆÛÛ™šYÈHÙ]Ú[YÜ˜][Û—ØÛÛ™šYÊ]Y]YWØÛÛ›‹S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓTŠBˆYˆÛÛ™šYÈ\È›Û™N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠÛÛ™šYÝ\˜XØ[È\Ú[Û”ÛÛ\ˆ˜[È[˜ÛÛ˜YKˆŠBˆXØÛÝ[ÚÙ^WÝ˜[YHH\Ú[ÛœÛÛ\—ØXØÛÝ[ÚÙ^JÛÛ™šYÊBˆYÚ\—Üš[Üš]WÝ\\ÈH
+ˆYÚ\—Üš[Üš]WÜ›ÙXÝ[Û—Ú›Ø—Ý\\Ê[
+ÛÛ^Èœš[Üš]H—JJBˆYˆ[™›Ü˜ÙWÜ›ÙXÝ[Û—Üš[Üš]Bˆ[ÙH
+
+Bˆ
+BˆYˆYÚ\—Üš[Üš]WÝ\\Î‚ˆXÙZÛ\œÈH‹‹š›Ú[ŠÈˆ›ÜˆÈ[ˆYÚ\—Üš[Üš]WÝ\\ÊBˆYÚ\—Üš[Üš]WÚ›ØˆH]Y]YWØÛÛ›‹™^XÝ]Jˆˆˆˆ‚ˆÑSPÕY™^Ø][\Ø]ˆ”“ÓH˜XÚÙÜ›Ý[™Ú›ØœÂˆÒT‘H›Ø—Ý\HSˆ
+ÜXÙZÛ\œßJBˆS‘Ý]\ÈSˆ
+	Ü[™[™ÉË	Ü[›š[™ÉË	ÝØZ][™×Ø\WÜÛÝ	Ë	ÝØZ][™×Ü˜]WÛ[Z]	ÊBˆS‘YOHÂˆÔ‘Tˆ–HYˆSRUBˆˆˆ‹ˆ
+
+šYÚ\—Üš[Üš]WÝ\\Ë[
+ÛÛ^Èš›Ø—ÚY—JJKˆ
+K™™]ÚÛ™J
+BˆYˆYÚ\—Üš[Üš]WÚ›Øˆ\È›Ý›Û™N‚ˆ™^Ø][\Ø]H]][YK››ÝÊTÐ“Ó—ÕSQV“Ó‘JH
+È[YY[JˆÙXÛÛ™ÏY\Ú[ÛœÛÛ\—Ü›ÙXÝ[Û—ÚÜWÜÛXÞJ
+K›Z[—Ú[\˜[ÜÙXÛÛ™ÂˆÜˆBˆ
+Bˆ˜Z\ÙH\TÛÝ[˜]˜Z[X›Q\œ›ÜŠˆ›ÝšY\RS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ˆXØÛÝ[ÚÙ^OXXØÛÝ[ÚÙ^WÝ˜[YKˆ\WØ\™XOX\WØ\™XKˆ™^Ø][\Ø][™^Ø][\Ø]ˆØZ]Ü™X\ÛÛHœš[Üš]WÜ]Y]YH‹ˆ
+BˆXØÛÝ[Ü™\Ù\˜][ÛˆH™\Ù\™WØXØÛÝ[ÛX\ÙJˆ]Y]YWØÛÛ›‹ˆ›ÝšY\RS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹›ÝÙ\Š
+KˆXØÛÝ[ÚÙ^WÝ˜[YOXXØÛÝ[ÚÙ^WÝ˜[YKˆX\ÙWÛÝÛ™\\ÝŠÛÛ^È›X\ÙWÛÝÛ™\ˆ—JKˆ
+BˆYˆ›ÝXØÛÝ[Ü™\Ù\˜][Û‹™Ü˜[Y‚ˆ˜Z\ÙH\TÛÝ[˜]˜Z[X›Q\œ›ÜŠˆ›ÝšY\RS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ˆXØÛÝ[ÚÙ^OXXØÛÝ[ÚÙ^WÝ˜[YKˆ\WØ\™XOX\WØ\™XKˆ™^Ø][\Ø]XXØÛÝ[Ü™\Ù\˜][Û‹›™^Ø][\Ø]ˆØZ]Ü™X\ÛÛXXØÛÝ[Ü™\Ù\˜][Û‹ØZ]Ü™X\ÛÛ‹ˆ
+Bˆ\™XWÜ™\Ù\™YH˜[ÙBˆžN‚ˆYˆÛXÞH\È›Ý›Û™N‚ˆ™\Ù\˜][ÛˆH™\Ù\™WØ\WÜÛÝ
+ˆ]Y]YWØÛÛ›‹ˆ›ÝšY\RS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹›ÝÙ\Š
+KˆXØÛÝ[ÚÙ^WÝ˜[YOXXØÛÝ[ÚÙ^WÝ˜[YKˆ\WØ\™XOX\WØ\™XKˆX\ÙWÛÝÛ™\\ÝŠÛÛ^È›X\ÙWÛÝÛ™\ˆ—JKˆš[Üš]OZ[
+ÛÛ^Èœš[Üš]H—JKˆÛXÞO\ÛXÞKˆ
+BˆYˆ›Ý™\Ù\˜][Û‹™Ü˜[Y‚ˆ˜Z\ÙH\TÛÝ[˜]˜Z[X›Q\œ›ÜŠˆ›ÝšY\RS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ˆXØÛÝ[ÚÙ^OXXØÛÝ[ÚÙ^WÝ˜[YKˆ\WØ\™XOX\WØ\™XKˆ™^Ø][\Ø]\™\Ù\˜][Û‹›™^Ø][\Ø]ˆØZ]Ü™X\ÛÛ\™\Ù\˜][Û‹ØZ]Ü™X\ÛÛ‹ˆ
+Bˆ\™XWÜ™\Ù\™YHYBˆ™]\›ˆØ[˜XÚÊ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆYˆ\×Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]Ù\œ›ÜŠ^ÊN‚ˆÛÛÛÝÛ—Ý[[H]][YK››ÝÊTÐ“Ó—ÕSQV“Ó‘JH
+È[YY[JˆZ[]\ÏY\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]ÛZ[]\Ê
+Bˆ
+Bˆ™XÛÜ™ØXØÛÝ[ÍÊˆ]Y]YWØÛÛ›‹ˆ›ÝšY\RS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹›ÝÙ\Š
+KˆXØÛÝ[ÚÙ^WÝ˜[YOXXØÛÝ[ÚÙ^WÝ˜[YKˆÛÛÛÝÛ—Ý[[XÛÛÛÝÛ—Ý[[ˆ
+BˆYˆÛXÞH\È›Ý›Û™N‚ˆ™XÛÜ™Ü›ÙXÝ[Û—Ø\WÍÊˆ]Y]YWØÛÛ›‹ˆ›ÝšY\RS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹›ÝÙ\Š
+KˆXØÛÝ[ÚÙ^WÝ˜[YOXXØÛÝ[ÚÙ^WÝ˜[YKˆ\WØ\™XOX\WØ\™XKˆÛÛÛÝÛ—Ý[[XÛÛÛÝÛ—Ý[[ˆ
+BˆÜÝÛ™WÜ[™[™×Ü›ÙXÝ[Û—Ú›Øœ×ØY\—ÍÊˆ]Y]YWØÛÛ›‹ˆÛÛÛÝÛ—Ý[[XÛÛÛÝÛ—Ý[[ˆ^ÛYWÚ›Ø—ÚYZ[
+ÛÛ^Èš›Ø—ÚY—JKˆ
+Bˆ˜Z\ÙBˆš[˜[N‚ˆYˆ\™XWÜ™\Ù\™Y‚ˆ™[X\ÙWØ\WÛX\ÙJˆ]Y]YWØÛÛ›‹ˆ›ÝšY\RS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹›ÝÙ\Š
+KˆXØÛÝ[ÚÙ^WÝ˜[YOXXØÛÝ[ÚÙ^WÝ˜[YKˆ\WØ\™XOX\WØ\™XKˆX\ÙWÛÝÛ™\\ÝŠÛÛ^È›X\ÙWÛÝÛ™\ˆ—JKˆ
+Bˆ™[X\ÙWØXØÛÝ[ÛX\ÙJˆ]Y]YWØÛÛ›‹ˆ›ÝšY\RS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹›ÝÙ\Š
+KˆXØÛÝ[ÚÙ^WÝ˜[YOXXØÛÝ[ÚÙ^WÝ˜[YKˆX\ÙWÛÝÛ™\\ÝŠÛÛ^È›X\ÙWÛÝÛ™\ˆ—JKˆ
+B‚‚™Yˆ\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[Û—ØØXÚWÛZ[]\Ê
+HOˆ[‚ˆ˜]×Ý˜[YHHÜË™[š\›Û‹™Ù]
+‘•TÒSÓ”ÓÓT—ÔÑTÔÒSÓ—ÐÐPÒWÓRS•UTÈ‹ÝŠQUSÑ•TÒSÓ”ÓÓT—ÔÑTÔÒSÓ—ÐÐPÒWÓRS•UTÊJKœÝš\
+
+BˆžN‚ˆ™]\›ˆX^
+K[
+˜]×Ý˜[YJJBˆ^Ù\˜[YQ\œ›ÜŽ‚ˆ™]\›ˆQUSÑ•TÒSÓ”ÓÓT—ÔÑTÔÒSÓ—ÐÐPÒWÓRS•UTÂ‚‚™YˆØÝ\œ™[Ø\Ù—ØÛÛ›™XÝ[ÛŠ
+HOˆÜ[]LËÛÛ›™XÝ[Ûˆ›Û™N‚ˆYˆ›Ý\×Ø\ØÛÛ^
+
+N‚ˆ™]\›ˆ›Û™Bˆ]X˜\ÙHHÝ\œ™[Ø\˜ÛÛ™šYË™Ù]
+‘UPTÑHŠBˆ™]\›ˆÙ]ÙŠ]X˜\ÙJHYˆ]X˜\ÙH[ÙH›Û™B‚‚™YˆÙ]Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]Ý[[
+ˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Ûˆ›Û™HH›Û™Kˆ›Ý×Ý˜[YNˆ]][YH›Û™HH›Û™KŠHOˆ]][YH›Û™N‚ˆÛÛÛÝÛ—Ý[[H•TÒSÓ”ÓÓT—ÔT‘“Ô“PSÑWÔUWÓSRUÕS•SˆÛÜÙWØÛÛ›ˆH˜[ÙBˆYˆÛÛ›ˆ\È›Û™N‚ˆÛÛ›ˆHØÝ\œ™[Ø\Ù—ØÛÛ›™XÝ[ÛŠ
+BˆÛÜÙWØÛÛ›ˆHÛÛ›ˆ\È›Ý›Û™BˆžN‚ˆYˆÛÛ›ˆ\È›Ý›Û™N‚ˆ›Üˆ\™XH[ˆ
+TWÐT‘PWÔÕUKTWÐT‘PWÔ“ÑPÕSÓ‹TWÐT‘PWÑPQÓ“ÔÕPÔÊN‚ˆ\™XWÝ[[HXÝ]™WØÛÛÛÝÛ—Ý[[
+ÛÛ›‹S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹\™XJBˆYˆ\™XWÝ[[[™
+ÛÛÛÝÛ—Ý[[\È›Û™HÜˆ\™XWÝ[[ˆÛÛÛÝÛ—Ý[[
+N‚ˆÛÛÛÝÛ—Ý[[H\™XWÝ[[ˆ›ÜˆÙ^H[ˆ
+•TÒSÓ”ÓÓT—ÔUWÓSRUÐÓÓÓÕÓ—ÒÑVK•TÒSÓ”ÓÓT—ÓQÐPÖWÔT‘“Ô“PSÑWÐÓÓÓÕÓ—ÒÑVJN‚ˆ˜]×Ý˜[YHHÙ]Ø\ÜÝ]WÝ˜[YJÛÛ›‹Ù^JBˆYˆ˜]×Ý˜[YN‚ˆžN‚ˆ\œÚ\ÝYÝ[[H]][YK™œ›ÛZ\ÛÙ›Ü›X]
+˜]×Ý˜[YJBˆYˆÛÛÛÝÛ—Ý[[\È›Û™HÜˆ\œÚ\ÝYÝ[[ˆÛÛÛÝÛ—Ý[[‚ˆÛÛÛÝÛ—Ý[[H\œÚ\ÝYÝ[[ˆ^Ù\˜[YQ\œ›ÜŽ‚ˆ\ÜÂˆš[˜[N‚ˆYˆÛÜÙWØÛÛ›ˆ[™ÛÛ›ˆ\È›Ý›Û™N‚ˆÛÛ›‹˜ÛÜÙJ
+BˆYˆÛÛÛÝÛ—Ý[[[™›Ý×Ý˜[YH[™ÛÛÛÝÛ—Ý[[H›Ý×Ý˜[YN‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆÛÛÛÝÛ—Ý[[‚‚™YˆÙ]Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]ØÛÛÛÝÛ—Ü™X\ÛÛŠˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Ûˆ›Û™HH›Û™Kˆ›Ý×Ý˜[YNˆ]][YH›Û™HH›Û™KŠHOˆÝŽ‚ˆ›Ý×Ý˜[YHH›Ý×Ý˜[YHÜˆ]][YK››ÝÊ
+BˆÛÛÛÝÛ—Ý[[HÙ]Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]Ý[[
+ÛÛ›‹›Ý×Ý˜[YJBˆYˆÛÛÛÝÛ—Ý[[[™ÛÛÛÝÛ—Ý[[ˆ›Ý×Ý˜[YN‚ˆ™[XZ[š[™×ÜÙXÛÛ™ÈH[
+
+ÛÛÛÝÛ—Ý[[H›Ý×Ý˜[YJKÝ[ÜÙXÛÛ™Ê
+JBˆ™[XZ[š[™×ÛZ[]\ÈHX^
+K
+™[XZ[š[™×ÜÙXÛÛ™È
+ÈNJHËÈŒ
+Bˆ™]\›ˆ
+ˆ‘\Ú[Û”ÛÛ\ˆ[\Ü˜\šX[Y[H[Z]YÈ[HTKˆ‚ˆˆ“›Ý˜H[]]˜H\ÜÛš]™[\ÜÈØÛÛÛÝÛ—Ý[[œÝ™[YJ	ÉR‰SIÊ_H
+Ü™[XZ[š[™×ÛZ[]\ßHZ[ŠKˆ‚ˆ
+Bˆ™]\›ˆˆ‚‚‚™YˆÙ]Ù\Ú[ÛœÛÛ\—Ü\™›Ü›X[˜ÙWØÛÛÛÝÛ—Ü™X\ÛÛŠˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Ûˆ›Û™HH›Û™Kˆ›Ý×Ý˜[YNˆ]][YH›Û™HH›Û™KŠHOˆÝŽ‚ˆ™]\›ˆÙ]Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]ØÛÛÛÝÛ—Ü™X\ÛÛŠÛÛ›‹›Ý×Ý˜[YJB‚‚™YˆX\š×Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]Y
+ˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Ûˆ›Û™HH›Û™Kˆ›Ý×Ý˜[YNˆ]][YH›Û™HH›Û™KŠHOˆÝŽ‚ˆÛØ˜[•TÒSÓ”ÓÓT—ÔT‘“Ô“PSÑWÔUWÓSRUÕS•Sˆ›Ý×Ý˜[YHH›Ý×Ý˜[YHÜˆ]][YK››ÝÊ
+Bˆ•TÒSÓ”ÓÓT—ÔT‘“Ô“PSÑWÔUWÓSRUÕS•SH›Ý×Ý˜[YH
+È[YY[JZ[]\ÏY\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]ÛZ[]\Ê
+JBˆÛÜÙWØÛÛ›ˆH˜[ÙBˆYˆÛÛ›ˆ\È›Û™N‚ˆÛÛ›ˆHØÝ\œ™[Ø\Ù—ØÛÛ›™XÝ[ÛŠ
+BˆÛÜÙWØÛÛ›ˆHÛÛ›ˆ\È›Ý›Û™BˆYˆÛÛ›ˆ\È›Ý›Û™N‚ˆÙ]Ø\ÜÝ]WÝ˜[YJˆÛÛ›‹ˆ•TÒSÓ”ÓÓT—ÔUWÓSRUÐÓÓÓÕÓ—ÒÑVKˆ•TÒSÓ”ÓÓT—ÔT‘“Ô“PSÑWÔUWÓSRUÕS•Sš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆ
+BˆY\ÜØYÙHH
+ˆ‘\Ú[Û”ÛÛ\ˆ[\Ü˜\šX[Y[H[Z]YÈ[HTKˆ‚ˆˆ“›Ý˜H[]]˜H\ÜÛš]™[\ÜÈÑ•TÒSÓ”ÓÓT—ÔT‘“Ô“PSÑWÔUWÓSRUÕS•SœÝ™[YJ	ÉR‰SIÊ_Kˆ‚ˆ
+BˆYˆÛÛ›ˆ\È›Ý›Û™N‚ˆ›ÝYžWÙ\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]
+ÛÛ›‹•TÒSÓ”ÓÓT—ÔT‘“Ô“PSÑWÔUWÓSRUÕS•SY\ÜØYÙJBˆÛÛ›‹˜ÛÛ[Z]
+
+BˆYˆÛÜÙWØÛÛ›ˆ[™ÛÛ›ˆ\È›Ý›Û™N‚ˆÛÛ›‹˜ÛÜÙJ
+BˆÑÑÑT‹Ø\›š[™Êˆ‘\Ú[Û”ÛÛ\ˆ˜]H[Z]ÛÛÛÝÛˆXÝ]˜]Y[[	\È‹ˆ•TÒSÓ”ÓÓT—ÔT‘“Ô“PSÑWÔUWÓSRUÕS•Sš\ÛÙ›Ü›X]
+[Y\ÜXÏH›Z[]\ÈŠKˆ
+Bˆ™]\›ˆY\ÜØYÙB‚‚™YˆX\š×Ù\Ú[ÛœÛÛ\—Ø\WØÛÛÛÝÛŠˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Ûˆ›Û™Kˆ\WØ\™XNˆÝ‹ˆ
+‹ˆ™X\ÛÛŽˆÝˆH‘\Ú[Û”ÛÛ\ˆ˜]H[Z]‹ˆ›Ý×Ý˜[YNˆ]][YH›Û™HH›Û™KŠHOˆ]][YN‚ˆÛØ˜[•TÒSÓ”ÓÓT—ÔT‘“Ô“PSÑWÔUWÓSRUÕS•Sˆ›Ý×Ý˜[YHH›Ý×Ý˜[YHÜˆ]][YK››ÝÊ
+Bˆ[[H›Ý×Ý˜[YH
+È[YY[JZ[]\ÏY\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]ÛZ[]\Ê
+JBˆ•TÒSÓ”ÓÓT—ÔT‘“Ô“PSÑWÔUWÓSRUÕS•SH[[ˆÛÜÙWØÛÛ›ˆH˜[ÙBˆYˆÛÛ›ˆ\È›Û™N‚ˆÛÛ›ˆHØÝ\œ™[Ø\Ù—ØÛÛ›™XÝ[ÛŠ
+BˆÛÜÙWØÛÛ›ˆHÛÛ›ˆ\È›Ý›Û™BˆžN‚ˆYˆÛÛ›ˆ\È›Ý›Û™N‚ˆX\š×Ø\WØÛÛÛÝÛŠˆÛÛ›‹ˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ˆ\WØ\™XKˆ™X\ÛÛ‹ˆÛÛÛÝÛ—Ý[[][[ˆ›ÝÏ[›Ý×Ý˜[YKˆ
+BˆÙ]Ø\ÜÝ]WÝ˜[YJÛÛ›‹•TÒSÓ”ÓÓT—ÔUWÓSRUÐÓÓÓÕÓ—ÒÑVK[[š\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠJBˆ›ÝYžWÙ\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]
+ÛÛ›‹[[Ù]Ü›ÝšY\—ØÛÛÛÝÛ—Ü™X\ÛÛŠÛÛ›‹S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹\WØ\™XJJBˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆš[˜[N‚ˆYˆÛÜÙWØÛÛ›ˆ[™ÛÛ›ˆ\È›Ý›Û™N‚ˆÛÛ›‹˜ÛÜÙJ
+BˆÑÑÑT‹Ø\›š[™Ê‘\Ú[Û”ÛÛ\ˆ	\ÈÛÛÛÝÛˆXÝ]˜]Y[[	\È‹\WØ\™XK[[š\ÛÙ›Ü›X]
+[Y\ÜXÏH›Z[]\ÈŠJBˆ™]\›ˆ[[‚‚™YˆX\š×Ù\Ú[ÛœÛÛ\—Ü\™›Ü›X[˜ÙWÜ˜]WÛ[Z]Y
+ˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Ûˆ›Û™HH›Û™Kˆ›Ý×Ý˜[YNˆ]][YH›Û™HH›Û™KŠHOˆÝŽ‚ˆ™]\›ˆX\š×Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]Y
+ÛÛ›‹›Ý×Ý˜[YJB‚‚™YˆÛX\—Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]ØÛÛÛÝÛŠÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Ûˆ›Û™HH›Û™JHOˆ›Û™N‚ˆÛØ˜[•TÒSÓ”ÓÓT—ÔT‘“Ô“PSÑWÔUWÓSRUÕS•Sˆ•TÒSÓ”ÓÓT—ÔT‘“Ô“PSÑWÔUWÓSRUÕS•SH›Û™BˆYˆÛÛ›ˆ\È›Ý›Û™N‚ˆÙ]Ø\ÜÝ]WÝ˜[YJÛÛ›‹•TÒSÓ”ÓÓT—ÔUWÓSRUÐÓÓÓÕÓ—ÒÑVKˆŠB‚‚™Yˆ\Ú[ÛœÛÛ\—ØÛÛÛÝÛ—ÜÛY\ÜÙXÛÛ™ÊˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Ûˆ›Û™HH›Û™Kˆ›Ý×Ý˜[YNˆ]][YH›Û™HH›Û™KŠHOˆ[‚ˆ›Ý×Ý˜[YHH›Ý×Ý˜[YHÜˆ]][YK››ÝÊ
+BˆÛÛÛÝÛ—Ý[[HÙ]Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]Ý[[
+ÛÛ›‹›Ý×Ý˜[YJBˆYˆÛÛÛÝÛ—Ý[[[™ÛÛÛÝÛ—Ý[[ˆ›Ý×Ý˜[YN‚ˆ™]\›ˆX^
+K[
+
+ÛÛÛÝÛ—Ý[[H›Ý×Ý˜[YJKÝ[ÜÙXÛÛ™Ê
+JH
+ÈJBˆ™]\›ˆ‚‚™YˆØ[Ý[]WÜÜXÚYšX×ÞZY[
+›ÙXÝ[Û—ÚÝÚˆ›Ø]›Û™KÝÜˆ›Ø]›Û™JHOˆ›Ø]›Û™N‚ˆYˆ›ÙXÝ[Û—ÚÝÚ\È›Û™HÜˆ›ÝÝÜ‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆ›ÙXÝ[Û—ÚÝÚÈÝÜ‚‚™YˆÛ\ÜÚYžWÜ\™›Ü›X[˜ÙWÜÝ]\Êˆ›ÙXÝ[Û—ÚÝÚˆ›Ø]›Û™KˆÝÜˆ›Ø]›Û™Kˆ^XÝYÚÝÚˆ›Ø]›Û™Kˆ
+‹ˆØ\›š[™×Ù]šX][Û—ÜÝˆ›Ø]HLLˆ[\Ù]šX][Û—ÜÝˆ›Ø]HLŒˆÜš]XØ[Ù]šX][Û—ÜÝˆ›Ø]HLÌŠHOˆ\VÜÝ‹Ý‹›Ø]›Û™WN‚ˆYˆ›ÙXÝ[Û—ÚÝÚ\È›Û™N‚ˆ™]\›ˆ”Ù[HYÜÈ‹›Z\ÜÚ[™×Ü›ÙXÝ[Ûˆ‹›Û™BˆYˆ›ÝÝÜ‚ˆ™]\›ˆ”Ù[H™Y™\°ê›˜ÚXH‹›Z\ÜÚ[™×ÚÝÜ‹›Û™BˆYˆ^XÝYÚÝÚ\È›Û™HÜˆ^XÝYÚÝÚH‚ˆ™]\›ˆ”Ù[H™Y™\°ê›˜ÚXH‹›ÚÈ‹›Û™B‚ˆ]šX][Û—ÜÝH
+
+›ÙXÝ[Û—ÚÝÚH^XÝYÚÝÚ
+HÈ^XÝYÚÝÚ
+H
+ˆLˆYˆ]šX][Û—ÜÝHØ\›š[™×Ù]šX][Û—ÜÝ‚ˆ™]\›ˆ“ÒÈ‹›ÚÈ‹]šX][Û—ÜÝˆYˆ]šX][Û—ÜÝH[\Ù]šX][Û—ÜÝ‚ˆ™]\›ˆ][°éðèÛÈ‹›ÚÈ‹]šX][Û—ÜÝˆYˆ]šX][Û—ÜÝHÜš]XØ[Ù]šX][Û—ÜÝ‚ˆ™]\›ˆ[\H‹›ÚÈ‹]šX][Û—ÜÝˆ™]\›ˆÜ°ë]XÛÈ‹›ÚÈ‹]šX][Û—ÜÝ‚‚™YˆÙ]Ü\™›Ü›X[˜ÙWÜÙ][™ÜÊÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹\ÜÙ]ÚYˆ[
+HOˆXÝÜÝ‹[žWN‚ˆ›ÝÈHÛÛ›‹™^XÝ]J”ÑSPÕ
+ˆ”“ÓH\™›Ü›X[˜ÙWÜÙ][™ÜÈÒT‘H\ÜÙ]ÚYHÈ‹
+\ÜÙ]ÚY
+JK™™]ÚÛ™J
+BˆY˜][ÈHÂˆ˜\ÜÙ]ÚYŽˆ\ÜÙ]ÚYˆ™[˜X›YŽˆKˆØ\›š[™×Ù]šX][Û—ÜÝŽˆLLŒˆ˜[\Ù]šX][Û—ÜÝŽˆLŒŒˆ˜Üš]XØ[Ù]šX][Û—ÜÝŽˆLÌŒˆ˜˜\Ù[[™WÞYX\œÈŽˆ‹ˆ›Z[—Ø˜\Ù[[™WÜÚ[ÈŽˆKˆ›[ÛWØYÙ]ÚœÛÛˆŽˆˆ‹ˆ››Ý\ÈŽˆˆ‹ˆ\]YØ]Žˆˆ‹ˆBˆYˆ›ÝÈ\È›Û™N‚ˆ™]\›ˆY˜][ÂˆY˜][Ë\]JXÝ
+›ÝÊJBˆ™]\›ˆY˜][Â‚‚™YˆÙ]Û[ÛWØYÙ]ÜÜXÚYšX×ÞZY[
+Ù][™ÜÎˆXÝÜÝ‹[žWK\š[ÙÙ]Nˆ]JHOˆ›Ø]›Û™N‚ˆ˜]ÈHÝŠÙ][™ÜË™Ù]
+›[ÛWØYÙ]ÚœÛÛˆŠHÜˆˆŠKœÝš\
+
+BˆYˆ›Ý˜]Î‚ˆ™]\›ˆ›Û™BˆžN‚ˆ^[ØYHœÛÛ‹›ØYÊ˜]ÊBˆ^Ù\œÛÛ‹’”ÓÓ‘XÛÙQ\œ›ÜŽ‚ˆ™]\›ˆ›Û™BˆYˆ›Ý\Ú[œÝ[˜ÙJ^[ØYXÝ
+N‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆ\œÙWÙ›Ø]Ý˜[YJ^[ØY™Ù]
+ˆžÜ\š[ÙÙ]K›[ÛŒ™HŠJB‚‚™YˆØ[Ý[]WÚ\ÝÜšXØ[Ø˜\Ù[[™JˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆ\ÜÙ]ÚYˆ[ˆ›ÝšY\ŽˆÝ‹ˆ\š[ÙÝ\NˆÝ‹ˆ\š[ÙÙ]Nˆ]Kˆ˜\Ù[[™WÞYX\œÎˆ[ˆZ[—Ø˜\Ù[[™WÜÚ[Îˆ[ŠHOˆ\VÙ›Ø]›Û™K›Ø]›Û™KÝ‹Ý—N‚ˆ™\Ý[HØ[Ý[]WÙ^XÝYÜ›ÙXÝ[Û—ÝÚ]ÙXYÛ›ÜÝXÊˆÛÛ›‹ˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ›ÝšY\\›ÝšY\‹ˆ\š[ÙÝ\O\\š[ÙÝ\Kˆ\š[ÙÙ]O\\š[ÙÙ]KˆÝÜS›Û™KˆÙ][™ÜÏ^Âˆ˜˜\Ù[[™WÞYX\œÈŽˆ˜\Ù[[™WÞYX\œËˆ›Z[—Ø˜\Ù[[™WÜÚ[ÈŽˆZ[—Ø˜\Ù[[™WÜÚ[Ëˆ›[ÛWØYÙ]ÚœÛÛˆŽˆˆ‹ˆKˆ
+Bˆ™]\›ˆ
+ˆ™\Ý[È™^XÝYÚÝÚ—Kˆ™\Ý[È™^XÝYÜÜXÚYšX×ÞZY[—Kˆ™\Ý[È™^XÝYÜÛÝ\˜ÙH—Kˆ™\Ý[Èœ]X[]H—Kˆ
+B‚‚™YˆØ[YWÙ]WÜ™]š[Ý\×ÞYX\œÊ\š[ÙÙ]Nˆ]K˜\Ù[[™WÞYX\œÎˆ[
+HOˆ\ÝÙ]WN‚ˆØ[™Y]\Îˆ\ÝÙ]WHH×Bˆ›ÜˆYX\—ÛÙ™œÙ][ˆ˜[™ÙJKX^
+[
+˜\Ù[[™WÞYX\œÈÜˆJKJH
+ÈJN‚ˆžN‚ˆ™]š[Ý\ÈH\š[ÙÙ]Kœ™\XÙJYX\\\š[ÙÙ]KžYX\ˆHYX\—ÛÙ™œÙ]
+Bˆ^Ù\˜[YQ\œ›ÜŽ‚ˆ™]š[Ý\ÈH\š[ÙÙ]Kœ™\XÙJYX\\\š[ÙÙ]KžYX\ˆHYX\—ÛÙ™œÙ]^OLŽ
+BˆØ[™Y]\Ë˜\[™
+™]š[Ý\ÊBˆ™]\›ˆØ[™Y]\Â‚‚™YˆØYÝ˜[YØ˜\Ù[[™WÜ›ÝÜÊˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆ\ÜÙ]ÚYˆ[ˆ›ÝšY\ŽˆÝ‹ˆ\š[ÙÝ\NˆÝ‹ˆØ[™Y]WÙ]\Îˆ\ÝÙ]WKŠHOˆ\ÝÜÜ[]LË”›Ý×N‚ˆYˆ›ÝØ[™Y]WÙ]\Î‚ˆ™]\›ˆ×BˆXÙZÛ\œÈH‹‹š›Ú[ŠÈˆ›ÜˆÈ[ˆØ[™Y]WÙ]\ÊBˆ™]\›ˆ]Y\žWØ[
+ˆÛÛ›‹ˆˆˆˆ‚ˆÑSPÕ›ÙXÝ[Û—ÚÝÚÜXÚYšX×ÞZY[\š[ÙÙ]Bˆ”“ÓH›ÙXÝ[Û—Ü™XÛÜ™ÂˆÒT‘H\ÜÙ]ÚYHÈS‘›ÝšY\ˆHÈS‘\š[ÙÝ\HHÂˆS‘\š[ÙÙ]HSˆ
+ÜXÙZÛ\œßJBˆS‘›ÙXÝ[Û—ÚÝÚTÈ“Õ•SˆS‘ÜXÚYšX×ÞZY[TÈ“Õ•SˆS‘ÓÐSTÐÑJ]WÜ]X[]K	ÉÊHOH	ÛZ\ÜÚ[™×Ü›ÙXÝ[Û‰ÂˆÔ‘Tˆ–H\š[ÙÙ]HTÐÂˆˆˆ‹ˆØ\ÜÙ]ÚY›ÝšY\‹\š[ÙÝ\K
+–Ú][Kš\ÛÙ›Ü›X]
+
+H›Üˆ][H[ˆØ[™Y]WÙ]\×WKˆ
+B‚‚™YˆØ[Ý[]WÛ]Ø˜\Ù[[™JˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆ\ÜÙ]ÚYˆ[ˆ›ÝšY\ŽˆÝ‹ˆ\š[ÙÙ]Nˆ]Kˆ˜\Ù[[™WÞYX\œÎˆ[ˆZ[—Ø˜\Ù[[™WÜÚ[Îˆ[ˆÙ^WÝ˜[YNˆ]H›Û™HH›Û™KŠHOˆXÝÜÝ‹[žWN‚ˆÙ^WÝ˜[YHHÙ^WÝ˜[YHÜˆ]KÙ^J
+Bˆ\š[ÙÜÝ\H\š[ÙÙ]Kœ™\XÙJ^OLJBˆYˆ\š[ÙÜÝ\žYX\ˆOHÙ^WÝ˜[YKžYX\ˆ[™\š[ÙÜÝ\›[ÛOHÙ^WÝ˜[YK›[Û‚ˆ\š[ÙÙ[™HÙ^WÝ˜[YBˆ[ÙN‚ˆ\š[ÙÙ[™H\š[ÙÜÝ\œ™\XÙJ^OXØ[[™\‹›[Û˜[™ÙJ\š[ÙÜÝ\žYX\‹\š[ÙÜÝ\›[Û
+VÌWJBˆ^WÜÜ[ˆH\š[ÙÙ[™™^BˆØ[™Y]WÜ˜[™Ù\Îˆ\ÝÜÝ—HH×BˆYX\›WÝ˜[Y\Îˆ\ÝÝ\VÙ›Ø]›Ø]WHH×Bˆ›ÜˆYX\—ÛÙ™œÙ][ˆ˜[™ÙJKX^
+[
+˜\Ù[[™WÞYX\œÈÜˆJKJH
+ÈJN‚ˆÝ\H\š[ÙÜÝ\œ™\XÙJYX\\\š[ÙÜÝ\žYX\ˆHYX\—ÛÙ™œÙ]
+Bˆ[™Ù^HHZ[Š^WÜÜ[‹Ø[[™\‹›[Û˜[™ÙJÝ\žYX\‹Ý\›[Û
+VÌWJBˆ[™HÝ\œ™\XÙJ^OY[™Ù^JBˆØ[™Y]WÜ˜[™Ù\Ë˜\[™
+ˆžÜÝ\š\ÛÙ›Ü›X]
+
+_K‹žÙ[™š\ÛÙ›Ü›X]
+
+_HŠBˆ›ÝÜÈH]Y\žWØ[
+ˆÛÛ›‹ˆˆˆ‚ˆÑSPÕ›ÙXÝ[Û—ÚÝÚÜXÚYšX×ÞZY[ˆ”“ÓH›ÙXÝ[Û—Ü™XÛÜ™ÂˆÒT‘H\ÜÙ]ÚYHÈS‘›ÝšY\ˆHÈS‘\š[ÙÝ\HH	Ù^IÂˆS‘\š[ÙÙ]H‘UÑQSˆÈS‘ÂˆS‘›ÙXÝ[Û—ÚÝÚTÈ“Õ•SˆS‘ÜXÚYšX×ÞZY[TÈ“Õ•SˆS‘ÓÐSTÐÑJ]WÜ]X[]K	ÉÊHOH	ÛZ\ÜÚ[™×Ü›ÙXÝ[Û‰ÂˆÔ‘Tˆ–H\š[ÙÙ]HTÐÂˆˆˆ‹ˆ
+\ÜÙ]ÚY›ÝšY\‹Ý\š\ÛÙ›Ü›X]
+
+K[™š\ÛÙ›Ü›X]
+
+JKˆ
+BˆYˆ[Š›ÝÜÊHOH[™Ù^N‚ˆYX\›WÝ˜[Y\Ë˜\[™
+ˆ
+ˆÝ[J›Ø]
+›ÝÖÈœ›ÙXÝ[Û—ÚÝÚ—JH›Üˆ›ÝÈ[ˆ›ÝÜÊKˆÝ[J›Ø]
+›ÝÖÈœÜXÚYšX×ÞZY[—JH›Üˆ›ÝÈ[ˆ›ÝÜÊKˆ
+Bˆ
+BˆYˆ[ŠYX\›WÝ˜[Y\ÊHX^
+[
+Z[—Ø˜\Ù[[™WÜÚ[ÈÜˆJKJN‚ˆ™]\›ˆÂˆ™^XÝYÚÝÚŽˆ›Û™Kˆ™^XÝYÜÜXÚYšX×ÞZY[Žˆ›Û™Kˆ™^XÝYÜÛÝ\˜ÙHŽˆ››Û™H‹ˆœ]X[]HŽˆœ\X[Ú\ÝÜžHˆYˆYX\›WÝ˜[Y\È[ÙH›ÚÈ‹ˆ™XYÛ›ÜÝXÈŽˆÂˆš\ÝÜšXØ[Ü™XÛÜ™×Ù›Ý[™Žˆ[ŠYX\›WÝ˜[Y\ÊKˆ˜˜\Ù[[™WÞYX\œÈŽˆ˜\Ù[[™WÞYX\œËˆ›Z[—Ø˜\Ù[[™WÜÚ[ÈŽˆZ[—Ø˜\Ù[[™WÜÚ[Ëˆ˜Ø[™Y]WÚ\ÝÜšXØ[Ù]\ÈŽˆØ[™Y]WÜ˜[™Ù\Ëˆ™^XÝYÜÛÝ\˜ÙWØ][\YŽˆš\ÝÜšXØ[ÜØ[YWÜ\š[Ù‹ˆ››×Ü™Y™\™[˜ÙWÜ™X\ÛÛˆŽˆ“U™Y™\™[˜ÙH™\]Z\™\È\ÝÜšXØ[Z[H™XÛÜ™È›ÜˆØ[YH\š[Ù‹ˆœ\š[ÙÜÝ\Žˆ\š[ÙÜÝ\š\ÛÙ›Ü›X]
+
+Kˆœ\š[ÙÙ[™Žˆ\š[ÙÙ[™š\ÛÙ›Ü›X]
+
+KˆKˆBˆ^XÝYÚÝÚHÝ[J][VÌH›Üˆ][H[ˆYX\›WÝ˜[Y\ÊHÈ[ŠYX\›WÝ˜[Y\ÊBˆ^XÝYÜÜXÚYšX×ÞZY[HÝ[J][VÌWH›Üˆ][H[ˆYX\›WÝ˜[Y\ÊHÈ[ŠYX\›WÝ˜[Y\ÊBˆ™]\›ˆÂˆ™^XÝYÚÝÚŽˆ^XÝYÚÝÚˆ™^XÝYÜÜXÚYšX×ÞZY[Žˆ^XÝYÜÜXÚYšX×ÞZY[ˆ™^XÝYÜÛÝ\˜ÙHŽˆš\ÝÜšXØ[ÜØ[YWÜ\š[Ù‹ˆœ]X[]HŽˆ›ÚÈ‹ˆ™XYÛ›ÜÝXÈŽˆÂˆš\ÝÜšXØ[Ü™XÛÜ™×Ù›Ý[™Žˆ[ŠYX\›WÝ˜[Y\ÊKˆ˜˜\Ù[[™WÞYX\œÈŽˆ˜\Ù[[™WÞYX\œËˆ›Z[—Ø˜\Ù[[™WÜÚ[ÈŽˆZ[—Ø˜\Ù[[™WÜÚ[Ëˆ˜Ø[™Y]WÚ\ÝÜšXØ[Ù]\ÈŽˆØ[™Y]WÜ˜[™Ù\Ëˆ™^XÝYÜÛÝ\˜ÙWØ][\YŽˆš\ÝÜšXØ[ÜØ[YWÜ\š[Ù‹ˆ››×Ü™Y™\™[˜ÙWÜ™X\ÛÛˆŽˆˆ‹ˆœ\š[ÙÜÝ\Žˆ\š[ÙÜÝ\š\ÛÙ›Ü›X]
+
+Kˆœ\š[ÙÙ[™Žˆ\š[ÙÙ[™š\ÛÙ›Ü›X]
+
+KˆKˆB‚‚™YˆØ[Ý[]WÙ^XÝYÜ›ÙXÝ[Û—ÝÚ]ÙXYÛ›ÜÝXÊˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆ\ÜÙ]ÚYˆ[ˆ›ÝšY\ŽˆÝ‹ˆ\š[ÙÝ\NˆÝ‹ˆ\š[ÙÙ]Nˆ]KˆÝÜˆ›Ø]›Û™KˆÙ][™ÜÎˆXÝÜÝ‹[žWKˆ\ÜÙ]Û˜[YNˆÝˆHˆ‹ˆÙ^WÝ˜[YNˆ]H›Û™HH›Û™KŠHOˆXÝÜÝ‹[žWN‚ˆ˜\Ù[[™WÞYX\œÈH[
+Ù][™ÜË™Ù]
+˜˜\Ù[[™WÞYX\œÈŠHÜˆŠBˆZ[—Ø˜\Ù[[™WÜÚ[ÈH[
+Ù][™ÜË™Ù]
+›Z[—Ø˜\Ù[[™WÜÚ[ÈŠHÜˆJBˆYˆ\š[ÙÝ\HOH›]Ž‚ˆ™\Ý[HØ[Ý[]WÛ]Ø˜\Ù[[™JˆÛÛ›‹ˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ›ÝšY\\›ÝšY\‹ˆ\š[ÙÙ]O\\š[ÙÙ]Kˆ˜\Ù[[™WÞYX\œÏX˜\Ù[[™WÞYX\œËˆZ[—Ø˜\Ù[[™WÜÚ[Ï[Z[—Ø˜\Ù[[™WÜÚ[ËˆÙ^WÝ˜[YO]Ù^WÝ˜[YKˆ
+Bˆ[ÙN‚ˆ\ÝÜšXØ[Ý\HH›[ÛˆYˆ\š[ÙÝ\HOH›[Ûˆ[ÙH™^H‚ˆØ[™Y]\ÈHØ[YWÙ]WÜ™]š[Ý\×ÞYX\œÊ\š[ÙÙ]Kœ™\XÙJ^OLJHYˆ\š[ÙÝ\HOH›[Ûˆ[ÙH\š[ÙÙ]K˜\Ù[[™WÞYX\œÊBˆ›ÝÜÈHØYÝ˜[YØ˜\Ù[[™WÜ›ÝÜÊˆÛÛ›‹ˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ›ÝšY\\›ÝšY\‹ˆ\š[ÙÝ\OZ\ÝÜšXØ[Ý\KˆØ[™Y]WÙ]\ÏXØ[™Y]\Ëˆ
+BˆXYÛ›ÜÝXÈHÂˆš\ÝÜšXØ[Ü™XÛÜ™×Ù›Ý[™Žˆ[Š›ÝÜÊKˆ˜˜\Ù[[™WÞYX\œÈŽˆ˜\Ù[[™WÞYX\œËˆ›Z[—Ø˜\Ù[[™WÜÚ[ÈŽˆZ[—Ø˜\Ù[[™WÜÚ[Ëˆ˜Ø[™Y]WÚ\ÝÜšXØ[Ù]\ÈŽˆÚ][Kš\ÛÙ›Ü›X]
+
+H›Üˆ][H[ˆØ[™Y]\×Kˆ™^XÝYÜÛÝ\˜ÙWØ][\YŽˆš\ÝÜšXØ[ÜØ[YWÜ\š[Ù‹ˆ››×Ü™Y™\™[˜ÙWÜ™X\ÛÛˆŽˆˆ‹ˆBˆYˆ[Š›ÝÜÊHZ[—Ø˜\Ù[[™WÜÚ[Î‚ˆX™[H›[ÛHˆYˆ\š[ÙÝ\HOH›[Ûˆ[ÙH™Z[H‚ˆXYÛ›ÜÝXÖÈ››×Ü™Y™\™[˜ÙWÜ™X\ÛÛˆ—HH
+ˆˆ“›È\ÝÜšXØ[ÛX™[H™XÛÜ™È›Ý[™›ÜˆØ[YHÉÛ[Û	ÈYˆ\š[ÙÝ\HOH	Û[Û	È[ÙH	Ù^IßH[ˆ™]š[Ý\ÈYX\œÈ‚ˆYˆ›Ý›ÝÜÂˆ[ÙHˆ“Û›HÛ[Š›ÝÜÊ_H˜\Ù[[™HÚ[È›Ý[™Z[š[][H\ÈÛZ[—Ø˜\Ù[[™WÜÚ[ßH‚ˆ
+Bˆ™\Ý[HÂˆ™^XÝYÚÝÚŽˆ›Û™Kˆ™^XÝYÜÜXÚYšX×ÞZY[Žˆ›Û™Kˆ™^XÝYÜÛÝ\˜ÙHŽˆ››Û™H‹ˆœ]X[]HŽˆœ\X[Ú\ÝÜžHˆYˆ›ÝÜÈ[ÙH›ÚÈ‹ˆ™XYÛ›ÜÝXÈŽˆXYÛ›ÜÝXËˆBˆ[ÙN‚ˆ›ÙXÝ[Û—Ý˜[Y\ÈHÙ›Ø]
+›ÝÖÈœ›ÙXÝ[Û—ÚÝÚ—JH›Üˆ›ÝÈ[ˆ›ÝÜ×BˆÜXÚYšX×Ý˜[Y\ÈHÙ›Ø]
+›ÝÖÈœÜXÚYšX×ÞZY[—JH›Üˆ›ÝÈ[ˆ›ÝÜ×Bˆ™\Ý[HÂˆ™^XÝYÚÝÚŽˆÝ[J›ÙXÝ[Û—Ý˜[Y\ÊHÈ[Š›ÙXÝ[Û—Ý˜[Y\ÊKˆ™^XÝYÜÜXÚYšX×ÞZY[ŽˆÝ[JÜXÚYšX×Ý˜[Y\ÊHÈ[ŠÜXÚYšX×Ý˜[Y\ÊKˆ™^XÝYÜÛÝ\˜ÙHŽˆš\ÝÜšXØ[ÜØ[YWÜ\š[Ù‹ˆœ]X[]HŽˆ›ÚÈ‹ˆ™XYÛ›ÜÝXÈŽˆXYÛ›ÜÝXËˆB‚ˆYˆ™\Ý[È™^XÝYÚÝÚ—H\È›Û™N‚ˆYÙ]ÜÜXÚYšXÈHÙ]Û[ÛWØYÙ]ÜÜXÚYšX×ÞZY[
+Ù][™ÜË\š[ÙÙ]JBˆYˆYÙ]ÜÜXÚYšXÈ\È›Ý›Û™H[™ÝÜ‚ˆYˆ\š[ÙÝ\HOH™^HŽ‚ˆYÙ]ÜÜXÚYšXÈHYÙ]ÜÜXÚYšXÈÈØ[[™\‹›[Û˜[™ÙJ\š[ÙÙ]KžYX\‹\š[ÙÙ]K›[Û
+VÌWBˆ™\Ý[HÂˆ™^XÝYÚÝÚŽˆYÙ]ÜÜXÚYšXÈ
+ˆÝÜˆ™^XÝYÜÜXÚYšX×ÞZY[ŽˆYÙ]ÜÜXÚYšXËˆ™^XÝYÜÛÝ\˜ÙHŽˆ›[ÛWØYÙ]‹ˆœ]X[]HŽˆ›ÚÈ‹ˆ™XYÛ›ÜÝXÈŽˆÂˆ
+Šœ™\Ý[È™XYÛ›ÜÝXÈ—Kˆ™^XÝYÜÛÝ\˜ÙWØ][\YŽˆ›[ÛWØYÙ]‹ˆ››×Ü™Y™\™[˜ÙWÜ™X\ÛÛˆŽˆˆ‹ˆKˆBˆYˆÝÜ\È›Û™N‚ˆ™\Ý[È™XYÛ›ÜÝXÈ—VÈ››×Ü™Y™\™[˜ÙWÜ™X\ÛÛˆ—HH“Z\ÜÚ[™ÈÕÜ‚ˆYˆ™\Ý[È™^XÝYÜÜXÚYšX×ÞZY[—H\È›Û™H[™›Ý™\Ý[È™XYÛ›ÜÝXÈ—K™Ù]
+››×Ü™Y™\™[˜ÙWÜ™X\ÛÛˆŠN‚ˆ™\Ý[È™XYÛ›ÜÝXÈ—VÈ››×Ü™Y™\™[˜ÙWÜ™X\ÛÛˆ—HH“Z\ÜÚ[™È^XÝYÜÜXÚYšX×ÞZY[‚‚ˆÙÙÙ\ˆHÝ\œ™[Ø\›ÙÙÙ\ˆYˆ\×Ø\ØÛÛ^
+
+H[ÙHÙÙÚ[™Ë™Ù]ÙÙÙ\Š×Û˜[YW×ÊBˆÙÙÙ\‹š[™›Êˆ”\™›Ü›X[˜ÙH™Y™\™[˜ÙHØ[Ý[][ÛŽˆ\ÜÙ]ÚYI\È\ÜÙ]Û˜[YOI\È\š[ÙÝ\OI\È\š[ÙÙ]OI\È˜\Ù[[™WÞYX\œÏI\ÈØ[™Y]WÙ]\ÏI\È˜[YØ˜\Ù[[™WÜ™XÛÜ™ÏI\È^XÝYÜÜXÚYšX×ÞZY[I\È^XÝYÜÛÝ\˜ÙOI\È›×Ü™Y™\™[˜ÙWÜ™X\ÛÛI\È‹ˆ\ÜÙ]ÚYˆ\ÜÙ]Û˜[YKˆ\š[ÙÝ\Kˆ\š[ÙÙ]Kš\ÛÙ›Ü›X]
+
+Kˆ˜\Ù[[™WÞYX\œËˆ™\Ý[È™XYÛ›ÜÝXÈ—K™Ù]
+˜Ø[™Y]WÚ\ÝÜšXØ[Ù]\ÈŠKˆ™\Ý[È™XYÛ›ÜÝXÈ—K™Ù]
+š\ÝÜšXØ[Ü™XÛÜ™×Ù›Ý[™ŠKˆ™\Ý[È™^XÝYÜÜXÚYšX×ÞZY[—Kˆ™\Ý[È™^XÝYÜÛÝ\˜ÙH—Kˆ™\Ý[È™XYÛ›ÜÝXÈ—K™Ù]
+››×Ü™Y™\™[˜ÙWÜ™X\ÛÛˆ‹ˆŠKˆ
+Bˆ™]\›ˆ™\Ý[‚‚™YˆØ[Ý[]WÙ^XÝYÜ›ÙXÝ[ÛŠˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆ\ÜÙ]ÚYˆ[ˆ›ÝšY\ŽˆÝ‹ˆ\š[ÙÝ\NˆÝ‹ˆ\š[ÙÙ]Nˆ]KˆÝÜˆ›Ø]›Û™KˆÙ][™ÜÎˆXÝÜÝ‹[žWKŠHOˆ\VÙ›Ø]›Û™K›Ø]›Û™KÝ‹Ý—N‚ˆ™\Ý[HØ[Ý[]WÙ^XÝYÜ›ÙXÝ[Û—ÝÚ]ÙXYÛ›ÜÝXÊˆÛÛ›‹ˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ›ÝšY\\›ÝšY\‹ˆ\š[ÙÝ\O\\š[ÙÝ\Kˆ\š[ÙÙ]O\\š[ÙÙ]KˆÝÜZÝÜˆÙ][™ÜÏ\Ù][™ÜËˆ
+Bˆ™]\›ˆ™\Ý[È™^XÝYÚÝÚ—K™\Ý[È™^XÝYÜÜXÚYšX×ÞZY[—K™\Ý[È™^XÝYÜÛÝ\˜ÙH—K™\Ý[Èœ]X[]H—B‚‚™Yˆ\Ù\Ü›ÙXÝ[Û—Ü™XÛÜ™
+ˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆ\ÜÙ]ÚYˆ[ˆ›ÝšY\ŽˆÝ‹ˆ^\›˜[ÚYˆÝ‹ˆ\š[ÙÝ\NˆÝ‹ˆ\š[ÙÙ]Nˆ]Kˆ›ÙXÝ[Û—ÚÝÚˆ›Ø]›Û™KˆÜXÚYšX×ÞZY[ˆ›Ø]›Û™Kˆ^XÝYÚÝÚˆ›Ø]›Û™Kˆ^XÝYÜÜXÚYšX×ÞZY[ˆ›Ø]›Û™Kˆ]šX][Û—ÜÝˆ›Ø]›Û™Kˆ\™›Ü›X[˜ÙWÜÝ]\ÎˆÝ‹ˆ^XÝYÜÛÝ\˜ÙNˆÝ‹ˆ]WÜ]X[]NˆÝ‹ˆ›Ý\ÎˆÝ‹ˆ^[ØYÚœÛÛŽˆÝ‹ˆÙ[XÝYÜ›ÙXÝ[Û—ÚÙ^NˆÝˆHˆ‹ˆÙ[XÝYÜ›ÙXÝ[Û—Ü˜]×Ý˜[YNˆÝˆHˆ‹ˆ™Y™\™[˜ÙWÙXYÛ›ÜÝX×ÚœÛÛŽˆÝˆHˆ‹ŠHOˆÝŽ‚ˆ›ÝÈH]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠBˆ^\Ý[™ÈHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕYˆ”“ÓH›ÙXÝ[Û—Ü™XÛÜ™ÂˆÒT‘H\ÜÙ]ÚYHÈS‘›ÝšY\ˆHÈS‘\š[ÙÝ\HHÈS‘\š[ÙÙ]HHÂˆSRUBˆˆˆ‹ˆ
+\ÜÙ]ÚY›ÝšY\‹\š[ÙÝ\K\š[ÙÙ]Kš\ÛÙ›Ü›X]
+
+JKˆ
+K™™]ÚÛ™J
+BˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È›ÙXÝ[Û—Ü™XÛÜ™È
+ˆ\ÜÙ]ÚY›ÝšY\‹^\›˜[ÚY\š[ÙÝ\K\š[ÙÙ]K›ÙXÝ[Û—ÚÝÚÜXÚYšX×ÞZY[ˆ^XÝYÚÝÚ^XÝYÜÜXÚYšX×ÞZY[]šX][Û—ÜÝ\™›Ü›X[˜ÙWÜÝ]\Ë^XÝYÜÛÝ\˜ÙKˆ]WÜ]X[]K›Ý\ËÙ[XÝYÜ›ÙXÝ[Û—ÚÙ^KÙ[XÝYÜ›ÙXÝ[Û—Ü˜]×Ý˜[YK™Y™\™[˜ÙWÙXYÛ›ÜÝX×ÚœÛÛ‹ˆ^[ØYÚœÛÛ‹Ü™X]YØ]\]YØ]ˆ
+HSQTÈ
+ËËËËËËËËËËËËËËËËËËËÊBˆÓˆÓÓ‘“PÕ
+\ÜÙ]ÚY›ÝšY\‹\š[ÙÝ\K\š[ÙÙ]JHÈTUHÑUˆ^\›˜[ÚYH^ÛYY™^\›˜[ÚYˆ›ÙXÝ[Û—ÚÝÚH^ÛYYœ›ÙXÝ[Û—ÚÝÚˆÜXÚYšX×ÞZY[H^ÛYYœÜXÚYšX×ÞZY[ˆ^XÝYÚÝÚH^ÛYY™^XÝYÚÝÚˆ^XÝYÜÜXÚYšX×ÞZY[H^ÛYY™^XÝYÜÜXÚYšX×ÞZY[ˆ]šX][Û—ÜÝH^ÛYY™]šX][Û—ÜÝˆ\™›Ü›X[˜ÙWÜÝ]\ÈH^ÛYYœ\™›Ü›X[˜ÙWÜÝ]\Ëˆ^XÝYÜÛÝ\˜ÙHH^ÛYY™^XÝYÜÛÝ\˜ÙKˆ]WÜ]X[]HH^ÛYY™]WÜ]X[]Kˆ›Ý\ÈH^ÛYY››Ý\ËˆÙ[XÝYÜ›ÙXÝ[Û—ÚÙ^HH^ÛYYœÙ[XÝYÜ›ÙXÝ[Û—ÚÙ^KˆÙ[XÝYÜ›ÙXÝ[Û—Ü˜]×Ý˜[YHH^ÛYYœÙ[XÝYÜ›ÙXÝ[Û—Ü˜]×Ý˜[YKˆ™Y™\™[˜ÙWÙXYÛ›ÜÝX×ÚœÛÛˆH^ÛYYœ™Y™\™[˜ÙWÙXYÛ›ÜÝX×ÚœÛÛ‹ˆ^[ØYÚœÛÛˆH^ÛYYœ^[ØYÚœÛÛ‹ˆ\]YØ]H^ÛYY\]YØ]ˆˆˆ‹ˆ
+ˆ\ÜÙ]ÚYˆ›ÝšY\‹ˆ^\›˜[ÚYÜˆ›Û™Kˆ\š[ÙÝ\Kˆ\š[ÙÙ]Kš\ÛÙ›Ü›X]
+
+Kˆ›ÙXÝ[Û—ÚÝÚˆÜXÚYšX×ÞZY[ˆ^XÝYÚÝÚˆ^XÝYÜÜXÚYšX×ÞZY[ˆ]šX][Û—ÜÝˆ\™›Ü›X[˜ÙWÜÝ]\Ëˆ^XÝYÜÛÝ\˜ÙKˆ]WÜ]X[]Kˆ›Ý\ËˆÙ[XÝYÜ›ÙXÝ[Û—ÚÙ^HÜˆ›Û™KˆÙ[XÝYÜ›ÙXÝ[Û—Ü˜]×Ý˜[YHÜˆ›Û™Kˆ™Y™\™[˜ÙWÙXYÛ›ÜÝX×ÚœÛÛˆÜˆ›Û™Kˆ^[ØYÚœÛÛ‹ˆ›ÝËˆ›ÝËˆ
+Kˆ
+Bˆ™]\›ˆ\]YˆYˆ^\Ý[™È[ÙHš[œÙ\Y‚‚‚™YˆÝÜ™WÜ›ÙXÝ[Û—ÚÜWÜ™XÛÜ™
+ˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆ\ÜÙ]Ü›ÝÎˆÜ[]LË”›ÝÈXÝÜÝ‹[žWKˆ›ÝšY\ŽˆÝ‹ˆ^\›˜[ÚYˆÝ‹ˆ\š[ÙÝ\NˆÝ‹ˆ\š[ÙÙ]Nˆ]KˆÜWÜ›ÝÎˆXÝÜÝ‹[žWKˆ›Ý\×Ü™Yš^ˆÝˆHˆ‹ŠHOˆXÝÜÝ‹[žWN‚ˆ]WÚ][WÛX\HÜWÜ›ÝË™Ù]
+™]R][SX\ŠHYˆ\Ú[œÝ[˜ÙJÜWÜ›ÝËXÝ
+H[ÙHßBˆYˆ›Ý\Ú[œÝ[˜ÙJ]WÚ][WÛX\XÝ
+N‚ˆ]WÚ][WÛX\HßBˆ›ÙXÝ[Û—ÚÝÚÙ[XÝYÚÙ^KÙ[XÝYÜ˜]×Ý˜[YHHÙ[XÝÜ›ÙXÝ[Û—Ý˜[YJ]WÚ][WÛX\
+BˆÝÜH\œÙWÚÝÜÝ˜[YJ\ÜÙ]Ü›ÝÖÈšÝÜ—JBˆÜXÚYšX×ÞZY[HØ[Ý[]WÜÜXÚYšX×ÞZY[
+›ÙXÝ[Û—ÚÝÚÝÜ
+Bˆ\ÜÙ]ÚYH[
+\ÜÙ]Ü›ÝÖÈ˜\ÜÙ]ÚY—HYˆ˜\ÜÙ]ÚYˆ[ˆ\ÜÙ]Ü›ÝËšÙ^\Ê
+H[ÙH\ÜÙ]Ü›ÝÖÈšY—JBˆÙ][™ÜÈHÙ]Ü\™›Ü›X[˜ÙWÜÙ][™ÜÊÛÛ›‹\ÜÙ]ÚY
+Bˆ›ÜˆÙ^H[ˆÙ][™ÜÎ‚ˆžN‚ˆ›Ý×Ý˜[YHH\ÜÙ]Ü›ÝÖÚÙ^WBˆ^Ù\
+Ù^Q\œ›Ü‹[™^\œ›ÜŠN‚ˆÛÛ[YBˆYˆ›Ý×Ý˜[YH\È›Ý›Û™N‚ˆÙ][™ÜÖÚÙ^WHH›Ý×Ý˜[YB‚ˆ™Y™\™[˜ÙWÜ™\Ý[HØ[Ý[]WÙ^XÝYÜ›ÙXÝ[Û—ÝÚ]ÙXYÛ›ÜÝXÊˆÛÛ›‹ˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ›ÝšY\\›ÝšY\‹ˆ\š[ÙÝ\O\\š[ÙÝ\Kˆ\š[ÙÙ]O\\š[ÙÙ]KˆÝÜZÝÜˆÙ][™ÜÏ\Ù][™ÜËˆ\ÜÙ]Û˜[YO\ÝŠ\ÜÙ]Ü›ÝÖÈœ›Ú™XÝÛ˜[YH—HYˆœ›Ú™XÝÛ˜[YHˆ[ˆ\ÜÙ]Ü›ÝËšÙ^\Ê
+H[ÙHˆŠKˆ
+Bˆ^XÝYÚÝÚH™Y™\™[˜ÙWÜ™\Ý[È™^XÝYÚÝÚ—Bˆ^XÝYÜÜXÚYšX×ÞZY[H™Y™\™[˜ÙWÜ™\Ý[È™^XÝYÜÜXÚYšX×ÞZY[—Bˆ^XÝYÜÛÝ\˜ÙHH™Y™\™[˜ÙWÜ™\Ý[È™^XÝYÜÛÝ\˜ÙH—Bˆ˜\Ù[[™WÜ]X[]HH™Y™\™[˜ÙWÜ™\Ý[Èœ]X[]H—Bˆ\™›Ü›X[˜ÙWÜÝ]\Ë]WÜ]X[]K]šX][Û—ÜÝHÛ\ÜÚYžWÜ\™›Ü›X[˜ÙWÜÝ]\Êˆ›ÙXÝ[Û—ÚÝÚˆÝÜˆ^XÝYÚÝÚˆØ\›š[™×Ù]šX][Û—ÜÝY›Ø]
+Ù][™ÜË™Ù]
+Ø\›š[™×Ù]šX][Û—ÜÝŠHÜˆLL
+Kˆ[\Ù]šX][Û—ÜÝY›Ø]
+Ù][™ÜË™Ù]
+˜[\Ù]šX][Û—ÜÝŠHÜˆLŒ
+KˆÜš]XØ[Ù]šX][Û—ÜÝY›Ø]
+Ù][™ÜË™Ù]
+˜Üš]XØ[Ù]šX][Û—ÜÝŠHÜˆLÌ
+Kˆ
+BˆYˆ]WÜ]X[]HOH›ÚÈˆ[™˜\Ù[[™WÜ]X[]HOHœ\X[Ú\ÝÜžHˆ[™^XÝYÜÛÝ\˜ÙHOH››Û™HŽ‚ˆ]WÜ]X[]HHœ\X[Ú\ÝÜžH‚‚ˆ›Ý\×Ü\ÈHÛ›Ý\×Ü™Yš^HYˆ›Ý\×Ü™Yš^[ÙH×BˆYˆ›ÙXÝ[Û—ÚÝÚ\È›Û™N‚ˆ›Ý\×Ü\Ë˜\[™
+ˆZ[ÛZ\ÜÚ[™×Ü›ÙXÝ[Û—Û›ÝJˆ]WÚ][WÛX\ˆÝ][Û—ØÛÙOY^\›˜[ÚYˆ\š[ÙÝ\O\\š[ÙÝ\Kˆ\š[ÙÙ]O\\š[ÙÙ]Kˆ
+Bˆ
+BˆYˆÝÜ\È›Û™N‚ˆ›Ý\×Ü\Ë˜\[™
+šÕÜØØ[[H˜[HÝH[˜[YËˆŠBˆYˆ^XÝYÜÛÝ\˜ÙHOH››Û™HŽ‚ˆ›Ý\×Ü\Ë˜\[™
+”Ù[H\Ý0ìÜšXÛÈÝHÜ°éØ[Y[ÈY[œØ[\˜H™Y™\°ê›˜ÚXKˆŠB‚ˆYˆ›ÙXÝ[Û—ÚÝÚ\È›Û™N‚ˆ^\Ý[™×Ý˜[YHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕYˆ”“ÓH›ÙXÝ[Û—Ü™XÛÜ™ÂˆÒT‘H\ÜÙ]ÚYHÈS‘›ÝšY\ˆHÈS‘\š[ÙÝ\HHÈS‘\š[ÙÙ]HHÂˆS‘›ÙXÝ[Û—ÚÝÚTÈ“Õ•SˆS‘ÓÐSTÐÑJ]WÜ]X[]K	ÉÊHOH	ÛZ\ÜÚ[™×Ü›ÙXÝ[Û‰ÂˆSRUBˆˆˆ‹ˆ
+\ÜÙ]ÚY›ÝšY\‹\š[ÙÝ\K\š[ÙÙ]Kš\ÛÙ›Ü›X]
+
+JKˆ
+K™™]ÚÛ™J
+BˆYˆ^\Ý[™×Ý˜[Y‚ˆ™]\›ˆÂˆ\Ù\ÜÝ]\ÈŽˆœÚÚ\YÙ^\Ý[™×Ý˜[Y‹ˆœ›ÙXÝ[Û—ÚÝÚŽˆ›Û™KˆœÜXÚYšX×ÞZY[Žˆ›Û™Kˆœ\™›Ü›X[˜ÙWÜÝ]\ÈŽˆ\™›Ü›X[˜ÙWÜÝ]\Ëˆ™]WÜ]X[]HŽˆ]WÜ]X[]KˆB‚ˆ\Ù\ÜÝ]\ÈH\Ù\Ü›ÙXÝ[Û—Ü™XÛÜ™
+ˆÛÛ›‹ˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ›ÝšY\\›ÝšY\‹ˆ^\›˜[ÚYY^\›˜[ÚYˆ\š[ÙÝ\O\\š[ÙÝ\Kˆ\š[ÙÙ]O\\š[ÙÙ]Kˆ›ÙXÝ[Û—ÚÝÚ\›ÙXÝ[Û—ÚÝÚˆÜXÚYšX×ÞZY[\ÜXÚYšX×ÞZY[ˆ^XÝYÚÝÚY^XÝYÚÝÚˆ^XÝYÜÜXÚYšX×ÞZY[Y^XÝYÜÜXÚYšX×ÞZY[ˆ]šX][Û—ÜÝY]šX][Û—ÜÝˆ\™›Ü›X[˜ÙWÜÝ]\Ï\\™›Ü›X[˜ÙWÜÝ]\Ëˆ^XÝYÜÛÝ\˜ÙOY^XÝYÜÛÝ\˜ÙKˆ]WÜ]X[]OY]WÜ]X[]Kˆ›Ý\ÏHˆ‹š›Ú[Š›Ý\×Ü\ÊKˆ^[ØYÚœÛÛ\ÝŠÜWÜ›ÝË™Ù]
+œ^[ØYÚœÛÛˆŠHÜˆœÛÛ‹™[\ÊÜWÜ›ÝË[œÝ\™WØ\ØÚZOUYJJKˆÙ[XÝYÜ›ÙXÝ[Û—ÚÙ^O\Ù[XÝYÚÙ^KˆÙ[XÝYÜ›ÙXÝ[Û—Ü˜]×Ý˜[YO\Ù[XÝYÜ˜]×Ý˜[YKˆ™Y™\™[˜ÙWÙXYÛ›ÜÝX×ÚœÛÛZœÛÛ‹™[\Ê™Y™\™[˜ÙWÜ™\Ý[È™XYÛ›ÜÝXÈ—K[œÝ\™WØ\ØÚZOUYJKˆ
+Bˆ™]\›ˆÂˆ\Ù\ÜÝ]\ÈŽˆ\Ù\ÜÝ]\Ëˆœ›ÙXÝ[Û—ÚÝÚŽˆ›ÙXÝ[Û—ÚÝÚˆœ\™›Ü›X[˜ÙWÜÝ]\ÈŽˆ\™›Ü›X[˜ÙWÜÝ]\Ëˆ™]WÜ]X[]HŽˆ]WÜ]X[]KˆB‚‚™Yˆš\œÝÛ›Û—Ù[\J^[ØYˆXÝÜÝ‹[žWKÙ^\Îˆ\ÝÜÝ—JHOˆÝŽ‚ˆ›ÜˆÙ^H[ˆÙ^\Î‚ˆ˜[YHH^[ØY™Ù]
+Ù^JBˆYˆ˜[YH›Ý[ˆ
+›Û™KˆŠN‚ˆ™]\›ˆÝŠ˜[YJKœÝš\
+
+Bˆ™]\›ˆˆ‚‚‚™Yˆ\œÙWÙ\Ú[ÛœÛÛ\—Ü—Ú[œ]Ê›ÝÎˆXÝÜÝ‹[žWJHOˆ\VÙXÝÜÝ‹[žWKXÝÜÝ‹[žWWN‚ˆÝ\œ™[ÎˆXÝÜÝ‹[žWHHßBˆ›ÛYÙ\ÎˆXÝÜÝ‹[žWHHßBˆÛÝ\˜ÙHH›ÝË™Ù]
+™]R][SX\ŠHYˆ\Ú[œÝ[˜ÙJ›ÝË™Ù]
+™]R][SX\ŠKXÝ
+H[ÙH›ÝÂˆ›Üˆ[™^[ˆ˜[™ÙJKÍÊN‚ˆÝ\œ™[ÚÙ^HHˆœžÚ[™^WÚH‚ˆ›ÛYÙWÚÙ^HHˆœžÚ[™^WÝH‚ˆYˆÝ\œ™[ÚÙ^H[ˆÛÝ\˜ÙH[™ÛÝ\˜ÙVØÝ\œ™[ÚÙ^WH›Ý[ˆ
+›Û™KˆŠN‚ˆÝ\œ™[ÖØÝ\œ™[ÚÙ^WHHÛÝ\˜ÙVØÝ\œ™[ÚÙ^WBˆYˆ›ÛYÙWÚÙ^H[ˆÛÝ\˜ÙH[™ÛÝ\˜ÙVÝ›ÛYÙWÚÙ^WH›Ý[ˆ
+›Û™KˆŠN‚ˆ›ÛYÙ\ÖÝ›ÛYÙWÚÙ^WHHÛÝ\˜ÙVÝ›ÛYÙWÚÙ^WBˆ™]\›ˆÝ\œ™[Ë›ÛYÙ\Â‚‚™YˆØ[Ý[]WÜ—Ú[œ]ÚX[
+ˆÝ\œ™[ÎˆXÝÜÝ‹[žWKˆ›ÛYÙ\ÎˆXÝÜÝ‹[žWKˆ
+‹ˆ^XÝYÜÝš[™×Ú[™^\ÎˆÙ]Ú[KŠHOˆXÝÜÝ‹[žWN‚ˆ^XÝYÚ[œ]ÈHÛÜY
+^XÝYÜÝš[™×Ú[™^\ÊBˆ]˜Z[X›WÚ[œ]ÈHˆ[˜]˜Z[X›WÚ[œ]ÈHˆ›ÛYÙWÝ˜[Y\ÎˆXÝÜÝ‹›Ø]HHßBˆ›Üˆ[™^[ˆ^XÝYÚ[œ]Î‚ˆ›ÛYÙHH\œÙWÙ›Ø]Ý˜[YJ›ÛYÙ\Ë™Ù]
+ˆœžÚ[™^WÝHŠJBˆ›ÛYÙWÝ˜[Y\ÖÜÝŠ[™^
+WHH›ÛYÙHÜˆŒˆYˆ›ÛYÙH\È›Ý›Û™H[™›ÛYÙHˆQUSÔÕ’S‘×Ô‘TÑS•Õ“ÓQÑWÕ‘TÒÓ‚ˆ]˜Z[X›WÚ[œ]È
+ÏHBˆ[ÙN‚ˆ[˜]˜Z[X›WÚ[œ]È
+ÏHBˆÝ[Ú[œ]ÈH[Š^XÝYÚ[œ]ÊBˆ™]\›ˆÂˆ˜]˜Z[X›WÜÝš[™ÜÈŽˆ]˜Z[X›WÚ[œ]ËˆÝ[ÜÝš[™ÜÈŽˆÝ[Ú[œ]Ëˆ[˜]˜Z[X›WÜÝš[™ÜÈŽˆ[˜]˜Z[X›WÚ[œ]ËˆœÝš[™×Ø]˜Z[Xš[]WÜÝŽˆ›Ý[™
+]˜Z[X›WÚ[œ]ÈÈÝ[Ú[œ]È
+ˆLŠHYˆÝ[Ú[œ]È[ÙH›Û™Kˆœ—Ú[œ]ÙXYÛ›ÜÝXÜÈŽˆÂˆ™^XÝYÚ[œ]ÈŽˆ^XÝYÚ[œ]Ëˆ›ÛYÙ\×ÝˆŽˆ›ÛYÙWÝ˜[Y\ËˆKˆB‚‚™YˆX\›—Ù^XÝYÜÝš[™Ü×Ùœ›ÛWÝ›ÛYÙJˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ›ÝšY\—Ù]šXÙWÚYˆ[ˆ›ÛYÙ\ÎˆXÝÜÝ‹[žWKˆØœÙ\™YØ]ˆÝ‹ŠHOˆÙ]Ú[N‚ˆX\›™YÚ[™^\ÎˆÙ]Ú[HHÙ]
+
+Bˆ›ÜˆÙ^K˜]×Ý›ÛYÙH[ˆ›ÛYÙ\Ëš][\Ê
+N‚ˆ›ÛYÙHH\œÙWÙ›Ø]Ý˜[YJ˜]×Ý›ÛYÙJBˆYˆ›ÛYÙH\È›Û™HÜˆ›ÛYÙHHQUSÔÕ’S‘×Ô‘TÑS•Õ“ÓQÑWÕ‘TÒÓ‚ˆÛÛ[YBˆ[™^H\œÙWÚ[Ý˜[YJÙ^Kœ™[[Ý™\™Yš^
+œˆŠKœ™[[Ý™\ÝY™š^
+—ÝHŠJBˆYˆ[™^\È›Û™N‚ˆÛÛ[YBˆ^\Ý[™ÈHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕ
+‚ˆ”“ÓH›ÝšY\—Ù]šXÙWÙ^XÝYÜÝš[™ÜÂˆÒT‘H›ÝšY\—Ù]šXÙWÚYHÈS‘Ýš[™×Ú[™^HÂˆˆˆ‹ˆ
+›ÝšY\—Ù]šXÙWÚY[™^
+Kˆ
+K™™]ÚÛ™J
+Bˆ›ÝÈH]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠBˆYˆ^\Ý[™È\È›Û™N‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È›ÝšY\—Ù]šXÙWÙ^XÝYÜÝš[™ÜÈ
+ˆ›ÝšY\—Ù]šXÙWÚYÝš[™×Ú[™^^XÝYÛÝ\˜ÙKØœÙ\™YØÛÝ[ˆš\œÝÛØœÙ\™YØ]\ÝÛØœÙ\™YØ]Ü™X]YØ]\]YØ]ˆ
+HSQTÈ
+ËË	Ø]]ÉËKËËËÊBˆˆˆ‹ˆ
+›ÝšY\—Ù]šXÙWÚY[™^ØœÙ\™YØ]ØœÙ\™YØ]›ÝË›ÝÊKˆ
+BˆÛÛ[YBˆØœÙ\™YØÛÝ[H[
+^\Ý[™ÖÈ›ØœÙ\™YØÛÝ[—HÜˆ
+H
+ÈBˆ^XÝYH[
+^\Ý[™ÖÈ™^XÝY—HÜˆ
+BˆÛÝ\˜ÙHH^\Ý[™ÖÈœÛÝ\˜ÙH—BˆYˆÛÝ\˜ÙHOH˜]]Èˆ[™ØœÙ\™YØÛÝ[HQUSÔÕ’S‘×ÐUU×ÓPT“—ÓÐ”ÑT•USÓ”Î‚ˆ^XÝYHBˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH›ÝšY\—Ù]šXÙWÙ^XÝYÜÝš[™ÜÂˆÑU^XÝYHËØœÙ\™YØÛÝ[HË\ÝÛØœÙ\™YØ]HË\]YØ]HÂˆÒT‘HYHÂˆˆˆ‹ˆ
+^XÝYØœÙ\™YØÛÝ[ØœÙ\™YØ]›ÝË^\Ý[™ÖÈšY—JKˆ
+B‚ˆ›ÝÜÈH]Y\žWØ[
+ˆÛÛ›‹ˆˆˆ‚ˆÑSPÕÝš[™×Ú[™^ˆ”“ÓH›ÝšY\—Ù]šXÙWÙ^XÝYÜÝš[™ÜÂˆÒT‘H›ÝšY\—Ù]šXÙWÚYHÈS‘^XÝYHBˆˆˆ‹ˆ
+›ÝšY\—Ù]šXÙWÚY
+Kˆ
+BˆX\›™YÚ[™^\Ë\]J[
+›ÝÖÈœÝš[™×Ú[™^—JH›Üˆ›ÝÈ[ˆ›ÝÜÊBˆ™]\›ˆX\›™YÚ[™^\Â‚‚™Yˆ›Ü›X[^™WÙ\Ú[ÛœÛÛ\—Ù]šXÙWÚY[]J›ÝÎˆXÝÜÝ‹[žWJHOˆXÝÜÝ‹[žWN‚ˆ]—Ý\WÚYH\œÙWÚ[Ý˜[YJš\œÝÛ›Û—Ù[\J›ÝËÈ™]•\RY‹™]—Ý\WÚY‹™]šXÙU\RY—JJBˆ[Ù[Hš\œÝÛ›Û—Ù[\J›ÝËÈ›[Ù[‹™]“[Ù[‹™]šXÙS[Ù[‹š[•\H—JBˆ˜]YÜÝÙ\—ÚÝÈH›Ü›X[^™WÜÝÙ\—Ý×ÚÝÊš\œÝÛ›Û—Ù[\J›ÝËÈœ˜]YÝÙ\ˆ‹œ˜]YÜÝÙ\ˆ‹˜Ø\XÚ]H‹››ÛZ[˜[ÝÙ\ˆ—JJBˆ™]\›ˆÂˆœÝ][Û—ØÛÙHŽˆš\œÝÛ›Û—Ù[\J›ÝËÈœÝ][ÛÛÙH‹œ[ÛÙH—JKˆ™^\›˜[Ù]šXÙWÚYŽˆš\œÝÛ›Û—Ù[\J›ÝËÈ™]’Y‹šY‹™]‘ˆ‹™]šXÙQˆ‹™\ÛÛÙH‹œÛˆ—JKˆ™]—ÙˆŽˆš\œÝÛ›Û—Ù[\J›ÝËÈ™]‘ˆ‹™]šXÙQˆ—JKˆœÛˆŽˆš\œÝÛ›Û—Ù[\J›ÝËÈ™\ÛÛÙH‹œÛˆ—JKˆ™]šXÙWÛ˜[YHŽˆš\œÝÛ›Û—Ù[\J›ÝËÈ™]“˜[YH‹™]šXÙS˜[YH‹›˜[YH—JKˆ™]—Ý\WÚYŽˆ]—Ý\WÚYˆ›[Ù[Žˆ[Ù[ˆœ˜]YÜÝÙ\—ÚÝÈŽˆ˜]YÜÝÙ\—ÚÝÈYˆ˜]YÜÝÙ\—ÚÝÈ\È›Ý›Û™H[ÙH[™™\—Ú[™\\—ÜÝÙ\—Ùœ›ÛWÛ[Ù[
+[Ù[
+KˆB‚‚™Yˆ›Ü›X[^™WÜÝÙ\—Ý×ÚÝÊ˜[YNˆ[žJHOˆ›Ø]›Û™N‚ˆ\œÙYH\œÙWÙ›Ø]Ý˜[YJ˜[YJBˆYˆ\œÙY\È›Û™N‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆ\œÙYÈLYˆ\œÙYˆL[ÙH\œÙY‚‚™Yˆ[™™\—Ú[™\\—ÜÝÙ\—Ùœ›ÛWÛ[Ù[
+[Ù[ˆÝˆ›Û™JHOˆ›Ø]›Û™N‚ˆ›Ü›X[^™YHÝŠ[Ù[ÜˆˆŠK\\Š
+Kœ™\XÙJˆ‹ˆŠBˆX]ÚH™KœÙX\˜Ú
+ˆŠÎ”ÕSŒŒ_ŠJ
+ÊÎ–Ë‹W
+ÊOÊJÎ’ÕÊÎ‹_	
+JH‹›Ü›X[^™Y
+BˆYˆ›ÝX]Ú‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆ\œÙWÙ›Ø]Ý˜[YJX]Ú™Ü›Ý\
+JKœ™\XÙJ‹‹‹ˆŠJB‚‚™YˆÜ[]WÛZ\ÜÚ[™×Ú[™\\—Ü˜]YÜÝÙ\ŠÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[ÛŠHOˆ[‚ˆ›ÝÜÈHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕY^\›˜[Ù]šXÙWÚY[Ù[^[ØYÚœÛÛ‚ˆ”“ÓH›ÝšY\—Ù]šXÙ\ÂˆÒT‘H˜]YÜÝÙ\—ÚÝÈTÈ•SÔˆ˜]YÜÝÙ\—ÚÝÈHˆˆˆ‚ˆ
+K™™]Ú[
+
+Bˆ\]YHˆ›Üˆ›ÝÈ[ˆ›ÝÜÎ‚ˆ[Ù[H›ÝÖÈ›[Ù[—BˆYˆ›Ý[Ù[[™›ÝÖÈœ^[ØYÚœÛÛˆ—N‚ˆžN‚ˆ^[ØYHœÛÛ‹›ØYÊ›ÝÖÈœ^[ØYÚœÛÛˆ—JBˆ[Ù[Hš\œÝÛ›Û—Ù[\J^[ØYÈ›[Ù[‹™]“[Ù[‹™]šXÙS[Ù[‹š[•\H—JBˆ^Ù\
+\Q\œ›Ü‹˜[YQ\œ›Ü‹œÛÛ‹’”ÓÓ‘XÛÙQ\œ›ÜŠN‚ˆ[Ù[H›Û™Bˆ˜]YÜÝÙ\—ÚÝÈH[™™\—Ú[™\\—ÜÝÙ\—Ùœ›ÛWÛ[Ù[
+[Ù[
+BˆYˆ˜]YÜÝÙ\—ÚÝÈ\È›Û™N‚ˆÛÛ[YBˆÛÛ›‹™^XÝ]Jˆ•TUH›ÝšY\—Ù]šXÙ\ÈÑU˜]YÜÝÙ\—ÚÝÈHÈÒT‘HYHÈ‹ˆ
+˜]YÜÝÙ\—ÚÝË›ÝÖÈšY—JKˆ
+BˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH[™\\—Ø]˜Z[Xš[]WÙZ[BˆÑU[™\\—ÜÝÙ\—ÚÝÈHÂˆÒT‘H›ÝšY\ˆHÈS‘[™\\—ÚYHÂˆS‘
+[™\\—ÜÝÙ\—ÚÝÈTÈ•SÔˆ[™\\—ÜÝÙ\—ÚÝÈH
+Bˆˆˆ‹ˆ
+˜]YÜÝÙ\—ÚÝËS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹›ÝÖÈ™^\›˜[Ù]šXÙWÚY—JKˆ
+BˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH[™\\—ÜÝÙ\—ÜØ[\\ÂˆÑU[™\\—ÜÝÙ\—ÚÝÈHÂˆÒT‘H›ÝšY\ˆHÈS‘[™\\—ÚYHÂˆS‘
+[™\\—ÜÝÙ\—ÚÝÈTÈ•SÔˆ[™\\—ÜÝÙ\—ÚÝÈH
+Bˆˆˆ‹ˆ
+˜]YÜÝÙ\—ÚÝËS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹›ÝÖÈ™^\›˜[Ù]šXÙWÚY—JKˆ
+Bˆ\]Y
+ÏHBˆ™]\›ˆ\]Y‚‚™Yˆ\ØX›WÜ™[[Ý™YÚ[™\\—Ù]šXÙ\ÊÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[ÛŠHOˆ[‚ˆ›ÝÜÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕY]šXÙWÛ˜[YH”“ÓH›ÝšY\—Ù]šXÙ\ÈÒT‘H[˜X›YHH‚ˆ
+K™™]Ú[
+
+Bˆ™[[Ý™YÚYÈHÚ[
+›ÝÖÈšY—JH›Üˆ›ÝÈ[ˆ›ÝÜÈYˆ\×Ü™[[Ý™YÚ[™\\—Û˜[YJ›ÝÖÈ™]šXÙWÛ˜[YH—JWBˆYˆ™[[Ý™YÚYÎ‚ˆÛÛ›‹™^XÝ][X[žJˆ•TUH›ÝšY\—Ù]šXÙ\ÈÑU[˜X›YHÒT‘HYHÈ‹ˆÊ]šXÙWÚY
+H›Üˆ]šXÙWÚY[ˆ™[[Ý™YÚY×Kˆ
+Bˆ›Üˆ]šXÙWÚY[ˆ™[[Ý™YÚYÎ‚ˆ™XÛÜ™Ù]šXÙWØÛÛ™šYÝ\˜][ÛŠˆÛÛ›‹ˆ›ÝšY\—Ù]šXÙWÚYY]šXÙWÚYˆXÝ]™OQ˜[ÙKˆY™™XÝ]™WÙ]OXÝ\œ™[Û\Ø›Û—Ù]J
+Kˆ
+Bˆ™]\›ˆ[Š™[[Ý™YÚYÊB‚‚™Yˆ\×Ü™[[Ý™YÚ[™\\—Û˜[YJ]šXÙWÛ˜[YNˆÝˆ›Û™JHOˆ›ÛÛ‚ˆ›Ü›X[^™YH›Ü›X[^™WÛ˜[YJÝŠ]šXÙWÛ˜[YHÜˆˆŠJBˆ™]\›ˆ[žJX\šÙ\ˆ[ˆ›Ü›X[^™Y›ÜˆX\šÙ\ˆ[ˆ
+œ™[[ÝšYÈ‹œ™[[Ý™YŠJB‚‚™Yˆ\×Ú[™\\—Ø]˜Z[X›JXÝ]™WÜÝÙ\—ÚÝÎˆ›Ø]›Û™JHOˆ›ÛÛ‚ˆ™]\›ˆ™\Ü[™×Ú\×Ú[™\\—Ø]˜Z[X›JXÝ]™WÜÝÙ\—ÚÝÊB‚‚™Yˆ[™\\—Ø]˜Z[Xš[]WÜÛÝ
+Ø[\WÝ[YNˆ]][YJHOˆ]][YN‚ˆ™]\›ˆ™\Ü[™×Ú[™\\—Ø]˜Z[Xš[]WÜÛÝ
+ˆØ[\WÝ[YKˆÛÝÛZ[]\ÏRS•‘T•T—ÐURSP’SUWÔÓÕÓRS•UTËˆ
+B‚‚™Yˆ\WÚ[™\\—ÙYÙWÝÛ\˜[˜ÙJˆ˜[YÜÛÝÎˆÙ]Ù]][YWKˆÛ\˜[˜ÙWÛZ[]\Îˆ[HS•‘T•T—ÐURSP’SUWÑQÑWÕÓTSÑWÓRS•UTËŠHOˆÙ]Ù]][YWN‚ˆ™]\›ˆ™\Ü[™×Ø\WÚ[™\\—ÙYÙWÝÛ\˜[˜ÙJˆ˜[YÜÛÝËˆÛ\˜[˜ÙWÛZ[]\Ï]Û\˜[˜ÙWÛZ[]\Ëˆ
+B‚‚™YˆØ[Ý[]WÚ[™\\—ÙZ[WØ]˜Z[Xš[]JˆØ[\\Îˆ\ÝÙXÝÜÝ‹[žWWKˆ˜[YÜÛÝÎˆÙ]Ù]][YWH›Û™HH›Û™KˆYÙWÝÛ\˜[˜ÙWÛZ[]\Îˆ[HS•‘T•T—ÐURSP’SUWÑQÑWÕÓTSÑWÓRS•UTËŠHOˆXÝÜÝ‹[žWN‚ˆ™]\›ˆ™\Ü[™×ØØ[Ý[]WÚ[™\\—ÙZ[WØ]˜Z[Xš[]JˆØ[\\Ëˆ˜[YÜÛÝËˆÛÝÛZ[]\ÏRS•‘T•T—ÐURSP’SUWÔÓÕÓRS•UTËˆYÙWÝÛ\˜[˜ÙWÛZ[]\ÏYYÙWÝÛ\˜[˜ÙWÛZ[]\Ëˆ
+B‚‚™YˆØ[Ý[]WÝÙZYÚYÜ[Ø]˜Z[Xš[]J[™\\—Ü›ÝÜÎˆ\ÝÙXÝÜÝ‹[žWWJHOˆ›Ø]›Û™N‚ˆ™]\›ˆ™\Ü[™×ØØ[Ý[]WÝÙZYÚYÜ[Ø]˜Z[Xš[]J[™\\—Ü›ÝÜÊB‚‚™Yˆ™\ÛÛ™WÚ[™\\—Ø]˜Z[Xš[]WÜ\š[Ù
+ˆ\š[ÙˆÝ‹ˆ˜]×Ùœ›ÛWÙ]NˆÝˆHˆ‹ˆ˜]×Ý×Ù]NˆÝˆHˆ‹ŠHOˆ\VÙ]K]WN‚ˆY\Ý\™^HH]KÙ^J
+HH[YY[J^\ÏLJBˆYˆ\š[ÙOH˜Ý\œ™[Û[ÛŽ‚ˆ™]\›ˆY\Ý\™^Kœ™\XÙJ^OLJKY\Ý\™^BˆYˆ\š[ÙOHœ™]š[Ý\×Û[ÛŽ‚ˆÝ\œ™[Û[ÛÜÝ\H]KÙ^J
+Kœ™\XÙJ^OLJBˆ™]š[Ý\×Û[ÛÙ[™HÝ\œ™[Û[ÛÜÝ\H[YY[J^\ÏLJBˆ™]\›ˆ™]š[Ý\×Û[ÛÙ[™œ™\XÙJ^OLJK™]š[Ý\×Û[ÛÙ[™ˆYˆ\š[ÙOH˜Ý\ÝÛHŽ‚ˆœ›ÛWÙ]HH\œÙWÙ]WÝ˜[YJ˜]×Ùœ›ÛWÙ]JHÜˆY\Ý\™^Bˆ×Ù]HHZ[Š\œÙWÙ]WÝ˜[YJ˜]×Ý×Ù]JHÜˆY\Ý\™^KY\Ý\™^JBˆ™]\›ˆœ›ÛWÙ]K×Ù]Bˆ™]\›ˆY\Ý\™^KY\Ý\™^B‚‚™YˆÙ]Ú[™\\—Ø]˜Z[Xš[]WÜ™\Ü
+ˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆœ›ÛWÙ]Nˆ]Kˆ×Ù]Nˆ]Kˆ
+‹ˆ\ÜÙ]ÚYˆ[›Û™HH›Û™KˆÛWÛÛ›Nˆ›ÛÛHYKˆÙX\˜ÚˆÝˆHˆ‹ŠHOˆXÝÜÝ‹[žWN‚ˆYˆœ›ÛWÙ]Hˆ×Ù]N‚ˆ™]\›ˆÂˆ˜]™\˜YÙWÜÝŽˆ›Û™Kˆœ[ÈŽˆ×Kˆš[™\\œÈŽˆ×KˆÛÜœÝÜ[Žˆ›Û™Kˆ›Ý×Ø]˜Z[Xš[]WØÛÝ[ŽˆˆBˆÛÛ™][ÛœÈHÂˆšXYœ›ÝšY\ˆHÈ‹ˆšXY˜]˜Z[Xš[]WÙ]H‘UÑQSˆÈS‘È‹ˆBˆ\˜[\Îˆ\ÝÐ[žWHHÂˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ˆœ›ÛWÙ]Kš\ÛÙ›Ü›X]
+
+Kˆ×Ù]Kš\ÛÙ›Ü›X]
+
+KˆBˆYˆ\ÜÙ]ÚY\È›Ý›Û™N‚ˆÛÛ™][ÛœË˜\[™
+šXY˜\ÜÙ]ÚYHÈŠBˆ\˜[\Ë˜\[™
+\ÜÙ]ÚY
+BˆYˆÛWÛÛ›N‚ˆÛÛ™][ÛœË˜\[™
+˜K˜XÝ]™WØÛÛ˜XÝH	ÞY\ÉÈŠBˆYˆÙX\˜Ú‚ˆÛÛ™][ÛœË˜\[™
+ˆŠKœ›Ú™XÝÛ˜[YHRÑHÈÔˆK›ØØ][ÛˆRÑHÈÔˆK˜ÛÛ\[žWÛ˜[YHRÑHÈÔˆK˜[X\×Ø›ØˆRÑHÊH‚ˆ
+BˆÚ[Ø\™Hˆ‰^ÜÙX\˜ÚIH‚ˆ\˜[\Ë™^[™
+ÝÚ[Ø\™Ú[Ø\™Ú[Ø\™Ú[Ø\™JBˆ›ÝÜÈHÛÛ›‹™^XÝ]Jˆˆˆˆ‚ˆÑSPÕˆXY˜\ÜÙ]ÚYˆKœ›Ú™XÝÛ˜[YKˆXYš[™\\—ÚYˆXYš[™\\—Û˜[YKˆXYš[™\\—ÜÝÙ\—ÚÝËˆPV
+™]šXÙWÛ˜[YJHTÈ›ÝšY\—Ù]šXÙWÛ˜[YKˆPV
+œ˜]YÜÝÙ\—ÚÝÊHTÈ›ÝšY\—ÜÝÙ\—ÚÝËˆPV
+›[Ù[
+HTÈ›ÝšY\—Û[Ù[ˆPV
+™[˜X›Y
+HTÈ›ÝšY\—Ù[˜X›YˆÕSJXY˜[YÜÛÝÊHTÈ˜[YÜÛÝËˆÕSJXY˜]˜Z[X›WÜÛÝÊHTÈ]˜Z[X›WÜÛÝËˆÕSJXY[˜]˜Z[X›WÜÛÝÊHTÈ[˜]˜Z[X›WÜÛÝÂˆ”“ÓH[™\\—Ø]˜Z[Xš[]WÙZ[HXYˆ“ÒSˆ\ÜÙ]ÈHÓˆKšYHXY˜\ÜÙ]ÚYˆQ•“ÒSˆ›ÝšY\—Ù]šXÙ\ÈˆÓˆœ›ÝšY\ˆHXYœ›ÝšY\ˆS‘™^\›˜[Ù]šXÙWÚYHXYš[™\\—ÚYˆÒT‘HÉÈS‘	Ëš›Ú[ŠÛÛ™][ÛœÊ_BˆÔ“ÕT–HXY˜\ÜÙ]ÚYKœ›Ú™XÝÛ˜[YKXYš[™\\—ÚYXYš[™\\—Û˜[YKXYš[™\\—ÜÝÙ\—ÚÝÂˆU’S‘ÈÕSJXY˜[YÜÛÝÊHˆˆˆˆ‹ˆ\˜[\Ëˆ
+K™™]Ú[
+
+Bˆ[™\\—Ü›ÝÜÎˆ\ÝÙXÝÜÝ‹[žWWHH×Bˆ›Üˆ›ÝÈ[ˆ›ÝÜÎ‚ˆ][HHXÝ
+›ÝÊBˆ]šXÙWÛ˜[YHH][K™Ù]
+œ›ÝšY\—Ù]šXÙWÛ˜[YHŠHÜˆ][K™Ù]
+š[™\\—Û˜[YHŠBˆYˆ][K™Ù]
+œ›ÝšY\—Ù[˜X›YŠHOHÜˆ\×Ü™[[Ý™YÚ[™\\—Û˜[YJ]šXÙWÛ˜[YJN‚ˆÛÛ[YBˆ][VÈš[™\\—Û˜[YH—HH]šXÙWÛ˜[YBˆ][VÈš[™\\—ÜÝÙ\—ÚÝÈ—HH
+ˆ\œÙWÙ›Ø]Ý˜[YJ][K™Ù]
+š[™\\—ÜÝÙ\—ÚÝÈŠJBˆÜˆ\œÙWÙ›Ø]Ý˜[YJ][K™Ù]
+œ›ÝšY\—ÜÝÙ\—ÚÝÈŠJBˆÜˆ[™™\—Ú[™\\—ÜÝÙ\—Ùœ›ÛWÛ[Ù[
+][K™Ù]
+œ›ÝšY\—Û[Ù[ŠJBˆ
+Bˆ][VÈ˜]˜Z[Xš[]WÜÝ—HH›Ý[™
+][VÈ˜]˜Z[X›WÜÛÝÈ—HÈ][VÈ˜[YÜÛÝÈ—H
+ˆLŠBˆ[™\\—Ü›ÝÜË˜\[™
+][JB‚ˆ[×ØžWÚYˆXÝÚ[XÝÜÝ‹[žWWHHßBˆ›Üˆ›ÝÈ[ˆ[™\\—Ü›ÝÜÎ‚ˆ[H[×ØžWÚYœÙ]Y˜][
+ˆ[
+›ÝÖÈ˜\ÜÙ]ÚY—JKˆÈ˜\ÜÙ]ÚYŽˆ›ÝÖÈ˜\ÜÙ]ÚY—Kœ›Ú™XÝÛ˜[YHŽˆ›ÝÖÈœ›Ú™XÝÛ˜[YH—Kš[™\\œÈŽˆ×_Kˆ
+Bˆ[Èš[™\\œÈ—K˜\[™
+›ÝÊBˆ[Ü›ÝÜÎˆ\ÝÙXÝÜÝ‹[žWWHH×Bˆ›Üˆ[[ˆ[×ØžWÚY˜[Y\Ê
+N‚ˆ[Ü›ÝÜË˜\[™
+ˆÂˆ˜\ÜÙ]ÚYŽˆ[È˜\ÜÙ]ÚY—Kˆœ›Ú™XÝÛ˜[YHŽˆ[Èœ›Ú™XÝÛ˜[YH—Kˆš[™\\—ØÛÝ[Žˆ[Š[Èš[™\\œÈ—JKˆ˜]˜Z[Xš[]WÜÝŽˆØ[Ý[]WÝÙZYÚYÜ[Ø]˜Z[Xš[]J[Èš[™\\œÈ—JKˆØ\›š[™ÜÈŽˆ™\Ü[™×Ú[˜[YÜÝÙ\—ÝØ\›š[™ÜÊˆ[Èš[™\\œÈ—KˆÝÙ\—ÚÙ^OHš[™\\—ÜÝÙ\—ÚÝÈ‹ˆØ\›š[™×ØÛÙOH›Z\ÜÚ[™×Ú[™\\—ÜÝÙ\ˆ‹ˆ
+KˆBˆ
+Bˆ[Ü›ÝÜËœÛÜ
+Ù^O[[X™H›ÝÎˆ
+›ÝÖÈ˜]˜Z[Xš[]WÜÝ—H\È›Û™K›ÝÖÈ˜]˜Z[Xš[]WÜÝ—HÜˆ›ÝÖÈœ›Ú™XÝÛ˜[YH—JJBˆ[™\\—Ü›ÝÜËœÛÜ
+Ù^O[[X™H›ÝÎˆ
+›ÝÖÈ˜]˜Z[Xš[]WÜÝ—K›ÝÖÈœ›Ú™XÝÛ˜[YH—K›ÝÖÈš[™\\—Û˜[YH—HÜˆ›ÝÖÈš[™\\—ÚY—JJBˆ›Üˆ˜[šË›ÝÈ[ˆ[[Y\˜]J[Ü›ÝÜËÝ\LJN‚ˆ›ÝÖÈœ˜[šÈ—HH˜[šÂˆ›Üˆ˜[šË›ÝÈ[ˆ[[Y\˜]J[™\\—Ü›ÝÜËÝ\LJN‚ˆ›ÝÖÈœ˜[šÈ—HH˜[šÂˆ\˜Ù[YÙ\ÈHÙ›Ø]
+›ÝÖÈ˜]˜Z[Xš[]WÜÝ—JH›Üˆ›ÝÈ[ˆ[Ü›ÝÜÈYˆ›ÝÖÈ˜]˜Z[Xš[]WÜÝ—H\È›Ý›Û™WBˆ™]\›ˆÂˆ˜]™\˜YÙWÜÝŽˆ›Ý[™
+Ý[J\˜Ù[YÙ\ÊHÈ[Š\˜Ù[YÙ\ÊKŠHYˆ\˜Ù[YÙ\È[ÙH›Û™Kˆœ[ÈŽˆ[Ü›ÝÜËˆš[™\\œÈŽˆ[™\\—Ü›ÝÜËˆÛÜœÝÜ[Žˆ[Ü›ÝÜÖÌHYˆ[Ü›ÝÜÈ[ÙH›Û™Kˆ›Ý×Ø]˜Z[Xš[]WØÛÝ[ŽˆÝ[JˆH›Üˆ›ÝÈ[ˆ[™\\—Ü›ÝÜÈYˆ›Ø]
+›ÝÖÈ˜]˜Z[Xš[]WÜÝ—JHÕ×ÒS•‘T•T—ÐURSP’SUWÔÕˆ
+KˆB‚‚™YˆÙ]Û[ÛWÝØ]Ü™\ÜÙ]JˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆœ›ÛWÙ]Nˆ]Kˆ×Ù]Nˆ]Kˆ\ÜÙ]ÚYˆ[›Û™HH›Û™KŠHOˆXÝÜÝ‹[žWN‚ˆYˆœ›ÛWÙ]Hˆ×Ù]N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ“È[\˜[ÈÐUH[˜[YËˆŠB‚ˆ›ÝšY\ˆHS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‚ˆœ›ÛWÚ\ÛÈHœ›ÛWÙ]Kš\ÛÙ›Ü›X]
+
+Bˆ×Ú\ÛÈH×Ù]Kš\ÛÙ›Ü›X]
+
+BˆØ[\WÙœ›ÛHH]][YK˜ÛÛXš[™Jœ›ÛWÙ]K]][YK›Z[‹[YJ
+JKš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠBˆØ[\WÝÈH]][YK˜ÛÛXš[™J×Ù]H
+È[YY[J^\ÏLJK]][YK›Z[‹[YJ
+JKš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠBˆ^XÝYÙ^\ÈH
+×Ù]HHœ›ÛWÙ]JK™^\È
+ÈB‚ˆ\ÜÙ]Ü\˜[\Îˆ\ÝÐ[žWHH×BˆYˆ\ÜÙ]ÚY\È›Ý›Û™N‚ˆ\ÜÙ]Ùš[\ˆH˜KšYHÈ‚ˆ\ÜÙ]Ü\˜[\Ë˜\[™
+\ÜÙ]ÚY
+Bˆ[ÙN‚ˆ\ÜÙ]Ùš[\ˆHˆˆ‚ˆVTÕÈ
+ˆÑSPÕH”“ÓH›ÝšY\—Ù]šXÙ\ÈˆÒT‘H˜\ÜÙ]ÚYHKšYS‘œ›ÝšY\ˆHÈS‘™[˜X›YHHS‘™]—Ý\WÚYSˆ
+KÎ
+Bˆ
+BˆÔˆVTÕÈ
+ˆÑSPÕH”“ÓH[™\\—Ø]˜Z[Xš[]WÙZ[HXYˆÒT‘HXY˜\ÜÙ]ÚYHKšYS‘XYœ›ÝšY\ˆHÈS‘XY˜]˜Z[Xš[]WÙ]H‘UÑQSˆÈS‘Âˆ
+BˆÔˆVTÕÈ
+ˆÑSPÕH”“ÓH[Ø]˜Z[Xš[]WÙZ[HYˆÒT‘HY˜\ÜÙ]ÚYHKšYS‘Yœ›ÝšY\ˆHÈS‘Y˜]˜Z[Xš[]WÙ]H‘UÑQSˆÈS‘Âˆ
+BˆÔˆVTÕÈ
+ˆÑSPÕH”“ÓH[™\\—ÜÝÙ\—ÜØ[\\È\ÂˆÒT‘H\Ë˜\ÜÙ]ÚYHKšYS‘\Ëœ›ÝšY\ˆHÈS‘\ËœØ[\WÝ[YHHÈS‘\ËœØ[\WÝ[YHÂˆ
+Bˆˆˆ‚ˆ\ÜÙ]Ü\˜[\Ë™^[™
+ˆÜ›ÝšY\‹›ÝšY\‹œ›ÛWÚ\ÛË×Ú\ÛË›ÝšY\‹œ›ÛWÚ\ÛË×Ú\ÛË›ÝšY\‹Ø[\WÙœ›ÛKØ[\WÝ×Bˆ
+Bˆ\ÜÙ]ÈHÛÛ›‹™^XÝ]Jˆˆ”ÑSPÕKšYKœ›Ú™XÝÛ˜[YH”“ÓH\ÜÙ]ÈHÒT‘HØ\ÜÙ]Ùš[\ŸHÔ‘Tˆ–HKœ›Ú™XÝÛ˜[YHÓÓUH“ÐÐTÑH‹ˆ\ÜÙ]Ü\˜[\Ëˆ
+K™™]Ú[
+
+B‚ˆ[Îˆ\ÝÙXÝÜÝ‹[žWWHH×Bˆ›Üˆ\ÜÙ][ˆ\ÜÙ]Î‚ˆÝ\œ™[Ø\ÜÙ]ÚYH[
+\ÜÙ]ÈšY—JBˆÛÛ™šYÝ\™YÙ]šXÙ\ÈH]Y\žWØ[
+ˆÛÛ›‹ˆˆˆ‚ˆÑSPÕ^\›˜[Ù]šXÙWÚY]šXÙWÛ˜[YBˆ”“ÓH›ÝšY\—Ù]šXÙ\ÂˆÒT‘H\ÜÙ]ÚYHÈS‘›ÝšY\ˆHÈS‘[˜X›YHHS‘]—Ý\WÚYSˆ
+KÎ
+Bˆˆˆ‹ˆ
+Ý\œ™[Ø\ÜÙ]ÚY›ÝšY\ŠKˆ
+BˆÛÛ™šYÝ\™YÚ[™\\—ØÛÝ[HÝ[JˆH›Üˆ›ÝÈ[ˆÛÛ™šYÝ\™YÙ]šXÙ\ÈYˆ›Ý\×Ü™[[Ý™YÚ[™\\—Û˜[YJ›ÝÖÈ™]šXÙWÛ˜[YH—JBˆ
+Bˆ[™\\—Ü›ÝÜÈH]Y\žWØ[
+ˆÛÛ›‹ˆˆˆ‚ˆÑSPÕˆXYš[™\\—ÚYˆÓÐSTÐÑJPV
+™]šXÙWÛ˜[YJKPV
+XYš[™\\—Û˜[YJKXYš[™\\—ÚY
+HTÈ[™\\—Û˜[YKˆPV
+XYš[™\\—ÜÝÙ\—ÚÝÊHTÈÝÜ™YÜÝÙ\—ÚÝËˆPV
+œ˜]YÜÝÙ\—ÚÝÊHTÈ›ÝšY\—ÜÝÙ\—ÚÝËˆPV
+›[Ù[
+HTÈ›ÝšY\—Û[Ù[ˆPV
+™[˜X›Y
+HTÈ›ÝšY\—Ù[˜X›YˆÓÕS•
+TÕSÕXY˜]˜Z[Xš[]WÙ]JHTÈ]WÙ^\ËˆÕSJXY˜[YÜÛÝÊHTÈ˜[YÜÛÝËˆÕSJXY˜]˜Z[X›WÜÛÝÊHTÈ]˜Z[X›WÜÛÝËˆÕSJXY[˜]˜Z[X›WÜÛÝÊHTÈ[˜]˜Z[X›WÜÛÝÂˆ”“ÓH[™\\—Ø]˜Z[Xš[]WÙZ[HXYˆQ•“ÒSˆ›ÝšY\—Ù]šXÙ\ÈˆÓˆœ›ÝšY\ˆHXYœ›ÝšY\ˆS‘™^\›˜[Ù]šXÙWÚYHXYš[™\\—ÚYˆÒT‘HXY˜\ÜÙ]ÚYHÈS‘XYœ›ÝšY\ˆHÈS‘XY˜]˜Z[Xš[]WÙ]H‘UÑQSˆÈS‘ÂˆÔ“ÕT–HXYš[™\\—ÚYˆÔ‘Tˆ–H[™\\—Û˜[YHÓÓUH“ÐÐTÑKXYš[™\\—ÚYˆˆˆ‹ˆ
+Ý\œ™[Ø\ÜÙ]ÚY›ÝšY\‹œ›ÛWÚ\ÛË×Ú\ÛÊKˆ
+Bˆ™\ÜÚ[™\\œÎˆ\ÝÙXÝÜÝ‹[žWWHH×Bˆ›ÜˆÝÜ™YÜ›ÝÈ[ˆ[™\\—Ü›ÝÜÎ‚ˆ›ÝÈHXÝ
+ÝÜ™YÜ›ÝÊBˆYˆ›ÝË™Ù]
+œ›ÝšY\—Ù[˜X›YŠHOHÜˆ\×Ü™[[Ý™YÚ[™\\—Û˜[YJ›ÝË™Ù]
+š[™\\—Û˜[YHŠJN‚ˆÛÛ[YBˆ˜[YÜÛÝÈH[
+›ÝË™Ù]
+˜[YÜÛÝÈŠHÜˆ
+Bˆ]˜Z[X›WÜÛÝÈH[
+›ÝË™Ù]
+˜]˜Z[X›WÜÛÝÈŠHÜˆ
+Bˆ™\ÜÚ[™\\œË˜\[™
+ˆÂˆš[™\\—ÚYŽˆÝŠ›ÝÖÈš[™\\—ÚY—JKˆš[™\\—Û˜[YHŽˆÝŠ›ÝË™Ù]
+š[™\\—Û˜[YHŠHÜˆ›ÝÖÈš[™\\—ÚY—JKˆš[™\\—ÜÝÙ\—ÚÝÈŽˆ
+ˆ\œÙWÙ›Ø]Ý˜[YJ›ÝË™Ù]
+œÝÜ™YÜÝÙ\—ÚÝÈŠJBˆÜˆ\œÙWÙ›Ø]Ý˜[YJ›ÝË™Ù]
+œ›ÝšY\—ÜÝÙ\—ÚÝÈŠJBˆÜˆ[™™\—Ú[™\\—ÜÝÙ\—Ùœ›ÛWÛ[Ù[
+›ÝË™Ù]
+œ›ÝšY\—Û[Ù[ŠJBˆ
+Kˆ™]WÙ^\ÈŽˆ[
+›ÝË™Ù]
+™]WÙ^\ÈŠHÜˆ
+Kˆ˜[YÜÛÝÈŽˆ˜[YÜÛÝËˆ˜]˜Z[X›WÜÛÝÈŽˆ]˜Z[X›WÜÛÝËˆ[˜]˜Z[X›WÜÛÝÈŽˆ[
+›ÝË™Ù]
+[˜]˜Z[X›WÜÛÝÈŠHÜˆ
+Kˆ˜]˜Z[Xš[]WÜÝŽˆ›Ý[™
+]˜Z[X›WÜÛÝÈÈ˜[YÜÛÝÈ
+ˆLŠHYˆ˜[YÜÛÝÈ[ÙH›Û™KˆBˆ
+B‚ˆ[Ù^\ÈHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕ]˜Z[Xš[]WÙ]K˜[YÜÛÝËÙZYÚYØ]˜Z[Xš[]WÜÝ[™\\—ØÛÝ[ˆ”“ÓH[Ø]˜Z[Xš[]WÙZ[BˆÒT‘H\ÜÙ]ÚYHÈS‘›ÝšY\ˆHÈS‘]˜Z[Xš[]WÙ]H‘UÑQSˆÈS‘ÂˆÔ‘Tˆ–H]˜Z[Xš[]WÙ]Bˆˆˆ‹ˆ
+Ý\œ™[Ø\ÜÙ]ÚY›ÝšY\‹œ›ÛWÚ\ÛË×Ú\ÛÊKˆ
+K™™]Ú[
+
+BˆØ[\WÜÝ[[X\žHHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕÓÕS•
+
+ŠHTÈØ[\WØÛÝ[ÓÕS•
+TÕSÕÝXœÝŠØ[\WÝ[YKKL
+JHTÈØ[\WÙ^\Âˆ”“ÓH[™\\—ÜÝÙ\—ÜØ[\\ÂˆÒT‘H\ÜÙ]ÚYHÈS‘›ÝšY\ˆHÈS‘Ø[\WÝ[YHHÈS‘Ø[\WÝ[YHÂˆˆˆ‹ˆ
+Ý\œ™[Ø\ÜÙ]ÚY›ÝšY\‹Ø[\WÙœ›ÛKØ[\WÝÊKˆ
+K™™]ÚÛ™J
+B‚ˆØ[\WØÛÝ[H[
+Ø[\WÜÝ[[X\žVÈœØ[\WØÛÝ[—HÜˆ
+BˆØ[\WÙ^\ÈH[
+Ø[\WÜÝ[[X\žVÈœØ[\WÙ^\È—HÜˆ
+Bˆ[Ù^WØÛÝ[H[Š[Ù^\ÊBˆ\×Ø[žWÙ]HH›ÛÛ
+™\ÜÚ[™\\œÈÜˆ[Ù^WØÛÝ[ÜˆØ[\WØÛÝ[
+BˆYˆ›Ý\×Ø[žWÙ]N‚ˆ]WÜÝ]\ÈHœÙ[HYÜÈ‚ˆ[ÙN‚ˆZ[WØÛÝ[ÈHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕ]˜Z[Xš[]WÙ]KÓÕS•
+
+ŠHTÈ[™\\—ØÛÝ[ˆÕSJÐTÑHÒSˆ˜[YÜÛÝÈˆS‘]˜Z[Xš[]WÜÝTÈ“Õ•SSˆHSÑHS‘
+HTÈ˜[YÚ[™\\œÂˆ”“ÓH[™\\—Ø]˜Z[Xš[]WÙZ[BˆÒT‘H\ÜÙ]ÚYHÈS‘›ÝšY\ˆHÈS‘]˜Z[Xš[]WÙ]H‘UÑQSˆÈS‘ÂˆÔ“ÕT–H]˜Z[Xš[]WÙ]Bˆˆˆ‹ˆ
+Ý\œ™[Ø\ÜÙ]ÚY›ÝšY\‹œ›ÛWÚ\ÛË×Ú\ÛÊKˆ
+K™™]Ú[
+
+Bˆ^XÝYÚ[™\\—ØÛÝ[HÛÛ™šYÝ\™YÚ[™\\—ØÛÝ[ÜˆX^
+ˆ
+[
+›ÝÖÈš[™\\—ØÛÝ[—HÜˆ
+H›Üˆ›ÝÈ[ˆZ[WØÛÝ[ÊKˆY˜][Lˆ
+BˆÛÛ\]WÚ[™\\—Ù^\ÈH
+ˆ[ŠZ[WØÛÝ[ÊHOH^XÝYÙ^\Âˆ[™^XÝYÚ[™\\—ØÛÝ[ˆˆ[™[
+ˆ[
+›ÝÖÈš[™\\—ØÛÝ[—HÜˆ
+HOH^XÝYÚ[™\\—ØÛÝ[ˆ[™[
+›ÝÖÈ˜[YÚ[™\\œÈ—HÜˆ
+HOH^XÝYÚ[™\\—ØÛÝ[ˆ›Üˆ›ÝÈ[ˆZ[WØÛÝ[Âˆ
+Bˆ
+BˆÛÛ\]WÜ[Ù^\ÈH
+ˆ[Ù^WØÛÝ[OH^XÝYÙ^\Âˆ[™[
+ˆ[
+›ÝÖÈ˜[YÜÛÝÈ—HÜˆ
+Hˆˆ[™›ÝÖÈÙZYÚYØ]˜Z[Xš[]WÜÝ—H\È›Ý›Û™Bˆ[™[
+›ÝÖÈš[™\\—ØÛÝ[—HÜˆ
+HOH^XÝYÚ[™\\—ØÛÝ[ˆ›Üˆ›ÝÈ[ˆ[Ù^\Âˆ
+Bˆ
+Bˆ]WÜÝ]\ÈH
+ˆ›ÚÈ‚ˆYˆÛÛ\]WÚ[™\\—Ù^\È[™ÛÛ\]WÜ[Ù^\È[™Ø[\WÙ^\ÈOH^XÝYÙ^\Âˆ[ÙHœ\˜ÚX[‚ˆ
+B‚ˆ˜[šÙYÚ[™\\œÈHÜ›ÝÈ›Üˆ›ÝÈ[ˆ™\ÜÚ[™\\œÈYˆ›ÝÖÈ˜]˜Z[Xš[]WÜÝ—H\È›Ý›Û™WBˆ˜[šÙYÚ[™\\œËœÛÜ
+ˆÙ^O[[X™H›ÝÎˆ
+›Ø]
+›ÝÖÈ˜]˜Z[Xš[]WÜÝ—JK›ÝÖÈš[™\\—Û˜[YH—K›ÝÙ\Š
+K›ÝÖÈš[™\\—ÚY—JBˆ
+BˆÛÜœÝÚ[™\\ˆH˜[šÙYÚ[™\\œÖÌHYˆ˜[šÙYÚ[™\\œÈ[ÙH›Û™BˆÙZYÚYÝØ]HØ[Ý[]WÝÙZYÚYÜ[Ø]˜Z[Xš[]J™\ÜÚ[™\\œÊBˆØ\›š[™ÜÈH™\Ü[™×Ú[˜[YÜÝÙ\—ÝØ\›š[™ÜÊˆ™\ÜÚ[™\\œËˆÝÙ\—ÚÙ^OHš[™\\—ÜÝÙ\—ÚÝÈ‹ˆØ\›š[™×ØÛÙOH›Z\ÜÚ[™×Ú[™\\—ÜÝÙ\ˆ‹ˆ
+Bˆ[Ë˜\[™
+ˆÂˆ˜\ÜÙ]ÚYŽˆÝ\œ™[Ø\ÜÙ]ÚYˆœ›Ú™XÝÛ˜[YHŽˆÝŠ\ÜÙ]Èœ›Ú™XÝÛ˜[YH—JKˆÙZYÚYÝØ]ÜÝŽˆÙZYÚYÝØ]ˆš[™\\—ØÛÝ[Žˆ[Š™\ÜÚ[™\\œÊHÜˆÛÛ™šYÝ\™YÚ[™\\—ØÛÝ[ˆš[™\\œ×Ø™[Ý×ÎLØÛÝ[ŽˆÝ[JˆBˆ›Üˆ›ÝÈ[ˆ™\ÜÚ[™\\œÂˆYˆ›ÝÖÈ˜]˜Z[Xš[]WÜÝ—H\È›Ý›Û™Bˆ[™›Ø]
+›ÝÖÈ˜]˜Z[Xš[]WÜÝ—JHÕ×ÒS•‘T•T—ÐURSP’SUWÔÕˆ
+KˆÛÜœÝÚ[™\\ˆŽˆÛÜœÝÚ[™\\–Èš[™\\—Û˜[YH—HYˆÛÜœÝÚ[™\\ˆ[ÙH›Û™KˆÛÜœÝÚ[™\\—ÚYŽˆÛÜœÝÚ[™\\–Èš[™\\—ÚY—HYˆÛÜœÝÚ[™\\ˆ[ÙH›Û™KˆÛÜœÝÚ[™\\—ÝØ]ÜÝŽˆÛÜœÝÚ[™\\–È˜]˜Z[Xš[]WÜÝ—HYˆÛÜœÝÚ[™\\ˆ[ÙH›Û™Kˆ˜[YÜÛÝÈŽˆÝ[J[
+›ÝÖÈ˜[YÜÛÝÈ—JH›Üˆ›ÝÈ[ˆ™\ÜÚ[™\\œÊKˆ[˜]˜Z[X›WÜÛÝÈŽˆÝ[J[
+›ÝÖÈ[˜]˜Z[X›WÜÛÝÈ—JH›Üˆ›ÝÈ[ˆ™\ÜÚ[™\\œÊKˆ™]WÜÝ]\ÈŽˆ]WÜÝ]\ËˆØ\›š[™ÜÈŽˆØ\›š[™ÜËˆBˆ
+B‚ˆ™]\›ˆÂˆ™œ›ÛWÙ]HŽˆœ›ÛWÚ\ÛËˆ×Ù]HŽˆ×Ú\ÛËˆœ[ÈŽˆ[ËˆB‚‚™YˆÙ]ÙZ[WÝØ]Ü™\ÜÙ]JÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹\™Ù]Ù]Nˆ]JHOˆXÝÜÝ‹[žWN‚ˆ™\ÜHÙ]Û[ÛWÝØ]Ü™\ÜÙ]JÛÛ›‹\™Ù]Ù]K\™Ù]Ù]JBˆ™]\›ˆÂˆ\™Ù]Ù]HŽˆ\™Ù]Ù]Kš\ÛÙ›Ü›X]
+
+Kˆœ[ÈŽˆ™\ÜÈœ[È—KˆB‚‚™YˆÙ]Ú[™\\—Ø]˜Z[Xš[]WØÚ\Ü™\Ü
+ˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ\ÜÙ]ÚYˆ[ˆœ›ÛWÙ]Nˆ]Kˆ×Ù]Nˆ]KŠHOˆXÝÜÝ‹[žWH›Û™N‚ˆ\ÜÙ]HÛÛ›‹™^XÝ]Jˆ”ÑSPÕY›Ú™XÝÛ˜[YH”“ÓH\ÜÙ]ÈÒT‘HYHÈ‹ˆ
+\ÜÙ]ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ\ÜÙ]\È›Û™N‚ˆ™]\›ˆ›Û™Bˆ]šXÙWÜ›ÝÜÈHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕˆ^\›˜[Ù]šXÙWÚYTÈ[™\\—ÚYˆ]šXÙWÛ˜[YHTÈ[™\\—Û˜[YKˆ˜]YÜÝÙ\—ÚÝÈTÈ[™\\—ÜÝÙ\—ÚÝËˆ[Ù[ˆ”“ÓH›ÝšY\—Ù]šXÙ\ÂˆÒT‘H\ÜÙ]ÚYHÈS‘›ÝšY\ˆHÈS‘[˜X›YHHS‘]—Ý\WÚYSˆ
+KÎ
+BˆÔ‘Tˆ–H]šXÙWÛ˜[YHÓÓUH“ÐÐTÑK^\›˜[Ù]šXÙWÚYˆˆˆ‹ˆ
+\ÜÙ]ÚYS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓTŠKˆ
+K™™]Ú[
+
+BˆZ[WÜ›ÝÜÈHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕ[™\\—ÚY[™\\—Û˜[YK[™\\—ÜÝÙ\—ÚÝË]˜Z[Xš[]WÜÝˆ”“ÓH[™\\—Ø]˜Z[Xš[]WÙZ[BˆÒT‘H\ÜÙ]ÚYHÈS‘›ÝšY\ˆHÈS‘]˜Z[Xš[]WÙ]H‘UÑQSˆÈS‘ÂˆÔ‘Tˆ–H]˜Z[Xš[]WÙ]Bˆˆˆ‹ˆ
+\ÜÙ]ÚYS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹œ›ÛWÙ]Kš\ÛÙ›Ü›X]
+
+K×Ù]Kš\ÛÙ›Ü›X]
+
+JKˆ
+K™™]Ú[
+
+Bˆ[™\\œ×ØžWÚYˆXÝÜÝ‹XÝÜÝ‹[žWWHHßBˆ›Üˆ›ÝÈ[ˆ]šXÙWÜ›ÝÜÎ‚ˆ[™\\—ÚYHÝŠ›ÝÖÈš[™\\—ÚY—JBˆYˆ\×Ü™[[Ý™YÚ[™\\—Û˜[YJ›ÝÖÈš[™\\—Û˜[YH—JN‚ˆÛÛ[YBˆ[™\\œ×ØžWÚYÚ[™\\—ÚYHHÂˆš[™\\—ÚYŽˆ[™\\—ÚYˆš[™\\—Û˜[YHŽˆ›ÝÖÈš[™\\—Û˜[YH—Kˆš[™\\—ÜÝÙ\—ÚÝÈŽˆ\œÙWÙ›Ø]Ý˜[YJ›ÝÖÈš[™\\—ÜÝÙ\—ÚÝÈ—JBˆÜˆ[™™\—Ú[™\\—ÜÝÙ\—Ùœ›ÛWÛ[Ù[
+›ÝÖÈ›[Ù[—JKˆ˜]˜Z[Xš[]WÝ˜[Y\ÈŽˆ×KˆBˆ›Üˆ›ÝÈ[ˆZ[WÜ›ÝÜÎ‚ˆ[™\\—ÚYHÝŠ›ÝÖÈš[™\\—ÚY—JBˆYˆ\×Ü™[[Ý™YÚ[™\\—Û˜[YJ›ÝÖÈš[™\\—Û˜[YH—JN‚ˆÛÛ[YBˆ[™\\ˆH[™\\œ×ØžWÚYœÙ]Y˜][
+ˆ[™\\—ÚYˆÂˆš[™\\—ÚYŽˆ[™\\—ÚYˆš[™\\—Û˜[YHŽˆ›ÝÖÈš[™\\—Û˜[YH—Kˆš[™\\—ÜÝÙ\—ÚÝÈŽˆ›ÝÖÈš[™\\—ÜÝÙ\—ÚÝÈ—Kˆ˜]˜Z[Xš[]WÝ˜[Y\ÈŽˆ×KˆKˆ
+BˆYˆ›ÝÖÈ˜]˜Z[Xš[]WÜÝ—H\È›Ý›Û™N‚ˆ[™\\–È˜]˜Z[Xš[]WÝ˜[Y\È—K˜\[™
+›Ø]
+›ÝÖÈ˜]˜Z[Xš[]WÜÝ—JJB‚ˆ\š[ÙÜÝ\H]][YK˜ÛÛXš[™Jœ›ÛWÙ]K]][YK›Z[‹[YJ
+JBˆ\š[ÙÙ[™H]][YK˜ÛÛXš[™J×Ù]H
+È[YY[J^\ÏLJK]][YK›Z[‹[YJ
+JBˆØ[\WÜ›ÝÜÈHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕ[™\\—ÚYØ[\WÝ[YKXÝ]™WÜÝÙ\—ÚÝÂˆ”“ÓH[™\\—ÜÝÙ\—ÜØ[\\ÂˆÒT‘H\ÜÙ]ÚYHÈS‘›ÝšY\ˆHÈS‘Ø[\WÝ[YHHÈS‘Ø[\WÝ[YHÂˆÔ‘Tˆ–H[™\\—ÚYØ[\WÝ[YBˆˆˆ‹ˆ
+ˆ\ÜÙ]ÚYˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ˆ\š[ÙÜÝ\š\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆ\š[ÙÙ[™š\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆ
+Kˆ
+K™™]Ú[
+
+BˆØ[\\×ØžWÚ[™\\ŽˆXÝÜÝ‹\ÝÝ\VÙ]][YK›Ø]WWHHßBˆ›Üˆ›ÝÈ[ˆØ[\WÜ›ÝÜÎ‚ˆØ[\WÝ[YHH\œÙWÙ]][YWÝ˜[YJ›ÝÖÈœØ[\WÝ[YH—JBˆXÝ]™WÜÝÙ\ˆH\œÙWÙ›Ø]Ý˜[YJ›ÝÖÈ˜XÝ]™WÜÝÙ\—ÚÝÈ—JBˆYˆØ[\WÝ[YH\È›Û™HÜˆXÝ]™WÜÝÙ\ˆ\È›Û™N‚ˆÛÛ[YBˆØ[\\×ØžWÚ[™\\‹œÙ]Y˜][
+ÝŠ›ÝÖÈš[™\\—ÚY—JK×JK˜\[™
+
+Ø[\WÝ[YKX^
+XÝ]™WÜÝÙ\‹Œ
+JJB‚ˆ[™\\œÈH\Ý
+[™\\œ×ØžWÚY˜[Y\Ê
+JBˆ›Üˆ[™\\ˆ[ˆ[™\\œÎ‚ˆ\˜Ù[YÙ\ÈH[™\\‹œÜ
+˜]˜Z[Xš[]WÝ˜[Y\ÈŠBˆ[™\\–È˜]™\˜YÙWÜÝ—HH›Ý[™
+Ý[J\˜Ù[YÙ\ÊHÈ[Š\˜Ù[YÙ\ÊKŠHYˆ\˜Ù[YÙ\È[ÙH›Û™Bˆ[™\\–È˜Ú\—HHZ[Ú[™\\—ÜÝÙ\—ØÚ\
+ˆØ[\\×ØžWÚ[™\\‹™Ù]
+[™\\–Èš[™\\—ÚY—K×JKˆ\š[ÙÜÝ\ˆ\š[ÙÙ[™ˆ\œÙWÙ›Ø]Ý˜[YJ[™\\–Èš[™\\—ÜÝÙ\—ÚÝÈ—JKˆ
+Bˆ[™\\œËœÛÜ
+Ù^O[[X™H›ÝÎˆ
+›ÝÖÈ˜]™\˜YÙWÜÝ—H\È›Û™K›ÝÖÈ˜]™\˜YÙWÜÝ—HÜˆ›ÝÖÈš[™\\—Û˜[YH—HÜˆ›ÝÖÈš[™\\—ÚY—JJBˆ™]\›ˆÂˆ˜\ÜÙ]ÚYŽˆ[
+\ÜÙ]ÈšY—JKˆœ›Ú™XÝÛ˜[YHŽˆ\ÜÙ]Èœ›Ú™XÝÛ˜[YH—Kˆš[™\\œÈŽˆ[™\\œËˆB‚‚™YˆZ[Ú[™\\—ÜÝÙ\—ØÚ\
+ˆØ[\\Îˆ\ÝÝ\VÙ]][YK›Ø]WKˆ\š[ÙÜÝ\ˆ]][YKˆ\š[ÙÙ[™ˆ]][YKˆ˜]YÜÝÙ\—ÚÝÎˆ›Ø]›Û™KŠHOˆXÝÜÝ‹[žWN‚ˆÚ\ÝÚYHÍŒŒˆÚ\ÚZYÚHŒŒˆÝÛYHL‹ŒˆÝÜšYÚHM‹ŒˆÝÝÜHM‹ŒˆÝØ›ÝÛHHÍ‹ŒˆÝÝÚYHÚ\ÝÚYHÝÛYHÝÜšYÚˆÝÚZYÚHÚ\ÚZYÚHÝÝÜHÝØ›ÝÛBˆÝ[ÜÙXÛÛ™ÈHX^
+
+\š[ÙÙ[™H\š[ÙÜÝ\
+KÝ[ÜÙXÛÛ™Ê
+KKŒ
+BˆÛÜYÜØ[\\ÈHÛÜY
+Ø[\\ËÙ^O[[X™H][Nˆ][VÌJBˆYˆ[ŠÛÜYÜØ[\\ÊHˆŒ‚ˆÝ\HX^
+[ŠÛÜYÜØ[\\ÊHËÈŒJBˆ™YXÙYHÛÜYÜØ[\\ÖÎŽœÝ\BˆYˆ™YXÙYËLWHOHÛÜYÜØ[\\ÖËLWN‚ˆ™YXÙY˜\[™
+ÛÜYÜØ[\\ÖËLWJBˆÛÜYÜØ[\\ÈH™YXÙYˆØœÙ\™YÛX^HX^
+
+ÝÙ\ˆ›ÜˆËÝÙ\ˆ[ˆÛÜYÜØ[\\ÊKY˜][LŒ
+BˆWÛX^HX^
+ØœÙ\™YÛX^˜]YÜÝÙ\—ÚÝÈÜˆŒKŒ
+BˆYˆWÛX^ˆL‚ˆWÛX^H›Ø]
+
+[
+WÛX^
+ÈŽNNJHËÈJH
+ˆJBˆ[ÙN‚ˆWÛX^H›Ø]
+[
+WÛX^
+ÈŽNNJJBˆÛÛÜ™[˜]\Îˆ\ÝÝ\VÙ›Ø]›Ø]WHH×Bˆ›ÜˆØ[\WÝ[YKÝÙ\ˆ[ˆÛÜYÜØ[\\Î‚ˆ[\ÙYHZ[ŠX^
+
+Ø[\WÝ[YHH\š[ÙÜÝ\
+KÝ[ÜÙXÛÛ™Ê
+KŒ
+KÝ[ÜÙXÛÛ™ÊBˆHÝÛY
+È[\ÙYÈÝ[ÜÙXÛÛ™È
+ˆÝÝÚYˆHHÝÝÜ
+È
+HHZ[ŠÝÙ\ˆÈWÛX^KŒ
+JH
+ˆÝÚZYÚˆÛÛÜ™[˜]\Ë˜\[™
+
+›Ý[™
+ŠK›Ý[™
+KŠJJBˆ[™WÜ]Hˆ‹š›Ú[Šˆ
+“HˆYˆ[™^OH[ÙH“ŠH
+ÈˆˆÞHÞ_H‚ˆ›Üˆ[™^
+JH[ˆ[[Y\˜]JÛÛÜ™[˜]\ÊBˆ
+Bˆ˜\Ù[[™HHÝÝÜ
+ÈÝÚZYÚˆ\™XWÜ]Hˆ‚ˆYˆÛÛÜ™[˜]\Î‚ˆ\™XWÜ]H
+ˆˆ“HØÛÛÜ™[˜]\ÖÌVÌ_HØ˜\Ù[[™_H‚ˆ
+Èˆ‹š›Ú[Šˆ“ÞHÞ_Hˆ›ÜˆH[ˆÛÛÜ™[˜]\ÊBˆ
+ÈˆˆØÛÛÜ™[˜]\ÖËLWVÌ_HØ˜\Ù[[™_Hˆ‚ˆ
+BˆÝXÚÜÈH×Bˆ›Üˆ[™^[ˆ˜[™ÙJJN‚ˆ˜][ÈH[™^ÈˆXÚ×Ý[YHH\š[ÙÜÝ\
+È[YY[JÙXÛÛ™Ï]Ý[ÜÙXÛÛ™È
+ˆ˜][ÊBˆÝXÚÜË˜\[™
+ˆÂˆžŽˆ›Ý[™
+ÝÛY
+ÈÝÝÚY
+ˆ˜][ËŠKˆ›X™[ŽˆXÚ×Ý[YKœÝ™[YJ‰R‰SHŠHYˆ
+\š[ÙÙ[™H\š[ÙÜÝ\
+K™^\ÈHH[ÙHXÚ×Ý[YKœÝ™[YJ‰YÉ[HŠKˆBˆ
+BˆWÝXÚÜÈHÂˆÂˆžHŽˆ›Ý[™
+ÝÝÜ
+ÈÝÚZYÚ
+ˆ[™^ÈŠKˆ›X™[Žˆ›Ý[™
+WÛX^
+ˆ
+HH[™^È
+KJKˆBˆ›Üˆ[™^[ˆ˜[™ÙJJBˆBˆ™]\›ˆÂˆÚYŽˆ[
+Ú\ÝÚY
+KˆšZYÚŽˆ[
+Ú\ÚZYÚ
+KˆœÝÛYŽˆÝÛYˆœÝÜšYÚŽˆÚ\ÝÚYHÝÜšYÚˆœÝÝÜŽˆÝÝÜˆœÝØ›ÝÛHŽˆ˜\Ù[[™Kˆ›[™WÜ]Žˆ[™WÜ]ˆ˜\™XWÜ]Žˆ\™XWÜ]ˆžÝXÚÜÈŽˆÝXÚÜËˆžWÝXÚÜÈŽˆWÝXÚÜËˆœØ[\WØÛÝ[Žˆ[ŠØ[\\ÊKˆ›X^ÜÝÙ\—ÚÝÈŽˆ›Ý[™
+WÛX^JKˆB‚‚™Yˆ\œÙWÙ]][YWÝ˜[YJ˜[YNˆ[žJHOˆ]][YH›Û™N‚ˆYˆ˜[YH[ˆ
+›Û™KˆŠN‚ˆ™]\›ˆ›Û™BˆYˆ\Ú[œÝ[˜ÙJ˜[YK
+[›Ø]
+JN‚ˆ[Y\Ý[\H›Ø]
+˜[YJBˆYˆ[Y\Ý[\ˆLÌÌÌ‚ˆ[Y\Ý[\ÏHLˆžN‚ˆ™]\›ˆ]][YK™œ›Û][Y\Ý[\
+[Y\Ý[\
+Bˆ^Ù\
+ÔÑ\œ›Ü‹Ý™\™›ÝÑ\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆ™]\›ˆ›Û™Bˆ˜]ÈHÝŠ˜[YJKœÝš\
+
+BˆžN‚ˆ[Y\Ý[\H›Ø]
+˜]ÊBˆYˆ[Y\Ý[\ˆLÌÌÌ‚ˆ[Y\Ý[\ÏHLˆ™]\›ˆ]][YK™œ›Û][Y\Ý[\
+[Y\Ý[\
+Bˆ^Ù\
+ÔÑ\œ›Ü‹Ý™\™›ÝÑ\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆ\ÜÂˆ˜]ÈH˜]Ëœ™\XÙJ–ˆ‹ŠÌŒŠBˆžN‚ˆ\œÙYH]][YK™œ›ÛZ\ÛÙ›Ü›X]
+˜]ÊBˆ™]\›ˆ\œÙYœ™\XÙJš[™›ÏS›Û™JHYˆ\œÙYš[™›È[ÙH\œÙYˆ^Ù\˜[YQ\œ›ÜŽ‚ˆ™]\›ˆ›Û™B‚‚™YˆØ[Ý[]WØ\ÜÙ]Ø]˜Z[Xš[]J]šXÙWÜ›ÝÜÎˆ\ÝÙXÝÜÝ‹[žWWJHOˆXÝÜÝ‹[žWN‚ˆ[˜X›YÜ›ÝÜÈHÜ›ÝÈ›Üˆ›ÝÈ[ˆ]šXÙWÜ›ÝÜÈYˆ[
+›ÝË™Ù]
+™[˜X›Y‹JHÜˆ
+HOHWBˆÝ[H[Š[˜X›YÜ›ÝÜÊBˆ]˜Z[X›HHÝ[JH›Üˆ›ÝÈ[ˆ[˜X›YÜ›ÝÜÈYˆ›ÝË™Ù]
+˜]˜Z[Xš[]WÜÝ]\ÈŠHOH˜]˜Z[X›HŠBˆ[˜]˜Z[X›HHÝ[JˆH›Üˆ›ÝÈ[ˆ[˜X›YÜ›ÝÜÈYˆ›ÝË™Ù]
+˜]˜Z[Xš[]WÜÝ]\ÈŠH[ˆÈ[˜]˜Z[X›H‹››×ØÛÛ[][šXØ][ÛˆŸBˆ
+Bˆ›×ØÛÛ[][šXØ][ÛˆHÝ[JH›Üˆ›ÝÈ[ˆ[˜X›YÜ›ÝÜÈYˆ›ÝË™Ù]
+˜]˜Z[Xš[]WÜÝ]\ÈŠHOH››×ØÛÛ[][šXØ][ÛˆŠBˆ™XÙ[HÝ[JH›Üˆ›ÝÈ[ˆ[˜X›YÜ›ÝÜÈYˆ›ÝË™Ù]
+˜ÛÛ[][šXØ][Û—ÜÝ]\ÈŠHOHœ™XÙ[ŠBˆ˜]YÝ˜[Y\ÈHÜ›ÝË™Ù]
+œ˜]YÜÝÙ\—ÚÝÈŠH›Üˆ›ÝÈ[ˆ[˜X›YÜ›ÝÜ×BˆÛ›ÝÛ—Ü˜]YHÙ›Ø]
+˜[YJH›Üˆ˜[YH[ˆ˜]YÝ˜[Y\ÈYˆ˜[YH\È›Ý›Û™WBˆY™™XÝYÜ›ÝÜÈHÂˆ›ÝÈ›Üˆ›ÝÈ[ˆ[˜X›YÜ›ÝÜÈYˆ›ÝË™Ù]
+˜]˜Z[Xš[]WÜÝ]\ÈŠH[ˆÈ[˜]˜Z[X›H‹››×ØÛÛ[][šXØ][ÛˆŸBˆBˆY™™XÝYÜÝÙ\—ÚÝÈH
+ˆÝ[J›Ø]
+›ÝÖÈœ˜]YÜÝÙ\—ÚÝÈ—JH›Üˆ›ÝÈ[ˆY™™XÝYÜ›ÝÜÊBˆYˆY™™XÝYÜ›ÝÜÈ[™[
+›ÝË™Ù]
+œ˜]YÜÝÙ\—ÚÝÈŠH\È›Ý›Û™H›Üˆ›ÝÈ[ˆY™™XÝYÜ›ÝÜÊBˆ[ÙH›Û™Bˆ
+BˆØ\XÚ]WØ]˜Z[Xš[]WÜÝH›Û™BˆYˆÝ[[™[ŠÛ›ÝÛ—Ü˜]Y
+HOHÝ[[™Ý[JÛ›ÝÛ—Ü˜]Y
+Hˆ‚ˆØ\XÚ]WØ]˜Z[Xš[]WÜÝH›Ý[™
+ˆÝ[J›Ø]
+›ÝÖÈœ˜]YÜÝÙ\—ÚÝÈ—JH›Üˆ›ÝÈ[ˆ[˜X›YÜ›ÝÜÈYˆ›ÝË™Ù]
+˜]˜Z[Xš[]WÜÝ]\ÈŠHOH˜]˜Z[X›HŠBˆÈÝ[JÛ›ÝÛ—Ü˜]Y
+Bˆ
+ˆLˆ‹ˆ
+Bˆ™]\›ˆÂˆš[™\\—Ø]˜Z[Xš[]WÜÝŽˆ›Ý[™
+]˜Z[X›HÈÝ[
+ˆLŠHYˆÝ[[ÙH›Û™Kˆ˜Ø\XÚ]WØ]˜Z[Xš[]WÜÝŽˆØ\XÚ]WØ]˜Z[Xš[]WÜÝˆ˜ÛÛ[][šXØ][Û—Ø]˜Z[Xš[]WÜÝŽˆ›Ý[™
+™XÙ[ÈÝ[
+ˆLŠHYˆÝ[[ÙH›Û™Kˆ˜]˜Z[X›WÚ[™\\œÈŽˆ]˜Z[X›KˆÝ[Ú[™\\œÈŽˆÝ[ˆ[˜]˜Z[X›WÚ[™\\œÈŽˆ[˜]˜Z[X›Kˆ››×ØÛÛ[][šXØ][Û—Ù]šXÙ\ÈŽˆ›×ØÛÛ[][šXØ][Û‹ˆ˜Y™™XÝYÜÝÙ\—ÚÝÈŽˆY™™XÝYÜÝÙ\—ÚÝËˆ˜]˜Z[X›WÜÝš[™ÜÈŽˆÝ[J[
+›ÝË™Ù]
+˜]˜Z[X›WÜÝš[™ÜÈŠHÜˆ
+H›Üˆ›ÝÈ[ˆ[˜X›YÜ›ÝÜÊKˆÝ[ÜÝš[™ÜÈŽˆÝ[J[
+›ÝË™Ù]
+Ý[ÜÝš[™ÜÈŠHÜˆ
+H›Üˆ›ÝÈ[ˆ[˜X›YÜ›ÝÜÊKˆ[˜]˜Z[X›WÜÝš[™ÜÈŽˆÝ[J[
+›ÝË™Ù]
+[˜]˜Z[X›WÜÝš[™ÜÈŠHÜˆ
+H›Üˆ›ÝÈ[ˆ[˜X›YÜ›ÝÜÊKˆœÝš[™×Ø]˜Z[Xš[]WÜÝŽˆ
+ˆ›Ý[™
+ˆÝ[J[
+›ÝË™Ù]
+˜]˜Z[X›WÜÝš[™ÜÈŠHÜˆ
+H›Üˆ›ÝÈ[ˆ[˜X›YÜ›ÝÜÊBˆÈÝ[J[
+›ÝË™Ù]
+Ý[ÜÝš[™ÜÈŠHÜˆ
+H›Üˆ›ÝÈ[ˆ[˜X›YÜ›ÝÜÊBˆ
+ˆLˆ‹ˆ
+BˆYˆÝ[J[
+›ÝË™Ù]
+Ý[ÜÝš[™ÜÈŠHÜˆ
+H›Üˆ›ÝÈ[ˆ[˜X›YÜ›ÝÜÊBˆ[ÙH›Û™Bˆ
+KˆB‚‚™Yˆ›Ü›X]Ù\Ú[ÛœÛÛ\—Ø[\›WÝ[YJ˜[YNˆ[žJHOˆÝŽ‚ˆYˆ˜[YH[ˆ
+›Û™KˆŠN‚ˆ™]\›ˆˆ‚ˆ˜]ÈHÝŠ˜[YJKœÝš\
+
+BˆYˆ˜]Ëš\ÙYÚ]
+
+N‚ˆ[Y\Ý[\H[
+˜]ÊBˆYˆ[Y\Ý[\ˆLÌÌÌ‚ˆ[Y\Ý[\H[
+[Y\Ý[\ÈL
+BˆžN‚ˆ™]\›ˆ]][YK™œ›Û][Y\Ý[\
+[Y\Ý[\
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠBˆ^Ù\
+˜[YQ\œ›Ü‹ÔÑ\œ›ÜŠN‚ˆ™]\›ˆ˜]Âˆ™]\›ˆ˜]Â‚‚™Yˆ›Ü›X[^™WÙ\Ú[ÛœÛÛ\—Ø[\›J›ÝÎˆXÝÜÝ‹[žWJHOˆXÝÜÝ‹Ý—N‚ˆ[\›WÛ˜[YHHš\œÝÛ›Û—Ù[\Jˆ›ÝËˆÂˆ˜[\›S˜[YH‹ˆ˜[\›WÛ˜[YH‹ˆ›˜[YH‹ˆ˜[\›U\H‹ˆ˜[\›U\S˜[YH‹ˆ™˜][˜[YH‹ˆ™]™[˜[YH‹ˆ˜Ø]\ÙH‹ˆKˆ
+Bˆ]šXÙWÛ˜[YHHš\œÝÛ›Û—Ù[\Jˆ›ÝËˆÂˆ™]“˜[YH‹ˆ™]šXÙS˜[YH‹ˆ™]šXÙWÛ˜[YH‹ˆ™\]Z\Y[˜[YH‹ˆš[™\\“˜[YH‹ˆ™][X\È‹ˆ™]•\S˜[YH‹ˆ™]‘ˆ‹ˆ™]šXÙQˆ‹ˆKˆ
+Bˆ™]\›ˆÂˆ˜[\›WÛ˜[YHŽˆ[\›WÛ˜[YHÜˆš\œÝÛ›Û—Ù[\J›ÝËÈ˜[\›RY‹˜[\›WÚY‹šY—JHÜˆ[\›YH]]›È‹ˆ™]šXÙWÛ˜[YHŽˆ]šXÙWÛ˜[YHÜˆ\\™[È˜[ÈY[YšXØYÈ‹ˆœÙ]™\š]HŽˆš\œÝÛ›Û—Ù[\J›ÝËÈ›]ˆ‹›]™[‹œÙ]™\š]H‹˜[\›S]™[—JKˆœ˜Z\ÙYØ]Žˆ›Ü›X]Ù\Ú[ÛœÛÛ\—Ø[\›WÝ[YJš\œÝÛ›Û—Ù[\J›ÝËÈœ˜Z\ÙU[YH‹œÝ\[YH‹›ØØÝ\•[YH‹š\[•[YH—JJKˆœÝ]\ÈŽˆš\œÝÛ›Û—Ù[\J›ÝËÈœÝ]\È‹˜[\›TÝ]\È‹œÝ]H—JKˆB‚‚™YˆÝ[[X\š^™WÙ\Ú[ÛœÛÛ\—Ø[\›\Ê[\›\Îˆ\ÝÙXÝÜÝ‹[žWWK[Z]ˆ[HÊHOˆXÝÜÝ‹[žWN‚ˆ›Ü›X[^™YHÛ›Ü›X[^™WÙ\Ú[ÛœÛÛ\—Ø[\›J[\›JH›Üˆ[\›H[ˆ[\›\ÈYˆ\Ú[œÝ[˜ÙJ[\›KXÝ
+WBˆš[X\žHH›Ü›X[^™YÌHYˆ›Ü›X[^™Y[ÙHßBˆÝ[[X\žWÜ\ÈH×Bˆ›Üˆ[\›H[ˆ›Ü›X[^™YÎ›[Z]N‚ˆX™[H[\›VÈ˜[\›WÛ˜[YH—BˆYˆ[\›VÈ™]šXÙWÛ˜[YH—N‚ˆX™[HˆžÛX™[HØ[\›VÉÙ]šXÙWÛ˜[YI×_H‚ˆYˆ[\›VÈœÙ]™\š]H—N‚ˆX™[HˆžÛX™[H
+Ù]‹ˆØ[\›VÉÜÙ]™\š]I×_JH‚ˆÝ[[X\žWÜ\Ë˜\[™
+X™[
+BˆYˆ[Š›Ü›X[^™Y
+Hˆ[Z]‚ˆÝ[[X\žWÜ\Ë˜\[™
+ˆŠÞÛ[Š›Ü›X[^™Y
+HH[Z]H[\›Y\ÈŠBˆ™]\›ˆÂˆœš[X\žWØ[\›WÛ˜[YHŽˆš[X\žK™Ù]
+˜[\›WÛ˜[YH‹ˆŠKˆœš[X\žWØ[\›WÙ]šXÙHŽˆš[X\žK™Ù]
+™]šXÙWÛ˜[YH‹ˆŠKˆœš[X\žWØ[\›WÜÙ]™\š]HŽˆš[X\žK™Ù]
+œÙ]™\š]H‹ˆŠKˆœš[X\žWØ[\›WÜ˜Z\ÙYØ]Žˆš[X\žK™Ù]
+œ˜Z\ÙYØ]‹ˆŠKˆ˜[\›WÜÝ[[X\žHŽˆŽÈ‹š›Ú[ŠÝ[[X\žWÜ\ÊKˆ››Ü›X[^™YØ[\›\ÈŽˆ›Ü›X[^™YˆB‚‚™Yˆ\Ú[ÛœÛÛ\—Ø[\›WÜÙ]™\š]WÜ˜[šÊ˜[YNˆ[žJHOˆ[›Û™N‚ˆ›Ü›X[^™YH›Ü›X[^™WÛ˜[YJÝŠ˜[YHÜˆˆŠJBˆYˆ›Ý›Ü›X[^™Y‚ˆ™]\›ˆ›Û™BˆYˆ›Ü›X[^™Y[ˆÈŒH‹ŒKŒ‹˜Üš]XØ[‹˜Üš]XØH‹˜Üš]XÛÈŸN‚ˆ™]\›ˆBˆYˆ›Ü›X[^™Y[ˆÈŒˆ‹Œ‹Œ‹›XZ›Üˆ‹˜[H‹›XZ[ÜˆŸN‚ˆ™]\›ˆ‚ˆYˆ›Ü›X[^™Y[ˆÈŒÈ‹ŒËŒ‹›Z[›Üˆ‹›Y[›Üˆ‹˜˜Z^HŸN‚ˆ™]\›ˆÂˆYˆ›Ü›X[^™Y[ˆÈ‹Œ‹Ø\›š[™È‹˜]š\ÛÈ‹˜[\HŸN‚ˆ™]\›ˆˆ™]\›ˆ›Û™B‚‚™Yˆ\š]™WÙ\Ú[ÛœÛÛ\—Û[Ûš]Üš[™×ÜÝ]\ÊX[Ü˜]Îˆ[žK[\›\Îˆ\ÝÙXÝÜÝ‹[žWWJHOˆÝŽ‚ˆÝ]\ÈHX\Ù\Ú[ÛœÛÛ\—ÜÝ]\ÊX[Ü˜]ÊBˆYˆÝ]\ÈOH‘\ØÛÛ™XÝYHŽ‚ˆ™]\›ˆÝ]\Â‚ˆ[\›WÜ˜[šÜÈHÂˆ˜[šÂˆ›Üˆ[\›H[ˆ[\›\ÂˆYˆ\Ú[œÝ[˜ÙJ[\›KXÝ
+Bˆ›Üˆ˜[šÈ[ˆÙ\Ú[ÛœÛÛ\—Ø[\›WÜÙ]™\š]WÜ˜[šÊš\œÝÛ›Û—Ù[\J[\›KÈ›]ˆ‹›]™[‹œÙ]™\š]H‹˜[\›S]™[—JJWBˆYˆ˜[šÈ\È›Ý›Û™BˆBˆYˆ[žJ˜[šÈHˆ›Üˆ˜[šÈ[ˆ[\›WÜ˜[šÜÊN‚ˆ™]\›ˆ‘\œ›È‚ˆYˆ[\›WÜ˜[šÜÎ‚ˆ™]\›ˆ[\H‚ˆ™]\›ˆÝ]\Â‚‚™Yˆ›Ü›X[^™WÙ\Ú[ÛœÛÛ\—Ü[Ü›ÝÊˆÝ][Û—Ü›ÝÎˆXÝÜÝ‹[žWKˆ™X[[YWÜ›ÝÎˆXÝÜÝ‹[žWH›Û™HH›Û™Kˆ[\›\Îˆ\ÝÙXÝÜÝ‹[žWWH›Û™HH›Û™KŠHOˆXÝÜÝ‹[žWN‚ˆ^\›˜[ÚYHÝŠÝ][Û—Ü›ÝË™Ù]
+œ[ÛÙHŠHÜˆÝ][Û—Ü›ÝË™Ù]
+œÝ][ÛÛÙHŠHÜˆˆŠKœÝš\
+
+Bˆ^\›˜[Û˜[YHHÝŠÝ][Û—Ü›ÝË™Ù]
+œ[˜[YHŠHÜˆÝ][Û—Ü›ÝË™Ù]
+œÝ][Û“˜[YHŠHÜˆˆŠKœÝš\
+
+BˆYˆ›Ý^\›˜[Û˜[YN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠH™\ÜÜÝH\Ú[Û”ÛÛ\ˆ˜[È›Ý^H›ÛYHHÙ[˜[[XH\È[š\ËˆŠB‚ˆ]WÚ][WÛX\H
+™X[[YWÜ›ÝÈÜˆßJK™Ù]
+™]R][SX\ŠHÜˆßBˆX[Ü˜]ÈH]WÚ][WÛX\™Ù]
+œ™X[ÚX[ÜÝ]HŠBˆ˜]×ÜÝ]\ÈH\ØÜšX™WÙ\Ú[ÛœÛÛ\—ÚX[ÜÝ]JX[Ü˜]ÊB‚ˆXÝ]™WØ[\›\ÈH[\›\ÈÜˆ×BˆÝ]\ÈH\š]™WÙ\Ú[ÛœÛÛ\—Û[Ûš]Üš[™×ÜÝ]\ÊX[Ü˜]ËXÝ]™WØ[\›\ÊBˆ[\›WÜÝ[[X\žHHÝ[[X\š^™WÙ\Ú[ÛœÛÛ\—Ø[\›\ÊXÝ]™WØ[\›\ÊBˆ[\›WÛ]™[ÈHÛÜY
+ÜÝŠ][K™Ù]
+›]ˆŠJH›Üˆ][H[ˆXÝ]™WØ[\›\ÈYˆ][K™Ù]
+›]ˆŠH\È›Ý›Û™_JBˆ›Ý\×Ü\ÈHÙˆšX[ÜÝ]O^Ü˜]×ÜÝ]\ßH—BˆYˆXÝ]™WØ[\›\Î‚ˆ›Ý\×Ü\Ë˜\[™
+ˆ˜XÝ]™WØ[\›\Ï^Û[ŠXÝ]™WØ[\›\Ê_HŠBˆYˆ[\›WÛ]™[Î‚ˆ›Ý\×Ü\Ë˜\[™
+ˆ›]™[Ï^ÉË	Ëš›Ú[Š[\›WÛ]™[Ê_HŠBˆYˆ[\›WÜÝ[[X\žVÈ˜[\›WÜÝ[[X\žH—N‚ˆ›Ý\×Ü\Ë˜\[™
+ˆ˜[\›WÙ]Z[Ï^Ø[\›WÜÝ[[X\žVÉØ[\›WÜÝ[[X\žI×_HŠB‚ˆ™]\›ˆÂˆ™^\›˜[ÚYŽˆ^\›˜[ÚYˆ™^\›˜[Û˜[YHŽˆ^\›˜[Û˜[YKˆœÝ]\ÈŽˆÝ]\Ëˆœ˜]×ÜÝ]\ÈŽˆ˜]×ÜÝ]\ËˆšX[ÜÝ]HŽˆ˜]×ÜÝ]\Ëˆ˜[\›WØÛÝ[Žˆ[ŠXÝ]™WØ[\›\ÊKˆ˜[\›WÛ]™[ÈŽˆ‹‹š›Ú[Š[\›WÛ]™[ÊKˆœš[X\žWØ[\›WÛ˜[YHŽˆ[\›WÜÝ[[X\žVÈœš[X\žWØ[\›WÛ˜[YH—Kˆœš[X\žWØ[\›WÙ]šXÙHŽˆ[\›WÜÝ[[X\žVÈœš[X\žWØ[\›WÙ]šXÙH—Kˆœš[X\žWØ[\›WÜÙ]™\š]HŽˆ[\›WÜÝ[[X\žVÈœš[X\žWØ[\›WÜÙ]™\š]H—Kˆœš[X\žWØ[\›WÜ˜Z\ÙYØ]Žˆ[\›WÜÝ[[X\žVÈœš[X\žWØ[\›WÜ˜Z\ÙYØ]—Kˆ˜[\›WÜÝ[[X\žHŽˆ[\›WÜÝ[[X\žVÈ˜[\›WÜÝ[[X\žH—Kˆ››Ý\ÈŽˆŽÈ‹š›Ú[Š›Ý\×Ü\ÊKˆœ^[ØYŽˆÂˆœÝ][ÛˆŽˆÝ][Û—Ü›ÝËˆœ™X[[YHŽˆ™X[[YWÜ›ÝÈÜˆßKˆ˜[\›\ÈŽˆXÝ]™WØ[\›\Ëˆ››Ü›X[^™YØ[\›\ÈŽˆ[\›WÜÝ[[X\žVÈ››Ü›X[^™YØ[\›\È—KˆKˆB‚‚™Yˆš[™ÜÝYÙÙ\ÝYØ\ÜÙ]ÚY
+ÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹^\›˜[Û˜[YNˆÝŠHOˆ[›Û™N‚ˆ›Ü›X[^™YÛ˜[YHH›Ü›X[^™WÛ˜[YJ^\›˜[Û˜[YJBˆ^XÝHš[™Ø\ÜÙ]ÚY
+ÛÛ›‹^\›˜[Û˜[YJBˆYˆ^XÝ‚ˆ™]\›ˆ^XÝˆØ[™Y]HHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕYˆ”“ÓH\ÜÙ]ÂˆÒT‘H‘TPÑJÕÑTŠ›Ú™XÝÛ˜[YJK	È	Ë	ÉÊHRÑHÂˆÔ‘Tˆ–H›Ú™XÝÛ˜[YHÓÓUH“ÐÐTÑBˆSRUBˆˆˆ‹ˆ
+ˆ‰^Û›Ü›X[^™YÛ˜[YKœ™\XÙJ	È	Ë	ÉÊ_IH‹
+Kˆ
+K™™]ÚÛ™J
+Bˆ™]\›ˆ[
+Ø[™Y]VÈšY—JHYˆØ[™Y]H[ÙH›Û™B‚‚™Yˆ\œÙWÜ›ÝšY\—Ü^[ØYÙ]J^[ØYˆXÝÜÝ‹[žWJHOˆ[žN‚ˆ]HH^[ØY™Ù]
+™]HŠBˆYˆ\Ú[œÝ[˜ÙJ]KÝŠN‚ˆžN‚ˆ™]\›ˆœÛÛ‹›ØYÊ]JBˆ^Ù\œÛÛ‹’”ÓÓ‘XÛÙQ\œ›ÜŽ‚ˆ™]\›ˆ]Bˆ™]\›ˆ]B‚‚™YˆÙ]ÜÚYÙ[™\™ÞWÙ[™Ú[ØÛÛ™šYÊÛÛ™šYÎˆÜ[]LË”›ÝÈXÝÜÝ‹[žWJHOˆXÝÜÝ‹Ý—N‚ˆÛÛ™šY×ÛX\HXÝ
+ÛÛ™šYÊBˆYØXÞWÙ[™\™ÞWÙ›ÝÈHÛÛ™šY×ÛX\™Ù]
+™[™\™ÞWÙ›Ý×Ù[™Ú[ŠHÜˆÛÛ™šY×ÛX\™Ù]
+˜[\›\×Ù[™Ú[ŠBˆ™]\›ˆÂˆ˜˜\ÙWÝ\›ŽˆÝŠÛÛ™šY×ÛX\™Ù]
+˜˜\ÙWÝ\›ŠHÜˆQUSÔÒQÑS‘T‘ÖWÐTÑWÕT“
+KœÝš\
+
+HÜˆQUSÔÒQÑS‘T‘ÖWÐTÑWÕT“ˆ›ÙÚ[—Ù[™Ú[ŽˆÝŠÛÛ™šY×ÛX\™Ù]
+›ÙÚ[—Ù[™Ú[ŠHÜˆQUSÔÒQÑS‘T‘ÖWÐUUÑS‘ÒS•
+KœÝš\
+
+HÜˆQUSÔÒQÑS‘T‘ÖWÐUUÑS‘ÒS•ˆœÞ\Ý[\×Ù[™Ú[ŽˆÝŠÛÛ™šY×ÛX\™Ù]
+œ[×Ù[™Ú[ŠHÜˆQUSÔÒQÑS‘T‘ÖWÔÖTÕST×ÑS‘ÒS•
+KœÝš\
+
+HÜˆQUSÔÒQÑS‘T‘ÖWÔÖTÕST×ÑS‘ÒS•ˆ™[™\™ÞWÙ›Ý×Ù[™Ú[ŽˆÝŠYØXÞWÙ[™\™ÞWÙ›ÝÈÜˆQUSÔÒQÑS‘T‘ÖWÑS‘T‘ÖWÑ“Õ×ÑS‘ÒS•
+KœÝš\
+
+HÜˆQUSÔÒQÑS‘T‘ÖWÑS‘T‘ÖWÑ“Õ×ÑS‘ÒS•ˆœ™YÚ[ÛˆŽˆÝŠÛÛ™šY×ÛX\™Ù]
+œ™YÚ[ÛˆŠHÜˆQUSÔÒQÑS‘T‘ÖWÔ‘QÒSÓŠKœÝš\
+
+HÜˆQUSÔÒQÑS‘T‘ÖWÔ‘QÒSÓ‹ˆB‚‚™YˆÚYÙ[™\™ÞWØÛÛ™šYÝ\™YÜÞ\Ý[WÚYÊÛÛ™šYÎˆÜ[]LË”›ÝÈXÝÜÝ‹[žWJHOˆ\ÝÜÝ—N‚ˆ˜]×Ý˜[YHHÝŠXÝ
+ÛÛ™šYÊK™Ù]
+œÞ\Ý[WÚYÈŠHÜˆˆŠKœÝš\
+
+Bˆ™]\›ˆÚ][KœÝš\
+
+H›Üˆ][H[ˆ™KœÜ]
+ˆ–Ë××JÈ‹˜]×Ý˜[YJHYˆ][KœÝš\
+
+WB‚‚™YˆZ[ÜÚYÙ[™\™ÞWÜÙ\šXÙWØÛÛ™šYÊÛÛ™šYÎˆÜ[]LË”›ÝÈXÝÜÝ‹[žWJHOˆXÝÜÝ‹[žWN‚ˆÛÛ™šY×ÛX\HXÝ
+ÛÛ™šYÊBˆ[™Ú[ÈHÙ]ÜÚYÙ[™\™ÞWÙ[™Ú[ØÛÛ™šYÊÛÛ™šY×ÛX\
+Bˆ™]\›ˆÂˆ\Ù\›˜[YHŽˆÝŠÛÛ™šY×ÛX\™Ù]
+\Ù\›˜[YHŠHÜˆˆŠKœÝš\
+
+Kˆœ\ÜÝÛÜ™ŽˆÝŠÛÛ™šY×ÛX\™Ù]
+œ\ÜÝÛÜ™ŠHÜˆˆŠKœÝš\
+
+Kˆ˜˜\ÙWÝ\›Žˆ[™Ú[ÖÈ˜˜\ÙWÝ\›—Kˆ›ÙÚ[—Ù[™Ú[Žˆ[™Ú[ÖÈ›ÙÚ[—Ù[™Ú[—KˆœÞ\Ý[\×Ù[™Ú[Žˆ[™Ú[ÖÈœÞ\Ý[\×Ù[™Ú[—Kˆœ[×Ù[™Ú[Žˆ[™Ú[ÖÈœÞ\Ý[\×Ù[™Ú[—Kˆ™[™\™ÞWÙ›Ý×Ù[™Ú[Žˆ[™Ú[ÖÈ™[™\™ÞWÙ›Ý×Ù[™Ú[—Kˆ›Û˜›Ø\™Ù[™Ú[ŽˆÝŠÛÛ™šY×ÛX\™Ù]
+›Û˜›Ø\™Ù[™Ú[ŠHÜˆQUSÔÒQÑS‘T‘ÖWÓÓ“ÐT‘ÑS‘ÒS•
+KœÝš\
+
+HÜˆQUSÔÒQÑS‘T‘ÖWÓÓ“ÐT‘ÑS‘ÒS•ˆœ™YÚ[ÛˆŽˆ[™Ú[ÖÈœ™YÚ[Ûˆ—KˆœÞ\Ý[WÚYÈŽˆÝŠÛÛ™šY×ÛX\™Ù]
+œÞ\Ý[WÚYÈŠHÜˆˆŠKœÝš\
+
+KˆB‚‚™Yˆ›Ü›X[^™WÜÚYÙ[™\™ÞWÜÞ\Ý[WÜ›ÝÜÊ]Nˆ[žJHOˆ\ÝÙXÝÜÝ‹[žWWN‚ˆYˆ\Ú[œÝ[˜ÙJ]K\Ý
+N‚ˆ™]\›ˆÜ›ÝÈ›Üˆ›ÝÈ[ˆ]HYˆ\Ú[œÝ[˜ÙJ›ÝËXÝ
+WBˆYˆ\Ú[œÝ[˜ÙJ]KXÝ
+N‚ˆ›ÜˆÙ^H[ˆ
+›\Ý‹œ™XÛÜ™È‹œÞ\Ý[\È‹š][\È‹œÞ\Ý[S\Ý‹œ›ÝÜÈŠN‚ˆ›ÝÜÈH]K™Ù]
+Ù^JBˆYˆ\Ú[œÝ[˜ÙJ›ÝÜË\Ý
+N‚ˆ™]\›ˆÜ›ÝÈ›Üˆ›ÝÈ[ˆ›ÝÜÈYˆ\Ú[œÝ[˜ÙJ›ÝËXÝ
+WBˆYˆ[žJÙ^H[ˆ]H›ÜˆÙ^H[ˆ
+œÞ\Ý[RY‹šY‹œÞ\Ý[S˜[YH‹›˜[YHŠJN‚ˆ™]\›ˆÙ]WBˆ™]\›ˆ×B‚‚™YˆX\ÜÚYÙ[™\™ÞWÜÝ]\Ê˜]×ÜÝ]\Îˆ[žK[™\™ÞWÙ›ÝÎˆXÝÜÝ‹[žWH›Û™HH›Û™JHOˆÝŽ‚ˆ[[™\™ÞWÙ›ÝÂˆ™]\›ˆÚYÙ[™\™ÞWÜÙ\šXÙK›X\ÜÚYÙ[™\™ÞWÜÝ]\Ê˜]×ÜÝ]\ÊB‚‚™Yˆ›Ü›X]ÜÚYÙ[™\™ÞWÚÝÊ˜[YNˆ[žJHOˆÝŽ‚ˆYˆ˜[YH[ˆ
+›Û™KˆŠN‚ˆ™]\›ˆ“‹ÐH‚ˆžN‚ˆ™]\›ˆˆžÙ›Ø]
+˜[YJN™ßHÕÈ‚ˆ^Ù\
+\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆ™]\›ˆ“‹ÐH‚‚‚™Yˆ›Ü›X]ÜÚYÙ[™\™ÞWÜÝ
+˜[YNˆ[žJHOˆÝŽ‚ˆYˆ˜[YH[ˆ
+›Û™KˆŠN‚ˆ™]\›ˆ“‹ÐH‚ˆžN‚ˆ™]\›ˆˆžÙ›Ø]
+˜[YJN™ßIH‚ˆ^Ù\
+\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆ™]\›ˆ“‹ÐH‚‚‚™YˆZ[ÜÚYÙ[™\™ÞWÛ[Ûš]Üš[™×Û›Ý\Ê›ÝÎˆXÝÜÝ‹[žWJHOˆÝŽ‚ˆ˜]\žWØØ\XÚ]HH›ÝË™Ù]
+˜˜]\žWØØ\XÚ]WÚÝÚŠBˆžN‚ˆ\×Ø˜]\žHH˜]\žWØØ\XÚ]H›Ý[ˆ
+›Û™KˆŠH[™›Ø]
+˜]\žWØØ\XÚ]HÜˆ
+Hˆˆ^Ù\
+\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆ\×Ø˜]\žHH˜[ÙBˆ˜]\žWÝ˜[YHH›Ü›X]ÜÚYÙ[™\™ÞWÚÝÊ›ÝË™Ù]
+˜˜]\žWÜÝÙ\—ÚÝÈŠJHYˆ\×Ø˜]\žH[ÙH“‹ÐH‚ˆÛØ×Ý˜[YHH›Ü›X]ÜÚYÙ[™\™ÞWÜÝ
+›ÝË™Ù]
+˜˜]\žWÜÛØ×ÜÝŠJHYˆ\×Ø˜]\žH[ÙH“‹ÐH‚ˆ™]\›ˆˆ‹š›Ú[ŠˆÂˆˆ”ŽˆÙ›Ü›X]ÜÚYÙ[™\™ÞWÚÝÊ›ÝË™Ù]
+	Ü—ÜÝÙ\—ÚÝÉÊJ_H‹ˆˆØ\™ØNˆÙ›Ü›X]ÜÚYÙ[™\™ÞWÚÝÊ›ÝË™Ù]
+	ÛØYÜÝÙ\—ÚÝÉÊJ_H‹ˆˆ”™YNˆÙ›Ü›X]ÜÚYÙ[™\™ÞWÚÝÊ›ÝË™Ù]
+	ÙÜšYÜÝÙ\—ÚÝ×Ü˜]ÉÊJ_H‹ˆˆ˜]\šXNˆØ˜]\žWÝ˜[Y_H‹ˆˆ”ÓÐÎˆÜÛØ×Ý˜[Y_H‹ˆBˆ
+B‚‚”ÒQÑS‘T‘ÖWÔÖTÕSWÒQÔUT“ˆH™K˜ÛÛ\[Jˆ—–ÐKV˜K^ŒNWËW^ÌKIŠB”ÒQÑS‘T‘ÖWÐPÕU‘WÓÓ“ÐT‘S‘×ÔÕUTÑTÈHÈœ™\]Y\ÝY‹˜[™XYWÜ™\]Y\ÝY‹˜[™XYWÜ™\]Y\ÝYÛÜ—ÛÛ˜›Ø\™YŸB‚‚™Yˆ›Ü›X[^™WÜÚYÙ[™\™ÞWÜÞ\Ý[WÚYÙ›Ü—ØÛÛ\\™JÞ\Ý[WÚYˆÝŠHOˆÝŽ‚ˆ™]\›ˆÞ\Ý[WÚYœÝš\
+
+K›ÝÙ\Š
+B‚‚™Yˆ˜[Y]WÜÚYÙ[™\™ÞWÜÞ\Ý[WÚY
+˜]×ÜÞ\Ý[WÚYˆÝŠHOˆÝŽ‚ˆÞ\Ý[WÚYH
+˜]×ÜÞ\Ý[WÚYÜˆˆŠKœÝš\
+
+BˆYˆ›ÝÞ\Ý[WÚY‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ”™Y[˜ÚHÈÞ\Ý[HQÚYÙ[™\™ÞKˆŠBˆYˆ‹ˆ[ˆÞ\Ý[WÚYÜˆŽÈˆ[ˆÞ\Ý[WÚYÜˆ[žJÚ\‹š\ÜÜXÙJ
+H›ÜˆÚ\ˆ[ˆÞ\Ý[WÚY
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ‘[šXH\[˜\È[HÞ\Ý[HQÜˆYYËˆŠBˆYˆ›ÝÒQÑS‘T‘ÖWÔÖTÕSWÒQÔUT“‹™[X]Ú
+Þ\Ý[WÚY
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ“ÈÞ\Ý[HQ]™H\ˆ]HØ\˜XÝ\™\ÈH\Ø\ˆ\[˜\È]˜\Ë[Y\›ÜËY™[ˆÝH[™\œØÛÜ™KˆŠBˆ™]\›ˆÞ\Ý[WÚY‚‚™Yˆ\Ù\ÜÚYÙ[™\™ÞWÛÛ˜›Ø\™[™×Ü™\]Y\Ý
+ˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆÞ\Ý[WÚYˆÝ‹ˆ™\]Y\ÝYØžNˆÝ‹ˆ™\Ý[ˆXÝÜÝ‹[žWKŠHOˆ[‚ˆ›Ü›X[^™YH›Ü›X[^™WÜÚYÙ[™\™ÞWÜÞ\Ý[WÚYÙ›Ü—ØÛÛ\\™JÞ\Ý[WÚY
+Bˆ^\Ý[™ÈHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕ
+‚ˆ”“ÓHÚYÙ[™\™ÞWÛÛ˜›Ø\™[™×Ü™\]Y\ÝÂˆÒT‘HÕÑTŠÞ\Ý[WÚY
+HHÈS‘Ý]\ÈSˆ
+	Ü™\]Y\ÝY	Ë	Ø[™XYWÜ™\]Y\ÝY	Ë	Ø[™XYWÜ™\]Y\ÝYÛÜ—ÛÛ˜›Ø\™Y	ÊBˆÔ‘Tˆ–HYTÐÂˆSRUBˆˆˆ‹ˆ
+›Ü›X[^™Y
+Kˆ
+K™™]ÚÛ™J
+Bˆ›ÝÈH]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠBˆ™\ÜÛœÙWÚœÛÛˆHœÛÛ‹™[\ÊÚYÙ[™\™ÞWÜÙ\šXÙKœØ[š]^™WÜ^[ØY
+™\Ý[™Ù]
+œ™\ÜÛœÙHŠHÜˆ™\Ý[
+K[œÝ\™WØ\ØÚZOUYJBˆYˆ^\Ý[™Î‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUHÚYÙ[™\™ÞWÛÛ˜›Ø\™[™×Ü™\]Y\ÝÂˆÑU][\ØÛÝ[H][\ØÛÝ[
+ÈK›ÝšY\—ØÛÙHHË›ÝšY\—ÛY\ÜØYÙHHËˆ\ÝÙ\œ›ÜˆHË™\ÜÛœÙWÚœÛÛˆHË\]YØ]HÂˆÒT‘HYHÂˆˆˆ‹ˆ
+ˆ™\Ý[™Ù]
+œ›ÝšY\—ØÛÙH‹ˆŠKˆ™\Ý[™Ù]
+›Y\ÜØYÙH‹ˆŠKˆˆˆYˆ™\Ý[™Ù]
+œÝ]\ÈŠHOH™˜Z[Yˆ[ÙH™\Ý[™Ù]
+›Y\ÜØYÙH‹ˆŠKˆ™\ÜÛœÙWÚœÛÛ‹ˆ›ÝËˆ^\Ý[™ÖÈšY—Kˆ
+Kˆ
+Bˆ™]\›ˆ[
+^\Ý[™ÖÈšY—JBˆÝ\œÛÜˆHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•ÈÚYÙ[™\™ÞWÛÛ˜›Ø\™[™×Ü™\]Y\ÝÈ
+ˆÞ\Ý[WÚY™\]Y\ÝYØ]™\]Y\ÝYØžKÝ]\Ë›ÝšY\—ØÛÙK›ÝšY\—ÛY\ÜØYÙKˆ\ÝØÚXÚÙYØ]\›Ý™YØ]][\ØÛÝ[\ÝÙ\œ›Ü‹™\ÜÛœÙWÚœÛÛ‹Ü™X]YØ]\]YØ]ˆ
+HSQTÈ
+ËËËËËË•S•SKËËËÊBˆˆˆ‹ˆ
+ˆÞ\Ý[WÚYˆ›ÝËˆ™\]Y\ÝYØžKˆ™\Ý[™Ù]
+œÝ]\È‹™˜Z[YŠKˆ™\Ý[™Ù]
+œ›ÝšY\—ØÛÙH‹ˆŠKˆ™\Ý[™Ù]
+›Y\ÜØYÙH‹ˆŠKˆˆˆYˆ™\Ý[™Ù]
+œÝ]\ÈŠHOH™˜Z[Yˆ[ÙH™\Ý[™Ù]
+›Y\ÜØYÙH‹ˆŠKˆ™\ÜÛœÙWÚœÛÛ‹ˆ›ÝËˆ›ÝËˆ
+Kˆ
+Bˆ™]\›ˆ[
+Ý\œÛÜ‹›\Ý›ÝÚY
+B‚‚™YˆÜ™X]WÜÚYÙ[™\™ÞWÛÛ˜›Ø\™[™×Ü™\]Y\Ý
+ˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆÛÛ™šYÎˆXÝÜÝ‹[žWKˆÞ\Ý[WÚYˆÝ‹ˆ™\]Y\ÝYØžNˆÝˆHˆ‹ŠHOˆXÝÜÝ‹[žWN‚ˆÞ\Ý[WÚYH˜[Y]WÜÚYÙ[™\™ÞWÜÞ\Ý[WÚY
+Þ\Ý[WÚY
+BˆÙ\šXÙWØÛÛ™šYÈHZ[ÜÚYÙ[™\™ÞWÜÙ\šXÙWØÛÛ™šYÊÛÛ™šYÊBˆ™\Ý[HÚYÙ[™\™ÞWÜÙ\šXÙK›Û˜›Ø\™ÜÞ\Ý[JÙ\šXÙWØÛÛ™šYËÞ\Ý[WÚYÙ\ÜÚ[Û\™\]Y\ÝË”Ù\ÜÚ[ÛŠ
+JBˆ™\]Y\ÝÚYH\Ù\ÜÚYÙ[™\™ÞWÛÛ˜›Ø\™[™×Ü™\]Y\Ý
+ÛÛ›‹Þ\Ý[WÚY\Þ\Ý[WÚY™\]Y\ÝYØžO\™\]Y\ÝYØžK™\Ý[\™\Ý[
+BˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ™]\›ˆÊŠœ™\Ý[œ™\]Y\ÝÚYŽˆ™\]Y\ÝÚYB‚‚™Yˆ™XÛÛ˜Ú[WÜÚYÙ[™\™ÞWÛÛ˜›Ø\™[™×Ü™\]Y\ÝÊÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹]˜Z[X›WÜÞ\Ý[WÚYÎˆ\ÝÜÝ—JHOˆ[‚ˆ›Ü›X[^™YØ]˜Z[X›HHÛ›Ü›X[^™WÜÚYÙ[™\™ÞWÜÞ\Ý[WÚYÙ›Ü—ØÛÛ\\™JÞ\Ý[WÚY
+H›ÜˆÞ\Ý[WÚY[ˆ]˜Z[X›WÜÞ\Ý[WÚYÈYˆÞ\Ý[WÚYBˆYˆ›Ý›Ü›X[^™YØ]˜Z[X›N‚ˆ™]\›ˆˆ[™[™ÈH]Y\žWØ[
+ˆÛÛ›‹ˆˆˆ‚ˆÑSPÕ
+‚ˆ”“ÓHÚYÙ[™\™ÞWÛÛ˜›Ø\™[™×Ü™\]Y\ÝÂˆÒT‘HÝ]\ÈSˆ
+	Ü™\]Y\ÝY	Ë	Ø[™XYWÜ™\]Y\ÝY	Ë	Ø[™XYWÜ™\]Y\ÝYÛÜ—ÛÛ˜›Ø\™Y	ÊBˆˆˆ‹ˆ
+Bˆ›ÝÈH]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠBˆ\›Ý™YØÛÝ[Hˆ›Üˆ›ÝÈ[ˆ[™[™Î‚ˆYˆ›Ü›X[^™WÜÚYÙ[™\™ÞWÜÞ\Ý[WÚYÙ›Ü—ØÛÛ\\™J›ÝÖÈœÞ\Ý[WÚY—JH[ˆ›Ü›X[^™YØ]˜Z[X›N‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUHÚYÙ[™\™ÞWÛÛ˜›Ø\™[™×Ü™\]Y\ÝÂˆÑUÝ]\ÈH	Ø\›Ý™Y	Ë\ÝØÚXÚÙYØ]HË\›Ý™YØ]HÓÐSTÐÑJ\›Ý™YØ]ÊK\]YØ]HË\ÝÙ\œ›ÜˆH	ÉÂˆÒT‘HYHÂˆˆˆ‹ˆ
+›ÝË›ÝË›ÝË›ÝÖÈšY—JKˆ
+Bˆ\›Ý™YØÛÝ[
+ÏHBˆ[ÙN‚ˆÛÛ›‹™^XÝ]Jˆ•TUHÚYÙ[™\™ÞWÛÛ˜›Ø\™[™×Ü™\]Y\ÝÈÑU\ÝØÚXÚÙYØ]HË\]YØ]HÈÒT‘HYHÈ‹ˆ
+›ÝË›ÝË›ÝÖÈšY—JKˆ
+Bˆ™]\›ˆ\›Ý™YØÛÝ[‚‚™YˆÛX[\ÜÚYÙ[™\™ÞWÜÛ˜\ÚÝÊÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹›ÝšY\ŽˆÝ‹™][[Û—Ù^\Îˆ[
+HOˆ[‚ˆ™][[Û—Ù^\ÈHX^
+[
+™][[Û—Ù^\ÈÜˆQUSÔÒQÑS‘T‘ÖWÔÓTÒÕÔ‘US•SÓ—ÑVTÊKJBˆÙ^WÚÙ^HHˆœÚYÙ[™\™ÞWÜÛ˜\ÚÝØÛX[\ÞÜ›ÝšY\ŸWÞØÝ\œ™[Û\Ø›Û—Ù]J
+Kš\ÛÙ›Ü›X]
+
+_H‚ˆYˆ]Y\žWÜØØ[\ŠÛÛ›‹”ÑSPÕ˜[YH”“ÓH\ÜÝ]HÒT‘HÙ^HHÈ‹
+Ù^WÚÙ^K
+JN‚ˆ™]\›ˆˆÝ]Ù™ˆH
+]][YK››ÝÊ
+HH[YY[J^\Ï\™][[Û—Ù^\ÊJKš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠBˆÝ\œÛÜˆHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆSUH”“ÓH[YÜ˜][Û—Ü™X[[YWÜÛ˜\ÚÝÂˆÒT‘H›ÝšY\ˆHÂˆS‘ÛÛXÝYØ]ÂˆS‘Y“ÕSˆ
+ˆÑSPÕPV
+Y
+Bˆ”“ÓH[YÜ˜][Û—Ü™X[[YWÜÛ˜\ÚÝÂˆÒT‘H›ÝšY\ˆHÂˆÔ“ÕT–H^\›˜[ÚYˆ
+Bˆˆˆ‹ˆ
+›ÝšY\‹Ý]Ù™‹›ÝšY\ŠKˆ
+BˆÛÛ›‹™^XÝ]Jˆ’S”ÑT•Ôˆ‘TPÑHS•È\ÜÝ]H
+Ù^K˜[YK\]YØ]
+HSQTÈ
+Ë	ÙÛ™IËÊH‹ˆ
+Ù^WÚÙ^K]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠJKˆ
+Bˆ™]\›ˆ[
+Ý\œÛÜ‹œ›ÝØÛÝ[Üˆ
+B‚‚™Yˆ›Ü›X[^™WÜÚYÙ[™\™ÞWÜÞ\Ý[WÜ›ÝÊˆÞ\Ý[WÜ›ÝÎˆXÝÜÝ‹[žWKˆ™X[[YWÜ›ÝÎˆXÝÜÝ‹[žWH›Û™HH›Û™Kˆ[™\™ÞWÙ›ÝÎˆXÝÜÝ‹[žWH›Û™HH›Û™KŠHOˆXÝÜÝ‹[žWN‚ˆ^\›˜[ÚYHš\œÝÛ›Û—Ù[\JÞ\Ý[WÜ›ÝËÈœÞ\Ý[RY‹šY‹œÝ][Û’Y‹œ[Y—JBˆYˆ›Ý^\›˜[ÚY‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠH™\ÜÜÝHÚYÙ[™\™ÞH˜[È›Ý^HÞ\Ý[RY[XH\È[š\ËˆŠBˆ^\›˜[Û˜[YHHš\œÝÛ›Û—Ù[\JÞ\Ý[WÜ›ÝËÈœÞ\Ý[S˜[YH‹›˜[YH‹œÝ][Û“˜[YH‹œ[˜[YH—JHÜˆ^\›˜[ÚYˆ›ÝÈH[™\™ÞWÙ›ÝÈÜˆßBˆ™X[[YHH™X[[YWÜ›ÝÈÜˆßBˆ˜]×ÜÝ]\ÈHš\œÝÛ›Û—Ù[\JÞ\Ý[WÜ›ÝËÈœÝ]\È‹œÞ\Ý[TÝ]\È‹œ[›š[™ÔÝ]\È‹œÝ]H—JHÜˆš\œÝÛ›Û—Ù[\J™X[[YKÈœÝ]\È‹œÞ\Ý[TÝ]\È‹œ[›š[™ÔÝ]\È‹œÝ]H—JBˆÞ\Ý[WÛ›Ü›X[^™YHÚYÙ[™\™ÞWÜÙ\šXÙK››Ü›X[^™WÜÞ\Ý[JÞ\Ý[WÜ›ÝÊBˆ›Ý×Û›Ü›X[^™YHÚYÙ[™\™ÞWÜÙ\šXÙK››Ü›X[^™WÙ[™\™ÞWÙ›ÝÊ›ÝÊBˆÝ]\ÈHX\ÜÚYÙ[™\™ÞWÜÝ]\Ê˜]×ÜÝ]\Ë›ÝÊBˆ›Ý\×Ü\ÈHZ[ÜÚYÙ[™\™ÞWÛ[Ûš]Üš[™×Û›Ý\ÊÊŠ™›Ý×Û›Ü›X[^™Y
+ŠœÞ\Ý[WÛ›Ü›X[^™YJBˆXY×Ü\ÈHÙˆœÞ\Ý[WÜÝ]\Ï^Ü˜]×ÜÝ]\ÈÜˆ	Ý[šÛ›ÝÛ‰ßH—Bˆ›ÜˆÙ^H[ˆ
+œ”ÝÙ\ˆ‹™ÜšYÝÙ\ˆ‹˜˜]\žTÝÙ\ˆ‹˜˜]\žTÛØÈ‹›ØYÝÙ\ˆŠN‚ˆYˆÙ^H[ˆ›ÝÈ[™›ÝÖÚÙ^WH›Ý[ˆ
+›Û™KˆŠN‚ˆXY×Ü\Ë˜\[™
+ˆžÚÙ^_O^Ù›ÝÖÚÙ^W_HŠBˆ™]\›ˆÂˆ™^\›˜[ÚYŽˆ^\›˜[ÚYˆ™^\›˜[Û˜[YHŽˆ^\›˜[Û˜[YKˆœÝ]\ÈŽˆÝ]\Ëˆœ˜]×ÜÝ]\ÈŽˆ˜]×ÜÝ]\ÈÜˆ[šÛ›ÝÛˆ‹ˆ››Ý\ÈŽˆˆžÛ›Ý\×Ü\ßHÉÎÈ	Ëš›Ú[ŠXY×Ü\Ê_H‹ˆ™™]ÚÜÝ]\ÈŽˆ›ÚÈ‹ˆ™™]ÚÙ\œ›ÜˆŽˆˆ‹ˆ
+ŠœÞ\Ý[WÛ›Ü›X[^™Yˆ
+Š™›Ý×Û›Ü›X[^™Yˆœ^[ØYŽˆÂˆœÞ\Ý[HŽˆÞ\Ý[WÜ›ÝËˆœ™X[[YHŽˆ™X[[YKˆ™[™\™ÞWÙ›ÝÈŽˆ›ÝËˆKˆB‚‚™Yˆ[—ÜÚYÙ[™\™ÞWØÚXÚÊÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹›ÝšY\ŽˆÝ‹žWÜ[Žˆ›ÛÛH˜[ÙJHOˆXÝÜÝ‹[žWN‚ˆÛÛ™šYÈHÙ]Ú[YÜ˜][Û—ØÛÛ™šYÊÛÛ›‹›ÝšY\ŠBˆYˆÛÛ™šYÈ\È›Û™N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠÛÛ™šYÝ\˜XØ[ÈÚYÙ[™\™ÞH˜[È[˜ÛÛ˜YKˆŠBˆ[™Ú[ÈHÙ]ÜÚYÙ[™\™ÞWÙ[™Ú[ØÛÛ™šYÊÛÛ™šYÊBˆÙ\šXÙWØÛÛ™šYÈHZ[ÜÚYÙ[™\™ÞWÜÙ\šXÙWØÛÛ™šYÊÛÛ™šYÊBˆÙ\ÜÚ[ÛˆH™\]Y\ÝË”Ù\ÜÚ[ÛŠ
+BˆÛY[HÚYÙ[™\™ÞWÜÙ\šXÙK”ÚYÙ[™\™ÞPÛY[
+Ù\šXÙWØÛÛ™šYËÙ\ÜÚ[Û\Ù\ÜÚ[ÛŠBˆÞ\Ý[\ÈH™]žWØ\WØØ[
+ÛY[›\ÝÜÞ\Ý[\Ë[Ý×ÜÛY\[›Ý\×Ü™\]Y\ÝØÛÛ^
+
+KÛY\\][YKœÛY\
+Bˆ]˜Z[X›WÜÞ\Ý[WÚYÈHÙš\œÝÛ›Û—Ù[\J›ÝËÈœÞ\Ý[RY‹šY‹œÝ][Û’Y‹œ[Y—JH›Üˆ›ÝÈ[ˆÞ\Ý[\ÈYˆš\œÝÛ›Û—Ù[\J›ÝËÈœÞ\Ý[RY‹šY‹œÝ][Û’Y‹œ[Y—JWBˆ›Ü›X[^™YÜ›ÝÜÎˆ\ÝÙXÝÜÝ‹[žWWHH×Bˆ[™\™ÞWÙ›Ý×ØÛÝ[Hˆ[™\™ÞWÙ›Ý×Ù\œ›ÜœÎˆ\ÝÜÝ—HH×Bˆ›ÜˆÞ\Ý[WÜ›ÝÈ[ˆÞ\Ý[\Î‚ˆÞ\Ý[WÚYHš\œÝÛ›Û—Ù[\JÞ\Ý[WÜ›ÝËÈœÞ\Ý[RY‹šY‹œÝ][Û’Y‹œ[Y—JBˆYˆ›ÝÞ\Ý[WÚY‚ˆÛÛ[YBˆ[™\™ÞWÙ›ÝÎˆXÝÜÝ‹[žWHHßBˆ›ÝÈH›Ü›X[^™WÜÚYÙ[™\™ÞWÜÞ\Ý[WÜ›ÝÊÞ\Ý[WÜ›ÝËßK[™\™ÞWÙ›ÝÊBˆžN‚ˆ[™\™ÞWÙ›ÝÈH™]žWØ\WØØ[
+ˆ[X™HÞ\Ý[WÚY\Þ\Ý[WÚYˆÛY[™Ù]Ù[™\™ÞWÙ›ÝÊÞ\Ý[WÚY
+Kˆ[Ý×ÜÛY\[›Ý\×Ü™\]Y\ÝØÛÛ^
+
+KˆÛY\\][YKœÛY\ˆ
+Bˆ[™\™ÞWÙ›Ý×ØÛÝ[
+ÏHBˆ›ÝÈH›Ü›X[^™WÜÚYÙ[™\™ÞWÜÞ\Ý[WÜ›ÝÊÞ\Ý[WÜ›ÝËßK[™\™ÞWÙ›ÝÊBˆ^Ù\\T˜]S[Z]\œ›ÜŽ‚ˆ˜Z\ÙBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆØ[š]^™YÙ\œ›ÜˆHÚYÙ[™\™ÞWÜÙ\šXÙKœØ[š]^™WÜÚYÙ[™\™ÞWÙ\œ›ÜŠ^ÊBˆ[™\™ÞWÙ›Ý×Ù\œ›ÜœË˜\[™
+ˆžÜÞ\Ý[WÚYNˆÜØ[š]^™YÙ\œ›ÜŸHŠBˆ›ÝÖÈœÝ]\È—HH”Ù[HYÜÈ‚ˆ›ÝÖÈ››Ü›X[^™YÜÝ]\È—HH”Ù[HYÜÈ‚ˆ›ÝÖÈ››Ý\È—HHˆ‘[™\™ÞH›ÝÈ[™\ÜÛš]™[ˆÜØ[š]^™YÙ\œ›ÜŸH‚ˆ›ÝÖÈ™™]ÚÜÝ]\È—HH™\œ›Üˆ‚ˆ›ÝÖÈ™™]ÚÙ\œ›Üˆ—HHØ[š]^™YÙ\œ›Ü‚ˆ›ÝÖÈœ^[ØY—VÈ™™]ÚÙ\œ›Üˆ—HHØ[š]^™YÙ\œ›Ü‚ˆ›Ü›X[^™YÜ›ÝÜË˜\[™
+›ÝÊBˆ[YKœÛY\
+ŒŠB‚ˆYˆ›ÝžWÜ[Ž‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH[YÜ˜][Û—ØÛÛ™šYÜÂˆÑU\ÝÜÞ[˜×ÜÝ]\ÈHË\ÝÙ\œ›ÜˆHË\]YØ]HÂˆÒT‘H›ÝšY\ˆHÂˆˆˆ‹ˆ
+œÝXØÙ\ÜÈ‹ˆ‹]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠK›ÝšY\ŠKˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ™]\›ˆÂˆœ›ÝÜÈŽˆ›Ü›X[^™YÜ›ÝÜËˆœÞ\Ý[\ÈŽˆ›Ü›X[^™YÜ›ÝÜËˆœÝ][Û—ØÛÝ[Žˆ[ŠÞ\Ý[\ÊKˆœ™X[[YWØÛÝ[Žˆ[™\™ÞWÙ›Ý×ØÛÝ[ˆ™˜Z[YÜ™X[[YWØÛÝ[Žˆ[Š[™\™ÞWÙ›Ý×Ù\œ›ÜœÊKˆ˜[\›WØÛÝ[Žˆˆ˜[\›WÙ\œ›ÜˆŽˆŽÈ‹š›Ú[Š[™\™ÞWÙ›Ý×Ù\œ›ÜœÊKˆ™[™\™ÞWÙ›Ý×ØÛÝ[Žˆ[™\™ÞWÙ›Ý×ØÛÝ[ˆ˜˜\ÙWÝ\›Žˆ[™Ú[ÖÈ˜˜\ÙWÝ\›—Kˆ˜]˜Z[X›WÜÞ\Ý[WÚYÈŽˆ]˜Z[X›WÜÞ\Ý[WÚYËˆB‚‚™Yˆ[—Ü›ÝšY\—ØÚXÚÊÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹›ÝšY\ŽˆÝ‹žWÜ[Žˆ›ÛÛH˜[ÙJHOˆXÝÜÝ‹[žWN‚ˆYˆ›ÝšY\ˆOHS•QÔUSÓ—Ô“Õ’QT—ÔÒQÑS‘T‘ÖN‚ˆ™]\›ˆ[—ÜÚYÙ[™\™ÞWØÚXÚÊÛÛ›‹›ÝšY\‹žWÜ[YžWÜ[ŠBˆ™]\›ˆ[—Ù\Ú[ÛœÛÛ\—ØÚXÚÊÛÛ›‹›ÝšY\‹žWÜ[YžWÜ[ŠB‚‚™Yˆš[™ÜÚYÙ[™\™ÞWØ\ÜÙ]ÚY
+ÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹›ÝšY\ŽˆÝ‹^\›˜[ÚYˆÝ‹^\›˜[Û˜[YNˆÝŠHOˆ[›Û™N‚ˆX\YHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕ\ÜÙ]ÚYˆ”“ÓH\ÜÙ]Ú[YÜ˜][ÛœÂˆÒT‘H›ÝšY\ˆHÈS‘^\›˜[ÚYHÈS‘[˜X›YHBˆSRUBˆˆˆ‹ˆ
+›ÝšY\‹^\›˜[ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆX\Y‚ˆ™]\›ˆ[
+X\YÈ˜\ÜÙ]ÚY—JB‚ˆ›Ü›X[^™YH›Ü›X[^™WÛ˜[YJ^\›˜[Û˜[YJBˆYˆ›Ý›Ü›X[^™Y‚ˆ™]\›ˆ›Û™B‚ˆ›Ú™XÝÛX]Ú\ÈHÂˆ[
+›ÝÖÈšY—JBˆ›Üˆ›ÝÈ[ˆ]Y\žWØ[
+ÛÛ›‹”ÑSPÕY›Ú™XÝÛ˜[YH”“ÓH\ÜÙ]ÈÒT‘H›Ú™XÝÛ˜[YHTÈ“Õ•SŠBˆYˆ›Ü›X[^™WÛ˜[YJ›ÝÖÈœ›Ú™XÝÛ˜[YH—HÜˆˆŠHOH›Ü›X[^™YˆBˆYˆ[ŠÙ]
+›Ú™XÝÛX]Ú\ÊJHOHN‚ˆ™]\›ˆ›Ú™XÝÛX]Ú\ÖÌBˆYˆ[ŠÙ]
+›Ú™XÝÛX]Ú\ÊJHˆN‚ˆ™]\›ˆ›Û™B‚ˆ[X\×ÛX]Ú\ÈHÂˆ[
+›ÝÖÈ˜\ÜÙ]ÚY—JBˆ›Üˆ›ÝÈ[ˆ]Y\žWØ[
+ˆÛÛ›‹ˆ”ÑSPÕ\ÜÙ]ÚY”“ÓH\ÜÙ]Ø[X\Ù\ÈÒT‘H›Ü›X[^™YØ[X\ÈHÈS‘ÓÐSTÐÑJXÝ]™KJHHH‹ˆ
+›Ü›X[^™Y
+Kˆ
+BˆBˆYˆ[ŠÙ]
+[X\×ÛX]Ú\ÊJHOHN‚ˆ™]\›ˆ[X\×ÛX]Ú\ÖÌBˆYˆ[ŠÙ]
+[X\×ÛX]Ú\ÊJHˆN‚ˆ™]\›ˆ›Û™B‚ˆÜ›Ý\ÛX]Ú\ÈHÂˆ[
+›ÝÖÈšY—JBˆ›Üˆ›ÝÈ[ˆ]Y\žWØ[
+ÛÛ›‹”ÑSPÕY[œÝ[][Û—ÙÜ›Ý\”“ÓH\ÜÙ]ÈÒT‘HÓÐSTÐÑJ[œÝ[][Û—ÙÜ›Ý\	ÉÊHOH	ÉÈŠBˆYˆ›Ü›X[^™WÛ˜[YJ›ÝÖÈš[œÝ[][Û—ÙÜ›Ý\—HÜˆˆŠHOH›Ü›X[^™YˆBˆYˆ[ŠÙ]
+Ü›Ý\ÛX]Ú\ÊJHOHN‚ˆ™]\›ˆÜ›Ý\ÛX]Ú\ÖÌBˆ™]\›ˆ›Û™B‚‚™Yˆ[œÙ\Ú[YÜ˜][Û—Ü™X[[YWÜÛ˜\ÚÝ
+ˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆ\ÜÙ]ÚYˆ[›Û™Kˆ›ÝšY\ŽˆÝ‹ˆ›ÝÎˆXÝÜÝ‹[žWKˆÛÛXÝYØ]ˆÝ‹ŠHOˆ›Û™N‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È[YÜ˜][Û—Ü™X[[YWÜÛ˜\ÚÝÈ
+ˆ\ÜÙ]ÚY›ÝšY\‹^\›˜[ÚYÛÛXÝYØ]^\›˜[ÜÝ]\Ë›Ü›X[^™YÜÝ]\Ëˆ—ÜÝÙ\—ÚÝËØYÜÝÙ\—ÚÝËÜšYÜÝÙ\—ÚÝ×Ü˜]Ë˜]\žWÜÝÙ\—ÚÝË˜]\žWÜÛØ×ÜÝˆ]—ÜÝÙ\—ÚÝËX×ÜÝÙ\—ÚÝËX]Ü[\ÜÝÙ\—ÚÝË—ØØ\XÚ]WÚÝË˜]\žWØØ\XÚ]WÚÝÚ^[ØYÚœÛÛ‚ˆ
+HSQTÈ
+ËËËËËËËËËËËËËËËËÊBˆˆˆ‹ˆ
+ˆ\ÜÙ]ÚYˆ›ÝšY\‹ˆ›ÝÖÈ™^\›˜[ÚY—KˆÛÛXÝYØ]ˆ›ÝË™Ù]
+œ˜]×ÜÝ]\ÈŠKˆ›ÝË™Ù]
+œÝ]\ÈŠKˆ›ÝË™Ù]
+œ—ÜÝÙ\—ÚÝÈŠKˆ›ÝË™Ù]
+›ØYÜÝÙ\—ÚÝÈŠKˆ›ÝË™Ù]
+™ÜšYÜÝÙ\—ÚÝ×Ü˜]ÈŠKˆ›ÝË™Ù]
+˜˜]\žWÜÝÙ\—ÚÝÈŠKˆ›ÝË™Ù]
+˜˜]\žWÜÛØ×ÜÝŠKˆ›ÝË™Ù]
+™]—ÜÝÙ\—ÚÝÈŠKˆ›ÝË™Ù]
+˜X×ÜÝÙ\—ÚÝÈŠKˆ›ÝË™Ù]
+šX]Ü[\ÜÝÙ\—ÚÝÈŠKˆ›ÝË™Ù]
+œ—ØØ\XÚ]WÚÝÈŠKˆ›ÝË™Ù]
+˜˜]\žWØØ\XÚ]WÚÝÚŠKˆœÛÛ‹™[\ÊˆÂˆ
+ŠŠ›ÝË™Ù]
+œ^[ØYŠHÜˆßJKˆ™™]ÚÜÝ]\ÈŽˆ›ÝË™Ù]
+™™]ÚÜÝ]\È‹›ÚÈŠKˆ™™]ÚÙ\œ›ÜˆŽˆ›ÝË™Ù]
+™™]ÚÙ\œ›Üˆ‹ˆŠKˆKˆ[œÝ\™WØ\ØÚZOUYKˆ
+Kˆ
+Kˆ
+B‚‚™Yˆ[—ÜÚYÙ[™\™ÞWÜÞ[˜ÊÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹›ÝšY\ŽˆÝˆH”ÚYÙ[™\™ÞH‹šYÙÙ\—Ý\NˆÝˆH›X[X[ŠHOˆXÝÜÝ‹[žWN‚ˆÚ]ÒQÑS‘T‘ÖWÔÖS×ÓÐÒÎ‚ˆÛÛ™šYÈHÙ]Ú[YÜ˜][Û—ØÛÛ™šYÊÛÛ›‹›ÝšY\ŠBˆYˆÛÛ™šYÈ\È›Û™N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠÛÛ™šYÝ\˜XØ[ÈÚYÙ[™\™ÞH˜[È[˜ÛÛ˜YKˆŠBˆYˆ›ÝÛÛ™šYÖÈ™[˜X›Y—N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠH[YÜ˜XØ[ÈÚYÙ[™\™ÞH\ÝH\Ø]]˜YKˆŠB‚ˆ[—ÚYHÜ™X]WÚ[YÜ˜][Û—Ü[ŠÛÛ›‹›ÝšY\‹šYÙÙ\—Ý\JBˆ˜]ÚÚYHÜ™X]WÛ[Ûš]Üš[™×Ø˜]Ú
+ˆÛÛ›‹ˆ™XÛÜ™Ù]OXÝ\œ™[Û\Ø›Û—Ù]J
+Kš\ÛÙ›Ü›X]
+
+KˆY˜][Û›Ý\ÏYˆ”Þ[˜ÈÜ›ÝšY\ŸH
+ÝšYÙÙ\—Ý\_JH‹ˆ˜]×Ú[œ]Hˆ‹ˆÛÝ\˜ÙO\›ÝšY\‹ˆ
+BˆžN‚ˆ™\Ý[H[—Ü›ÝšY\—ØÚXÚÊÛÛ›‹›ÝšY\‹žWÜ[UYJBˆ›ÝÜÈH™\Ý[Èœ›ÝÜÈ—Bˆ™XÛÛ˜Ú[WÜÚYÙ[™\™ÞWÛÛ˜›Ø\™[™×Ü™\]Y\ÝÊÛÛ›‹™\Ý[™Ù]
+˜]˜Z[X›WÜÞ\Ý[WÚYÈ‹×JJBˆX]ÚYHˆ[œ™\ÛÛ™YHˆÞ[˜ÙYØ\ÜÙ]ÚYÎˆÙ]Ú[HHÙ]
+
+Bˆ[\Ù]™[Îˆ\ÝÙXÝÜÝ‹[žWWHH×Bˆ›ÝÈH]][YK››ÝÊ
+BˆÛÛXÝYØ]H›ÝËš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠB‚ˆ›Üˆ›ÝÈ[ˆ›ÝÜÎ‚ˆ\ÜÙ]ÚYHš[™ÜÚYÙ[™\™ÞWØ\ÜÙ]ÚY
+ÛÛ›‹›ÝšY\‹›ÝÖÈ™^\›˜[ÚY—K›ÝÖÈ™^\›˜[Û˜[YH—JBˆ[œÙ\Ú[YÜ˜][Û—Ü™X[[YWÜÛ˜\ÚÝ
+ÛÛ›‹\ÜÙ]ÚYX\ÜÙ]ÚY›ÝšY\\›ÝšY\‹›ÝÏ\›ÝËÛÛXÝYØ]XÛÛXÝYØ]
+BˆYˆ›ÝË™Ù]
+™™]ÚÜÝ]\ÈŠHOH™\œ›ÜˆŽ‚ˆYˆ\ÜÙ]ÚY‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH\ÜÙ]Ú[YÜ˜][ÛœÂˆÑU\ÝÙ\œ›ÜˆHË\ÝÜÞ[˜×Ø]HÂˆÒT‘H›ÝšY\ˆHÈS‘^\›˜[ÚYHÂˆˆˆ‹ˆ
+›ÝË™Ù]
+™™]ÚÙ\œ›Üˆ‹ˆŠKÛÛXÝYØ]›ÝšY\‹›ÝÖÈ™^\›˜[ÚY—JKˆ
+BˆÛÛ[YBˆYˆ\ÜÙ]ÚY‚ˆÞ[˜ÙYØ\ÜÙ]ÚYË˜Y
+\ÜÙ]ÚY
+Bˆ™]š[Ý\ÈHÙ]Û]\ÝÛ[Ûš]Üš[™×Ü›ÝÊÛÛ›‹\ÜÙ]ÚY
+Bˆ\XØ]WÛ]\ÝH
+ˆ™]š[Ý\È\È›Ý›Û™Bˆ[™™]š[Ý\ÖÈœÝ]\È—HOH›ÝÖÈœÝ]\È—Bˆ[™™]š[Ý\ÖÈœ™XÛÜ™Ù]H—HOHÝ\œ™[Û\Ø›Û—Ù]J
+Kš\ÛÙ›Ü›X]
+
+Bˆ[™™]š[Ý\ÖÈœÛÝ\˜ÙH—HOH›ÝšY\‚ˆ
+BˆYˆ›Ý\XØ]WÛ]\Ý‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È[Ûš]Üš[™×Ü™XÛÜ™È
+\ÜÙ]ÚYÝ]\Ë™XÛÜ™Ù]K›Ý\ËÛÝ\˜ÙK˜]ÚÚY
+BˆSQTÈ
+ËËËËËÊBˆˆˆ‹ˆ
+ˆ\ÜÙ]ÚYˆ›ÝÖÈœÝ]\È—KˆÝ\œ™[Û\Ø›Û—Ù]J
+Kš\ÛÙ›Ü›X]
+
+Kˆ›ÝÖÈ››Ý\È—Kˆ›ÝšY\‹ˆ˜]ÚÚYˆ
+Kˆ
+Bˆ]™[HZ[Û[Ûš]Üš[™×Ø[\Ù]™[
+ˆÛÛ›‹ˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ™]š[Ý\×ÜÝ]\Ï\™]š[Ý\ÖÈœÝ]\È—HYˆ™]š[Ý\È[ÙHˆ‹ˆÝ\œ™[ÜÝ]\Ï\›ÝÖÈœÝ]\È—Kˆ\[™YØ]XÛÛXÝYØ]ˆ[\›WØÛÛ^\›ÝËˆ
+BˆYˆ]™[‚ˆ[\Ù]™[Ë˜\[™
+]™[
+BˆÜ™X]WÛÜ—Ý\]WØ\ÜÙ]Ú[YÜ˜][ÛŠÛÛ›‹\ÜÙ]ÚY›ÝšY\‹›ÝÖÈ™^\›˜[ÚY—K›ÝÖÈ™^\›˜[Û˜[YH—K›ÝÖÈœÝ]\È—JBˆX]ÚY
+ÏHBˆ[ÙN‚ˆ\Ù\Ú[YÜ˜][Û—Ý[œ™\ÛÛ™Y
+ˆÛÛ›‹ˆ›ÝšY\\›ÝšY\‹ˆ[—ÚY\[—ÚYˆ^\›˜[ÚY\›ÝÖÈ™^\›˜[ÚY—Kˆ^\›˜[Û˜[YO\›ÝÖÈ™^\›˜[Û˜[YH—KˆÝ]\Ï\›ÝÖÈœÝ]\È—Kˆ^[ØY\›ÝÖÈœ^[ØY—Kˆ
+Bˆ[œ™\ÛÛ™Y
+ÏHB‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH[Ûš]Üš[™×Ú[\ÜØ˜]Ú\ÂˆÑU[\ÜYØÛÝ[HËX]ÚYØÛÝ[HË[›X]ÚYØÛÝ[HË]]×Ü™\ÛÛ™YØÛÝ[HˆÒT‘HYHÂˆˆˆ‹ˆ
+X]ÚY
+È[œ™\ÛÛ™YX]ÚY[œ™\ÛÛ™Y˜]ÚÚY
+Kˆ
+Bˆ˜Z[YÜ™X[[YWØÛÝ[H[
+™\Ý[™Ù]
+™˜Z[YÜ™X[[YWØÛÝ[‹
+HÜˆ
+BˆÞ[˜×ÜÝ]\ÈHœ\X[ˆYˆ˜Z[YÜ™X[[YWØÛÝ[[ÙHœÝXØÙ\ÜÈ‚ˆÞ[˜×Ù\œ›ÜˆHÚYÙ[™\™ÞWÜÙ\šXÙKœØ[š]^™WÜÚYÙ[™\™ÞWÙ\œ›ÜŠ™\Ý[™Ù]
+˜[\›WÙ\œ›Üˆ‹ˆŠJBˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH[YÜ˜][Û—ØÛÛ™šYÜÂˆÑU\ÝÜÞ[˜×Ø]HË\ÝÜÞ[˜×ÜÝ]\ÈHË\ÝÙ\œ›ÜˆHË\]YØ]HÂˆÒT‘H›ÝšY\ˆHÂˆˆˆ‹ˆ
+ÛÛXÝYØ]Þ[˜×ÜÝ]\ËÞ[˜×Ù\œ›Ü‹ÛÛXÝYØ]›ÝšY\ŠKˆ
+Bˆš[˜[^™WÚ[YÜ˜][Û—Ü[ŠˆÛÛ›‹ˆ[—ÚYˆÝ]\Ï\Þ[˜×ÜÝ]\ËˆX]ÚYØÛÝ[[X]ÚYˆ[œ™\ÛÛ™YØÛÝ[][œ™\ÛÛ™Yˆ]]×Ü™\ÛÛ™YØÛÝ[LˆÝ[[X\žWÚœÛÛ^Âˆœ›ÝšY\—Ü›ÝÜÈŽˆ[Š›ÝÜÊKˆœÝ][Û—Ü›ÝÜÈŽˆ™\Ý[™Ù]
+œÝ][Û—ØÛÝ[‹[Š›ÝÜÊJKˆœ™X[[YWÜ›ÝÜÈŽˆ™\Ý[™Ù]
+œ™X[[YWØÛÝ[‹
+Kˆ™˜Z[YÜ™X[[YWÜ›ÝÜÈŽˆ˜Z[YÜ™X[[YWØÛÝ[ˆ™[™\™ÞWÙ›Ý×Ù\œ›ÜˆŽˆÞ[˜×Ù\œ›Ü‹ˆKˆ
+BˆžN‚ˆÛX[\ÜÚYÙ[™\™ÞWÜÛ˜\ÚÝÊÛÛ›‹›ÝšY\‹[
+ÛÛ™šYË™Ù]
+œÛ˜\ÚÝÜ™][[Û—Ù^\ÈŠHÜˆQUSÔÒQÑS‘T‘ÖWÔÓTÒÕÔ‘US•SÓ—ÑVTÊJBˆ^Ù\^Ù\[Ûˆ\ÈÛX[\Ù^Î‚ˆÑÑÑT‹Ø\›š[™Ê”ÚYÙ[™\™ÞHÛ˜\ÚÝÛX[\˜Z[Yˆ	\È‹ÚYÙ[™\™ÞWÜÙ\šXÙKœØ[š]^™WÜÚYÙ[™\™ÞWÙ\œ›ÜŠÛX[\Ù^ÊJBˆ›ØÙ\Ü×Û[Ûš]Üš[™×Ø[\ÊÛÛ›‹[\Ù]™[Ë˜]ÚÚY›ÝÊBˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ™]\›ˆÈ›X]ÚYŽˆX]ÚY[œ™\ÛÛ™YŽˆ[œ™\ÛÛ™Y˜]]×Ü™\ÛÛ™YŽˆœÛ˜\ÚÝÈŽˆ[Š›ÝÜÊKœÝ]\ÈŽˆÞ[˜×ÜÝ]\ßBˆ^Ù\\T˜]S[Z]\œ›Üˆ\È^Î‚ˆ[[HX\š×Ø\WØÛÛÛÝÛŠˆÛÛ›‹ˆ›ÝšY\‹ˆTWÐT‘PWÔÕUKˆ^Ë›Y\ÜØYÙKˆÛÛÛÝÛ—Ý[[Y^Ë˜ÛÛÛÝÛ—Ý[[ˆ
+Bˆ›ÝYžWØ\WÜ˜]WÛ[Z]
+ÛÛ›‹›ÝšY\‹TWÐT‘PWÔÕUK[[^Ë›Y\ÜØYÙJBˆØ[š]^™YÙ\œ›ÜˆHÚYÙ[™\™ÞWÜÙ\šXÙKœØ[š]^™WÜÚYÙ[™\™ÞWÙ\œ›ÜŠ^Ë›Y\ÜØYÙJBˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH[YÜ˜][Û—ØÛÛ™šYÜÂˆÑU\ÝÜÞ[˜×ÜÝ]\ÈH	ÝØZ][™×Ü˜]WÛ[Z]	Ë\ÝÙ\œ›ÜˆHË\]YØ]HÂˆÒT‘H›ÝšY\ˆHÂˆˆˆ‹ˆ
+Ø[š]^™YÙ\œ›Ü‹]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠK›ÝšY\ŠKˆ
+Bˆš[˜[^™WÚ[YÜ˜][Û—Ü[ŠˆÛÛ›‹ˆ[—ÚYˆÝ]\ÏHØZ][™×Ü˜]WÛ[Z]‹ˆX]ÚYØÛÝ[Lˆ[œ™\ÛÛ™YØÛÝ[Lˆ]]×Ü™\ÛÛ™YØÛÝ[Lˆ\œ›Ü—ÛY\ÜØYÙO\Ø[š]^™YÙ\œ›Ü‹ˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ˜Z\ÙH\T˜]S[Z]\œ›ÜŠ›ÝšY\‹TWÐT‘PWÔÕUK[[Ù]Ü›ÝšY\—ØÛÛÛÝÛ—Ü™X\ÛÛŠÛÛ›‹›ÝšY\‹TWÐT‘PWÔÕUJJHœ›ÛH^Âˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆØ[š]^™YÙ\œ›ÜˆHÚYÙ[™\™ÞWÜÙ\šXÙKœØ[š]^™WÜÚYÙ[™\™ÞWÙ\œ›ÜŠ^ÊBˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH[YÜ˜][Û—ØÛÛ™šYÜÂˆÑU\ÝÜÞ[˜×ÜÝ]\ÈH	Ù\œ›Ü‰Ë\ÝÙ\œ›ÜˆHË\]YØ]HÂˆÒT‘H›ÝšY\ˆHÂˆˆˆ‹ˆ
+Ø[š]^™YÙ\œ›Ü‹]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠK›ÝšY\ŠKˆ
+Bˆš[˜[^™WÚ[YÜ˜][Û—Ü[ŠˆÛÛ›‹ˆ[—ÚYˆÝ]\ÏH™\œ›Üˆ‹ˆX]ÚYØÛÝ[Lˆ[œ™\ÛÛ™YØÛÝ[Lˆ]]×Ü™\ÛÛ™YØÛÝ[Lˆ\œ›Ü—ÛY\ÜØYÙO\Ø[š]^™YÙ\œ›Ü‹ˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ˜Z\ÙB‚‚™YˆØYÛØØ[Ù\Ú[ÛœÛÛ\—ÜÝ][ÛœÊˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ›ÝšY\ŽˆÝˆHS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ŠHOˆ\ÝÙXÝÜÝ‹[žWWN‚ˆ›ÝÜÈHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕZK™^\›˜[ÚYZK™^\›˜[Û˜[YKKœ›Ú™XÝÛ˜[YBˆ”“ÓH\ÜÙ]Ú[YÜ˜][ÛœÈZBˆ“ÒSˆ\ÜÙ]ÈHÓˆKšYHZK˜\ÜÙ]ÚYˆÒT‘HZKœ›ÝšY\ˆHÂˆS‘ZK™[˜X›YHBˆS‘ÓÐSTÐÑJZK™^\›˜[ÚY	ÉÊHOH	ÉÂˆS‘ÓÐSTÐÑJK›[Ûš]Üš[™×ÜÝ]\Ë	ØXÝ]™IÊHOH	Ù\ØX›Y	ÂˆÔ‘Tˆ–HKœ›Ú™XÝÛ˜[YHÓÓUH“ÐÐTÑBˆˆˆ‹ˆ
+›ÝšY\‹
+Kˆ
+K™™]Ú[
+
+Bˆ™]\›ˆÂˆÂˆœ[ÛÙHŽˆÝŠ›ÝÖÈ™^\›˜[ÚY—JKˆœ[˜[YHŽˆÝŠˆ›ÝÖÈ™^\›˜[Û˜[YH—HÜˆ›ÝÖÈœ›Ú™XÝÛ˜[YH—HÜˆ›ÝÖÈ™^\›˜[ÚY—Bˆ
+KˆBˆ›Üˆ›ÝÈ[ˆ›ÝÜÂˆB‚‚™Yˆ[—Ù\Ú[ÛœÛÛ\—ØÚXÚÊˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ›ÝšY\ŽˆÝ‹ˆžWÜ[Žˆ›ÛÛH˜[ÙKˆ[˜ÛYWÙXYÛ›ÜÝXÜÎˆ›ÛÛHYKˆ™Y™\—ÛØØ[ÜÝ][Û—Ú[™[ÜžNˆ›ÛÛH˜[ÙKŠHOˆXÝÜÝ‹[žWN‚ˆÛÛ™šYÈHÙ]Ú[YÜ˜][Û—ØÛÛ™šYÊÛÛ›‹›ÝšY\ŠBˆYˆÛÛ™šYÈ\È›Û™N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠÛÛ™šYÝ\˜XØ[È\Ú[Û”ÛÛ\ˆ˜[È[˜ÛÛ˜YKˆŠBˆ[™Ú[ÈHÙ]Ù\Ú[ÛœÛÛ\—Ù[™Ú[ØÛÛ™šYÊÛÛ™šYÊBˆYˆ›Ý[™Ú[ÖÈ˜˜\ÙWÝ\›—N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ‘˜[HH˜\ÙHT“È\Ú[Û”ÛÛ\‹ˆŠB‚ˆ\ÝÙ\œ›ÜŽˆ^Ù\[Ûˆ›Û™HH›Û™Bˆ›Üˆ][\[ˆ˜[™ÙJŠN‚ˆžN‚ˆÙ\ÜÚ[Û‹ÈHÙ]Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[ÛŠÛÛ™šYË›Ü˜ÙWÛÙÚ[X][\OHJBˆ[™[ÜžWÙ]HHÙ]Ø\ÜÝ]WÝ˜[YJˆÛÛ›‹ˆ•TÒSÓ”ÓÓT—ÔÕUSÓ—ÒS•‘S•Ô–WÑUWÒÑVKˆ
+Bˆ\ÙWÛØØ[Ú[™[ÜžHH
+ˆ™Y™\—ÛØØ[ÜÝ][Û—Ú[™[ÜžBˆ[™[™[ÜžWÙ]HOHÝ\œ™[Û\Ø›Û—Ù]J
+Kš\ÛÙ›Ü›X]
+
+Bˆ
+BˆÝ][ÛœÈH
+ˆØYÛØØ[Ù\Ú[ÛœÛÛ\—ÜÝ][ÛœÊÛÛ›‹›ÝšY\ŠBˆYˆ\ÙWÛØØ[Ú[™[ÜžBˆ[ÙH×Bˆ
+BˆÝ][Û—Û\ÝØ\WØØ[ÈHˆYˆ›ÝÝ][ÛœÎ‚ˆÝ][ÛœÈH™]ÚÙ\Ú[ÛœÛÛ\—ÜÝ][ÛœÊˆÙ\ÜÚ[Û‹ˆ˜\ÙWÝ\›Y[™Ú[ÖÈ˜˜\ÙWÝ\›—Kˆ[™Ú[Y[™Ú[ÖÈœ[×Ù[™Ú[—Kˆ
+BˆÝ][Û—Û\ÝØ\WØØ[ÈHX^
+KX]˜ÙZ[
+[ŠÝ][ÛœÊHÈL
+JBˆÙ]Ø\ÜÝ]WÝ˜[YJˆÛÛ›‹ˆ•TÒSÓ”ÓÓT—ÔÕUSÓ—ÒS•‘S•Ô–WÑUWÒÑVKˆÝ\œ™[Û\Ø›Û—Ù]J
+Kš\ÛÙ›Ü›X]
+
+Kˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+BˆYˆ›ÝÝ][ÛœÎ‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠHTH\Ú[Û”ÛÛ\ˆ˜[È]›Û™]HÙ[˜Z\È\˜H\ÝHÛÛKˆŠB‚ˆÝ][Û—ØÛÙ\ÈHÂˆÝŠ›ÝË™Ù]
+œ[ÛÙHŠHÜˆ›ÝË™Ù]
+œÝ][ÛÛÙHŠHÜˆˆŠKœÝš\
+
+Bˆ›Üˆ›ÝÈ[ˆÝ][ÛœÂˆYˆÝŠ›ÝË™Ù]
+œ[ÛÙHŠHÜˆ›ÝË™Ù]
+œÝ][ÛÛÙHŠHÜˆˆŠKœÝš\
+
+BˆBˆ™X[[YWÛX\H™]ÚÙ\Ú[ÛœÛÛ\—Ü™X[[YWÛX\
+ˆÙ\ÜÚ[Û‹ˆ˜\ÙWÝ\›Y[™Ú[ÖÈ˜˜\ÙWÝ\›—Kˆ[™Ú[Y[™Ú[ÖÈœ™X[Ý[YWÙ[™Ú[—KˆÝ][Û—ØÛÙ\Ï\Ý][Û—ØÛÙ\Ëˆ
+Bˆ[\›WÛX\ˆXÝÜÝ‹\ÝÙXÝÜÝ‹[žWWWHHßBˆ[\›WÙ\œ›ÜˆHˆ‚ˆYˆ[˜ÛYWÙXYÛ›ÜÝXÜÎ‚ˆžN‚ˆ[\›WÛX\H™]ÚÙ\Ú[ÛœÛÛ\—Ø[\›WÛX\
+ˆÙ\ÜÚ[Û‹ˆ˜\ÙWÝ\›Y[™Ú[ÖÈ˜˜\ÙWÝ\›—Kˆ[™Ú[Y[™Ú[ÖÈ˜[\›\×Ù[™Ú[—KˆÝ][Û—ØÛÙ\Ï\Ý][Û—ØÛÙ\Ëˆ
+Bˆ^Ù\\T˜]S[Z]\œ›ÜŽ‚ˆ˜Z\ÙBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆ[\›WÙ\œ›ÜˆHÝŠ^ÊBˆ›Ü›X[^™YÜ›ÝÜÈHÂˆ›Ü›X[^™WÙ\Ú[ÛœÛÛ\—Ü[Ü›ÝÊˆÝ][Û—Ü›ÝËˆ™X[[YWÛX\™Ù]
+ÝŠÝ][Û—Ü›ÝË™Ù]
+œ[ÛÙHŠHÜˆÝ][Û—Ü›ÝË™Ù]
+œÝ][ÛÛÙHŠHÜˆˆŠKœÝš\
+
+JKˆ[\›WÛX\™Ù]
+ÝŠÝ][Û—Ü›ÝË™Ù]
+œ[ÛÙHŠHÜˆÝ][Û—Ü›ÝË™Ù]
+œÝ][ÛÛÙHŠHÜˆˆŠKœÝš\
+
+K×JKˆ
+Bˆ›ÜˆÝ][Û—Ü›ÝÈ[ˆÝ][ÛœÂˆBˆœ™XZÂˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆ\ÝÙ\œ›ÜˆH^ÂˆYˆ›Ý\×Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[Û—Ù^\™YÙ\œ›ÜŠ^ÊHÜˆ][\OHN‚ˆ˜Z\ÙBˆÑÑÑT‹š[™›Ê‘\Ú[Û”ÛÛ\ˆÙ\ÜÚ[Ûˆ^\™YÈ[˜[Y][™ÈØXÚH[™™]žZ[™ÈÙÚ[ˆÛ˜ÙHŠBˆ[˜[Y]WÙ\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[ÛŠÛÛ™šYÊBˆ[ÙN‚ˆ˜Z\ÙH\ÝÙ\œ›ÜˆÜˆ˜[YQ\œ›ÜŠ‘˜[H\ØÛÛšXÚYH›È\Ú[Û”ÛÛ\‹ˆŠB‚ˆYˆ›ÝžWÜ[Ž‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH[YÜ˜][Û—ØÛÛ™šYÜÂˆÑU\ÝÜÞ[˜×ÜÝ]\ÈHË\ÝÙ\œ›ÜˆHË\]YØ]HÂˆÒT‘H›ÝšY\ˆHÂˆˆˆ‹ˆ
+œÝXØÙ\ÜÈ‹ˆ‹]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠK›ÝšY\ŠKˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ™]\›ˆÂˆœ›ÝÜÈŽˆ›Ü›X[^™YÜ›ÝÜËˆœÝ][Û—ØÛÝ[Žˆ[ŠÝ][ÛœÊKˆœ™X[[YWØÛÝ[Žˆ[Š™X[[YWÛX\
+Kˆ˜[\›WØÛÝ[ŽˆÝ[J[Š][\ÊH›Üˆ][\È[ˆ[\›WÛX\˜[Y\Ê
+JKˆ˜[\›WÙ\œ›ÜˆŽˆ[\›WÙ\œ›Ü‹ˆœÝ][Û—Ú[™[ÜžWÜÛÝ\˜ÙHŽˆ
+ˆ›ØØ[ˆYˆ\ÙWÛØØ[Ú[™[ÜžH[ÙH˜\H‚ˆ
+Kˆ˜\WØØ[×Ý\ÙYŽˆ
+ˆÝ][Û—Û\ÝØ\WØØ[Âˆ
+ÈX]˜ÙZ[
+[ŠÝ][Û—ØÛÙ\ÊHÈL
+Bˆ
+È
+ˆX]˜ÙZ[
+[ŠÝ][Û—ØÛÙ\ÊHÈL
+BˆYˆ[˜ÛYWÙXYÛ›ÜÝXÜÂˆ[ÙHˆ
+Bˆ
+KˆB‚‚™Yˆ[—Ù\Ú[ÛœÛÛ\—Ü›ÙXÝ[Û—ÜÞ[˜ÊˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ›ÝšY\ŽˆÝˆH‘\Ú[Û”ÛÛ\ˆ‹ˆ\™Ù]Ù]Nˆ]H›Û™HH›Û™Kˆ\š[ÙÝ\NˆÝˆH™^H‹ŠHOˆXÝÜÝ‹[žWN‚ˆYˆ\š[ÙÝ\H›Ý[ˆÈ™^H‹›[ÛŸN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ”\š[ÙÈ[˜[YÈ\˜H\™›Ü›X[˜ÙKˆŠBˆYˆ\™Ù]Ù]H\È›Û™N‚ˆ\™Ù]Ù]HH]KÙ^J
+HH[YY[J^\ÏLJBˆYˆ\š[ÙÝ\HOH›[ÛŽ‚ˆ\™Ù]Ù]HH\™Ù]Ù]Kœ™\XÙJ^OLJB‚ˆYˆ›Ý•TÒSÓ”ÓÓT—ÔÖS×ÓÐÒË˜XÜ]Z\™J›ØÚÚ[™ÏQ˜[ÙJN‚ˆY\ÜØYÙHH”Ú[˜Ü›Ûš^˜XØ[È\Ú[Û”ÛÛ\ˆYÛ›Ü˜YHÜœ]YH˜H^\ÝHÝ]˜H[HÝ\œÛËˆ‚ˆÑÑÑT‹š[™›ÊY\ÜØYÙJBˆ™]\›ˆÈœ›ØÙ\ÜÙYŽˆ›Z\ÜÚ[™×Ù]HŽˆ››×Ü™Y™\™[˜ÙHŽˆœ\š[ÙÙ]HŽˆ\™Ù]Ù]Kš\ÛÙ›Ü›X]
+
+KœÝÜYÜ™X\ÛÛˆŽˆY\ÜØYÙ_B‚ˆÚ]™[X\ÙWÙ\Ú[ÛœÛÛ\—ÜÞ[˜×ÛØÚÊ
+N‚ˆÛÛ™šYÈHÙ]Ú[YÜ˜][Û—ØÛÛ™šYÊÛÛ›‹›ÝšY\ŠBˆYˆÛÛ™šYÈ\È›Û™N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠÛÛ™šYÝ\˜XØ[È\Ú[Û”ÛÛ\ˆ˜[È[˜ÛÛ˜YKˆŠBˆYˆ›ÝÛÛ™šYÖÈ™[˜X›Y—N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠH[YÜ˜XØ[È\Ú[Û”ÛÛ\ˆ\ÝH\Ø]]˜YKˆŠBˆ[™Ú[ÈHÙ]Ù\Ú[ÛœÛÛ\—Ù[™Ú[ØÛÛ™šYÊÛÛ™šYÊBˆYˆ›Ý[™Ú[ÖÈ˜˜\ÙWÝ\›—N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ‘˜[HH˜\ÙHT“È\Ú[Û”ÛÛ\‹ˆŠB‚ˆX\YØ\ÜÙ]ÈH]Y\žWØ[
+ˆÛÛ›‹ˆˆˆ‚ˆÑSPÕˆKšYTÈ\ÜÙ]ÚYˆKœ›Ú™XÝÛ˜[YKˆKšÝÜˆZK™^\›˜[ÚYˆÓÐSTÐÑJË™[˜X›YJHTÈ\™›Ü›X[˜ÙWÙ[˜X›YˆËØ\›š[™×Ù]šX][Û—ÜÝˆË˜[\Ù]šX][Û—ÜÝˆË˜Üš]XØ[Ù]šX][Û—ÜÝˆË˜˜\Ù[[™WÞYX\œËˆË›Z[—Ø˜\Ù[[™WÜÚ[ËˆË›[ÛWØYÙ]ÚœÛÛ‚ˆ”“ÓH\ÜÙ]Ú[YÜ˜][ÛœÈZBˆ“ÒSˆ\ÜÙ]ÈHÓˆKšYHZK˜\ÜÙ]ÚYˆQ•“ÒSˆ\™›Ü›X[˜ÙWÜÙ][™ÜÈÈÓˆË˜\ÜÙ]ÚYHKšYˆÒT‘HZKœ›ÝšY\ˆHÂˆS‘ZK™[˜X›YHBˆS‘ÓÐSTÐÑJZK™^\›˜[ÚY	ÉÊHOH	ÉÂˆS‘ÓÐSTÐÑJK›[Ûš]Üš[™×ÜÝ]\Ë	ØXÝ]™IÊHOH	Ù\ØX›Y	ÂˆS‘ÓÐSTÐÑJË™[˜X›YJHHBˆÔ‘Tˆ–HKœ›Ú™XÝÛ˜[YHÓÓUH“ÐÐTÑBˆˆˆ‹ˆ
+›ÝšY\‹
+Kˆ
+BˆYˆ›ÝX\YØ\ÜÙ]Î‚ˆ™]\›ˆÈœ›ØÙ\ÜÙYŽˆ›Z\ÜÚ[™×Ù]HŽˆ››×Ü™Y™\™[˜ÙHŽˆœ\š[ÙÙ]HŽˆ\™Ù]Ù]Kš\ÛÙ›Ü›X]
+
+_B‚ˆ[™XYWÝ˜[YØ\ÜÙ]ÚYÈHÂˆ[
+][VÈ˜\ÜÙ]ÚY—JBˆ›Üˆ][H[ˆ]Y\žWØ[
+ˆÛÛ›‹ˆˆˆ‚ˆÑSPÕ\ÜÙ]ÚYˆ”“ÓH›ÙXÝ[Û—Ü™XÛÜ™ÂˆÒT‘H›ÝšY\ˆHÈS‘\š[ÙÝ\HHÈS‘\š[ÙÙ]HHÂˆS‘›ÙXÝ[Û—ÚÝÚTÈ“Õ•Sˆˆˆ‹ˆ
+›ÝšY\‹\š[ÙÝ\K\™Ù]Ù]Kš\ÛÙ›Ü›X]
+
+JKˆ
+BˆBˆX\YØ\ÜÙ]ÈHÂˆ›ÝÂˆ›Üˆ›ÝÈ[ˆX\YØ\ÜÙ]ÂˆYˆ[
+›ÝÖÈ˜\ÜÙ]ÚY—JH›Ý[ˆ[™XYWÝ˜[YØ\ÜÙ]ÚYÂˆBˆÝ][Û—ØÛÙ\ÈHÂˆÝŠ›ÝÖÈ™^\›˜[ÚY—JKœÝš\
+
+Bˆ›Üˆ›ÝÈ[ˆX\YØ\ÜÙ]ÂˆYˆÝŠ›ÝÖÈ™^\›˜[ÚY—HÜˆˆŠKœÝš\
+
+BˆBˆYˆ›ÝÝ][Û—ØÛÙ\Î‚ˆ™]\›ˆÂˆœ›ØÙ\ÜÙYŽˆˆ›Z\ÜÚ[™×Ù]HŽˆˆ››×Ü™Y™\™[˜ÙHŽˆˆœ\š[ÙÙ]HŽˆ\™Ù]Ù]Kš\ÛÙ›Ü›X]
+
+KˆœÚÚ\YØÛÛ\]HŽˆ[Š[™XYWÝ˜[YØ\ÜÙ]ÚYÊKˆBˆÙ\ÜÚ[Û—ÛØš‹ÈHÙ]Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[ÛŠÛÛ™šYÊBˆ[™Ú[Ý\ÙYH
+ˆ[™Ú[ÖÈ›[ÛÚÜWÙ[™Ú[—BˆYˆ\š[ÙÝ\HOH›[Û‚ˆ[ÙH[™Ú[ÖÈ™^WÚÜWÙ[™Ú[—Bˆ
+BˆÜWÛX\ˆXÝÜÝ‹XÝÜÝ‹[žWWHHßBˆ™\]Y\ÝYÜÝ][Û—ØÛÙ\ÎˆÙ]ÜÝ—HHÙ]
+
+BˆY™\œ™YÜÛÝÙ\œ›ÜŽˆ\TÛÝ[˜]˜Z[X›Q\œ›Üˆ›Û™HH›Û™Bˆ›ÜˆÝ][Û—ÙÜ›Ý\[ˆÚ[šÙY
+Ý][Û—ØÛÙ\ËL
+N‚ˆ™]žWØY\—Ü™[ÙÚ[ˆH˜[ÙBˆÚ[HYN‚ˆžN‚ˆYˆ\š[ÙÝ\HOH›[ÛŽ‚ˆÚ[š×ÛX\H™]ÚÙ\Ú[ÛœÛÛ\—ÚÜWÛ[ÛÛX\
+ˆÙ\ÜÚ[Û—ÛØš‹ˆ[™Ú[ÖÈ˜˜\ÙWÝ\›—Kˆ[™Ú[Ý\ÙYˆÝ][Û—ÙÜ›Ý\ˆ\™Ù]Ù]Kˆ
+Bˆ[ÙN‚ˆÚ[š×ÛX\H™]ÚÙ\Ú[ÛœÛÛ\—ÚÜWÙ^WÛX\
+ˆÙ\ÜÚ[Û—ÛØš‹ˆ[™Ú[ÖÈ˜˜\ÙWÝ\›—Kˆ[™Ú[Ý\ÙYˆÝ][Û—ÙÜ›Ý\ˆ\™Ù]Ù]Kˆ
+BˆÜWÛX\\]JÚ[š×ÛX\
+Bˆ™\]Y\ÝYÜÝ][Û—ØÛÙ\Ë\]JÝ][Û—ÙÜ›Ý\
+Bˆœ™XZÂˆ^Ù\\TÛÝ[˜]˜Z[X›Q\œ›Üˆ\È^Î‚ˆY™\œ™YÜÛÝÙ\œ›ÜˆH^Âˆœ™XZÂˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆYˆ\×Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[Û—Ù^\™YÙ\œ›ÜŠ^ÊH[™›Ý™]žWØY\—Ü™[ÙÚ[Ž‚ˆÑÑÑT‹š[™›Ê‘\Ú[Û”ÛÛ\ˆ›ÙXÝ[ÛˆÙ\ÜÚ[Ûˆ^\™YÈ[˜[Y][™ÈØXÚH[™™]žZ[™ÈÙÚ[ˆÛ˜ÙHŠBˆ™]žWØY\—Ü™[ÙÚ[ˆHYBˆ[˜[Y]WÙ\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[ÛŠÛÛ™šYÊBˆÙ\ÜÚ[Û—ÛØš‹ÈHÙ]Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[ÛŠÛÛ™šYË›Ü˜ÙWÛÙÚ[UYJBˆÛÛ[YBˆYˆ\Ú[œÝ[˜ÙJ^Ë
+\T˜]S[Z]\œ›Ü‹\TÛÝ[˜]˜Z[X›Q\œ›ÜŠJN‚ˆ˜Z\ÙBˆYˆ\×Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]Ù\œ›ÜŠ^ÊN‚ˆ™X\ÛÛˆHX\š×Ù\Ú[ÛœÛÛ\—Ü\™›Ü›X[˜ÙWÜ˜]WÛ[Z]Y
+ÛÛ›ŠBˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ™]\›ˆÂˆœ›ØÙ\ÜÙYŽˆˆ›Z\ÜÚ[™×Ù]HŽˆˆ››×Ü™Y™\™[˜ÙHŽˆˆœ\š[ÙÙ]HŽˆ\™Ù]Ù]Kš\ÛÙ›Ü›X]
+
+KˆœÝÜYÜ™X\ÛÛˆŽˆ™X\ÛÛ‹ˆBˆ˜Z\ÙBˆYˆY™\œ™YÜÛÝÙ\œ›Üˆ\È›Ý›Û™N‚ˆœ™XZÂˆ›ØÙ\ÜÙYHˆZ\ÜÚ[™×Ù]HHˆ›×Ü™Y™\™[˜ÙHHˆÚ]Ü›ÙXÝ[ÛˆHˆ›Üˆ›ÝÈ[ˆX\YØ\ÜÙ]Î‚ˆ\ÜÙ]ÚYH[
+›ÝÖÈ˜\ÜÙ]ÚY—JBˆ^\›˜[ÚYHÝŠ›ÝÖÈ™^\›˜[ÚY—HÜˆˆŠKœÝš\
+
+BˆYˆ^\›˜[ÚY›Ý[ˆ™\]Y\ÝYÜÝ][Û—ØÛÙ\Î‚ˆÛÛ[YBˆÜWÜ›ÝÈHÜWÛX\™Ù]
+^\›˜[ÚYßJBˆ]WÚ][WÛX\HÜWÜ›ÝË™Ù]
+™]R][SX\ŠHYˆ\Ú[œÝ[˜ÙJÜWÜ›ÝËXÝ
+H[ÙHßBˆYˆ›Ý\Ú[œÝ[˜ÙJ]WÚ][WÛX\XÝ
+N‚ˆ]WÚ][WÛX\HßBˆ›ÙXÝ[Û—ÚÝÚÙ[XÝYÚÙ^KÙ[XÝYÜ˜]×Ý˜[YHHÙ[XÝÜ›ÙXÝ[Û—Ý˜[YJ]WÚ][WÛX\
+BˆYˆ›ÙXÝ[Û—ÚÝÚ\È›Ý›Û™N‚ˆÚ]Ü›ÙXÝ[Ûˆ
+ÏHBˆÝÜH\œÙWÚÝÜÝ˜[YJ›ÝÖÈšÝÜ—JBˆÜXÚYšX×ÞZY[HØ[Ý[]WÜÜXÚYšX×ÞZY[
+›ÙXÝ[Û—ÚÝÚÝÜ
+BˆÙ][™ÜÈHÙ]Ü\™›Ü›X[˜ÙWÜÙ][™ÜÊÛÛ›‹\ÜÙ]ÚY
+BˆÙ][™ÜË\]JÚÙ^Nˆ›ÝÖÚÙ^WH›ÜˆÙ^H[ˆ›ÝËšÙ^\Ê
+HYˆÙ^H[ˆÙ][™ÜÈ[™›ÝÖÚÙ^WH\È›Ý›Û™_JB‚ˆ^XÝYÚÝÚ^XÝYÜÜXÚYšX×ÞZY[^XÝYÜÛÝ\˜ÙK˜\Ù[[™WÜ]X[]HHØ[Ý[]WÙ^XÝYÜ›ÙXÝ[ÛŠˆÛÛ›‹ˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ›ÝšY\\›ÝšY\‹ˆ\š[ÙÝ\O\\š[ÙÝ\Kˆ\š[ÙÙ]O]\™Ù]Ù]KˆÝÜZÝÜˆÙ][™ÜÏ\Ù][™ÜËˆ
+Bˆ\™›Ü›X[˜ÙWÜÝ]\Ë]WÜ]X[]K]šX][Û—ÜÝHÛ\ÜÚYžWÜ\™›Ü›X[˜ÙWÜÝ]\Êˆ›ÙXÝ[Û—ÚÝÚˆÝÜˆ^XÝYÚÝÚˆØ\›š[™×Ù]šX][Û—ÜÝY›Ø]
+Ù][™ÜË™Ù]
+Ø\›š[™×Ù]šX][Û—ÜÝŠHÜˆLL
+Kˆ[\Ù]šX][Û—ÜÝY›Ø]
+Ù][™ÜË™Ù]
+˜[\Ù]šX][Û—ÜÝŠHÜˆLŒ
+KˆÜš]XØ[Ù]šX][Û—ÜÝY›Ø]
+Ù][™ÜË™Ù]
+˜Üš]XØ[Ù]šX][Û—ÜÝŠHÜˆLÌ
+Kˆ
+BˆYˆ]WÜ]X[]HOH›ÚÈˆ[™˜\Ù[[™WÜ]X[]HOHœ\X[Ú\ÝÜžHˆ[™^XÝYÜÛÝ\˜ÙHOH››Û™HŽ‚ˆ]WÜ]X[]HHœ\X[Ú\ÝÜžH‚ˆYˆ\™›Ü›X[˜ÙWÜÝ]\ÈOH”Ù[HYÜÈŽ‚ˆZ\ÜÚ[™×Ù]H
+ÏHBˆYˆ\™›Ü›X[˜ÙWÜÝ]\ÈOH”Ù[H™Y™\°ê›˜ÚXHŽ‚ˆ›×Ü™Y™\™[˜ÙH
+ÏHB‚ˆ›Ý\×Ü\ÈH×BˆYˆ›ÙXÝ[Û—ÚÝÚ\È›Û™N‚ˆ›Ý\×Ü\Ë˜\[™
+ˆZ[ÛZ\ÜÚ[™×Ü›ÙXÝ[Û—Û›ÝJˆ]WÚ][WÛX\ˆÝ][Û—ØÛÙOY^\›˜[ÚYˆ\š[ÙÝ\O\\š[ÙÝ\Kˆ\š[ÙÙ]O]\™Ù]Ù]Kˆ
+Bˆ
+BˆYˆÝÜ\È›Û™N‚ˆ›Ý\×Ü\Ë˜\[™
+šÕÜØØ[[H˜[HÝH[˜[YËˆŠBˆYˆ^XÝYÜÛÝ\˜ÙHOH››Û™HŽ‚ˆ›Ý\×Ü\Ë˜\[™
+”Ù[H\Ý0ìÜšXÛÈÝHÜ°éØ[Y[ÈY[œØ[\˜H™Y™\°ê›˜ÚXKˆŠBˆ\Ù\Ü›ÙXÝ[Û—Ü™XÛÜ™
+ˆÛÛ›‹ˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ›ÝšY\\›ÝšY\‹ˆ^\›˜[ÚYY^\›˜[ÚYˆ\š[ÙÝ\O\\š[ÙÝ\Kˆ\š[ÙÙ]O]\™Ù]Ù]Kˆ›ÙXÝ[Û—ÚÝÚ\›ÙXÝ[Û—ÚÝÚˆÜXÚYšX×ÞZY[\ÜXÚYšX×ÞZY[ˆ^XÝYÚÝÚY^XÝYÚÝÚˆ^XÝYÜÜXÚYšX×ÞZY[Y^XÝYÜÜXÚYšX×ÞZY[ˆ]šX][Û—ÜÝY]šX][Û—ÜÝˆ\™›Ü›X[˜ÙWÜÝ]\Ï\\™›Ü›X[˜ÙWÜÝ]\Ëˆ^XÝYÜÛÝ\˜ÙOY^XÝYÜÛÝ\˜ÙKˆ]WÜ]X[]OY]WÜ]X[]Kˆ›Ý\ÏHˆ‹š›Ú[Š›Ý\×Ü\ÊKˆ^[ØYÚœÛÛ\ÝŠÜWÜ›ÝË™Ù]
+œ^[ØYÚœÛÛˆŠHÜˆœÛÛ‹™[\ÊÜWÜ›ÝË[œÝ\™WØ\ØÚZOUYJJKˆÙ[XÝYÜ›ÙXÝ[Û—ÚÙ^O\Ù[XÝYÚÙ^KˆÙ[XÝYÜ›ÙXÝ[Û—Ü˜]×Ý˜[YO\Ù[XÝYÜ˜]×Ý˜[YKˆ
+Bˆ›ØÙ\ÜÙY
+ÏHB‚ˆ™XØ[Ý[]WÜ\™›Ü›X[˜ÙWÜ™Y™\™[˜Ù\ÊˆÛÛ›‹ˆ\š[ÙÝ\O\\š[ÙÝ\Kˆ\š[ÙÙ]O]\™Ù]Ù]Kˆ›ÝšY\\›ÝšY\‹ˆ
+BˆÙÙÙ\ˆHÝ\œ™[Ø\›ÙÙÙ\ˆYˆ\×Ø\ØÛÛ^
+
+H[ÙHÙÙÚ[™Ë™Ù]ÙÙÙ\Š×Û˜[YW×ÊBˆÙÙÙ\‹š[™›Êˆ‘\Ú[Û”ÛÛ\ˆ\™›Ü›X[˜ÙHÞ[˜Îˆ™\]Y\ÝYÜÝ][Û—ØÛÙ\ÏI\È[™Ú[I\È\š[ÙÝ\OI\È\™Ù]Ù]OI\È\WÜ›ÝÜÏI\ÈÚ]Ü›ÙXÝ[ÛI\ÈZ\ÜÚ[™×Ü›ÙXÝ[ÛI\È‹ˆ[ŠÝ][Û—ØÛÙ\ÊKˆ[™Ú[Ý\ÙYˆ\š[ÙÝ\Kˆ\™Ù]Ù]Kš\ÛÙ›Ü›X]
+
+Kˆ[ŠÜWÛX\
+KˆÚ]Ü›ÙXÝ[Û‹ˆZ\ÜÚ[™×Ù]Kˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+BˆYˆY™\œ™YÜÛÝÙ\œ›Üˆ\È›Ý›Û™N‚ˆ˜Z\ÙHY™\œ™YÜÛÝÙ\œ›Ü‚ˆ™]\›ˆÂˆœ›ØÙ\ÜÙYŽˆ›ØÙ\ÜÙYˆ›Z\ÜÚ[™×Ù]HŽˆZ\ÜÚ[™×Ù]Kˆ››×Ü™Y™\™[˜ÙHŽˆ›×Ü™Y™\™[˜ÙKˆœ\š[ÙÙ]HŽˆ\™Ù]Ù]Kš\ÛÙ›Ü›X]
+
+KˆB‚‚™Yˆ]\—ÙZ[WØ˜XÚÙš[Ù]\Êœ›ÛWÞYX\Žˆ[×ÞYX\Žˆ[
+‹Ù^WÝ˜[YNˆ]H›Û™HH›Û™JHOˆ\ÝÙ]WN‚ˆÙ^WÝ˜[YHHÙ^WÝ˜[YHÜˆ]KÙ^J
+BˆÝ\œÛÜˆH]Jœ›ÛWÞYX\‹KJBˆ[™Ù]HHZ[Š]J×ÞYX\‹L‹ÌJKÙ^WÝ˜[YHH[YY[J^\ÏLJJBˆ^\Îˆ\ÝÙ]WHH×BˆÚ[HÝ\œÛÜˆH[™Ù]N‚ˆ^\Ë˜\[™
+Ý\œÛÜŠBˆÝ\œÛÜˆ
+ÏH[YY[J^\ÏLJBˆ™]\›ˆ^\Â‚‚™Yˆ]\—ÙZ[WØ˜XÚÙš[Û[ÛÊˆœ›ÛWÞYX\Žˆ[ˆ×ÞYX\Žˆ[ˆ
+‹ˆÙ^WÝ˜[YNˆ]H›Û™HH›Û™Kˆ]WÙœ›ÛNˆ]H›Û™HH›Û™Kˆ]WÝÎˆ]H›Û™HH›Û™KŠHOˆ\ÝÙ]WN‚ˆÙ^WÝ˜[YHHÙ^WÝ˜[YHÜˆ]KÙ^J
+BˆÝ\Ù]HH]WÙœ›ÛHÜˆ]Jœ›ÛWÞYX\‹KJBˆ[™Ù]HH]WÝÈÜˆ]J×ÞYX\‹L‹ÌJBˆ[™Ù]HHZ[Š[™Ù]KÙ^WÝ˜[YHH[YY[J^\ÏLJJBˆYˆÝ\Ù]Hˆ[™Ù]N‚ˆ™]\›ˆ×BˆÝ\œÛÜˆHÝ\Ù]Kœ™\XÙJ^OLJBˆ[™Û[ÛH[™Ù]Kœ™\XÙJ^OLJBˆ[ÛÎˆ\ÝÙ]WHH×BˆÚ[HÝ\œÛÜˆH[™Û[Û‚ˆ[ÛË˜\[™
+Ý\œÛÜŠBˆYX\ˆHÝ\œÛÜ‹žYX\ˆ
+È
+HYˆÝ\œÛÜ‹›[ÛOHLˆ[ÙH
+Bˆ[ÛHHYˆÝ\œÛÜ‹›[ÛOHLˆ[ÙHÝ\œÛÜ‹›[Û
+ÈBˆÝ\œÛÜˆH]JYX\‹[ÛJBˆ™]\›ˆ[ÛÂ‚‚™Yˆ]WÚ[—Ø˜XÚÙš[ÝÚ[™ÝÊˆØ[™Y]Nˆ]Kˆ
+‹ˆœ›ÛWÞYX\Žˆ[ˆ×ÞYX\Žˆ[ˆÙ^WÝ˜[YNˆ]Kˆ]WÙœ›ÛNˆ]H›Û™HH›Û™Kˆ]WÝÎˆ]H›Û™HH›Û™KŠHOˆ›ÛÛ‚ˆÝ\Ù]HH]WÙœ›ÛHÜˆ]Jœ›ÛWÞYX\‹KJBˆ[™Ù]HH]WÝÈÜˆ]J×ÞYX\‹L‹ÌJBˆ[™Ù]HHZ[Š[™Ù]KÙ^WÝ˜[YHH[YY[J^\ÏLJJBˆ™]\›ˆÝ\Ù]HHØ[™Y]HH[™Ù]B‚‚™Yˆ]\—Û[ÛWØ˜XÚÙš[Ù]\Êœ›ÛWÞYX\Žˆ[×ÞYX\Žˆ[
+‹Ù^WÝ˜[YNˆ]H›Û™HH›Û™JHOˆ\ÝÙ]WN‚ˆÙ^WÝ˜[YHHÙ^WÝ˜[YHÜˆ]KÙ^J
+BˆÝ\œ™[Û[ÛHÙ^WÝ˜[YKœ™\XÙJ^OLJBˆ[ÛÎˆ\ÝÙ]WHH×Bˆ›ÜˆYX\ˆ[ˆ˜[™ÙJœ›ÛWÞYX\‹×ÞYX\ˆ
+ÈJN‚ˆ›Üˆ[Û[ˆ˜[™ÙJKLÊN‚ˆ\š[ÙÙ]HH]JYX\‹[ÛJBˆYˆ\š[ÙÙ]HHÝ\œ™[Û[Û‚ˆÛÛ[YBˆ[ÛË˜\[™
+\š[ÙÙ]JBˆ™]\›ˆ[ÛÂ‚‚™YˆÙ]Ù\Ú[ÛœÛÛ\—Ü\™›Ü›X[˜ÙWØ\ÜÙ]ÊˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ›ÝšY\ŽˆÝ‹ˆ\ÜÙ]ÚYˆ[›Û™HH›Û™Kˆ\ÜÙ]ÚYÎˆ\ÝÚ[H›Û™HH›Û™KŠHOˆ\ÝÜÜ[]LË”›Ý×N‚ˆÛÛ™][ÛœÈHÂˆ˜ZKœ›ÝšY\ˆHÈ‹ˆ˜ZK™[˜X›YHH‹ˆÓÐSTÐÑJZK™^\›˜[ÚY	ÉÊHOH	ÉÈ‹ˆÓÐSTÐÑJK›[Ûš]Üš[™×ÜÝ]\Ë	ØXÝ]™IÊHOH	Ù\ØX›Y	È‹ˆÓÐSTÐÑJË™[˜X›YJHHH‹ˆBˆ\˜[\Îˆ\ÝÐ[žWHHÜ›ÝšY\—BˆYˆ\ÜÙ]ÚY‚ˆÛÛ™][ÛœË˜\[™
+˜KšYHÈŠBˆ\˜[\Ë˜\[™
+\ÜÙ]ÚY
+BˆYˆ\ÜÙ]ÚYÎ‚ˆXÙZÛ\œÈH‹‹š›Ú[ŠÈˆ›ÜˆÈ[ˆ\ÜÙ]ÚYÊBˆÛÛ™][ÛœË˜\[™
+ˆ˜KšYSˆ
+ÜXÙZÛ\œßJHŠBˆ\˜[\Ë™^[™
+\ÜÙ]ÚYÊBˆ™]\›ˆ]Y\žWØ[
+ˆÛÛ›‹ˆˆˆˆ‚ˆÑSPÕˆKšYTÈ\ÜÙ]ÚYˆKœ›Ú™XÝÛ˜[YKˆKšÝÜˆZK™^\›˜[ÚYˆÓÐSTÐÑJË™[˜X›YJHTÈ\™›Ü›X[˜ÙWÙ[˜X›YˆËØ\›š[™×Ù]šX][Û—ÜÝˆË˜[\Ù]šX][Û—ÜÝˆË˜Üš]XØ[Ù]šX][Û—ÜÝˆË˜˜\Ù[[™WÞYX\œËˆË›Z[—Ø˜\Ù[[™WÜÚ[ËˆË›[ÛWØYÙ]ÚœÛÛ‚ˆ”“ÓH\ÜÙ]Ú[YÜ˜][ÛœÈZBˆ“ÒSˆ\ÜÙ]ÈHÓˆKšYHZK˜\ÜÙ]ÚYˆQ•“ÒSˆ\™›Ü›X[˜ÙWÜÙ][™ÜÈÈÓˆË˜\ÜÙ]ÚYHKšYˆÒT‘HÈˆS‘‹š›Ú[ŠÛÛ™][ÛœÊ_BˆÔ‘Tˆ–HKœ›Ú™XÝÛ˜[YHÓÓUH“ÐÐTÑBˆˆˆ‹ˆ\˜[\Ëˆ
+B‚‚™Yˆ™XØ[Ý[]WÜ›ÙXÝ[Û—Ù^XÝ][ÛœÊˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆ›ÝšY\ŽˆÝ‹ˆ\ÜÙ]ÚYÎˆ\ÝÚ[Kˆ\š[ÙÝ\NˆÝˆ›Û™HH›Û™KŠHOˆ[‚ˆYˆ›Ý\ÜÙ]ÚYÎ‚ˆ™]\›ˆˆÝ[Hˆ›Üˆ\ÜÙ]ÚY[ˆ\ÜÙ]ÚYÎ‚ˆÝ[[X\žHH™XØ[Ý[]WÜ\™›Ü›X[˜ÙWÜ™Y™\™[˜Ù\ÊˆÛÛ›‹ˆ\š[ÙÝ\O\\š[ÙÝ\Kˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ›ÝšY\\›ÝšY\‹ˆ
+BˆÝ[
+ÏHÝ[[X\žVÈœ™XÛÜ™×Ü›ØÙ\ÜÙY—Bˆ™]\›ˆÝ[‚‚™Yˆ™XØ[Ý[]WÜ\™›Ü›X[˜ÙWÜ™Y™\™[˜Ù\ÊˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ\š[ÙÝ\NˆÝˆ›Û™HH›Û™Kˆ\š[ÙÙ]Nˆ]HÝˆ›Û™HH›Û™Kˆ\ÜÙ]ÚYˆ[›Û™HH›Û™Kˆ›ÝšY\ŽˆÝˆH‘\Ú[Û”ÛÛ\ˆ‹ˆÙ^WÝ˜[YNˆ]H›Û™HH›Û™KŠHOˆXÝÜÝ‹[N‚ˆÛÛ™][ÛœÈHÈœ‹œ›ÝšY\ˆHÈ—Bˆ\˜[\Îˆ\ÝÐ[žWHHÜ›ÝšY\—BˆYˆ\š[ÙÝ\N‚ˆÛÛ™][ÛœË˜\[™
+œ‹œ\š[ÙÝ\HHÈŠBˆ\˜[\Ë˜\[™
+\š[ÙÝ\JBˆYˆ\š[ÙÙ]N‚ˆ›Ü›X[^™YÙ]HH\š[ÙÙ]Kš\ÛÙ›Ü›X]
+
+HYˆ\Ú[œÝ[˜ÙJ\š[ÙÙ]K]JH[ÙHÝŠ\š[ÙÙ]JBˆÛÛ™][ÛœË˜\[™
+œ‹œ\š[ÙÙ]HHÈŠBˆ\˜[\Ë˜\[™
+›Ü›X[^™YÙ]JBˆYˆ\ÜÙ]ÚY‚ˆÛÛ™][ÛœË˜\[™
+œ‹˜\ÜÙ]ÚYHÈŠBˆ\˜[\Ë˜\[™
+\ÜÙ]ÚY
+Bˆ›ÝÜÈH]Y\žWØ[
+ˆÛÛ›‹ˆˆˆˆ‚ˆÑSPÕˆ‹Š‹ˆKœ›Ú™XÝÛ˜[YKˆKšÝÜˆËØ\›š[™×Ù]šX][Û—ÜÝˆË˜[\Ù]šX][Û—ÜÝˆË˜Üš]XØ[Ù]šX][Û—ÜÝˆË˜˜\Ù[[™WÞYX\œËˆË›Z[—Ø˜\Ù[[™WÜÚ[ËˆË›[ÛWØYÙ]ÚœÛÛ‚ˆ”“ÓH›ÙXÝ[Û—Ü™XÛÜ™È‚ˆ“ÒSˆ\ÜÙ]ÈHÓˆKšYH‹˜\ÜÙ]ÚYˆQ•“ÒSˆ\™›Ü›X[˜ÙWÜÙ][™ÜÈÈÓˆË˜\ÜÙ]ÚYH‹˜\ÜÙ]ÚYˆÒT‘HÈˆS‘‹š›Ú[ŠÛÛ™][ÛœÊ_BˆÔ‘Tˆ–H‹œ\š[ÙÙ]HTÐË‹šYTÐÂˆˆˆ‹ˆ\˜[\Ëˆ
+BˆÝ[[X\žHHÂˆœ™XÛÜ™×Ü›ØÙ\ÜÙYŽˆˆœ™Y™\™[˜Ù\×ØÜ™X]YŽˆˆœÝ[ÝÚ]Ý]Ü™Y™\™[˜ÙHŽˆˆ›Z\ÜÚ[™×ÚÝÜŽˆˆ›Z\ÜÚ[™×Ü›ÙXÝ[ÛˆŽˆˆBˆ›Üˆ›ÝÈ[ˆ›ÝÜÎ‚ˆ\™Ù]Ù]HH\œÙWÙ]WÝ˜[YJ›ÝÖÈœ\š[ÙÙ]H—JBˆYˆ\™Ù]Ù]H\È›Û™N‚ˆÛÛ[YBˆÝÜH\œÙWÚÝÜÝ˜[YJ›ÝÖÈšÝÜ—JBˆÙ][™ÜÈHÙ]Ü\™›Ü›X[˜ÙWÜÙ][™ÜÊÛÛ›‹[
+›ÝÖÈ˜\ÜÙ]ÚY—JJBˆÙ][™ÜË\]JÚÙ^Nˆ›ÝÖÚÙ^WH›ÜˆÙ^H[ˆ›ÝËšÙ^\Ê
+HYˆÙ^H[ˆÙ][™ÜÈ[™›ÝÖÚÙ^WH\È›Ý›Û™_JBˆ™Y™\™[˜ÙWÜ™\Ý[HØ[Ý[]WÙ^XÝYÜ›ÙXÝ[Û—ÝÚ]ÙXYÛ›ÜÝXÊˆÛÛ›‹ˆ\ÜÙ]ÚYZ[
+›ÝÖÈ˜\ÜÙ]ÚY—JKˆ›ÝšY\\›ÝšY\‹ˆ\š[ÙÝ\O\›ÝÖÈœ\š[ÙÝ\H—Kˆ\š[ÙÙ]O]\™Ù]Ù]KˆÝÜZÝÜˆÙ][™ÜÏ\Ù][™ÜËˆ\ÜÙ]Û˜[YO\›ÝÖÈœ›Ú™XÝÛ˜[YH—KˆÙ^WÝ˜[YO]Ù^WÝ˜[YKˆ
+Bˆ^XÝYÚÝÚH™Y™\™[˜ÙWÜ™\Ý[È™^XÝYÚÝÚ—Bˆ^XÝYÜÜXÚYšX×ÞZY[H™Y™\™[˜ÙWÜ™\Ý[È™^XÝYÜÜXÚYšX×ÞZY[—Bˆ^XÝYÜÛÝ\˜ÙHH™Y™\™[˜ÙWÜ™\Ý[È™^XÝYÜÛÝ\˜ÙH—Bˆ\™›Ü›X[˜ÙWÜÝ]\Ë]WÜ]X[]K]šX][Û—ÜÝHÛ\ÜÚYžWÜ\™›Ü›X[˜ÙWÜÝ]\Êˆ›ÝÖÈœ›ÙXÝ[Û—ÚÝÚ—KˆÝÜˆ^XÝYÚÝÚˆØ\›š[™×Ù]šX][Û—ÜÝY›Ø]
+Ù][™ÜË™Ù]
+Ø\›š[™×Ù]šX][Û—ÜÝŠHÜˆLL
+Kˆ[\Ù]šX][Û—ÜÝY›Ø]
+Ù][™ÜË™Ù]
+˜[\Ù]šX][Û—ÜÝŠHÜˆLŒ
+KˆÜš]XØ[Ù]šX][Û—ÜÝY›Ø]
+Ù][™ÜË™Ù]
+˜Üš]XØ[Ù]šX][Û—ÜÝŠHÜˆLÌ
+Kˆ
+BˆYˆ]WÜ]X[]HOH›ÚÈˆ[™™Y™\™[˜ÙWÜ™\Ý[Èœ]X[]H—HOHœ\X[Ú\ÝÜžHˆ[™^XÝYÜÛÝ\˜ÙHOH››Û™HŽ‚ˆ]WÜ]X[]HHœ\X[Ú\ÝÜžH‚ˆ›Ý\ÈH›ÝÖÈ››Ý\È—HÜˆˆ‚ˆ™X\ÛÛˆH™Y™\™[˜ÙWÜ™\Ý[È™XYÛ›ÜÝXÈ—K™Ù]
+››×Ü™Y™\™[˜ÙWÜ™X\ÛÛˆŠHÜˆˆ‚ˆYˆ™X\ÛÛˆ[™™X\ÛÛˆ›Ý[ˆ›Ý\Î‚ˆ›Ý\ÈHˆžÛ›Ý\ßHÜ™X\ÛÛŸH‹œÝš\
+
+BˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH›ÙXÝ[Û—Ü™XÛÜ™ÂˆÑU^XÝYÚÝÚHË^XÝYÜÜXÚYšX×ÞZY[HË]šX][Û—ÜÝHËˆ\™›Ü›X[˜ÙWÜÝ]\ÈHË^XÝYÜÛÝ\˜ÙHHË]WÜ]X[]HHËˆ™Y™\™[˜ÙWÙXYÛ›ÜÝX×ÚœÛÛˆHË›Ý\ÈHË\]YØ]HÂˆÒT‘HYHÂˆˆˆ‹ˆ
+ˆ^XÝYÚÝÚˆ^XÝYÜÜXÚYšX×ÞZY[ˆ]šX][Û—ÜÝˆ\™›Ü›X[˜ÙWÜÝ]\Ëˆ^XÝYÜÛÝ\˜ÙKˆ]WÜ]X[]KˆœÛÛ‹™[\Ê™Y™\™[˜ÙWÜ™\Ý[È™XYÛ›ÜÝXÈ—K[œÝ\™WØ\ØÚZOUYJKˆ›Ý\Ëˆ]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆ›ÝÖÈšY—Kˆ
+Kˆ
+BˆÝ[[X\žVÈœ™XÛÜ™×Ü›ØÙ\ÜÙY—H
+ÏHBˆYˆ^XÝYÚÝÚ\È›Ý›Û™H[™^XÝYÜÜXÚYšX×ÞZY[\È›Ý›Û™N‚ˆÝ[[X\žVÈœ™Y™\™[˜Ù\×ØÜ™X]Y—H
+ÏHBˆ[ÙN‚ˆÝ[[X\žVÈœÝ[ÝÚ]Ý]Ü™Y™\™[˜ÙH—H
+ÏHBˆYˆÝÜ\È›Û™N‚ˆÝ[[X\žVÈ›Z\ÜÚ[™×ÚÝÜ—H
+ÏHBˆYˆ›ÝÖÈœ›ÙXÝ[Û—ÚÝÚ—H\È›Û™N‚ˆÝ[[X\žVÈ›Z\ÜÚ[™×Ü›ÙXÝ[Ûˆ—H
+ÏHBˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ™]\›ˆÝ[[X\žB‚‚™YˆÜ[—Ù\Ú[ÛœÛÛ\—Ü›ÙXÝ[Û—Ø˜XÚÙš[ÛYØXÞJˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆ›ÝšY\ŽˆÝˆH‘\Ú[Û”ÛÛ\ˆ‹ˆ\š[ÙÝ\NˆÝˆH™^H‹ˆœ›ÛWÞYX\Žˆ[ˆ×ÞYX\Žˆ[ˆ\ÜÙ]ÚYˆ[›Û™HH›Û™KˆÙ^WÝ˜[YNˆ]H›Û™HH›Û™Kˆ]WÙœ›ÛNˆ]H›Û™HH›Û™Kˆ]WÝÎˆ]H›Û™HH›Û™KˆX^Ù^\Îˆ[›Û™HH›Û™KŠHOˆXÝÜÝ‹[žWN‚ˆYˆ\š[ÙÝ\H›Ý[ˆÈ™^H‹›[ÛŸN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ•\ÈH\°ë[ÙÈ[°è[YËˆŠBˆYˆœ›ÛWÞYX\ˆˆ×ÞYX\Ž‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ[›È[šXÚX[˜[ÈÙHÙ\ˆÝ\\š[Üˆ[È[›Èš[˜[ˆŠBˆYˆ
+×ÞYX\ˆHœ›ÛWÞYX\ˆ
+ÈJHˆÎ‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[\˜[ÈÝ\\š[ÜˆHÈ[›ÜËˆ™Y^ˆÈ\°ë[ÙÈ\˜H^XÝ]\ˆÈ˜XÚÙš[ˆŠB‚ˆÙ^WÝ˜[YHHÙ^WÝ˜[YHÜˆ]KÙ^J
+BˆÛÛ™šYÈHÙ]Ú[YÜ˜][Û—ØÛÛ™šYÊÛÛ›‹›ÝšY\ŠBˆYˆÛÛ™šYÈ\È›Û™N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠÛÛ™šYÝ\˜XØ[È\Ú[Û”ÛÛ\ˆ˜[È[˜ÛÛ˜YKˆŠBˆYˆ›ÝÛÛ™šYÖÈ™[˜X›Y—N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠH[YÜ˜XØ[È\Ú[Û”ÛÛ\ˆ\ÝH\Ø]]˜YKˆŠBˆ[™Ú[ÈHÙ]Ù\Ú[ÛœÛÛ\—Ù[™Ú[ØÛÛ™šYÊÛÛ™šYÊBˆ\ÜÙ]ÈHÙ]Ù\Ú[ÛœÛÛ\—Ü\™›Ü›X[˜ÙWØ\ÜÙ]ÊÛÛ›‹›ÝšY\‹\ÜÙ]ÚY
+Bˆ]\ÈH
+ˆ]\—ÙZ[WØ˜XÚÙš[Ù]\Êœ›ÛWÞYX\‹×ÞYX\‹Ù^WÝ˜[YO]Ù^WÝ˜[YJBˆYˆ\š[ÙÝ\HOH™^H‚ˆ[ÙH]\—Û[ÛWØ˜XÚÙš[Ù]\Êœ›ÛWÞYX\‹×ÞYX\‹Ù^WÝ˜[YO]Ù^WÝ˜[YJBˆ
+BˆYˆ\š[ÙÝ\HOH™^HŽ‚ˆYˆ]WÙœ›ÛH\È›Ý›Û™N‚ˆ]\ÈHØØ[™Y]H›ÜˆØ[™Y]H[ˆ]\ÈYˆØ[™Y]HH]WÙœ›ÛWBˆYˆ]WÝÈ\È›Ý›Û™N‚ˆ]\ÈHØØ[™Y]H›ÜˆØ[™Y]H[ˆ]\ÈYˆØ[™Y]HH]WÝ×BˆYˆX^Ù^\È\È›Ý›Û™H[™X^Ù^\Èˆ‚ˆ]\ÈH]\ÖÎ›X^Ù^\×B‚ˆÝ[[X\žHHÂˆ˜\ÜÙ]×Ü›ØÙ\ÜÙYŽˆˆœ™XÛÜ™×Ý\]YŽˆˆ›Z\ÜÚ[™×Ü›ÙXÝ[ÛˆŽˆˆ˜\WÙ\œ›ÜœÈŽˆˆ›]Ü™XÛÜ™×Ý\]YŽˆˆ˜˜\Ù[[™\×Ü™XØ[Ý[]YŽˆˆœ™Y™\™[˜Ù\×ØÜ™X]YŽˆˆœÝ[ÝÚ]Ý]Ü™Y™\™[˜ÙHŽˆˆBˆÙÙÙ\ˆHÝ\œ™[Ø\›ÙÙÙ\ˆYˆ\×Ø\ØÛÛ^
+
+H[ÙHÙÙÚ[™Ë™Ù]ÙÙÙ\Š×Û˜[YW×ÊBˆÙ\ÜÚ[Û—ÛØš‹ÈHÙ]Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[ÛŠÛÛ™šYÊB‚ˆ›Üˆ\ÜÙ][ˆ\ÜÙ]Î‚ˆÝ[[X\žVÈ˜\ÜÙ]×Ü›ØÙ\ÜÙY—H
+ÏHBˆ^\›˜[ÚYHÝŠ\ÜÙ]È™^\›˜[ÚY—HÜˆˆŠKœÝš\
+
+Bˆ›Üˆ\š[ÙÙ]H[ˆ]\Î‚ˆžN‚ˆYˆ\š[ÙÝ\HOH›[ÛŽ‚ˆÜWÛX\H™]ÚÙ\Ú[ÛœÛÛ\—ÚÜWÛ[ÛÛX\
+ˆÙ\ÜÚ[Û—ÛØš‹ˆ[™Ú[ÖÈ˜˜\ÙWÝ\›—Kˆ[™Ú[ÖÈ›[ÛÚÜWÙ[™Ú[—KˆÙ^\›˜[ÚYKˆ\š[ÙÙ]Kˆ
+Bˆ[ÙN‚ˆÜWÛX\H™]ÚÙ\Ú[ÛœÛÛ\—ÚÜWÙ^WÛX\
+ˆÙ\ÜÚ[Û—ÛØš‹ˆ[™Ú[ÖÈ˜˜\ÙWÝ\›—Kˆ[™Ú[ÖÈ™^WÚÜWÙ[™Ú[—KˆÙ^\›˜[ÚYKˆ\š[ÙÙ]Kˆ
+Bˆ™\Ý[HÝÜ™WÜ›ÙXÝ[Û—ÚÜWÜ™XÛÜ™
+ˆÛÛ›‹ˆ\ÜÙ]Ü›ÝÏX\ÜÙ]ˆ›ÝšY\\›ÝšY\‹ˆ^\›˜[ÚYY^\›˜[ÚYˆ\š[ÙÝ\O\\š[ÙÝ\Kˆ\š[ÙÙ]O\\š[ÙÙ]KˆÜWÜ›ÝÏZÜWÛX\™Ù]
+^\›˜[ÚYßJKˆ›Ý\×Ü™Yš^H˜XÚÙš[\Ý0ìÜšXÛËˆ‹ˆ
+BˆÝ[[X\žVÈœ™XÛÜ™×Ý\]Y—H
+ÏHBˆYˆ™\Ý[Èœ›ÙXÝ[Û—ÚÝÚ—H\È›Û™N‚ˆÝ[[X\žVÈ›Z\ÜÚ[™×Ü›ÙXÝ[Ûˆ—H
+ÏHBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÝ[[X\žVÈ˜\WÙ\œ›ÜœÈ—H
+ÏHBˆYˆ\Ú[œÝ[˜ÙJ^Ë\TÛÝ[˜]˜Z[X›Q\œ›ÜŠN‚ˆ˜Z\ÙBˆÙÙÙ\‹Ø\›š[™Êˆ‘\Ú[Û”ÛÛ\ˆ\™›Ü›X[˜ÙH˜XÚÙš[˜Z[Yˆ\ÜÙ]ÚYI\ÈÝ][ÛÛÙOI\È\š[ÙÝ\OI\È\š[ÙÙ]OI\È\œ›ÜI\È‹ˆ\ÜÙ]È˜\ÜÙ]ÚY—Kˆ^\›˜[ÚYˆ\š[ÙÝ\Kˆ\š[ÙÙ]Kš\ÛÙ›Ü›X]
+
+Kˆ^Ëˆ
+BˆÛÛ[YB‚ˆÙ[XÝYØ\ÜÙ]ÚYÈHÚ[
+\ÜÙ]È˜\ÜÙ]ÚY—JH›Üˆ\ÜÙ][ˆ\ÜÙ]×Bˆ™XØ[×Ý\™Ù]ÈH]\ÈYˆ\š[ÙÝ\HOH›[Ûˆ[ÙH
+ÛX^
+]\ÊWHYˆ]\È[ÙH×JBˆYˆ›ÝÝ[[X\žVÈœÝÜYÜ™X\ÛÛˆ—N‚ˆ›Üˆ\™Ù][ˆ™XØ[×Ý\™Ù]Î‚ˆ™XØ[ÈH™XØ[Ý[]WÜ\™›Ü›X[˜ÙWÜ™Y™\™[˜Ù\ÊˆÛÛ›‹ˆ\š[ÙÝ\O\\š[ÙÝ\Kˆ\š[ÙÙ]O]\™Ù]ˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ›ÝšY\\›ÝšY\‹ˆÙ^WÝ˜[YO]Ù^WÝ˜[YKˆ
+BˆÝ[[X\žVÈ˜˜\Ù[[™\×Ü™XØ[Ý[]Y—H
+ÏH™XØ[ÖÈœ™XÛÜ™×Ü›ØÙ\ÜÙY—BˆÝ[[X\žVÈœ™Y™\™[˜Ù\×ØÜ™X]Y—H
+ÏH™XØ[ÖÈœ™Y™\™[˜Ù\×ØÜ™X]Y—BˆÝ[[X\žVÈœÝ[ÝÚ]Ý]Ü™Y™\™[˜ÙH—H
+ÏH™XØ[ÖÈœÝ[ÝÚ]Ý]Ü™Y™\™[˜ÙH—B‚ˆÝ\œ™[Û[ÛHÙ^WÝ˜[YKœ™\XÙJ^OLJBˆYˆÙ[XÝYØ\ÜÙ]ÚYÎ‚ˆ›Üˆ\ÜÙ][ˆ\ÜÙ]Î‚ˆ^\›˜[ÚYHÝŠ\ÜÙ]È™^\›˜[ÚY—HÜˆˆŠKœÝš\
+
+BˆžN‚ˆÜWÛX\H™]ÚÙ\Ú[ÛœÛÛ\—ÚÜWÛ[ÛÛX\
+ˆÙ\ÜÚ[Û—ÛØš‹ˆ[™Ú[ÖÈ˜˜\ÙWÝ\›—Kˆ[™Ú[ÖÈ›[ÛÚÜWÙ[™Ú[—KˆÙ^\›˜[ÚYKˆÝ\œ™[Û[Ûˆ
+BˆÝÜ™WÜ›ÙXÝ[Û—ÚÜWÜ™XÛÜ™
+ˆÛÛ›‹ˆ\ÜÙ]Ü›ÝÏX\ÜÙ]ˆ›ÝšY\\›ÝšY\‹ˆ^\›˜[ÚYY^\›˜[ÚYˆ\š[ÙÝ\OH›]‹ˆ\š[ÙÙ]OXÝ\œ™[Û[ÛˆÜWÜ›ÝÏZÜWÛX\™Ù]
+^\›˜[ÚYßJKˆ›Ý\×Ü™Yš^H“U™XØ[Ý[YÈ\0ìÜÈ˜XÚÙš[ˆ‹ˆ
+BˆÝ[[X\žVÈ›]Ü™XÛÜ™×Ý\]Y—H
+ÏHBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÝ[[X\žVÈ˜\WÙ\œ›ÜœÈ—H
+ÏHBˆYˆ\Ú[œÝ[˜ÙJ^Ë\TÛÝ[˜]˜Z[X›Q\œ›ÜŠN‚ˆ˜Z\ÙBˆÙÙÙ\‹Ø\›š[™Êˆ‘\Ú[Û”ÛÛ\ˆU™XØ[Ý[][Ûˆ˜Z[YY\ˆ˜XÚÙš[ˆ\ÜÙ]ÚYI\ÈÝ][ÛÛÙOI\È\œ›ÜI\È‹ˆ\ÜÙ]È˜\ÜÙ]ÚY—Kˆ^\›˜[ÚYˆ^Ëˆ
+Bˆ™XØ[ÈH™XØ[Ý[]WÜ\™›Ü›X[˜ÙWÜ™Y™\™[˜Ù\ÊˆÛÛ›‹ˆ\š[ÙÝ\OH›]‹ˆ\š[ÙÙ]OXÝ\œ™[Û[Ûˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ›ÝšY\\›ÝšY\‹ˆÙ^WÝ˜[YO]Ù^WÝ˜[YKˆ
+BˆÝ[[X\žVÈ˜˜\Ù[[™\×Ü™XØ[Ý[]Y—H
+ÏH™XØ[ÖÈœ™XÛÜ™×Ü›ØÙ\ÜÙY—BˆÝ[[X\žVÈœ™Y™\™[˜Ù\×ØÜ™X]Y—H
+ÏH™XØ[ÖÈœ™Y™\™[˜Ù\×ØÜ™X]Y—BˆÝ[[X\žVÈœÝ[ÝÚ]Ý]Ü™Y™\™[˜ÙH—H
+ÏH™XØ[ÖÈœÝ[ÝÚ]Ý]Ü™Y™\™[˜ÙH—BˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ™]\›ˆÝ[[X\žB‚‚™Yˆ[—Ù\Ú[ÛœÛÛ\—Ü›ÙXÝ[Û—Ø˜XÚÙš[
+ˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆ›ÝšY\ŽˆÝˆH‘\Ú[Û”ÛÛ\ˆ‹ˆ\š[ÙÝ\NˆÝˆH™^H‹ˆœ›ÛWÞYX\Žˆ[ˆ×ÞYX\Žˆ[ˆ\ÜÙ]ÚYˆ[›Û™HH›Û™KˆÙ^WÝ˜[YNˆ]H›Û™HH›Û™Kˆ]WÙœ›ÛNˆ]H›Û™HH›Û™Kˆ]WÝÎˆ]H›Û™HH›Û™KˆX^Ù^\Îˆ[›Û™HH›Û™KˆX^Ø\WØØ[Îˆ[›Û™HH›Û™KˆÜWØØ[Ù[^WÜÙXÛÛ™Îˆ›Ø]›Û™HH›Û™KˆÛY\\Žˆ[žH›Û™HH›Û™KˆX^ÝØZ]ØÞXÛ\Îˆ[HŠHOˆXÝÜÝ‹[žWN‚ˆYˆ\š[ÙÝ\H›Ý[ˆÈ™^H‹›[ÛŸN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ•\ÈH\š[ÙÈ[˜[YËˆŠBˆYˆœ›ÛWÞYX\ˆˆ×ÞYX\Ž‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ[›È[šXÚX[˜[ÈÙHÙ\ˆÝ\\š[Üˆ[È[›Èš[˜[ˆŠBˆYˆ
+×ÞYX\ˆHœ›ÛWÞYX\ˆ
+ÈJHˆÎ‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[\˜[ÈÝ\\š[ÜˆHÈ[›ÜËˆ™Y^ˆÈ\š[ÙÈ\˜H^XÝ]\ˆÈ˜XÚÙš[ˆŠB‚ˆÙ^WÝ˜[YHHÙ^WÝ˜[YHÜˆ]KÙ^J
+BˆÛÛ™šYÈHÙ]Ú[YÜ˜][Û—ØÛÛ™šYÊÛÛ›‹›ÝšY\ŠBˆYˆÛÛ™šYÈ\È›Û™N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠÛÛ™šYÝ\˜XØ[È\Ú[Û”ÛÛ\ˆ˜[È[˜ÛÛ˜YKˆŠBˆYˆ›ÝÛÛ™šYÖÈ™[˜X›Y—N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠH[YÜ˜XØ[È\Ú[Û”ÛÛ\ˆ\ÝH\Ø]]˜YKˆŠBˆ[™Ú[ÈHÙ]Ù\Ú[ÛœÛÛ\—Ù[™Ú[ØÛÛ™šYÊÛÛ™šYÊBˆ\ÜÙ]ÈHÙ]Ù\Ú[ÛœÛÛ\—Ü\™›Ü›X[˜ÙWØ\ÜÙ]ÊÛÛ›‹›ÝšY\‹\ÜÙ]ÚY
+Bˆ]\ÈH]\—Û[ÛWØ˜XÚÙš[Ù]\Êœ›ÛWÞYX\‹×ÞYX\‹Ù^WÝ˜[YO]Ù^WÝ˜[YJBˆYˆ\š[ÙÝ\HOH™^HŽ‚ˆ]\ÈH]\—ÙZ[WØ˜XÚÙš[Û[ÛÊˆœ›ÛWÞYX\‹ˆ×ÞYX\‹ˆÙ^WÝ˜[YO]Ù^WÝ˜[YKˆ]WÙœ›ÛOY]WÙœ›ÛKˆ]WÝÏY]WÝËˆ
+B‚ˆÝ[[X\žHHÂˆ˜\ÜÙ]×Ü›ØÙ\ÜÙYŽˆˆœ™XÛÜ™×Ý\]YŽˆˆ›Z\ÜÚ[™×Ü›ÙXÝ[ÛˆŽˆˆ˜\WÙ\œ›ÜœÈŽˆˆ˜\WØØ[×Ý\ÙYŽˆˆ›[Û×Ü›ØÙ\ÜÙYŽˆˆ˜Ú[šÜ×Ü›ØÙ\ÜÙYŽˆˆ›]Ü™XÛÜ™×Ý\]YŽˆˆ˜˜\Ù[[™\×Ü™XØ[Ý[]YŽˆˆœ™Y™\™[˜Ù\×ØÜ™X]YŽˆˆœÝ[ÝÚ]Ý]Ü™Y™\™[˜ÙHŽˆˆœÝÜYÜ™X\ÛÛˆŽˆˆ‹ˆœ™\Ý[YWÚ[Žˆˆ‹ˆØZ]ØÞXÛ\ÈŽˆˆBˆÙÙÙ\ˆHÝ\œ™[Ø\›ÙÙÙ\ˆYˆ\×Ø\ØÛÛ^
+
+H[ÙHÙÙÚ[™Ë™Ù]ÙÙÙ\Š×Û˜[YW×ÊBˆÝ][Û—ØÛÙ\ÈHÜÝŠ\ÜÙ]È™^\›˜[ÚY—HÜˆˆŠKœÝš\
+
+H›Üˆ\ÜÙ][ˆ\ÜÙ]ÈYˆÝŠ\ÜÙ]È™^\›˜[ÚY—HÜˆˆŠKœÝš\
+
+WBˆ\ÜÙ]×ØžWÙ^\›˜[ÚYHÂˆÝŠ\ÜÙ]È™^\›˜[ÚY—HÜˆˆŠKœÝš\
+
+Nˆ\ÜÙ]ˆ›Üˆ\ÜÙ][ˆ\ÜÙ]ÂˆYˆÝŠ\ÜÙ]È™^\›˜[ÚY—HÜˆˆŠKœÝš\
+
+BˆBˆÝ[[X\žVÈ˜\ÜÙ]×Ü›ØÙ\ÜÙY—HH[Š\ÜÙ]×ØžWÙ^\›˜[ÚY
+BˆX^Ø\WØØ[ÈHX^Ø\WØØ[ÈYˆX^Ø\WØØ[È\È›Ý›Û™H[ÙHX^Ù^\ÂˆX^Ø\WØØ[ÈHX^Ø\WØØ[ÈYˆX^Ø\WØØ[È\È›Ý›Û™H[ÙH•TÒSÓ”ÓÓT—ÔT‘“Ô“PSÑWÓPVÐTWÐÐSÂˆÜWØØ[Ù[^WÜÙXÛÛ™ÈH
+ˆ•TÒSÓ”ÓÓT—ÔT‘“Ô“PSÑWÒÔWÑSVWÔÑPÓÓ‘ÂˆYˆÜWØØ[Ù[^WÜÙXÛÛ™È\È›Û™Bˆ[ÙHÜWØØ[Ù[^WÜÙXÛÛ™Âˆ
+BˆÛY\Ù[˜ÈHÛY\\ˆÜˆ[YKœÛY\ˆ›ØÙ\ÜÙYÙ]\Îˆ\ÝÙ]WHH×B‚ˆYˆØZ]ØY\—Ü˜]WÛ[Z]
+™X\ÛÛŽˆÝ‹™\Ý[YWÚ[ˆ]H›Û™HH›Û™JHOˆ›ÛÛ‚ˆÝ[[X\žVÈØZ]ØÞXÛ\È—H
+ÏHBˆÝ[[X\žVÈœ™\Ý[YWÚ[—HH™\Ý[YWÚ[š\ÛÙ›Ü›X]
+
+HYˆ™\Ý[YWÚ[[ÙHÝ[[X\žVÈœ™\Ý[YWÚ[—BˆYˆÝ[[X\žVÈØZ]ØÞXÛ\È—HˆX^ÝØZ]ØÞXÛ\Î‚ˆÝ[[X\žVÈœÝÜYÜ™X\ÛÛˆ—HHˆ“[Z]H\Ú[Û”ÛÛ\ˆ™\]YÈ[X\ÚXY\È™^™\Ëˆ[[[È\ÝYÎˆÜ™X\ÛÛŸH‚ˆÙÙÙ\‹Ø\›š[™Êˆ‘\Ú[Û”ÛÛ\ˆ\™›Ü›X[˜ÙH˜XÚÙš[ÝÜYY\ˆ™\X]YÛÛÛÝÛœÎˆ\š[ÙÝ\OI\ÈÝ][Û—ØÛÝ[I\ÈØZ]ØÞXÛ\ÏI\È™X\ÛÛI\È‹ˆ\š[ÙÝ\Kˆ[ŠÝ][Û—ØÛÙ\ÊKˆÝ[[X\žVÈØZ]ØÞXÛ\È—Kˆ™X\ÛÛ‹ˆ
+Bˆ™]\›ˆ˜[ÙBˆÛÛ›‹˜ÛÛ[Z]
+
+BˆÙXÛÛ™ÈH\Ú[ÛœÛÛ\—ØÛÛÛÝÛ—ÜÛY\ÜÙXÛÛ™ÊÛÛ›ŠBˆÙÙÙ\‹Ø\›š[™Êˆ‘\Ú[Û”ÛÛ\ˆ\™›Ü›X[˜ÙH˜XÚÙš[ØZ][™È›ÜˆTHÛÛÛÝÛŽˆ\š[ÙÝ\OI\ÈÝ][Û—ØÛÝ[I\ÈÙXÛÛ™ÏI\ÈØZ]ØÞXÛOI\È‹ˆ\š[ÙÝ\Kˆ[ŠÝ][Û—ØÛÙ\ÊKˆÙXÛÛ™ËˆÝ[[X\žVÈØZ]ØÞXÛ\È—Kˆ
+BˆÛY\Ù[˜ÊÙXÛÛ™ÊBˆ™]\›ˆYB‚ˆÛÛÛÝÛ—Ü™X\ÛÛˆHÙ]Ù\Ú[ÛœÛÛ\—Ü\™›Ü›X[˜ÙWØÛÛÛÝÛ—Ü™X\ÛÛŠÛÛ›ŠBˆYˆÛÛÛÝÛ—Ü™X\ÛÛˆ[™›ÝØZ]ØY\—Ü˜]WÛ[Z]
+ÛÛÛÝÛ—Ü™X\ÛÛŠN‚ˆÝ[[X\žVÈ˜\WÙ\œ›ÜœÈ—HHBˆ™]\›ˆÝ[[X\žB‚ˆÙ\ÜÚ[Û—ÛØš‹ÈHÙ]Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[ÛŠÛÛ™šYÊB‚ˆYˆ™Yœ™\ÚÜÙ\ÜÚ[Û—ØY\—Ù^\žJ^Îˆ^Ù\[Û‹ÛÛ^ˆÝŠHOˆ›Û™N‚ˆ›Û›ØØ[Ù\ÜÚ[Û—ÛØš‚ˆ[˜[Y]WÙ\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[ÛŠÛÛ™šYÊBˆÙ\ÜÚ[Û—ÛØš‹ÈHÙ]Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[ÛŠÛÛ™šYË›Ü˜ÙWÛÙÚ[UYJBˆÙÙÙ\‹Ø\›š[™Ê‘\Ú[Û”ÛÛ\ˆÙ\ÜÚ[Ûˆ™Yœ™\ÚYY\ˆ^\™YÙÚ[ŽˆÛÛ^I\È\œ›ÜI\È‹ÛÛ^^ÊB‚ˆYˆÝÜ™WÚÜWÛX\
+ˆ\š[ÙÙ]WÝ˜[YNˆ]KˆÜWÛX\Ý˜[YNˆXÝÜÝ‹XÝÜÝ‹[žWWKˆ™XÛÜ™Ý\NˆÝ‹ˆ›Ý\×Ü™Yš^ˆÝ‹ˆ^\›˜[ÚYÎˆ\ÝÜÝ—H›Û™HH›Û™Kˆ
+HOˆ›Û™N‚ˆÙ[XÝYÙ^\›˜[ÚYÈH^\›˜[ÚYÈÜˆ\Ý
+\ÜÙ]×ØžWÙ^\›˜[ÚY
+Bˆ›Üˆ^\›˜[ÚYÝ˜[YH[ˆÙ[XÝYÙ^\›˜[ÚYÎ‚ˆ\ÜÙ]H\ÜÙ]×ØžWÙ^\›˜[ÚYÙ^\›˜[ÚYÝ˜[YWBˆ™\Ý[HÝÜ™WÜ›ÙXÝ[Û—ÚÜWÜ™XÛÜ™
+ˆÛÛ›‹ˆ\ÜÙ]Ü›ÝÏX\ÜÙ]ˆ›ÝšY\\›ÝšY\‹ˆ^\›˜[ÚYY^\›˜[ÚYÝ˜[YKˆ\š[ÙÝ\O\™XÛÜ™Ý\Kˆ\š[ÙÙ]O\\š[ÙÙ]WÝ˜[YKˆÜWÜ›ÝÏZÜWÛX\Ý˜[YK™Ù]
+^\›˜[ÚYÝ˜[YKßJKˆ›Ý\×Ü™Yš^[›Ý\×Ü™Yš^ˆ
+BˆYˆ™XÛÜ™Ý\HOH›]Ž‚ˆÝ[[X\žVÈ›]Ü™XÛÜ™×Ý\]Y—H
+ÏHBˆ[ÙN‚ˆÝ[[X\žVÈœ™XÛÜ™×Ý\]Y—H
+ÏHBˆYˆ™\Ý[Èœ›ÙXÝ[Û—ÚÝÚ—H\È›Û™N‚ˆÝ[[X\žVÈ›Z\ÜÚ[™×Ü›ÙXÝ[Ûˆ—H
+ÏHB‚ˆYˆØZ]Ø™Y›Ü™WÛ™^ØØ[
+
+HOˆ›Û™N‚ˆYˆ
+ˆ“ÑPÕSÓ—ÒÔWÐÐSÐÓÓ•V™Ù]
+
+H\È›Û™Bˆ[™ÜWØØ[Ù[^WÜÙXÛÛ™Âˆ[™ÜWØØ[Ù[^WÜÙXÛÛ™Èˆˆ
+N‚ˆÛY\Ù[˜ÊÜWØØ[Ù[^WÜÙXÛÛ™ÊB‚ˆYˆ\š[ÙÝ\HOH™^HŽ‚ˆ›Üˆ[ÛÝ˜[YH[ˆ]\Î‚ˆ[ÛÚYÜ™XÛÜ™ÈH˜[ÙBˆ[ÛÜÝ][Û—ØÛÙ\ÈHÂˆ^\›˜[ÚYˆ›Üˆ^\›˜[ÚY\ÜÙ][ˆ\ÜÙ]×ØžWÙ^\›˜[ÚYš][\Ê
+BˆYˆ]˜[X]WÛØØ[Û[ÛWÜ›ÙXÝ[Û—Ü]X[]JˆÛÛ›‹ˆ\ÜÙ]ÚYZ[
+\ÜÙ]È˜\ÜÙ]ÚY—JKˆ›ÝšY\\›ÝšY\‹ˆ[ÛÜÝ\[[ÛÝ˜[YKˆ™Y™\™[˜ÙWÙ]O]Ù^WÝ˜[YKˆ
+KœÝ]\ÂˆOH˜ÛÛ\]H‚ˆBˆÝ][Û—ØÚ[šÜÈHÚ[šÙY
+[ÛÜÝ][Û—ØÛÙ\ËL
+Bˆ›ÜˆÚ[š×Ú[™^Ý][Û—ÙÜ›Ý\[ˆ[[Y\˜]JÝ][Û—ØÚ[šÜËÝ\LJN‚ˆÙ\ÜÚ[Û—Ü™]žWÝ\ÙYH˜[ÙBˆÚ[HYN‚ˆYˆÝ[[X\žVÈ˜\WØØ[×Ý\ÙY—HHX^Ø\WØØ[Î‚ˆÝ[[X\žVÈœÝÜYÜ™X\ÛÛˆ—HH
+ˆˆ“[Z]HØØ[HÛX^Ø\WØØ[ßHÚ[XY\ÈTH][™ÚYËˆ‚ˆˆ”™]ÛXHH\\ˆHÛ[ÛÝ˜[YKš\ÛÙ›Ü›X]
+
+_Kˆ‚ˆ
+BˆÝ[[X\žVÈœ™\Ý[YWÚ[—HH[ÛÝ˜[YKš\ÛÙ›Ü›X]
+
+BˆÙÙÙ\‹š[™›Êˆ‘\Ú[Û”ÛÛ\ˆ\™›Ü›X[˜ÙH˜XÚÙš[ÝÜYžHX^Ø[Îˆ\š[ÙÝ\OI\È[ÛI\È\WØØ[×Ý\ÙYI\ÈX^Ø\WØØ[ÏI\È‹ˆ\š[ÙÝ\Kˆ[ÛÝ˜[YKš\ÛÙ›Ü›X]
+
+KˆÝ[[X\žVÈ˜\WØØ[×Ý\ÙY—KˆX^Ø\WØØ[Ëˆ
+Bˆœ™XZÂˆYˆÝ[[X\žVÈ˜\WØØ[×Ý\ÙY—Hˆ‚ˆØZ]Ø™Y›Ü™WÛ™^ØØ[
+
+BˆžN‚ˆÙÙÙ\‹š[™›Êˆ‘\Ú[Û”ÛÛ\ˆZ[H\™›Ü›X[˜ÙH˜XÚÙš[™\]Y\Ýˆ\š[ÙÝ\OI\È[ÛI\ÈÝ][Û—ØÛÝ[I\ÈÚ[š×Ú[™^I\È\WØØ[×Ý\ÙYI\È‹ˆ\š[ÙÝ\Kˆ[ÛÝ˜[YKš\ÛÙ›Ü›X]
+
+Kˆ[ŠÝ][Û—ÙÜ›Ý\
+KˆÚ[š×Ú[™^ˆÝ[[X\žVÈ˜\WØØ[×Ý\ÙY—Kˆ
+Bˆ›ÝÜÈH™]ÚÙ\Ú[ÛœÛÛ\—ÚÜWÙ^WÜ›ÝÜÊˆÙ\ÜÚ[Û—ÛØš‹ˆ[™Ú[ÖÈ˜˜\ÙWÝ\›—Kˆ[™Ú[ÖÈ™^WÚÜWÙ[™Ú[—KˆÝ][Û—ÙÜ›Ý\ˆ[ÛÝ˜[YKˆ
+BˆÝ[[X\žVÈ˜\WØØ[×Ý\ÙY—H
+ÏHBˆÝ[[X\žVÈ˜Ú[šÜ×Ü›ØÙ\ÜÙY—H
+ÏHBˆ›Üˆ›ÝÈ[ˆ›ÝÜÎ‚ˆ^\›˜[ÚYÝ˜[YHHÝŠ›ÝË™Ù]
+œÝ][ÛÛÙHŠHÜˆ›ÝË™Ù]
+œ[ÛÙHŠHÜˆˆŠKœÝš\
+
+Bˆ\ÜÙ]H\ÜÙ]×ØžWÙ^\›˜[ÚY™Ù]
+^\›˜[ÚYÝ˜[YJBˆYˆ\ÜÙ]\È›Û™N‚ˆÛÛ[YBˆ›Ý×Ù]HH\œÙWÙ\Ú[ÛœÛÛ\—ØÛÛXÝÙ]J›ÝË[ÛÝ˜[YJBˆYˆ›Ý×Ù]H\È›Û™HÜˆ›Ý×Ù]Kœ™\XÙJ^OLJHOH[ÛÝ˜[YN‚ˆÛÛ[YBˆYˆ›Ý]WÚ[—Ø˜XÚÙš[ÝÚ[™ÝÊˆ›Ý×Ù]Kˆœ›ÛWÞYX\Yœ›ÛWÞYX\‹ˆ×ÞYX\]×ÞYX\‹ˆÙ^WÝ˜[YO]Ù^WÝ˜[YKˆ]WÙœ›ÛOY]WÙœ›ÛKˆ]WÝÏY]WÝËˆ
+N‚ˆÛÛ[YBˆ™\Ý[HÝÜ™WÜ›ÙXÝ[Û—ÚÜWÜ™XÛÜ™
+ˆÛÛ›‹ˆ\ÜÙ]Ü›ÝÏX\ÜÙ]ˆ›ÝšY\\›ÝšY\‹ˆ^\›˜[ÚYY^\›˜[ÚYÝ˜[YKˆ\š[ÙÝ\OH™^H‹ˆ\š[ÙÙ]O\›Ý×Ù]KˆÜWÜ›ÝÏ\›ÝËˆ›Ý\×Ü™Yš^H˜XÚÙš[\ÝÜšXÛÈY[œØ[X\š[Ëˆ‹ˆ
+BˆYˆ™\Ý[È\Ù\ÜÝ]\È—HOHœÚÚ\YÙ^\Ý[™×Ý˜[YŽ‚ˆÝ[[X\žVÈœ™XÛÜ™×Ý\]Y—H
+ÏHBˆ›ØÙ\ÜÙYÙ]\Ë˜\[™
+›Ý×Ù]JBˆ[ÛÚYÜ™XÛÜ™ÈHYBˆYˆ™\Ý[Èœ›ÙXÝ[Û—ÚÝÚ—H\È›Û™N‚ˆÝ[[X\žVÈ›Z\ÜÚ[™×Ü›ÙXÝ[Ûˆ—H
+ÏHBˆÙÙÙ\‹š[™›Êˆ‘\Ú[Û”ÛÛ\ˆZ[H\™›Ü›X[˜ÙH˜XÚÙš[™\ÜÛœÙNˆ[ÛI\ÈÚ[š×Ú[™^I\È›ÝÜÏI\È™XÛÜ™×Ý\]YI\È\WØØ[×Ý\ÙYI\È‹ˆ[ÛÝ˜[YKš\ÛÙ›Ü›X]
+
+KˆÚ[š×Ú[™^ˆ[Š›ÝÜÊKˆÝ[[X\žVÈœ™XÛÜ™×Ý\]Y—KˆÝ[[X\žVÈ˜\WØØ[×Ý\ÙY—Kˆ
+Bˆœ™XZÂˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÝ[[X\žVÈ˜\WÙ\œ›ÜœÈ—H
+ÏHBˆYˆ\Ú[œÝ[˜ÙJ^Ë
+\T˜]S[Z]\œ›Ü‹\TÛÝ[˜]˜Z[X›Q\œ›ÜŠJN‚ˆ˜Z\ÙBˆYˆ\×Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]Ù\œ›ÜŠ^ÊN‚ˆ™X\ÛÛˆHX\š×Ù\Ú[ÛœÛÛ\—Ü\™›Ü›X[˜ÙWÜ˜]WÛ[Z]Y
+ÛÛ›ŠBˆÙÙÙ\‹Ø\›š[™Êˆ‘\Ú[Û”ÛÛ\ˆ\™›Ü›X[˜ÙH˜XÚÙš[˜]H[Z]Yˆ\š[ÙÝ\OI\È[ÛI\ÈÝ][Û—ØÛÝ[I\ÈÚ[š×Ú[™^I\È\WØØ[×Ý\ÙYI\È\œ›ÜI\È‹ˆ\š[ÙÝ\Kˆ[ÛÝ˜[YKš\ÛÙ›Ü›X]
+
+Kˆ[ŠÝ][Û—ÙÜ›Ý\
+KˆÚ[š×Ú[™^ˆÝ[[X\žVÈ˜\WØØ[×Ý\ÙY—Kˆ^Ëˆ
+BˆYˆØZ]ØY\—Ü˜]WÛ[Z]
+™X\ÛÛ‹[ÛÝ˜[YJN‚ˆÛÛ[YBˆœ™XZÂˆYˆ\×Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[Û—Ù^\™YÙ\œ›ÜŠ^ÊH[™›ÝÙ\ÜÚ[Û—Ü™]žWÝ\ÙY‚ˆÙ\ÜÚ[Û—Ü™]žWÝ\ÙYHYBˆ™Yœ™\ÚÜÙ\ÜÚ[Û—ØY\—Ù^\žJ^Ëˆ™Z[NžÛ[ÛÝ˜[YKš\ÛÙ›Ü›X]
+
+_N˜Ú[šÎžØÚ[š×Ú[™^HŠBˆÛÛ[YBˆÙÙÙ\‹Ø\›š[™Êˆ‘\Ú[Û”ÛÛ\ˆZ[H\™›Ü›X[˜ÙH˜XÚÙš[Ú[šÈ˜Z[Yˆ\š[ÙÝ\OI\È[ÛI\ÈÝ][Û—ØÛÝ[I\ÈÚ[š×Ú[™^I\È\œ›ÜI\È‹ˆ\š[ÙÝ\Kˆ[ÛÝ˜[YKš\ÛÙ›Ü›X]
+
+Kˆ[ŠÝ][Û—ÙÜ›Ý\
+KˆÚ[š×Ú[™^ˆ^Ëˆ
+Bˆœ™XZÂˆYˆÝ[[X\žVÈœÝÜYÜ™X\ÛÛˆ—N‚ˆœ™XZÂˆYˆ[ÛÚYÜ™XÛÜ™Î‚ˆÝ[[X\žVÈ›[Û×Ü›ØÙ\ÜÙY—H
+ÏHBˆYˆÝ[[X\žVÈœÝÜYÜ™X\ÛÛˆ—N‚ˆœ™XZÂ‚ˆ™XØ[×Ý\™Ù]ÈHÛÜY
+Ù]
+›ØÙ\ÜÙYÙ]\ÊJBˆ›Üˆ\™Ù][ˆ™XØ[×Ý\™Ù]Î‚ˆ™XØ[ÈH™XØ[Ý[]WÜ\™›Ü›X[˜ÙWÜ™Y™\™[˜Ù\ÊˆÛÛ›‹ˆ\š[ÙÝ\OH™^H‹ˆ\š[ÙÙ]O]\™Ù]ˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ›ÝšY\\›ÝšY\‹ˆÙ^WÝ˜[YO]Ù^WÝ˜[YKˆ
+BˆÝ[[X\žVÈ˜˜\Ù[[™\×Ü™XØ[Ý[]Y—H
+ÏH™XØ[ÖÈœ™XÛÜ™×Ü›ØÙ\ÜÙY—BˆÝ[[X\žVÈœ™Y™\™[˜Ù\×ØÜ™X]Y—H
+ÏH™XØ[ÖÈœ™Y™\™[˜Ù\×ØÜ™X]Y—BˆÝ[[X\žVÈœÝ[ÝÚ]Ý]Ü™Y™\™[˜ÙH—H
+ÏH™XØ[ÖÈœÝ[ÝÚ]Ý]Ü™Y™\™[˜ÙH—BˆÙ[XÝYØ\ÜÙ]ÚYÈHÚ[
+\ÜÙ]È˜\ÜÙ]ÚY—JH›Üˆ\ÜÙ][ˆ\ÜÙ]×BˆÝ\œ™[Û[ÛHÙ^WÝ˜[YKœ™\XÙJ^OLJBˆYˆÙ[XÝYØ\ÜÙ]ÚYÈ[™›ÝÝ[[X\žVÈœÝÜYÜ™X\ÛÛˆ—N‚ˆÙ\ÜÚ[Û—Ü™]žWÝ\ÙYH˜[ÙBˆÚ[HYN‚ˆžN‚ˆYˆÝ[[X\žVÈ˜\WØØ[×Ý\ÙY—Hˆ‚ˆØZ]Ø™Y›Ü™WÛ™^ØØ[
+
+Bˆ›ÜˆÝ][Û—ÙÜ›Ý\[ˆÚ[šÙY
+Ý][Û—ØÛÙ\ËL
+N‚ˆÜWÛX\H™]ÚÙ\Ú[ÛœÛÛ\—ÚÜWÛ[ÛÛX\
+ˆÙ\ÜÚ[Û—ÛØš‹ˆ[™Ú[ÖÈ˜˜\ÙWÝ\›—Kˆ[™Ú[ÖÈ›[ÛÚÜWÙ[™Ú[—KˆÝ][Û—ÙÜ›Ý\ˆÝ\œ™[Û[Ûˆ
+BˆÝ[[X\žVÈ˜\WØØ[×Ý\ÙY—H
+ÏHBˆÝÜ™WÚÜWÛX\
+ˆÝ\œ™[Û[ÛˆÜWÛX\ˆ›]‹ˆ“U™XØ[Ý[YÈ\ÜÈ˜XÚÙš[ˆ‹ˆÝ][Û—ÙÜ›Ý\ˆ
+Bˆœ™XZÂˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÝ[[X\žVÈ˜\WÙ\œ›ÜœÈ—H
+ÏHBˆYˆ\Ú[œÝ[˜ÙJ^Ë
+\T˜]S[Z]\œ›Ü‹\TÛÝ[˜]˜Z[X›Q\œ›ÜŠJN‚ˆ˜Z\ÙBˆYˆ\×Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]Ù\œ›ÜŠ^ÊN‚ˆ™X\ÛÛˆHX\š×Ù\Ú[ÛœÛÛ\—Ü\™›Ü›X[˜ÙWÜ˜]WÛ[Z]Y
+ÛÛ›ŠBˆYˆØZ]ØY\—Ü˜]WÛ[Z]
+™X\ÛÛ‹Ý\œ™[Û[Û
+N‚ˆÛÛ[YBˆYˆ\×Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[Û—Ù^\™YÙ\œ›ÜŠ^ÊH[™›ÝÙ\ÜÚ[Û—Ü™]žWÝ\ÙY‚ˆÙ\ÜÚ[Û—Ü™]žWÝ\ÙYHYBˆ™Yœ™\ÚÜÙ\ÜÚ[Û—ØY\—Ù^\žJ^Ëˆ™Z[K[]žØÝ\œ™[Û[Ûš\ÛÙ›Ü›X]
+
+_HŠBˆÛÛ[YBˆÙÙÙ\‹Ø\›š[™Êˆ‘\Ú[Û”ÛÛ\ˆU™XØ[Ý[][Ûˆ˜Z[YY\ˆ˜XÚÙš[ˆÝ][Û—ØÛÝ[I\È\œ›ÜI\È‹ˆ[ŠÝ][Û—ØÛÙ\ÊKˆ^Ëˆ
+Bˆœ™XZÂˆ™XØ[ÈH™XØ[Ý[]WÜ\™›Ü›X[˜ÙWÜ™Y™\™[˜Ù\ÊˆÛÛ›‹ˆ\š[ÙÝ\OH›]‹ˆ\š[ÙÙ]OXÝ\œ™[Û[Ûˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ›ÝšY\\›ÝšY\‹ˆÙ^WÝ˜[YO]Ù^WÝ˜[YKˆ
+BˆÝ[[X\žVÈ˜˜\Ù[[™\×Ü™XØ[Ý[]Y—H
+ÏH™XØ[ÖÈœ™XÛÜ™×Ü›ØÙ\ÜÙY—BˆÝ[[X\žVÈœ™Y™\™[˜Ù\×ØÜ™X]Y—H
+ÏH™XØ[ÖÈœ™Y™\™[˜Ù\×ØÜ™X]Y—BˆÝ[[X\žVÈœÝ[ÝÚ]Ý]Ü™Y™\™[˜ÙH—H
+ÏH™XØ[ÖÈœÝ[ÝÚ]Ý]Ü™Y™\™[˜ÙH—BˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ™]\›ˆÝ[[X\žB‚ˆ›Üˆ\š[ÙÙ]WÝ˜[YH[ˆ]\Î‚ˆÝÜ™YØÝ\œ™[Ù]HH˜[ÙBˆÙ\ÜÚ[Û—Ü™]žWÝ\ÙYH˜[ÙBˆÚ[HYN‚ˆžN‚ˆYˆÝ[[X\žVÈ˜\WØØ[×Ý\ÙY—HHX^Ø\WØØ[Î‚ˆÝ[[X\žVÈœÝÜYÜ™X\ÛÛˆ—HH
+ˆˆ“[Z]HØØ[HÛX^Ø\WØØ[ßHÚ[XY\ÈTH][™ÚYËˆ‚ˆˆ”™]ÛXHH\\ˆHÜ\š[ÙÙ]WÝ˜[YKš\ÛÙ›Ü›X]
+
+_Kˆ‚ˆ
+BˆÝ[[X\žVÈœ™\Ý[YWÚ[—HH\š[ÙÙ]WÝ˜[YKš\ÛÙ›Ü›X]
+
+Bˆœ™XZÂˆYˆÝ[[X\žVÈ˜\WØØ[×Ý\ÙY—Hˆ‚ˆØZ]Ø™Y›Ü™WÛ™^ØØ[
+
+Bˆ›ÜˆÝ][Û—ÙÜ›Ý\[ˆÚ[šÙY
+Ý][Û—ØÛÙ\ËL
+N‚ˆÜWÛX\H™]ÚÙ\Ú[ÛœÛÛ\—ÚÜWÛ[ÛÛX\
+ˆÙ\ÜÚ[Û—ÛØš‹ˆ[™Ú[ÖÈ˜˜\ÙWÝ\›—Kˆ[™Ú[ÖÈ›[ÛÚÜWÙ[™Ú[—KˆÝ][Û—ÙÜ›Ý\ˆ\š[ÙÙ]WÝ˜[YKˆ
+BˆÝ[[X\žVÈ˜\WØØ[×Ý\ÙY—H
+ÏHBˆÝÜ™WÚÜWÛX\
+ˆ\š[ÙÙ]WÝ˜[YKˆÜWÛX\ˆ\š[ÙÝ\Kˆ˜XÚÙš[\ÝÜšXÛËˆ‹ˆÝ][Û—ÙÜ›Ý\ˆ
+BˆÝÜ™YØÝ\œ™[Ù]HHYBˆœ™XZÂˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆYˆ\Ú[œÝ[˜ÙJ^Ë
+\T˜]S[Z]\œ›Ü‹\TÛÝ[˜]˜Z[X›Q\œ›ÜŠJN‚ˆ˜Z\ÙBˆYˆ\×Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]Ù\œ›ÜŠ^ÊN‚ˆÝ[[X\žVÈ˜\WÙ\œ›ÜœÈ—H
+ÏHBˆ™X\ÛÛˆHX\š×Ù\Ú[ÛœÛÛ\—Ü\™›Ü›X[˜ÙWÜ˜]WÛ[Z]Y
+ÛÛ›ŠBˆÙÙÙ\‹Ø\›š[™Êˆ‘\Ú[Û”ÛÛ\ˆ\™›Ü›X[˜ÙH˜XÚÙš[˜]H[Z]Yˆ\š[ÙÝ\OI\È\š[ÙÙ]OI\ÈÝ][Û—ØÛÝ[I\È\œ›ÜI\È‹ˆ\š[ÙÝ\Kˆ\š[ÙÙ]WÝ˜[YKš\ÛÙ›Ü›X]
+
+Kˆ[ŠÝ][Û—ØÛÙ\ÊKˆ^Ëˆ
+BˆYˆØZ]ØY\—Ü˜]WÛ[Z]
+™X\ÛÛ‹\š[ÙÙ]WÝ˜[YJN‚ˆÛÛ[YBˆœ™XZÂˆYˆ\×Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[Û—Ù^\™YÙ\œ›ÜŠ^ÊH[™›ÝÙ\ÜÚ[Û—Ü™]žWÝ\ÙY‚ˆÙ\ÜÚ[Û—Ü™]žWÝ\ÙYHYBˆÝ[[X\žVÈ˜\WÙ\œ›ÜœÈ—H
+ÏHBˆ™Yœ™\ÚÜÙ\ÜÚ[Û—ØY\—Ù^\žJ^Ëˆ›[ÛYÜ›Ý\žÜ\š[ÙÙ]WÝ˜[YKš\ÛÙ›Ü›X]
+
+_HŠBˆÛÛ[YBˆÙÙÙ\‹Ø\›š[™Êˆ‘\Ú[Û”ÛÛ\ˆÜ›Ý\Y\™›Ü›X[˜ÙH˜XÚÙš[˜Z[Y™]žZ[™È\ˆ\ÜÙ]ˆ\š[ÙÝ\OI\È\š[ÙÙ]OI\ÈÝ][Û—ØÛÝ[I\È\œ›ÜI\È‹ˆ\š[ÙÝ\Kˆ\š[ÙÙ]WÝ˜[YKš\ÛÙ›Ü›X]
+
+Kˆ[ŠÝ][Û—ØÛÙ\ÊKˆ^Ëˆ
+Bˆœ™XZÂˆYˆÝ[[X\žVÈœÝÜYÜ™X\ÛÛˆ—N‚ˆœ™XZÂˆYˆÝÜ™YØÝ\œ™[Ù]N‚ˆ›ØÙ\ÜÙYÙ]\Ë˜\[™
+\š[ÙÙ]WÝ˜[YJBˆÛÛ[YB‚ˆÝÜ™YØ[žWÙ›Ü—Ù]HH˜[ÙBˆ›Üˆ^\›˜[ÚYÝ˜[YK\ÜÙ][ˆ\ÜÙ]×ØžWÙ^\›˜[ÚYš][\Ê
+N‚ˆÙ\ÜÚ[Û—Ü™]žWÝ\ÙYH˜[ÙBˆÚ[HYN‚ˆžN‚ˆYˆÝ[[X\žVÈ˜\WØØ[×Ý\ÙY—HHX^Ø\WØØ[Î‚ˆÝ[[X\žVÈœÝÜYÜ™X\ÛÛˆ—HH
+ˆˆ“[Z]HØØ[HÛX^Ø\WØØ[ßHÚ[XY\ÈTH][™ÚYËˆ‚ˆˆ”™]ÛXHH\\ˆHÜ\š[ÙÙ]WÝ˜[YKš\ÛÙ›Ü›X]
+
+_Kˆ‚ˆ
+BˆÝ[[X\žVÈœ™\Ý[YWÚ[—HH\š[ÙÙ]WÝ˜[YKš\ÛÙ›Ü›X]
+
+Bˆœ™XZÂˆYˆÝ[[X\žVÈ˜\WØØ[×Ý\ÙY—Hˆ‚ˆØZ]Ø™Y›Ü™WÛ™^ØØ[
+
+BˆÚ[™ÛWÛX\H™]ÚÙ\Ú[ÛœÛÛ\—ÚÜWÛ[ÛÛX\
+ˆÙ\ÜÚ[Û—ÛØš‹ˆ[™Ú[ÖÈ˜˜\ÙWÝ\›—Kˆ[™Ú[ÖÈ›[ÛÚÜWÙ[™Ú[—KˆÙ^\›˜[ÚYÝ˜[YWKˆ\š[ÙÙ]WÝ˜[YKˆ
+BˆÝ[[X\žVÈ˜\WØØ[×Ý\ÙY—H
+ÏHBˆÝÜ™WÚÜWÛX\
+\š[ÙÙ]WÝ˜[YKÚ[™ÛWÛX\\š[ÙÝ\K˜XÚÙš[\ÝÜšXÛËˆŠBˆÝÜ™YØ[žWÙ›Ü—Ù]HHYBˆœ™XZÂˆ^Ù\^Ù\[Ûˆ\È\ÜÙ]Ù^Î‚ˆÝ[[X\žVÈ˜\WÙ\œ›ÜœÈ—H
+ÏHBˆYˆ\Ú[œÝ[˜ÙJ\ÜÙ]Ù^Ë
+\T˜]S[Z]\œ›Ü‹\TÛÝ[˜]˜Z[X›Q\œ›ÜŠJN‚ˆ˜Z\ÙBˆYˆ\×Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]Ù\œ›ÜŠ\ÜÙ]Ù^ÊN‚ˆ™X\ÛÛˆHX\š×Ù\Ú[ÛœÛÛ\—Ü\™›Ü›X[˜ÙWÜ˜]WÛ[Z]Y
+ÛÛ›ŠBˆÙÙÙ\‹Ø\›š[™Êˆ‘\Ú[Û”ÛÛ\ˆ\™›Ü›X[˜ÙH˜XÚÙš[˜]H[Z]Yˆ\ÜÙ]ÚYI\ÈÝ][ÛÛÙOI\È\š[ÙÝ\OI\È\š[ÙÙ]OI\È\œ›ÜI\È‹ˆ\ÜÙ]È˜\ÜÙ]ÚY—Kˆ^\›˜[ÚYÝ˜[YKˆ\š[ÙÝ\Kˆ\š[ÙÙ]WÝ˜[YKš\ÛÙ›Ü›X]
+
+Kˆ\ÜÙ]Ù^Ëˆ
+BˆYˆØZ]ØY\—Ü˜]WÛ[Z]
+™X\ÛÛ‹\š[ÙÙ]WÝ˜[YJN‚ˆÛÛ[YBˆœ™XZÂˆYˆ\×Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[Û—Ù^\™YÙ\œ›ÜŠ\ÜÙ]Ù^ÊH[™›ÝÙ\ÜÚ[Û—Ü™]žWÝ\ÙY‚ˆÙ\ÜÚ[Û—Ü™]žWÝ\ÙYHYBˆ™Yœ™\ÚÜÙ\ÜÚ[Û—ØY\—Ù^\žJ\ÜÙ]Ù^Ëˆ›[ÛX\ÜÙ]žÜ\š[ÙÙ]WÝ˜[YKš\ÛÙ›Ü›X]
+
+_NžÙ^\›˜[ÚYÝ˜[Y_HŠBˆÛÛ[YBˆÙÙÙ\‹Ø\›š[™Êˆ‘\Ú[Û”ÛÛ\ˆ\™›Ü›X[˜ÙH˜XÚÙš[˜Z[Yˆ\ÜÙ]ÚYI\ÈÝ][ÛÛÙOI\È\š[ÙÝ\OI\È\š[ÙÙ]OI\È\œ›ÜI\È‹ˆ\ÜÙ]È˜\ÜÙ]ÚY—Kˆ^\›˜[ÚYÝ˜[YKˆ\š[ÙÝ\Kˆ\š[ÙÙ]WÝ˜[YKš\ÛÙ›Ü›X]
+
+Kˆ\ÜÙ]Ù^Ëˆ
+Bˆœ™XZÂˆYˆÝ[[X\žVÈœÝÜYÜ™X\ÛÛˆ—N‚ˆœ™XZÂˆYˆÝ[[X\žVÈœÝÜYÜ™X\ÛÛˆ—N‚ˆœ™XZÂˆYˆÝÜ™YØ[žWÙ›Ü—Ù]N‚ˆ›ØÙ\ÜÙYÙ]\Ë˜\[™
+\š[ÙÙ]WÝ˜[YJB‚ˆÙ[XÝYØ\ÜÙ]ÚYÈHÚ[
+\ÜÙ]È˜\ÜÙ]ÚY—JH›Üˆ\ÜÙ][ˆ\ÜÙ]×Bˆ™XØ[×Ý\™Ù]ÈH›ØÙ\ÜÙYÙ]\Âˆ›Üˆ\™Ù][ˆ™XØ[×Ý\™Ù]Î‚ˆ™XØ[ÈH™XØ[Ý[]WÜ\™›Ü›X[˜ÙWÜ™Y™\™[˜Ù\ÊˆÛÛ›‹ˆ\š[ÙÝ\O\\š[ÙÝ\Kˆ\š[ÙÙ]O]\™Ù]ˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ›ÝšY\\›ÝšY\‹ˆÙ^WÝ˜[YO]Ù^WÝ˜[YKˆ
+BˆÝ[[X\žVÈ˜˜\Ù[[™\×Ü™XØ[Ý[]Y—H
+ÏH™XØ[ÖÈœ™XÛÜ™×Ü›ØÙ\ÜÙY—BˆÝ[[X\žVÈœ™Y™\™[˜Ù\×ØÜ™X]Y—H
+ÏH™XØ[ÖÈœ™Y™\™[˜Ù\×ØÜ™X]Y—BˆÝ[[X\žVÈœÝ[ÝÚ]Ý]Ü™Y™\™[˜ÙH—H
+ÏH™XØ[ÖÈœÝ[ÝÚ]Ý]Ü™Y™\™[˜ÙH—B‚ˆÝ\œ™[Û[ÛHÙ^WÝ˜[YKœ™\XÙJ^OLJBˆYˆÙ[XÝYØ\ÜÙ]ÚYÈ[™›ÝÝ[[X\žVÈœÝÜYÜ™X\ÛÛˆ—N‚ˆÙ\ÜÚ[Û—Ü™]žWÝ\ÙYH˜[ÙBˆÚ[HYN‚ˆžN‚ˆYˆÝ[[X\žVÈ˜\WØØ[×Ý\ÙY—Hˆ‚ˆØZ]Ø™Y›Ü™WÛ™^ØØ[
+
+Bˆ›ÜˆÝ][Û—ÙÜ›Ý\[ˆÚ[šÙY
+Ý][Û—ØÛÙ\ËL
+N‚ˆÜWÛX\H™]ÚÙ\Ú[ÛœÛÛ\—ÚÜWÛ[ÛÛX\
+ˆÙ\ÜÚ[Û—ÛØš‹ˆ[™Ú[ÖÈ˜˜\ÙWÝ\›—Kˆ[™Ú[ÖÈ›[ÛÚÜWÙ[™Ú[—KˆÝ][Û—ÙÜ›Ý\ˆÝ\œ™[Û[Ûˆ
+BˆÝ[[X\žVÈ˜\WØØ[×Ý\ÙY—H
+ÏHBˆÝÜ™WÚÜWÛX\
+ˆÝ\œ™[Û[ÛˆÜWÛX\ˆ›]‹ˆ“U™XØ[Ý[YÈ\ÜÈ˜XÚÙš[ˆ‹ˆÝ][Û—ÙÜ›Ý\ˆ
+Bˆœ™XZÂˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÝ[[X\žVÈ˜\WÙ\œ›ÜœÈ—H
+ÏHBˆYˆ\Ú[œÝ[˜ÙJ^Ë
+\T˜]S[Z]\œ›Ü‹\TÛÝ[˜]˜Z[X›Q\œ›ÜŠJN‚ˆ˜Z\ÙBˆYˆ\×Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]Ù\œ›ÜŠ^ÊN‚ˆ™X\ÛÛˆHX\š×Ù\Ú[ÛœÛÛ\—Ü\™›Ü›X[˜ÙWÜ˜]WÛ[Z]Y
+ÛÛ›ŠBˆYˆØZ]ØY\—Ü˜]WÛ[Z]
+™X\ÛÛ‹Ý\œ™[Û[Û
+N‚ˆÛÛ[YBˆYˆ\×Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[Û—Ù^\™YÙ\œ›ÜŠ^ÊH[™›ÝÙ\ÜÚ[Û—Ü™]žWÝ\ÙY‚ˆÙ\ÜÚ[Û—Ü™]žWÝ\ÙYHYBˆ™Yœ™\ÚÜÙ\ÜÚ[Û—ØY\—Ù^\žJ^Ëˆ›[Û[]žØÝ\œ™[Û[Ûš\ÛÙ›Ü›X]
+
+_HŠBˆÛÛ[YBˆÙÙÙ\‹Ø\›š[™Êˆ‘\Ú[Û”ÛÛ\ˆU™XØ[Ý[][Ûˆ˜Z[YY\ˆ˜XÚÙš[ˆÝ][Û—ØÛÝ[I\È\œ›ÜI\È‹ˆ[ŠÝ][Û—ØÛÙ\ÊKˆ^Ëˆ
+Bˆœ™XZÂˆ™XØ[ÈH™XØ[Ý[]WÜ\™›Ü›X[˜ÙWÜ™Y™\™[˜Ù\ÊˆÛÛ›‹ˆ\š[ÙÝ\OH›]‹ˆ\š[ÙÙ]OXÝ\œ™[Û[Ûˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ›ÝšY\\›ÝšY\‹ˆÙ^WÝ˜[YO]Ù^WÝ˜[YKˆ
+BˆÝ[[X\žVÈ˜˜\Ù[[™\×Ü™XØ[Ý[]Y—H
+ÏH™XØ[ÖÈœ™XÛÜ™×Ü›ØÙ\ÜÙY—BˆÝ[[X\žVÈœ™Y™\™[˜Ù\×ØÜ™X]Y—H
+ÏH™XØ[ÖÈœ™Y™\™[˜Ù\×ØÜ™X]Y—BˆÝ[[X\žVÈœÝ[ÝÚ]Ý]Ü™Y™\™[˜ÙH—H
+ÏH™XØ[ÖÈœÝ[ÝÚ]Ý]Ü™Y™\™[˜ÙH—BˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ™]\›ˆÝ[[X\žB‚‚™Yˆ]˜[X]WÛØØ[Û[ÛWÜ›ÙXÝ[Û—Ü]X[]JˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆ\ÜÙ]ÚYˆ[ˆ›ÝšY\ŽˆÝ‹ˆ[ÛÜÝ\ˆ]Kˆ™Y™\™[˜ÙWÙ]Nˆ]KŠHOˆ[žN‚ˆË\ÝÙ^HHØ[[™\‹›[Û˜[™ÙJ[ÛÜÝ\žYX\‹[ÛÜÝ\›[Û
+Bˆ[ÛÙ[™H[ÛÜÝ\œ™\XÙJ^O[\ÝÙ^JBˆ[ÛWÜ™XÛÜ™ÈH]Y\žWØ[
+ˆÛÛ›‹ˆˆˆ‚ˆÑSPÕ\š[ÙÙ]K›ÙXÝ[Û—ÚÝÚˆ”“ÓH›ÙXÝ[Û—Ü™XÛÜ™ÂˆÒT‘H\ÜÙ]ÚYHÈS‘›ÝšY\ˆHÈS‘\š[ÙÝ\HH	Û[Û	ÈS‘\š[ÙÙ]HHÂˆÔ‘Tˆ–HYˆˆˆ‹ˆ
+\ÜÙ]ÚY›ÝšY\‹[ÛÜÝ\š\ÛÙ›Ü›X]
+
+JKˆ
+BˆZ[WÜ™XÛÜ™ÈH]Y\žWØ[
+ˆÛÛ›‹ˆˆˆ‚ˆÑSPÕ\š[ÙÙ]K›ÙXÝ[Û—ÚÝÚˆ”“ÓH›ÙXÝ[Û—Ü™XÛÜ™ÂˆÒT‘H\ÜÙ]ÚYHÈS‘›ÝšY\ˆHÈS‘\š[ÙÝ\HH	Ù^IÂˆS‘\š[ÙÙ]H‘UÑQSˆÈS‘ÂˆÔ‘Tˆ–H\š[ÙÙ]KYˆˆˆ‹ˆ
+\ÜÙ]ÚY›ÝšY\‹[ÛÜÝ\š\ÛÙ›Ü›X]
+
+K[ÛÙ[™š\ÛÙ›Ü›X]
+
+JKˆ
+Bˆ™]\›ˆ]˜[X]WÛ[ÛWÜ›ÙXÝ[Û—Ü]X[]Jˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ[ÛÜÝ\[[ÛÜÝ\ˆ™Y™\™[˜ÙWÙ]O\™Y™\™[˜ÙWÙ]Kˆ[ÛWÜ™XÛÜ™Ï[[ÛWÜ™XÛÜ™ËˆZ[WÜ™XÛÜ™ÏYZ[WÜ™XÛÜ™Ëˆ
+B‚‚™YˆÛÝ[Û[ÛWÜ›ÙXÝ[Û—ÜÝ]\Ê]X[]Y\ÎˆXÝÚ[[žWJHOˆXÝÜÝ‹[N‚ˆÛÝ[ÈHÈ˜ÛÛ\]HŽˆœ\X[Žˆ›Z\ÜÚ[™ÈŽˆ˜ÛÛ™›XÝŽˆBˆ›Üˆ]X[]H[ˆ]X[]Y\Ë˜[Y\Ê
+N‚ˆÝ]\ÈHÝŠ]X[]KœÝ]\ÊBˆÛÝ[ÖÜÝ]\×HHÛÝ[Ë™Ù]
+Ý]\Ë
+H
+ÈBˆ™]\›ˆÛÝ[Â‚‚™Yˆ[—Ù\Ú[ÛœÛÛ\—Û[ÛØÛÜÙJˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆ›ÝšY\ŽˆÝˆH‘\Ú[Û”ÛÛ\ˆ‹ˆ™\ÜÛ[ÛˆÝ‹ˆ\ÜÙ]ÚYÎˆ\ÝÚ[H›Û™HH›Û™Kˆ™Y™\™[˜ÙWÙ]Nˆ]H›Û™HH›Û™KˆÜWØØ[Ù[^WÜÙXÛÛ™Îˆ›Ø]›Û™HH›Û™KˆÛY\\Žˆ[žH›Û™HH›Û™KŠHOˆXÝÜÝ‹[žWN‚ˆ™Y™\™[˜ÙWÙ]HH™Y™\™[˜ÙWÙ]HÜˆÝ\œ™[Û\Ø›Û—Ù]J
+Bˆ[ÛÜÝ\H]][YKœÝœ[YJ›Ü›X[^™WÜ™\ÜÛ[Û
+™\ÜÛ[Û
+K‰VKI[HŠK™]J
+BˆYˆ[ÛÜÝ\H™Y™\™[˜ÙWÙ]Kœ™\XÙJ^OLJN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ“È™XÚÈY[œØ[]]ÛX]XÛÈÛÈÙHÛÛœÝ[\ˆY\Ù\ÈÚ]š\È[\š[Ü™\ËˆŠB‚ˆÛÛ™šYÈHÙ]Ú[YÜ˜][Û—ØÛÛ™šYÊÛÛ›‹›ÝšY\ŠBˆYˆÛÛ™šYÈ\È›Û™N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠÛÛ™šYÝ\˜XØ[È\Ú[Û”ÛÛ\ˆ˜[È[˜ÛÛ˜YKˆŠBˆYˆ›ÝÛÛ™šYÖÈ™[˜X›Y—N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠH[YÜ˜XØ[È\Ú[Û”ÛÛ\ˆ\ÝH\Ø]]˜YKˆŠBˆ[™Ú[ÈHÙ]Ù\Ú[ÛœÛÛ\—Ù[™Ú[ØÛÛ™šYÊÛÛ™šYÊBˆ\ÜÙ]ÈHÙ]Ù\Ú[ÛœÛÛ\—Ü\™›Ü›X[˜ÙWØ\ÜÙ]ÊˆÛÛ›‹ˆ›ÝšY\‹ˆ\ÜÙ]ÚYÏX\ÜÙ]ÚYËˆ
+Bˆ\ÜÙ]×ØžWÚYHÚ[
+\ÜÙ]È˜\ÜÙ]ÚY—JNˆ\ÜÙ]›Üˆ\ÜÙ][ˆ\ÜÙ]ßBˆ\ÜÙ]×ØžWÙ^\›˜[ÚYHÂˆÝŠ\ÜÙ]È™^\›˜[ÚY—HÜˆˆŠKœÝš\
+
+Nˆ\ÜÙ]ˆ›Üˆ\ÜÙ][ˆ\ÜÙ]ÂˆYˆÝŠ\ÜÙ]È™^\›˜[ÚY—HÜˆˆŠKœÝš\
+
+BˆB‚ˆYˆ]˜[X]WØ\ÜÙ]Ê
+HOˆXÝÚ[[žWN‚ˆ™]\›ˆÂˆ\ÜÙ]ÚYˆ]˜[X]WÛØØ[Û[ÛWÜ›ÙXÝ[Û—Ü]X[]JˆÛÛ›‹ˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ›ÝšY\\›ÝšY\‹ˆ[ÛÜÝ\[[ÛÜÝ\ˆ™Y™\™[˜ÙWÙ]O\™Y™\™[˜ÙWÙ]Kˆ
+Bˆ›Üˆ\ÜÙ]ÚY[ˆ\ÜÙ]×ØžWÚYˆB‚ˆ]X[]Y\ÈH]˜[X]WØ\ÜÙ]Ê
+Bˆ[™[™×Ø\ÜÙ]ÚYÈHÂˆ\ÜÙ]ÚYˆ›Üˆ\ÜÙ]ÚY]X[]H[ˆ]X[]Y\Ëš][\Ê
+BˆYˆ]X[]KœÝ]\È[ˆÈœ\X[‹›Z\ÜÚ[™È‹˜ÛÛ™›XÝŸBˆBˆY™™XÝYØ\ÜÙ]ÚYÈHÙ]
+[™[™×Ø\ÜÙ]ÚYÊBˆ›ØÙ\ÜÙYÙZ[WÝ\™Ù]ÎˆÙ]Ý\VÚ[]WWHHÙ]
+
+BˆÝ[[X\žNˆXÝÜÝ‹[žWHHÂˆœÝ]\ÈŽˆœ[›š[™È‹ˆ›[ÛŽˆ[ÛÜÝ\œÝ™[YJ‰VKI[HŠKˆ˜\ÜÙ]×Ù]˜[X]YŽˆ[Š\ÜÙ]×ØžWÚY
+Kˆ˜\ÜÙ]×ØY™™XÝYŽˆ[ŠY™™XÝYØ\ÜÙ]ÚYÊKˆ˜\ÜÙ]ÚY×ØY™™XÝYŽˆÛÜY
+Y™™XÝYØ\ÜÙ]ÚYÊKˆœÝ]\×Ø™Y›Ü™HŽˆÛÝ[Û[ÛWÜ›ÙXÝ[Û—ÜÝ]\Ê]X[]Y\ÊKˆœÝ]\×ØY\—Û[ÛHŽˆÛÝ[Û[ÛWÜ›ÙXÝ[Û—ÜÝ]\Ê]X[]Y\ÊKˆœÝ]\×ØY\ˆŽˆÛÝ[Û[ÛWÜ›ÙXÝ[Û—ÜÝ]\Ê]X[]Y\ÊKˆ›[ÛWØ\ÜÙ]×Ü™\]Y\ÝYŽˆˆ™Z[WØ\ÜÙ]×Ü™\]Y\ÝYŽˆˆ›[ÛWÜ™XÛÜ™×Ý\]YŽˆˆœ™XÛÜ™×Ý\]YŽˆˆ›Z\ÜÚ[™×Ü›ÙXÝ[ÛˆŽˆˆ˜\WØØ[×Ø][\YŽˆˆ˜\WØØ[×Ý\ÙYŽˆˆ˜\WÙ\œ›ÜœÈŽˆˆœÝÜYÜ™X\ÛÛˆŽˆˆ‹ˆ›™^Ø][\Ø]Žˆˆ‹ˆBˆYˆ›Ý[™[™×Ø\ÜÙ]ÚYÎ‚ˆÝ[[X\žVÈœÝ]\È—HH˜ÛÛ\]Y‚ˆ™]\›ˆÝ[[X\žB‚ˆÛY\Ù[˜ÈHÛY\\ˆÜˆ[YKœÛY\ˆ[^WÜÙXÛÛ™ÈH
+ˆ•TÒSÓ”ÓÓT—ÔT‘“Ô“PSÑWÒÔWÑSVWÔÑPÓÓ‘ÂˆYˆÜWØØ[Ù[^WÜÙXÛÛ™È\È›Û™Bˆ[ÙHÜWØØ[Ù[^WÜÙXÛÛ™Âˆ
+BˆÙÙÙ\ˆHÝ\œ™[Ø\›ÙÙÙ\ˆYˆ\×Ø\ØÛÛ^
+
+H[ÙHÙÙÚ[™Ë™Ù]ÙÙÙ\Š×Û˜[YW×ÊBˆÙ\ÜÚ[Û—ÛØšŽˆ[žHH›Û™B‚ˆYˆ™XØ[Ý[]WØY™™XÝYÜ™Y™\™[˜Ù\Ê
+HOˆ›Û™N‚ˆ›Üˆ\ÜÙ]ÚY\™Ù]Ù]H[ˆÛÜY
+›ØÙ\ÜÙYÙZ[WÝ\™Ù]ÊN‚ˆ™XØ[Ý[]WÜ\™›Ü›X[˜ÙWÜ™Y™\™[˜Ù\ÊˆÛÛ›‹ˆ\š[ÙÝ\OH™^H‹ˆ\š[ÙÙ]O]\™Ù]Ù]Kˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ›ÝšY\\›ÝšY\‹ˆÙ^WÝ˜[YO\™Y™\™[˜ÙWÙ]Kˆ
+Bˆ›Üˆ\ÜÙ]ÚY[ˆÛÜY
+Y™™XÝYØ\ÜÙ]ÚYÊN‚ˆ™XØ[Ý[]WÜ\™›Ü›X[˜ÙWÜ™Y™\™[˜Ù\ÊˆÛÛ›‹ˆ\š[ÙÝ\OH›[Û‹ˆ\š[ÙÙ]O[[ÛÜÝ\ˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ›ÝšY\\›ÝšY\‹ˆÙ^WÝ˜[YO\™Y™\™[˜ÙWÙ]Kˆ
+B‚ˆYˆÝÜÙ›Ü—Ü˜]WÛ[Z]
+^Îˆ^Ù\[ÛŠHOˆ›Û™N‚ˆYˆ\Ú[œÝ[˜ÙJ^Ë\T˜]S[Z]\œ›ÜŠN‚ˆ˜]WÙ\œ›ÜˆH^Âˆ[ÙN‚ˆ[[HX\š×Ù\Ú[ÛœÛÛ\—Ø\WØÛÛÛÝÛŠˆÛÛ›‹ˆTWÐT‘PWÔ“ÑPÕSÓ‹ˆ™X\ÛÛ\ÝŠ^ÊKˆ
+Bˆ˜]WÙ\œ›ÜˆH\T˜]S[Z]\œ›ÜŠˆ›ÝšY\‹ˆTWÐT‘PWÔ“ÑPÕSÓ‹ˆ[[ˆÙ]Ü›ÝšY\—ØÛÛÛÝÛ—Ü™X\ÛÛŠÛÛ›‹›ÝšY\‹TWÐT‘PWÔ“ÑPÕSÓŠKˆ
+Bˆ™XØ[Ý[]WØY™™XÝYÜ™Y™\™[˜Ù\Ê
+BˆÝ\œ™[Ü]X[]Y\ÈH]˜[X]WØ\ÜÙ]Ê
+BˆÝ[[X\žVÈœÝ]\È—HHØZ][™×Ü˜]WÛ[Z]‚ˆÝ[[X\žVÈœÝ]\×ØY\ˆ—HHÛÝ[Û[ÛWÜ›ÙXÝ[Û—ÜÝ]\ÊÝ\œ™[Ü]X[]Y\ÊBˆÝ[[X\žVÈœÝÜYÜ™X\ÛÛˆ—HH˜]WÙ\œ›Ü‹›Y\ÜØYÙBˆÝ[[X\žVÈ›™^Ø][\Ø]—HH˜]WÙ\œ›Ü‹˜ÛÛÛÝÛ—Ý[[š\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠBˆÝ[[X\žVÈ˜ÛÛÛÝÛ—Ý[[—HHÝ[[X\žVÈ›™^Ø][\Ø]—BˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ˜]WÙ\œ›Ü‹š›Ø—Ü™\Ý[HXÝ
+Ý[[X\žJBˆ˜Z\ÙH˜]WÙ\œ›Ü‚‚ˆžN‚ˆÙ\ÜÚ[Û—ÛØš‹ÈHÙ]Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[ÛŠÛÛ™šYÊBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÝ[[X\žVÈ˜\WÙ\œ›ÜœÈ—H
+ÏHBˆYˆ\×Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]Ù\œ›ÜŠ^ÊN‚ˆÝÜÙ›Ü—Ü˜]WÛ[Z]
+^ÊBˆ˜Z\ÙB‚ˆYˆØ[ÚÜWØ\JØ[˜XÚÎˆ[žKÛÛ^ˆÝŠHOˆ[žN‚ˆ›Û›ØØ[Ù\ÜÚ[Û—ÛØš‚ˆ™[ÙÚ[—Ý\ÙYH˜[ÙBˆÚ[HYN‚ˆYˆ
+ˆ“ÑPÕSÓ—ÒÔWÐÐSÐÓÓ•V™Ù]
+
+H\È›Û™Bˆ[™Ý[[X\žVÈ˜\WØØ[×Ý\ÙY—Bˆ[™[^WÜÙXÛÛ™Âˆ[™[^WÜÙXÛÛ™Èˆˆ
+N‚ˆÛY\Ù[˜Ê[^WÜÙXÛÛ™ÊBˆÝ[[X\žVÈ˜\WØØ[×Ø][\Y—H
+ÏHBˆžN‚ˆ™\Ý[HØ[˜XÚÊ
+BˆÝ[[X\žVÈ˜\WØØ[×Ý\ÙY—H
+ÏHBˆ™]\›ˆ™\Ý[ˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÝ[[X\žVÈ˜\WÙ\œ›ÜœÈ—H
+ÏHBˆYˆ\×Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]Ù\œ›ÜŠ^ÊN‚ˆÝÜÙ›Ü—Ü˜]WÛ[Z]
+^ÊBˆYˆ\×Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[Û—Ù^\™YÙ\œ›ÜŠ^ÊH[™›Ý™[ÙÚ[—Ý\ÙY‚ˆ™[ÙÚ[—Ý\ÙYHYBˆ[˜[Y]WÙ\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[ÛŠÛÛ™šYÊBˆžN‚ˆÙ\ÜÚ[Û—ÛØš‹ÈHÙ]Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[ÛŠÛÛ™šYË›Ü˜ÙWÛÙÚ[UYJBˆ^Ù\^Ù\[Ûˆ\ÈÙÚ[—Ù^Î‚ˆÝ[[X\žVÈ˜\WÙ\œ›ÜœÈ—H
+ÏHBˆYˆ\×Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]Ù\œ›ÜŠÙÚ[—Ù^ÊN‚ˆÝÜÙ›Ü—Ü˜]WÛ[Z]
+ÙÚ[—Ù^ÊBˆ˜Z\ÙBˆÙÙÙ\‹Ø\›š[™Êˆ‘\Ú[Û”ÛÛ\ˆ[ÛÛÜÙHÙ\ÜÚ[Ûˆ™Yœ™\ÚYÛ˜ÙNˆ[ÛI\ÈÛÛ^I\È\œ›ÜI\È‹ˆ[ÛÜÝ\ˆÛÛ^ˆ^Ëˆ
+BˆÛÛ[YBˆ˜Z\ÙB‚ˆ[™[™×ÜÝ][Û—ØÛÙ\ÈHÂˆÝŠ\ÜÙ]×ØžWÚYØ\ÜÙ]ÚYVÈ™^\›˜[ÚY—HÜˆˆŠKœÝš\
+
+Bˆ›Üˆ\ÜÙ]ÚY[ˆ[™[™×Ø\ÜÙ]ÚYÂˆBˆÝ[[X\žVÈ›[ÛWØ\ÜÙ]×Ü™\]Y\ÝY—HH[Š[™[™×ÜÝ][Û—ØÛÙ\ÊBˆ›ÜˆÚ[š×Ú[™^Ý][Û—ÙÜ›Ý\[ˆ[[Y\˜]JÚ[šÙY
+[™[™×ÜÝ][Û—ØÛÙ\ËL
+KÝ\LJN‚ˆÜWÛX\HØ[ÚÜWØ\Jˆ[X™HÝ][Û—ÙÜ›Ý\\Ý][Û—ÙÜ›Ý\ˆ™]ÚÙ\Ú[ÛœÛÛ\—ÚÜWÛ[ÛÛX\
+ˆÙ\ÜÚ[Û—ÛØš‹ˆ[™Ú[ÖÈ˜˜\ÙWÝ\›—Kˆ[™Ú[ÖÈ›[ÛÚÜWÙ[™Ú[—KˆÝ][Û—ÙÜ›Ý\ˆ[ÛÜÝ\ˆ
+Kˆˆ›[ÛNžØÚ[š×Ú[™^H‹ˆ
+Bˆ›Üˆ^\›˜[ÚY[ˆÝ][Û—ÙÜ›Ý\‚ˆ\ÜÙ]H\ÜÙ]×ØžWÙ^\›˜[ÚYÙ^\›˜[ÚYBˆ™\Ý[HÝÜ™WÜ›ÙXÝ[Û—ÚÜWÜ™XÛÜ™
+ˆÛÛ›‹ˆ\ÜÙ]Ü›ÝÏX\ÜÙ]ˆ›ÝšY\\›ÝšY\‹ˆ^\›˜[ÚYY^\›˜[ÚYˆ\š[ÙÝ\OH›[Û‹ˆ\š[ÙÙ]O[[ÛÜÝ\ˆÜWÜ›ÝÏZÜWÛX\™Ù]
+^\›˜[ÚYßJKˆ›Ý\×Ü™Yš^H‘™XÚÈY[œØ[]]ÛX]XÛËˆ‹ˆ
+BˆYˆ™\Ý[È\Ù\ÜÝ]\È—HOHœÚÚ\YÙ^\Ý[™×Ý˜[YŽ‚ˆÝ[[X\žVÈ›[ÛWÜ™XÛÜ™×Ý\]Y—H
+ÏHBˆYˆ™\Ý[Èœ›ÙXÝ[Û—ÚÝÚ—H\È›Û™N‚ˆÝ[[X\žVÈ›Z\ÜÚ[™×Ü›ÙXÝ[Ûˆ—H
+ÏHBˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆ]X[]Y\ÈH]˜[X]WØ\ÜÙ]Ê
+BˆÝ[[X\žVÈœÝ]\×ØY\—Û[ÛH—HHÛÝ[Û[ÛWÜ›ÙXÝ[Û—ÜÝ]\Ê]X[]Y\ÊBˆZ[WØ\ÜÙ]ÚYÈHÂˆ\ÜÙ]ÚYˆ›Üˆ\ÜÙ]ÚY[ˆ[™[™×Ø\ÜÙ]ÚYÂˆYˆ]X[]Y\ÖØ\ÜÙ]ÚYKœÝ]\È[ˆÈœ\X[‹›Z\ÜÚ[™È‹˜ÛÛ™›XÝŸBˆBˆZ[WÜÝ][Û—ØÛÙ\ÈHÂˆÝŠ\ÜÙ]×ØžWÚYØ\ÜÙ]ÚYVÈ™^\›˜[ÚY—HÜˆˆŠKœÝš\
+
+Bˆ›Üˆ\ÜÙ]ÚY[ˆZ[WØ\ÜÙ]ÚYÂˆBˆÝ[[X\žVÈ™Z[WØ\ÜÙ]×Ü™\]Y\ÝY—HH[ŠZ[WÜÝ][Û—ØÛÙ\ÊBˆË\ÝÙ^HHØ[[™\‹›[Û˜[™ÙJ[ÛÜÝ\žYX\‹[ÛÜÝ\›[Û
+Bˆ[ÛÙ[™H[ÛÜÝ\œ™\XÙJ^O[\ÝÙ^JBˆ›ÜˆÚ[š×Ú[™^Ý][Û—ÙÜ›Ý\[ˆ[[Y\˜]JÚ[šÙY
+Z[WÜÝ][Û—ØÛÙ\ËL
+KÝ\LJN‚ˆ›ÝÜÈHØ[ÚÜWØ\Jˆ[X™HÝ][Û—ÙÜ›Ý\\Ý][Û—ÙÜ›Ý\ˆ™]ÚÙ\Ú[ÛœÛÛ\—ÚÜWÙ^WÜ›ÝÜÊˆÙ\ÜÚ[Û—ÛØš‹ˆ[™Ú[ÖÈ˜˜\ÙWÝ\›—Kˆ[™Ú[ÖÈ™^WÚÜWÙ[™Ú[—KˆÝ][Û—ÙÜ›Ý\ˆ[ÛÜÝ\ˆ
+Kˆˆ™Z[NžØÚ[š×Ú[™^H‹ˆ
+Bˆ›Üˆ›ÝÈ[ˆ›ÝÜÎ‚ˆ^\›˜[ÚYHÝŠ›ÝË™Ù]
+œÝ][ÛÛÙHŠHÜˆ›ÝË™Ù]
+œ[ÛÙHŠHÜˆˆŠKœÝš\
+
+Bˆ\ÜÙ]H\ÜÙ]×ØžWÙ^\›˜[ÚY™Ù]
+^\›˜[ÚY
+Bˆ›Ý×Ù]HH\œÙWÙ\Ú[ÛœÛÛ\—ØÛÛXÝÙ]J›ÝË[ÛÜÝ\
+BˆYˆ\ÜÙ]\È›Û™HÜˆ›Ý×Ù]H\È›Û™HÜˆ›Ý[ÛÜÝ\H›Ý×Ù]HH[ÛÙ[™‚ˆÛÛ[YBˆ™\Ý[HÝÜ™WÜ›ÙXÝ[Û—ÚÜWÜ™XÛÜ™
+ˆÛÛ›‹ˆ\ÜÙ]Ü›ÝÏX\ÜÙ]ˆ›ÝšY\\›ÝšY\‹ˆ^\›˜[ÚYY^\›˜[ÚYˆ\š[ÙÝ\OH™^H‹ˆ\š[ÙÙ]O\›Ý×Ù]KˆÜWÜ›ÝÏ\›ÝËˆ›Ý\×Ü™Yš^H”™XÛÛ˜Ú[XXØ[ÈX\šXHÈ™XÚÈY[œØ[ˆ‹ˆ
+BˆYˆ™\Ý[È\Ù\ÜÝ]\È—HOHœÚÚ\YÙ^\Ý[™×Ý˜[YŽ‚ˆÝ[[X\žVÈœ™XÛÜ™×Ý\]Y—H
+ÏHBˆ›ØÙ\ÜÙYÙZ[WÝ\™Ù]Ë˜Y
+
+[
+\ÜÙ]È˜\ÜÙ]ÚY—JK›Ý×Ù]JJBˆYˆ™\Ý[Èœ›ÙXÝ[Û—ÚÝÚ—H\È›Û™N‚ˆÝ[[X\žVÈ›Z\ÜÚ[™×Ü›ÙXÝ[Ûˆ—H
+ÏHBˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆ™XØ[Ý[]WØY™™XÝYÜ™Y™\™[˜Ù\Ê
+Bˆ]X[]Y\ÈH]˜[X]WØ\ÜÙ]Ê
+BˆÝ[[X\žVÈœÝ]\×ØY\ˆ—HHÛÝ[Û[ÛWÜ›ÙXÝ[Û—ÜÝ]\Ê]X[]Y\ÊBˆÝ[[X\žVÈœÝ]\È—HH˜ÛÛ\]Y‚ˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ™]\›ˆÝ[[X\žB‚‚™Yˆ[—Ù\Ú[ÛœÛÛ\—Û[ÛØÞXÛJˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆ›ÝšY\ŽˆÝˆH‘\Ú[Û”ÛÛ\ˆ‹ˆ™\ÜÛ[ÛˆÝ‹ˆ\ÜÙ]ÚYÎˆ\ÝÚ[KˆÜWØØ[Ù[^WÜÙXÛÛ™Îˆ›Ø]›Û™HH›Û™KˆÛY\\Žˆ[žH›Û™HH›Û™KˆX^ÝØZ]ØÞXÛ\Îˆ[HŠHOˆXÝÜÝ‹[žWN‚ˆYˆ›Ý\ÜÙ]ÚYÎ‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ‘\ØÛÛH[ÈY[›ÜÈ[XH[œÝ[XØ[È\˜HÈÚXÛËˆŠBˆ[ÛÜÝ\H]][YKœÝœ[YJ›Ü›X[^™WÜ™\ÜÛ[Û
+™\ÜÛ[Û
+K‰VKI[HŠK™]J
+BˆË[ÛÛ\ÝÙ^HHØ[[™\‹›[Û˜[™ÙJ[ÛÜÝ\žYX\‹[ÛÜÝ\›[Û
+Bˆ[ÛÙ[™H[ÛÜÝ\œ™\XÙJ^O[[ÛÛ\ÝÙ^JBˆÙ^WÝ˜[YHH]KÙ^J
+Bˆ]WÝÈHZ[Š[ÛÙ[™Ù^WÝ˜[YHH[YY[J^\ÏLJJBˆYˆ]WÝÈ[ÛÜÝ\‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ“ÈY\È\ØÛÛYÈZ[™H˜[È[HX\È™XÚYÜÈ\˜H[\Ü\‹ˆŠB‚ˆÛÛ™šYÈHÙ]Ú[YÜ˜][Û—ØÛÛ™šYÊÛÛ›‹›ÝšY\ŠBˆYˆÛÛ™šYÈ\È›Û™N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠÛÛ™šYÝ\˜XØ[È\Ú[Û”ÛÛ\ˆ˜[È[˜ÛÛ˜YKˆŠBˆYˆ›ÝÛÛ™šYÖÈ™[˜X›Y—N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠH[YÜ˜XØ[È\Ú[Û”ÛÛ\ˆ\ÝH\Ø]]˜YKˆŠBˆ[™Ú[ÈHÙ]Ù\Ú[ÛœÛÛ\—Ù[™Ú[ØÛÛ™šYÊÛÛ™šYÊBˆ\ÜÙ]ÈHÙ]Ù\Ú[ÛœÛÛ\—Ü\™›Ü›X[˜ÙWØ\ÜÙ]ÊÛÛ›‹›ÝšY\‹\ÜÙ]ÚYÏX\ÜÙ]ÚYÊBˆYˆ›Ý\ÜÙ]Î‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ“™[š[XH\È[œÝ[XÛÙ\È\ØÛÛY\È[HX\X[Y[È\Ú[Û”ÛÛ\ˆ]]›ËˆŠB‚ˆÝ][Û—ØÛÙ\ÈHÜÝŠ\ÜÙ]È™^\›˜[ÚY—HÜˆˆŠKœÝš\
+
+H›Üˆ\ÜÙ][ˆ\ÜÙ]ÈYˆÝŠ\ÜÙ]È™^\›˜[ÚY—HÜˆˆŠKœÝš\
+
+WBˆ\ÜÙ]×ØžWÙ^\›˜[ÚYHÜÝŠ\ÜÙ]È™^\›˜[ÚY—HÜˆˆŠKœÝš\
+
+Nˆ\ÜÙ]›Üˆ\ÜÙ][ˆ\ÜÙ]ÈYˆÝŠ\ÜÙ]È™^\›˜[ÚY—HÜˆˆŠKœÝš\
+
+_BˆÝ][Û—ØÚ[šÜÈHÚ[šÙY
+Ý][Û—ØÛÙ\ËL
+BˆÙ\ÜÚ[Û—ÛØš‹ÈHÙ]Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[ÛŠÛÛ™šYÊBˆÛY\Ù[˜ÈHÛY\\ˆÜˆ[YKœÛY\ˆÜWØØ[Ù[^WÜÙXÛÛ™ÈH•TÒSÓ”ÓÓT—ÔT‘“Ô“PSÑWÒÔWÑSVWÔÑPÓÓ‘ÈYˆÜWØØ[Ù[^WÜÙXÛÛ™È\È›Û™H[ÙHÜWØØ[Ù[^WÜÙXÛÛ™ÂˆÙÙÙ\ˆHÝ\œ™[Ø\›ÙÙÙ\ˆYˆ\×Ø\ØÛÛ^
+
+H[ÙHÙÙÚ[™Ë™Ù]ÙÙÙ\Š×Û˜[YW×ÊBˆÝ[[X\žHHÂˆ˜\ÜÙ]×ÜÙ[XÝYŽˆ[Š\ÜÙ]ÚYÊKˆ˜\ÜÙ]×ÛX\YŽˆ[Š\ÜÙ]×ØžWÙ^\›˜[ÚY
+Kˆ›[ÛŽˆ[ÛÜÝ\œÝ™[YJ‰VKI[HŠKˆ™Z[WØÚ[šÜ×ÝÝ[Žˆ[ŠÝ][Û—ØÚ[šÜÊKˆ™Z[WØÚ[šÜ×ØÛÛ\]YŽˆˆ›[ÛWØÚ[šÜ×ØÛÛ\]YŽˆˆœ™XÛÜ™×Ý\]YŽˆˆ›[ÛWÜ™XÛÜ™×Ý\]YŽˆˆ›Z\ÜÚ[™×Ü›ÙXÝ[ÛˆŽˆˆ˜\WØØ[×Ý\ÙYŽˆˆ˜\WÙ\œ›ÜœÈŽˆˆØZ]ØÞXÛ\ÈŽˆˆœÝ]\ÈŽˆœ[›š[™È‹ˆBˆ›ØÙ\ÜÙYÙ]\ÎˆÙ]Ù]WHHÙ]
+
+B‚ˆYˆØZ]ØY\—Ü˜]WÛ[Z]
+™X\ÛÛŽˆÝŠHOˆ›Û™N‚ˆÝ[[X\žVÈØZ]ØÞXÛ\È—H
+ÏHBˆYˆÝ[[X\žVÈØZ]ØÞXÛ\È—HˆX^ÝØZ]ØÞXÛ\Î‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠˆ“[Z]H\Ú[Û”ÛÛ\ˆ™\]YÈ[X\ÚXY\È™^™\Ëˆ[[[È\ÝYÎˆÜ™X\ÛÛŸHŠBˆÛÛ›‹˜ÛÛ[Z]
+
+BˆÙXÛÛ™ÈH\Ú[ÛœÛÛ\—ØÛÛÛÝÛ—ÜÛY\ÜÙXÛÛ™ÊÛÛ›ŠBˆÙÙÙ\‹Ø\›š[™Êˆ‘\Ú[Û”ÛÛ\ˆ[ÛÞXÛHØZ][™È›ÜˆTHÛÛÛÝÛŽˆ[ÛI\ÈÙXÛÛ™ÏI\ÈØZ]ØÞXÛOI\È‹ˆ[ÛÜÝ\š\ÛÙ›Ü›X]
+
+KˆÙXÛÛ™ËˆÝ[[X\žVÈØZ]ØÞXÛ\È—Kˆ
+BˆÛY\Ù[˜ÊÙXÛÛ™ÊB‚ˆYˆØZ]Ø™]ÙY[—ØØ[Ê
+HOˆ›Û™N‚ˆYˆ
+ˆ“ÑPÕSÓ—ÒÔWÐÐSÐÓÓ•V™Ù]
+
+H\È›Û™Bˆ[™Ý[[X\žVÈ˜\WØØ[×Ý\ÙY—Hˆˆ[™ÜWØØ[Ù[^WÜÙXÛÛ™Âˆ[™ÜWØØ[Ù[^WÜÙXÛÛ™Èˆˆ
+N‚ˆÛY\Ù[˜ÊÜWØØ[Ù[^WÜÙXÛÛ™ÊB‚ˆYˆ™Yœ™\ÚÜÙ\ÜÚ[Û—ØY\—Ù^\žJ^Îˆ^Ù\[Û‹ÛÛ^ˆÝŠHOˆ›Û™N‚ˆ›Û›ØØ[Ù\ÜÚ[Û—ÛØš‚ˆ[˜[Y]WÙ\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[ÛŠÛÛ™šYÊBˆÙ\ÜÚ[Û—ÛØš‹ÈHÙ]Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[ÛŠÛÛ™šYË›Ü˜ÙWÛÙÚ[UYJBˆÙÙÙ\‹Ø\›š[™Ê‘\Ú[Û”ÛÛ\ˆÙ\ÜÚ[Ûˆ™Yœ™\ÚYY\ˆ^\™YÙÚ[ŽˆÛÛ^I\È\œ›ÜI\È‹ÛÛ^^ÊB‚ˆ›ÜˆÚ[š×Ú[™^Ý][Û—ÙÜ›Ý\[ˆ[[Y\˜]JÝ][Û—ØÚ[šÜËÝ\LJN‚ˆÙ\ÜÚ[Û—Ü™]žWÝ\ÙYH˜[ÙBˆÚ[HYN‚ˆžN‚ˆØZ]Ø™]ÙY[—ØØ[Ê
+Bˆ›ÝÜÈH™]ÚÙ\Ú[ÛœÛÛ\—ÚÜWÙ^WÜ›ÝÜÊˆÙ\ÜÚ[Û—ÛØš‹ˆ[™Ú[ÖÈ˜˜\ÙWÝ\›—Kˆ[™Ú[ÖÈ™^WÚÜWÙ[™Ú[—KˆÝ][Û—ÙÜ›Ý\ˆ[ÛÜÝ\ˆ
+BˆÝ[[X\žVÈ˜\WØØ[×Ý\ÙY—H
+ÏHBˆ›Üˆ›ÝÈ[ˆ›ÝÜÎ‚ˆ^\›˜[ÚYÝ˜[YHHÝŠ›ÝË™Ù]
+œÝ][ÛÛÙHŠHÜˆ›ÝË™Ù]
+œ[ÛÙHŠHÜˆˆŠKœÝš\
+
+Bˆ\ÜÙ]H\ÜÙ]×ØžWÙ^\›˜[ÚY™Ù]
+^\›˜[ÚYÝ˜[YJBˆYˆ\ÜÙ]\È›Û™N‚ˆÛÛ[YBˆ›Ý×Ù]HH\œÙWÙ\Ú[ÛœÛÛ\—ØÛÛXÝÙ]J›ÝË[ÛÜÝ\
+BˆYˆ›Ý×Ù]H\È›Û™HÜˆ›Ý×Ù]H[ÛÜÝ\Üˆ›Ý×Ù]Hˆ]WÝÎ‚ˆÛÛ[YBˆ™\Ý[HÝÜ™WÜ›ÙXÝ[Û—ÚÜWÜ™XÛÜ™
+ˆÛÛ›‹ˆ\ÜÙ]Ü›ÝÏX\ÜÙ]ˆ›ÝšY\\›ÝšY\‹ˆ^\›˜[ÚYY^\›˜[ÚYÝ˜[YKˆ\š[ÙÝ\OH™^H‹ˆ\š[ÙÙ]O\›Ý×Ù]KˆÜWÜ›ÝÏ\›ÝËˆ›Ý\×Ü™Yš^HÚXÛÈY[œØ[]]ÛX]XÛËˆ‹ˆ
+BˆYˆ™\Ý[È\Ù\ÜÝ]\È—HOHœÚÚ\YÙ^\Ý[™×Ý˜[YŽ‚ˆÝ[[X\žVÈœ™XÛÜ™×Ý\]Y—H
+ÏHBˆ›ØÙ\ÜÙYÙ]\Ë˜Y
+›Ý×Ù]JBˆYˆ™\Ý[Èœ›ÙXÝ[Û—ÚÝÚ—H\È›Û™N‚ˆÝ[[X\žVÈ›Z\ÜÚ[™×Ü›ÙXÝ[Ûˆ—H
+ÏHBˆÝ[[X\žVÈ™Z[WØÚ[šÜ×ØÛÛ\]Y—HHÚ[š×Ú[™^ˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆœ™XZÂˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÝ[[X\žVÈ˜\WÙ\œ›ÜœÈ—H
+ÏHBˆYˆ\Ú[œÝ[˜ÙJ^Ë
+\T˜]S[Z]\œ›Ü‹\TÛÝ[˜]˜Z[X›Q\œ›ÜŠJN‚ˆ˜Z\ÙBˆYˆ\×Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]Ù\œ›ÜŠ^ÊN‚ˆØZ]ØY\—Ü˜]WÛ[Z]
+X\š×Ù\Ú[ÛœÛÛ\—Ü\™›Ü›X[˜ÙWÜ˜]WÛ[Z]Y
+ÛÛ›ŠJBˆÛÛ[YBˆYˆ\×Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[Û—Ù^\™YÙ\œ›ÜŠ^ÊH[™›ÝÙ\ÜÚ[Û—Ü™]žWÝ\ÙY‚ˆÙ\ÜÚ[Û—Ü™]žWÝ\ÙYHYBˆ™Yœ™\ÚÜÙ\ÜÚ[Û—ØY\—Ù^\žJ^Ëˆ›[ÛXÞXÛKY^NžÛ[ÛÜÝ\š\ÛÙ›Ü›X]
+
+_N˜Ú[šÎžØÚ[š×Ú[™^HŠBˆÛÛ[YBˆ˜Z\ÙB‚ˆ›ÜˆÚ[š×Ú[™^Ý][Û—ÙÜ›Ý\[ˆ[[Y\˜]JÝ][Û—ØÚ[šÜËÝ\LJN‚ˆÙ\ÜÚ[Û—Ü™]žWÝ\ÙYH˜[ÙBˆÚ[HYN‚ˆžN‚ˆØZ]Ø™]ÙY[—ØØ[Ê
+BˆÜWÛX\H™]ÚÙ\Ú[ÛœÛÛ\—ÚÜWÛ[ÛÛX\
+ˆÙ\ÜÚ[Û—ÛØš‹ˆ[™Ú[ÖÈ˜˜\ÙWÝ\›—Kˆ[™Ú[ÖÈ›[ÛÚÜWÙ[™Ú[—KˆÝ][Û—ÙÜ›Ý\ˆ[ÛÜÝ\ˆ
+BˆÝ[[X\žVÈ˜\WØØ[×Ý\ÙY—H
+ÏHBˆ›Üˆ^\›˜[ÚYÝ˜[YH[ˆÝ][Û—ÙÜ›Ý\‚ˆ\ÜÙ]H\ÜÙ]×ØžWÙ^\›˜[ÚY™Ù]
+^\›˜[ÚYÝ˜[YJBˆYˆ\ÜÙ]\È›Û™N‚ˆÛÛ[YBˆ™\Ý[HÝÜ™WÜ›ÙXÝ[Û—ÚÜWÜ™XÛÜ™
+ˆÛÛ›‹ˆ\ÜÙ]Ü›ÝÏX\ÜÙ]ˆ›ÝšY\\›ÝšY\‹ˆ^\›˜[ÚYY^\›˜[ÚYÝ˜[YKˆ\š[ÙÝ\OH›[Û‹ˆ\š[ÙÙ]O[[ÛÜÝ\ˆÜWÜ›ÝÏZÜWÛX\™Ù]
+^\›˜[ÚYÝ˜[YKßJKˆ›Ý\×Ü™Yš^HÚXÛÈY[œØ[]]ÛX]XÛËˆ‹ˆ
+BˆYˆ™\Ý[È\Ù\ÜÝ]\È—HOHœÚÚ\YÙ^\Ý[™×Ý˜[YŽ‚ˆÝ[[X\žVÈ›[ÛWÜ™XÛÜ™×Ý\]Y—H
+ÏHBˆYˆ™\Ý[Èœ›ÙXÝ[Û—ÚÝÚ—H\È›Û™N‚ˆÝ[[X\žVÈ›Z\ÜÚ[™×Ü›ÙXÝ[Ûˆ—H
+ÏHBˆÝ[[X\žVÈ›[ÛWØÚ[šÜ×ØÛÛ\]Y—HHÚ[š×Ú[™^ˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆœ™XZÂˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÝ[[X\žVÈ˜\WÙ\œ›ÜœÈ—H
+ÏHBˆYˆ\Ú[œÝ[˜ÙJ^Ë
+\T˜]S[Z]\œ›Ü‹\TÛÝ[˜]˜Z[X›Q\œ›ÜŠJN‚ˆ˜Z\ÙBˆYˆ\×Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]Ù\œ›ÜŠ^ÊN‚ˆØZ]ØY\—Ü˜]WÛ[Z]
+X\š×Ù\Ú[ÛœÛÛ\—Ü\™›Ü›X[˜ÙWÜ˜]WÛ[Z]Y
+ÛÛ›ŠJBˆÛÛ[YBˆYˆ\×Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[Û—Ù^\™YÙ\œ›ÜŠ^ÊH[™›ÝÙ\ÜÚ[Û—Ü™]žWÝ\ÙY‚ˆÙ\ÜÚ[Û—Ü™]žWÝ\ÙYHYBˆ™Yœ™\ÚÜÙ\ÜÚ[Û—ØY\—Ù^\žJ^Ëˆ›[ÛXÞXÛK[[ÛžÛ[ÛÜÝ\š\ÛÙ›Ü›X]
+
+_N˜Ú[šÎžØÚ[š×Ú[™^HŠBˆÛÛ[YBˆ˜Z\ÙB‚ˆ›Üˆ\™Ù][ˆÛÜY
+›ØÙ\ÜÙYÙ]\ÊN‚ˆ›ÜˆÙ[XÝYØ\ÜÙ]ÚY[ˆ\ÜÙ]ÚYÎ‚ˆ™XØ[Ý[]WÜ\™›Ü›X[˜ÙWÜ™Y™\™[˜Ù\ÊˆÛÛ›‹ˆ\š[ÙÝ\OH™^H‹ˆ\š[ÙÙ]O]\™Ù]ˆ\ÜÙ]ÚY\Ù[XÝYØ\ÜÙ]ÚYˆ›ÝšY\\›ÝšY\‹ˆÙ^WÝ˜[YO]Ù^WÝ˜[YKˆ
+Bˆ›ÜˆÙ[XÝYØ\ÜÙ]ÚY[ˆ\ÜÙ]ÚYÎ‚ˆ™XØ[Ý[]WÜ\™›Ü›X[˜ÙWÜ™Y™\™[˜Ù\ÊˆÛÛ›‹ˆ\š[ÙÝ\OH›[Û‹ˆ\š[ÙÙ]O[[ÛÜÝ\ˆ\ÜÙ]ÚY\Ù[XÝYØ\ÜÙ]ÚYˆ›ÝšY\\›ÝšY\‹ˆÙ^WÝ˜[YO]Ù^WÝ˜[YKˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+BˆÝ[[X\žVÈœÝ]\È—HH˜ÛÛ\]Y‚ˆ™]\›ˆÝ[[X\žB‚‚™YˆÜ™X]WÚ[YÜ˜][Û—Ü[ŠÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹›ÝšY\ŽˆÝ‹šYÙÙ\—Ý\NˆÝŠHOˆ[‚ˆÝ\œÛÜˆHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È[YÜ˜][Û—ÜÞ[˜×Ü[œÈ
+›ÝšY\‹Ý\YØ]šYÙÙ\—Ý\KÝ]\ÊBˆSQTÈ
+ËËËÊBˆˆˆ‹ˆ
+›ÝšY\‹]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKšYÙÙ\—Ý\Kœ[›š[™ÈŠKˆ
+Bˆ™]\›ˆ[
+Ý\œÛÜ‹›\Ý›ÝÚY
+B‚‚™Yˆš[˜[^™WÚ[YÜ˜][Û—Ü[ŠˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ[—ÚYˆ[ˆ
+‹ˆÝ]\ÎˆÝ‹ˆX]ÚYØÛÝ[ˆ[ˆ[œ™\ÛÛ™YØÛÝ[ˆ[ˆ]]×Ü™\ÛÛ™YØÛÝ[ˆ[ˆ\œ›Ü—ÛY\ÜØYÙNˆÝˆHˆ‹ˆÝ[[X\žWÚœÛÛŽˆXÝÜÝ‹[žWH›Û™HH›Û™KŠHOˆ›Û™N‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH[YÜ˜][Û—ÜÞ[˜×Ü[œÂˆÑUš[š\ÚYØ]HËÝ]\ÈHËX]ÚYØÛÝ[HË[œ™\ÛÛ™YØÛÝ[HËˆ]]×Ü™\ÛÛ™YØÛÝ[HË\œ›Ü—ÛY\ÜØYÙHHËÝ[[X\žWÚœÛÛˆHÂˆÒT‘HYHÂˆˆˆ‹ˆ
+ˆ]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆÝ]\ËˆX]ÚYØÛÝ[ˆ[œ™\ÛÛ™YØÛÝ[ˆ]]×Ü™\ÛÛ™YØÛÝ[ˆ\œ›Ü—ÛY\ÜØYÙKˆœÛÛ‹™[\ÊÝ[[X\žWÚœÛÛˆÜˆßK[œÝ\™WØ\ØÚZOUYJKˆ[—ÚYˆ
+Kˆ
+B‚‚™YˆÜ™X]WÛÜ—Ý\]WØ\ÜÙ]Ú[YÜ˜][ÛŠˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ\ÜÙ]ÚYˆ[ˆ›ÝšY\ŽˆÝ‹ˆ^\›˜[ÚYˆÝ‹ˆ^\›˜[Û˜[YNˆÝ‹ˆÝ]\ÎˆÝ‹ŠHOˆ›Û™N‚ˆ^\Ý[™ÈH›Û™BˆYˆ^\›˜[ÚY‚ˆ^\Ý[™ÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕY”“ÓH\ÜÙ]Ú[YÜ˜][ÛœÈÒT‘H›ÝšY\ˆHÈS‘^\›˜[ÚYHÈ‹ˆ
+›ÝšY\‹^\›˜[ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ^\Ý[™Î‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH\ÜÙ]Ú[YÜ˜][ÛœÂˆÑU\ÜÙ]ÚYHË^\›˜[Û˜[YHHË[˜X›YHK\ÝÜÞ[˜×Ø]HË\ÝÜÝ]\ÈHË\ÝÙ\œ›ÜˆH	ÉÂˆÒT‘HYHÂˆˆˆ‹ˆ
+\ÜÙ]ÚY^\›˜[Û˜[YK]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKÝ]\Ë^\Ý[™ÖÈšY—JKˆ
+Bˆ™]\›‚‚ˆØ[™Y]HHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕYˆ”“ÓH\ÜÙ]Ú[YÜ˜][ÛœÂˆÒT‘H›ÝšY\ˆHÈS‘\ÜÙ]ÚYHÂˆSRUBˆˆˆ‹ˆ
+›ÝšY\‹\ÜÙ]ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆØ[™Y]N‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH\ÜÙ]Ú[YÜ˜][ÛœÂˆÑU^\›˜[ÚYHË^\›˜[Û˜[YHHË[˜X›YHK\ÝÜÞ[˜×Ø]HË\ÝÜÝ]\ÈHË\ÝÙ\œ›ÜˆH	ÉÂˆÒT‘HYHÂˆˆˆ‹ˆ
+^\›˜[ÚYÜˆ›Û™K^\›˜[Û˜[YK]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKÝ]\ËØ[™Y]VÈšY—JKˆ
+Bˆ™]\›‚‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È\ÜÙ]Ú[YÜ˜][ÛœÈ
+\ÜÙ]ÚY›ÝšY\‹^\›˜[ÚY^\›˜[Û˜[YK[˜X›Y\ÝÜÞ[˜×Ø]\ÝÜÝ]\Ë\ÝÙ\œ›ÜŠBˆSQTÈ
+ËËËËKËË	ÉÊBˆˆˆ‹ˆ
+ˆ\ÜÙ]ÚYˆ›ÝšY\‹ˆ^\›˜[ÚYÜˆ›Û™Kˆ^\›˜[Û˜[YKˆ]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆÝ]\Ëˆ
+Kˆ
+B‚‚™Yˆ\Ù\Ú[YÜ˜][Û—Ý[œ™\ÛÛ™Y
+ˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆ›ÝšY\ŽˆÝ‹ˆ[—ÚYˆ[ˆ^\›˜[ÚYˆÝ‹ˆ^\›˜[Û˜[YNˆÝ‹ˆÝ]\ÎˆÝ‹ˆ^[ØYˆXÝÜÝ‹[žWKŠHOˆ›Û™N‚ˆ›Ü›X[^™YÛ˜[YHH›Ü›X[^™WÛ˜[YJ^\›˜[Û˜[YJBˆÝYÙÙ\ÝYØ\ÜÙ]ÚYHš[™ÜÝYÙÙ\ÝYØ\ÜÙ]ÚY
+ÛÛ›‹^\›˜[Û˜[YJBˆ^\Ý[™ÈHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕYˆ”“ÓH[YÜ˜][Û—Ý[œ™\ÛÛ™YˆÒT‘H›ÝšY\ˆHÈS‘›Ü›X[^™YÛ˜[YHHÈS‘™\ÛÛ][Û—ÜÝ]\ÈH	Ü[™[™ÉÂˆSRUBˆˆˆ‹ˆ
+›ÝšY\‹›Ü›X[^™YÛ˜[YJKˆ
+K™™]ÚÛ™J
+BˆYˆ^\Ý[™Î‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH[YÜ˜][Û—Ý[œ™\ÛÛ™YˆÑUÞ[˜×Ü[—ÚYHË^\›˜[ÚYHË^\›˜[ÜÝ]\ÈHË^[ØYÚœÛÛˆHËÝYÙÙ\ÝYØ\ÜÙ]ÚYHËÜ™X]YØ]HÂˆÒT‘HYHÂˆˆˆ‹ˆ
+ˆ[—ÚYˆ^\›˜[ÚYÜˆ›Û™KˆÝ]\ËˆœÛÛ‹™[\Ê^[ØY[œÝ\™WØ\ØÚZOUYJKˆÝYÙÙ\ÝYØ\ÜÙ]ÚYˆ]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆ^\Ý[™ÖÈšY—Kˆ
+Kˆ
+Bˆ™]\›‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È[YÜ˜][Û—Ý[œ™\ÛÛ™Y
+ˆ›ÝšY\‹Þ[˜×Ü[—ÚY^\›˜[ÚY^\›˜[Û˜[YK›Ü›X[^™YÛ˜[YK^\›˜[ÜÝ]\Ëˆ^[ØYÚœÛÛ‹ÝYÙÙ\ÝYØ\ÜÙ]ÚY™\ÛÛ][Û—ÜÝ]\ËÜ™X]YØ]ˆ
+HSQTÈ
+ËËËËËËËË	Ü[™[™ÉËÊBˆˆˆ‹ˆ
+ˆ›ÝšY\‹ˆ[—ÚYˆ^\›˜[ÚYÜˆ›Û™Kˆ^\›˜[Û˜[YKˆ›Ü›X[^™YÛ˜[YKˆÝ]\ËˆœÛÛ‹™[\Ê^[ØY[œÝ\™WØ\ØÚZOUYJKˆÝYÙÙ\ÝYØ\ÜÙ]ÚYˆ]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆ
+Kˆ
+B‚‚™YˆÙ]Û]\ÝØ]˜Z[Xš[]WØžWØ\ÜÙ]
+ÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹\ÜÙ]ÚYˆ[
+HOˆXÝÜÝ‹[žWH›Û™N‚ˆ›ÝÈHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕ
+‚ˆ”“ÓH]˜Z[Xš[]WÙZ[BˆÒT‘H\ÜÙ]ÚYHÂˆÔ‘Tˆ–H\š[ÙÙ]HTÐËYTÐÂˆSRUBˆˆˆ‹ˆ
+\ÜÙ]ÚY
+Kˆ
+K™™]ÚÛ™J
+Bˆ™]\›ˆXÝ
+›ÝÊHYˆ›ÝÈ[ÙH›Û™B‚‚™YˆÙ]Ù\Ú›Ø\™Ø]˜Z[Xš[]WÜÝ[[X\žJÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[ÛŠHOˆXÝÜÝ‹[žWN‚ˆ›ÝÜÈH]Y\žWØ[
+ˆÛÛ›‹ˆˆˆ‚ˆÑSPÕYŠ‚ˆ”“ÓH]˜Z[Xš[]WÙZ[HYˆ“ÒSˆ
+ˆÑSPÕ\ÜÙ]ÚYPV
+\š[ÙÙ]H	Õ	Èš[Š	ÉLY	ËY
+JHTÈX\šÙ\‚ˆ”“ÓH]˜Z[Xš[]WÙZ[BˆÔ“ÕT–H\ÜÙ]ÚYˆ
+H]\ÝˆÓˆ]\Ý˜\ÜÙ]ÚYHY˜\ÜÙ]ÚYˆS‘]\Ý›X\šÙ\ˆHYœ\š[ÙÙ]H	Õ	Èš[Š	ÉLY	ËYšY
+Bˆˆˆ‚ˆ
+BˆÝÝ˜[Y\ÈHÜ›ÝÖÈš[™\\—Ø]˜Z[Xš[]WÜÝ—H›Üˆ›ÝÈ[ˆ›ÝÜÈYˆ›ÝÖÈš[™\\—Ø]˜Z[Xš[]WÜÝ—H\È›Ý›Û™WBˆY™™XÝYÝ˜[Y\ÈHÜ›ÝÖÈ˜Y™™XÝYÜÝÙ\—ÚÝÈ—H›Üˆ›ÝÈ[ˆ›ÝÜÈYˆ›ÝÖÈ˜Y™™XÝYÜÝÙ\—ÚÝÈ—H\È›Ý›Û™WBˆ™]\›ˆÂˆ˜]™\˜YÙWÚ[™\\—Ø]˜Z[Xš[]WÜÝŽˆ›Ý[™
+Ý[JÝÝ˜[Y\ÊHÈ[ŠÝÝ˜[Y\ÊKŠHYˆÝÝ˜[Y\È[ÙH›Û™Kˆ[˜]˜Z[X›WÚ[™\\œÈŽˆÝ[J[
+›ÝÖÈ[˜]˜Z[X›WÚ[™\\œÈ—HÜˆ
+H›Üˆ›ÝÈ[ˆ›ÝÜÊKˆ››×ØÛÛ[][šXØ][Û—Ù]šXÙ\ÈŽˆÝ[J[
+›ÝÖÈ››×ØÛÛ[][šXØ][Û—Ù]šXÙ\È—HÜˆ
+H›Üˆ›ÝÈ[ˆ›ÝÜÊKˆ˜Y™™XÝYÜÝÙ\—ÚÝÈŽˆ›Ý[™
+Ý[J›Ø]
+˜[YJH›Üˆ˜[YH[ˆY™™XÝYÝ˜[Y\ÊKŠHYˆY™™XÝYÝ˜[Y\È[ÙH›Û™KˆœÝš[™×Ø]˜Z[Xš[]WÜÝŽˆ
+ˆ›Ý[™
+ˆÝ[J[
+›ÝÖÈ˜]˜Z[X›WÜÝš[™ÜÈ—HÜˆ
+H›Üˆ›ÝÈ[ˆ›ÝÜÊBˆÈÝ[J[
+›ÝÖÈÝ[ÜÝš[™ÜÈ—HÜˆ
+H›Üˆ›ÝÈ[ˆ›ÝÜÊBˆ
+ˆLˆ‹ˆ
+BˆYˆÝ[J[
+›ÝÖÈÝ[ÜÝš[™ÜÈ—HÜˆ
+H›Üˆ›ÝÈ[ˆ›ÝÜÊBˆ[ÙH›Û™Bˆ
+Kˆ[˜]˜Z[X›WÜÝš[™ÜÈŽˆÝ[J[
+›ÝÖÈ[˜]˜Z[X›WÜÝš[™ÜÈ—HÜˆ
+H›Üˆ›ÝÈ[ˆ›ÝÜÊKˆB‚‚™YˆÙ]Û]\ÝÙ]šXÙWÜ›ÝÜ×Ù›Ü—Ø\ÜÙ]
+ÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹\ÜÙ]ÚYˆ[
+HOˆ\ÝÙXÝÜÝ‹[žWWN‚ˆ™]\›ˆ]Y\žWØ[
+ˆÛÛ›‹ˆˆˆ‚ˆÑSPÕˆ™]šXÙWÛ˜[YKˆœ˜]YÜÝÙ\—ÚÝËˆ›\ÝÜÙY[—Ø]ˆœËŠ‚ˆ”“ÓH›ÝšY\—Ù]šXÙ\ÈˆQ•“ÒSˆ]šXÙWÜ™X[[YWÜÛ˜\ÚÝÈœÂˆÓˆœËšYH
+ˆÑSPÕ]\ÝšYˆ”“ÓH]šXÙWÜ™X[[YWÜÛ˜\ÚÝÈ]\ÝˆÒT‘H]\Ýœ›ÝšY\—Ù]šXÙWÚYHšYˆÔ‘Tˆ–H]\Ý˜ÛÛXÝYØ]TÐË]\ÝšYTÐÂˆSRUBˆ
+BˆÒT‘H˜\ÜÙ]ÚYHÈS‘™[˜X›YHBˆÔ‘Tˆ–H™]šXÙWÛ˜[YHÓÓUH“ÐÐTÑKšYˆˆˆ‹ˆ
+\ÜÙ]ÚY
+Kˆ
+B‚‚™Yˆ\Ù\Ü›ÝšY\—Ù]šXÙJÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹\ÜÙ]ÚYˆ[›ÝšY\ŽˆÝ‹›ÝÎˆXÝÜÝ‹[žWJHOˆ[‚ˆ›ÝÈH]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠBˆ[˜X›YH[
+›ÝË™Ù]
+™[˜X›Y‹JJBˆ^\Ý[™ÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕY[˜X›Y”“ÓH›ÝšY\—Ù]šXÙ\ÈÒT‘H›ÝšY\ˆHÈS‘^\›˜[Ù]šXÙWÚYHÈ‹ˆ
+›ÝšY\‹›ÝÖÈ™^\›˜[Ù]šXÙWÚY—JKˆ
+K™™]ÚÛ™J
+Bˆ^[ØYÚœÛÛˆHœÛÛ‹™[\Ê›ÝÖÈœ^[ØY—K[œÝ\™WØ\ØÚZOUYJBˆYˆ^\Ý[™Î‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH›ÝšY\—Ù]šXÙ\ÂˆÑU\ÜÙ]ÚYHËÝ][Û—ØÛÙHHË]—ÙˆHËÛˆHË]šXÙWÛ˜[YHHË]—Ý\WÚYHËˆ[Ù[HË˜]YÜÝÙ\—ÚÝÈHË[˜X›YHË^[ØYÚœÛÛˆHË\]YØ]HÂˆÒT‘HYHÂˆˆˆ‹ˆ
+ˆ\ÜÙ]ÚYˆ›ÝÖÈœÝ][Û—ØÛÙH—Kˆ›ÝÖÈ™]—Ùˆ—Kˆ›ÝÖÈœÛˆ—Kˆ›ÝÖÈ™]šXÙWÛ˜[YH—Kˆ›ÝÖÈ™]—Ý\WÚY—Kˆ›ÝÖÈ›[Ù[—Kˆ›ÝÖÈœ˜]YÜÝÙ\—ÚÝÈ—Kˆ[˜X›Yˆ^[ØYÚœÛÛ‹ˆ›ÝËˆ^\Ý[™ÖÈšY—Kˆ
+Kˆ
+Bˆ]šXÙWÚYH[
+^\Ý[™ÖÈšY—JBˆ™XÛÜ™Ù]šXÙWØÛÛ™šYÝ\˜][ÛŠˆÛÛ›‹ˆ›ÝšY\—Ù]šXÙWÚYY]šXÙWÚYˆXÝ]™OX›ÛÛ
+[˜X›Y
+KˆY™™XÝ]™WÙ]OXÝ\œ™[Û\Ø›Û—Ù]J
+Kˆ
+Bˆ™]\›ˆ]šXÙWÚYˆÝ\œÛÜˆHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È›ÝšY\—Ù]šXÙ\È
+ˆ\ÜÙ]ÚY›ÝšY\‹Ý][Û—ØÛÙK^\›˜[Ù]šXÙWÚY]—Ù‹Û‹]šXÙWÛ˜[YK]—Ý\WÚYˆ[Ù[˜]YÜÝÙ\—ÚÝË[˜X›Y^[ØYÚœÛÛ‹Ü™X]YØ]\]YØ]ˆ
+HSQTÈ
+ËËËËËËËËËËËËËÊBˆˆˆ‹ˆ
+ˆ\ÜÙ]ÚYˆ›ÝšY\‹ˆ›ÝÖÈœÝ][Û—ØÛÙH—Kˆ›ÝÖÈ™^\›˜[Ù]šXÙWÚY—Kˆ›ÝÖÈ™]—Ùˆ—Kˆ›ÝÖÈœÛˆ—Kˆ›ÝÖÈ™]šXÙWÛ˜[YH—Kˆ›ÝÖÈ™]—Ý\WÚY—Kˆ›ÝÖÈ›[Ù[—Kˆ›ÝÖÈœ˜]YÜÝÙ\—ÚÝÈ—Kˆ[˜X›Yˆ^[ØYÚœÛÛ‹ˆ›ÝËˆ›ÝËˆ
+Kˆ
+Bˆ]šXÙWÚYH[
+Ý\œÛÜ‹›\Ý›ÝÚY
+Bˆ™XÛÜ™Ù]šXÙWØÛÛ™šYÝ\˜][ÛŠˆÛÛ›‹ˆ›ÝšY\—Ù]šXÙWÚYY]šXÙWÚYˆXÝ]™OX›ÛÛ
+[˜X›Y
+KˆY™™XÝ]™WÙ]OXÝ\œ™[Û\Ø›Û—Ù]J
+Kˆ
+Bˆ™]\›ˆ]šXÙWÚY‚‚™Yˆ™\\™WÙ\Ú[ÛœÛÛ\—Ú[™\\—Ú\ÝÜžWØÛÛ^
+ˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆ›Ü˜ÙWÛÙÚ[Žˆ›ÛÛH˜[ÙKˆ\ÝÜžWØØ[Ù[^WÜÙXÛÛ™Îˆ›Ø]HˆÛY\\Žˆ[žHH[YKœÛY\ŠHOˆXÝÜÝ‹[žWN‚ˆ›ÝšY\ˆHS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‚ˆÛÛ™šYÈHÙ]Ú[YÜ˜][Û—ØÛÛ™šYÊÛÛ›‹›ÝšY\ŠBˆYˆÛÛ™šYÈ\È›Û™HÜˆ›ÝÛÛ™šYÖÈ™[˜X›Y—N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠÛÛ™šYÝ\˜XØ[È\Ú[Û”ÛÛ\ˆ[™\ÜÛš]™[ˆŠBˆ[™Ú[ÈHÙ]Ù\Ú[ÛœÛÛ\—Ù[™Ú[ØÛÛ™šYÊÛÛ™šYÊBˆX\[™ÜÈH]Y\žWØ[
+ˆÛÛ›‹ˆˆˆ‚ˆÑSPÕ\ÜÙ]ÚY^\›˜[ÚYˆ”“ÓH\ÜÙ]Ú[YÜ˜][ÛœÂˆÒT‘H›ÝšY\ˆHÈS‘[˜X›YHHS‘ÓÐSTÐÑJ^\›˜[ÚY	ÉÊHOH	ÉÂˆˆˆ‹ˆ
+›ÝšY\‹
+Kˆ
+BˆÝ][Û—Ý×Ø\ÜÙ]HÜÝŠ›ÝÖÈ™^\›˜[ÚY—JNˆ[
+›ÝÖÈ˜\ÜÙ]ÚY—JH›Üˆ›ÝÈ[ˆX\[™ÜßBˆYˆ›ÝÝ][Û—Ý×Ø\ÜÙ]‚ˆ™]\›ˆÈœ›ÝšY\ˆŽˆ›ÝšY\‹˜ÛÛ™šYÈŽˆÛÛ™šYË™[™Ú[ÈŽˆ[™Ú[ËœÙ\ÜÚ[ÛˆŽˆ›Û™K™]šXÙ\ÈŽˆ×_BˆÙ\ÜÚ[Û‹ÈHÙ]Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[ÛŠÛÛ™šYË›Ü˜ÙWÛÙÚ[Y›Ü˜ÙWÛÙÚ[ŠBˆ˜]×Ù]šXÙ\ÈH™]ÚÙ\Ú[ÛœÛÛ\—Ù]šXÙWÛ\Ý
+ˆÙ\ÜÚ[Û‹ˆ˜\ÙWÝ\›Y[™Ú[ÖÈ˜˜\ÙWÝ\›—Kˆ[™Ú[Y[™Ú[ÖÈ™]šXÙWÛ\ÝÙ[™Ú[—KˆÝ][Û—ØÛÙ\Ï\ÛÜY
+Ý][Û—Ý×Ø\ÜÙ]
+Kˆ
+Bˆ]šXÙ\Îˆ\ÝÙXÝÜÝ‹[žWWHH×Bˆ›Üˆ˜]×Ü›ÝÈ[ˆ˜]×Ù]šXÙ\Î‚ˆ]šXÙHH›Ü›X[^™WÙ\Ú[ÛœÛÛ\—Ù]šXÙWÚY[]J˜]×Ü›ÝÊBˆYˆ]šXÙVÈ™]—Ý\WÚY—H›Ý[ˆ•TÒSÓ”ÓÓT—ÒS•‘T•T—ÑU’PÑWÕTWÒQÎ‚ˆÛÛ[YBˆ\ÜÙ]ÚYHÝ][Û—Ý×Ø\ÜÙ]™Ù]
+ÝŠ]šXÙVÈœÝ][Û—ØÛÙH—HÜˆˆŠJBˆYˆ›Ý\ÜÙ]ÚYÜˆ›Ý]šXÙVÈ™^\›˜[Ù]šXÙWÚY—N‚ˆÛÛ[YBˆ]šXÙVÈ˜\ÜÙ]ÚY—HH\ÜÙ]ÚYˆ]šXÙVÈ™[˜X›Y—HHYˆ\×Ü™[[Ý™YÚ[™\\—Û˜[YJ]šXÙVÈ™]šXÙWÛ˜[YH—JH[ÙHBˆ]šXÙVÈœ^[ØY—HH˜]×Ü›ÝÂˆ]šXÙVÈœ›ÝšY\—Ù]šXÙWÚY—HH\Ù\Ü›ÝšY\—Ù]šXÙJÛÛ›‹\ÜÙ]ÚY›ÝšY\‹]šXÙJBˆYˆ›Ý]šXÙVÈ™[˜X›Y—N‚ˆÙÙÚ[™Ëš[™›Êˆ‘\Ú[Û”ÛÛ\ˆ[™\\ˆ^ÛYY™XØ]\ÙH]\ÈX\šÙY\È™[[Ý™Yˆ\ÜÙ]ÚYI\È[™\\—ÚYI\È˜[YOI\È‹ˆ\ÜÙ]ÚYˆ]šXÙVÈ™^\›˜[Ù]šXÙWÚY—Kˆ]šXÙVÈ™]šXÙWÛ˜[YH—Kˆ
+BˆÛÛ[YBˆ]šXÙ\Ë˜\[™
+]šXÙJBˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ™]\›ˆÂˆœ›ÝšY\ˆŽˆ›ÝšY\‹ˆ˜ÛÛ™šYÈŽˆÛÛ™šYËˆ™[™Ú[ÈŽˆ[™Ú[ËˆœÙ\ÜÚ[ÛˆŽˆÙ\ÜÚ[Û‹ˆ™]šXÙ\ÈŽˆ]šXÙ\Ëˆš\ÝÜžWØØ[Ù[^WÜÙXÛÛ™ÈŽˆ\ÝÜžWØØ[Ù[^WÜÙXÛÛ™ËˆœÛY\\ˆŽˆÛY\\‹ˆB‚‚™YˆÞ[˜×Ù\Ú[ÛœÛÛ\—Ú[™\\—Ø]˜Z[Xš[]WÙ›Ü—Ù]JˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ\™Ù]Ù]Nˆ]Kˆ
+‹ˆÛÛ^ˆXÝÜÝ‹[žWH›Û™HH›Û™KŠHOˆXÝÜÝ‹[žWN‚ˆYˆ\™Ù]Ù]HHÝ\œ™[Û\Ø›Û—Ù]J
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠH\ÜÛšXš[YYH[\Ü˜[™\]Y\ˆ[HXH™XÚYËˆŠBˆÞ[˜×ØÛÛ^HÛÛ^Üˆ™\\™WÙ\Ú[ÛœÛÛ\—Ú[™\\—Ú\ÝÜžWØÛÛ^
+ÛÛ›ŠBˆ]šXÙ\ÈHÞ[˜×ØÛÛ^È™]šXÙ\È—BˆYˆ›Ý]šXÙ\Î‚ˆ™]\›ˆÈ™]HŽˆ\™Ù]Ù]Kš\ÛÙ›Ü›X]
+
+KœØ[\\ÈŽˆœ[ÈŽˆš[™\\œÈŽˆBˆžN‚ˆ\ÝÜžWÜ›ÝÜÈH™]ÚÙ\Ú[ÛœÛÛ\—Ù]šXÙWÚ\ÝÜžJˆÞ[˜×ØÛÛ^ÈœÙ\ÜÚ[Ûˆ—Kˆ˜\ÙWÝ\›\Þ[˜×ØÛÛ^È™[™Ú[È—VÈ˜˜\ÙWÝ\›—Kˆ[™Ú[\Þ[˜×ØÛÛ^È™[™Ú[È—VÈ™]šXÙWÚ\ÝÜžWÙ[™Ú[—Kˆ]šXÙ\ÏY]šXÙ\Ëˆ\™Ù]Ù]O]\™Ù]Ù]KˆØ[Ù[^WÜÙXÛÛ™ÏY›Ø]
+Þ[˜×ØÛÛ^™Ù]
+š\ÝÜžWØØ[Ù[^WÜÙXÛÛ™ÈŠHÜˆ
+KˆÛY\\\Þ[˜×ØÛÛ^™Ù]
+œÛY\\ˆŠHÜˆ[YKœÛY\ˆ
+Bˆ^Ù\^Ù\[ÛŽ‚ˆÙÙÚ[™Ë™^Ù\[ÛŠˆ‘\Ú[Û”ÛÛ\ˆ]šXÙH\ÝÜžH™\]Y\Ý˜Z[Yˆ\™Ù]Ù]OI\È[™Ú[I\È[™\\—ØÛÝ[I\È‹ˆ\™Ù]Ù]KˆÞ[˜×ØÛÛ^È™[™Ú[È—VÈ™]šXÙWÚ\ÝÜžWÙ[™Ú[—Kˆ[Š]šXÙ\ÊKˆ
+Bˆ˜Z\ÙB‚ˆ›ÝÈH]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠBˆ›ÜˆØ[\H[ˆ\ÝÜžWÜ›ÝÜÎ‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È[™\\—ÜÝÙ\—ÜØ[\\È
+ˆ\ÜÙ]ÚY›ÝšY\‹^\›˜[ÜÝ][Û—ÚY[™\\—ÚY[™\\—Û˜[YK[™\\—ÜÝÙ\—ÚÝËˆØ[\WÝ[YKXÝ]™WÜÝÙ\—ÚÝË˜]×Ü^[ØYÜ™X]YØ]ˆ
+HSQTÈ
+ËËËËËËËËËÊBˆÓˆÓÓ‘“PÕ
+›ÝšY\‹[™\\—ÚYØ[\WÝ[YJHÈTUHÑUˆ\ÜÙ]ÚYH^ÛYY˜\ÜÙ]ÚYˆ^\›˜[ÜÝ][Û—ÚYH^ÛYY™^\›˜[ÜÝ][Û—ÚYˆ[™\\—Û˜[YHH^ÛYYš[™\\—Û˜[YKˆ[™\\—ÜÝÙ\—ÚÝÈH^ÛYYš[™\\—ÜÝÙ\—ÚÝËˆXÝ]™WÜÝÙ\—ÚÝÈH^ÛYY˜XÝ]™WÜÝÙ\—ÚÝËˆ˜]×Ü^[ØYH^ÛYYœ˜]×Ü^[ØYˆˆˆ‹ˆ
+ˆØ[\VÈ˜\ÜÙ]ÚY—KˆÞ[˜×ØÛÛ^Èœ›ÝšY\ˆ—KˆØ[\VÈœÝ][Û—ØÛÙH—KˆØ[\VÈ™^\›˜[Ù]šXÙWÚY—KˆØ[\VÈ™]šXÙWÛ˜[YH—KˆØ[\VÈœ˜]YÜÝÙ\—ÚÝÈ—KˆØ[\VÈœØ[\WÝ[YH—Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆØ[\VÈ˜XÝ]™WÜÝÙ\—ÚÝÈ—KˆœÛÛ‹™[\ÊØ[\VÈœ˜]×Ü^[ØY—K[œÝ\™WØ\ØÚZOUYJKˆ›ÝËˆ
+Kˆ
+B‚ˆ[×ÝÜš][ˆHˆ]šXÙ\×ØžWØ\ÜÙ]ˆXÝÚ[\ÝÙXÝÜÝ‹[žWWWHHßBˆ›Üˆ]šXÙH[ˆ]šXÙ\Î‚ˆ]šXÙ\×ØžWØ\ÜÙ]œÙ]Y˜][
+[
+]šXÙVÈ˜\ÜÙ]ÚY—JK×JK˜\[™
+]šXÙJBˆ›Üˆ\ÜÙ]ÚY[Ù]šXÙ\È[ˆ]šXÙ\×ØžWØ\ÜÙ]š][\Ê
+N‚ˆÝÜ™YÜØ[\\ÈH]Y\žWØ[
+ˆÛÛ›‹ˆˆˆ‚ˆÑSPÕ[™\\—ÚYØ[\WÝ[YKXÝ]™WÜÝÙ\—ÚÝÂˆ”“ÓH[™\\—ÜÝÙ\—ÜØ[\\ÂˆÒT‘H\ÜÙ]ÚYHÈS‘›ÝšY\ˆHÈS‘Ø[\WÝ[YHHÈS‘Ø[\WÝ[YHÂˆˆˆ‹ˆ
+ˆ\ÜÙ]ÚYˆÞ[˜×ØÛÛ^Èœ›ÝšY\ˆ—Kˆ]][YK˜ÛÛXš[™J\™Ù]Ù]K]][YK›Z[‹[YJ
+JKš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆ]][YK˜ÛÛXš[™J\™Ù]Ù]H
+È[YY[J^\ÏLJK]][YK›Z[‹[YJ
+JKš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆ
+Kˆ
+BˆØ[\\×ØžWÚ[™\\ŽˆXÝÜÝ‹\ÝÙXÝÜÝ‹[žWWWHHßBˆ˜[YÜÛÝÎˆÙ]Ù]][YWHHÙ]
+
+Bˆ›Üˆ›ÝÈ[ˆÝÜ™YÜØ[\\Î‚ˆØ[\WÝ[YHH\œÙWÙ]][YWÝ˜[YJ›ÝÖÈœØ[\WÝ[YH—JBˆYˆØ[\WÝ[YH\È›Û™N‚ˆÛÛ[YBˆØ[\HHÈœØ[\WÝ[YHŽˆØ[\WÝ[YK˜XÝ]™WÜÝÙ\—ÚÝÈŽˆ›ÝÖÈ˜XÝ]™WÜÝÙ\—ÚÝÈ—_BˆØ[\\×ØžWÚ[™\\‹œÙ]Y˜][
+ÝŠ›ÝÖÈš[™\\—ÚY—JK×JK˜\[™
+Ø[\JBˆYˆ\×Ú[™\\—Ø]˜Z[X›J›ÝÖÈ˜XÝ]™WÜÝÙ\—ÚÝÈ—JN‚ˆ˜[YÜÛÝË˜Y
+[™\\—Ø]˜Z[Xš[]WÜÛÝ
+Ø[\WÝ[YJJB‚ˆÛÛ›‹™^XÝ]Jˆ‘SUH”“ÓH[™\\—Ø]˜Z[Xš[]WÙZ[HÒT‘H\ÜÙ]ÚYHÈS‘›ÝšY\ˆHÈS‘]˜Z[Xš[]WÙ]HHÈ‹ˆ
+\ÜÙ]ÚYÞ[˜×ØÛÛ^Èœ›ÝšY\ˆ—K\™Ù]Ù]Kš\ÛÙ›Ü›X]
+
+JKˆ
+Bˆ[™\\—Ü™\Ý[Îˆ\ÝÙXÝÜÝ‹[žWWHH×Bˆ›Üˆ]šXÙH[ˆ[Ù]šXÙ\Î‚ˆ]šXÙWÜØ[\\ÈHØ[\\×ØžWÚ[™\\‹™Ù]
+ÝŠ]šXÙVÈ™^\›˜[Ù]šXÙWÚY—JK×JBˆ™\Ý[HØ[Ý[]WÚ[™\\—ÙZ[WØ]˜Z[Xš[]Jˆ]šXÙWÜØ[\\Ëˆ˜[YÜÛÝËˆ
+Bˆ™\Ý[\]JˆÂˆ˜\ÜÙ]ÚYŽˆ\ÜÙ]ÚYˆš[™\\—ÚYŽˆ]šXÙVÈ™^\›˜[Ù]šXÙWÚY—Kˆš[™\\—Û˜[YHŽˆ]šXÙVÈ™]šXÙWÛ˜[YH—Kˆš[™\\—ÜÝÙ\—ÚÝÈŽˆ]šXÙVÈœ˜]YÜÝÙ\—ÚÝÈ—KˆBˆ
+Bˆ[™\\—Ü™\Ý[Ë˜\[™
+™\Ý[
+BˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È[™\\—Ø]˜Z[Xš[]WÙZ[H
+ˆ\ÜÙ]ÚY›ÝšY\‹]˜Z[Xš[]WÙ]K[™\\—ÚY[™\\—Û˜[YK[™\\—ÜÝÙ\—ÚÝËˆ˜[YÜÛÝË]˜Z[X›WÜÛÝË[˜]˜Z[X›WÜÛÝË]˜Z[Xš[]WÜÝÜ™X]YØ]\]YØ]ˆ
+HSQTÈ
+ËËËËËËËËËËËÊBˆÓˆÓÓ‘“PÕ
+›ÝšY\‹[™\\—ÚY]˜Z[Xš[]WÙ]JHÈTUHÑUˆ\ÜÙ]ÚYH^ÛYY˜\ÜÙ]ÚYˆ[™\\—Û˜[YHH^ÛYYš[™\\—Û˜[YKˆ[™\\—ÜÝÙ\—ÚÝÈH^ÛYYš[™\\—ÜÝÙ\—ÚÝËˆ˜[YÜÛÝÈH^ÛYY˜[YÜÛÝËˆ]˜Z[X›WÜÛÝÈH^ÛYY˜]˜Z[X›WÜÛÝËˆ[˜]˜Z[X›WÜÛÝÈH^ÛYY[˜]˜Z[X›WÜÛÝËˆ]˜Z[Xš[]WÜÝH^ÛYY˜]˜Z[Xš[]WÜÝˆ\]YØ]H^ÛYY\]YØ]ˆˆˆ‹ˆ
+ˆ\ÜÙ]ÚYˆÞ[˜×ØÛÛ^Èœ›ÝšY\ˆ—Kˆ\™Ù]Ù]Kš\ÛÙ›Ü›X]
+
+Kˆ]šXÙVÈ™^\›˜[Ù]šXÙWÚY—Kˆ]šXÙVÈ™]šXÙWÛ˜[YH—Kˆ]šXÙVÈœ˜]YÜÝÙ\—ÚÝÈ—Kˆ™\Ý[È˜[YÜÛÝÈ—Kˆ™\Ý[È˜]˜Z[X›WÜÛÝÈ—Kˆ™\Ý[È[˜]˜Z[X›WÜÛÝÈ—Kˆ™\Ý[È˜]˜Z[Xš[]WÜÝ—Kˆ›ÝËˆ›ÝËˆ
+Kˆ
+BˆÙZYÚYÜÝHØ[Ý[]WÝÙZYÚYÜ[Ø]˜Z[Xš[]J[™\\—Ü™\Ý[ÊBˆÛ\˜]YÝ˜[YÜÛÝÈH\WÚ[™\\—ÙYÙWÝÛ\˜[˜ÙJ˜[YÜÛÝÊBˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È[Ø]˜Z[Xš[]WÙZ[H
+ˆ\ÜÙ]ÚY›ÝšY\‹]˜Z[Xš[]WÙ]K˜[YÜÛÝËÙZYÚYØ]˜Z[Xš[]WÜÝˆ[™\\—ØÛÝ[Ü™X]YØ]\]YØ]ˆ
+HSQTÈ
+ËËËËËËËÊBˆÓˆÓÓ‘“PÕ
+›ÝšY\‹\ÜÙ]ÚY]˜Z[Xš[]WÙ]JHÈTUHÑUˆ˜[YÜÛÝÈH^ÛYY˜[YÜÛÝËˆÙZYÚYØ]˜Z[Xš[]WÜÝH^ÛYYÙZYÚYØ]˜Z[Xš[]WÜÝˆ[™\\—ØÛÝ[H^ÛYYš[™\\—ØÛÝ[ˆ\]YØ]H^ÛYY\]YØ]ˆˆˆ‹ˆ
+ˆ\ÜÙ]ÚYˆÞ[˜×ØÛÛ^Èœ›ÝšY\ˆ—Kˆ\™Ù]Ù]Kš\ÛÙ›Ü›X]
+
+Kˆ[ŠÛ\˜]YÝ˜[YÜÛÝÊKˆÙZYÚYÜÝˆ[Š[™\\—Ü™\Ý[ÊKˆ›ÝËˆ›ÝËˆ
+Kˆ
+Bˆ[×ÝÜš][ˆ
+ÏHBˆÙÙÚ[™Ëš[™›Êˆ‘\Ú[Û”ÛÛ\ˆ[™\\ˆ]˜Z[Xš[]HØ[Ý[]Yˆ\™Ù]Ù]OI\È\ÜÙ]ÚYI\È[™\\œÏI\È˜[YÜÛÝÏI\È]˜Z[Xš[]WÜÝI\È‹ˆ\™Ù]Ù]Kˆ\ÜÙ]ÚYˆ[Š[™\\—Ü™\Ý[ÊKˆ[ŠÛ\˜]YÝ˜[YÜÛÝÊKˆÙZYÚYÜÝˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ™]\›ˆÂˆ™]HŽˆ\™Ù]Ù]Kš\ÛÙ›Ü›X]
+
+KˆœØ[\\ÈŽˆ[Š\ÝÜžWÜ›ÝÜÊKˆœ[ÈŽˆ[×ÝÜš][‹ˆš[™\\œÈŽˆ[Š]šXÙ\ÊKˆB‚‚™YˆÞ[˜×Ù\Ú[ÛœÛÛ\—Ú[™\\—Ø]˜Z[Xš[]WÜ˜[™ÙJˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆœ›ÛWÙ]Nˆ]Kˆ×Ù]Nˆ]KŠHOˆXÝÜÝ‹[žWN‚ˆÛÛ^H™\\™WÙ\Ú[ÛœÛÛ\—Ú[™\\—Ú\ÝÜžWØÛÛ^
+ÛÛ›ŠBˆÝ[ÈHÈ™^\ÈŽˆœØ[\\ÈŽˆœ[ÈŽˆš[™\\œÈŽˆ[ŠÛÛ^È™]šXÙ\È—J_BˆÝ\œ™[Hœ›ÛWÙ]BˆÚ[HÝ\œ™[H×Ù]N‚ˆ™\Ý[HÞ[˜×Ù\Ú[ÛœÛÛ\—Ú[™\\—Ø]˜Z[Xš[]WÙ›Ü—Ù]JÛÛ›‹Ý\œ™[ÛÛ^XÛÛ^
+BˆÝ[ÖÈ™^\È—H
+ÏHBˆÝ[ÖÈœØ[\\È—H
+ÏH[
+™\Ý[ÈœØ[\\È—JBˆÝ[ÖÈœ[È—H
+ÏH[
+™\Ý[Èœ[È—JBˆÝ\œ™[
+ÏH[YY[J^\ÏLJBˆ™]\›ˆÝ[Â‚‚™YˆØYÛØØ[Ù\Ú[ÛœÛÛ\—ÝØ]Ù]šXÙ\ÊˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆ\™Ù]Ù]Nˆ]Kˆ\ÜÙ]ÚYÎˆ\ÝÚ[H›Û™HH›Û™KŠHOˆ\ÝÙXÝÜÝ‹[žWWN‚ˆ[œÝ\™WÜØ[\YØ]˜Z[Xš[]WÜØÚ[XJÛÛ›ŠBˆÛÛ™][ÛœÈHÂˆšœ›ÝšY\ˆHÈ‹ˆš™^XÝYHH‹ˆš˜[YÙœ›ÛHHÈ‹ˆŠ˜[YÝÈTÈ•SÔˆ˜[YÝÈHÊH‹ˆœ™]—Ý\WÚYSˆ
+KÎ
+H‹ˆBˆ\˜[\Îˆ\ÝÐ[žWHHÂˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ˆ\™Ù]Ù]Kš\ÛÙ›Ü›X]
+
+Kˆ\™Ù]Ù]Kš\ÛÙ›Ü›X]
+
+KˆBˆYˆ\ÜÙ]ÚYÎ‚ˆXÙZÛ\œÈH‹‹š›Ú[ŠÈˆ›ÜˆÈ[ˆ\ÜÙ]ÚYÊBˆÛÛ™][ÛœË˜\[™
+ˆš˜\ÜÙ]ÚYSˆ
+ÜXÙZÛ\œßJHŠBˆ\˜[\Ë™^[™
+ÛÜY
+Ù]
+\ÜÙ]ÚYÊJJBˆ›ÝÜÈHÛÛ›‹™^XÝ]Jˆˆˆˆ‚ˆÑSPÕˆšYTÈ›ÝšY\—Ù]šXÙWÚYˆ˜\ÜÙ]ÚYˆœÝ][Û—ØÛÙKˆ™^\›˜[Ù]šXÙWÚYˆ™]—Ù‹ˆœÛ‹ˆ™]šXÙWÛ˜[YKˆ™]—Ý\WÚYˆ›[Ù[ˆœ˜]YÜÝÙ\—ÚÝËˆ\]YØ]ˆ”“ÓH›ÝšY\—Ù]šXÙWØÛÛ™šYÝ\˜][Û—Ú\ÝÜžHˆ“ÒSˆ›ÝšY\—Ù]šXÙ\ÈÓˆšYHœ›ÝšY\—Ù]šXÙWÚYˆÒT‘HÉÈS‘	Ëš›Ú[ŠÛÛ™][ÛœÊ_BˆÔ‘Tˆ–H˜\ÜÙ]ÚY™^\›˜[Ù]šXÙWÚYˆˆˆ‹ˆ\˜[\Ëˆ
+K™™]Ú[
+
+Bˆ™]\›ˆÙXÝ
+›ÝÊH›Üˆ›ÝÈ[ˆ›ÝÜ×B‚‚™Yˆ\Ú[ÛœÛÛ\—Ù]šXÙWØØ][Ù×Ú\×ÜÝ[JˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆ›ÝÎˆ]][YH›Û™HH›Û™KŠHOˆ›ÛÛ‚ˆ›ÝÈHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕÓÕS•
+
+ŠHTÈÝ[PV
+\]YØ]
+HTÈ\ÝÝ\]YØ]ˆ”“ÓH›ÝšY\—Ù]šXÙ\ÂˆÒT‘H›ÝšY\ˆHÈS‘]—Ý\WÚYSˆ
+KÎ
+Bˆˆˆ‹ˆ
+S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ[
+›ÝÖÈÝ[—HÜˆ
+HOH‚ˆ™]\›ˆYBˆ\ÝÝ\]YH\œÙWØ˜XÚÙÜ›Ý[™Ú›Ø—Ý[Y\Ý[\
+›ÝÖÈ›\ÝÝ\]YØ]—JBˆYˆ\ÝÝ\]Y\È›Û™N‚ˆ™]\›ˆYBˆ›Ý×Ý]ÈH\×Ø˜XÚÙÜ›Ý[™Ú›Ø—Ý]Ê›ÝÈÜˆ˜XÚÙÜ›Ý[™Ú›Ø—Ý]×Û›ÝÊ
+JBˆ™]\›ˆ›Ý×Ý]ÈH\ÝÝ\]Yˆ[YY[JÝ\œÏL
+B‚‚™YˆZ\ÜÚ[™×ÝØ]Ù]šXÙ\×Ù›Ü—Ù]JˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆ\™Ù]Ù]Nˆ]Kˆ]šXÙ\Îˆ\ÝÙXÝÜÝ‹[žWWKŠHOˆ\VÛ\ÝÙXÝÜÝ‹[žWWK[N‚ˆYˆ›Ý]šXÙ\Î‚ˆ™]\›ˆ×KˆÝ\H]][YK˜ÛÛXš[™J\™Ù]Ù]K]][YK›Z[‹[YJ
+JKš\ÛÙ›Ü›X]
+ˆ[Y\ÜXÏHœÙXÛÛ™È‚ˆ
+Bˆ[™H]][YK˜ÛÛXš[™Jˆ\™Ù]Ù]H
+È[YY[J^\ÏLJKˆ]][YK›Z[‹[YJ
+Kˆ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠBˆ›ÝÜÈHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕ[™\\—ÚYØ[\WÝ[YKXÝ]™WÜÝÙ\—ÚÝÂˆ”“ÓH[™\\—ÜÝÙ\—ÜØ[\\ÂˆÒT‘H›ÝšY\ˆHÈS‘Ø[\WÝ[YHHÈS‘Ø[\WÝ[YHÂˆÔ‘Tˆ–HØ[\WÝ[YBˆˆˆ‹ˆ
+S•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹Ý\[™
+Kˆ
+K™™]Ú[
+
+Bˆ˜[YÜÛÝÎˆÙ]Ù]][YWHHÙ]
+
+BˆØœÙ\™YØžWÚ[™\\ŽˆXÝÜÝ‹Ù]Ù]][YWWHHßBˆ›Üˆ›ÝÈ[ˆ›ÝÜÎ‚ˆØ[\WÝ[YHH\œÙWÙ]][YWÝ˜[YJ›ÝÖÈœØ[\WÝ[YH—JBˆYˆØ[\WÝ[YH\È›Û™N‚ˆÛÛ[YBˆÛÝH[™\\—Ø]˜Z[Xš[]WÜÛÝ
+Ø[\WÝ[YJBˆØœÙ\™YØžWÚ[™\\‹œÙ]Y˜][
+ˆÝŠ›ÝÖÈš[™\\—ÚY—JKˆÙ]
+
+Kˆ
+K˜Y
+ÛÝ
+BˆYˆ\×Ú[™\\—Ø]˜Z[X›J›ÝÖÈ˜XÝ]™WÜÝÙ\—ÚÝÈ—JN‚ˆ˜[YÜÛÝË˜Y
+ÛÝ
+BˆÛÛœÚY\™YÜÛÝÈH\WÚ[™\\—ÙYÙWÝÛ\˜[˜ÙJ˜[YÜÛÝÊBˆYˆ›ÝÛÛœÚY\™YÜÛÝÎ‚ˆ™]\›ˆ\Ý
+]šXÙ\ÊKˆZ\ÜÚ[™ÈHÂˆ]šXÙBˆ›Üˆ]šXÙH[ˆ]šXÙ\ÂˆYˆ›ÝÛÛœÚY\™YÜÛÝËš\ÜÝXœÙ]
+ˆØœÙ\™YØžWÚ[™\\‹™Ù]
+ˆÝŠ]šXÙVÈ™^\›˜[Ù]šXÙWÚY—JKˆÙ]
+
+Kˆ
+Bˆ
+BˆBˆ™]\›ˆZ\ÜÚ[™Ë[ŠÛÛœÚY\™YÜÛÝÊB‚‚™YˆÝÜ™WÙ\Ú[ÛœÛÛ\—ÝØ]Ú\ÝÜžWØ˜]Ú
+ˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆØ[\\Îˆ\ÝÙXÝÜÝ‹[žWWKˆ›ÝšY\ŽˆÝˆHS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ŠHOˆ[‚ˆ›ÝÈHÙ\šX[^™WØ˜XÚÙÜ›Ý[™Ú›Ø—Ý[Y\Ý[\
+
+Bˆ›ÜˆØ[\H[ˆØ[\\Î‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È[™\\—ÜÝÙ\—ÜØ[\\È
+ˆ\ÜÙ]ÚY›ÝšY\‹^\›˜[ÜÝ][Û—ÚY[™\\—ÚYˆ[™\\—Û˜[YK[™\\—ÜÝÙ\—ÚÝËØ[\WÝ[YKˆXÝ]™WÜÝÙ\—ÚÝË˜]×Ü^[ØYÜ™X]YØ]ˆ
+HSQTÈ
+ËËËËËËËËËÊBˆÓˆÓÓ‘“PÕ
+›ÝšY\‹[™\\—ÚYØ[\WÝ[YJHÈTUHÑUˆ\ÜÙ]ÚYH^ÛYY˜\ÜÙ]ÚYˆ^\›˜[ÜÝ][Û—ÚYH^ÛYY™^\›˜[ÜÝ][Û—ÚYˆ[™\\—Û˜[YHH^ÛYYš[™\\—Û˜[YKˆ[™\\—ÜÝÙ\—ÚÝÈH^ÛYYš[™\\—ÜÝÙ\—ÚÝËˆXÝ]™WÜÝÙ\—ÚÝÈH^ÛYY˜XÝ]™WÜÝÙ\—ÚÝËˆ˜]×Ü^[ØYH^ÛYYœ˜]×Ü^[ØYˆˆˆ‹ˆ
+ˆØ[\VÈ˜\ÜÙ]ÚY—Kˆ›ÝšY\‹ˆØ[\VÈœÝ][Û—ØÛÙH—KˆØ[\VÈ™^\›˜[Ù]šXÙWÚY—KˆØ[\VÈ™]šXÙWÛ˜[YH—KˆØ[\VÈœ˜]YÜÝÙ\—ÚÝÈ—KˆØ[\VÈœØ[\WÝ[YH—Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆØ[\VÈ˜XÝ]™WÜÝÙ\—ÚÝÈ—KˆœÛÛ‹™[\ÊØ[\VÈœ˜]×Ü^[ØY—K[œÝ\™WØ\ØÚZOUYJKˆ›ÝËˆ
+Kˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ™]\›ˆ[ŠØ[\\ÊB‚‚™Yˆ\]WØÝ\œ™[Ø˜XÚÙÜ›Ý[™Ú›Ø—ØÚXÚÜÚ[
+ˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ\]\ÎˆXÝÜÝ‹[žWKŠHOˆXÝÜÝ‹[žWN‚ˆÛÛ^H“ÑPÕSÓ—ÒÔWÐÐSÐÓÓ•V™Ù]
+
+BˆYˆ›ÝÛÛ^‚ˆ™]\›ˆßBˆ›Ø—ÚYH[
+ÛÛ^Èš›Ø—ÚY—JBˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕ\˜[\×ÚœÛÛˆ”“ÓH˜XÚÙÜ›Ý[™Ú›ØœÈÒT‘HYHÈ‹ˆ
+›Ø—ÚY
+Kˆ
+K™™]ÚÛ™J
+Bˆ\˜[\ÈHXÛÙWÚ›Ø—Ü\˜[\Ê›ÝÖÈœ\˜[\×ÚœÛÛˆ—HYˆ›ÝÈ[ÙHžßHŠBˆ\˜[\Ë\]J\]\ÊBˆÛÛ›‹™^XÝ]Jˆ•TUH˜XÚÙÜ›Ý[™Ú›ØœÈÑU\˜[\×ÚœÛÛˆHÈÒT‘HYHÈ‹ˆ
+[˜ÛÙWÚ›Ø—Ü\˜[\Ê\˜[\ÊK›Ø—ÚY
+Kˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ™]\›ˆ\˜[\Â‚‚™Yˆ[—Ü™\Ý[XX›WÙ\Ú[ÛœÛÛ\—ÝØ]Ø˜XÚÙš[
+ˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆœ›ÛWÙ]Nˆ]Kˆ×Ù]Nˆ]KŠHOˆXÝÜÝ‹[žWN‚ˆÛÛ^H“ÑPÕSÓ—ÒÔWÐÐSÐÓÓ•V™Ù]
+
+HÜˆßBˆ›Ø—ÚYH[
+ÛÛ^™Ù]
+š›Ø—ÚYŠHÜˆ
+Bˆ›ØˆHÛÛ›‹™^XÝ]Jˆ”ÑSPÕ\˜[\×ÚœÛÛˆ”“ÓH˜XÚÙÜ›Ý[™Ú›ØœÈÒT‘HYHÈ‹ˆ
+›Ø—ÚY
+Kˆ
+K™™]ÚÛ™J
+Bˆ\˜[\ÈHXÛÙWÚ›Ø—Ü\˜[\Ê›Ø–Èœ\˜[\×ÚœÛÛˆ—HYˆ›Øˆ[ÙHžßHŠBˆÝ\œÛÜ—Ù]HH
+ˆ\œÙWÙ]WÝ˜[YJÝŠ\˜[\Ë™Ù]
+˜Ý\œÛÜ—Ù]HŠHÜˆˆŠJBˆÜˆœ›ÛWÙ]Bˆ
+Bˆ\ÜÙ]ÚYÈHÂˆ[
+˜[YJBˆ›Üˆ˜[YH[ˆ\˜[\Ë™Ù]
+˜\ÜÙ]ÚYÈŠHÜˆ×BˆYˆÝŠ˜[YJKš\ÙYÚ]
+
+BˆBˆ][\YÚYÈHÂˆÝŠ˜[YJBˆ›Üˆ˜[YH[ˆ\˜[\Ë™Ù]
+˜][\YÚ[™\\—ÚYÈŠHÜˆ×BˆYˆÝŠ˜[YJBˆBˆÝ[[X\žNˆXÝÜÝ‹[žWHHÂˆ™^\ÈŽˆˆœØ[\\ÈŽˆˆœ[ÈŽˆˆš[™\\œÈŽˆˆ˜\WØØ[×Ý\ÙYŽˆˆ™^\×Ü™XØ[Ý[]YÙœ›ÛWÙˆŽˆˆœ™\Ý[YWÚ[ŽˆÝ\œÛÜ—Ù]Kš\ÛÙ›Ü›X]
+
+KˆœÝÜYÜ™X\ÛÛˆŽˆˆ‹ˆB‚ˆYˆ\Ú[ÛœÛÛ\—Ù]šXÙWØØ][Ù×Ú\×ÜÝ[JÛÛ›ŠN‚ˆ™Yœ™\ÚYH™\\™WÙ\Ú[ÛœÛÛ\—Ú[™\\—Ú\ÝÜžWØÛÛ^
+ˆÛÛ›‹ˆ\ÝÜžWØØ[Ù[^WÜÙXÛÛ™ÏLˆÛY\\[[X™HÜÙXÛÛ™Îˆ›Û™Kˆ
+BˆÝ][Û—ØÚ[šÜÈHX^
+ˆKˆX]˜ÙZ[
+ˆ[ŠˆÂˆÝŠ]šXÙVÈœÝ][Û—ØÛÙH—JBˆ›Üˆ]šXÙH[ˆ™Yœ™\ÚYÈ™]šXÙ\È—BˆYˆ]šXÙK™Ù]
+œÝ][Û—ØÛÙHŠBˆBˆ
+BˆÈLˆ
+Kˆ
+BˆÝ[[X\žVÈ˜\WØØ[×Ý\ÙY—H
+ÏHÝ][Û—ØÚ[šÜÈ
+ˆ‚‚ˆÝ\œ™[HÝ\œÛÜ—Ù]BˆÚ[HÝ\œ™[H×Ù]N‚ˆ]šXÙ\ÈHØYÛØØ[Ù\Ú[ÛœÛÛ\—ÝØ]Ù]šXÙ\ÊˆÛÛ›‹ˆ\™Ù]Ù]OXÝ\œ™[ˆ\ÜÙ]ÚYÏX\ÜÙ]ÚYÈÜˆ›Û™Kˆ
+BˆÝ[[X\žVÈš[™\\œÈ—HH[Š]šXÙ\ÊBˆ™XØ[Ý[]WÜÝÜ™YÚ[™\\—Ø]˜Z[Xš[]JˆÛÛ›‹ˆÝ\œ™[ˆÝ\œ™[ˆ
+BˆZ\ÜÚ[™×Ù]šXÙ\Ë˜[YÜÛÝÈHZ\ÜÚ[™×ÝØ]Ù]šXÙ\×Ù›Ü—Ù]JˆÛÛ›‹ˆ\™Ù]Ù]OXÝ\œ™[ˆ]šXÙ\ÏY]šXÙ\Ëˆ
+BˆYˆ›ÝZ\ÜÚ[™×Ù]šXÙ\Î‚ˆÝ[[X\žVÈ™^\È—H
+ÏHBˆÝ[[X\žVÈ™^\×Ü™XØ[Ý[]YÙœ›ÛWÙˆ—H
+ÏHBˆÝ[[X\žVÈœ[È—H
+ÏH[ŠˆÚ[
+]šXÙVÈ˜\ÜÙ]ÚY—JH›Üˆ]šXÙH[ˆ]šXÙ\ßBˆ
+BˆÝ\œ™[
+ÏH[YY[J^\ÏLJBˆ][\YÚYÈHÙ]
+
+Bˆ\]WØÝ\œ™[Ø˜XÚÙÜ›Ý[™Ú›Ø—ØÚXÚÜÚ[
+ˆÛÛ›‹ˆÂˆ˜Ý\œÛÜ—Ù]HŽˆÝ\œ™[š\ÛÙ›Ü›X]
+
+Kˆ˜][\YÚ[™\\—ÚYÈŽˆ×KˆKˆ
+BˆÛÛ[YB‚ˆ[™[™×Ù]šXÙ\ÈHÂˆ]šXÙBˆ›Üˆ]šXÙH[ˆZ\ÜÚ[™×Ù]šXÙ\ÂˆYˆÝŠ]šXÙVÈ™^\›˜[Ù]šXÙWÚY—JH›Ý[ˆ][\YÚYÂˆBˆYˆ›Ý[™[™×Ù]šXÙ\Î‚ˆÝ[[X\žVÈ™^\È—H
+ÏHBˆÝ[[X\žVÈœÝÜYÜ™X\ÛÛˆ—HH
+ˆØ]Ú\ÝÜžWÚ[˜ÛÛ\]WØY\—Ü™Yœ™\Ú‚ˆYˆ˜[YÜÛÝÂˆ[ÙH››×ÛØœÙ\™YÛÜ\˜][™×ÝÚ[™ÝÈ‚ˆ
+BˆÝ\œ™[
+ÏH[YY[J^\ÏLJBˆ][\YÚYÈHÙ]
+
+Bˆ\]WØÝ\œ™[Ø˜XÚÙÜ›Ý[™Ú›Ø—ØÚXÚÜÚ[
+ˆÛÛ›‹ˆÂˆ˜Ý\œÛÜ—Ù]HŽˆÝ\œ™[š\ÛÙ›Ü›X]
+
+Kˆ˜][\YÚ[™\\—ÚYÈŽˆ×KˆKˆ
+BˆÛÛ[YB‚ˆ˜]ÚH[™[™×Ù]šXÙ\ÖÎŒLBˆÛÛ™šYÈHÙ]Ú[YÜ˜][Û—ØÛÛ™šYÊˆÛÛ›‹ˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ˆ
+BˆYˆÛÛ™šYÈ\È›Û™N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠÛÛ™šYÝ\˜XØ[È\Ú[Û”ÛÛ\ˆ[™\ÜÛš]™[ˆŠBˆ[™Ú[ÈHÙ]Ù\Ú[ÛœÛÛ\—Ù[™Ú[ØÛÛ™šYÊÛÛ™šYÊBˆÛÛ›‹˜ÛÛ[Z]
+
+BˆÙ\ÜÚ[Û‹ÝÚÙ[ˆHÙ]Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[ÛŠÛÛ™šYÊBˆ\ÝÜžWÜ›ÝÜÈH™]ÚÙ\Ú[ÛœÛÛ\—Ù]šXÙWÚ\ÝÜžJˆÙ\ÜÚ[Û‹ˆ˜\ÙWÝ\›Y[™Ú[ÖÈ˜˜\ÙWÝ\›—Kˆ[™Ú[Y[™Ú[ÖÈ™]šXÙWÚ\ÝÜžWÙ[™Ú[—Kˆ]šXÙ\ÏX˜]Úˆ\™Ù]Ù]OXÝ\œ™[ˆØ[Ù[^WÜÙXÛÛ™ÏLˆÛY\\[[X™HÜÙXÛÛ™Îˆ›Û™Kˆ
+BˆÝ[[X\žVÈ˜\WØØ[×Ý\ÙY—H
+ÏHBˆÝ[[X\žVÈœØ[\\È—H
+ÏHÝÜ™WÙ\Ú[ÛœÛÛ\—ÝØ]Ú\ÝÜžWØ˜]Ú
+ˆÛÛ›‹ˆØ[\\ÏZ\ÝÜžWÜ›ÝÜËˆ
+Bˆ][\YÚYË\]JˆÝŠ]šXÙVÈ™^\›˜[Ù]šXÙWÚY—JH›Üˆ]šXÙH[ˆ˜]Úˆ
+Bˆ™XØ[Ý[]WÜÝÜ™YÚ[™\\—Ø]˜Z[Xš[]JˆÛÛ›‹ˆÝ\œ™[ˆÝ\œ™[ˆ
+Bˆ\]WØÝ\œ™[Ø˜XÚÙÜ›Ý[™Ú›Ø—ØÚXÚÜÚ[
+ˆÛÛ›‹ˆÂˆ˜Ý\œÛÜ—Ù]HŽˆÝ\œ™[š\ÛÙ›Ü›X]
+
+Kˆ˜][\YÚ[™\\—ÚYÈŽˆÛÜY
+][\YÚYÊKˆKˆ
+BˆÝ[[X\žVÈœ™\Ý[YWÚ[—HHÝ\œ™[š\ÛÙ›Ü›X]
+
+Bˆ˜Z\ÙH\TÛÝ[˜]˜Z[X›Q\œ›ÜŠˆ›ÝšY\RS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ˆXØÛÝ[ÚÙ^OY\Ú[ÛœÛÛ\—ØXØÛÝ[ÚÙ^JÛÛ™šYÊKˆ\WØ\™XOUÐUÒTÕÔ–WÐT‘PKˆ™^Ø][\Ø]Y]][YK››ÝÊTÐ“Ó—ÕSQV“Ó‘JBˆ
+È[YY[JÙXÛÛ™ÏLJKˆØZ]Ü™X\ÛÛH˜ÚXÚÜÚ[‹ˆY\ÜØYÙOH“ÝHÐUÝX\™YÎÈ›Øˆ™\\˜YÈ\˜HÈÝHÙYÝZ[Kˆ‹ˆ›Ø—Ü™\Ý[\Ý[[X\žKˆ
+B‚ˆÝ[[X\žVÈœ™\Ý[YWÚ[—HHˆ‚ˆ™]\›ˆÝ[[X\žB‚‚™Yˆ[—Ù\Ú[ÛœÛÛ\—Ú[™\\—Ø]˜Z[Xš[]WØ˜XÚÙš[
+ˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ
+‹ˆœ›ÛWÙ]Nˆ]Kˆ×Ù]Nˆ]KˆÛY\\Žˆ[žHH[YKœÛY\ˆ\ÝÜžWØØ[Ù[^WÜÙXÛÛ™Îˆ›Ø]H•TÒSÓ”ÓÓT—ÔT‘“Ô“PSÑWÒÔWÑSVWÔÑPÓÓ‘ËˆX^ÝØZ]ØÞXÛ\Îˆ[HŠHOˆXÝÜÝ‹[žWN‚ˆYˆœ›ÛWÙ]Hˆ×Ù]HÜˆ×Ù]HHÝ\œ™[Û\Ø›Û—Ù]J
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ“È˜XÚÙš[ÐU™\]Y\ˆ[H[\˜[È˜[YÈHX\È™XÚYÜËˆŠBˆYˆ“ÑPÕSÓ—ÒÔWÐÐSÐÓÓ•V™Ù]
+
+H\È›Ý›Û™N‚ˆ™]\›ˆ[—Ü™\Ý[XX›WÙ\Ú[ÛœÛÛ\—ÝØ]Ø˜XÚÙš[
+ˆÛÛ›‹ˆœ›ÛWÙ]OYœ›ÛWÙ]Kˆ×Ù]O]×Ù]Kˆ
+BˆÝ[[X\žNˆXÝÜÝ‹[žWHHÂˆ™^\ÈŽˆˆœØ[\\ÈŽˆˆœ[ÈŽˆˆš[™\\œÈŽˆˆ˜\WÙ\œ›ÜœÈŽˆˆØZ]ØÞXÛ\ÈŽˆˆœ™\Ý[YWÚ[Žˆœ›ÛWÙ]Kš\ÛÙ›Ü›X]
+
+KˆœÝÜYÜ™X\ÛÛˆŽˆˆ‹ˆB‚ˆYˆØZ]ØY\—Ü˜]WÛ[Z]
+™X\ÛÛŽˆÝ‹™\Ý[YWÙ]Nˆ]JHOˆ›ÛÛ‚ˆÝ[[X\žVÈØZ]ØÞXÛ\È—H
+ÏHBˆÝ[[X\žVÈœ™\Ý[YWÚ[—HH™\Ý[YWÙ]Kš\ÛÙ›Ü›X]
+
+BˆYˆÝ[[X\žVÈØZ]ØÞXÛ\È—HˆX^ÝØZ]ØÞXÛ\Î‚ˆÝ[[X\žVÈœÝÜYÜ™X\ÛÛˆ—HHˆ“[Z]H\Ú[Û”ÛÛ\ˆ™\]YÈ[X\ÚXY\È™^™\Ëˆ[[[È\ÝYÎˆÜ™X\ÛÛŸH‚ˆÙÙÚ[™ËØ\›š[™Êˆ‘\Ú[Û”ÛÛ\ˆÐU˜XÚÙš[ÝÜYY\ˆ™\X]YÛÛÛÝÛœÎˆ™\Ý[YWÙ]OI\ÈØZ]ØÞXÛ\ÏI\È™X\ÛÛI\È‹ˆ™\Ý[YWÙ]KˆÝ[[X\žVÈØZ]ØÞXÛ\È—Kˆ™X\ÛÛ‹ˆ
+Bˆ™]\›ˆ˜[ÙBˆÛÛ›‹˜ÛÛ[Z]
+
+BˆÙXÛÛ™ÈH\Ú[ÛœÛÛ\—ØÛÛÛÝÛ—ÜÛY\ÜÙXÛÛ™ÊÛÛ›ŠBˆÙÙÚ[™ËØ\›š[™Êˆ‘\Ú[Û”ÛÛ\ˆÐU˜XÚÙš[ØZ][™È›ÜˆTHÛÛÛÝÛŽˆ™\Ý[YWÙ]OI\ÈÙXÛÛ™ÏI\ÈØZ]ØÞXÛOI\È‹ˆ™\Ý[YWÙ]KˆÙXÛÛ™ËˆÝ[[X\žVÈØZ]ØÞXÛ\È—Kˆ
+BˆÛY\\ŠÙXÛÛ™ÊBˆÛX\—Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]ØÛÛÛÝÛŠÛÛ›ŠBˆ™]\›ˆYB‚ˆYˆ™\\™WØÛÛ^
+›Ü˜ÙWÛÙÚ[Žˆ›ÛÛH˜[ÙJHOˆXÝÜÝ‹[žWH›Û™N‚ˆÚ[HYN‚ˆžN‚ˆ™]\›ˆ™\\™WÙ\Ú[ÛœÛÛ\—Ú[™\\—Ú\ÝÜžWØÛÛ^
+ˆÛÛ›‹ˆ›Ü˜ÙWÛÙÚ[Y›Ü˜ÙWÛÙÚ[‹ˆ\ÝÜžWØØ[Ù[^WÜÙXÛÛ™ÏZ\ÝÜžWØØ[Ù[^WÜÙXÛÛ™ËˆÛY\\\ÛY\\‹ˆ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÝ[[X\žVÈ˜\WÙ\œ›ÜœÈ—H
+ÏHBˆYˆ\Ú[œÝ[˜ÙJ^Ë\T˜]S[Z]\œ›ÜŠN‚ˆ˜Z\ÙBˆYˆ\×Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]Ù\œ›ÜŠ^ÊN‚ˆ™X\ÛÛˆHX\š×Ù\Ú[ÛœÛÛ\—Ü\™›Ü›X[˜ÙWÜ˜]WÛ[Z]Y
+ÛÛ›ŠBˆYˆ›ÝØZ]ØY\—Ü˜]WÛ[Z]
+™X\ÛÛ‹œ›ÛWÙ]JN‚ˆ™]\›ˆ›Û™Bˆ›Ü˜ÙWÛÙÚ[ˆHYBˆÛÛ[YBˆYˆ\×Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[Û—Ù^\™YÙ\œ›ÜŠ^ÊN‚ˆ›Ü˜ÙWÛÙÚ[ˆHYBˆÛÛ[YBˆ˜Z\ÙB‚ˆÛÛÛÝÛ—Ü™X\ÛÛˆHÙ]Ù\Ú[ÛœÛÛ\—Ü\™›Ü›X[˜ÙWØÛÛÛÝÛ—Ü™X\ÛÛŠÛÛ›ŠBˆYˆÛÛÛÝÛ—Ü™X\ÛÛˆ[™›ÝØZ]ØY\—Ü˜]WÛ[Z]
+ÛÛÛÝÛ—Ü™X\ÛÛ‹œ›ÛWÙ]JN‚ˆ™]\›ˆÝ[[X\žBˆÛÛ^H™\\™WØÛÛ^
+
+BˆYˆÛÛ^\È›Û™N‚ˆ™]\›ˆÝ[[X\žBˆÝ[[X\žVÈš[™\\œÈ—HH[ŠÛÛ^È™]šXÙ\È—JB‚ˆÝ\œ™[Hœ›ÛWÙ]BˆÚ[HÝ\œ™[H×Ù]N‚ˆÙ\ÜÚ[Û—Ü™]žWÝ\ÙYH˜[ÙBˆÚ[HYN‚ˆžN‚ˆÙÙÚ[™Ëš[™›Ê‘\Ú[Û”ÛÛ\ˆÐU˜XÚÙš[^HÝ\Yˆ\™Ù]Ù]OI\È‹Ý\œ™[
+Bˆ™\Ý[HÞ[˜×Ù\Ú[ÛœÛÛ\—Ú[™\\—Ø]˜Z[Xš[]WÙ›Ü—Ù]JÛÛ›‹Ý\œ™[ÛÛ^XÛÛ^
+BˆÝÜ™YØÛÝ[ÈHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕˆ
+ÑSPÕÓÕS•
+
+ŠH”“ÓH[™\\—ÜÝÙ\—ÜØ[\\ÂˆÒT‘H›ÝšY\ˆHÈS‘Ø[\WÝ[YHHÈS‘Ø[\WÝ[YHÊHTÈÝÙ\—ÜØ[\\Ëˆ
+ÑSPÕÓÕS•
+
+ŠH”“ÓH[™\\—Ø]˜Z[Xš[]WÙZ[BˆÒT‘H›ÝšY\ˆHÈS‘]˜Z[Xš[]WÙ]HHÊHTÈ[™\\—ÙZ[WÜ›ÝÜËˆ
+ÑSPÕÓÕS•
+
+ŠH”“ÓH[Ø]˜Z[Xš[]WÙZ[BˆÒT‘H›ÝšY\ˆHÈS‘]˜Z[Xš[]WÙ]HHÊHTÈ[ÙZ[WÜ›ÝÜÂˆˆˆ‹ˆ
+ˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ˆ]][YK˜ÛÛXš[™JÝ\œ™[]][YK›Z[‹[YJ
+JKš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆ]][YK˜ÛÛXš[™JÝ\œ™[
+È[YY[J^\ÏLJK]][YK›Z[‹[YJ
+JKš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ˆÝ\œ™[š\ÛÙ›Ü›X]
+
+KˆS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‹ˆÝ\œ™[š\ÛÙ›Ü›X]
+
+Kˆ
+Kˆ
+K™™]ÚÛ™J
+BˆÝ[[X\žVÈ™^\È—H
+ÏHBˆÝ[[X\žVÈœØ[\\È—H
+ÏH[
+™\Ý[ÈœØ[\\È—JBˆÝ[[X\žVÈœ[È—H
+ÏH[
+™\Ý[Èœ[È—JBˆÝ[[X\žVÈœ™\Ý[YWÚ[—HH
+Ý\œ™[
+È[YY[J^\ÏLJJKš\ÛÙ›Ü›X]
+
+BˆÛÛ›‹˜ÛÛ[Z]
+
+BˆÙÙÚ[™Ëš[™›Êˆ‘\Ú[Û”ÛÛ\ˆÐU˜XÚÙš[^HÛÛ\]Yˆ\™Ù]Ù]OI\È™]ÚYÜØ[\\ÏI\È‚ˆœÝÜ™YÜÝÙ\—ÜØ[\\ÏI\ÈÝÜ™YÚ[™\\—ÙZ[OI\ÈÝÜ™YÜ[ÙZ[OI\È[ÏI\È[™\\œÏI\È‹ˆÝ\œ™[ˆ™\Ý[ÈœØ[\\È—KˆÝÜ™YØÛÝ[ÖÈœÝÙ\—ÜØ[\\È—KˆÝÜ™YØÛÝ[ÖÈš[™\\—ÙZ[WÜ›ÝÜÈ—KˆÝÜ™YØÛÝ[ÖÈœ[ÙZ[WÜ›ÝÜÈ—Kˆ™\Ý[Èœ[È—Kˆ™\Ý[Èš[™\\œÈ—Kˆ
+Bˆœ™XZÂˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÝ[[X\žVÈ˜\WÙ\œ›ÜœÈ—H
+ÏHBˆYˆ\Ú[œÝ[˜ÙJ^Ë\T˜]S[Z]\œ›ÜŠN‚ˆ˜Z\ÙBˆYˆ\×Ù\Ú[ÛœÛÛ\—Ü˜]WÛ[Z]Ù\œ›ÜŠ^ÊN‚ˆ™X\ÛÛˆHX\š×Ù\Ú[ÛœÛÛ\—Ü\™›Ü›X[˜ÙWÜ˜]WÛ[Z]Y
+ÛÛ›ŠBˆYˆ›ÝØZ]ØY\—Ü˜]WÛ[Z]
+™X\ÛÛ‹Ý\œ™[
+N‚ˆ™]\›ˆÝ[[X\žBˆÛÛ[YBˆYˆ\×Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[Û—Ù^\™YÙ\œ›ÜŠ^ÊH[™›ÝÙ\ÜÚ[Û—Ü™]žWÝ\ÙY‚ˆÙ\ÜÚ[Û—Ü™]žWÝ\ÙYHYBˆ[˜[Y]WÙ\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[ÛŠÛÛ^È˜ÛÛ™šYÈ—JBˆ™Yœ™\ÚYH™\\™WØÛÛ^
+›Ü˜ÙWÛÙÚ[UYJBˆYˆ™Yœ™\ÚY\È›Û™N‚ˆ™]\›ˆÝ[[X\žBˆÛÛ^H™Yœ™\ÚYˆÛÛ[YBˆ˜Z\ÙBˆÝ\œ™[
+ÏH[YY[J^\ÏLJBˆÝ[[X\žVÈœ™\Ý[YWÚ[—HHˆ‚ˆ™]\›ˆÝ[[X\žB‚‚™Yˆ™XØ[Ý[]WÜÝÜ™YÚ[™\\—Ø]˜Z[Xš[]JˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆœ›ÛWÙ]Nˆ]Kˆ×Ù]Nˆ]Kˆ
+‹ˆ\ÜÙ]ÚYˆ[›Û™HH›Û™KŠHOˆXÝÜÝ‹[N‚ˆ›ÝšY\ˆHS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓT‚ˆÛÛ™][ÛœÈHÈœ›ÝšY\ˆHÈ‹œØ[\WÝ[YHHÈ‹œØ[\WÝ[YHÈ—Bˆ\˜[\Îˆ\ÝÐ[žWHHÂˆ›ÝšY\‹ˆ]][YK˜ÛÛXš[™Jœ›ÛWÙ]K]][YK›Z[‹[YJ
+JKš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆ]][YK˜ÛÛXš[™J×Ù]H
+È[YY[J^\ÏLJK]][YK›Z[‹[YJ
+JKš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆBˆYˆ\ÜÙ]ÚY\È›Ý›Û™N‚ˆÛÛ™][ÛœË˜\[™
+˜\ÜÙ]ÚYHÈŠBˆ\˜[\Ë˜\[™
+\ÜÙ]ÚY
+BˆØ[\WÙ]\ÈHÛÛ›‹™^XÝ]Jˆˆˆˆ‚ˆÑSPÕTÕSÕ\ÜÙ]ÚYÝXœÝŠØ[\WÝ[YKKL
+HTÈØ[\WÙ]Bˆ”“ÓH[™\\—ÜÝÙ\—ÜØ[\\ÂˆÒT‘HÉÈS‘	Ëš›Ú[ŠÛÛ™][ÛœÊ_BˆÔ‘Tˆ–HØ[\WÙ]K\ÜÙ]ÚYˆˆˆ‹ˆ\˜[\Ëˆ
+K™™]Ú[
+
+Bˆ›ÝÈH]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠBˆÝ[ÈHÈ™^\ÈŽˆœ[ÈŽˆš[™\\œÈŽˆBˆ›Üˆ]WÜ›ÝÈ[ˆØ[\WÙ]\Î‚ˆÝ\œ™[Ø\ÜÙ]ÚYH[
+]WÜ›ÝÖÈ˜\ÜÙ]ÚY—JBˆ\™Ù]Ù]HH\œÙWÙ]WÝ˜[YJ]WÜ›ÝÖÈœØ[\WÙ]H—JBˆYˆ\™Ù]Ù]H\È›Û™N‚ˆÛÛ[YBˆ]šXÙ\ÈH^XÝYÙ]šXÙ\×Ù›Ü—Ù]JˆÛÛ›‹ˆ\ÜÙ]ÚYXÝ\œ™[Ø\ÜÙ]ÚYˆ›ÝšY\\›ÝšY\‹ˆ\™Ù]Ù]O]\™Ù]Ù]Kˆ
+BˆØ[\\ÈH]Y\žWØ[
+ˆÛÛ›‹ˆˆˆ‚ˆÑSPÕ[™\\—ÚYØ[\WÝ[YKXÝ]™WÜÝÙ\—ÚÝÂˆ”“ÓH[™\\—ÜÝÙ\—ÜØ[\\ÂˆÒT‘H\ÜÙ]ÚYHÈS‘›ÝšY\ˆHÈS‘Ø[\WÝ[YHHÈS‘Ø[\WÝ[YHÂˆÔ‘Tˆ–HØ[\WÝ[YBˆˆˆ‹ˆ
+ˆÝ\œ™[Ø\ÜÙ]ÚYˆ›ÝšY\‹ˆ]][YK˜ÛÛXš[™J\™Ù]Ù]K]][YK›Z[‹[YJ
+JKš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆ]][YK˜ÛÛXš[™J\™Ù]Ù]H
+È[YY[J^\ÏLJK]][YK›Z[‹[YJ
+JKš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆ
+Kˆ
+BˆØ[\\×ØžWÚ[™\\ŽˆXÝÜÝ‹\ÝÙXÝÜÝ‹[žWWWHHßBˆ˜[YÜÛÝÎˆÙ]Ù]][YWHHÙ]
+
+Bˆ›ÜˆØ[\WÜ›ÝÈ[ˆØ[\\Î‚ˆØ[\WÝ[YHH\œÙWÙ]][YWÝ˜[YJØ[\WÜ›ÝÖÈœØ[\WÝ[YH—JBˆYˆØ[\WÝ[YH\È›Û™N‚ˆÛÛ[YBˆØ[\HHÈœØ[\WÝ[YHŽˆØ[\WÝ[YK˜XÝ]™WÜÝÙ\—ÚÝÈŽˆØ[\WÜ›ÝÖÈ˜XÝ]™WÜÝÙ\—ÚÝÈ—_BˆØ[\\×ØžWÚ[™\\‹œÙ]Y˜][
+ÝŠØ[\WÜ›ÝÖÈš[™\\—ÚY—JK×JK˜\[™
+Ø[\JBˆYˆ\×Ú[™\\—Ø]˜Z[X›JØ[\WÜ›ÝÖÈ˜XÝ]™WÜÝÙ\—ÚÝÈ—JN‚ˆ˜[YÜÛÝË˜Y
+[™\\—Ø]˜Z[Xš[]WÜÛÝ
+Ø[\WÝ[YJJB‚ˆÛÛ›‹™^XÝ]Jˆ‘SUH”“ÓH[™\\—Ø]˜Z[Xš[]WÙZ[HÒT‘H\ÜÙ]ÚYHÈS‘›ÝšY\ˆHÈS‘]˜Z[Xš[]WÙ]HHÈ‹ˆ
+Ý\œ™[Ø\ÜÙ]ÚY›ÝšY\‹\™Ù]Ù]Kš\ÛÙ›Ü›X]
+
+JKˆ
+BˆÛ\˜]YÝ˜[YÜÛÝÈH\WÚ[™\\—ÙYÙWÝÛ\˜[˜ÙJ˜[YÜÛÝÊBˆ[™\\—Ü™\Ý[Îˆ\ÝÙXÝÜÝ‹[žWWHH×Bˆ›Üˆ]šXÙH[ˆ]šXÙ\Î‚ˆYˆ\×Ü™[[Ý™YÚ[™\\—Û˜[YJ]šXÙVÈ™]šXÙWÛ˜[YH—JN‚ˆÛÛ[YBˆ[™\\—ÚYHÝŠ]šXÙVÈ™^\›˜[Ù]šXÙWÚY—HÜˆˆŠBˆYˆ›Ý[™\\—ÚY‚ˆÛÛ[YBˆ]šXÙWÜØ[\\ÈHØ[\\×ØžWÚ[™\\‹™Ù]
+[™\\—ÚY×JBˆ[™\\—ÜÝÙ\—ÚÝÈH
+ˆ\œÙWÙ›Ø]Ý˜[YJ]šXÙVÈœ˜]YÜÝÙ\—ÚÝÈ—JBˆÜˆ[™™\—Ú[™\\—ÜÝÙ\—Ùœ›ÛWÛ[Ù[
+]šXÙVÈ›[Ù[—JBˆ
+Bˆ™\Ý[HØ[Ý[]WÚ[™\\—ÙZ[WØ]˜Z[Xš[]J]šXÙWÜØ[\\Ë˜[YÜÛÝÊBˆØœÙ\™YÜÛÝÈHÂˆ[™\\—Ø]˜Z[Xš[]WÜÛÝ
+Ø[\VÈœØ[\WÝ[YH—JBˆ›ÜˆØ[\H[ˆ]šXÙWÜØ[\\ÂˆBˆYˆ
+ˆ›ÝÛ\˜]YÝ˜[YÜÛÝÂˆÜˆ›ÝÛ\˜]YÝ˜[YÜÛÝËš\ÜÝXœÙ]
+ØœÙ\™YÜÛÝÊBˆ
+N‚ˆ™\Ý[È˜]˜Z[Xš[]WÜÝ—HH›Û™Bˆ™\Ý[Èš[™\\—ÜÝÙ\—ÚÝÈ—HH[™\\—ÜÝÙ\—ÚÝÂˆ[™\\—Ü™\Ý[Ë˜\[™
+™\Ý[
+BˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È[™\\—Ø]˜Z[Xš[]WÙZ[H
+ˆ\ÜÙ]ÚY›ÝšY\‹]˜Z[Xš[]WÙ]K[™\\—ÚY[™\\—Û˜[YK[™\\—ÜÝÙ\—ÚÝËˆ˜[YÜÛÝË]˜Z[X›WÜÛÝË[˜]˜Z[X›WÜÛÝË]˜Z[Xš[]WÜÝÜ™X]YØ]\]YØ]ˆ
+HSQTÈ
+ËËËËËËËËËËËÊBˆˆˆ‹ˆ
+ˆÝ\œ™[Ø\ÜÙ]ÚYˆ›ÝšY\‹ˆ\™Ù]Ù]Kš\ÛÙ›Ü›X]
+
+Kˆ[™\\—ÚYˆ]šXÙVÈ™]šXÙWÛ˜[YH—Kˆ[™\\—ÜÝÙ\—ÚÝËˆ™\Ý[È˜[YÜÛÝÈ—Kˆ™\Ý[È˜]˜Z[X›WÜÛÝÈ—Kˆ™\Ý[È[˜]˜Z[X›WÜÛÝÈ—Kˆ™\Ý[È˜]˜Z[Xš[]WÜÝ—Kˆ›ÝËˆ›ÝËˆ
+Kˆ
+BˆÙZYÚYÜÝH
+ˆØ[Ý[]WÝÙZYÚYÜ[Ø]˜Z[Xš[]J[™\\—Ü™\Ý[ÊBˆYˆ[™\\—Ü™\Ý[Âˆ[™[
+ˆ›ÝË™Ù]
+˜]˜Z[Xš[]WÜÝŠH\È›Ý›Û™Bˆ›Üˆ›ÝÈ[ˆ[™\\—Ü™\Ý[Âˆ
+Bˆ[ÙH›Û™Bˆ
+BˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È[Ø]˜Z[Xš[]WÙZ[H
+ˆ\ÜÙ]ÚY›ÝšY\‹]˜Z[Xš[]WÙ]K˜[YÜÛÝËÙZYÚYØ]˜Z[Xš[]WÜÝˆ[™\\—ØÛÝ[Ü™X]YØ]\]YØ]ˆ
+HSQTÈ
+ËËËËËËËÊBˆÓˆÓÓ‘“PÕ
+›ÝšY\‹\ÜÙ]ÚY]˜Z[Xš[]WÙ]JHÈTUHÑUˆ˜[YÜÛÝÈH^ÛYY˜[YÜÛÝËˆÙZYÚYØ]˜Z[Xš[]WÜÝH^ÛYYÙZYÚYØ]˜Z[Xš[]WÜÝˆ[™\\—ØÛÝ[H^ÛYYš[™\\—ØÛÝ[ˆ\]YØ]H^ÛYY\]YØ]ˆˆˆ‹ˆ
+ˆÝ\œ™[Ø\ÜÙ]ÚYˆ›ÝšY\‹ˆ\™Ù]Ù]Kš\ÛÙ›Ü›X]
+
+Kˆ[ŠÛ\˜]YÝ˜[YÜÛÝÊKˆÙZYÚYÜÝˆ[Š[™\\—Ü™\Ý[ÊKˆ›ÝËˆ›ÝËˆ
+Kˆ
+BˆÝ[ÖÈœ[È—H
+ÏHBˆÝ[ÖÈš[™\\œÈ—H
+ÏH[Š[™\\—Ü™\Ý[ÊBˆÝ[ÖÈ™^\È—H
+ÏHBˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ™]\›ˆÝ[Â‚‚™Yˆ[—Ù\Ú[ÛœÛÛ\—Ù]šXÙWØ]˜Z[Xš[]WÜÞ[˜ÊˆÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹ˆ›ÝšY\ŽˆÝ‹ˆšYÙÙ\—Ý\NˆÝˆH›X[X[‹ŠHOˆXÝÜÝ‹[žWN‚ˆÛÛ™šYÈHÙ]Ú[YÜ˜][Û—ØÛÛ™šYÊÛÛ›‹›ÝšY\ŠBˆYˆÛÛ™šYÈ\È›Û™HÜˆ›ÝÛÛ™šYÖÈ™[˜X›Y—N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠˆÛÛ™šYÝ\˜XØ[ÈÜ›ÝšY\ŸH[™\ÜÛš]™[ˆŠBˆ[™Ú[ÈHÙ]Ù\Ú[ÛœÛÛ\—Ù[™Ú[ØÛÛ™šYÊÛÛ™šYÊBˆX\[™ÜÈH]Y\žWØ[
+ˆÛÛ›‹ˆˆˆ‚ˆÑSPÕ\ÜÙ]ÚY^\›˜[ÚYˆ”“ÓH\ÜÙ]Ú[YÜ˜][ÛœÂˆÒT‘H›ÝšY\ˆHÈS‘[˜X›YHHS‘ÓÐSTÐÑJ^\›˜[ÚY	ÉÊHOH	ÉÂˆˆˆ‹ˆ
+›ÝšY\‹
+Kˆ
+BˆÝ][Û—Ý×Ø\ÜÙ]HÜÝŠ›ÝÖÈ™^\›˜[ÚY—JNˆ[
+›ÝÖÈ˜\ÜÙ]ÚY—JH›Üˆ›ÝÈ[ˆX\[™ÜßBˆÝ][Û—ØÛÙ\ÈHÛÜY
+Ý][Û—Ý×Ø\ÜÙ]
+BˆYˆ›ÝÝ][Û—ØÛÙ\Î‚ˆ™]\›ˆÈ™]šXÙ\ÈŽˆœÛ˜\ÚÝÈŽˆ˜\ÜÙ]ÈŽˆB‚ˆ\ÝÙ\œ›ÜŽˆ^Ù\[Ûˆ›Û™HH›Û™Bˆ›Üˆ][\[ˆ˜[™ÙJŠN‚ˆžN‚ˆÙ\ÜÚ[Û‹ÈHÙ]Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[ÛŠÛÛ™šYË›Ü˜ÙWÛÙÚ[X][\OHJBˆ]šXÙWÜ›ÝÜÈH™]ÚÙ\Ú[ÛœÛÛ\—Ù]šXÙWÛ\Ý
+ˆÙ\ÜÚ[Û‹ˆ˜\ÙWÝ\›Y[™Ú[ÖÈ˜˜\ÙWÝ\›—Kˆ[™Ú[Y[™Ú[ÖÈ™]šXÙWÛ\ÝÙ[™Ú[—KˆÝ][Û—ØÛÙ\Ï\Ý][Û—ØÛÙ\Ëˆ
+Bˆœ™XZÂˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆ\ÝÙ\œ›ÜˆH^ÂˆYˆ›Ý\×Ù\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[Û—Ù^\™YÙ\œ›ÜŠ^ÊHÜˆ][\OHN‚ˆ˜Z\ÙBˆÑÑÑT‹š[™›Ê‘\Ú[Û”ÛÛ\ˆ]šXÙHÙ\ÜÚ[Ûˆ^\™YÈ[˜[Y][™ÈØXÚH[™™]žZ[™ÈÙÚ[ˆÛ˜ÙHŠBˆ[˜[Y]WÙ\Ú[ÛœÛÛ\—ÜÙ\ÜÚ[ÛŠÛÛ™šYÊBˆ[ÙN‚ˆ˜Z\ÙH\ÝÙ\œ›ÜˆÜˆ˜[YQ\œ›ÜŠ‘˜[H\ØÛÛšXÚYH›È\Ú[Û”ÛÛ\‹ˆŠB‚ˆ˜XÚÙYˆ\ÝÙXÝÜÝ‹[žWWHH×Bˆ›Üˆ˜]×Ü›ÝÈ[ˆ]šXÙWÜ›ÝÜÎ‚ˆ›Ü›X[^™YH›Ü›X[^™WÙ\Ú[ÛœÛÛ\—Ù]šXÙWÚY[]J˜]×Ü›ÝÊBˆYˆ›Ü›X[^™YÈ™]—Ý\WÚY—H›Ý[ˆ•TÒSÓ”ÓÓT—ÒS•‘T•T—ÑU’PÑWÕTWÒQÎ‚ˆÛÛ[YBˆYˆ›Ý›Ü›X[^™YÈœÝ][Û—ØÛÙH—HÜˆ›Ý›Ü›X[^™YÈ™^\›˜[Ù]šXÙWÚY—N‚ˆÛÛ[YBˆ\ÜÙ]ÚYHÝ][Û—Ý×Ø\ÜÙ]™Ù]
+›Ü›X[^™YÈœÝ][Û—ØÛÙH—JBˆYˆ›Ý\ÜÙ]ÚY‚ˆÛÛ[YBˆ›Ü›X[^™YÈœ^[ØY—HH˜]×Ü›ÝÂˆ›Ü›X[^™YÈ™[˜X›Y—HHYˆ\×Ü™[[Ý™YÚ[™\\—Û˜[YJ›Ü›X[^™YÈ™]šXÙWÛ˜[YH—JH[ÙHBˆ›Ü›X[^™YÈœ›ÝšY\—Ù]šXÙWÚY—HH\Ù\Ü›ÝšY\—Ù]šXÙJÛÛ›‹\ÜÙ]ÚY›ÝšY\‹›Ü›X[^™Y
+BˆYˆ›Ý›Ü›X[^™YÈ™[˜X›Y—N‚ˆÛÛ[YBˆ›Ü›X[^™YÈ˜\ÜÙ]ÚY—HH\ÜÙ]ÚYˆ˜XÚÙY˜\[™
+›Ü›X[^™Y
+B‚ˆ™X[[YWÛX\H™]ÚÙ\Ú[ÛœÛÛ\—Ù]šXÙWÜ™X[[YWÛX\
+ˆÙ\ÜÚ[Û‹ˆ˜\ÙWÝ\›Y[™Ú[ÖÈ˜˜\ÙWÝ\›—Kˆ[™Ú[Y[™Ú[ÖÈ™]šXÙWÜ™X[Ý[YWÙ[™Ú[—Kˆ]šXÙ\Ï]˜XÚÙYˆ
+BˆÛÛXÝYØ]ÙH]][YK››ÝÊ
+BˆÛÛXÝYØ]HÙ\šX[^™WØ˜XÚÙÜ›Ý[™Ú›Ø—Ý[Y\Ý[\
+
+BˆÛ˜\ÚÝ×ØžWØ\ÜÙ]ˆXÝÚ[\ÝÙXÝÜÝ‹[žWWWHHßBˆ›Üˆ]šXÙH[ˆ˜XÚÙY‚ˆ™X[[YHH™^
+ˆ
+™X[[YWÛX\ÚÙ^WH›ÜˆÙ^H[ˆ
+]šXÙVÈ™^\›˜[Ù]šXÙWÚY—K]šXÙVÈ™]—Ùˆ—K]šXÙVÈœÛˆ—JHYˆÙ^H[™Ù^H[ˆ™X[[YWÛX\
+KˆßKˆ
+Bˆ]WÛX\H™X[[YK™Ù]
+™]R][SX\ŠHYˆ\Ú[œÝ[˜ÙJ™X[[YK™Ù]
+™]R][SX\ŠKXÝ
+H[ÙH™X[[YBˆÙY[—ÙH\œÙWÙ]][YWÝ˜[YJš\œÝÛ›Û—Ù[\J™X[[YKÈ˜ÛÛXÝ[YH‹˜ÛÛXÝY]‹›\ÝÙY[ˆ‹›\ÝÜÙY[—Ø]—JJBˆ\×Ü™XÙ[Ù]HHYHYˆ™X[[YH[™ÙY[—Ù\È›Û™H[ÙH›ÛÛ
+ˆÙY[—Ù[™ÛÛXÝYØ]ÙHÙY[—ÙH[YY[JZ[]\ÏQQUSÑU’PÑWÐÓÓSUS’PÐUSÓ—Õ‘TÒÓÓRS•UTÊBˆ
+Bˆ]˜Z[Xš[]WÜÝ]\ÈHÛ\ÜÚYžWÙ\Ú[ÛœÛÛ\—Ú[™\\—Ø]˜Z[Xš[]JˆÈš[™\\—ÜÝ]HŽˆš\œÝÛ›Û—Ù[\J]WÛX\Èš[™\\—ÜÝ]H‹š[™\\”Ý]H—J_Kˆ\×Ü™XÙ[Ù]OZ\×Ü™XÙ[Ù]Kˆ
+BˆÛÛ[][šXØ][Û—ÜÝ]\ÈHœ™XÙ[ˆYˆ\×Ü™XÙ[Ù]H[ÙHœÝ[H‚ˆÝ\œ™[Ë›ÛYÙ\ÈH\œÙWÙ\Ú[ÛœÛÛ\—Ü—Ú[œ]Ê™X[[YJBˆ^XÝYÜÝš[™×Ú[™^\ÈHX\›—Ù^XÝYÜÝš[™Ü×Ùœ›ÛWÝ›ÛYÙJˆÛÛ›‹ˆ]šXÙVÈœ›ÝšY\—Ù]šXÙWÚY—Kˆ›ÛYÙ\ËˆÛÛXÝYØ]ˆ
+Bˆ—ÚX[HØ[Ý[]WÜ—Ú[œ]ÚX[
+ˆÝ\œ™[Ëˆ›ÛYÙ\Ëˆ^XÝYÜÝš[™×Ú[™^\ÏY^XÝYÜÝš[™×Ú[™^\Ëˆ
+BˆÛ˜\ÚÝHÂˆ
+Š™]šXÙKˆ˜]˜Z[Xš[]WÜÝ]\ÈŽˆ]˜Z[Xš[]WÜÝ]\Ëˆ˜ÛÛ[][šXØ][Û—ÜÝ]\ÈŽˆÛÛ[][šXØ][Û—ÜÝ]\Ëˆœ˜]YÜÝÙ\—ÚÝÈŽˆ]šXÙVÈœ˜]YÜÝÙ\—ÚÝÈ—Kˆ
+Šœ—ÚX[ˆBˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È]šXÙWÜ™X[[YWÜÛ˜\ÚÝÈ
+ˆ›ÝšY\—Ù]šXÙWÚY\ÜÙ]ÚY›ÝšY\‹Ý][Û—ØÛÙKÛÛXÝYØ][™\\—ÜÝ]KˆXÝ]™WÜÝÙ\—ÚÝË^WÙ[™\™ÞWÚÝÚ]˜Z[Xš[]WÜÝ]\ËÛÛ[][šXØ][Û—ÜÝ]\ËˆÝš[™×Ø]˜Z[X›WØÛÝ[Ýš[™×ÝÝ[ØÛÝ[—ØÝ\œ™[ÚœÛÛ‹—Ý›ÛYÙWÚœÛÛ‹^[ØYÚœÛÛ‹Ü™X]YØ]ˆ
+HSQTÈ
+ËËËËËËËËËËËËËËËÊBˆˆˆ‹ˆ
+ˆ]šXÙVÈœ›ÝšY\—Ù]šXÙWÚY—Kˆ]šXÙVÈ˜\ÜÙ]ÚY—Kˆ›ÝšY\‹ˆ]šXÙVÈœÝ][Û—ØÛÙH—KˆÛÛXÝYØ]ˆ\œÙWÚ[Ý˜[YJš\œÝÛ›Û—Ù[\J]WÛX\Èš[™\\—ÜÝ]H‹š[™\\”Ý]H—JJKˆ›Ü›X[^™WÜÝÙ\—Ý×ÚÝÊš\œÝÛ›Û—Ù[\J]WÛX\È˜XÝ]™WÜÝÙ\ˆ‹˜XÝ]™TÝÙ\ˆ—JJKˆ\œÙWÙ›Ø]Ý˜[YJš\œÝÛ›Û—Ù[\J]WÛX\È™^WØØ\‹™^Q[™\™ÞH‹™^WÙ[™\™ÞH—JJKˆ]˜Z[Xš[]WÜÝ]\ËˆÛÛ[][šXØ][Û—ÜÝ]\Ëˆ—ÚX[È˜]˜Z[X›WÜÝš[™ÜÈ—Kˆ—ÚX[ÈÝ[ÜÝš[™ÜÈ—KˆœÛÛ‹™[\ÊÝ\œ™[Ë[œÝ\™WØ\ØÚZOUYJHYˆÝ\œ™[È[ÙH›Û™KˆœÛÛ‹™[\Ê›ÛYÙ\Ë[œÝ\™WØ\ØÚZOUYJHYˆ›ÛYÙ\È[ÙH›Û™KˆœÛÛ‹™[\Ê™X[[YK[œÝ\™WØ\ØÚZOUYJKˆÛÛXÝYØ]ˆ
+Kˆ
+BˆÛÛ›‹™^XÝ]Jˆ•TUH›ÝšY\—Ù]šXÙ\ÈÑU\ÝÜÙY[—Ø]HÓÐSTÐÑJË\ÝÜÙY[—Ø]
+K\]YØ]HÈÒT‘HYHÈ‹ˆ
+ÙY[—Ùš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠHYˆÙY[—Ù[ÙHÛÛXÝYØ]Yˆ™X[[YH[ÙH›Û™KÛÛXÝYØ]]šXÙVÈœ›ÝšY\—Ù]šXÙWÚY—JKˆ
+BˆÛ˜\ÚÝ×ØžWØ\ÜÙ]œÙ]Y˜][
+]šXÙVÈ˜\ÜÙ]ÚY—K×JK˜\[™
+Û˜\ÚÝ
+B‚ˆ›Üˆ\ÜÙ]ÚY›ÝÜÈ[ˆÛ˜\ÚÝ×ØžWØ\ÜÙ]š][\Ê
+N‚ˆÝ[[X\žHHØ[Ý[]WØ\ÜÙ]Ø]˜Z[Xš[]J›ÝÜÊBˆ›ÝÈH]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠBˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È]˜Z[Xš[]WÙZ[H
+ˆ\ÜÙ]ÚY›ÝšY\‹\š[ÙÙ]K[™\\—Ø]˜Z[Xš[]WÜÝØ\XÚ]WØ]˜Z[Xš[]WÜÝˆÛÛ[][šXØ][Û—Ø]˜Z[Xš[]WÜÝÝš[™×Ø]˜Z[Xš[]WÜÝ]˜Z[X›WÚ[™\\œËÝ[Ú[™\\œË[˜]˜Z[X›WÚ[™\\œËˆ›×ØÛÛ[][šXØ][Û—Ù]šXÙ\Ë]˜Z[X›WÜÝš[™ÜËÝ[ÜÝš[™ÜË[˜]˜Z[X›WÜÝš[™ÜËY™™XÝYÜÝÙ\—ÚÝËˆ^[ØYÚœÛÛ‹Ü™X]YØ]\]YØ]ˆ
+HSQTÈ
+ËËËËËËËËËËËËËËËËËÊBˆÓˆÓÓ‘“PÕ
+\ÜÙ]ÚY›ÝšY\‹\š[ÙÙ]JHÈTUHÑUˆ[™\\—Ø]˜Z[Xš[]WÜÝH^ÛYYš[™\\—Ø]˜Z[Xš[]WÜÝˆØ\XÚ]WØ]˜Z[Xš[]WÜÝH^ÛYY˜Ø\XÚ]WØ]˜Z[Xš[]WÜÝˆÛÛ[][šXØ][Û—Ø]˜Z[Xš[]WÜÝH^ÛYY˜ÛÛ[][šXØ][Û—Ø]˜Z[Xš[]WÜÝˆÝš[™×Ø]˜Z[Xš[]WÜÝH^ÛYYœÝš[™×Ø]˜Z[Xš[]WÜÝˆ]˜Z[X›WÚ[™\\œÈH^ÛYY˜]˜Z[X›WÚ[™\\œËˆÝ[Ú[™\\œÈH^ÛYYÝ[Ú[™\\œËˆ[˜]˜Z[X›WÚ[™\\œÈH^ÛYY[˜]˜Z[X›WÚ[™\\œËˆ›×ØÛÛ[][šXØ][Û—Ù]šXÙ\ÈH^ÛYY››×ØÛÛ[][šXØ][Û—Ù]šXÙ\Ëˆ]˜Z[X›WÜÝš[™ÜÈH^ÛYY˜]˜Z[X›WÜÝš[™ÜËˆÝ[ÜÝš[™ÜÈH^ÛYYÝ[ÜÝš[™ÜËˆ[˜]˜Z[X›WÜÝš[™ÜÈH^ÛYY[˜]˜Z[X›WÜÝš[™ÜËˆY™™XÝYÜÝÙ\—ÚÝÈH^ÛYY˜Y™™XÝYÜÝÙ\—ÚÝËˆ^[ØYÚœÛÛˆH^ÛYYœ^[ØYÚœÛÛ‹ˆ\]YØ]H^ÛYY\]YØ]ˆˆˆ‹ˆ
+ˆ\ÜÙ]ÚYˆ›ÝšY\‹ˆÝ\œ™[Û\Ø›Û—Ù]J
+Kš\ÛÙ›Ü›X]
+
+KˆÝ[[X\žVÈš[™\\—Ø]˜Z[Xš[]WÜÝ—KˆÝ[[X\žVÈ˜Ø\XÚ]WØ]˜Z[Xš[]WÜÝ—KˆÝ[[X\žVÈ˜ÛÛ[][šXØ][Û—Ø]˜Z[Xš[]WÜÝ—KˆÝ[[X\žVÈœÝš[™×Ø]˜Z[Xš[]WÜÝ—KˆÝ[[X\žVÈ˜]˜Z[X›WÚ[™\\œÈ—KˆÝ[[X\žVÈÝ[Ú[™\\œÈ—KˆÝ[[X\žVÈ[˜]˜Z[X›WÚ[™\\œÈ—KˆÝ[[X\žVÈ››×ØÛÛ[][šXØ][Û—Ù]šXÙ\È—KˆÝ[[X\žVÈ˜]˜Z[X›WÜÝš[™ÜÈ—KˆÝ[[X\žVÈÝ[ÜÝš[™ÜÈ—KˆÝ[[X\žVÈ[˜]˜Z[X›WÜÝš[™ÜÈ—KˆÝ[[X\žVÈ˜Y™™XÝYÜÝÙ\—ÚÝÈ—KˆœÛÛ‹™[\ÊÝ[[X\žK[œÝ\™WØ\ØÚZOUYJKˆ›ÝËˆ›ÝËˆ
+Kˆ
+BˆØ[\YÜÝ]\ÎˆXÝÜÝ‹[HHßBˆ›Üˆ\ÜÙ]ÚY[ˆÛ˜\ÚÝ×ØžWØ\ÜÙ]‚ˆØ[\YHX]\šX[^™WÜØ[\YØ]˜Z[Xš[]WÙ^JˆÛÛ›‹ˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ›ÝšY\\›ÝšY\‹ˆ\™Ù]Ù]OXÝ\œ™[Û\Ø›Û—Ù]J
+Kˆ
+BˆÝ]HHÝŠØ[\YÈ˜ÛÝ™\˜YÙWÜÝ]\È—JBˆØ[\YÜÝ]\ÖÜÝ]WHHØ[\YÜÝ]\Ë™Ù]
+Ý]K
+H
+ÈBˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ™]\›ˆÂˆ™]šXÙ\ÈŽˆ[Š˜XÚÙY
+KˆœÛ˜\ÚÝÈŽˆÝ[J[Š›ÝÜÊH›Üˆ›ÝÜÈ[ˆÛ˜\ÚÝ×ØžWØ\ÜÙ]˜[Y\Ê
+JKˆ˜\ÜÙ]ÈŽˆ[ŠÛ˜\ÚÝ×ØžWØ\ÜÙ]
+KˆœØ[\YÙ^\×Ü™XØ[Ý[]YÛØØ[HŽˆ[ŠÛ˜\ÚÝ×ØžWØ\ÜÙ]
+KˆœØ[\YÜÝ]\ÈŽˆØ[\YÜÝ]\ËˆB‚‚™Yˆ[—Ú[YÜ˜][Û—ÜÞ[˜ÊÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹›ÝšY\ŽˆÝ‹šYÙÙ\—Ý\NˆÝˆH›X[X[ŠHOˆXÝÜÝ‹[žWN‚ˆYˆ›ÝšY\ˆOHS•QÔUSÓ—Ô“Õ’QT—ÔÒQÑS‘T‘ÖN‚ˆ™]\›ˆ[—ÜÚYÙ[™\™ÞWÜÞ[˜ÊÛÛ›‹›ÝšY\‹šYÙÙ\—Ý\O]šYÙÙ\—Ý\JBˆ™]\›ˆ[—Ù\Ú[ÛœÛÛ\—ÜÞ[˜ÊÛÛ›‹›ÝšY\‹šYÙÙ\—Ý\O]šYÙÙ\—Ý\JB‚‚™Yˆ[—Ù\Ú[ÛœÛÛ\—ÜÞ[˜ÊÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹›ÝšY\ŽˆÝ‹šYÙÙ\—Ý\NˆÝˆH›X[X[ŠHOˆXÝÜÝ‹[žWN‚ˆYˆ›Ý•TÒSÓ”ÓÓT—ÔÖS×ÓÐÒË˜XÜ]Z\™J›ØÚÚ[™ÏQ˜[ÙJN‚ˆY\ÜØYÙHH”Ú[˜Ü›Ûš^˜XØ[È\Ú[Û”ÛÛ\ˆYÛ›Ü˜YHÜœ]YH˜H^\ÝHÝ]˜H[HÝ\œÛËˆ‚ˆÑÑÑT‹š[™›ÊY\ÜØYÙJBˆ™]\›ˆÈ›X]ÚYŽˆ[œ™\ÛÛ™YŽˆ˜]]×Ü™\ÛÛ™YŽˆœÝ]\ÈŽˆœÚÚ\Y‹œÝÜYÜ™X\ÛÛˆŽˆY\ÜØYÙ_B‚ˆÚ]™[X\ÙWÙ\Ú[ÛœÛÛ\—ÜÞ[˜×ÛØÚÊ
+N‚ˆÛÛ™šYÈHÙ]Ú[YÜ˜][Û—ØÛÛ™šYÊÛÛ›‹›ÝšY\ŠBˆYˆÛÛ™šYÈ\È›Û™N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠˆÛÛ™šYÝ\˜XØ[ÈÜ›ÝšY\ŸH˜[È[˜ÛÛ˜YKˆŠBˆYˆ›ÝÛÛ™šYÖÈ™[˜X›Y—N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠˆH[YÜ˜XØ[ÈÜ›ÝšY\ŸH\ÝH\Ø]]˜YKˆŠB‚ˆ[—ÚYHÜ™X]WÚ[YÜ˜][Û—Ü[ŠÛÛ›‹›ÝšY\‹šYÙÙ\—Ý\JBˆ˜]ÚÚYHÜ™X]WÛ[Ûš]Üš[™×Ø˜]Ú
+ˆÛÛ›‹ˆ™XÛÜ™Ù]OY]KÙ^J
+Kš\ÛÙ›Ü›X]
+
+KˆY˜][Û›Ý\ÏYˆ”Þ[˜ÈÜ›ÝšY\ŸH
+ÝšYÙÙ\—Ý\_JH‹ˆ˜]×Ú[œ]Hˆ‹ˆÛÝ\˜ÙO\›ÝšY\‹ˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆžN‚ˆYˆšYÙÙ\—Ý\HOHœØÚY[YÜÝ]HŽ‚ˆ™\Ý[H[—Ù\Ú[ÛœÛÛ\—ØÚXÚÊˆÛÛ›‹ˆ›ÝšY\‹ˆžWÜ[UYKˆ[˜ÛYWÙXYÛ›ÜÝXÜÏQ˜[ÙKˆ™Y™\—ÛØØ[ÜÝ][Û—Ú[™[ÜžOUYKˆ
+Bˆ[ÙN‚ˆ™\Ý[H[—Ù\Ú[ÛœÛÛ\—ØÚXÚÊÛÛ›‹›ÝšY\‹žWÜ[UYJBˆ›ÝÜÈH™\Ý[Èœ›ÝÜÈ—BˆX]ÚYHˆ[œ™\ÛÛ™YHˆ]]×Ü™\ÛÛ™YHˆÞ[˜ÙYØ\ÜÙ]ÚYÎˆÙ]Ú[HHÙ]
+
+Bˆ[\Ù]™[Îˆ\ÝÙXÝÜÝ‹[žWWHH×Bˆ›ÝÈH]][YK››ÝÊ
+B‚ˆ›Üˆ›ÝÈ[ˆ›ÝÜÎ‚ˆ^\›˜[ÚYH›ÝÖÈ™^\›˜[ÚY—Bˆ^\›˜[Û˜[YHH›ÝÖÈ™^\›˜[Û˜[YH—BˆÝ]\ÈH›ÝÖÈœÝ]\È—B‚ˆX\YØ\ÜÙ]H›Û™BˆYˆ^\›˜[ÚY‚ˆX\YØ\ÜÙ]HÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕZK˜\ÜÙ]ÚYˆ”“ÓH\ÜÙ]Ú[YÜ˜][ÛœÈZBˆÒT‘HZKœ›ÝšY\ˆHÈS‘ZK™^\›˜[ÚYHÈS‘ZK™[˜X›YHBˆSRUBˆˆˆ‹ˆ
+›ÝšY\‹^\›˜[ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆX\YØ\ÜÙ]\È›Û™N‚ˆX\YØ\ÜÙ]HÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕZK˜\ÜÙ]ÚYˆ”“ÓH\ÜÙ]Ú[YÜ˜][ÛœÈZBˆÒT‘HZKœ›ÝšY\ˆHÈS‘ZK™^\›˜[Û˜[YHHÈS‘ZK™[˜X›YHBˆSRUBˆˆˆ‹ˆ
+›ÝšY\‹^\›˜[Û˜[YJKˆ
+K™™]ÚÛ™J
+Bˆ\ÜÙ]ÚYH[
+X\YØ\ÜÙ]È˜\ÜÙ]ÚY—JHYˆX\YØ\ÜÙ][ÙH
+š[™Ø\ÜÙ]ÚY
+ÛÛ›‹^\›˜[Û˜[YJHÜˆ
+B‚ˆYˆ\ÜÙ]ÚY‚ˆÞ[˜ÙYØ\ÜÙ]ÚYË˜Y
+\ÜÙ]ÚY
+Bˆ™]š[Ý\ÈHÙ]Û]\ÝÛ[Ûš]Üš[™×Ü›ÝÊÛÛ›‹\ÜÙ]ÚY
+Bˆ\XØ]WÛ]\ÝH
+ˆ™]š[Ý\È\È›Ý›Û™Bˆ[™™]š[Ý\ÖÈœÝ]\È—HOHÝ]\Âˆ[™™]š[Ý\ÖÈœ™XÛÜ™Ù]H—HOH]KÙ^J
+Kš\ÛÙ›Ü›X]
+
+Bˆ[™™]š[Ý\ÖÈœÛÝ\˜ÙH—HOH›ÝšY\‚ˆ
+BˆYˆ›Ý\XØ]WÛ]\Ý‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È[Ûš]Üš[™×Ü™XÛÜ™È
+\ÜÙ]ÚYÝ]\Ë™XÛÜ™Ù]K›Ý\ËÛÝ\˜ÙK˜]ÚÚY
+BˆSQTÈ
+ËËËËËÊBˆˆˆ‹ˆ
+ˆ\ÜÙ]ÚYˆÝ]\Ëˆ]KÙ^J
+Kš\ÛÙ›Ü›X]
+
+Kˆˆ”Þ[˜ÈÜ›ÝšY\ŸNˆÜ›ÝÖÉÛ›Ý\É×_H‹ˆ›ÝšY\‹ˆ˜]ÚÚYˆ
+Kˆ
+Bˆ]™[HZ[Û[Ûš]Üš[™×Ø[\Ù]™[
+ˆÛÛ›‹ˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ™]š[Ý\×ÜÝ]\Ï\™]š[Ý\ÖÈœÝ]\È—HYˆ™]š[Ý\È[ÙHˆ‹ˆÝ\œ™[ÜÝ]\Ï\Ý]\Ëˆ\[™YØ][›ÝËš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆ[\›WØÛÛ^\›ÝËˆ
+BˆYˆ]™[‚ˆ[\Ù]™[Ë˜\[™
+]™[
+BˆÜ™X]WÛÜ—Ý\]WØ\ÜÙ]Ú[YÜ˜][ÛŠÛÛ›‹\ÜÙ]ÚY›ÝšY\‹^\›˜[ÚY^\›˜[Û˜[YKÝ]\ÊBˆX]ÚY
+ÏHBˆ[ÙN‚ˆ\Ù\Ú[YÜ˜][Û—Ý[œ™\ÛÛ™Y
+ˆÛÛ›‹ˆ›ÝšY\\›ÝšY\‹ˆ[—ÚY\[—ÚYˆ^\›˜[ÚYY^\›˜[ÚYˆ^\›˜[Û˜[YOY^\›˜[Û˜[YKˆÝ]\Ï\Ý]\Ëˆ^[ØY\›ÝÖÈœ^[ØY—Kˆ
+Bˆ[œ™\ÛÛ™Y
+ÏHB‚ˆX\YØ\ÜÙ]ÈH]Y\žWØ[
+ˆÛÛ›‹ˆˆˆ‚ˆÑSPÕZK˜\ÜÙ]ÚYˆ”“ÓH\ÜÙ]Ú[YÜ˜][ÛœÈZBˆ“ÒSˆ]\ÝÛ[Ûš]Üš[™×ÝšY]ÈHÓˆK˜\ÜÙ]ÚYHZK˜\ÜÙ]ÚYˆÒT‘HZKœ›ÝšY\ˆHÈS‘ZK™[˜X›YHHS‘KœÝ]\ÈSˆ
+	Ñ\œ›ÉË	Ñ\ØÛÛ™XÝYIÊBˆˆˆ‹ˆ
+›ÝšY\‹
+Kˆ
+Bˆ›Üˆ›ÝÈ[ˆX\YØ\ÜÙ]Î‚ˆ\ÜÙ]ÚYH[
+›ÝÖÈ˜\ÜÙ]ÚY—JBˆYˆ\ÜÙ]ÚY[ˆÞ[˜ÙYØ\ÜÙ]ÚYÎ‚ˆÛÛ[YBˆ^\Ý[™×ÝÙ^HHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕBˆ”“ÓH[Ûš]Üš[™×Ü™XÛÜ™ÂˆÒT‘H\ÜÙ]ÚYHÈS‘™XÛÜ™Ù]HHÈS‘ÛÝ\˜ÙHHÂˆSRUBˆˆˆ‹ˆ
+\ÜÙ]ÚY]KÙ^J
+Kš\ÛÙ›Ü›X]
+
+K›ÝšY\ŠKˆ
+K™™]ÚÛ™J
+BˆYˆ^\Ý[™×ÝÙ^N‚ˆÛÛ[YBˆ™]š[Ý\ÈHÙ]Û]\ÝÛ[Ûš]Üš[™×Ü›ÝÊÛÛ›‹\ÜÙ]ÚY
+BˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È[Ûš]Üš[™×Ü™XÛÜ™È
+\ÜÙ]ÚYÝ]\Ë™XÛÜ™Ù]K›Ý\ËÛÝ\˜ÙK˜]ÚÚY
+BˆSQTÈ
+ËËËËËÊBˆˆˆ‹ˆ
+ˆ\ÜÙ]ÚYˆ”™\ÛÛšYÈ‹ˆ]KÙ^J
+Kš\ÛÙ›Ü›X]
+
+Kˆˆ”™\ÛÛšYÈ]]ÛX]XØ[Y[HÜˆ]\Ù[˜ÚXH›ÈÞ[˜ÈÜ›ÝšY\ŸKˆ‹ˆ›ÝšY\‹ˆ˜]ÚÚYˆ
+Kˆ
+Bˆ]]×Ü™\ÛÛ™Y
+ÏHBˆ]™[HZ[Û[Ûš]Üš[™×Ø[\Ù]™[
+ˆÛÛ›‹ˆ\ÜÙ]ÚYX\ÜÙ]ÚYˆ™]š[Ý\×ÜÝ]\Ï\™]š[Ý\ÖÈœÝ]\È—HYˆ™]š[Ý\È[ÙHˆ‹ˆÝ\œ™[ÜÝ]\ÏH”™\ÛÛšYÈ‹ˆ\[™YØ][›ÝËš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆ
+BˆYˆ]™[‚ˆ[\Ù]™[Ë˜\[™
+]™[
+B‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH[YÜ˜][Û—ØÛÛ™šYÜÂˆÑU\ÝÜÞ[˜×Ø]HË\ÝÜÞ[˜×ÜÝ]\ÈH	ÜÝXØÙ\ÜÉË\ÝÙ\œ›ÜˆH	ÉË\]YØ]HÂˆÒT‘H›ÝšY\ˆHÂˆˆˆ‹ˆ
+ˆ]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆ]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆ›ÝšY\‹ˆ
+Kˆ
+BˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH[Ûš]Üš[™×Ú[\ÜØ˜]Ú\ÂˆÑU[\ÜYØÛÝ[HËX]ÚYØÛÝ[HË[›X]ÚYØÛÝ[HË]]×Ü™\ÛÛ™YØÛÝ[HÂˆÒT‘HYHÂˆˆˆ‹ˆ
+X]ÚY
+È[œ™\ÛÛ™YX]ÚY[œ™\ÛÛ™Y]]×Ü™\ÛÛ™Y˜]ÚÚY
+Kˆ
+Bˆš[˜[^™WÚ[YÜ˜][Û—Ü[ŠˆÛÛ›‹ˆ[—ÚYˆÝ]\ÏHœÝXØÙ\ÜÈ‹ˆX]ÚYØÛÝ[[X]ÚYˆ[œ™\ÛÛ™YØÛÝ[][œ™\ÛÛ™Yˆ]]×Ü™\ÛÛ™YØÛÝ[X]]×Ü™\ÛÛ™YˆÝ[[X\žWÚœÛÛ^Âˆœ›ÝšY\—Ü›ÝÜÈŽˆ[Š›ÝÜÊKˆ˜[\›WÜ›ÝÜÈŽˆ™\Ý[™Ù]
+˜[\›WØÛÝ[‹
+Kˆ˜[\›WÙ\œ›ÜˆŽˆ™\Ý[™Ù]
+˜[\›WÙ\œ›Üˆ‹ˆŠKˆœÝ][Û—Ü›ÝÜÈŽˆ™\Ý[™Ù]
+œÝ][Û—ØÛÝ[‹[Š›ÝÜÊJKˆœ™X[[YWÜ›ÝÜÈŽˆ™\Ý[™Ù]
+œ™X[[YWØÛÝ[‹[Š›ÝÜÊJKˆœÝ][Û—Ú[™[ÜžWÜÛÝ\˜ÙHŽˆ™\Ý[™Ù]
+ˆœÝ][Û—Ú[™[ÜžWÜÛÝ\˜ÙH‹ˆ˜\H‹ˆ
+Kˆ˜\WØØ[×Ý\ÙYŽˆ[
+™\Ý[™Ù]
+˜\WØØ[×Ý\ÙYŠHÜˆ
+KˆKˆ
+Bˆ›ØÙ\Ü×Û[Ûš]Üš[™×Ø[\ÊÛÛ›‹[\Ù]™[Ë˜]ÚÚY›ÝÊBˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ]šXÙWØ]˜Z[Xš[]NˆXÝÜÝ‹[žWH›Û™HH›Û™BˆYˆ›ÝšY\ˆOHS•QÔUSÓ—Ô“Õ’QT—Ñ•TÒSÓ”ÓÓTˆ[™šYÙÙ\—Ý\H›Ý[ˆÈœØÚY[YÜÝ]H‹›X[X[Ø˜XÚÙÜ›Ý[™ŸN‚ˆžN‚ˆ]šXÙWØ]˜Z[Xš[]HH[—Ù\Ú[ÛœÛÛ\—Ù]šXÙWØ]˜Z[Xš[]WÜÞ[˜ÊÛÛ›‹›ÝšY\‹šYÙÙ\—Ý\O]šYÙÙ\—Ý\JBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÚ[™Ë™Ù]ÙÙÙ\Š×Û˜[YW×ÊKØ\›š[™Ê‘\Ú[Û”ÛÛ\ˆ]šXÙH]˜Z[Xš[]HÞ[˜È˜Z[Yˆ	\È‹^ÊBˆ™]\›ˆÂˆ›X]ÚYŽˆX]ÚYˆ[œ™\ÛÛ™YŽˆ[œ™\ÛÛ™Yˆ˜]]×Ü™\ÛÛ™YŽˆ]]×Ü™\ÛÛ™Yˆ™]šXÙWØ]˜Z[Xš[]HŽˆ]šXÙWØ]˜Z[Xš[]Kˆ˜\WØØ[×Ý\ÙYŽˆ[
+™\Ý[™Ù]
+˜\WØØ[×Ý\ÙYŠHÜˆ
+KˆœÝ][Û—Ú[™[ÜžWÜÛÝ\˜ÙHŽˆ™\Ý[™Ù]
+ˆœÝ][Û—Ú[™[ÜžWÜÛÝ\˜ÙH‹ˆ˜\H‹ˆ
+KˆBˆ^Ù\\T˜]S[Z]\œ›Üˆ\È^Î‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH[YÜ˜][Û—ØÛÛ™šYÜÂˆÑU\ÝÜÞ[˜×ÜÝ]\ÈH	ÝØZ][™×Ü˜]WÛ[Z]	Ë\ÝÙ\œ›ÜˆHË\]YØ]HÂˆÒT‘H›ÝšY\ˆHÂˆˆˆ‹ˆ
+^Ë›Y\ÜØYÙK]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠK›ÝšY\ŠKˆ
+Bˆš[˜[^™WÚ[YÜ˜][Û—Ü[ŠˆÛÛ›‹ˆ[—ÚYˆÝ]\ÏHØZ][™×Ü˜]WÛ[Z]‹ˆX]ÚYØÛÝ[Lˆ[œ™\ÛÛ™YØÛÝ[Lˆ]]×Ü™\ÛÛ™YØÛÝ[Lˆ\œ›Ü—ÛY\ÜØYÙOY^Ë›Y\ÜØYÙKˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ˜Z\ÙBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH[YÜ˜][Û—ØÛÛ™šYÜÂˆÑU\ÝÜÞ[˜×ÜÝ]\ÈH	Ù\œ›Ü‰Ë\ÝÙ\œ›ÜˆHË\]YØ]HÂˆÒT‘H›ÝšY\ˆHÂˆˆˆ‹ˆ
+ÝŠ^ÊK]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠK›ÝšY\ŠKˆ
+Bˆš[˜[^™WÚ[YÜ˜][Û—Ü[ŠˆÛÛ›‹ˆ[—ÚYˆÝ]\ÏH™\œ›Üˆ‹ˆX]ÚYØÛÝ[Lˆ[œ™\ÛÛ™YØÛÝ[Lˆ]]×Ü™\ÛÛ™YØÛÝ[Lˆ\œ›Ü—ÛY\ÜØYÙO\ÝŠ^ÊKˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ˜Z\ÙB‚‚™Yˆ[—Ø[Ú[YÜ˜][Û—ÜÞ[˜ÜÊÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹šYÙÙ\—Ý\NˆÝˆH›X[X[ŠHOˆXÝÜÝ‹[žWN‚ˆ™\Ý[ÎˆXÝÜÝ‹[žWHHßBˆ\œ›ÜœÎˆXÝÜÝ‹Ý—HHßBˆ›Üˆ›ÝšY\ˆ[ˆS•QÔUSÓ—Ô“Õ’QT—ÓÔSÓ”Î‚ˆÛÛ™šYÈHÙ]Ú[YÜ˜][Û—ØÛÛ™šYÊÛÛ›‹›ÝšY\ŠBˆYˆÛÛ™šYÈ\È›Û™HÜˆ›ÝÛÛ™šYÖÈ™[˜X›Y—N‚ˆÛÛ[YBˆžN‚ˆ™\Ý[ÖÜ›ÝšY\—HH[—Ú[YÜ˜][Û—ÜÞ[˜ÊÛÛ›‹›ÝšY\‹šYÙÙ\—Ý\O]šYÙÙ\—Ý\JBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆ\œ›ÜœÖÜ›ÝšY\—HHÝŠ^ÊBˆYˆ›Ý™\Ý[È[™\œ›ÜœÎ‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠŽÈ‹š›Ú[ŠˆžÜ›ÝšY\ŸNˆÛY\ÜØYÙ_Hˆ›Üˆ›ÝšY\‹Y\ÜØYÙH[ˆ\œ›ÜœËš][\Ê
+JJBˆ™]\›ˆÈœ™\Ý[ÈŽˆ™\Ý[Ë™\œ›ÜœÈŽˆ\œ›ÜœßB‚‚™Yˆ™\ÛÛ™WÙ\Ú[ÛœÛÛ\—Ý[œ™\ÛÛ™Y
+ÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹[œ™\ÛÛ™YÚYˆ[\ÜÙ]ÚYˆ[
+HOˆ›Û™N‚ˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕ
+ˆ”“ÓH[YÜ˜][Û—Ý[œ™\ÛÛ™YÒT‘HYHÈS‘™\ÛÛ][Û—ÜÝ]\ÈH	Ü[™[™ÉÈ‹ˆ
+[œ™\ÛÛ™YÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ›ÝÈ\È›Û™N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ‘[˜YH\Ú[Û”ÛÛ\ˆÜˆ™\ÛÛ™\ˆ˜[È[˜ÛÛ˜YKˆŠBˆÜ™X]WÛÜ—Ý\]WØ\ÜÙ]Ú[YÜ˜][ÛŠˆÛÛ›‹ˆ\ÜÙ]ÚYˆ›ÝÖÈœ›ÝšY\ˆ—KˆÝŠ›ÝÖÈ™^\›˜[ÚY—HÜˆˆŠKˆ›ÝÖÈ™^\›˜[Û˜[YH—Kˆ›ÝÖÈ™^\›˜[ÜÝ]\È—HÜˆ“Ü\˜XÚ[Û˜[‹ˆ
+BˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH[YÜ˜][Û—Ý[œ™\ÛÛ™YˆÑU™\ÛÛ][Û—ÜÝ]\ÈH	Ü™\ÛÛ™Y	Ë™\ÛÛ™YØ]HË™\ÛÛ][Û—Û›Ý\ÈHÂˆÒT‘HYHÂˆˆˆ‹ˆ
+ˆ]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠKˆˆ\ÜÛØÚXYÈ[È\ÜÙ]Ø\ÜÙ]ÚYH‹ˆ[œ™\ÛÛ™YÚYˆ
+Kˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+B‚‚™YˆÜ™X]WØ\ÜÙ]Ùœ›ÛWÝ[œ™\ÛÛ™Y
+ÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹[œ™\ÛÛ™YÚYˆ[
+HOˆ[‚ˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕ
+ˆ”“ÓH[YÜ˜][Û—Ý[œ™\ÛÛ™YÒT‘HYHÈS‘™\ÛÛ][Û—ÜÝ]\ÈH	Ü[™[™ÉÈ‹ˆ
+[œ™\ÛÛ™YÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ›ÝÈ\È›Û™N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ‘[˜YH\Ú[Û”ÛÛ\ˆÜˆ™\ÛÛ™\ˆ˜[È[˜ÛÛ˜YKˆŠB‚ˆ›Ú™XÝÛ˜[YHH›ÝÖÈ™^\›˜[Û˜[YH—Bˆ[œÝ[][Û—ÙÜ›Ý\H[™™\—Ú[œÝ[][Û—ÙÜ›Ý\
+›Ú™XÝÛ˜[YJBˆÝ\œÛÜˆHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È\ÜÙ]È
+›Ú™XÝÛ˜[YK[œÝ[][Û—ÙÜ›Ý\XÝ]™WØÛÛ˜XÝ›Ý\Ë[X\×Ø›ØŠBˆSQTÈ
+ËË	Û›ÉËËÊBˆˆˆ‹ˆ
+ˆ›Ú™XÝÛ˜[YKˆ[œÝ[][Û—ÙÜ›Ý\ˆˆÜšXYÈH\\ˆÈ›ÝšY\ˆÜ›ÝÖÉÜ›ÝšY\‰×_Kˆ‹ˆ›Ú™XÝÛ˜[YKˆ
+Kˆ
+Bˆ\ÜÙ]ÚYH[
+Ý\œÛÜ‹›\Ý›ÝÚY
+Bˆ›Ü›X[^™YÛ˜[YHH›Ü›X[^™WÛ˜[YJ›Ú™XÝÛ˜[YJBˆYˆ›Ü›X[^™YÛ˜[YN‚ˆÛÛ›‹™^XÝ]Jˆ’S”ÑT•ÔˆQÓ“Ô‘HS•È\ÜÙ]Ø[X\Ù\È
+\ÜÙ]ÚY[X\×Û˜[YK›Ü›X[^™YØ[X\ËÛÝ\˜ÙJHSQTÈ
+ËËËÊH‹ˆ
+\ÜÙ]ÚY›Ú™XÝÛ˜[YK›Ü›X[^™YÛ˜[YKš[YÜ˜][Û‹XÜ™X]HŠKˆ
+Bˆ™\ÛÛ™WÙ\Ú[ÛœÛÛ\—Ý[œ™\ÛÛ™Y
+ÛÛ›‹[œ™\ÛÛ™YÚY\ÜÙ]ÚY
+Bˆ™XZ[Ø\ÜÙ]Ø[X\×Ø›ØŠÛÛ›‹\ÜÙ]ÚY
+Bˆ™]\›ˆ\ÜÙ]ÚY‚‚™YˆYÛ›Ü™WÙ\Ú[ÛœÛÛ\—Ý[œ™\ÛÛ™Y
+ÛÛ›ŽˆÜ[]LËÛÛ›™XÝ[Û‹[œ™\ÛÛ™YÚYˆ[
+HOˆ›Û™N‚ˆÛÛ›‹™^XÝ]Jˆˆˆ‚ˆTUH[YÜ˜][Û—Ý[œ™\ÛÛ™YˆÑU™\ÛÛ][Û—ÜÝ]\ÈH	ÚYÛ›Ü™Y	Ë™\ÛÛ™YØ]HË™\ÛÛ][Û—Û›Ý\ÈH	ÒYÛ›Ü˜YÈX[X[Y[IÂˆÒT‘HYHÂˆˆˆ‹ˆ
+]][YK››ÝÊ
+Kš\ÛÙ›Ü›X]
+[Y\ÜXÏHœÙXÛÛ™ÈŠK[œ™\ÛÛ™YÚY
+Kˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+B‚‚˜\HÜ™X]WØ\
+
+B‚‚™Yˆ\œÙWØÛWØ\™ÜÊ
+HOˆ\™Ü\œÙK“˜[Y\ÜXÙN‚ˆ\œÙ\ˆH\™Ü\œÙK\™Ý[Y[\œÙ\Š\ØÜš\[ÛH“[Ûš]Üš[™È›Ø\™ØØ[\ŠBˆ\œÙ\‹˜YØ\™Ý[Y[
+‹KZÜÝ‹Y˜][HŒLËŒŒŒH‹[H’ÜÝÒTÛ™HH\˜ZH\ØÝ]\ˆŠBˆ\œÙ\‹˜YØ\™Ý[Y[
+‹K\Ü‹\OZ[Y˜][ML[H”ÜHÛ™HH\˜ZH\œ˜[˜Ø\ˆŠBˆ\œÙ\‹˜YØ\™Ý[Y[
+‹KYXYÈ‹XÝ[ÛHœÝÜ™WÝYH‹[H]]˜HXYÈÈ›\ÚÈŠBˆ™]\›ˆ\œÙ\‹œ\œÙWØ\™ÜÊ
+B‚‚šYˆ×Û˜[YW×ÈOH—×ÛXZ[—×ÈŽ‚ˆ\™ÜÈH\œÙWØÛWØ\™ÜÊ
+BˆYˆQUSÑVÑSÔU[™›Ý—ÔU™^\ÝÊ
+N‚ˆÚ]ÛÜÚ[™ÊÙ]ÙŠÝŠ—ÔU
+JJH\ÈÛÛ›Ž‚ˆ[\ÜÙ^Ù[Ù]JÛÛ›‹QUSÑVÑSÔU
+Bˆ[YˆQUSÑVÑSÔU‚ˆÚ]ÛÜÚ[™ÊÙ]ÙŠÝŠ—ÔU
+JJH\ÈÛÛ›Ž‚ˆYˆ]Y\žWÜØØ[\ŠÛÛ›‹”ÑSPÕÓÕS•
+
+ŠH”“ÓH\ÜÙ]ÈŠHOH‚ˆ[\ÜÙ^Ù[Ù]JÛÛ›‹QUSÑVÑSÔU
+Bˆ\œ[ŠÜÝX\™ÜËšÜÝÜX\™ÜËœÜXYÏX\™ÜË™XYÊB

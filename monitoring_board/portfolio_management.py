@@ -21,6 +21,7 @@ MAPPING_METHOD_NAME_FUZZY = "name_fuzzy"
 MAPPING_METHOD_MANUAL = "manual"
 MAPPING_METHOD_UNMAPPED = "unmapped"
 MAPPING_METHOD_CONFLICT = "conflict"
+MAPPING_METHOD_NIF_SHARED = "nif_shared"
 
 SAFE_AUTO_METHODS = {
     MAPPING_METHOD_NIF_EXACT,
@@ -248,16 +249,21 @@ def decide_mapping(
     normalized_name = normalize_name(external_name)
     candidates: list[MappingCandidate] = []
     warnings: list[str] = []
+    nif_asset_ids: set[int] = set()
 
     if normalized_nif:
         nif_assets = [asset for asset in assets if normalize_nif(asset.get("nif")) == normalized_nif]
+        nif_asset_ids = {int(asset["id"]) for asset in nif_assets}
         if len(nif_assets) == 1:
             asset = nif_assets[0]
             candidates.append(_candidate(asset, None, MAPPING_METHOD_NIF_EXACT, 1.0, ("nif_exact",)))
         elif len(nif_assets) > 1:
-            warnings.append("nif_conflict")
+            # A NIF identifies a customer, not a physical installation.  It is
+            # useful to narrow the manual choice, but must never turn several
+            # installations of the same customer into a false conflict.
+            warnings.append("nif_shared")
             for asset in nif_assets:
-                candidates.append(_candidate(asset, None, MAPPING_METHOD_CONFLICT, 1.0, ("nif_duplicate",), conflict=True))
+                candidates.append(_candidate(asset, None, MAPPING_METHOD_NIF_SHARED, 0.0, ("nif_shared",)))
 
     if normalized_name:
         alias_matches = [alias for alias in aliases if alias.get("active", True) and alias.get("normalized_alias") == normalized_name]
@@ -283,6 +289,25 @@ def decide_mapping(
                 candidates.append(_candidate(asset, None, MAPPING_METHOD_CONFLICT, 0.95, ("name_duplicate",), conflict=True))
 
     best_by_asset = _best_candidates(candidates)
+    if len(nif_asset_ids) > 1:
+        exact_asset_ids = {
+            candidate.asset_id
+            for candidate in best_by_asset
+            if candidate.method in SAFE_AUTO_METHODS
+        }
+        if exact_asset_ids and not exact_asset_ids.issubset(nif_asset_ids):
+            warnings.append("identifier_disagreement")
+            ordered = tuple(sorted(best_by_asset, key=lambda item: item.score, reverse=True)[:5])
+            return MappingDecision(
+                None,
+                MAPPING_METHOD_CONFLICT,
+                max(candidate.score for candidate in best_by_asset),
+                "conflict",
+                "mapping_conflict",
+                ordered,
+                warnings=tuple(sorted(set(warnings))),
+                auto_mappable=False,
+            )
     if best_by_asset:
         exact = _resolve_exact(best_by_asset, warnings)
         if exact:
@@ -295,6 +320,17 @@ def decide_mapping(
 
     ordered = sorted(best, key=lambda item: item.score, reverse=True)
     top = ordered[0]
+    if top.method == MAPPING_METHOD_NIF_SHARED:
+        return MappingDecision(
+            None,
+            MAPPING_METHOD_NIF_SHARED,
+            0.0,
+            "low",
+            "mapping_pending",
+            tuple(ordered[:5]),
+            warnings=tuple(sorted(set(warnings))),
+            auto_mappable=False,
+        )
     if top.conflict:
         return MappingDecision(None, MAPPING_METHOD_CONFLICT, top.score, "conflict", "mapping_conflict", tuple(ordered), warnings=tuple(sorted(set(warnings))), auto_mappable=False)
     if len(ordered) > 1 and top.score - ordered[1].score < AMBIGUOUS_DELTA:
