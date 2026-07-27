@@ -1,0 +1,88 @@
+<div class="reports-layout reports-automations-layout">
+  <section class="card reports-card">
+    <div class="section-title">
+      <div><h3>{{ 'Editar automatização' if selected_automation else 'Nova automatização' }}</h3><p class="muted">Gera o mês fechado anterior e guarda os ficheiros na plataforma.</p></div>
+    </div>
+    <form method="post" action="{{ url_for('report_automations') }}" class="stack-form" id="reports-automation-form">
+      <input type="hidden" name="automation_id" value="{{ selected_automation.id if selected_automation else '' }}">
+      <label for="automation-name">Nome
+        <input id="automation-name" name="name" maxlength="120" required value="{{ selected_automation.name if selected_automation else '' }}">
+      </label>
+      <fieldset class="reports-segmented">
+        <legend>Tipo</legend>
+        <label><input type="radio" name="report_type" value="individual" {{ 'checked' if not selected_automation or selected_automation.report_type == 'individual' }}><span>Individual</span></label>
+        <label><input type="radio" name="report_type" value="portfolio" {{ 'checked' if selected_automation and selected_automation.report_type == 'portfolio' }}><span>Portefólio</span></label>
+      </fieldset>
+      <div class="grid two">
+        <label data-report-scope="individual" for="automation-asset">Instalação
+          <select id="automation-asset" name="asset_id">
+            <option value="">Escolher instalação</option>
+            {% for asset in report_assets %}<option value="{{ asset.asset_id }}" {{ 'selected' if selected_automation and selected_automation.asset_id == asset.asset_id }}>{{ asset.project_name }}</option>{% endfor %}
+          </select>
+        </label>
+        <label data-report-scope="portfolio" for="automation-portfolio">Portefólio
+          <select id="automation-portfolio" name="portfolio_id">
+            <option value="">Escolher portefólio</option>
+            {% for group in groups %}<option value="{{ group.id }}" {{ 'selected' if selected_automation and selected_automation.portfolio_id == group.id }}>{{ group.name }}</option>{% endfor %}
+          </select>
+        </label>
+        <label for="automation-template">Template
+          <select id="automation-template" name="template_id" required>
+            {% for template in templates %}<option value="{{ template.id }}" data-template-type="{{ template.report_type }}" {{ 'selected' if selected_automation and selected_automation.template_id == template.id }}>{{ template.name }} · {{ template.report_type }}</option>{% endfor %}
+          </select>
+        </label>
+        <label data-report-scope="portfolio" for="automation-profile">Perfil
+          <select id="automation-profile" name="profile_id">
+            <option value="">Perfil default</option>
+            {% for profile in profiles %}<option value="{{ profile.id }}" {{ 'selected' if selected_automation and selected_automation.profile_id == profile.id }}>{{ profile.name }}</option>{% endfor %}
+          </select>
+        </label>
+        <label for="automation-day">Dia do mês
+          <input id="automation-day" type="number" name="schedule_day" min="1" max="28" required value="{{ selected_automation.schedule_day if selected_automation else 2 }}">
+        </label>
+        <label for="automation-time">Hora · Europe/Lisbon
+          <input id="automation-time" type="time" name="schedule_time" required value="{{ selected_automation.schedule_time if selected_automation else '09:00' }}">
+        </label>
+      </div>
+      <div class="reports-checks">
+        <label class="check-row"><input type="checkbox" name="include_excel" {{ 'checked' if selected_automation and 'excel' in selected_automation.formats_json }}><span>Gerar também Excel</span></label>
+        <label class="check-row"><input type="checkbox" name="include_availability" {{ 'checked' if selected_automation and selected_automation.include_availability }}><span>Incluir disponibilidade</span></label>
+        <label class="check-row"><input type="checkbox" name="active" {{ 'checked' if not selected_automation or selected_automation.active }}><span>Ativa</span></label>
+      </div>
+      <div class="reports-actions">
+        <button class="button" type="submit">Guardar automatização</button>
+        {% if selected_automation %}<a class="button secondary" href="{{ url_for('exports', tab='automations') }}">Cancelar edição</a>{% endif %}
+      </div>
+    </form>
+  </section>
+
+  <section class="card reports-card">
+    <div class="section-title"><div><h3>Automatizações existentes</h3><p class="muted">Execuções mensais reais registadas no scheduler.</p></div></div>
+    <div class="reports-automation-list">
+      {% for automation in automations %}
+        <article class="reports-automation-item">
+          <div class="reports-automation-title">
+            <div><strong>{{ automation.name }}</strong><small>{{ automation.asset_name or automation.portfolio_name }} · dia {{ automation.schedule_day }} às {{ automation.schedule_time }}</small></div>
+            <span class="reports-status {{ automation.last_status or ('inactive' if not automation.active else 'never') }}">{{ report_status_labels.get(automation.last_status, automation.last_status) if automation.last_status else ('Inativa' if not automation.active else 'Nunca executada') }}</span>
+          </div>
+          <dl class="reports-summary compact">
+            <div><dt>Tipo</dt><dd>{{ 'Individual' if automation.report_type == 'individual' else 'Portefólio' }}</dd></div>
+            <div><dt>Template</dt><dd>{{ automation.template_name }}</dd></div>
+            <div><dt>Próxima execução</dt><dd>{{ automation.next_run or ('Inativa' if not automation.active else 'Scheduler indisponível') }}</dd></div>
+            <div><dt>Última execução</dt><dd>{{ automation.last_run_at or 'Nunca' }}</dd></div>
+          </dl>
+          <div class="reports-row-actions">
+            <a class="button secondary small" href="{{ url_for('exports', tab='automations', automation_id=automation.id) }}">Editar</a>
+            <form method="post" action="{{ url_for('run_report_automation_now', automation_id=automation.id) }}"><button class="button secondary small" type="submit">Executar agora</button></form>
+            <form method="post" action="{{ url_for('toggle_report_automation', automation_id=automation.id) }}"><button class="button secondary small" type="submit">{{ 'Desativar' if automation.active else 'Ativar' }}</button></form>
+            {% if automation.last_file_id %}<a class="button secondary small" href="{{ url_for('download_generated_report', file_id=automation.last_file_id) }}">Último PDF</a>{% endif %}
+            <a class="button secondary small" href="{{ url_for('exports', tab='history', automation_id=automation.id) }}#reports-history">Histórico</a>
+            <form method="post" action="{{ url_for('remove_report_automation', automation_id=automation.id) }}" data-confirm="Apagar esta automatização? O histórico será preservado."><button class="button danger small" type="submit">Apagar</button></form>
+          </div>
+        </article>
+      {% else %}
+        <div class="reports-empty"><strong>Sem automatizações</strong><p>Cria a primeira execução mensal no formulário.</p></div>
+      {% endfor %}
+    </div>
+  </section>
+</div>

@@ -28,6 +28,7 @@ import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import current_app
 from flask import Flask, abort, flash, g, has_app_context, has_request_context, redirect, render_template, request, send_file, session, url_for
+from werkzeug.datastructures import MultiDict
 from werkzeug.utils import secure_filename
 from monitoring_board.db import configure_database_for_runtime, create_database_backup, ensure_column, get_db, query_all, query_scalar
 from monitoring_board.logging_config import configure_logging
@@ -128,17 +129,23 @@ from monitoring_board.report_template_repository import (
     add_generated_file,
     archive_template as archive_report_template,
     create_generation_run,
+    delete_report_automation,
     duplicate_template as duplicate_report_template,
     ensure_report_template_schema,
     finish_generation_run,
     get_default_template,
     get_generated_file,
+    get_report_automation,
     get_template,
     latest_template_version,
     list_generated_files,
     list_generation_runs,
+    list_enabled_report_automations,
+    list_report_automations,
     list_templates,
+    save_report_automation,
     save_template,
+    set_report_automation_active,
     set_default_template,
 )
 from monitoring_board.reporting_storage import reconcile_generated_reports
@@ -153,6 +160,7 @@ from monitoring_board.services.report_rendering import (
     MAX_BATCH_ASSETS,
     MAX_BATCH_PERIODS,
     MAX_TOTAL_OUTPUTS,
+    RenderedFile,
     render_individual_excel,
     render_individual_pdf,
     render_portfolio_excel,
@@ -3017,10 +3025,64 @@ def create_app() -> Flask:
             else False
         )
         billing_form = billing_config_to_form_values(selected_billing_config)
+        active_tab = request.args.get("tab", "generate")
+        if active_tab not in {"generate", "automations", "templates", "history"}:
+            active_tab = "generate"
+        groups = query_all(g.db, "SELECT id, name FROM portfolio_groups WHERE active = 1 OR active IS NULL ORDER BY name COLLATE NOCASE")
+        templates = list_templates(g.db)
+        all_templates = list_templates(g.db, include_inactive=True)
+        profiles = list_portfolio_report_profiles(g.db)
+        page = max(int(request.args.get("page", "1") or 1), 1)
+        selected_automation_id = int(request.args.get("automation_id", "0") or 0)
+        runs = list_generation_runs(
+            g.db,
+            limit=20,
+            offset=(page - 1) * 20,
+            automation_id=selected_automation_id if active_tab == "history" else None,
+        )
+        files = list_generated_files(
+            g.db,
+            limit=50,
+            offset=(page - 1) * 50,
+            automation_id=selected_automation_id if active_tab == "history" else None,
+        )
+        automations = []
+        for row in list_report_automations(g.db):
+            item = dict(row)
+            try:
+                item["formats"] = json.loads(item.get("formats_json") or '["pdf"]')
+            except (TypeError, json.JSONDecodeError):
+                item["formats"] = ["pdf"]
+            item["next_run"] = scheduler_next_run_label(f"report-automation-{item['id']}") if item.get("active") else ""
+            automations.append(item)
+        selected_automation = get_report_automation(g.db, selected_automation_id) if selected_automation_id else None
+        last_compatible_file = None
+        if selected_asset_id.isdigit():
+            last_compatible_file = g.db.execute(
+                """
+                SELECT f.*, r.status AS run_status, r.created_at AS run_created_at
+                FROM report_generated_files f
+                JOIN report_generation_runs r ON r.id = f.run_id
+                WHERE f.asset_id = ? AND f.format = 'pdf' AND f.status = 'completed'
+                ORDER BY f.created_at DESC, f.id DESC LIMIT 1
+                """,
+                (int(selected_asset_id),),
+            ).fetchone()
 
         return render_template(
             "exports.html",
+            title="Relatórios",
+            active_tab=active_tab,
             report_assets=report_assets,
+            groups=groups,
+            templates=templates,
+            all_templates=all_templates,
+            profiles=profiles,
+            runs=runs,
+            files=files,
+            automations=automations,
+            selected_automation=selected_automation,
+            last_compatible_file=last_compatible_file,
             selected_asset_id=selected_asset_id,
             selected_report_type=selected_report_type,
             period_type=report_period.period_type.value,
@@ -3038,6 +3100,67 @@ def create_app() -> Flask:
             selected_billing_config_exists=selected_billing_config_exists,
             fusionsolar_api_warning=get_fusionsolar_performance_cooldown_reason(g.db),
         )
+
+    @app.route("/report-automations", methods=["GET", "POST"])
+    def report_automations():
+        if request.method == "GET":
+            return redirect(url_for("exports", tab="automations"))
+        automation_id = int(request.form.get("automation_id", "0") or 0) or None
+        try:
+            values = validate_report_automation_form(g.db, request.form)
+            automation_id = save_report_automation(
+                g.db,
+                automation_id=automation_id,
+                **values,
+            )
+            g.db.commit()
+            refresh_integration_scheduler(app)
+            flash("Automatização guardada.", "success")
+        except Exception as exc:
+            g.db.rollback()
+            LOGGER.warning(
+                "report_automation_save_failed automation_id=%s error_code=%s",
+                automation_id,
+                type(exc).__name__,
+            )
+            flash(str(exc), "error")
+        return redirect(url_for("exports", tab="automations", automation_id=automation_id or ""))
+
+    @app.post("/report-automations/<int:automation_id>/toggle")
+    def toggle_report_automation(automation_id: int):
+        automation = get_report_automation(g.db, automation_id)
+        if automation is None:
+            abort(404)
+        set_report_automation_active(g.db, automation_id, 0 if automation["active"] else 1)
+        g.db.commit()
+        refresh_integration_scheduler(app)
+        flash("Automatização ativada." if not automation["active"] else "Automatização desativada.", "success")
+        return redirect(url_for("exports", tab="automations"))
+
+    @app.post("/report-automations/<int:automation_id>/run")
+    def run_report_automation_now(automation_id: int):
+        if get_report_automation(g.db, automation_id) is None:
+            abort(404)
+        job_id, created = create_background_job(
+            g.db,
+            "report_automation_generation",
+            {"automation_id": automation_id},
+        )
+        g.db.commit()
+        if created and not schedule_background_job(app, job_id):
+            flash("A execução ficou pendente porque o scheduler não está disponível.", "warning")
+        else:
+            flash("Execução colocada em fila." if created else "Já existe uma execução em fila.", "success")
+        return redirect(url_for("exports", tab="automations"))
+
+    @app.post("/report-automations/<int:automation_id>/delete")
+    def remove_report_automation(automation_id: int):
+        delete_report_automation(g.db, automation_id)
+        g.db.commit()
+        if SCHEDULER and SCHEDULER.get_job(f"report-automation-{automation_id}"):
+            SCHEDULER.remove_job(f"report-automation-{automation_id}")
+        flash("Automatização apagada. O histórico de relatórios foi preservado.", "success")
+        return redirect(url_for("exports", tab="automations"))
 
     @app.route("/portfolio-manager")
     def portfolio_manager() -> str:
@@ -4307,118 +4430,22 @@ def create_app() -> Flask:
         output_dir = UPLOAD_DIR / "generated_reports"
         output_dir.mkdir(parents=True, exist_ok=True)
         if request.method == "POST":
-            report_type = request.form.get("report_type", "portfolio")
-            template_id = int(request.form.get("template_id", "0") or 0)
-            portfolio_id = int(request.form.get("portfolio_id", "0") or 0) or None
-            snapshot_id = int(request.form.get("snapshot_id", "0") or 0) or None
-            raw_formats = request.form.getlist("formats") or ["pdf"]
-            run_id = None
             try:
-                formats = validate_formats(report_type, raw_formats)
-                main_formats = tuple(item for item in formats if item != "zip")
-                template = get_template(g.db, template_id) if template_id else get_default_template(g.db, report_type, portfolio_id)
-                if template is None:
-                    raise ValueError("Template invalido.")
-                snapshot_result = None
-                if snapshot_id:
-                    snapshot_result = get_portfolio_snapshot_result(g.db, snapshot_id)
-                    if snapshot_result is None or (portfolio_id and snapshot_result.portfolio_id != portfolio_id):
-                        raise ValueError("Snapshot invalido.")
-                    portfolio_id = snapshot_result.portfolio_id
-                    reject_snapshot_period_overrides(request.form, snapshot_result)
-                client_key = resolve_generation_client_key(g.db, report_type, request.form, portfolio_id)
-                validate_template_scope(template, report_type, portfolio_id=portfolio_id, client_key=client_key)
-                if report_type == "portfolio" and not snapshot_id and not portfolio_id:
-                    raise ValueError("Portfolio obrigatorio.")
-                jobs = build_snapshot_generation_jobs(snapshot_result, main_formats) if snapshot_result else build_generation_jobs(request.form, report_type, main_formats)
-                if not jobs:
-                    raise ValueError("Pedido sem outputs principais.")
-                if len(jobs) > MAX_TOTAL_OUTPUTS:
-                    raise ValueError("Demasiados outputs no mesmo run.")
-                first_period = jobs[0]["period"]
-                run_id = create_generation_run(
+                result = execute_persisted_report_generation(
                     g.db,
-                    template_id=template.id,
-                    template_version=latest_template_version(g.db, template.id),
-                    report_type=report_type,
-                    portfolio_id=portfolio_id,
-                    asset_id=jobs[0].get("asset_id"),
-                    snapshot_id=snapshot_id,
-                    period_type=first_period["period_type"],
-                    period_start=first_period["period_start"],
-                    period_end=first_period["period_end"],
-                    requested_count=len(jobs),
+                    request.form,
+                    output_dir=output_dir,
                 )
-                LOGGER.info("report_generation_run_created run_id=%s report_type=%s template_id=%s portfolio_id=%s snapshot_id=%s requested_count=%s", run_id, report_type, template.id, portfolio_id, snapshot_id, len(jobs))
-                g.db.commit()
-                completed = 0
-                failed = 0
-                skipped = 0
-                warnings: list[str] = []
-                completed_files = []
-                if report_type == "portfolio":
-                    for job in jobs:
-                        try:
-                            LOGGER.info("report_generation_item_started run_id=%s format=%s portfolio_id=%s snapshot_id=%s", run_id, job["format"], portfolio_id, snapshot_id)
-                            result = snapshot_result or build_portfolio_generation_result(g.db, request.form, portfolio_id, snapshot_id, job["period"])
-                            if snapshot_id:
-                                portfolio_id = result.portfolio_id
-                            rendered = render_portfolio_pdf(result, template) if job["format"] == "pdf" else render_portfolio_excel(result, template)
-                            completed_files.append(register_rendered_generation_file(g.db, output_dir, run_id, rendered, snapshot_id=snapshot_id))
-                            completed += 1
-                            warnings.extend(rendered.warnings)
-                            LOGGER.info("report_generation_item_completed run_id=%s format=%s portfolio_id=%s snapshot_id=%s", run_id, job["format"], rendered.portfolio_id, snapshot_id)
-                        except Exception as exc:
-                            failed += 1
-                            LOGGER.warning("report_generation_item_failed run_id=%s format=%s portfolio_id=%s snapshot_id=%s error_code=%s", run_id, job.get("format"), portfolio_id, snapshot_id, type(exc).__name__)
-                            add_failed_generation_file(g.db, run_id, job, str(exc), portfolio_id=portfolio_id, snapshot_id=snapshot_id)
-                else:
-                    for job in jobs:
-                        try:
-                            LOGGER.info("report_generation_item_started run_id=%s format=%s asset_id=%s", run_id, job["format"], job.get("asset_id"))
-                            report = build_individual_generation_report(
-                                g.db,
-                                job["asset_id"],
-                                job["period"],
-                                include_wat=any(
-                                    section.enabled
-                                    and section.key == "availability"
-                                    for section in template.sections
-                                ),
-                            )
-                            rendered = render_individual_pdf(report, template) if job["format"] == "pdf" else render_individual_excel(report, template)
-                            completed_files.append(register_rendered_generation_file(g.db, output_dir, run_id, rendered))
-                            completed += 1
-                            warnings.extend(rendered.warnings)
-                            LOGGER.info("report_generation_item_completed run_id=%s format=%s asset_id=%s", run_id, job["format"], rendered.asset_id)
-                        except Exception as exc:
-                            failed += 1
-                            LOGGER.warning("report_generation_item_failed run_id=%s format=%s asset_id=%s error_code=%s", run_id, job.get("format"), job.get("asset_id"), type(exc).__name__)
-                            add_failed_generation_file(g.db, run_id, job, str(exc), asset_id=job.get("asset_id"))
-                if "zip" in formats and completed_files:
-                    zip_file = render_zip(completed_files, filename=f"run_{run_id}.zip")
-                    register_rendered_generation_file(g.db, output_dir, run_id, zip_file)
-                status = "completed" if completed and not failed else ("partial" if completed and failed else "failed")
-                finish_generation_run(g.db, run_id, status=status, completed_count=completed, failed_count=failed, skipped_count=skipped, warnings=sorted(set(warnings)), error_message="" if completed else "Todos os outputs falharam.")
-                g.db.commit()
-                flash(f"Run #{run_id} terminado: {completed} concluídos, {failed} falhados.", "success" if status == "completed" else "warning")
+                flash(
+                    f"Run #{result['run_id']} terminado: {result['completed']} concluídos, {result['failed']} falhados.",
+                    "success" if result["status"] == "completed" else "warning",
+                )
             except Exception as exc:
-                g.db.rollback()
-                if run_id:
-                    finish_generation_run(g.db, run_id, status="failed", completed_count=0, failed_count=0, error_message=str(exc))
-                    g.db.commit()
-                LOGGER.warning("report_generation_failed run_id=%s report_type=%s template_id=%s error_code=%s", run_id, report_type, template_id, type(exc).__name__)
+                LOGGER.warning("report_generation_failed error_code=%s", type(exc).__name__)
                 flash("Falha na geração. Revê o pedido e consulta os logs para detalhe técnico.", "error")
-            return redirect(url_for("report_generation"))
-        groups = query_all(g.db, "SELECT * FROM portfolio_groups ORDER BY name COLLATE NOCASE")
-        assets = query_all(g.db, "SELECT id, project_name FROM assets WHERE active_contract = 'yes' OR active_contract IS NULL ORDER BY project_name COLLATE NOCASE LIMIT 200")
-        templates = list_templates(g.db)
-        profiles = list_portfolio_report_profiles(g.db)
+            return redirect(url_for("exports", tab="history"))
         page = max(int(request.args.get("page", "1") or 1), 1)
-        offset = (page - 1) * 20
-        runs = list_generation_runs(g.db, limit=20, offset=offset)
-        files = list_generated_files(g.db, limit=50, offset=(page - 1) * 50)
-        return render_template("report_generation.html", title="Geracao de relatorios", groups=groups, assets=assets, templates=templates, profiles=profiles, runs=runs, files=files, page=page)
+        return redirect(url_for("exports", tab="history", page=page))
 
     @app.route("/reporting-health")
     def reporting_health():
@@ -10575,6 +10602,301 @@ def build_generation_jobs(form: Any, report_type: str, main_formats: tuple[str, 
     return jobs
 
 
+def execute_persisted_report_generation(
+    conn: sqlite3.Connection,
+    form: Any,
+    *,
+    output_dir: Path,
+    automation_id: int | None = None,
+) -> dict[str, Any]:
+    """Run the canonical persisted generation flow for manual and scheduled reports."""
+    report_type = str(form.get("report_type", "portfolio") or "portfolio")
+    template_id = int(form.get("template_id", "0") or 0)
+    portfolio_id = int(form.get("portfolio_id", "0") or 0) or None
+    snapshot_id = int(form.get("snapshot_id", "0") or 0) or None
+    raw_formats = form.getlist("formats") or ["pdf"]
+    run_id: int | None = None
+    try:
+        formats = validate_formats(report_type, raw_formats)
+        main_formats = tuple(item for item in formats if item != "zip")
+        template = get_template(conn, template_id) if template_id else get_default_template(conn, report_type, portfolio_id)
+        if template is None:
+            raise ValueError("Template inválido.")
+        snapshot_result = None
+        if snapshot_id:
+            snapshot_result = get_portfolio_snapshot_result(conn, snapshot_id)
+            if snapshot_result is None or (portfolio_id and snapshot_result.portfolio_id != portfolio_id):
+                raise ValueError("Snapshot inválido.")
+            portfolio_id = snapshot_result.portfolio_id
+            reject_snapshot_period_overrides(form, snapshot_result)
+        client_key = resolve_generation_client_key(conn, report_type, form, portfolio_id)
+        validate_template_scope(template, report_type, portfolio_id=portfolio_id, client_key=client_key)
+        if report_type == "portfolio" and not snapshot_id and not portfolio_id:
+            raise ValueError("Portefólio obrigatório.")
+        jobs = build_snapshot_generation_jobs(snapshot_result, main_formats) if snapshot_result else build_generation_jobs(form, report_type, main_formats)
+        if not jobs:
+            raise ValueError("Pedido sem outputs principais.")
+        if len(jobs) > MAX_TOTAL_OUTPUTS:
+            raise ValueError("Demasiados outputs no mesmo run.")
+        first_period = jobs[0]["period"]
+        if automation_id:
+            duplicate = conn.execute(
+                """
+                SELECT id, status FROM report_generation_runs
+                WHERE automation_id = ? AND period_start = ?
+                  AND status IN ('running', 'completed')
+                ORDER BY id DESC LIMIT 1
+                """,
+                (automation_id, first_period["period_start"]),
+            ).fetchone()
+            if duplicate:
+                return {
+                    "run_id": int(duplicate["id"]),
+                    "status": str(duplicate["status"]),
+                    "completed": 0,
+                    "failed": 0,
+                    "duplicate": True,
+                }
+        run_id = create_generation_run(
+            conn,
+            template_id=template.id,
+            template_version=latest_template_version(conn, template.id),
+            report_type=report_type,
+            portfolio_id=portfolio_id,
+            asset_id=jobs[0].get("asset_id"),
+            snapshot_id=snapshot_id,
+            automation_id=automation_id,
+            period_type=first_period["period_type"],
+            period_start=first_period["period_start"],
+            period_end=first_period["period_end"],
+            requested_count=len(jobs),
+        )
+        conn.commit()
+        completed = 0
+        failed = 0
+        warnings: list[str] = []
+        completed_files: list[RenderedFile] = []
+        if report_type == "portfolio":
+            for job in jobs:
+                try:
+                    result = snapshot_result or build_portfolio_generation_result(conn, form, portfolio_id, snapshot_id, job["period"])
+                    rendered = render_portfolio_pdf(result, template) if job["format"] == "pdf" else render_portfolio_excel(result, template)
+                    completed_files.append(register_rendered_generation_file(conn, output_dir, run_id, rendered, snapshot_id=snapshot_id))
+                    completed += 1
+                    warnings.extend(rendered.warnings)
+                except Exception as exc:
+                    failed += 1
+                    LOGGER.warning(
+                        "report_generation_item_failed run_id=%s format=%s portfolio_id=%s error_code=%s",
+                        run_id,
+                        job.get("format"),
+                        portfolio_id,
+                        type(exc).__name__,
+                    )
+                    add_failed_generation_file(conn, run_id, job, str(exc), portfolio_id=portfolio_id, snapshot_id=snapshot_id)
+        else:
+            include_availability = bool(
+                form.get("include_availability") in {"on", "1", 1, True}
+                or any(section.enabled and section.key == "availability" for section in template.sections)
+            )
+            force_api = form.get("force_api") == "on"
+            for job in jobs:
+                try:
+                    billing_override = None
+                    if form.get("billing_values_source"):
+                        selection = validate_report_asset_selection(
+                            get_fusionsolar_report_assets(conn),
+                            str(job["asset_id"]),
+                        )
+                        source = parse_billing_values_source(form.get("billing_values_source", "saved"))
+                        billing_override = (
+                            parse_billing_config_form(dict(form), selection.report_type)
+                            if source == "manual"
+                            else get_asset_billing_config(conn, job["asset_id"], selection.report_type)
+                        )
+                    report = build_individual_generation_report(
+                        conn,
+                        job["asset_id"],
+                        job["period"],
+                        include_wat=include_availability,
+                        billing_config=billing_override,
+                        force_api=force_api,
+                    )
+                    rendered = render_individual_pdf(report, template) if job["format"] == "pdf" else render_individual_excel(report, template)
+                    completed_files.append(register_rendered_generation_file(conn, output_dir, run_id, rendered))
+                    completed += 1
+                    warnings.extend(rendered.warnings)
+                except Exception as exc:
+                    failed += 1
+                    LOGGER.warning(
+                        "report_generation_item_failed run_id=%s format=%s asset_id=%s error_code=%s",
+                        run_id,
+                        job.get("format"),
+                        job.get("asset_id"),
+                        type(exc).__name__,
+                    )
+                    add_failed_generation_file(conn, run_id, job, str(exc), asset_id=job.get("asset_id"))
+        if "zip" in formats and completed_files:
+            zip_file = render_zip(completed_files, filename=f"run_{run_id}.zip")
+            register_rendered_generation_file(conn, output_dir, run_id, zip_file)
+        status = "completed" if completed and not failed else ("partial" if completed and failed else "failed")
+        finish_generation_run(
+            conn,
+            run_id,
+            status=status,
+            completed_count=completed,
+            failed_count=failed,
+            warnings=sorted(set(warnings)),
+            error_message="" if completed else "Todos os outputs falharam.",
+        )
+        conn.commit()
+        return {
+            "run_id": run_id,
+            "status": status,
+            "completed": completed,
+            "failed": failed,
+            "duplicate": False,
+        }
+    except Exception:
+        conn.rollback()
+        if run_id:
+            finish_generation_run(
+                conn,
+                run_id,
+                status="failed",
+                completed_count=0,
+                failed_count=0,
+                error_message="Falha antes de concluir a geração.",
+            )
+            conn.commit()
+        raise
+
+
+def validate_report_automation_form(conn: sqlite3.Connection, form: Any) -> dict[str, Any]:
+    report_type = str(form.get("report_type") or "")
+    if report_type not in {"individual", "portfolio"}:
+        raise ValueError("Tipo de relatório inválido.")
+    name = str(form.get("name") or "").strip()
+    if not name or len(name) > 120:
+        raise ValueError("Indica um nome válido.")
+    asset_id = int(form.get("asset_id", "0") or 0) or None
+    portfolio_id = int(form.get("portfolio_id", "0") or 0) or None
+    if report_type == "individual":
+        if not asset_id or portfolio_id:
+            raise ValueError("A automatização individual exige uma instalação.")
+        if conn.execute("SELECT id FROM assets WHERE id = ?", (asset_id,)).fetchone() is None:
+            raise ValueError("Instalação inválida.")
+    elif not portfolio_id or asset_id:
+        raise ValueError("A automatização de portefólio exige um portefólio.")
+    elif conn.execute("SELECT id FROM portfolio_groups WHERE id = ?", (portfolio_id,)).fetchone() is None:
+        raise ValueError("Portefólio inválido.")
+    template_id = int(form.get("template_id", "0") or 0)
+    template = get_template(conn, template_id)
+    if template is None:
+        raise ValueError("Template inválido.")
+    client_key = resolve_report_client_key(conn, portfolio_id=portfolio_id, asset_id=asset_id)
+    validate_template_scope(template, report_type, portfolio_id=portfolio_id, client_key=client_key)
+    profile_id = int(form.get("profile_id", "0") or 0) or None
+    if report_type == "portfolio" and profile_id:
+        profile = get_portfolio_report_profile(conn, profile_id)
+        profile_row = conn.execute(
+            "SELECT active FROM portfolio_report_profiles WHERE id = ?",
+            (profile_id,),
+        ).fetchone()
+        if profile is None or profile.portfolio_id not in {None, portfolio_id} or not profile_row or not profile_row["active"]:
+            raise ValueError("Perfil inválido para o portefólio.")
+    if report_type == "individual":
+        profile_id = None
+    schedule_day = int(form.get("schedule_day", "0") or 0)
+    if schedule_day < 1 or schedule_day > 28:
+        raise ValueError("O dia de geração deve estar entre 1 e 28.")
+    schedule_time = str(form.get("schedule_time") or "").strip()
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", schedule_time):
+        raise ValueError("Indica uma hora válida.")
+    formats = ["pdf"]
+    if form.get("include_excel") == "on":
+        formats.append("excel")
+    return {
+        "name": name,
+        "active": 1 if form.get("active", "on") == "on" else 0,
+        "report_type": report_type,
+        "asset_id": asset_id,
+        "portfolio_id": portfolio_id,
+        "template_id": template_id,
+        "profile_id": profile_id,
+        "schedule_day": schedule_day,
+        "schedule_time": schedule_time,
+        "formats": formats,
+        "include_availability": 1 if form.get("include_availability") == "on" else 0,
+    }
+
+
+def run_report_automation_generation(conn: sqlite3.Connection, automation_id: int) -> dict[str, Any]:
+    automation = get_report_automation(conn, automation_id)
+    if automation is None:
+        raise ValueError("Automatização não encontrada.")
+    previous_month_end = current_lisbon_date().replace(day=1) - timedelta(days=1)
+    report_month = previous_month_end.strftime("%Y-%m")
+    try:
+        formats = json.loads(automation["formats_json"] or '["pdf"]')
+    except (TypeError, json.JSONDecodeError):
+        formats = ["pdf"]
+    form = MultiDict(
+        [
+            ("report_type", str(automation["report_type"])),
+            ("template_id", str(automation["template_id"])),
+            ("portfolio_id", str(automation["portfolio_id"] or "")),
+            ("profile_id", str(automation["profile_id"] or "")),
+            ("asset_id", str(automation["asset_id"] or "")),
+            ("period_type", "monthly"),
+            ("report_month", report_month),
+            ("include_availability", "on" if automation["include_availability"] else ""),
+            *[("formats", str(fmt)) for fmt in formats],
+        ]
+    )
+    try:
+        return execute_persisted_report_generation(
+            conn,
+            form,
+            output_dir=UPLOAD_DIR / "generated_reports",
+            automation_id=automation_id,
+        )
+    except Exception:
+        period = build_period("monthly", report_month=report_month)
+        existing = conn.execute(
+            """
+            SELECT id FROM report_generation_runs
+            WHERE automation_id = ? AND period_start = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (automation_id, period.start.isoformat()),
+        ).fetchone()
+        if existing is None:
+            run_id = create_generation_run(
+                conn,
+                template_id=automation["template_id"],
+                template_version=latest_template_version(conn, automation["template_id"]),
+                report_type=automation["report_type"],
+                portfolio_id=automation["portfolio_id"],
+                asset_id=automation["asset_id"],
+                automation_id=automation_id,
+                period_type="monthly",
+                period_start=period.start.isoformat(),
+                period_end=period.end.isoformat(),
+                requested_count=max(1, len(formats)),
+            )
+            finish_generation_run(
+                conn,
+                run_id,
+                status="failed",
+                completed_count=0,
+                failed_count=max(1, len(formats)),
+                error_message="Falha ao preparar a execução automática.",
+            )
+            conn.commit()
+        raise
+
+
 def build_snapshot_generation_jobs(snapshot_result, main_formats: tuple[str, ...]) -> list[dict[str, Any]]:
     period = {
         "period_type": snapshot_result.period.period_type.value,
@@ -10699,6 +11021,8 @@ def build_individual_generation_report(
     period_job: dict[str, str],
     *,
     include_wat: bool = False,
+    billing_config: BillingConfig | None = None,
+    force_api: bool = False,
 ) -> dict[str, Any]:
     period = build_period(
         period_job["period_type"],
@@ -10707,15 +11031,21 @@ def build_individual_generation_report(
         quarter=period_job.get("report_quarter"),
         semester=period_job.get("report_semester"),
     )
-    billing_config = get_asset_billing_config(conn, asset_id, ReportType.EPC)
-    report = build_local_customer_production_report(
+    if billing_config is None:
+        asset = conn.execute("SELECT * FROM assets WHERE id = ?", (asset_id,)).fetchone()
+        report_type = ReportType(detect_report_type(asset)) if asset is not None else ReportType.EPC
+        billing_config = get_asset_billing_config(conn, asset_id, report_type)
+    builder = build_fusionsolar_customer_production_report if force_api else build_local_customer_production_report
+    report = builder(
         conn,
         asset_id=asset_id,
         report_month=period.start.strftime("%Y-%m"),
         electricity_price=float(billing_config.electricity_price_eur_kwh),
         sell_price=float(billing_config.export_price_eur_kwh),
+        solcor_price_per_kwh=float(billing_config.solcor_price_per_kwh),
         billing_config=billing_config,
         period=period,
+        **({"force_api": True} if force_api else {}),
     )
     if report is None:
         raise ValueError(f"Sem dados para a instalacao {asset_id}.")
@@ -11707,6 +12037,7 @@ def refresh_integration_scheduler(app: Flask) -> None:
         if (
             job.id.startswith("integration-sync-")
             or job.id.startswith("fusionsolar-sync-")
+            or job.id.startswith("report-automation-")
             or job.id
             in {
                 "telegram-daily-summary",
@@ -11725,6 +12056,7 @@ def refresh_integration_scheduler(app: Flask) -> None:
 
     with closing(get_db(app.config["DATABASE"])) as conn:
         configs = [get_integration_config(conn, provider) for provider in INTEGRATION_PROVIDER_OPTIONS]
+        report_automations = list_enabled_report_automations(conn)
     if telegram_daily_summary_enabled():
         SCHEDULER.add_job(
             func=run_scheduled_telegram_daily_summary,
@@ -11747,6 +12079,18 @@ def refresh_integration_scheduler(app: Flask) -> None:
             continue
         if provider == INTEGRATION_PROVIDER_SIGENERGY:
             register_sigenergy_scheduler_jobs(app, config)
+    for automation in report_automations:
+        hour, minute = split_clock_time(automation["schedule_time"], "09:00")
+        add_scheduler_job(
+            func=queue_scheduled_report_automation,
+            trigger="cron",
+            day=int(automation["schedule_day"]),
+            hour=hour,
+            minute=minute,
+            timezone=str(automation["timezone"] or "Europe/Lisbon"),
+            args=[app, int(automation["id"])],
+            id=f"report-automation-{automation['id']}",
+        )
     register_background_job_reactivation_scheduler(app)
 
 
@@ -11834,6 +12178,26 @@ def register_background_job_reactivation_scheduler(app: Flask) -> None:
         args=[app],
         id="background-jobs-reactivate-rate-limit",
     )
+
+
+def queue_scheduled_report_automation(app: Flask, automation_id: int) -> None:
+    with app.app_context():
+        with closing(get_db(app.config["DATABASE"])) as conn:
+            automation = get_report_automation(conn, automation_id)
+            if automation is None or not automation["active"]:
+                return
+            previous_month_end = current_lisbon_date().replace(day=1) - timedelta(days=1)
+            job_id, created = create_background_job(
+                conn,
+                "report_automation_generation",
+                {
+                    "automation_id": automation_id,
+                    "report_month": previous_month_end.strftime("%Y-%m"),
+                },
+            )
+            conn.commit()
+        if created:
+            schedule_background_job(app, job_id)
 
 
 def run_scheduled_background_job_reactivation(app: Flask) -> None:
@@ -12085,6 +12449,12 @@ def schedule_pending_background_jobs(app: Flask) -> dict[str, Any]:
         recovered_count = mark_stale_running_background_jobs_failed(conn)
         if recovered_count:
             app.logger.warning("Marked %s stale running background jobs as failed on startup", recovered_count)
+        stale_report_runs = recover_stale_report_automation_runs(conn)
+        if stale_report_runs:
+            app.logger.warning(
+                "Marked %s stale automated report runs as failed on startup",
+                stale_report_runs,
+            )
         reactivated_count = reactivate_due_rate_limited_background_jobs(conn)
         if reactivated_count:
             app.logger.info("Reactivated %s background jobs after API cooldown", reactivated_count)
@@ -12125,6 +12495,30 @@ def schedule_pending_background_jobs(app: Flask) -> dict[str, Any]:
         "waiting_scheduled": waiting_scheduled_count,
         "waiting_schedule_failed_ids": failed_waiting_job_ids,
     }
+
+
+def recover_stale_report_automation_runs(
+    conn: sqlite3.Connection,
+    *,
+    stale_after_hours: int = 2,
+) -> int:
+    cursor = conn.execute(
+        """
+        UPDATE report_generation_runs
+        SET status = 'failed',
+            error_message = 'Execução automática interrompida antes da conclusão.',
+            completed_at = ?
+        WHERE automation_id IS NOT NULL
+          AND status = 'running'
+          AND created_at < datetime('now', ?)
+        """,
+        (
+            datetime.now().isoformat(timespec="seconds"),
+            f"-{max(1, stale_after_hours)} hours",
+        ),
+    )
+    conn.commit()
+    return cursor.rowcount
 
 
 def is_transient_sqlite_lock(exc: BaseException) -> bool:
@@ -12335,6 +12729,12 @@ def run_background_job_payload(conn: sqlite3.Connection, job_type: str, params: 
     if provider and api_area:
         require_not_in_cooldown(conn, provider, api_area)
         record_api_attempt(conn, provider, api_area)
+
+    if job_type == "report_automation_generation":
+        automation_id = int(params.get("automation_id") or 0)
+        if not automation_id:
+            raise ValueError("Automatização inválida.")
+        return run_report_automation_generation(conn, automation_id)
 
     if job_type == "fusionsolar_state_sync":
         result = run_fusionsolar_sync(

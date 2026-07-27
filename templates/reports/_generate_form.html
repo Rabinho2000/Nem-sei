@@ -1,0 +1,133 @@
+<section class="card reports-card" aria-labelledby="report-config-title">
+  <div class="section-title">
+    <div>
+      <h3 id="report-config-title">Configuração do relatório</h3>
+      <p class="muted">Seleciona o âmbito, período e regras de cálculo.</p>
+    </div>
+  </div>
+
+  {% if fusionsolar_api_warning %}
+    <div class="reports-notice warning"><strong>FusionSolar:</strong> {{ fusionsolar_api_warning }}</div>
+  {% endif %}
+
+  <form id="reports-generate-form" class="stack-form" method="post" action="{{ url_for('report_generation') }}">
+    <fieldset class="reports-segmented">
+      <legend>Tipo de relatório</legend>
+      <label><input type="radio" name="report_type" value="individual" checked> <span>Individual</span></label>
+      <label><input type="radio" name="report_type" value="portfolio"> <span>Portefólio</span></label>
+    </fieldset>
+
+    <div class="grid two">
+      <label data-report-scope="individual" for="report-asset">Instalação
+        <select name="asset_id" id="report-asset">
+          <option value="">Escolher instalação</option>
+          {% for asset in report_assets %}
+            <option value="{{ asset.asset_id }}" data-report-type="{{ asset.report_type }}" {{ 'selected' if selected_asset_id|string == asset.asset_id|string else '' }}>
+              {{ asset.project_name }}{% if asset.external_name and asset.external_name != asset.project_name %} · {{ asset.external_name }}{% endif %}
+            </option>
+          {% endfor %}
+        </select>
+        <small class="muted" id="detected-report-model">
+          {% if selected_report_type %}Modelo detetado: {{ selected_report_type|upper }}{% else %}O modelo ESCO/EPC é detetado pela instalação.{% endif %}
+        </small>
+      </label>
+      <label data-report-scope="portfolio" for="report-portfolio">Portefólio
+        <select name="portfolio_id" id="report-portfolio">
+          <option value="">Escolher portefólio</option>
+          {% for group in groups %}<option value="{{ group.id }}">{{ group.name }}</option>{% endfor %}
+        </select>
+      </label>
+      <label for="report-template">Template
+        <select name="template_id" id="report-template" required>
+          {% for template in templates %}
+            <option value="{{ template.id }}" data-template-type="{{ template.report_type }}" data-template-name="{{ template.name }}">{{ template.name }} · {{ 'Individual' if template.report_type == 'individual' else 'Portefólio' }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label data-report-scope="portfolio" for="report-profile">Perfil
+        <select name="profile_id" id="report-profile">
+          <option value="">Perfil default</option>
+          {% for profile in profiles %}<option value="{{ profile.id }}">{{ profile.name }}</option>{% endfor %}
+        </select>
+      </label>
+    </div>
+
+    <div class="grid two">
+      <label for="period-type">Período
+        <select name="period_type" id="period-type">
+          <option value="monthly" {{ 'selected' if period_type == 'monthly' else '' }}>Mensal</option>
+          <option value="quarterly" {{ 'selected' if period_type == 'quarterly' else '' }}>Trimestral</option>
+          <option value="semiannual" {{ 'selected' if period_type == 'semiannual' else '' }}>Semestral</option>
+          <option value="annual" {{ 'selected' if period_type == 'annual' else '' }}>Anual</option>
+        </select>
+      </label>
+      <label data-period-field="monthly" for="report-month">Mês
+        <input id="report-month" type="month" name="report_month" value="{{ report_month }}">
+      </label>
+      <label data-period-field="quarterly semiannual annual" for="report-year">Ano
+        <input id="report-year" type="number" name="report_year" min="2000" max="2100" value="{{ report_year }}">
+      </label>
+      <label data-period-field="quarterly" for="report-quarter">Trimestre
+        <select id="report-quarter" name="report_quarter">
+          <option value="1" {{ 'selected' if report_quarter == '1' }}>T1 · janeiro a março</option>
+          <option value="2" {{ 'selected' if report_quarter == '2' }}>T2 · abril a junho</option>
+          <option value="3" {{ 'selected' if report_quarter == '3' }}>T3 · julho a setembro</option>
+          <option value="4" {{ 'selected' if report_quarter == '4' }}>T4 · outubro a dezembro</option>
+        </select>
+      </label>
+      <label data-period-field="semiannual" for="report-semester">Semestre
+        <select id="report-semester" name="report_semester">
+          <option value="1" {{ 'selected' if report_semester == '1' }}>S1 · janeiro a junho</option>
+          <option value="2" {{ 'selected' if report_semester == '2' }}>S2 · julho a dezembro</option>
+        </select>
+      </label>
+    </div>
+
+    <details class="reports-details" id="reports-calculation" {{ 'open' if request.args.get('billing_values_source') == 'manual' else '' }}>
+      <summary>Cálculo e dados</summary>
+      <div class="grid three reports-details-body">
+        <label for="billing-values-source">Fonte dos valores
+          <select name="billing_values_source" id="billing-values-source">
+            <option value="saved">Configuração guardada{% if not selected_billing_config_exists %} · defaults{% endif %}</option>
+            <option value="manual">Valores manuais</option>
+          </select>
+        </label>
+        <label for="billing-mode">Modelo de cobrança
+          <select name="billing_mode" id="billing-mode">
+            <option value="energy" {{ 'selected' if billing_mode == 'energy' }}>Tarifa por energia</option>
+            <option value="fixed_monthly_fee" {{ 'selected' if billing_mode == 'fixed_monthly_fee' }}>Mensalidade fixa</option>
+          </select>
+        </label>
+        <label for="electricity-price">Preço eletricidade EUR/kWh
+          <input id="electricity-price" type="number" step="0.00001" min="0" name="electricity_price" value="{{ electricity_price }}">
+        </label>
+        <label for="sell-price">Venda de excedente EUR/kWh
+          <input id="sell-price" type="number" step="0.00001" min="0" name="sell_price" value="{{ sell_price }}">
+        </label>
+        <label id="solcor-price-field" for="solcor-price">Preço Solcor EUR/kWh
+          <input id="solcor-price" type="number" step="0.00001" min="0" name="solcor_price_per_kwh" value="{{ solcor_price_per_kwh }}">
+        </label>
+        <label id="fixed-monthly-fee-field" for="fixed-monthly-fee">Mensalidade fixa EUR
+          <input id="fixed-monthly-fee" type="number" step="0.01" min="0" name="fixed_monthly_fee_eur" value="{{ fixed_monthly_fee_eur }}">
+        </label>
+      </div>
+      <div class="reports-checks">
+        <label class="check-row" id="charge-total-production-field">
+          <input type="checkbox" name="charge_total_production" {{ 'checked' if billing_energy_base == 'total_production' }}>
+          <input type="hidden" name="billing_energy_base" id="billing-energy-base" value="{{ billing_energy_base }}">
+          <span>Cobrar também o excedente</span>
+        </label>
+        <label class="check-row"><input type="checkbox" name="force_api"><span>Atualizar diretamente da FusionSolar</span></label>
+        <label class="check-row"><input type="checkbox" name="include_availability" {{ 'checked' if include_availability }}><span>Incluir disponibilidade</span></label>
+        <label class="check-row"><input type="checkbox" name="formats" value="excel"><span>Gerar também Excel</span></label>
+        <input type="hidden" name="formats" value="pdf">
+      </div>
+    </details>
+
+    <div class="reports-actions">
+      <button class="button" type="submit" data-submit-label="Gerar e guardar">Gerar e guardar</button>
+      <button class="button secondary" type="submit" formaction="{{ url_for('exports') }}" name="action" value="save_billing_config" data-report-scope="individual">Guardar configuração</button>
+      <button class="button secondary" type="submit" formmethod="get" formaction="{{ url_for('report_generation_preview') }}" data-report-scope="portfolio">Testar geração</button>
+    </div>
+  </form>
+</section>

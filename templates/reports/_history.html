@@ -1,0 +1,28 @@
+<section class="card reports-card" id="reports-history">
+  <div class="section-title">
+    <div><h3>Histórico de gerações</h3><p class="muted">Runs e ficheiros persistidos pelo motor de reporting.</p></div>
+  </div>
+  <div class="table-wrap">
+    <table class="reports-table">
+      <thead><tr><th>Run</th><th>Template</th><th>Tipo</th><th>Período</th><th>Estado</th><th>Concluídos</th><th>Falhados</th><th>Criado</th></tr></thead>
+      <tbody>
+        {% for run in runs %}
+          <tr>
+            <td>#{{ run.id }}</td><td>{{ run.template_name or 'Template removido' }}</td>
+            <td>{{ 'Individual' if run.report_type == 'individual' else 'Portefólio' }}</td>
+            <td>{{ run.period_start or '-' }}</td>
+            <td><span class="reports-status {{ run.status }}">{{ report_status_labels.get(run.status, run.status) }}</span></td>
+            <td>{{ run.completed_count }}</td><td>{{ run.failed_count }}</td><td>{{ run.created_at }}</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="8" class="muted">Ainda não existem gerações.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="reports-files">
+    {% for file in files if file.status == 'completed' %}
+      <a href="{{ url_for('download_generated_report', file_id=file.id) }}">{{ file.filename }} · {{ file.format|upper }}</a>
+    {% endfor %}
+  </div>
+</section>

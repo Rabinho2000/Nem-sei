@@ -1,0 +1,27 @@
+<aside class="reports-side">
+  <section class="card reports-card" aria-labelledby="reports-summary-title">
+    <div class="section-title"><h3 id="reports-summary-title">Resumo e estado</h3></div>
+    <dl class="reports-summary">
+      <div><dt>Tipo</dt><dd data-summary="type">Individual</dd></div>
+      <div><dt>Instalação ou portefólio</dt><dd data-summary="scope">{{ report_assets|selectattr('asset_id', 'equalto', selected_asset_id|int)|map(attribute='project_name')|first|default('Por selecionar', true) }}</dd></div>
+      <div><dt>Período</dt><dd data-summary="period">{{ report_month }}</dd></div>
+      <div><dt>Template</dt><dd data-summary="template">Por selecionar</dd></div>
+      <div><dt>Fonte dos dados</dt><dd data-summary="source">Configuração guardada</dd></div>
+      <div><dt>Modelo de cobrança</dt><dd data-summary="billing">{{ 'Mensalidade fixa' if billing_mode == 'fixed_monthly_fee' else 'Tarifa por energia' }}</dd></div>
+      <div><dt>Disponibilidade</dt><dd data-summary="availability">{{ 'Incluída' if include_availability else 'Não incluída' }}</dd></div>
+      <div><dt>Qualidade dos dados</dt><dd>Validada durante a geração</dd></div>
+      <div><dt>Último relatório compatível</dt><dd>{{ last_compatible_file.run_created_at if last_compatible_file else 'Nenhum' }}</dd></div>
+      <div><dt>Estado da última geração</dt><dd><span class="reports-status {{ last_compatible_file.run_status if last_compatible_file else 'never' }}">{{ report_status_labels.get(last_compatible_file.run_status, last_compatible_file.run_status) if last_compatible_file else 'Nunca gerado' }}</span></dd></div>
+      <div><dt>Dados em falta</dt><dd>Consultar avisos do run</dd></div>
+    </dl>
+  </section>
+  <section class="card reports-card">
+    <div class="section-title"><h3>Ações rápidas</h3></div>
+    <div class="reports-quick-actions">
+      {% if last_compatible_file %}
+        <a class="button secondary" href="{{ url_for('download_generated_report', file_id=last_compatible_file.id) }}">Ver último PDF</a>
+      {% endif %}
+      <a class="button secondary" href="#reports-history">Ver histórico</a>
+    </div>
+  </section>
+</aside>
