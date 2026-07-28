@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -36,9 +37,16 @@ def endpoints() -> SigenergyEndpoints:
 
 
 class FakeResponse:
-    def __init__(self, payload: Any, *, status_code: int = 200) -> None:
+    def __init__(
+        self,
+        payload: Any,
+        *,
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.payload = payload
         self.status_code = status_code
+        self.headers = headers or {}
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
@@ -126,17 +134,23 @@ def test_list_systems_uses_api_rows() -> None:
     assert session.requests[0]["headers"]["sigen-region"] == "eu"
 
 
-def test_list_systems_falls_back_to_configured_system_ids_without_api_call() -> None:
-    session = QueueSession({})
+def test_list_systems_ignores_legacy_system_ids_and_uses_discovery_api() -> None:
+    session = QueueSession(
+        {
+            "https://sigenergy.example.test/openapi/auth/login/key": [
+                FakeResponse(load_fixture("auth_success_object.json"))
+            ],
+            "https://sigenergy.example.test/openapi/system": [
+                FakeResponse(load_fixture("systems_list.json"))
+            ],
+        }
+    )
 
     systems = client(session, system_ids="SIG-001, SIG-002").list_systems()
 
-    assert systems == [
-        {"systemId": "SIG-001", "systemName": "SIG-001"},
-        {"systemId": "SIG-002", "systemName": "SIG-002"},
-    ]
-    assert session.posts == []
-    assert session.requests == []
+    assert [row["systemId"] for row in systems] == ["SIG-001", "SIG-002"]
+    assert len(session.posts) == 1
+    assert session.requests[0]["url"].endswith("/openapi/system")
 
 
 def test_energy_flow_current_by_system() -> None:
@@ -188,6 +202,29 @@ def test_http_429_raises_common_rate_limit_error() -> None:
 
     with pytest.raises(ApiRateLimitError, match="Sigenergy HTTP 429"):
         client(session).get_energy_flow("SIG-001")
+
+
+def test_http_429_respects_retry_after_seconds() -> None:
+    session = QueueSession(
+        {
+            "https://sigenergy.example.test/openapi/auth/login/key": [
+                FakeResponse(load_fixture("auth_success_object.json"))
+            ],
+            "https://sigenergy.example.test/openapi/systems/SIG-001/energyFlow": [
+                FakeResponse(
+                    {"code": 429, "msg": "too many"},
+                    status_code=429,
+                    headers={"Retry-After": "120"},
+                )
+            ],
+        }
+    )
+
+    before = datetime.now()
+    with pytest.raises(ApiRateLimitError) as error:
+        client(session).get_energy_flow("SIG-001")
+
+    assert 115 <= (error.value.cooldown_until - before).total_seconds() <= 125
 
 
 def test_normalizers_tolerate_missing_or_unexpected_fields() -> None:

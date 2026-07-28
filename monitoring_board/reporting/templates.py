@@ -10,6 +10,16 @@ TEMPLATE_TYPES = {"individual", "portfolio"}
 PAGE_SIZES = {"A4"}
 ORIENTATIONS = {"portrait", "landscape"}
 LANGUAGES = {"pt"}
+RENDERER_SOLCOR_INDIVIDUAL = "solcor_individual_v1"
+RENDERER_GENERIC_INDIVIDUAL = "generic_individual_v1"
+RENDERER_GENERIC_PORTFOLIO = "generic_portfolio_v1"
+RENDERERS_BY_TYPE = {
+    "individual": {
+        RENDERER_SOLCOR_INDIVIDUAL,
+        RENDERER_GENERIC_INDIVIDUAL,
+    },
+    "portfolio": {RENDERER_GENERIC_PORTFOLIO},
+}
 SECTIONS_INDIVIDUAL = (
     "cover",
     "identification",
@@ -82,6 +92,7 @@ class ReportTemplate:
     sections: tuple[TemplateSection, ...]
     branding: BrandingConfig
     filename_pattern: str
+    renderer: str
     show_internal_data: bool = False
     active: bool = True
     is_default: bool = False
@@ -105,6 +116,13 @@ def default_template(name: str, *, portfolio_id: int | None = None) -> ReportTem
         report_type = "portfolio"
         sections = SECTIONS_PORTFOLIO
         compact = name.endswith("executivo")
+    renderer = (
+        RENDERER_SOLCOR_INDIVIDUAL
+        if name == "Individual padrao"
+        else RENDERER_GENERIC_INDIVIDUAL
+        if report_type == "individual"
+        else RENDERER_GENERIC_PORTFOLIO
+    )
     return ReportTemplate(
         id=None,
         name=name,
@@ -121,6 +139,7 @@ def default_template(name: str, *, portfolio_id: int | None = None) -> ReportTem
         sections=tuple(TemplateSection(key=key, title=section_title(key), enabled=True, display_order=index * 10, compact=compact) for index, key in enumerate(sections, start=1)),
         branding=BrandingConfig(),
         filename_pattern="{portfolio}_{period}" if report_type == "portfolio" else "{asset}_{period}",
+        renderer=renderer,
         is_default=name in {"Individual padrao", "Portfolio executivo"},
     )
 
@@ -142,6 +161,8 @@ def validate_template(template: ReportTemplate) -> ReportTemplate:
         raise ValueError("invalid_page_size")
     if template.orientation not in ORIENTATIONS:
         raise ValueError("invalid_orientation")
+    if template.renderer not in RENDERERS_BY_TYPE[template.report_type]:
+        raise ValueError("invalid_template_renderer")
     if any(margin < 0 or margin > 50 for margin in template.margins_mm):
         raise ValueError("invalid_margins")
     allowed_sections = set(SECTIONS_INDIVIDUAL if template.report_type == "individual" else SECTIONS_PORTFOLIO)
@@ -210,6 +231,7 @@ def template_to_config(template: ReportTemplate) -> dict[str, Any]:
         "sections": [section.__dict__ for section in template.sections],
         "branding": template.branding.__dict__,
         "filename_pattern": template.filename_pattern,
+        "renderer": template.renderer,
         "show_internal_data": template.show_internal_data,
         "version": REPORT_TEMPLATE_VERSION,
     }
@@ -228,6 +250,13 @@ def template_from_config(config: dict[str, Any], *, template_id: int | None = No
         for index, item in enumerate(config.get("sections") or (), start=1)
     )
     report_type = str(config.get("report_type") or "portfolio")
+    renderer = str(
+        config.get("renderer")
+        or infer_legacy_renderer(
+            report_type=report_type,
+            name=str(config.get("name") or ""),
+        )
+    )
     if not sections:
         sections = default_template("Portfolio executivo" if report_type == "portfolio" else "Individual padrao").sections
     margins = tuple(int(item) for item in (config.get("margins_mm") or (14, 14, 14, 14))[:4])
@@ -248,6 +277,21 @@ def template_from_config(config: dict[str, Any], *, template_id: int | None = No
             sections=tuple(sorted(sections, key=lambda section: section.display_order)),
             branding=branding,
             filename_pattern=str(config.get("filename_pattern") or "{portfolio}_{period}"),
+            renderer=renderer,
             show_internal_data=bool(config.get("show_internal_data", False)),
         )
     )
+
+
+def infer_legacy_renderer(*, report_type: str, name: str) -> str:
+    """Infer an in-memory renderer for configurations saved before renderer IDs.
+
+    The inference is deliberately narrow. It restores only the historically
+    evidenced standard individual family; all other legacy configurations stay
+    on the generic renderer that originally produced them.
+    """
+    if report_type == "individual":
+        if name.strip().casefold() == "individual padrao":
+            return RENDERER_SOLCOR_INDIVIDUAL
+        return RENDERER_GENERIC_INDIVIDUAL
+    return RENDERER_GENERIC_PORTFOLIO

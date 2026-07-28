@@ -1,58 +1,89 @@
-# Sigenergy API
+# Sigenergy API — matriz de capacidades
 
-A integração Sigenergy fica limitada ao estado atual da instalação. Não há produção histórica, alarmes, inversores, strings, disponibilidade ou controlo remoto implementados sem payloads reais/documentação validada na repo.
+Esta integração é read-only. Comandos remotos, controlo de bateria e alterações
+de modo estão explicitamente fora de âmbito.
 
-## Configuração suportada
+A matriz abaixo usa apenas endpoints já presentes e cobertos por fixtures na
+repo. Não foram encontrados documentos oficiais nem payloads validados para
+histórico energético, dispositivos, alarmes ou Data Subscription. Essas
+capacidades não são inferidas.
 
-As variáveis atuais continuam compatíveis:
+| Capacidade | Endpoint / canal | Permissões / onboarding | Dados e granularidade | Limites confirmados | Utilização | Estado |
+| --- | --- | --- | --- | --- | --- | --- |
+| Autenticação | `POST /openapi/auth/login/key` | App Key e App Secret; região no header `sigen-region` | Token Bearer com validade indicada no payload | Não documentados na repo | Acesso à API | Confirmado por implementação e fixture |
+| Descoberta de sistemas | `GET /openapi/system` | A App Key tem de estar autorizada para os sistemas | Lista de System ID, nome, estado e metadados presentes no payload | Paginação não confirmada; não implementada | Inventário e onboarding | Confirmado por implementação e fixture |
+| Estado operacional atual | `GET /openapi/systems/{system_id}/energyFlow` | Acesso ao System ID descoberto | Potências instantâneas, SOC e campos opcionais do fluxo atual | Não documentados na repo | Monitorização, UI e alertas | Confirmado por implementação e fixture |
+| Data Subscription — System Data | Não disponível na repo | Desconhecidas | Desconhecidos | Desconhecidos | Telemetria | Disponível mas não validado; não implementado |
+| Data Subscription — Telemetry | Não disponível na repo | Desconhecidas | Desconhecidos | Desconhecidos | Telemetria e eventual energia por intervalo | Disponível mas não validado; não implementado |
+| Data Subscription — Alarms | Não disponível na repo | Desconhecidas | Desconhecidos | Desconhecidos | Alarmes | Disponível mas não validado; não implementado |
+| Histórico energético | Nenhum endpoint confirmado | Desconhecidas | Desconhecidos | Desconhecidos | Relatórios e backfill | Não suportado sem documentação/payload real |
+| Dispositivos / inversores / strings | Nenhum endpoint confirmado | Desconhecidas | Desconhecidos | Desconhecidos | Diagnóstico e disponibilidade | Não suportado |
+| Escrita operacional | Fora de âmbito | — | — | — | — | Não suportado por decisão de produto |
 
-- `SIGENERGY_ENABLED`
-- `SIGENERGY_APP_KEY`
-- `SIGENERGY_APP_SECRET`
-- `SIGENERGY_BASE_URL`
-- `SIGENERGY_AUTH_ENDPOINT`
-- `SIGENERGY_SYSTEMS_ENDPOINT`
-- `SIGENERGY_ENERGY_FLOW_ENDPOINT`
-- `SIGENERGY_REGION`
-- `SIGENERGY_SYSTEM_IDS`
+## Regras implementadas
 
-`SIGENERGY_SYSTEM_IDS` é o fallback quando a API não devolve lista de sistemas ou quando se quer limitar explicitamente os sistemas monitorizados.
+- A descoberta vem sempre da API. `SIGENERGY_SYSTEM_IDS`, `SIGENERGY_SYSTEM_ID`
+  e a coluna legado `integration_configs.system_ids` são ignorados.
+- O inventário externo fica em `provider_system_inventory`; o
+  `asset_integrations` mantém apenas o mapeamento para um asset local.
+- Um pedido de onboarding só passa a aprovado quando o System ID aparece numa
+  descoberta real.
+- “Testar ligação” autentica e lista sistemas, sem chamar `energyFlow`.
+- “Atualizar instalações” executa apenas descoberta.
+- “Sincronizar todas agora” executa uma descoberta completa e depois consulta
+  o estado atual de cada sistema devolvido. Uma falha isolada não bloqueia os
+  restantes sistemas.
+- Um HTTP 403 no estado atual é guardado como “Sem autorização para esta
+  instalação”. Não há retry agressivo.
+- HTTP 429 respeita `Retry-After` quando presente; na ausência desse header é
+  aplicado um cooldown conservador de 60 minutos.
+- HTTP 5xx e falhas de rede usam o backoff curto e limitado do cliente.
+- Token, App Secret e headers de autorização são sanitizados.
+- Não existe paginação porque a forma do cursor/página não está confirmada.
 
-## Implementado
+## Quotas e scheduler
 
-| Área | Endpoint/config | Método | Notas |
-| --- | --- | --- | --- |
-| Login | `SIGENERGY_AUTH_ENDPOINT` | `get_access_token` / `authenticate` | Envia App Key/App Secret codificados no payload `key`. |
-| Token | Bearer | `request_json` | O token é guardado em cache até expirar. |
-| Região | `SIGENERGY_REGION` | headers | Envia `sigen-region` no login e nas chamadas autenticadas. |
-| Sistemas | `SIGENERGY_SYSTEMS_ENDPOINT` | `list_systems` | Aceita listas em `data.list`, `records`, `systems`, `items`, `systemList` ou `rows`. |
-| Estado atual | `SIGENERGY_ENERGY_FLOW_ENDPOINT` | `get_energy_flow` | Substitui `{system_id}`/`{systemId}` e lê `energyFlow` atual. |
-| Scheduler | `integration-state-sigenergy-hourly` | sync horário | Só agenda estado/energyFlow. |
+Descoberta e estado usam áreas separadas na fila persistente, mas partilham uma
+lease de conta. O reset diário usa `Europe/Lisbon`.
 
-## Validação e tolerância de payload
+Os limites ficam vazios por defeito até serem confirmados. Podem ser
+configurados operacionalmente com:
 
-- Payload Sigenergy tem de ser objeto JSON.
-- `code` ausente, `0` ou `"0"` é tratado como sucesso.
-- `data` pode vir como objeto ou como string JSON; ambos continuam suportados.
-- Campos em falta no `energyFlow` resultam em `None`, não em exceção.
-- Estado desconhecido é apresentado como `Sem dados`.
+- `SIGENERGY_API_MIN_INTERVAL_SECONDS`
+- `SIGENERGY_API_DAILY_BUDGET`
+- `SIGENERGY_DISCOVERY_MIN_INTERVAL_SECONDS`
+- `SIGENERGY_DISCOVERY_DAILY_BUDGET`
+- `SIGENERGY_STATE_MIN_INTERVAL_SECONDS`
+- `SIGENERGY_STATE_DAILY_BUDGET`
 
-## Token, 401 e rate limit
+Não existe `sleep(0.2)` entre instalações. A sincronização periódica executa
+uma descoberta completa em cada ciclo, garantindo pelo menos uma descoberta
+diária quando o scheduler está ativo.
 
-- HTTP `401` invalida o token e faz relogin uma vez.
-- HTTP `429` gera `ApiRateLimitError` para a camada comum persistir cooldown e evitar novas chamadas até ao próximo attempt.
-- HTTP `5xx` e erros de rede usam backoff curto e limitado pela camada comum.
-- Secrets, tokens e Bearer headers devem ser sanitizados em mensagens de erro.
+## Energia e relatórios
 
-## Fora de scope atual
+`energyFlow` é potência instantânea e só alimenta
+`integration_realtime_snapshots`. O sinal de `gridPower` e `batteryPower` não é
+usado para calcular energia.
 
-Não existem endpoints implementados para:
+`energy_interval_facts` é a base genérica reservada para energia documentada por
+intervalo, com provider, unidade implícita em kWh, timezone, proveniência e
+qualidade. Não recebe dados de `energyFlow`.
 
-- produção histórica;
-- alarmes;
-- inversores;
-- strings;
-- availability;
-- controlo remoto.
+Os relatórios escolhem uma única fonte energética ativa por asset. Uma escolha
+explícita em `asset_integrations.is_primary_energy_source` vence; instalações
+legadas continuam a preferir FusionSolar até a fonte ser alterada. Relatórios
+leem apenas factos persistidos (`production_records` e
+`production_hourly_records`) e nunca chamam a API Sigenergy durante a geração.
 
-O onboarding existente na app fica como compatibilidade operacional da UI atual, mas não faz parte do client de estado Sigenergy documentado aqui.
+Sem histórico ou telemetria energética Sigenergy confirmados, meses anteriores
+não podem ser reconstruídos a partir de snapshots de potência. O resultado é
+“dados insuficientes para cálculo financeiro”; kWh não são inventados.
+
+## Data Subscription e configuração manual
+
+Não há endpoints de webhook ativos porque a repo não contém o contrato oficial
+de autenticação/assinatura, IDs de evento, timestamps ou payloads. Quando essa
+documentação e payloads anonimizados forem fornecidos, devem ser criados
+receptores separados para System Data, Telemetry e Alarms, com idempotência e
+retenção segura. Até lá não há URLs a configurar no portal Sigenergy.

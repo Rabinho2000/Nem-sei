@@ -6,40 +6,59 @@
       <thead>
         <tr>
           <th>Instalacao</th>
+          <th>System ID</th>
           <th>Asset local</th>
-          <th>Estado</th>
-          <th>PV</th>
-          <th>Carga</th>
-          <th>Rede raw</th>
-          <th>Bateria</th>
-          <th>SOC</th>
-          <th>Recolhido</th>
+          <th>Acesso</th>
+          <th>Ultimo estado</th>
+          <th>Ultima telemetria</th>
+          <th>Qualidade</th>
+          <th>Fonte de relatorio</th>
           <th>Erro</th>
         </tr>
       </thead>
       <tbody>
         {% for row in sigenergy_system_rows %}
-          {% set no_battery = row.battery_capacity_kwh is not none and row.battery_capacity_kwh|float == 0 %}
           <tr>
             <td>
-              <strong>{{ row.mapped_external_name or row.external_id }}</strong>
-              <div class="muted">{{ row.external_id }}</div>
+              <strong>{{ row.external_name or row.mapped_external_name or row.external_id }}</strong>
             </td>
+            <td>{{ row.external_id }}</td>
             <td>{{ row.project_name or 'Por associar' }}</td>
-            <td>{{ row.normalized_status or '-' }}{% if row.external_status %}<div class="muted">{{ row.external_status }}</div>{% endif %}</td>
-            <td>{{ "%.3g"|format(row.pv_power_kw) if row.pv_power_kw is not none else 'N/A' }} kW</td>
-            <td>{{ "%.3g"|format(row.load_power_kw) if row.load_power_kw is not none else 'N/A' }} kW</td>
-            <td>{{ "%.3g"|format(row.grid_power_kw_raw) if row.grid_power_kw_raw is not none else 'N/A' }} kW</td>
-            <td>{{ 'N/A' if no_battery else (("%.3g"|format(row.battery_power_kw) ~ ' kW') if row.battery_power_kw is not none else 'N/A') }}</td>
-            <td>{{ 'N/A' if no_battery else (("%.3g"|format(row.battery_soc_pct) ~ '%') if row.battery_soc_pct is not none else 'N/A') }}</td>
-            <td>{{ row.collected_at }}</td>
-            <td>{{ row.last_error or '-' }}</td>
+            <td>
+              {% if row.access_status == 'unauthorized' %}
+                Sem autorizacao
+              {% elif row.access_status == 'not_returned' %}
+                Nao devolvida
+              {% else %}
+                Acessivel
+              {% endif %}
+            </td>
+            <td>{{ row.normalized_status or row.last_state or '-' }}<div class="muted">{{ row.collected_at or row.last_state_at or '-' }}</div></td>
+            <td>{{ row.last_telemetry_at or 'Nao configurada' }}</td>
+            <td>{{ row.data_quality or 'missing' }}</td>
+            <td>
+              {% if row.asset_id %}
+                {% if row.is_primary_energy_source %}
+                  Primaria
+                {% else %}
+                  <form method="post">
+                    <input type="hidden" name="action" value="set_primary_energy_source">
+                    <input type="hidden" name="asset_id" value="{{ row.asset_id }}">
+                    <input type="hidden" name="provider" value="Sigenergy">
+                    <button class="button secondary" type="submit">Definir como primaria</button>
+                  </form>
+                {% endif %}
+              {% else %}
+                -
+              {% endif %}
+            </td>
+            <td>{{ row.display_error or '-' }}</td>
           </tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
   {% else %}
-    <p class="muted">Ainda nao existem snapshots Sigenergy. Usa Testar ligacao para validar a API ou Sincronizar agora para guardar dados.</p>
+    <p class="muted">Ainda nao existe inventario. Usa Atualizar instalacoes para descobrir os sistemas autorizados pela App Key.</p>
   {% endif %}
 </section>

@@ -222,7 +222,7 @@ def test_sigenergy_429_marks_persistent_cooldown(tmp_path, monkeypatch) -> None:
             "Sigenergy HTTP 429",
         )
 
-    monkeypatch.setattr(app_module, "run_provider_check", fake_provider_check)
+    monkeypatch.setattr(app_module, "run_sigenergy_check", fake_provider_check)
     with get_db(str(db_path)) as conn:
         now = datetime.now().isoformat(timespec="seconds")
         conn.execute(

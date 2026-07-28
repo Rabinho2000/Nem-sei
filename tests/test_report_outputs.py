@@ -24,12 +24,19 @@ from monitoring_board.report_template_repository import (
     duplicate_template,
     ensure_report_template_schema,
     get_default_template,
+    get_template,
     latest_template_version,
     list_templates,
     save_template,
     set_default_template,
 )
-from monitoring_board.reporting.templates import default_template, template_to_config
+from monitoring_board.reporting.templates import (
+    RENDERER_GENERIC_INDIVIDUAL,
+    RENDERER_GENERIC_PORTFOLIO,
+    RENDERER_SOLCOR_INDIVIDUAL,
+    default_template,
+    template_to_config,
+)
 from monitoring_board.reporting.templates import validate_template_scope
 from monitoring_board.reporting_storage import reconcile_generated_reports
 from monitoring_board.services.portfolio_reporting import prepare_portfolio_report
@@ -233,6 +240,45 @@ def test_persisted_custom_default_is_used_without_generic_reseed(
     ]
 
 
+def test_legacy_standard_template_infers_renderer_without_rewriting_config(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "legacy-renderer-inference.db"
+    ensure_database(str(db_path))
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT id, config_json FROM report_templates WHERE name = 'Individual padrao'"
+        ).fetchone()
+        config = json.loads(row["config_json"])
+        config.pop("renderer")
+        legacy_json = json.dumps(config, ensure_ascii=False, indent=2)
+        conn.execute(
+            "UPDATE report_templates SET config_json = ? WHERE id = ?",
+            (legacy_json, row["id"]),
+        )
+        conn.execute(
+            "UPDATE report_template_versions SET config_json = ? WHERE template_id = ?",
+            (legacy_json, row["id"]),
+        )
+        conn.commit()
+
+        ensure_report_template_schema(conn)
+        inferred = get_template(conn, row["id"])
+        stored_template = conn.execute(
+            "SELECT config_json FROM report_templates WHERE id = ?",
+            (row["id"],),
+        ).fetchone()[0]
+        stored_version = conn.execute(
+            "SELECT config_json FROM report_template_versions WHERE template_id = ?",
+            (row["id"],),
+        ).fetchone()[0]
+
+    assert inferred.renderer == RENDERER_SOLCOR_INDIVIDUAL
+    assert stored_template == legacy_json
+    assert stored_version == legacy_json
+
+
 def test_existing_template_version_remains_linked_to_historical_run(
     tmp_path: Path,
 ) -> None:
@@ -308,6 +354,17 @@ def test_portfolio_renderers_use_canonical_result(tmp_path: Path) -> None:
     assert pdf.content.startswith(b"%PDF-")
     assert excel.content.startswith(b"PK")
     assert zipped.content.startswith(b"PK")
+
+
+def test_portfolio_defaults_have_explicit_generic_renderer() -> None:
+    for name in (
+        "Portfolio executivo",
+        "Portfolio operacional",
+        "Portfolio financeiro",
+    ):
+        template = default_template(name)
+        assert template.renderer == RENDERER_GENERIC_PORTFOLIO
+        assert template_to_config(template)["renderer"] == RENDERER_GENERIC_PORTFOLIO
 
 
 def test_report_generation_routes_create_files_and_download(tmp_path: Path) -> None:
@@ -523,6 +580,122 @@ def test_seeded_individual_epc_uses_recovered_solcor_layout() -> None:
     assert "Identification" not in text
     assert "Executive Summary" not in text
     assert len(xobjects) >= 1
+
+
+def test_seeded_individual_esco_uses_recovered_solcor_layout_and_kpis() -> None:
+    report = prepare_customer_report(
+        {
+            "asset": {
+                "id": 2035,
+                "project_name": "Sicobrita",
+                "contract_type": "ESCO",
+            },
+            "period_type": "monthly",
+            "period_start": "2026-06-01",
+            "period_end": "2026-06-30",
+            "period_label": "Junho 2026",
+            "production_kwh": 1000,
+            "self_use_kwh": 800,
+            "export_kwh": 200,
+            "consumption_kwh": 1200,
+            "production_is_final": True,
+            "daily_rows": [],
+            "electricity_price": 0.2,
+            "sell_price": 0.04,
+        },
+        solcor_price_per_kwh=0.08,
+    )
+
+    rendered = render_individual_pdf(report, default_template("Individual padrao"))
+    reader = PdfReader(io.BytesIO(rendered.content))
+    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+
+    assert len(reader.pages) == 1
+    assert float(reader.pages[0].mediabox.width) > float(reader.pages[0].mediabox.height)
+    assert "Modelo ESCO" in text
+    assert "Instalação operada em modelo ESCO" in text
+    assert "Pagamento à Solcor" in text
+    assert "Benefício Líquido" in text
+    assert "Cover" not in text
+
+
+def test_customised_individual_keeps_solcor_renderer_branding_and_sections(
+    tmp_path: Path,
+) -> None:
+    conn = connect(tmp_path)
+    template_id = install_custom_individual_template(conn)
+    conn.commit()
+    reloaded = get_template(conn, template_id)
+    raw_config = json.loads(
+        conn.execute(
+            "SELECT config_json FROM report_templates WHERE id = ?",
+            (template_id,),
+        ).fetchone()[0]
+    )
+    conn.close()
+
+    report = prepare_customer_report(
+        {
+            "asset": {
+                "id": 1956,
+                "project_name": "AGA Personalizada",
+                "contract_type": "EPC",
+            },
+            "period_type": "monthly",
+            "period_start": "2026-07-01",
+            "period_end": "2026-07-31",
+            "period_label": "Julho 2026",
+            "production_kwh": 120,
+            "self_use_kwh": 100,
+            "export_kwh": 20,
+            "consumption_kwh": 180,
+            "production_is_final": True,
+            "daily_rows": [],
+            "electricity_price": 0.2,
+            "sell_price": 0.04,
+        }
+    )
+    rendered = render_individual_pdf(report, reloaded)
+    reader = PdfReader(io.BytesIO(rendered.content))
+    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    content_stream = reader.pages[0].get_contents().get_data()
+
+    assert reloaded.renderer == RENDERER_SOLCOR_INDIVIDUAL
+    assert raw_config["renderer"] == RENDERER_SOLCOR_INDIVIDUAL
+    assert "Relatório Solar AGA Personalizada" in text
+    assert "Desempenho energético" in text
+    assert "Rodapé preservado" in text
+    assert "Produção Diária de Eletricidade" in text
+    assert "Destaques do Periodo" not in text
+    assert b".070588 .203922 .337255 rg" in content_stream
+    assert b".396078 .643137 .188235 rg" in content_stream
+
+
+def test_individual_compact_remains_explicit_generic_visual_family() -> None:
+    template = default_template("Individual compacto")
+    report = {
+        "asset": {"id": 1, "project_name": "Compact Test"},
+        "report_type": "epc",
+        "period_label": "Julho 2026",
+        "period_type": "monthly",
+        "period_start": "2026-07-01",
+        "period_end": "2026-07-31",
+        "production_kwh": 100,
+        "self_use_kwh": 80,
+        "export_kwh": 20,
+        "consumption_kwh": 120,
+        "net_benefit_eur": 12,
+    }
+
+    rendered = render_individual_pdf(report, template)
+    reader = PdfReader(io.BytesIO(rendered.content))
+    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+
+    assert template.renderer == RENDERER_GENERIC_INDIVIDUAL
+    assert float(reader.pages[0].mediabox.width) < float(reader.pages[0].mediabox.height)
+    assert "Cover" in text
+    assert "Identification" in text
+    assert "Modelo EPC" not in text
 
 
 def test_individual_generation_persists_scope_and_fallback_state(
@@ -1348,6 +1521,17 @@ def test_ensure_database_is_idempotent_for_reporting_outputs(tmp_path: Path) -> 
         "Portfolio financeiro",
     ]
     assert all(row["active"] == 1 and json.loads(row["config_json"]) for row in templates)
+    renderers = {
+        row["name"]: json.loads(row["config_json"])["renderer"]
+        for row in templates
+    }
+    assert renderers == {
+        "Individual padrao": RENDERER_SOLCOR_INDIVIDUAL,
+        "Individual compacto": RENDERER_GENERIC_INDIVIDUAL,
+        "Portfolio executivo": RENDERER_GENERIC_PORTFOLIO,
+        "Portfolio operacional": RENDERER_GENERIC_PORTFOLIO,
+        "Portfolio financeiro": RENDERER_GENERIC_PORTFOLIO,
+    }
     assert {
         (row["report_type"], row["name"])
         for row in templates

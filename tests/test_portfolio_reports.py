@@ -64,6 +64,67 @@ def test_helioscope_monthly_parser_reads_month_columns(tmp_path: Path) -> None:
     assert parsed[12] == 12
 
 
+def test_portfolio_reports_use_sigenergy_primary_facts_without_mixing_providers(
+    tmp_path: Path,
+) -> None:
+    conn = connect(tmp_path)
+    asset_id = add_asset(conn, "Sigenergy Report Site")
+    portfolio_id = conn.execute(
+        "SELECT id FROM portfolio_groups WHERE name = 'Solcorelios I'"
+    ).fetchone()["id"]
+    conn.execute(
+        "INSERT INTO portfolio_assets (portfolio_id, asset_id, active, mapping_status, mapping_confidence) VALUES (?, ?, 1, 'manual', 1)",
+        (portfolio_id, asset_id),
+    )
+    conn.execute(
+        """
+        INSERT INTO asset_integrations (
+            asset_id, provider, external_id, external_name, enabled,
+            is_primary_energy_source
+        ) VALUES (?, 'Sigenergy', 'SIG-REPORT', 'Sigenergy Report Site', 1, 1)
+        """,
+        (asset_id,),
+    )
+    now = "2026-02-01T00:00:00"
+    conn.execute(
+        """
+        INSERT INTO production_records (
+            asset_id, provider, external_id, period_type, period_date,
+            production_kwh, data_quality, created_at, updated_at
+        ) VALUES (?, 'Sigenergy', 'SIG-REPORT', 'month', '2026-01-01',
+                  321.5, 'complete', ?, ?)
+        """,
+        (asset_id, now, now),
+    )
+    conn.execute(
+        """
+        INSERT INTO production_records (
+            asset_id, provider, external_id, period_type, period_date,
+            production_kwh, data_quality, created_at, updated_at
+        ) VALUES (?, 'FusionSolar', 'FUSION-DUPLICATE', 'month', '2026-01-01',
+                  9999, 'complete', ?, ?)
+        """,
+        (asset_id, now, now),
+    )
+    conn.commit()
+
+    row = next(
+        item
+        for item in build_portfolio_report_rows(
+            conn,
+            portfolio_id,
+            "2026-01",
+            reference_date=date(2026, 2, 1),
+        )
+        if item["asset_id"] == asset_id
+    )
+
+    assert row["energy_provider"] == "Sigenergy"
+    assert row["actual_production_kwh"] == 321.5
+    assert row["quality_status"] == "complete"
+    assert row["data_origin"] == "production_records"
+
+
 def build_financial_workbook(path: Path) -> None:
     workbook = Workbook()
     projeto = workbook.active

@@ -4,6 +4,7 @@ import base64
 import threading
 import time
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable
 
 import requests
@@ -65,11 +66,12 @@ class SigenergyClient:
                 app_key=str(config.get("username") or config.get("app_key") or ""),
                 app_secret=str(config.get("password") or config.get("app_secret") or ""),
             )
-            self.system_ids = config.get("system_ids") or system_ids
         else:
             self.endpoints = endpoints
             self.credentials = credentials or SigenergyCredentials("", "")
-            self.system_ids = system_ids
+        # Kept as an ignored constructor argument for backwards compatibility.
+        # Authorized systems must always come from the provider discovery API.
+        self.system_ids = ""
         self.session = session or requests.Session()
         self.token_cache = token_cache if token_cache is not None else _TOKEN_CACHE
         self.token_lock = token_lock or _TOKEN_LOCK
@@ -135,7 +137,7 @@ class SigenergyClient:
                 if status_code == 401 and not refreshed:
                     raise SigenergyAuthError("Sigenergy HTTP 401.", status_code=status_code) from exc
                 if http_rate_limited_status(status_code):
-                    raise sigenergy_rate_limit_error("Sigenergy HTTP 429.") from exc
+                    raise sigenergy_rate_limit_error("Sigenergy HTTP 429.", response=exc.response) from exc
                 if http_retryable_status(status_code):
                     raise ApiTransientError(f"Sigenergy HTTP {status_code}") from exc
                 raise SigenergyApiError(sanitize_sigenergy_error(exc), status_code=status_code, error_type="http") from exc
@@ -156,9 +158,6 @@ class SigenergyClient:
         return payload
 
     def list_systems(self, *, allow_empty: bool = False) -> list[dict[str, Any]]:
-        configured = configured_system_rows(self.system_ids)
-        if configured:
-            return configured
         payload = self.request_json("GET", self.endpoints.systems_endpoint)
         rows = rows_from_data(parse_sigenergy_response(payload))
         if not rows and not allow_empty:
@@ -195,7 +194,7 @@ class SigenergyClient:
             except requests.HTTPError as exc:
                 status_code = getattr(exc.response, "status_code", None)
                 if http_rate_limited_status(status_code):
-                    raise sigenergy_rate_limit_error("Sigenergy HTTP 429 auth.") from exc
+                    raise sigenergy_rate_limit_error("Sigenergy HTTP 429 auth.", response=exc.response) from exc
                 if http_retryable_status(status_code):
                     raise ApiTransientError(f"Sigenergy auth HTTP {status_code}") from exc
                 raise SigenergyApiError(sanitize_sigenergy_error(exc), status_code=status_code, error_type="http") from exc
@@ -218,18 +217,28 @@ class SigenergyClient:
         return payload
 
 
-def configured_system_rows(system_ids: str | list[str]) -> list[dict[str, str]]:
-    if isinstance(system_ids, str):
-        import re
-
-        ids = [item for item in re.split(r"[,;\s]+", system_ids.strip()) if item]
-    else:
-        ids = [str(item).strip() for item in system_ids if str(item).strip()]
-    return [{"systemId": item, "systemName": item} for item in ids]
-
-
-def sigenergy_rate_limit_error(message: str) -> ApiRateLimitError:
-    return ApiRateLimitError("Sigenergy", "state", datetime.now() + timedelta(minutes=60), message)
+def sigenergy_rate_limit_error(
+    message: str,
+    *,
+    response: requests.Response | None = None,
+) -> ApiRateLimitError:
+    cooldown_until = datetime.now() + timedelta(minutes=60)
+    retry_after = ""
+    if response is not None:
+        retry_after = str(getattr(response, "headers", {}).get("Retry-After") or "").strip()
+    if retry_after:
+        try:
+            cooldown_until = datetime.now() + timedelta(seconds=max(int(retry_after), 1))
+        except ValueError:
+            try:
+                parsed = parsedate_to_datetime(retry_after)
+                if parsed.tzinfo is not None:
+                    parsed = parsed.astimezone().replace(tzinfo=None)
+                if parsed > datetime.now():
+                    cooldown_until = parsed
+            except (TypeError, ValueError, OverflowError):
+                pass
+    return ApiRateLimitError("Sigenergy", "state", cooldown_until, message)
 
 
 def client_from_config(config: dict[str, Any], session: requests.Session | None = None) -> SigenergyClient:

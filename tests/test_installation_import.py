@@ -780,12 +780,12 @@ def test_sigenergy_accessible_import_syncs_only_new_mapping_despite_fixed_ids(
 
     assert json.loads(job["params_json"])["target_external_ids"] == ["SIG-NEW"]
     assert client_configs[0] == ""
-    assert client_configs[-1] == ["SIG-NEW"]
+    assert client_configs[-1] == ""
     assert result["matched"] == 1
     assert {row["external_id"] for row in snapshots} == {"SIG-NEW"}
 
 
-def test_sigenergy_normal_sync_uses_only_active_mappings(
+def test_sigenergy_normal_sync_uses_full_discovery_and_ignores_manual_ids(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -799,14 +799,10 @@ def test_sigenergy_normal_sync_uses_only_active_mappings(
             self.system_ids = config.get("system_ids")
             self.session = session
 
-        def list_systems(self):
+        def list_systems(self, *, allow_empty: bool = False):
             return [
-                {
-                    "systemId": item,
-                    "systemName": item,
-                    "status": "Normal",
-                }
-                for item in self.system_ids
+                {"systemId": "SIG-ACTIVE", "systemName": "Active", "status": "Normal"},
+                {"systemId": "SIG-UNMAPPED", "systemName": "Unmapped", "status": "Normal"},
             ]
 
         def get_energy_flow(self, _system_id: str):
@@ -852,8 +848,11 @@ def test_sigenergy_normal_sync_uses_only_active_mappings(
             dry_run=True,
         )
 
-    assert configured_ids == [["SIG-ACTIVE"]]
-    assert [row["external_id"] for row in result["rows"]] == ["SIG-ACTIVE"]
+    assert configured_ids == [""]
+    assert [row["external_id"] for row in result["rows"]] == [
+        "SIG-ACTIVE",
+        "SIG-UNMAPPED",
+    ]
 
 
 def test_fusionsolar_raw_devices_are_normalized_for_realtime_and_storage(
