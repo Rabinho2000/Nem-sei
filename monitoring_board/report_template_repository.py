@@ -186,18 +186,11 @@ def ensure_report_template_schema(conn: sqlite3.Connection) -> None:
 
 
 def seed_default_templates(conn: sqlite3.Connection) -> None:
-    existing = {row["name"] for row in conn.execute("SELECT name FROM report_templates WHERE portfolio_id IS NULL").fetchall()}
+    if conn.execute("SELECT 1 FROM report_templates LIMIT 1").fetchone() is not None:
+        return
     for name in DEFAULT_TEMPLATE_NAMES:
-        if name not in existing:
-            template = default_template(name)
-            save_template(conn, template, is_default=1 if template.is_default else 0)
-    for report_type in ("individual", "portfolio"):
-        defaults = conn.execute(
-            "SELECT id FROM report_templates WHERE report_type = ? AND portfolio_id IS NULL AND active = 1 AND is_default = 1 ORDER BY id",
-            (report_type,),
-        ).fetchall()
-        if len(defaults) > 1:
-            set_default_template(conn, int(defaults[0]["id"]))
+        template = default_template(name)
+        save_template(conn, template, is_default=1 if template.is_default else 0)
 
 
 def list_templates(conn: sqlite3.Connection, report_type: str | None = None, portfolio_id: int | None = None, *, include_inactive: bool = False) -> list[sqlite3.Row]:
@@ -227,13 +220,15 @@ def get_default_template(conn: sqlite3.Connection, report_type: str, portfolio_i
         """
         SELECT *
         FROM report_templates
-        WHERE active = 1 AND report_type = ? AND is_default = 1 AND (portfolio_id IS NULL OR portfolio_id = ?)
-        ORDER BY portfolio_id IS NOT NULL DESC, id
+        WHERE active = 1 AND report_type = ? AND (portfolio_id IS NULL OR portfolio_id = ?)
+        ORDER BY is_default DESC, portfolio_id IS NOT NULL DESC, id
         LIMIT 1
         """,
         (report_type, portfolio_id),
     ).fetchone()
-    return template_from_row(row) if row else default_template("Portfolio executivo" if report_type == "portfolio" else "Individual padrao", portfolio_id=portfolio_id)
+    if row is None:
+        raise ValueError("active_report_template_required")
+    return template_from_row(row)
 
 
 def save_template(conn: sqlite3.Connection, template: ReportTemplate, *, active: int = 1, is_default: int = 0) -> int:

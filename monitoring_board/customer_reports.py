@@ -564,17 +564,18 @@ def draw_monthly_summary(pdf: canvas.Canvas, report: dict[str, Any], x: float, y
         pdf.drawRightString(x + width - 12, row_y + row_h / 2 - 2, value)
 
 
-def _draw_donut(pdf: canvas.Canvas, center_x: float, center_y: float, radius: float, pct: float, color, label: str) -> None:
-    pct = min(max(pct, 0), 100)
+def _draw_donut(pdf: canvas.Canvas, center_x: float, center_y: float, radius: float, pct: float | None, color, label: str) -> None:
+    display_pct = min(max(pct, 0), 100) if pct is not None else None
     pdf.setFillColor(MID_GRAY)
     pdf.wedge(center_x - radius, center_y - radius, center_x + radius, center_y + radius, 90, 450, fill=1, stroke=0)
-    pdf.setFillColor(color)
-    pdf.wedge(center_x - radius, center_y - radius, center_x + radius, center_y + radius, 90, 90 + 360 * pct / 100, fill=1, stroke=0)
+    if display_pct is not None:
+        pdf.setFillColor(color)
+        pdf.wedge(center_x - radius, center_y - radius, center_x + radius, center_y + radius, 90, 90 + 360 * display_pct / 100, fill=1, stroke=0)
     pdf.setFillColor(colors.white)
     pdf.circle(center_x, center_y, radius * 0.58, fill=1, stroke=0)
     pdf.setFillColor(NAVY)
     pdf.setFont("Helvetica-Bold", 11)
-    pdf.drawCentredString(center_x, center_y - 4, format_pct(pct))
+    pdf.drawCentredString(center_x, center_y - 4, format_pct(display_pct) if display_pct is not None else "N/D")
     pdf.setFont("Helvetica-Bold", 7)
     pdf.drawCentredString(center_x, center_y + radius + 10, label)
 

@@ -18,10 +18,11 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-from monitoring_board.runtime import resolve_runtime_file_path
+from monitoring_board.customer_reports import build_customer_report_pdf
+from monitoring_board.runtime import BASE_DIR, resolve_runtime_file_path
 from monitoring_board.reporting.financial_quality import PRODUCTION_FINANCIALS_NOT_FINAL_WARNING
 from monitoring_board.reporting.portfolio import METRIC_CATALOG, PortfolioReportResult
-from monitoring_board.reporting.templates import ReportTemplate, enabled_sections_in_order
+from monitoring_board.reporting.templates import ReportTemplate, default_template, enabled_sections_in_order, template_to_config
 from monitoring_board.services.portfolio_reporting import export_portfolio_result_workbook, format_cell
 
 
@@ -193,6 +194,29 @@ def append_portfolio_pdf_section(story: list[Any], styles: Any, result: Portfoli
 
 
 def render_individual_pdf(report: dict[str, Any], template: ReportTemplate) -> RenderedFile:
+    if uses_recovered_individual_layout(report, template):
+        logo_path = (
+            resolve_runtime_file_path(template.branding.logo_path)
+            if template.branding.logo_path
+            else BASE_DIR / "static" / "solcor-logo.png"
+        )
+        asset = report.get("asset") or {}
+        return checked_file(
+            RenderedFile(
+                filename=safe_filename(expand_individual_pattern(template.filename_pattern or "{asset}_{period}", report), extension="pdf"),
+                content=build_customer_report_pdf(
+                    report,
+                    logo_path=logo_path if logo_path.is_file() else None,
+                ),
+                mimetype="application/pdf",
+                fmt="pdf",
+                asset_id=int(asset.get("id") or asset.get("asset_id") or report.get("asset_id") or 0) or None,
+                period_type=str(report.get("period_type") or "monthly"),
+                period_start=str(report.get("period_start") or report.get("month_start") or ""),
+                period_end=str(report.get("period_end") or report.get("month_end") or ""),
+                warnings=tuple(report.get("warnings") or report.get("billing_warnings") or ()),
+            )
+        )
     buffer = io.BytesIO()
     top, right, bottom, left = template.margins_mm
     doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=left * mm, rightMargin=right * mm, topMargin=top * mm, bottomMargin=bottom * mm)
@@ -222,6 +246,27 @@ def render_individual_pdf(report: dict[str, Any], template: ReportTemplate) -> R
             warnings=tuple(report.get("warnings") or report.get("billing_warnings") or ()),
         )
     )
+
+
+def uses_recovered_individual_layout(
+    report: dict[str, Any],
+    template: ReportTemplate,
+) -> bool:
+    if str(report.get("report_type") or "").lower() not in {"epc", "esco"}:
+        return False
+    if template.name != "Individual padrao":
+        return False
+    config = template_to_config(template)
+    baseline = template_to_config(default_template("Individual padrao"))
+    legacy_baseline = {
+        **baseline,
+        "sections": [
+            section
+            for section in baseline["sections"]
+            if section["key"] != "metadata"
+        ],
+    }
+    return config == baseline or config == legacy_baseline
 
 
 def render_individual_excel(report: dict[str, Any], template: ReportTemplate) -> RenderedFile:
