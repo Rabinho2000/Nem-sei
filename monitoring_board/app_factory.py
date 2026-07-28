@@ -386,6 +386,34 @@ def _portfolio_manager_redirect(portfolio_id: int | None = None, **overrides: An
     return redirect(url_for("portfolio_manager", **values))
 
 
+def report_state_query_params(values: Any, *, run_id: int | None = None) -> dict[str, str]:
+    """Return the whitelisted report form state that is safe to keep in a URL."""
+    report_type = str(values.get("report_type", "") or "").strip()
+    if report_type not in {"individual", "portfolio"}:
+        report_type = "portfolio" if values.get("portfolio_id") and not values.get("asset_id") else "individual"
+
+    params = {"report_type": report_type}
+    scope_fields = ("asset_id",) if report_type == "individual" else ("portfolio_id", "profile_id")
+    for field in (
+        *scope_fields,
+        "template_id",
+        "period_type",
+        "report_month",
+        "report_year",
+        "report_quarter",
+        "report_semester",
+    ):
+        value = str(values.get(field, "") or "").strip()
+        if value:
+            params[field] = value
+    if values.get("include_availability") in {"on", "1", 1, True}:
+        params["include_availability"] = "on"
+    effective_run_id = run_id if run_id is not None else values.get("run_id")
+    if str(effective_run_id or "").isdigit() and int(effective_run_id) > 0:
+        params["run_id"] = str(effective_run_id)
+    return params
+
+
 LOGGER = logging.getLogger(__name__)
 
 build_runtime_paths = runtime_module.build_runtime_paths
@@ -3003,7 +3031,29 @@ def create_app() -> Flask:
                 flash(f"Falha ao gerar relatorio de producao: {exc}", "error")
                 return redirect(url_for("exports", **redirect_params))
 
-        selected_asset_id = request.args.get("asset_id", "").strip()
+        generation_report_type = request.args.get("report_type", "").strip()
+        if generation_report_type not in {"individual", "portfolio"}:
+            generation_report_type = (
+                "portfolio"
+                if request.args.get("portfolio_id") and not request.args.get("asset_id")
+                else "individual"
+            )
+        selected_asset_id = (
+            request.args.get("asset_id", "").strip()
+            if generation_report_type == "individual"
+            else ""
+        )
+        selected_portfolio_id = (
+            request.args.get("portfolio_id", "").strip()
+            if generation_report_type == "portfolio"
+            else ""
+        )
+        selected_profile_id = (
+            request.args.get("profile_id", "").strip()
+            if generation_report_type == "portfolio"
+            else ""
+        )
+        selected_template_id = request.args.get("template_id", "").strip()
         period_type = request.args.get("period_type") or request.args.get("report_period_type") or ReportPeriodType.MONTHLY.value
         raw_report_month = request.args.get("report_month", "")
         report_month = reporting_normalize_report_month(raw_report_month)
@@ -3059,13 +3109,21 @@ def create_app() -> Flask:
             g.db,
             limit=20,
             offset=(page - 1) * 20,
-            automation_id=selected_automation_id if active_tab == "history" else None,
+            automation_id=(
+                selected_automation_id
+                if active_tab == "history" and selected_automation_id
+                else None
+            ),
         )
         files = list_generated_files(
             g.db,
             limit=50,
             offset=(page - 1) * 50,
-            automation_id=selected_automation_id if active_tab == "history" else None,
+            automation_id=(
+                selected_automation_id
+                if active_tab == "history" and selected_automation_id
+                else None
+            ),
         )
         automations = []
         for row in list_report_automations(g.db):
@@ -3104,7 +3162,11 @@ def create_app() -> Flask:
             automations=automations,
             selected_automation=selected_automation,
             last_compatible_file=last_compatible_file,
+            generation_report_type=generation_report_type,
             selected_asset_id=selected_asset_id,
+            selected_portfolio_id=selected_portfolio_id,
+            selected_profile_id=selected_profile_id,
+            selected_template_id=selected_template_id,
             selected_report_type=selected_report_type,
             period_type=report_period.period_type.value,
             report_month=report_period.start.strftime("%Y-%m"),
@@ -4451,12 +4513,59 @@ def create_app() -> Flask:
         output_dir = UPLOAD_DIR / "generated_reports"
         output_dir.mkdir(parents=True, exist_ok=True)
         if request.method == "POST":
+            redirect_state = report_state_query_params(request.form)
             try:
                 result = execute_persisted_report_generation(
                     g.db,
                     request.form,
                     output_dir=output_dir,
                 )
+                redirect_state = report_state_query_params(
+                    request.form,
+                    run_id=int(result["run_id"]),
+                )
+                scope_column = (
+                    "asset_id"
+                    if redirect_state["report_type"] == "individual"
+                    else "portfolio_id"
+                )
+                scope_id = redirect_state.get(scope_column)
+                scope_filter = f"AND {scope_column} = ?" if scope_id else ""
+                scope_params = (
+                    (result["run_id"], int(scope_id))
+                    if scope_id
+                    else (result["run_id"],)
+                )
+                persisted_completed = g.db.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM report_generated_files
+                    WHERE run_id = ?
+                      AND status = 'completed'
+                      AND COALESCE(is_auxiliary, 0) = 0
+                      {scope_filter}
+                    """,
+                    scope_params,
+                ).fetchone()[0]
+                if int(persisted_completed) != int(result["completed"]):
+                    missing_count = max(
+                        int(result["completed"]) - int(persisted_completed),
+                        0,
+                    )
+                    result["completed"] = int(persisted_completed)
+                    result["failed"] = int(result["failed"]) + missing_count
+                    result["status"] = (
+                        "partial" if result["completed"] else "failed"
+                    )
+                    finish_generation_run(
+                        g.db,
+                        int(result["run_id"]),
+                        status=result["status"],
+                        completed_count=result["completed"],
+                        failed_count=result["failed"],
+                        error_message="Um ou mais ficheiros concluídos não foram persistidos com o âmbito pedido.",
+                    )
+                    g.db.commit()
                 flash(
                     f"Run #{result['run_id']} terminado: {result['completed']} concluídos, {result['failed']} falhados.",
                     "success" if result["status"] == "completed" else "warning",
@@ -4467,22 +4576,25 @@ def create_app() -> Flask:
                     and result["failed"] == 0
                 ):
                     generated_file = g.db.execute(
-                        """
+                        f"""
                         SELECT id
                         FROM report_generated_files
                         WHERE run_id = ?
+                          AND format = 'pdf'
                           AND status = 'completed'
                           AND COALESCE(is_auxiliary, 0) = 0
+                          {scope_filter}
                         ORDER BY id
                         LIMIT 1
                         """,
-                        (result["run_id"],),
+                        scope_params,
                     ).fetchone()
                     if generated_file is not None:
                         return redirect(
                             url_for(
                                 "download_generated_report",
                                 file_id=int(generated_file["id"]),
+                                **redirect_state,
                             )
                         )
             except ValueError as exc:
@@ -4505,7 +4617,12 @@ def create_app() -> Flask:
                 LOGGER.warning("report_generation_failed error_code=%s", type(exc).__name__)
                 flash("Falha na geração. Revê o pedido e consulta os logs para detalhe técnico.", "error")
             return redirect(
-                url_for("exports", tab="history", _anchor="reports-history")
+                url_for(
+                    "exports",
+                    tab="history",
+                    **redirect_state,
+                    _anchor="reports-history",
+                )
             )
         page = max(int(request.args.get("page", "1") or 1), 1)
         return redirect(url_for("exports", tab="history", page=page))
@@ -11074,9 +11191,19 @@ def execute_persisted_report_generation(
 ) -> dict[str, Any]:
     """Run the canonical persisted generation flow for manual and scheduled reports."""
     report_type = str(form.get("report_type", "portfolio") or "portfolio")
+    if report_type not in {"individual", "portfolio"}:
+        raise ValueError("Tipo de relatório inválido.")
     template_id = int(form.get("template_id", "0") or 0)
-    portfolio_id = int(form.get("portfolio_id", "0") or 0) or None
-    snapshot_id = int(form.get("snapshot_id", "0") or 0) or None
+    portfolio_id = (
+        int(form.get("portfolio_id", "0") or 0) or None
+        if report_type == "portfolio"
+        else None
+    )
+    snapshot_id = (
+        int(form.get("snapshot_id", "0") or 0) or None
+        if report_type == "portfolio"
+        else None
+    )
     raw_formats = form.getlist("formats") or ["pdf"]
     run_id: int | None = None
     try:
@@ -11144,7 +11271,16 @@ def execute_persisted_report_generation(
                 try:
                     result = snapshot_result or build_portfolio_generation_result(conn, form, portfolio_id, snapshot_id, job["period"])
                     rendered = render_portfolio_pdf(result, template) if job["format"] == "pdf" else render_portfolio_excel(result, template)
-                    completed_files.append(register_rendered_generation_file(conn, output_dir, run_id, rendered, snapshot_id=snapshot_id))
+                    completed_files.append(
+                        register_rendered_generation_file(
+                            conn,
+                            output_dir,
+                            run_id,
+                            rendered,
+                            portfolio_id=portfolio_id,
+                            snapshot_id=snapshot_id,
+                        )
+                    )
                     completed += 1
                     warnings.extend(rendered.warnings)
                 except Exception as exc:
@@ -11186,7 +11322,15 @@ def execute_persisted_report_generation(
                         force_api=force_api,
                     )
                     rendered = render_individual_pdf(report, template) if job["format"] == "pdf" else render_individual_excel(report, template)
-                    completed_files.append(register_rendered_generation_file(conn, output_dir, run_id, rendered))
+                    completed_files.append(
+                        register_rendered_generation_file(
+                            conn,
+                            output_dir,
+                            run_id,
+                            rendered,
+                            asset_id=job["asset_id"],
+                        )
+                    )
                     completed += 1
                     warnings.extend(rendered.warnings)
                 except Exception as exc:
@@ -11536,7 +11680,16 @@ def build_individual_generation_report(
     return report
 
 
-def register_rendered_generation_file(conn: sqlite3.Connection, output_dir: Path, run_id: int, file, *, snapshot_id: int | None = None):
+def register_rendered_generation_file(
+    conn: sqlite3.Connection,
+    output_dir: Path,
+    run_id: int,
+    file,
+    *,
+    portfolio_id: int | None = None,
+    asset_id: int | None = None,
+    snapshot_id: int | None = None,
+):
     path, _ = store_rendered_file(output_dir, run_id, file)
     add_generated_file(
         conn,
@@ -11546,8 +11699,8 @@ def register_rendered_generation_file(conn: sqlite3.Connection, output_dir: Path
         relative_path=store_runtime_relative_path(path),
         sha256=file.sha256,
         size_bytes=file.size_bytes,
-        portfolio_id=file.portfolio_id,
-        asset_id=file.asset_id,
+        portfolio_id=portfolio_id,
+        asset_id=asset_id,
         snapshot_id=snapshot_id or file.snapshot_id,
         period_type=file.period_type,
         period_start=file.period_start,

@@ -13,8 +13,8 @@
   <form id="reports-generate-form" class="stack-form" method="post" action="{{ url_for('report_generation') }}">
     <fieldset class="reports-segmented">
       <legend>Tipo de relatório</legend>
-      <label><input type="radio" name="report_type" value="individual" checked> <span>Individual</span></label>
-      <label><input type="radio" name="report_type" value="portfolio"> <span>Portefólio</span></label>
+      <label><input type="radio" name="report_type" value="individual" {{ 'checked' if generation_report_type == 'individual' }}> <span>Individual</span></label>
+      <label><input type="radio" name="report_type" value="portfolio" {{ 'checked' if generation_report_type == 'portfolio' }}> <span>Portefólio</span></label>
     </fieldset>
 
     <div class="grid two">
@@ -34,20 +34,20 @@
       <label data-report-scope="portfolio" for="report-portfolio">Portefólio
         <select name="portfolio_id" id="report-portfolio">
           <option value="">Escolher portefólio</option>
-          {% for group in groups %}<option value="{{ group.id }}">{{ group.name }}</option>{% endfor %}
+          {% for group in groups %}<option value="{{ group.id }}" {{ 'selected' if selected_portfolio_id|string == group.id|string else '' }}>{{ group.name }}</option>{% endfor %}
         </select>
       </label>
       <label for="report-template">Template
         <select name="template_id" id="report-template" required>
           {% for template in templates %}
-            <option value="{{ template.id }}" data-template-type="{{ template.report_type }}" data-template-name="{{ template.name }}">{{ template.name }} · {{ 'Individual' if template.report_type == 'individual' else 'Portefólio' }}</option>
+            <option value="{{ template.id }}" data-template-type="{{ template.report_type }}" data-template-name="{{ template.name }}" {{ 'selected' if selected_template_id|string == template.id|string else '' }}>{{ template.name }} · {{ 'Individual' if template.report_type == 'individual' else 'Portefólio' }}</option>
           {% endfor %}
         </select>
       </label>
       <label data-report-scope="portfolio" for="report-profile">Perfil
         <select name="profile_id" id="report-profile">
           <option value="">Perfil default</option>
-          {% for profile in profiles %}<option value="{{ profile.id }}">{{ profile.name }}</option>{% endfor %}
+          {% for profile in profiles %}<option value="{{ profile.id }}" {{ 'selected' if selected_profile_id|string == profile.id|string else '' }}>{{ profile.name }}</option>{% endfor %}
         </select>
       </label>
     </div>

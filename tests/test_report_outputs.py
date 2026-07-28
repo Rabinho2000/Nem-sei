@@ -3,8 +3,10 @@ from __future__ import annotations
 import sqlite3
 import struct
 import hashlib
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import app as app_module
 import monitoring_board.app_factory as app_factory_module
@@ -47,6 +49,21 @@ def add_asset(conn: sqlite3.Connection, name: str = "Output Solar") -> int:
     return int(cursor.lastrowid)
 
 
+def add_fusionsolar_integration(
+    conn: sqlite3.Connection,
+    asset_id: int,
+    name: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO asset_integrations
+            (asset_id, provider, external_id, external_name, enabled)
+        VALUES (?, 'FusionSolar', ?, ?, 1)
+        """,
+        (asset_id, f"FS-{asset_id}", name),
+    )
+
+
 def add_portfolio(conn: sqlite3.Connection, asset_id: int) -> int:
     portfolio_id = create_portfolio(conn, name=f"Output Portfolio {asset_id}")
     conn.execute(
@@ -55,6 +72,24 @@ def add_portfolio(conn: sqlite3.Connection, asset_id: int) -> int:
     )
     conn.commit()
     return portfolio_id
+
+
+@contextmanager
+def report_test_client(db_path: Path):
+    flask_app = app_module.app
+    previous_db = flask_app.config["DATABASE"]
+    previous_testing = flask_app.config.get("TESTING")
+    flask_app.config["DATABASE"] = str(db_path)
+    flask_app.config["TESTING"] = True
+    client = flask_app.test_client()
+    with client.session_transaction() as session:
+        session["authenticated"] = True
+        session["csrf_token"] = "token"
+    try:
+        yield client
+    finally:
+        flask_app.config["DATABASE"] = previous_db
+        flask_app.config["TESTING"] = previous_testing
 
 
 def test_template_crud_default_version_and_invalid_config(tmp_path: Path) -> None:
@@ -186,6 +221,274 @@ def test_individual_report_form_hides_portfolio_controls_and_requires_asset(
     assert b"Gerar, guardar e descarregar" in page.data
     assert b".reports-card [hidden]" in stylesheet.data
     assert b"display: none !important" in stylesheet.data
+
+
+def test_exports_individual_asset_query_renders_selected_option(tmp_path: Path) -> None:
+    db_path = tmp_path / "selected-asset.db"
+    ensure_database(str(db_path))
+    with sqlite3.connect(db_path) as conn:
+        asset_id = add_asset(conn, "Selected Solar")
+        add_fusionsolar_integration(conn, asset_id, "Selected Solar")
+        conn.commit()
+
+    with report_test_client(db_path) as client:
+        page = client.get(
+            "/exports",
+            query_string={
+                "tab": "generate",
+                "asset_id": asset_id,
+            },
+        )
+
+    assert page.status_code == 200
+    html = page.get_data(as_text=True)
+    option_start = html.index(f'<option value="{asset_id}" data-report-type=')
+    assert " selected>" in html[option_start : option_start + 180]
+    assert 'name="asset_id" id="report-asset" required' in html
+
+
+def test_individual_generation_persists_scope_and_fallback_state(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "individual-state.db"
+    ensure_database(str(db_path))
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        asset_id = add_asset(conn, "Stateful Solar")
+        add_fusionsolar_integration(conn, asset_id, "Stateful Solar")
+        template_id = next(
+            row["id"]
+            for row in list_templates(conn, "individual")
+            if row["name"] == "Individual padrao"
+        )
+        conn.commit()
+
+    def fake_report(conn, asset_id, period_job, **kwargs):
+        return {
+            "asset": {"project_name": "Stateful Solar"},
+            "period_label": "Abril 2026",
+        }
+
+    def fake_pdf(report, template):
+        return app_factory_module.RenderedFile(
+            filename="stateful.pdf",
+            content=b"%PDF-1.4 fake",
+            mimetype="application/pdf",
+            fmt="pdf",
+        )
+
+    def fake_excel(report, template):
+        return app_factory_module.RenderedFile(
+            filename="stateful.xlsx",
+            content=b"PK fake",
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            fmt="xlsx",
+        )
+
+    monkeypatch.setattr(app_factory_module, "UPLOAD_DIR", tmp_path / "uploads")
+    monkeypatch.setattr(app_factory_module, "store_runtime_relative_path", lambda path: str(path))
+    monkeypatch.setattr(app_factory_module, "build_individual_generation_report", fake_report)
+    monkeypatch.setattr(app_factory_module, "render_individual_pdf", fake_pdf)
+    monkeypatch.setattr(app_factory_module, "render_individual_excel", fake_excel)
+
+    with report_test_client(db_path) as client:
+        response = client.post(
+            "/report-generation",
+            data={
+                "csrf_token": "token",
+                "report_type": "individual",
+                "asset_id": str(asset_id),
+                "portfolio_id": "999",
+                "profile_id": "999",
+                "template_id": str(template_id),
+                "period_type": "monthly",
+                "report_month": "2026-04",
+                "report_year": "2026",
+                "report_quarter": "2",
+                "report_semester": "1",
+                "include_availability": "on",
+                "formats": ["pdf", "excel"],
+            },
+        )
+        assert response.status_code in {302, 303}
+        location = response.headers["Location"]
+        parsed = urlparse(location)
+        query = parse_qs(parsed.query)
+        assert parsed.path == "/exports"
+        assert parsed.fragment == "reports-history"
+        assert query["tab"] == ["history"]
+        assert query["report_type"] == ["individual"]
+        assert query["asset_id"] == [str(asset_id)]
+        assert query["template_id"] == [str(template_id)]
+        assert query["period_type"] == ["monthly"]
+        assert query["report_month"] == ["2026-04"]
+        assert query["report_year"] == ["2026"]
+        assert query["report_quarter"] == ["2"]
+        assert query["report_semester"] == ["1"]
+        assert query["include_availability"] == ["on"]
+        assert "portfolio_id" not in query
+        assert "profile_id" not in query
+        assert query["run_id"][0].isdigit()
+
+        history = client.get(location)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        run = conn.execute(
+            "SELECT * FROM report_generation_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        files = conn.execute(
+            "SELECT * FROM report_generated_files WHERE run_id = ? ORDER BY id",
+            (run["id"],),
+        ).fetchall()
+
+    assert run["status"] == "completed"
+    assert run["asset_id"] == asset_id
+    assert run["portfolio_id"] is None
+    assert run["completed_count"] == 2
+    assert len(files) == 2
+    assert all(row["asset_id"] == asset_id for row in files)
+    assert all(row["portfolio_id"] is None for row in files)
+    assert any(row["format"] == "pdf" and row["status"] == "completed" for row in files)
+
+    history_html = history.get_data(as_text=True)
+    option_start = history_html.index(f'<option value="{asset_id}" data-report-type=')
+    assert " selected>" in history_html[option_start : option_start + 180]
+    assert "Último relatório compatível" in history_html
+    assert "stateful.pdf" in history_html
+    assert f"#{run['id']}" in history_html
+    assert "Ainda não existem gerações." not in history_html
+
+
+def test_missing_individual_asset_is_rejected_without_persistence(tmp_path: Path) -> None:
+    db_path = tmp_path / "missing-individual-asset.db"
+    ensure_database(str(db_path))
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        template_id = next(
+            row["id"]
+            for row in list_templates(conn, "individual")
+            if row["name"] == "Individual padrao"
+        )
+
+    with report_test_client(db_path) as client:
+        response = client.post(
+            "/report-generation",
+            data={
+                "csrf_token": "token",
+                "report_type": "individual",
+                "template_id": str(template_id),
+                "period_type": "monthly",
+                "report_month": "2026-04",
+                "formats": ["pdf"],
+            },
+        )
+
+    assert response.status_code in {302, 303}
+    query = parse_qs(urlparse(response.headers["Location"]).query)
+    assert query["report_type"] == ["individual"]
+    assert "asset_id" not in query
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM report_generation_runs").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM report_generated_files").fetchone()[0] == 0
+
+
+def test_portfolio_generation_preserves_portfolio_scope_without_asset_leak(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "portfolio-state.db"
+    ensure_database(str(db_path))
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        asset_id = add_asset(conn, "Portfolio Member")
+        portfolio_id = add_portfolio(conn, asset_id)
+        profile = get_default_profile(conn, portfolio_id)
+        template_id = next(
+            row["id"]
+            for row in list_templates(conn, "portfolio")
+            if row["name"] == "Portfolio executivo"
+        )
+
+    def fake_portfolio_pdf(result, template):
+        return app_factory_module.RenderedFile(
+            filename="portfolio.pdf",
+            content=b"%PDF-1.4 fake",
+            mimetype="application/pdf",
+            fmt="pdf",
+            asset_id=asset_id,
+        )
+
+    def fake_portfolio_excel(result, template):
+        return app_factory_module.RenderedFile(
+            filename="portfolio.xlsx",
+            content=b"PK fake",
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            fmt="xlsx",
+            asset_id=asset_id,
+        )
+
+    monkeypatch.setattr(app_factory_module, "UPLOAD_DIR", tmp_path / "uploads")
+    monkeypatch.setattr(app_factory_module, "store_runtime_relative_path", lambda path: str(path))
+    monkeypatch.setattr(app_factory_module, "render_portfolio_pdf", fake_portfolio_pdf)
+    monkeypatch.setattr(app_factory_module, "render_portfolio_excel", fake_portfolio_excel)
+
+    with report_test_client(db_path) as client:
+        response = client.post(
+            "/report-generation",
+            data={
+                "csrf_token": "token",
+                "report_type": "portfolio",
+                "asset_id": str(asset_id),
+                "portfolio_id": str(portfolio_id),
+                "profile_id": str(profile.id),
+                "template_id": str(template_id),
+                "period_type": "monthly",
+                "report_month": "2026-01",
+                "formats": ["pdf", "excel"],
+            },
+        )
+        location = response.headers["Location"]
+        page = client.get(location)
+
+    query = parse_qs(urlparse(location).query)
+    assert query["report_type"] == ["portfolio"]
+    assert query["portfolio_id"] == [str(portfolio_id)]
+    assert query["profile_id"] == [str(profile.id)]
+    assert "asset_id" not in query
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        run = conn.execute(
+            "SELECT * FROM report_generation_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        files = conn.execute(
+            "SELECT * FROM report_generated_files WHERE run_id = ? ORDER BY id",
+            (run["id"],),
+        ).fetchall()
+    assert run["status"] == "completed"
+    assert run["portfolio_id"] == portfolio_id
+    assert run["asset_id"] is None
+    assert files
+    assert all(row["portfolio_id"] == portfolio_id for row in files)
+    assert all(row["asset_id"] is None for row in files)
+    page_html = page.get_data(as_text=True)
+    assert 'value="portfolio" checked' in page_html
+    assert f'<option value="{portfolio_id}" selected>' in page_html
+
+
+def test_report_scope_changes_only_replace_browser_url(tmp_path: Path) -> None:
+    db_path = tmp_path / "report-scope-js.db"
+    ensure_database(str(db_path))
+    with report_test_client(db_path) as client:
+        script = client.get("/static/reports.js").get_data(as_text=True)
+        page = client.get("/exports?tab=generate").get_data(as_text=True)
+
+    assert "window.history.replaceState" in script
+    assert "select[name='asset_id']" in script
+    assert "select[name='portfolio_id']" in script
+    assert "fetch(" not in script
+    assert 'name="action" value="save_billing_config"' in page
 
 
 def test_individual_preview_is_rejected_without_internal_error(

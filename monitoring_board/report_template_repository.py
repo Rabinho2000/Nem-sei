@@ -394,7 +394,7 @@ def list_generation_runs(
         FROM report_generation_runs r
         LEFT JOIN report_templates t ON t.id = r.template_id
         WHERE (? IS NULL OR r.automation_id = ?)
-        ORDER BY r.created_at DESC
+        ORDER BY r.created_at DESC, r.id DESC
         LIMIT ? OFFSET ?
         """,
         (automation_id, automation_id, limit, offset),
@@ -417,7 +417,7 @@ def list_generated_files(
         FROM report_generated_files f
         JOIN report_generation_runs r ON r.id = f.run_id
         WHERE (? IS NULL OR r.automation_id = ?)
-        ORDER BY f.created_at DESC
+        ORDER BY f.created_at DESC, f.id DESC
         LIMIT ? OFFSET ?
         """,
         (automation_id, automation_id, limit, offset),

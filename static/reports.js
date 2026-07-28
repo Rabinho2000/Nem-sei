@@ -7,6 +7,26 @@
     return form.querySelector("input[name='report_type']:checked")?.value || "individual";
   }
 
+  function replaceReportScopeInUrl(form) {
+    if (form.id !== "reports-generate-form") return;
+    const reportType = selectedReportType(form);
+    const url = new URL(window.location.href);
+    url.searchParams.set("report_type", reportType);
+    if (reportType === "individual") {
+      const assetId = form.querySelector("select[name='asset_id']")?.value || "";
+      if (assetId) url.searchParams.set("asset_id", assetId);
+      else url.searchParams.delete("asset_id");
+      url.searchParams.delete("portfolio_id");
+      url.searchParams.delete("profile_id");
+    } else {
+      const portfolioId = form.querySelector("select[name='portfolio_id']")?.value || "";
+      if (portfolioId) url.searchParams.set("portfolio_id", portfolioId);
+      else url.searchParams.delete("portfolio_id");
+      url.searchParams.delete("asset_id");
+    }
+    window.history.replaceState(window.history.state, "", url);
+  }
+
   function syncTemplateOptions(form, reportType) {
     const select = form.querySelector("select[name='template_id']");
     if (!select) return;
@@ -116,8 +136,13 @@
 
   forms.forEach((form) => {
     form.querySelectorAll("input[name='report_type']").forEach((radio) => {
-      radio.addEventListener("change", () => syncReportScope(form));
+      radio.addEventListener("change", () => {
+        syncReportScope(form);
+        replaceReportScopeInUrl(form);
+      });
     });
+    form.querySelector("select[name='asset_id']")?.addEventListener("change", () => replaceReportScopeInUrl(form));
+    form.querySelector("select[name='portfolio_id']")?.addEventListener("change", () => replaceReportScopeInUrl(form));
     form.querySelector("select[name='period_type']")?.addEventListener("change", () => syncPeriodFields(form));
     form.querySelectorAll("select, input").forEach((control) => {
       control.addEventListener("change", () => {
