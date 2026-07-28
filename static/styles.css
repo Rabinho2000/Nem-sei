@@ -535,6 +535,75 @@ small {
   flex-wrap: wrap;
 }
 
+.import-provider-row,
+.import-status-row {
+  align-items: center;
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+}
+
+.import-provider-row > div,
+.import-status-row > div {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.import-field-table {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  overflow: hidden;
+}
+
+.import-field-row {
+  align-items: center;
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: minmax(150px, 0.45fr) minmax(220px, 1fr);
+  margin: 0;
+  padding: 0.75rem 1rem;
+}
+
+.import-field-row.is-associate,
+.import-field-header {
+  align-items: center;
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: auto minmax(120px, 0.4fr) minmax(160px, 0.7fr) minmax(200px, 1fr);
+}
+
+.import-field-header {
+  background: var(--panel);
+  padding: 0.75rem 1rem;
+}
+
+.import-current-value {
+  color: var(--muted);
+}
+
+.import-field-row + .import-field-row {
+  border-top: 1px solid var(--line);
+}
+
+.import-field-row > input[type="text"],
+.import-field-row > input[type="date"] {
+  margin: 0;
+}
+
+.integration-advanced > summary {
+  cursor: pointer;
+  font-size: 1.05rem;
+  font-weight: 700;
+}
+
+@media (max-width: 760px) {
+  .import-provider-row,
+  .import-status-row,
+  .import-field-row {
+    grid-template-columns: 1fr;
+  }
+}
+
 .cards,
 .grid.two {
   display: grid;

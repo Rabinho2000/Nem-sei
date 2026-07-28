@@ -1,18 +1,10 @@
 <section class="hero">
   <div>
     <p class="eyebrow">Integracoes</p>
-    <h2>Monitorizacao API</h2>
-    <p class="muted">Estado das APIs, sincronizacoes agendadas, cooldowns e jobs em background.</p>
-    <p class="muted">As sincronizacoes manuais ficam em fila e nao bloqueiam o pedido da pagina.</p>
+    <h2>Instalações ligadas às APIs</h2>
+    <p class="muted">Importa uma instalação, revê os dados encontrados e começa a sincronizar.</p>
   </div>
   <div class="hero-actions">
-    <form method="post">
-      <input type="hidden" name="action" value="test_connection">
-      <button class="button secondary" type="submit">Testar ligacoes</button>
-    </form>
-    <form method="post">
-      <input type="hidden" name="action" value="sync_now">
-      <button class="button" type="submit">Enfileirar estado de todas</button>
-    </form>
+    <a class="button" href="{{ url_for('installation_import') }}">Importar instalação</a>
   </div>
 </section>

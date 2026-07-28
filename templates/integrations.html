@@ -2,6 +2,7 @@
 {% block content %}
 {% include "integrations/_hero.html" %}
 {% include "integrations/_asset_options.html" %}
+{% include "integrations/_installation_imports.html" %}
 
 {% if fusionsolar_api_warning %}
 <section class="card">
@@ -13,19 +14,15 @@
 <section class="tab-shell" id="integrations-tabs">
   <div class="tab-bar integration-tab-bar">
     <button class="tab-button active" type="button" data-tab-target="integrations-summary">Resumo</button>
-    <button class="tab-button" type="button" data-tab-target="integrations-fusionsolar">FusionSolar</button>
-    <button class="tab-button" type="button" data-tab-target="integrations-sigenergy">Sigenergy</button>
-    <button class="tab-button" type="button" data-tab-target="integrations-mappings">Mapeamentos</button>
-    <button class="tab-button" type="button" data-tab-target="integrations-link-audit">Validacao</button>
     <button class="tab-button" type="button" data-tab-target="integrations-alerts">Alertas</button>
     <button class="tab-button" type="button" data-tab-target="integrations-assets">Instalacoes</button>
-    <button class="tab-button" type="button" data-tab-target="integrations-history">Historico</button>
   </div>
 
   <section class="tab-panel active" id="integrations-summary">
     {% include "integrations/_sync_status.html" %}
     {% include "integrations/_production_api_queue.html" %}
     {% include "integrations/_telegram.html" %}
+    {% include "integrations/_advanced.html" %}
   </section>
 
   <section class="tab-panel" id="integrations-fusionsolar">

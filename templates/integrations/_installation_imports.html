@@ -1,0 +1,35 @@
+<section class="card" id="installation-imports">
+  <div class="section-title">
+    <div>
+      <h3>Importações de instalações</h3>
+      <p class="muted">Acesso, associação e última sincronização num único lugar.</p>
+    </div>
+    <a class="button" href="{{ url_for('installation_import') }}">Importar instalação</a>
+  </div>
+  <div class="list">
+    {% for row in installation_import_rows %}
+      <div class="list-row import-status-row">
+        <div>
+          <strong>{{ row.provider }} · {{ row.external_name or row.external_id }}</strong>
+          <span>{{ row.external_id }} · {{ row.project_name or "Sem asset associado" }}</span>
+        </div>
+        <div>
+          <span class="status-pill">{{ row.access_status }}</span>
+          <small class="muted">Última sync: {{ row.mapping_last_sync_at or "—" }}</small>
+          {% if row.mapping_last_error or row.last_error %}
+            <small class="error-text">{{ row.mapping_last_error or row.last_error }}</small>
+          {% endif %}
+        </div>
+        {% if row.status in ["access_pending", "preview", "error"] %}
+          <a class="button small secondary" href="{{ url_for('installation_import', import_id=row.id) }}">
+            {{ "Verificar" if row.status == "access_pending" else "Continuar" }}
+          </a>
+        {% elif row.asset_id %}
+          <a class="button small secondary" href="{{ url_for('asset_detail', asset_id=row.asset_id) }}">Abrir</a>
+        {% endif %}
+      </div>
+    {% else %}
+      <p class="empty-state">Ainda não existem importações pelo novo fluxo.</p>
+    {% endfor %}
+  </div>
+</section>

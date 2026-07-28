@@ -171,6 +171,12 @@ from monitoring_board.services.report_rendering import (
     validate_formats,
 )
 from monitoring_board.services.portfolio_reporting import export_portfolio_result_workbook, prepare_portfolio_report
+from monitoring_board.services.installation_import import (
+    EDITABLE_ASSET_FIELDS,
+    missing_asset_fields,
+    normalize_fusionsolar_import,
+    normalize_sigenergy_import,
+)
 from monitoring_board.reporting.billing import decimal_from_value
 from monitoring_board.reporting.data_quality import (
     evaluate_monthly_production_quality,
@@ -393,6 +399,8 @@ API_AREA_STATE = "state"
 API_AREA_PRODUCTION = "production"
 API_AREA_DIAGNOSTICS = "diagnostics"
 BACKGROUND_JOB_TYPES_PERFORMANCE = (
+    "installation_import_list",
+    "installation_import_preview",
     "fusionsolar_state_sync",
     "fusionsolar_production_sync",
     "fusionsolar_production_backfill",
@@ -1606,6 +1614,17 @@ def create_app() -> Flask:
             (current_installation_group,),
         )
         financial_model = build_asset_financial_model_context(g.db, asset_id=asset_id)
+        requested_import_id = request.args.get("import_id", "").strip()
+        installation_import_summary = (
+            get_installation_import_context(g.db, int(requested_import_id))
+            if requested_import_id.isdigit()
+            else None
+        )
+        if (
+            installation_import_summary is not None
+            and int(installation_import_summary.get("asset_id") or 0) != asset_id
+        ):
+            installation_import_summary = None
         return render_template(
             "asset_detail.html",
             asset=asset,
@@ -1629,6 +1648,7 @@ def create_app() -> Flask:
             latest_device_rows=latest_device_rows,
             expected_strings_by_device=expected_strings_by_device,
             financial_model=financial_model,
+            installation_import_summary=installation_import_summary,
         )
 
     @app.route("/asset/<int:asset_id>/financial-model/upload", methods=["POST"])
@@ -4520,6 +4540,222 @@ def create_app() -> Flask:
         mimetype = "application/pdf" if row["format"] == "pdf" else ("application/zip" if row["format"] == "zip" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         return send_file(path, as_attachment=True, download_name=row["filename"], mimetype=mimetype)
 
+    @app.route("/integrations/import", methods=["GET", "POST"])
+    def installation_import() -> str:
+        assets_for_import = query_all(
+            g.db,
+            "SELECT * FROM assets ORDER BY project_name COLLATE NOCASE",
+        )
+        if request.method == "GET":
+            import_id = request.args.get("import_id", "").strip()
+            search_job_id = request.args.get("job_id", "").strip()
+            import_context = (
+                get_installation_import_context(g.db, int(import_id))
+                if import_id.isdigit()
+                else None
+            )
+            search_job = None
+            provider_rows: list[dict[str, Any]] = []
+            selected_provider = ""
+            selected_mode = ""
+            selected_target_asset_id = None
+            stage = "preview" if import_context else "start"
+            if search_job_id.isdigit():
+                job_row = g.db.execute(
+                    "SELECT * FROM background_jobs WHERE id = ? AND job_type = 'installation_import_list'",
+                    (int(search_job_id),),
+                ).fetchone()
+                if job_row is not None:
+                    search_job = dict(job_row)
+                    try:
+                        job_params = json.loads(search_job.get("params_json") or "{}")
+                    except json.JSONDecodeError:
+                        job_params = {}
+                    selected_provider = str(job_params.get("provider") or "")
+                    selected_mode = str(job_params.get("mode") or "")
+                    selected_target_asset_id = job_params.get("target_asset_id")
+                    if search_job["status"] == "success":
+                        try:
+                            result = json.loads(search_job.get("result_json") or "{}")
+                        except json.JSONDecodeError:
+                            result = {}
+                        provider_rows = result.get("provider_rows") or []
+                        stage = "select"
+                    else:
+                        stage = "search_pending"
+            return render_template(
+                "installation_import.html",
+                stage=stage,
+                import_context=import_context,
+                provider_rows=provider_rows,
+                search_job=search_job,
+                selected_provider=selected_provider,
+                selected_mode=selected_mode,
+                selected_target_asset_id=selected_target_asset_id,
+                assets_for_import=assets_for_import,
+                sigenergy_config=get_integration_config(g.db, INTEGRATION_PROVIDER_SIGENERGY),
+                fusionsolar_config=get_integration_config(g.db, INTEGRATION_PROVIDER_FUSIONSOLAR),
+            )
+
+        provider = request.form.get("provider", "").strip()
+        mode = request.form.get("mode", "").strip()
+        action = request.form.get("action", "preview").strip()
+        if provider not in INTEGRATION_PROVIDER_OPTIONS:
+            flash("Escolhe Sigenergy ou FusionSolar.", "error")
+            return redirect(url_for("installation_import"))
+        if mode not in {"create", "associate"}:
+            flash("Escolhe criar uma instalacao ou associar uma existente.", "error")
+            return redirect(url_for("installation_import"))
+
+        target_asset_raw = request.form.get("target_asset_id", "").strip()
+        target_asset_id = int(target_asset_raw) if target_asset_raw.isdigit() else None
+
+        if provider == INTEGRATION_PROVIDER_SIGENERGY:
+            config = get_integration_config(g.db, provider)
+            submitted_key = request.form.get("app_key", "").strip()
+            submitted_secret = request.form.get("app_secret", "").strip()
+            if config and (submitted_key or submitted_secret):
+                env_key = bool(os.environ.get("SIGENERGY_APP_KEY", "").strip())
+                env_secret = bool(os.environ.get("SIGENERGY_APP_SECRET", "").strip())
+                g.db.execute(
+                    """
+                    UPDATE integration_configs
+                    SET username = CASE WHEN ? = 0 AND ? != '' THEN ? ELSE username END,
+                        password = CASE WHEN ? = 0 AND ? != '' THEN ? ELSE password END,
+                        updated_at = ?
+                    WHERE provider = ?
+                    """,
+                    (
+                        1 if env_key else 0,
+                        submitted_key,
+                        submitted_key,
+                        1 if env_secret else 0,
+                        submitted_secret,
+                        submitted_secret,
+                        datetime.now().isoformat(timespec="seconds"),
+                        provider,
+                    ),
+                )
+                g.db.commit()
+
+        if action == "list":
+            job_id, _ = create_background_job(
+                g.db,
+                "installation_import_list",
+                {
+                    "provider": provider,
+                    "mode": mode,
+                    "target_asset_id": target_asset_id,
+                },
+            )
+            g.db.commit()
+            schedule_background_job(app, job_id)
+            return redirect(url_for("installation_import", job_id=job_id))
+
+        external_id = request.form.get("external_id", "").strip()
+        seed: dict[str, Any] | None = None
+        seed_json = request.form.get("seed_json", "").strip()
+        if seed_json:
+            try:
+                parsed_seed = json.loads(seed_json)
+                seed = parsed_seed if isinstance(parsed_seed, dict) else None
+            except json.JSONDecodeError:
+                seed = None
+        if not external_id:
+            flash("Indica o ID externo ou usa Procurar na API.", "error")
+            return redirect(url_for("installation_import"))
+        external_name = (
+            (seed or {}).get("plantName")
+            or (seed or {}).get("stationName")
+            or (seed or {}).get("systemName")
+            or external_id
+        )
+        queued_normalized = {
+            "provider": provider,
+            "source_label": f"{provider} API",
+            "external_id": external_id,
+            "external_name": external_name,
+            "project_name": external_name,
+            "fetched_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        import_id = upsert_installation_import_preview(
+            g.db,
+            provider=provider,
+            external_id=external_id,
+            external_name=external_name,
+            mode=mode,
+            target_asset_id=target_asset_id,
+            status="queued",
+            access_status="checking",
+            normalized=queued_normalized,
+            raw_payload={},
+            created_by=str(session.get("username") or ""),
+        )
+        job_id, _ = create_background_job(
+            g.db,
+            "installation_import_preview",
+            {
+                "import_id": import_id,
+                "provider": provider,
+                "seed": sanitize_installation_import_payload(seed or {}),
+            },
+        )
+        g.db.execute(
+            "UPDATE installation_imports SET background_job_id = ?, updated_at = ? WHERE id = ?",
+            (job_id, datetime.now().isoformat(timespec="seconds"), import_id),
+        )
+        g.db.commit()
+        schedule_background_job(app, job_id)
+        return redirect(url_for("installation_import", import_id=import_id))
+
+    @app.post("/integrations/import/<int:import_id>/check-access")
+    def check_installation_import_access(import_id: int) -> str:
+        import_context = get_installation_import_context(g.db, import_id)
+        if import_context is None:
+            abort(404)
+        now = datetime.now().isoformat(timespec="seconds")
+        g.db.execute(
+            """
+            UPDATE installation_imports
+            SET status = 'queued', access_status = 'checking', last_error = '', updated_at = ?
+            WHERE id = ?
+            """,
+            (now, import_id),
+        )
+        job_id, _ = create_background_job(
+            g.db,
+            "installation_import_preview",
+            {
+                "import_id": import_id,
+                "provider": import_context["provider"],
+                "seed": {},
+            },
+        )
+        g.db.execute(
+            "UPDATE installation_imports SET background_job_id = ? WHERE id = ?",
+            (job_id, import_id),
+        )
+        g.db.commit()
+        schedule_background_job(app, job_id)
+        flash("Verificacao de acesso iniciada em background.", "success")
+        return redirect(url_for("installation_import", import_id=import_id))
+
+    @app.post("/integrations/import/<int:import_id>/confirm")
+    def confirm_installation_import(import_id: int) -> str:
+        try:
+            asset_id, job_id = apply_installation_import(g.db, import_id, request.form)
+            schedule_background_job(app, job_id)
+            refresh_integration_scheduler(app)
+            flash(
+                f"Instalacao importada e sincronizacao colocada em background (job #{job_id}).",
+                "success",
+            )
+            return redirect(url_for("asset_detail", asset_id=asset_id, import_id=import_id))
+        except Exception as exc:
+            safe_error = sigenergy_service.sanitize_sigenergy_error(exc)
+            flash(f"Nao foi possivel concluir a importacao: {safe_error}", "error")
+            return redirect(url_for("installation_import", import_id=import_id))
+
     @app.route("/integrations", methods=["GET", "POST"])
     def integrations() -> str:
         provider = INTEGRATION_PROVIDER_FUSIONSOLAR
@@ -5074,6 +5310,22 @@ def create_app() -> Flask:
             LIMIT 50
             """,
         )
+        installation_import_rows = query_all(
+            g.db,
+            """
+            SELECT
+                ii.*,
+                a.project_name,
+                ai.last_sync_at AS mapping_last_sync_at,
+                ai.last_error AS mapping_last_error
+            FROM installation_imports ii
+            LEFT JOIN assets a ON a.id = COALESCE(ii.asset_id, ii.target_asset_id)
+            LEFT JOIN asset_integrations ai
+              ON ai.provider = ii.provider AND ai.external_id = ii.external_id
+            ORDER BY ii.updated_at DESC, ii.id DESC
+            LIMIT 50
+            """,
+        )
         sigenergy_last_run = g.db.execute(
             """
             SELECT *
@@ -5139,6 +5391,7 @@ def create_app() -> Flask:
             sigenergy_config=sigenergy_config,
             sigenergy_system_rows=sigenergy_system_rows,
             sigenergy_onboarding_rows=sigenergy_onboarding_rows,
+            installation_import_rows=installation_import_rows,
             sigenergy_last_run=sigenergy_last_run,
             link_audit_rows=link_audit_rows,
             link_audit_counts=link_audit_counts,
@@ -5645,6 +5898,33 @@ def ensure_database(path: str) -> None:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS installation_imports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                external_name TEXT,
+                mode TEXT NOT NULL,
+                target_asset_id INTEGER,
+                asset_id INTEGER,
+                status TEXT NOT NULL,
+                access_status TEXT NOT NULL DEFAULT 'available',
+                source_label TEXT NOT NULL,
+                normalized_json TEXT,
+                raw_payload_json TEXT,
+                fetched_at TEXT,
+                onboarding_request_id INTEGER,
+                background_job_id INTEGER,
+                last_error TEXT,
+                created_by TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(provider, external_id),
+                FOREIGN KEY (target_asset_id) REFERENCES assets(id) ON DELETE SET NULL,
+                FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE SET NULL,
+                FOREIGN KEY (onboarding_request_id) REFERENCES sigenergy_onboarding_requests(id) ON DELETE SET NULL,
+                FOREIGN KEY (background_job_id) REFERENCES background_jobs(id) ON DELETE SET NULL
+            );
+
             CREATE TABLE IF NOT EXISTS provider_devices (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 asset_id INTEGER NOT NULL,
@@ -6100,6 +6380,16 @@ def ensure_database(path: str) -> None:
         ensure_column(conn, "assets", "silenced_until TEXT")
         ensure_column(conn, "assets", "silence_reason TEXT")
         ensure_column(conn, "assets", "mounting_date TEXT")
+        ensure_column(conn, "assets", "country TEXT")
+        ensure_column(conn, "assets", "timezone TEXT")
+        ensure_column(conn, "assets", "kwac TEXT")
+        ensure_column(conn, "assets", "commissioning_date TEXT")
+        ensure_column(conn, "assets", "data_source TEXT")
+        ensure_column(conn, "assets", "imported_at TEXT")
+        ensure_column(conn, "assets", "latitude REAL")
+        ensure_column(conn, "assets", "longitude REAL")
+        ensure_column(conn, "assets", "coordinates_source TEXT")
+        ensure_column(conn, "assets", "coordinates_confidence TEXT")
         ensure_column(conn, "asset_aliases", "active INTEGER DEFAULT 1")
         ensure_column(conn, "tickets", "planned_date TEXT")
         ensure_column(conn, "tickets", "due_date TEXT")
@@ -6131,6 +6421,7 @@ def ensure_database(path: str) -> None:
         ensure_column(conn, "integration_configs", "diagnostics_sync_time TEXT")
         ensure_column(conn, "background_jobs", "next_attempt_at TEXT")
         ensure_column(conn, "background_jobs", "wait_reason TEXT")
+        ensure_column(conn, "sigenergy_onboarding_requests", "installation_import_id INTEGER")
         ensure_api_call_state_schema(conn)
         ensure_api_queue_schema(conn)
         ensure_sampled_availability_schema(conn)
@@ -6280,6 +6571,9 @@ def ensure_database_indexes(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_sigenergy_onboarding_status
             ON sigenergy_onboarding_requests(status, updated_at);
+
+        CREATE INDEX IF NOT EXISTS idx_installation_imports_status_updated
+            ON installation_imports(status, updated_at);
 
         CREATE INDEX IF NOT EXISTS idx_availability_daily_asset_provider_period
             ON availability_daily(asset_id, provider, period_date DESC);
@@ -12736,6 +13030,28 @@ def run_background_job_payload(conn: sqlite3.Connection, job_type: str, params: 
             raise ValueError("Automatização inválida.")
         return run_report_automation_generation(conn, automation_id)
 
+    if job_type == "installation_import_list":
+        provider = str(params.get("provider") or "")
+        if provider not in INTEGRATION_PROVIDER_OPTIONS:
+            raise ValueError("Fornecedor invalido para listar instalacoes.")
+        return {
+            "provider": provider,
+            "provider_rows": sanitize_installation_import_payload(
+                list_provider_installations_for_import(conn, provider)
+            ),
+        }
+
+    if job_type == "installation_import_preview":
+        import_id = int(params.get("import_id") or 0)
+        if not import_id:
+            raise ValueError("Importacao de instalacao invalida.")
+        seed = params.get("seed")
+        return run_installation_import_preview_job(
+            conn,
+            import_id,
+            seed=seed if isinstance(seed, dict) else None,
+        )
+
     if job_type == "fusionsolar_state_sync":
         result = run_fusionsolar_sync(
             conn,
@@ -16050,6 +16366,10 @@ SIGENERGY_SYSTEM_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 SIGENERGY_ACTIVE_ONBOARDING_STATUSES = {"requested", "already_requested", "already_requested_or_onboarded"}
 
 
+class SigenergyInstallationAccessPending(ValueError):
+    pass
+
+
 def normalize_sigenergy_system_id_for_compare(system_id: str) -> str:
     return system_id.strip().lower()
 
@@ -16131,12 +16451,48 @@ def create_sigenergy_onboarding_request(
     config: dict[str, Any],
     system_id: str,
     requested_by: str = "",
+    *,
+    installation_import_id: int | None = None,
+    commit: bool = True,
 ) -> dict[str, Any]:
     system_id = validate_sigenergy_system_id(system_id)
+    existing = conn.execute(
+        """
+        SELECT *
+        FROM sigenergy_onboarding_requests
+        WHERE LOWER(system_id) = ?
+          AND status IN ('requested', 'already_requested', 'already_requested_or_onboarded')
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (normalize_sigenergy_system_id_for_compare(system_id),),
+    ).fetchone()
+    if existing is not None:
+        if installation_import_id and not existing["installation_import_id"]:
+            conn.execute(
+                "UPDATE sigenergy_onboarding_requests SET installation_import_id = ?, updated_at = ? WHERE id = ?",
+                (installation_import_id, datetime.now().isoformat(timespec="seconds"), existing["id"]),
+            )
+            if commit:
+                conn.commit()
+        return {
+            "system_id": system_id,
+            "status": existing["status"],
+            "provider_code": existing["provider_code"] or "",
+            "message": existing["provider_message"] or "O pedido de acesso ja estava pendente.",
+            "request_id": int(existing["id"]),
+            "reused": True,
+        }
     service_config = build_sigenergy_service_config(config)
     result = sigenergy_service.onboard_system(service_config, system_id, session=requests.Session())
     request_id = upsert_sigenergy_onboarding_request(conn, system_id=system_id, requested_by=requested_by, result=result)
-    conn.commit()
+    if installation_import_id:
+        conn.execute(
+            "UPDATE sigenergy_onboarding_requests SET installation_import_id = ? WHERE id = ?",
+            (installation_import_id, request_id),
+        )
+    if commit:
+        conn.commit()
     return {**result, "request_id": request_id}
 
 
@@ -16171,6 +16527,754 @@ def reconcile_sigenergy_onboarding_requests(conn: sqlite3.Connection, available_
                 (now, now, row["id"]),
             )
     return approved_count
+
+
+def sanitize_installation_import_payload(value: Any) -> Any:
+    return sigenergy_service.sanitize_payload(value)
+
+
+def begin_installation_import_api_call(
+    conn: sqlite3.Connection,
+    provider: str,
+) -> None:
+    require_not_in_cooldown(conn, provider, API_AREA_STATE)
+    record_api_attempt(conn, provider, API_AREA_STATE)
+    conn.commit()
+
+
+def complete_installation_import_api_call(
+    conn: sqlite3.Connection,
+    provider: str,
+) -> None:
+    record_api_success(conn, provider, API_AREA_STATE)
+    conn.commit()
+
+
+def persist_installation_import_rate_limit(
+    conn: sqlite3.Connection,
+    provider: str,
+    exc: ApiRateLimitError | FusionSolarRateLimitError,
+) -> ApiRateLimitError:
+    cooldown_until = (
+        exc.cooldown_until
+        if isinstance(exc, ApiRateLimitError)
+        else datetime.now() + timedelta(minutes=60)
+    )
+    mark_api_cooldown(
+        conn,
+        provider,
+        API_AREA_STATE,
+        str(exc),
+        cooldown_until=cooldown_until,
+    )
+    conn.commit()
+    return ApiRateLimitError(
+        provider,
+        API_AREA_STATE,
+        cooldown_until,
+        str(exc),
+    )
+
+
+def list_provider_installations_for_import(
+    conn: sqlite3.Connection,
+    provider: str,
+) -> list[dict[str, Any]]:
+    config = get_integration_config(conn, provider)
+    if config is None:
+        raise ValueError(f"Configuracao {provider} nao encontrada.")
+    if not config.get("username") or not config.get("password"):
+        credential_label = "App Key/App Secret" if provider == INTEGRATION_PROVIDER_SIGENERGY else "utilizador/password"
+        raise ValueError(f"Faltam credenciais {credential_label} para {provider}.")
+    begin_installation_import_api_call(conn, provider)
+    try:
+        if provider == INTEGRATION_PROVIDER_SIGENERGY:
+            service_config = build_sigenergy_service_config(config)
+            service_config["system_ids"] = ""
+            rows = sigenergy_service.SigenergyClient(service_config, session=requests.Session()).list_systems()
+            result = [
+                {
+                    "external_id": first_non_empty(row, ["systemId", "id", "stationId", "plantId"]),
+                    "external_name": first_non_empty(row, ["systemName", "name", "stationName", "plantName"])
+                    or first_non_empty(row, ["systemId", "id", "stationId", "plantId"]),
+                    "seed": row,
+                }
+                for row in rows
+                if first_non_empty(row, ["systemId", "id", "stationId", "plantId"])
+            ]
+        else:
+            rows = build_fusionsolar_client(config).stations()
+            result = [
+                {
+                    "external_id": first_non_empty(row, ["plantCode", "stationCode", "stationId"]),
+                    "external_name": first_non_empty(row, ["plantName", "stationName", "name"])
+                    or first_non_empty(row, ["plantCode", "stationCode", "stationId"]),
+                    "seed": row,
+                }
+                for row in rows
+                if first_non_empty(row, ["plantCode", "stationCode", "stationId"])
+            ]
+        complete_installation_import_api_call(conn, provider)
+        return result
+    except (ApiRateLimitError, FusionSolarRateLimitError) as exc:
+        raise persist_installation_import_rate_limit(conn, provider, exc) from exc
+
+
+def fetch_provider_installation_preview(
+    conn: sqlite3.Connection,
+    provider: str,
+    external_id: str,
+    *,
+    seed: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    external_id = str(external_id or "").strip()
+    if not external_id:
+        raise ValueError("Indica o System ID, Plant ID ou Station Code.")
+    config = get_integration_config(conn, provider)
+    if config is None:
+        raise ValueError(f"Configuracao {provider} nao encontrada.")
+    if not config.get("username") or not config.get("password"):
+        credential_label = "App Key/App Secret" if provider == INTEGRATION_PROVIDER_SIGENERGY else "utilizador/password"
+        raise ValueError(f"Faltam credenciais {credential_label} para {provider}.")
+
+    try:
+        begin_installation_import_api_call(conn, provider)
+        if provider == INTEGRATION_PROVIDER_SIGENERGY:
+            service_config = build_sigenergy_service_config(config)
+            service_config["system_ids"] = ""
+            client = sigenergy_service.SigenergyClient(service_config, session=requests.Session())
+            systems = client.list_systems()
+            system = next(
+                (
+                    row
+                    for row in systems
+                    if normalize_sigenergy_system_id_for_compare(
+                        first_non_empty(row, ["systemId", "id", "stationId", "plantId"])
+                    )
+                    == normalize_sigenergy_system_id_for_compare(external_id)
+                ),
+                None,
+            )
+            if system is None:
+                complete_installation_import_api_call(conn, provider)
+                raise SigenergyInstallationAccessPending(
+                    f"O System ID {external_id} ainda nao esta acessivel por esta App Key."
+                )
+            flow = client.get_energy_flow(external_id)
+            normalized = normalize_sigenergy_import(system, flow)
+            raw = {"system": system, "energy_flow": flow}
+            complete_installation_import_api_call(conn, provider)
+            return normalized, sanitize_installation_import_payload(raw)
+
+        client = build_fusionsolar_client(config)
+        station = dict(seed or {})
+        station.setdefault("plantCode", external_id)
+        station.setdefault("plantName", external_id)
+        realtime = client.station_realtime_kpi([external_id]).get(external_id, {})
+        devices = client.device_list([external_id])
+        device_realtime = client.device_realtime_kpi(devices) if devices else {}
+        alarms: list[dict[str, Any]] = []
+        try:
+            alarms = client.alarms([external_id]).get(external_id, [])
+        except (ApiRateLimitError, FusionSolarRateLimitError):
+            raise
+        except Exception as exc:
+            current_app.logger.info(
+                "FusionSolar alarms unavailable during installation import for %s: %s",
+                external_id,
+                exc,
+            )
+        if not realtime and not devices and not seed:
+            raise ValueError(
+                f"O Station Code {external_id} nao devolveu dados realtime nem equipamentos."
+            )
+        normalized = normalize_fusionsolar_import(
+            station,
+            realtime,
+            devices,
+            device_realtime,
+            alarms,
+        )
+        raw = {
+            "station": station,
+            "realtime": realtime,
+            "devices": devices,
+            "device_realtime": device_realtime,
+            "alarms": alarms,
+        }
+        complete_installation_import_api_call(conn, provider)
+        return normalized, sanitize_installation_import_payload(raw)
+    except (ApiRateLimitError, FusionSolarRateLimitError) as exc:
+        raise persist_installation_import_rate_limit(conn, provider, exc) from exc
+
+
+def run_installation_import_preview_job(
+    conn: sqlite3.Connection,
+    import_id: int,
+    *,
+    seed: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    import_context = get_installation_import_context(conn, import_id)
+    if import_context is None:
+        raise ValueError("Importacao de instalacao nao encontrada.")
+    provider = str(import_context["provider"])
+    external_id = str(import_context["external_id"])
+    try:
+        normalized, raw_payload = fetch_provider_installation_preview(
+            conn,
+            provider,
+            external_id,
+            seed=seed,
+        )
+        upsert_installation_import_preview(
+            conn,
+            provider=provider,
+            external_id=external_id,
+            external_name=normalized.get("external_name") or external_id,
+            mode=import_context["mode"],
+            target_asset_id=import_context.get("target_asset_id"),
+            status="preview",
+            access_status="available",
+            normalized=normalized,
+            raw_payload=raw_payload,
+            created_by=str(import_context.get("created_by") or ""),
+        )
+        if provider == INTEGRATION_PROVIDER_SIGENERGY:
+            now = datetime.now().isoformat(timespec="seconds")
+            conn.execute(
+                """
+                UPDATE sigenergy_onboarding_requests
+                SET status = 'approved', last_checked_at = ?,
+                    approved_at = COALESCE(approved_at, ?), updated_at = ?, last_error = ''
+                WHERE installation_import_id = ?
+                """,
+                (now, now, now, import_id),
+            )
+        conn.commit()
+        return {"import_id": import_id, "status": "preview"}
+    except SigenergyInstallationAccessPending:
+        normalized = {
+            "provider": provider,
+            "source_label": f"{provider} API",
+            "external_id": external_id,
+            "external_name": external_id,
+            "project_name": external_id,
+            "fetched_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        upsert_installation_import_preview(
+            conn,
+            provider=provider,
+            external_id=external_id,
+            external_name=external_id,
+            mode=import_context["mode"],
+            target_asset_id=import_context.get("target_asset_id"),
+            status="access_pending",
+            access_status="pending_approval",
+            normalized=normalized,
+            raw_payload={},
+            created_by=str(import_context.get("created_by") or ""),
+        )
+        conn.commit()
+        try:
+            config = get_integration_config(conn, provider)
+            if config is None:
+                raise ValueError("Configuracao Sigenergy nao encontrada.")
+            result = create_sigenergy_onboarding_request(
+                conn,
+                config,
+                external_id,
+                requested_by=str(import_context.get("created_by") or ""),
+                installation_import_id=import_id,
+            )
+        except Exception as onboarding_exc:
+            safe_error = sigenergy_service.sanitize_sigenergy_error(onboarding_exc)
+            conn.execute(
+                """
+                UPDATE installation_imports
+                SET status = 'error', access_status = 'error', last_error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (safe_error, datetime.now().isoformat(timespec="seconds"), import_id),
+            )
+            conn.commit()
+            raise
+        conn.execute(
+            """
+            UPDATE installation_imports
+            SET onboarding_request_id = ?, last_error = '', updated_at = ?
+            WHERE id = ?
+            """,
+            (result["request_id"], datetime.now().isoformat(timespec="seconds"), import_id),
+        )
+        now = datetime.now().isoformat(timespec="seconds")
+        conn.execute(
+            """
+            UPDATE sigenergy_onboarding_requests
+            SET last_checked_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (now, now, result["request_id"]),
+        )
+        conn.commit()
+        return {
+            "import_id": import_id,
+            "status": "access_pending",
+            "onboarding_request_id": result["request_id"],
+            "onboarding_reused": bool(result.get("reused")),
+        }
+    except ApiRateLimitError as exc:
+        safe_error = sigenergy_service.sanitize_sigenergy_error(exc)
+        conn.execute(
+            """
+            UPDATE installation_imports
+            SET status = 'queued', access_status = 'waiting_rate_limit',
+                last_error = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (safe_error, datetime.now().isoformat(timespec="seconds"), import_id),
+        )
+        conn.commit()
+        raise
+    except Exception as exc:
+        safe_error = sigenergy_service.sanitize_sigenergy_error(exc)
+        conn.execute(
+            """
+            UPDATE installation_imports
+            SET status = 'error', access_status = 'error', last_error = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (safe_error, datetime.now().isoformat(timespec="seconds"), import_id),
+        )
+        conn.commit()
+        raise
+
+
+def find_import_asset_matches(
+    conn: sqlite3.Connection,
+    external_name: str,
+) -> list[dict[str, Any]]:
+    normalized = normalize_name(external_name)
+    if not normalized:
+        return []
+    asset_ids: set[int] = set()
+    for row in query_all(
+        conn,
+        "SELECT id, project_name, installation_group FROM assets",
+    ):
+        if normalized in {
+            normalize_name(row["project_name"] or ""),
+            normalize_name(row["installation_group"] or ""),
+        }:
+            asset_ids.add(int(row["id"]))
+    for row in query_all(
+        conn,
+        "SELECT asset_id FROM asset_aliases WHERE normalized_alias = ? AND COALESCE(active, 1) = 1",
+        (normalized,),
+    ):
+        asset_ids.add(int(row["asset_id"]))
+    if not asset_ids:
+        return []
+    placeholders = ", ".join("?" for _ in asset_ids)
+    return query_all(
+        conn,
+        f"SELECT * FROM assets WHERE id IN ({placeholders}) ORDER BY project_name COLLATE NOCASE",
+        sorted(asset_ids),
+    )
+
+
+def upsert_installation_import_preview(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    external_id: str,
+    external_name: str,
+    mode: str,
+    target_asset_id: int | None,
+    status: str,
+    access_status: str,
+    normalized: dict[str, Any],
+    raw_payload: dict[str, Any],
+    created_by: str,
+) -> int:
+    now = datetime.now().isoformat(timespec="seconds")
+    existing = conn.execute(
+        "SELECT id, status FROM installation_imports WHERE provider = ? AND external_id = ?",
+        (provider, external_id),
+    ).fetchone()
+    values = (
+        external_name,
+        mode,
+        target_asset_id,
+        status,
+        access_status,
+        f"{provider} API",
+        json.dumps(normalized, ensure_ascii=True, sort_keys=True),
+        json.dumps(sanitize_installation_import_payload(raw_payload), ensure_ascii=True, sort_keys=True),
+        normalized.get("fetched_at") or now,
+        "",
+        created_by,
+        now,
+    )
+    if existing:
+        if status == "queued":
+            conn.execute(
+                """
+                UPDATE installation_imports
+                SET external_name = ?, mode = ?, target_asset_id = ?, status = ?,
+                    access_status = ?, last_error = '', created_by = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    external_name,
+                    mode,
+                    target_asset_id,
+                    status,
+                    access_status,
+                    created_by,
+                    now,
+                    existing["id"],
+                ),
+            )
+            return int(existing["id"])
+        conn.execute(
+            """
+            UPDATE installation_imports
+            SET external_name = ?, mode = ?, target_asset_id = ?, status = ?, access_status = ?,
+                source_label = ?, normalized_json = ?, raw_payload_json = ?, fetched_at = ?,
+                last_error = ?, created_by = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            values + (existing["id"],),
+        )
+        return int(existing["id"])
+    cursor = conn.execute(
+        """
+        INSERT INTO installation_imports (
+            provider, external_id, external_name, mode, target_asset_id, status,
+            access_status, source_label, normalized_json, raw_payload_json, fetched_at,
+            last_error, created_by, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            provider,
+            external_id,
+            *values[:-1],
+            now,
+            now,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def get_installation_import_context(
+    conn: sqlite3.Connection,
+    import_id: int,
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT * FROM installation_imports WHERE id = ?",
+        (import_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    try:
+        result["normalized"] = json.loads(result.get("normalized_json") or "{}")
+    except json.JSONDecodeError:
+        result["normalized"] = {}
+    try:
+        result["raw_payload"] = json.loads(result.get("raw_payload_json") or "{}")
+    except json.JSONDecodeError:
+        result["raw_payload"] = {}
+    result["missing_fields"] = missing_asset_fields(result["normalized"])
+    result["matches"] = find_import_asset_matches(
+        conn,
+        result["normalized"].get("external_name") or result.get("external_name") or "",
+    )
+    result["suggested_asset_id"] = (
+        int(result["matches"][0]["id"]) if len(result["matches"]) == 1 else None
+    )
+    result["ambiguous_match"] = len(result["matches"]) > 1
+    comparison_asset_id = result.get("target_asset_id") or result["suggested_asset_id"]
+    comparison_row = (
+        conn.execute(
+            "SELECT id FROM assets WHERE id = ?",
+            (comparison_asset_id,),
+        ).fetchone()
+        if comparison_asset_id
+        else None
+    )
+    result["target_asset"] = (
+        dict(
+            conn.execute(
+                "SELECT * FROM assets WHERE id = ?",
+                (comparison_asset_id,),
+            ).fetchone()
+        )
+        if comparison_row is not None
+        else None
+    )
+    background_job_id = result.get("background_job_id")
+    background_job_row = (
+        conn.execute(
+            "SELECT * FROM background_jobs WHERE id = ?",
+            (background_job_id,),
+        ).fetchone()
+        if background_job_id
+        else None
+    )
+    result["background_job"] = (
+        dict(background_job_row) if background_job_row is not None else None
+    )
+    return result
+
+
+def _insert_import_snapshot(
+    conn: sqlite3.Connection,
+    asset_id: int,
+    normalized: dict[str, Any],
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO integration_realtime_snapshots (
+            asset_id, provider, external_id, collected_at, external_status, normalized_status,
+            pv_power_kw, load_power_kw, grid_power_kw_raw, battery_power_kw, battery_soc_pct,
+            ev_power_kw, ac_power_kw, heat_pump_power_kw, pv_capacity_kw, battery_capacity_kwh,
+            payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            asset_id,
+            normalized["provider"],
+            normalized["external_id"],
+            normalized.get("fetched_at") or datetime.now().isoformat(timespec="seconds"),
+            normalized.get("operational_status") or "",
+            normalized.get("operational_status") or "Sem dados",
+            normalized.get("pv_power_kw"),
+            normalized.get("load_power_kw"),
+            normalized.get("grid_power_kw"),
+            normalized.get("battery_power_kw"),
+            normalized.get("battery_soc_pct"),
+            normalized.get("ev_power_kw"),
+            normalized.get("kwac"),
+            normalized.get("heat_pump_power_kw"),
+            normalized.get("kwp"),
+            normalized.get("battery_capacity_kwh"),
+            json.dumps(normalized, ensure_ascii=True, sort_keys=True),
+        ),
+    )
+
+
+def apply_installation_import(
+    conn: sqlite3.Connection,
+    import_id: int,
+    form: MultiDict[str, str],
+) -> tuple[int, int]:
+    import_context = get_installation_import_context(conn, import_id)
+    if import_context is None:
+        raise ValueError("Pre-visualizacao de importacao nao encontrada.")
+    if import_context["status"] not in {"preview", "completed"}:
+        raise ValueError("A instalacao ainda nao esta pronta para confirmar.")
+    normalized = dict(import_context["normalized"])
+    provider = str(import_context["provider"])
+    external_id = str(import_context["external_id"])
+    mode = str(import_context["mode"])
+    now = datetime.now().isoformat(timespec="seconds")
+    editable = {
+        field: str(form.get(field, normalized.get(field) or "")).strip()
+        for field in EDITABLE_ASSET_FIELDS
+    }
+    if not editable["project_name"]:
+        raise ValueError("O nome da instalacao e obrigatorio.")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        mapped = conn.execute(
+            "SELECT asset_id FROM asset_integrations WHERE provider = ? AND external_id = ?",
+            (provider, external_id),
+        ).fetchone()
+        target_asset_id_raw = form.get("target_asset_id") or import_context.get("target_asset_id")
+        target_asset_id = int(target_asset_id_raw) if str(target_asset_id_raw or "").isdigit() else None
+        if mapped is not None:
+            asset_id = int(mapped["asset_id"])
+            if mode == "associate" and target_asset_id and target_asset_id != asset_id:
+                raise ValueError("Este ID externo ja esta associado a outra instalacao.")
+        elif mode == "associate":
+            if not target_asset_id:
+                raise ValueError("Escolhe a instalacao local a associar.")
+            if conn.execute("SELECT id FROM assets WHERE id = ?", (target_asset_id,)).fetchone() is None:
+                raise ValueError("A instalacao local escolhida ja nao existe.")
+            asset_id = target_asset_id
+        else:
+            cursor = conn.execute(
+                """
+                INSERT INTO assets (
+                    project_name, installation_group, company_name, address, location, country,
+                    timezone, kwp, kwac, commissioning_date, mounting_date, status_detail,
+                    latitude, longitude, coordinates_source, coordinates_confidence,
+                    data_source, imported_at, source_payload, alias_blob
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    editable["project_name"],
+                    editable["project_name"],
+                    editable["company_name"],
+                    editable["address"],
+                    editable["location"],
+                    editable["country"],
+                    editable["timezone"],
+                    editable["kwp"],
+                    editable["kwac"],
+                    editable["commissioning_date"],
+                    editable["commissioning_date"],
+                    normalized.get("operational_status") or "",
+                    normalized.get("latitude"),
+                    normalized.get("longitude"),
+                    f"{provider} API" if normalized.get("latitude") is not None else "",
+                    "api" if normalized.get("latitude") is not None else "",
+                    f"{provider} API",
+                    now,
+                    json.dumps(
+                        {
+                            "source": f"{provider} API",
+                            "installation_import_id": import_id,
+                            "normalized": normalized,
+                        },
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    ),
+                    editable["project_name"],
+                ),
+            )
+            asset_id = int(cursor.lastrowid)
+            normalized_alias = normalize_name(editable["project_name"])
+            if normalized_alias:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO asset_aliases (
+                        asset_id, alias_name, normalized_alias, source
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (asset_id, editable["project_name"], normalized_alias, f"{provider} API"),
+                )
+
+        if mode == "associate":
+            allowed_fields = {
+                field for field in form.getlist("apply_field") if field in EDITABLE_ASSET_FIELDS
+            }
+            column_map = {
+                "project_name": "project_name",
+                "company_name": "company_name",
+                "address": "address",
+                "location": "location",
+                "country": "country",
+                "timezone": "timezone",
+                "kwp": "kwp",
+                "kwac": "kwac",
+                "commissioning_date": "commissioning_date",
+            }
+            for field in allowed_fields:
+                conn.execute(
+                    f"UPDATE assets SET {column_map[field]} = ? WHERE id = ?",
+                    (editable[field], asset_id),
+                )
+
+        if mapped is None:
+            conn.execute(
+                """
+                INSERT INTO asset_integrations (
+                    asset_id, provider, external_id, external_name, enabled,
+                    last_sync_at, last_status, last_error
+                ) VALUES (?, ?, ?, ?, 1, ?, ?, '')
+                """,
+                (
+                    asset_id,
+                    provider,
+                    external_id,
+                    normalized.get("external_name") or external_id,
+                    now,
+                    normalized.get("operational_status") or "Sem dados",
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE asset_integrations
+                SET external_name = ?, enabled = 1, last_sync_at = ?, last_status = ?, last_error = ''
+                WHERE provider = ? AND external_id = ?
+                """,
+                (
+                    normalized.get("external_name") or external_id,
+                    now,
+                    normalized.get("operational_status") or "Sem dados",
+                    provider,
+                    external_id,
+                ),
+            )
+
+        if provider == INTEGRATION_PROVIDER_FUSIONSOLAR:
+            raw_devices = import_context["raw_payload"].get("devices") or []
+            for device in raw_devices:
+                identity = normalize_fusionsolar_device_identity(device)
+                if not identity["external_device_id"]:
+                    continue
+                identity["station_code"] = identity["station_code"] or external_id
+                identity["payload"] = device
+                identity["enabled"] = 1
+                upsert_provider_device(conn, asset_id, provider, identity)
+
+        _insert_import_snapshot(conn, asset_id, normalized)
+        status = str(normalized.get("operational_status") or "").strip()
+        if status and status != "Sem dados":
+            duplicate = conn.execute(
+                """
+                SELECT id FROM monitoring_records
+                WHERE asset_id = ? AND record_date = ? AND status = ? AND source = ?
+                LIMIT 1
+                """,
+                (asset_id, current_lisbon_date().isoformat(), status, provider),
+            ).fetchone()
+            if duplicate is None:
+                conn.execute(
+                    """
+                    INSERT INTO monitoring_records (asset_id, status, record_date, notes, source)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        asset_id,
+                        status,
+                        current_lisbon_date().isoformat(),
+                        f"Importacao inicial {provider} API",
+                        provider,
+                    ),
+                )
+
+        conn.execute(
+            "UPDATE integration_configs SET enabled = 1, updated_at = ? WHERE provider = ?",
+            (now, provider),
+        )
+        job_type = (
+            "sigenergy_state_sync"
+            if provider == INTEGRATION_PROVIDER_SIGENERGY
+            else "fusionsolar_state_sync"
+        )
+        job_id, _ = create_background_job(
+            conn,
+            job_type,
+            {"provider": provider, "trigger_type": "installation_import"},
+        )
+        conn.execute(
+            """
+            UPDATE installation_imports
+            SET asset_id = ?, status = 'completed', access_status = 'available',
+                background_job_id = ?, last_error = '', updated_at = ?
+            WHERE id = ?
+            """,
+            (asset_id, job_id, now, import_id),
+        )
+        conn.commit()
+        return asset_id, job_id
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def cleanup_sigenergy_snapshots(conn: sqlite3.Connection, provider: str, retention_days: int) -> int:

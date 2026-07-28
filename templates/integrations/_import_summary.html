@@ -1,0 +1,17 @@
+{% if installation_import_summary %}
+  {% set imported = installation_import_summary.normalized %}
+  <section class="card import-complete-summary">
+    <div class="section-title">
+      <div>
+        <p class="eyebrow">Importação concluída</p>
+        <h3>{{ installation_import_summary.source_label }}</h3>
+        <p class="muted">{{ installation_import_summary.external_id }} · recolhido em {{ imported.fetched_at }}</p>
+      </div>
+      <span class="status-pill">{{ imported.operational_status or "Sem dados" }}</span>
+    </div>
+    <p>Foram importados os metadados disponíveis, o estado atual e {{ imported.devices|length }} equipamento(s). A sincronização ficou agendada em background.</p>
+    {% if installation_import_summary.missing_fields %}
+      <p class="callout warning"><strong>Ainda por preencher:</strong> {{ installation_import_summary.missing_fields|join(", ") }}</p>
+    {% endif %}
+  </section>
+{% endif %}

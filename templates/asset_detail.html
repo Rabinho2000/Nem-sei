@@ -12,6 +12,8 @@
   </div>
 </section>
 
+{% include "integrations/_import_summary.html" %}
+
 <datalist id="installation-group-options">
   {% for group in installation_groups %}
     <option value="{{ group.name }}">{{ group.member_count }} central{{ '' if group.member_count == 1 else 's' }}</option>

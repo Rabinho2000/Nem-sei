@@ -1,0 +1,263 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">Integrações</p>
+    <h2>Importar instalação</h2>
+    <p class="muted">Escolhe a instalação na API, revê os dados encontrados e confirma numa única operação.</p>
+  </div>
+  <div class="hero-actions">
+    <a class="button secondary" href="{{ url_for('integrations') }}">Voltar às integrações</a>
+  </div>
+</section>
+
+{% if stage == "start" %}
+<section class="card import-wizard">
+  <div class="section-title">
+    <div>
+      <h3>1. Origem e destino</h3>
+      <p class="muted">Podes procurar na conta ou indicar diretamente o ID externo.</p>
+    </div>
+  </div>
+  <form method="post" class="stack-form">
+    <div class="grid two">
+      <label>Fornecedor
+        <select name="provider" id="import-provider" required>
+          <option value="">Escolher…</option>
+          <option value="Sigenergy">Sigenergy</option>
+          <option value="FusionSolar">FusionSolar</option>
+        </select>
+      </label>
+      <label>Modo
+        <select name="mode" id="import-mode" required>
+          <option value="create">Criar nova instalação no Nem-sei</option>
+          <option value="associate">Associar a instalação existente</option>
+        </select>
+      </label>
+    </div>
+    <label id="import-target-wrap" hidden>Instalação local
+      <select name="target_asset_id">
+        <option value="">Escolher depois da pré-visualização</option>
+        {% for asset in assets_for_import %}
+          <option value="{{ asset.id }}">{{ asset.project_name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>System ID / Plant ID / Station Code
+      <input type="text" name="external_id" autocomplete="off" placeholder="Deixa vazio para listar as instalações disponíveis">
+    </label>
+    {% if not sigenergy_config or not sigenergy_config.password_configured %}
+      <details class="nested-card" id="sigenergy-credentials">
+        <summary>Credenciais Sigenergy, se ainda não estiverem configuradas</summary>
+        <div class="grid two">
+          <label>App Key
+            <input type="text" name="app_key" autocomplete="username">
+          </label>
+          <label>App Secret
+            <input type="password" name="app_secret" autocomplete="new-password">
+          </label>
+        </div>
+        <p class="muted">Variáveis de ambiente continuam a ter prioridade. O segredo nunca é devolvido no HTML.</p>
+      </details>
+    {% endif %}
+    <div class="hero-actions">
+      <button class="button secondary" type="submit" name="action" value="list">Procurar na API</button>
+      <button class="button" type="submit" name="action" value="preview">Obter pré-visualização</button>
+    </div>
+  </form>
+</section>
+{% endif %}
+
+{% if stage == "search_pending" and search_job %}
+<section class="card import-access-state">
+  <span class="status-pill">{{ search_job.status }}</span>
+  <h3>A procurar instalações na API</h3>
+  {% if search_job.status == "failed" %}
+    <p class="callout error">{{ search_job.error_message or "A pesquisa falhou." }}</p>
+    <a class="button secondary" href="{{ url_for('installation_import') }}">Tentar novamente</a>
+  {% else %}
+    <p class="muted">A pesquisa está a correr em background. Esta página atualiza automaticamente.</p>
+    <a class="button secondary" href="{{ url_for('installation_import', job_id=search_job.id) }}">Atualizar agora</a>
+  {% endif %}
+</section>
+{% endif %}
+
+{% if stage == "select" %}
+<section class="card import-wizard">
+  <div class="section-title">
+    <div>
+      <h3>2. Escolher instalação externa</h3>
+      <p class="muted">{{ provider_rows|length }} instalação(ões) encontrada(s) em {{ selected_provider }}.</p>
+    </div>
+  </div>
+  <div class="list">
+    {% for row in provider_rows %}
+      <form method="post" class="list-row import-provider-row">
+        <input type="hidden" name="provider" value="{{ selected_provider }}">
+        <input type="hidden" name="mode" value="{{ selected_mode }}">
+        <input type="hidden" name="target_asset_id" value="{{ selected_target_asset_id or '' }}">
+        <input type="hidden" name="external_id" value="{{ row.external_id }}">
+        <input type="hidden" name="seed_json" value="{{ row.seed|tojson|forceescape }}">
+        <div>
+          <strong>{{ row.external_name }}</strong>
+          <span class="muted">{{ row.external_id }}</span>
+        </div>
+        <button class="button small" type="submit" name="action" value="preview">Rever dados</button>
+      </form>
+    {% else %}
+      <p class="empty-state">Não foram encontradas instalações. Confirma as credenciais ou introduz o ID manualmente.</p>
+    {% endfor %}
+  </div>
+  <div class="hero-actions">
+    <a class="button secondary" href="{{ url_for('installation_import') }}">Voltar</a>
+  </div>
+</section>
+{% endif %}
+
+{% if stage == "preview" and import_context %}
+  {% set data = import_context.normalized %}
+  {% if import_context.status == "queued" %}
+    <section class="card import-access-state">
+      <span class="status-pill">{{ import_context.background_job.status if import_context.background_job else "pending" }}</span>
+      <h3>{{ import_context.provider }} · {{ import_context.external_id }}</h3>
+      {% if import_context.background_job and import_context.background_job.status in ["waiting_rate_limit", "waiting_api_slot"] %}
+        <p class="muted">A recolha está em espera para respeitar o limite da API. Podes voltar mais tarde ou atualizar manualmente.</p>
+      {% else %}
+        <p class="muted">Metadados, estado atual e equipamentos estão a ser obtidos em background. Esta página atualiza automaticamente.</p>
+      {% endif %}
+      <a class="button secondary" href="{{ url_for('installation_import', import_id=import_context.id) }}">Atualizar agora</a>
+    </section>
+  {% elif import_context.status in ["access_pending", "error"] %}
+    <section class="card import-access-state">
+      <span class="status-pill {{ 'warning' if import_context.status == 'access_pending' else 'error' }}">
+        {{ "Pedido enviado — aguarda aprovação" if import_context.status == "access_pending" else "Não foi possível pedir acesso" }}
+      </span>
+      <h3>{{ import_context.provider }} · {{ import_context.external_id }}</h3>
+      <p class="muted">O pedido fica ligado a esta importação. Verificar novamente não envia pedidos duplicados.</p>
+      {% if import_context.last_error %}<p class="callout error">{{ import_context.last_error }}</p>{% endif %}
+      {% if import_context.status == "access_pending" %}
+        <form method="post" action="{{ url_for('check_installation_import_access', import_id=import_context.id) }}">
+          <button class="button" type="submit">Verificar acesso</button>
+        </form>
+      {% endif %}
+    </section>
+  {% else %}
+    <section class="card">
+      <div class="section-title">
+        <div>
+          <p class="eyebrow">Pré-visualização</p>
+          <h3>{{ data.external_name or data.external_id }}</h3>
+          <p class="muted">{{ import_context.source_label }} · recolhido em {{ data.fetched_at or import_context.fetched_at }}</p>
+        </div>
+        <span class="status-pill">{{ data.operational_status or "Sem dados" }}</span>
+      </div>
+
+      {% if import_context.ambiguous_match %}
+        <p class="callout warning">Foram encontradas várias correspondências locais. Nenhuma associação foi escolhida automaticamente.</p>
+      {% elif import_context.suggested_asset_id and import_context.mode == "associate" and not import_context.target_asset_id %}
+        <p class="callout">Foi encontrada uma correspondência exata. Confirma-a abaixo antes de associar.</p>
+      {% endif %}
+
+      <div class="grid four import-live-grid">
+        <div class="stat-card"><span>PV agora</span><strong>{{ data.pv_power_kw if data.pv_power_kw is not none else "—" }} kW</strong></div>
+        <div class="stat-card"><span>Consumo</span><strong>{{ data.load_power_kw if data.load_power_kw is not none else "—" }} kW</strong></div>
+        <div class="stat-card"><span>Rede</span><strong>{{ data.grid_power_kw if data.grid_power_kw is not none else "—" }} kW</strong></div>
+        <div class="stat-card"><span>Bateria / SOC</span><strong>{{ data.battery_power_kw if data.battery_power_kw is not none else "—" }} kW · {{ data.battery_soc_pct if data.battery_soc_pct is not none else "—" }}%</strong></div>
+      </div>
+
+      <form method="post" action="{{ url_for('confirm_installation_import', import_id=import_context.id) }}" class="stack-form import-review-form">
+        {% if import_context.mode == "associate" %}
+          <label>Instalação local a associar
+            <select name="target_asset_id" required>
+              <option value="">Escolher…</option>
+              {% for asset in assets_for_import %}
+                {% set selected_id = import_context.target_asset_id or import_context.suggested_asset_id %}
+                <option value="{{ asset.id }}" {{ 'selected' if asset.id == selected_id else '' }}>{{ asset.project_name }}</option>
+              {% endfor %}
+            </select>
+          </label>
+          <p class="muted">Os campos manuais ficam intactos. Marca apenas os valores da API que queres aplicar.</p>
+        {% else %}
+          <p class="muted">Corrige os valores antes de criar. Campos sem resposta da API ficam por preencher.</p>
+        {% endif %}
+
+        <div class="import-field-table">
+          {% if import_context.mode == "associate" and import_context.target_asset %}
+            <div class="import-field-header">
+              <span></span><strong>Campo</strong><strong>Valor atual</strong><strong>Valor da API</strong>
+            </div>
+          {% endif %}
+          {% set fields = [
+            ("project_name", "Nome"),
+            ("company_name", "Proprietário/empresa"),
+            ("address", "Morada"),
+            ("location", "Localidade"),
+            ("country", "País"),
+            ("timezone", "Fuso horário"),
+            ("kwp", "Potência DC (kWp)"),
+            ("kwac", "Potência AC (kW)"),
+            ("commissioning_date", "Comissionamento")
+          ] %}
+          {% for field, label in fields %}
+            <label class="import-field-row {{ 'is-associate' if import_context.mode == 'associate' else '' }}">
+              {% if import_context.mode == "associate" %}
+                <input type="checkbox" name="apply_field" value="{{ field }}">
+              {% endif %}
+              <span>{{ label }}</span>
+              {% if import_context.mode == "associate" %}
+                <span class="import-current-value">
+                  {{ import_context.target_asset[field] if import_context.target_asset and import_context.target_asset[field] else "Por preencher" }}
+                </span>
+              {% endif %}
+              <input type="{{ 'date' if field == 'commissioning_date' else 'text' }}" name="{{ field }}" value="{{ data[field] or '' }}" placeholder="Por preencher">
+            </label>
+          {% endfor %}
+        </div>
+
+        <div class="grid three">
+          <div><span class="muted">ID externo</span><strong>{{ data.external_id }}</strong></div>
+          <div><span class="muted">Inversores/dispositivos</span><strong>{{ data.inverter_count or data.devices|length }}</strong></div>
+          <div><span class="muted">Alarmes atuais</span><strong>{{ data.alarm_count or 0 }}</strong></div>
+        </div>
+        {% if data.devices %}
+          <details class="nested-card">
+            <summary>Equipamentos encontrados ({{ data.devices|length }})</summary>
+            <div class="list">
+              {% for device in data.devices %}
+                <div class="list-row">
+                  <strong>{{ device.name or device.model or device.external_device_id }}</strong>
+                  <span>{{ device.model or "Modelo por preencher" }} · {{ device.serial_number or "S/N por preencher" }} · {{ device.rated_power_kw or "—" }} kW</span>
+                </div>
+              {% endfor %}
+            </div>
+          </details>
+        {% endif %}
+        {% if import_context.missing_fields %}
+          <p class="callout warning"><strong>Por preencher:</strong> {{ import_context.missing_fields|join(", ") }}</p>
+        {% endif %}
+        <div class="hero-actions">
+          <a class="button secondary" href="{{ url_for('installation_import') }}">Cancelar</a>
+          <button class="button" type="submit">
+            {{ "Associar e sincronizar" if import_context.mode == "associate" else "Criar e sincronizar instalação" }}
+          </button>
+        </div>
+      </form>
+    </section>
+  {% endif %}
+{% endif %}
+
+<script>
+  (function () {
+    const mode = document.getElementById('import-mode');
+    const target = document.getElementById('import-target-wrap');
+    if (mode && target) {
+      const refresh = () => { target.hidden = mode.value !== 'associate'; };
+      mode.addEventListener('change', refresh);
+      refresh();
+    }
+    const shouldRefresh =
+      {{ 'true' if (stage == 'search_pending' and search_job and search_job.status in ['pending', 'running']) or (import_context and import_context.status == 'queued' and import_context.background_job and import_context.background_job.status in ['pending', 'running']) else 'false' }};
+    if (shouldRefresh) window.setTimeout(() => window.location.reload(), 2500);
+  })();
+</script>
+{% endblock %}
