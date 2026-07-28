@@ -42,6 +42,13 @@ def float_value(value: Any) -> float | None:
         return None
 
 
+def normalize_power_to_kw(value: Any) -> float | None:
+    parsed = float_value(value)
+    if parsed is None:
+        return None
+    return parsed / 1000 if parsed > 1000 else parsed
+
+
 def date_value(value: Any) -> str:
     raw = text_value(value)
     if not raw:
@@ -93,16 +100,31 @@ def normalize_fusionsolar_import(
     for device in devices:
         identity = text_value(first_value([device], ("devId", "id", "devDn", "deviceDn", "esnCode", "sn")))
         live = device_realtime.get(identity, {})
+        live_data = (
+            live.get("dataItemMap")
+            if isinstance(live.get("dataItemMap"), dict)
+            else live
+        )
         normalized_devices.append(
             {
                 "external_device_id": identity,
                 "name": text_value(first_value([device], ("devName", "deviceName", "name"))),
                 "serial_number": text_value(first_value([device], ("esnCode", "sn", "serialNumber"))),
                 "model": text_value(first_value([device], ("model", "devModel", "deviceModel", "invType"))),
-                "rated_power_kw": float_value(
+                "rated_power_kw": normalize_power_to_kw(
                     first_value([device], ("ratedPower", "rated_power", "capacity", "nominalPower"))
                 ),
-                "status": text_value(first_value([live, device], ("inverter_state", "status", "runningState"))),
+                "status": text_value(
+                    first_value(
+                        [live_data, live, device],
+                        (
+                            "inverter_state",
+                            "inverterState",
+                            "status",
+                            "runningState",
+                        ),
+                    )
+                ),
                 "device_type": text_value(first_value([device], ("devTypeId", "dev_type_id", "deviceTypeId"))),
                 "payload": {"device": device, "realtime": live},
             }
@@ -122,8 +144,15 @@ def normalize_fusionsolar_import(
         "timezone": text_value(first_value([station], ("timeZone", "timezone", "stationTimeZone"))),
         "latitude": latitude,
         "longitude": longitude,
-        "kwp": float_value(first_value([station], ("capacity", "installedCapacity", "pvCapacity", "dcCapacity"))),
-        "kwac": float_value(first_value([station], ("acCapacity", "gridConnectionCapacity"))),
+        "kwp": normalize_power_to_kw(
+            first_value(
+                [station],
+                ("capacity", "installedCapacity", "pvCapacity", "dcCapacity"),
+            )
+        ),
+        "kwac": normalize_power_to_kw(
+            first_value([station], ("acCapacity", "gridConnectionCapacity"))
+        ),
         "commissioning_date": date_value(
             first_value([station], ("gridConnectionDate", "commissioningDate", "connectTime", "createTime"))
         ),
@@ -166,8 +195,15 @@ def normalize_sigenergy_import(
         "timezone": text_value(first_value([system], ("timeZone", "timezone", "systemTimeZone"))),
         "latitude": float_value(first_value([system], ("latitude", "lat"))),
         "longitude": float_value(first_value([system], ("longitude", "lng", "lon"))),
-        "kwp": float_value(first_value([system, energy_flow], ("pvCapacity", "installedCapacity", "dcCapacity"))),
-        "kwac": float_value(first_value([system], ("acCapacity", "ratedPower"))),
+        "kwp": normalize_power_to_kw(
+            first_value(
+                [system, energy_flow],
+                ("pvCapacity", "installedCapacity", "dcCapacity"),
+            )
+        ),
+        "kwac": normalize_power_to_kw(
+            first_value([system], ("acCapacity", "ratedPower"))
+        ),
         "commissioning_date": date_value(
             first_value([system], ("gridConnectionDate", "commissioningDate", "connectTime", "createTime"))
         ),

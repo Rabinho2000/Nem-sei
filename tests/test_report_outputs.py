@@ -160,6 +160,159 @@ def test_report_generation_routes_create_files_and_download(tmp_path: Path) -> N
         flask_app.config["TESTING"] = previous_testing
 
 
+def test_individual_report_form_hides_portfolio_controls_and_requires_asset(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "individual-form.db"
+    ensure_database(str(db_path))
+    flask_app = app_module.app
+    previous_db = flask_app.config["DATABASE"]
+    previous_testing = flask_app.config.get("TESTING")
+    flask_app.config["DATABASE"] = str(db_path)
+    flask_app.config["TESTING"] = True
+    client = flask_app.test_client()
+    with client.session_transaction() as session:
+        session["authenticated"] = True
+        session["csrf_token"] = "token"
+    try:
+        page = client.get("/exports?tab=generate")
+        stylesheet = client.get("/static/styles.css")
+    finally:
+        flask_app.config["DATABASE"] = previous_db
+        flask_app.config["TESTING"] = previous_testing
+
+    assert page.status_code == 200
+    assert b'id="report-asset" required' in page.data
+    assert b"Gerar, guardar e descarregar" in page.data
+    assert b".reports-card [hidden]" in stylesheet.data
+    assert b"display: none !important" in stylesheet.data
+
+
+def test_individual_preview_is_rejected_without_internal_error(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "individual-preview.db"
+    ensure_database(str(db_path))
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        template_id = next(
+            row["id"]
+            for row in list_templates(conn, "individual")
+            if row["name"] == "Individual padrao"
+        )
+    flask_app = app_module.app
+    previous_db = flask_app.config["DATABASE"]
+    previous_testing = flask_app.config.get("TESTING")
+    flask_app.config["DATABASE"] = str(db_path)
+    flask_app.config["TESTING"] = True
+    client = flask_app.test_client()
+    with client.session_transaction() as session:
+        session["authenticated"] = True
+        session["csrf_token"] = "token"
+    try:
+        response = client.get(
+            "/report-generation/preview",
+            query_string={
+                "report_type": "individual",
+                "template_id": template_id,
+                "report_month": "2026-07",
+            },
+            follow_redirects=True,
+        )
+    finally:
+        flask_app.config["DATABASE"] = previous_db
+        flask_app.config["TESTING"] = previous_testing
+
+    assert response.status_code == 200
+    assert b"Erro interno" not in response.data
+    assert "apenas para relatórios de portefólio" in response.get_data(
+        as_text=True
+    )
+
+
+def test_single_manual_pdf_is_saved_and_downloaded(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "single-download.db"
+    ensure_database(str(db_path))
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        asset_id = add_asset(conn, "Download Solar")
+        template_id = next(
+            row["id"]
+            for row in list_templates(conn, "individual")
+            if row["name"] == "Individual padrao"
+        )
+        conn.commit()
+
+    def fake_report(conn, asset_id, period_job, **kwargs):
+        return {
+            "asset": {"id": asset_id, "project_name": "Download Solar"},
+            "period_label": "Junho 2026",
+            "period_type": "monthly",
+            "period_start": "2026-06-01",
+            "period_end": "2026-06-30",
+            "production_kwh": 100,
+            "self_use_kwh": 70,
+            "export_kwh": 30,
+            "consumption_kwh": 90,
+            "grid_import_kwh": 20,
+            "net_benefit_eur": 10,
+        }
+
+    output_root = tmp_path / "uploads"
+    monkeypatch.setattr(app_factory_module, "UPLOAD_DIR", output_root)
+    monkeypatch.setattr(
+        app_factory_module,
+        "store_runtime_relative_path",
+        lambda path: str(path),
+    )
+    monkeypatch.setattr(
+        app_factory_module,
+        "build_individual_generation_report",
+        fake_report,
+    )
+    flask_app = app_module.app
+    previous_db = flask_app.config["DATABASE"]
+    previous_testing = flask_app.config.get("TESTING")
+    flask_app.config["DATABASE"] = str(db_path)
+    flask_app.config["TESTING"] = True
+    client = flask_app.test_client()
+    with client.session_transaction() as session:
+        session["authenticated"] = True
+        session["csrf_token"] = "token"
+    try:
+        response = client.post(
+            "/report-generation",
+            data={
+                "csrf_token": "token",
+                "report_type": "individual",
+                "template_id": str(template_id),
+                "asset_id": str(asset_id),
+                "report_month": "2026-06",
+                "period_type": "monthly",
+                "formats": ["pdf"],
+            },
+        )
+        assert response.status_code in {302, 303}
+        assert "/report-generation/files/" in response.headers["Location"]
+        download = client.get(response.headers["Location"])
+    finally:
+        flask_app.config["DATABASE"] = previous_db
+        flask_app.config["TESTING"] = previous_testing
+
+    assert download.status_code == 200
+    assert download.mimetype == "application/pdf"
+    assert download.headers["Content-Disposition"].startswith("attachment;")
+    with sqlite3.connect(db_path) as conn:
+        run = conn.execute(
+            "SELECT status, completed_count, failed_count "
+            "FROM report_generation_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert run == ("completed", 1, 0)
+
+
 def test_batch_partial_counts_metadata_and_auxiliary_zip(tmp_path: Path, monkeypatch) -> None:
     db_path = tmp_path / "batch.db"
     ensure_database(str(db_path))

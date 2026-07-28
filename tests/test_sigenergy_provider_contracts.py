@@ -169,6 +169,24 @@ def test_normalize_sigenergy_system_rows_accepts_list_variants_and_single_object
     ]
 
 
+def test_sigenergy_client_allows_empty_system_list_only_when_explicit(
+    monkeypatch,
+) -> None:
+    client = sigenergy_service.SigenergyClient(sigenergy_config())
+    monkeypatch.setattr(
+        client,
+        "request_json",
+        lambda *args, **kwargs: {"code": 0, "data": {"list": []}},
+    )
+
+    assert client.list_systems(allow_empty=True) == []
+    with pytest.raises(
+        sigenergy_service.SigenergyAPIError,
+        match="sem sistemas",
+    ):
+        client.list_systems()
+
+
 def test_normalize_sigenergy_system_row_maps_realtime_and_energy_flow_fields() -> None:
     system = app_module.parse_provider_payload_data(load_fixture("systems_list.json"))["list"][0]
     realtime = app_module.parse_provider_payload_data(load_fixture("realtime_data.json"))

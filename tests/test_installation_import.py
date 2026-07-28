@@ -99,10 +99,25 @@ def confirm_form(name: str, *, target_asset_id: int | None = None, apply_fields:
     return MultiDict(values)
 
 
+def configure_provider(conn, provider: str, *, system_ids: str = "") -> None:
+    app_module.ensure_integration_seed_data(conn)
+    conn.execute(
+        """
+        UPDATE integration_configs
+        SET username = 'test-user', password = 'test-secret', enabled = 1,
+            auto_sync_enabled = 0, system_ids = ?
+        WHERE provider = ?
+        """,
+        (system_ids, provider),
+    )
+    conn.commit()
+
+
 def test_import_new_sigenergy_creates_asset_mapping_snapshot_and_background_job(tmp_path) -> None:
     db_path = tmp_path / "sigenergy-import.db"
     app_module.ensure_database(str(db_path))
     with get_db(str(db_path)) as conn:
+        configure_provider(conn, "Sigenergy")
         import_id = preview_import(
             conn,
             provider="Sigenergy",
@@ -130,6 +145,13 @@ def test_import_new_sigenergy_creates_asset_mapping_snapshot_and_background_job(
         assert mapping["asset_id"] == asset_id
         assert snapshot["battery_soc_pct"] == 77
         assert job["job_type"] == "sigenergy_state_sync"
+        assert json.loads(job["params_json"])["target_external_ids"] == [
+            "SIG-NEW-1"
+        ]
+        assert conn.execute(
+            "SELECT auto_sync_enabled FROM integration_configs "
+            "WHERE provider = 'Sigenergy'"
+        ).fetchone()["auto_sync_enabled"] == 0
 
 
 def test_import_new_fusionsolar_persists_inverter_details(tmp_path) -> None:
@@ -168,6 +190,13 @@ def test_import_new_fusionsolar_persists_inverter_details(tmp_path) -> None:
         assert conn.execute(
             "SELECT job_type FROM background_jobs WHERE id = ?", (job_id,)
         ).fetchone()["job_type"] == "fusionsolar_state_sync"
+        job_params = json.loads(
+            conn.execute(
+                "SELECT params_json FROM background_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()["params_json"]
+        )
+        assert job_params["target_external_ids"] == ["FS-NEW-1"]
 
 
 def test_sigenergy_missing_access_sends_only_one_onboarding_request(tmp_path, monkeypatch) -> None:
@@ -369,23 +398,27 @@ def test_repeating_same_import_is_idempotent(tmp_path) -> None:
             external_id="SIG-IDEMP",
             name="Idempotent Site",
         )
-        first_asset, _ = app_module.apply_installation_import(
+        first_asset, first_job = app_module.apply_installation_import(
             conn,
             import_id,
             confirm_form("Idempotent Site"),
         )
-        second_asset, _ = app_module.apply_installation_import(
+        second_asset, second_job = app_module.apply_installation_import(
             conn,
             import_id,
             confirm_form("Idempotent Site"),
         )
 
         assert first_asset == second_asset
+        assert first_job == second_job
         assert conn.execute(
             "SELECT COUNT(*) FROM assets WHERE project_name = 'Idempotent Site'"
         ).fetchone()[0] == 1
         assert conn.execute(
             "SELECT COUNT(*) FROM asset_integrations WHERE provider = 'Sigenergy' AND external_id = 'SIG-IDEMP'"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM background_jobs WHERE job_type = 'sigenergy_state_sync'"
         ).fetchone()[0] == 1
 
 
@@ -554,3 +587,451 @@ def test_failed_sigenergy_onboarding_job_leaves_no_partial_asset_or_mapping(tmp_
         assert conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM asset_integrations").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM sigenergy_onboarding_requests").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "available_systems",
+    [
+        [],
+        [{"systemId": "SIG-OTHER", "systemName": "Outra instalação"}],
+    ],
+    ids=["empty-list", "requested-id-absent"],
+)
+def test_sigenergy_discovery_requests_onboarding_once_when_access_is_pending(
+    tmp_path,
+    monkeypatch,
+    available_systems,
+) -> None:
+    db_path = tmp_path / "sigenergy-access-pending.db"
+    app_module.ensure_database(str(db_path))
+    list_calls: list[bool] = []
+    onboarding_calls: list[str] = []
+
+    class FakeClient:
+        def __init__(self, _config, session=None) -> None:
+            self.session = session
+
+        def list_systems(self, *, allow_empty: bool = False):
+            list_calls.append(allow_empty)
+            return available_systems
+
+        def get_energy_flow(self, _system_id: str):
+            raise AssertionError("Energy flow must not be requested without access")
+
+    def fake_onboard(_config, system_id, session):
+        onboarding_calls.append(system_id)
+        return {
+            "system_id": system_id,
+            "status": "requested",
+            "provider_code": "0",
+            "message": "pending",
+            "response": {"code": 0},
+        }
+
+    monkeypatch.setattr(
+        app_module.sigenergy_service,
+        "SigenergyClient",
+        FakeClient,
+    )
+    monkeypatch.setattr(
+        app_module.sigenergy_service,
+        "onboard_system",
+        fake_onboard,
+    )
+    with get_db(str(db_path)) as conn:
+        configure_provider(conn, "Sigenergy")
+        import_id = app_module.upsert_installation_import_preview(
+            conn,
+            provider="Sigenergy",
+            external_id="SIG-REQUESTED",
+            external_name="SIG-REQUESTED",
+            mode="create",
+            target_asset_id=None,
+            status="queued",
+            access_status="checking",
+            normalized={
+                "external_id": "SIG-REQUESTED",
+                "external_name": "SIG-REQUESTED",
+            },
+            raw_payload={},
+            created_by="test",
+        )
+        conn.commit()
+
+        first = app_module.run_installation_import_preview_job(
+            conn,
+            import_id,
+        )
+        second = app_module.run_installation_import_preview_job(
+            conn,
+            import_id,
+        )
+        installation_import = conn.execute(
+            "SELECT * FROM installation_imports WHERE id = ?",
+            (import_id,),
+        ).fetchone()
+        onboarding = conn.execute(
+            """
+            SELECT *
+            FROM sigenergy_onboarding_requests
+            WHERE installation_import_id = ?
+            """,
+            (import_id,),
+        ).fetchone()
+
+    assert first["status"] == second["status"] == "access_pending"
+    assert list_calls == [True, True]
+    assert onboarding_calls == ["SIG-REQUESTED"]
+    assert installation_import["status"] == "access_pending"
+    assert installation_import["onboarding_request_id"] == onboarding["id"]
+    assert onboarding["attempt_count"] == 1
+
+
+def test_sigenergy_accessible_import_syncs_only_new_mapping_despite_fixed_ids(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "sigenergy-targeted-sync.db"
+    app_module.ensure_database(str(db_path))
+    client_configs: list[object] = []
+
+    class FakeClient:
+        def __init__(self, config, session=None) -> None:
+            client_configs.append(config.get("system_ids"))
+            self.system_ids = config.get("system_ids")
+            self.session = session
+
+        def list_systems(self, *, allow_empty: bool = False):
+            if allow_empty:
+                return [
+                    {
+                        "systemId": "SIG-NEW",
+                        "systemName": "Nova Sigenergy",
+                        "status": "Normal",
+                        "address": "Rua API",
+                    }
+                ]
+            return [
+                {
+                    "systemId": item,
+                    "systemName": item,
+                    "status": "Normal",
+                }
+                for item in self.system_ids
+            ]
+
+        def get_energy_flow(self, system_id: str):
+            assert system_id == "SIG-NEW"
+            return {"pvPower": 4.5, "loadPower": 1.0}
+
+    monkeypatch.setattr(
+        app_module.sigenergy_service,
+        "SigenergyClient",
+        FakeClient,
+    )
+    with get_db(str(db_path)) as conn:
+        configure_provider(
+            conn,
+            "Sigenergy",
+            system_ids="SIG-LEGACY-1,SIG-LEGACY-2",
+        )
+        import_id = app_module.upsert_installation_import_preview(
+            conn,
+            provider="Sigenergy",
+            external_id="SIG-NEW",
+            external_name="SIG-NEW",
+            mode="create",
+            target_asset_id=None,
+            status="queued",
+            access_status="checking",
+            normalized={
+                "external_id": "SIG-NEW",
+                "external_name": "SIG-NEW",
+            },
+            raw_payload={},
+            created_by="test",
+        )
+        conn.commit()
+        app_module.run_installation_import_preview_job(conn, import_id)
+        asset_id, job_id = app_module.apply_installation_import(
+            conn,
+            import_id,
+            confirm_form("Nova Sigenergy"),
+        )
+        job = conn.execute(
+            "SELECT params_json FROM background_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        result = app_module.run_sigenergy_sync(
+            conn,
+            "Sigenergy",
+            trigger_type="installation_import",
+            target_external_ids=["SIG-NEW"],
+        )
+        snapshots = conn.execute(
+            """
+            SELECT external_id
+            FROM integration_realtime_snapshots
+            WHERE provider = 'Sigenergy' AND asset_id = ?
+            ORDER BY id
+            """,
+            (asset_id,),
+        ).fetchall()
+
+    assert json.loads(job["params_json"])["target_external_ids"] == ["SIG-NEW"]
+    assert client_configs[0] == ""
+    assert client_configs[-1] == ["SIG-NEW"]
+    assert result["matched"] == 1
+    assert {row["external_id"] for row in snapshots} == {"SIG-NEW"}
+
+
+def test_sigenergy_normal_sync_uses_only_active_mappings(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "sigenergy-active-mappings.db"
+    app_module.ensure_database(str(db_path))
+    configured_ids: list[object] = []
+
+    class FakeClient:
+        def __init__(self, config, session=None) -> None:
+            configured_ids.append(config.get("system_ids"))
+            self.system_ids = config.get("system_ids")
+            self.session = session
+
+        def list_systems(self):
+            return [
+                {
+                    "systemId": item,
+                    "systemName": item,
+                    "status": "Normal",
+                }
+                for item in self.system_ids
+            ]
+
+        def get_energy_flow(self, _system_id: str):
+            return {"pvPower": 1.0}
+
+    monkeypatch.setattr(
+        app_module.sigenergy_service,
+        "SigenergyClient",
+        FakeClient,
+    )
+    with get_db(str(db_path)) as conn:
+        configure_provider(
+            conn,
+            "Sigenergy",
+            system_ids="SIG-LEGACY,SIG-UNMAPPED",
+        )
+        active_asset = conn.execute(
+            "INSERT INTO assets (project_name) VALUES ('Active')"
+        ).lastrowid
+        disabled_asset = conn.execute(
+            "INSERT INTO assets (project_name) VALUES ('Disabled')"
+        ).lastrowid
+        conn.execute(
+            """
+            INSERT INTO asset_integrations (
+                asset_id, provider, external_id, external_name, enabled
+            ) VALUES (?, 'Sigenergy', 'SIG-ACTIVE', 'Active', 1)
+            """,
+            (active_asset,),
+        )
+        conn.execute(
+            """
+            INSERT INTO asset_integrations (
+                asset_id, provider, external_id, external_name, enabled
+            ) VALUES (?, 'Sigenergy', 'SIG-DISABLED', 'Disabled', 0)
+            """,
+            (disabled_asset,),
+        )
+        conn.commit()
+        result = app_module.run_sigenergy_check(
+            conn,
+            "Sigenergy",
+            dry_run=True,
+        )
+
+    assert configured_ids == [["SIG-ACTIVE"]]
+    assert [row["external_id"] for row in result["rows"]] == ["SIG-ACTIVE"]
+
+
+def test_fusionsolar_raw_devices_are_normalized_for_realtime_and_storage(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "fusionsolar-raw-device.db"
+    app_module.ensure_database(str(db_path))
+    realtime_requests: list[list[dict]] = []
+    raw_device = {
+        "stationCode": "FS-RAW",
+        "devId": "INV-RAW",
+        "devTypeId": 1,
+        "devName": "Inversor API",
+        "model": "SUN2000-50KTL",
+        "sn": "SERIAL-RAW",
+        "ratedPower": 50000,
+    }
+    realtime_payload = {
+        "devId": "INV-RAW",
+        "dataItemMap": {"inverter_state": "512", "active_power": 12.5},
+    }
+
+    class FakeClient:
+        def station_realtime_kpi(self, station_codes):
+            assert station_codes == ["FS-RAW"]
+            return {
+                "FS-RAW": {
+                    "stationCode": "FS-RAW",
+                    "dataItemMap": {"active_power": 20},
+                }
+            }
+
+        def device_list(self, station_codes):
+            assert station_codes == ["FS-RAW"]
+            return [raw_device]
+
+        def device_realtime_kpi(self, devices):
+            realtime_requests.append(devices)
+            assert devices[0]["external_device_id"] == "INV-RAW"
+            assert devices[0]["dev_type_id"] == 1
+            return {"INV-RAW": realtime_payload}
+
+        def alarms(self, station_codes):
+            assert station_codes == ["FS-RAW"]
+            return {"FS-RAW": []}
+
+    monkeypatch.setattr(
+        app_module,
+        "build_fusionsolar_client",
+        lambda _config: FakeClient(),
+    )
+    with get_db(str(db_path)) as conn:
+        configure_provider(conn, "FusionSolar")
+        normalized_preview, raw_payload = (
+            app_module.fetch_provider_installation_preview(
+                conn,
+                "FusionSolar",
+                "FS-RAW",
+                seed={
+                    "plantCode": "FS-RAW",
+                    "plantName": "Central Raw",
+                    "capacity": 75,
+                },
+            )
+        )
+        import_id = app_module.upsert_installation_import_preview(
+            conn,
+            provider="FusionSolar",
+            external_id="FS-RAW",
+            external_name="Central Raw",
+            mode="create",
+            target_asset_id=None,
+            status="preview",
+            access_status="available",
+            normalized=normalized_preview,
+            raw_payload=raw_payload,
+            created_by="test",
+        )
+        conn.commit()
+        asset_id, _ = app_module.apply_installation_import(
+            conn,
+            import_id,
+            confirm_form("Central Raw"),
+        )
+        stored = conn.execute(
+            "SELECT * FROM provider_devices WHERE asset_id = ?",
+            (asset_id,),
+        ).fetchone()
+        stored_payload = json.loads(stored["payload_json"])
+
+    preview_device = normalized_preview["devices"][0]
+    assert realtime_requests
+    assert raw_payload["devices"][0]["ratedPower"] == 50000
+    assert preview_device["model"] == "SUN2000-50KTL"
+    assert preview_device["serial_number"] == "SERIAL-RAW"
+    assert preview_device["rated_power_kw"] == 50
+    assert preview_device["status"] == "512"
+    assert stored["rated_power_kw"] == 50
+    assert stored_payload["device"]["ratedPower"] == 50000
+    assert stored_payload["realtime"] == realtime_payload
+
+
+def test_scheduler_failure_does_not_leave_installation_import_pending(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "scheduler-failure.db"
+    app_module.ensure_database(str(db_path))
+    with get_db(str(db_path)) as conn:
+        configure_provider(conn, "Sigenergy")
+    monkeypatch.setattr(
+        app_module,
+        "schedule_background_job",
+        lambda *args, **kwargs: False,
+    )
+    flask_app, original_database, client = authenticated_client(db_path)
+    try:
+        response = client.post(
+            "/integrations/import",
+            data={
+                "csrf_token": "token",
+                "provider": "Sigenergy",
+                "mode": "create",
+                "external_id": "SIG-NO-SCHEDULER",
+                "action": "preview",
+            },
+        )
+        import_id = int(
+            parse_qs(urlparse(response.headers["Location"]).query)["import_id"][0]
+        )
+        retry_page = client.get(
+            f"/integrations/import?import_id={import_id}"
+        )
+    finally:
+        flask_app.config["DATABASE"] = original_database
+
+    with get_db(str(db_path)) as conn:
+        installation_import = conn.execute(
+            "SELECT * FROM installation_imports WHERE id = ?",
+            (import_id,),
+        ).fetchone()
+        job = conn.execute(
+            "SELECT * FROM background_jobs WHERE id = ?",
+            (installation_import["background_job_id"],),
+        ).fetchone()
+
+    assert installation_import["status"] == "error"
+    assert installation_import["access_status"] == "error"
+    assert job["status"] == "failed"
+    assert "scheduler" in installation_import["last_error"]
+    assert "Repetir recolha" in retry_page.get_data(as_text=True)
+
+
+def test_auto_sync_is_enabled_only_after_final_confirmation(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "auto-sync-confirmation.db"
+    app_module.ensure_database(str(db_path))
+    with get_db(str(db_path)) as conn:
+        configure_provider(conn, "Sigenergy")
+        import_id = preview_import(
+            conn,
+            provider="Sigenergy",
+            external_id="SIG-AUTO",
+            name="Auto Sync",
+        )
+        before = conn.execute(
+            "SELECT auto_sync_enabled FROM integration_configs "
+            "WHERE provider = 'Sigenergy'"
+        ).fetchone()["auto_sync_enabled"]
+        form = confirm_form("Auto Sync")
+        form.add("enable_auto_sync", "on")
+        app_module.apply_installation_import(conn, import_id, form)
+        after = conn.execute(
+            "SELECT auto_sync_enabled FROM integration_configs "
+            "WHERE provider = 'Sigenergy'"
+        ).fetchone()["auto_sync_enabled"]
+
+    assert before == 0
+    assert after == 1

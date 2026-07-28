@@ -135,11 +135,11 @@
       <h3>{{ import_context.provider }} · {{ import_context.external_id }}</h3>
       <p class="muted">O pedido fica ligado a esta importação. Verificar novamente não envia pedidos duplicados.</p>
       {% if import_context.last_error %}<p class="callout error">{{ import_context.last_error }}</p>{% endif %}
-      {% if import_context.status == "access_pending" %}
-        <form method="post" action="{{ url_for('check_installation_import_access', import_id=import_context.id) }}">
-          <button class="button" type="submit">Verificar acesso</button>
-        </form>
-      {% endif %}
+      <form method="post" action="{{ url_for('check_installation_import_access', import_id=import_context.id) }}">
+        <button class="button" type="submit">
+          {{ "Verificar acesso" if import_context.status == "access_pending" else "Repetir recolha" }}
+        </button>
+      </form>
     </section>
   {% else %}
     <section class="card">
@@ -180,6 +180,10 @@
         {% else %}
           <p class="muted">Corrige os valores antes de criar. Campos sem resposta da API ficam por preencher.</p>
         {% endif %}
+        <p class="muted">
+          Origem dos valores apresentados: {{ import_context.source_label }}.
+          Campos vazios não são inferidos.
+        </p>
 
         <div class="import-field-table">
           {% if import_context.mode == "associate" and import_context.target_asset %}
@@ -226,15 +230,33 @@
               {% for device in data.devices %}
                 <div class="list-row">
                   <strong>{{ device.name or device.model or device.external_device_id }}</strong>
-                  <span>{{ device.model or "Modelo por preencher" }} · {{ device.serial_number or "S/N por preencher" }} · {{ device.rated_power_kw or "—" }} kW</span>
+                  <span>
+                    {{ device.model or "Modelo por preencher" }} ·
+                    {{ device.serial_number or "S/N por preencher" }} ·
+                    {{ device.rated_power_kw if device.rated_power_kw is not none else "—" }} kW ·
+                    Estado: {{ device.status or "sem dados realtime" }}
+                  </span>
                 </div>
               {% endfor %}
             </div>
           </details>
         {% endif %}
+        {% if import_context.raw_payload %}
+          <details class="nested-card">
+            <summary>Payload API sanitizado</summary>
+            <pre class="import-raw-payload">{{ import_context.raw_payload|tojson(indent=2) }}</pre>
+          </details>
+        {% endif %}
         {% if import_context.missing_fields %}
           <p class="callout warning"><strong>Por preencher:</strong> {{ import_context.missing_fields|join(", ") }}</p>
         {% endif %}
+        <label class="check-row">
+          <input type="checkbox" name="enable_auto_sync">
+          <span>Ativar sincronização automática</span>
+        </label>
+        <p class="muted">
+          Desligado por defeito. O sync inicial desta instalação é sempre dirigido apenas ao ID importado.
+        </p>
         <div class="hero-actions">
           <a class="button secondary" href="{{ url_for('installation_import') }}">Cancelar</a>
           <button class="button" type="submit">

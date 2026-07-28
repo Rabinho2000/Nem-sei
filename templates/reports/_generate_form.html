@@ -19,7 +19,7 @@
 
     <div class="grid two">
       <label data-report-scope="individual" for="report-asset">Instalação
-        <select name="asset_id" id="report-asset">
+        <select name="asset_id" id="report-asset" required>
           <option value="">Escolher instalação</option>
           {% for asset in report_assets %}
             <option value="{{ asset.asset_id }}" data-report-type="{{ asset.report_type }}" {{ 'selected' if selected_asset_id|string == asset.asset_id|string else '' }}>
@@ -125,7 +125,7 @@
     </details>
 
     <div class="reports-actions">
-      <button class="button" type="submit" data-submit-label="Gerar e guardar">Gerar e guardar</button>
+      <button class="button" type="submit" data-submit-label="Gerar, guardar e descarregar">Gerar, guardar e descarregar</button>
       <button class="button secondary" type="submit" formaction="{{ url_for('exports') }}" name="action" value="save_billing_config" data-report-scope="individual">Guardar configuração</button>
       <button class="button secondary" type="submit" formmethod="get" formaction="{{ url_for('report_generation_preview') }}" data-report-scope="portfolio">Testar geração</button>
     </div>

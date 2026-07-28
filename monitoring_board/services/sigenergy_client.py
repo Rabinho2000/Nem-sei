@@ -155,13 +155,13 @@ class SigenergyClient:
             parse_sigenergy_response(payload)
         return payload
 
-    def list_systems(self) -> list[dict[str, Any]]:
+    def list_systems(self, *, allow_empty: bool = False) -> list[dict[str, Any]]:
         configured = configured_system_rows(self.system_ids)
         if configured:
             return configured
         payload = self.request_json("GET", self.endpoints.systems_endpoint)
         rows = rows_from_data(parse_sigenergy_response(payload))
-        if not rows:
+        if not rows and not allow_empty:
             raise SigenergyApiError(
                 "A API Sigenergy respondeu com sucesso, mas sem sistemas. Confirma se a App Key tem sistemas autorizados.",
                 payload=payload,
@@ -250,8 +250,15 @@ def invalidate_access_token(config: dict[str, Any]) -> None:
     client_from_config(config).invalidate_access_token()
 
 
-def list_systems(config: dict[str, Any], session: requests.Session | None = None) -> list[dict[str, Any]]:
-    return client_from_config(config, session=session).list_systems()
+def list_systems(
+    config: dict[str, Any],
+    session: requests.Session | None = None,
+    *,
+    allow_empty: bool = False,
+) -> list[dict[str, Any]]:
+    return client_from_config(config, session=session).list_systems(
+        allow_empty=allow_empty
+    )
 
 
 def get_energy_flow(config: dict[str, Any], system_id: str, session: requests.Session | None = None) -> dict[str, Any]:

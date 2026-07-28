@@ -26,7 +26,27 @@
   --shadow: 0 20px 40px rgba(56, 42, 22, 0.08);
 }
 
+.import-wizard [hidden] {
+  display: none !important;
+}
+
+.import-raw-payload {
+  max-height: 360px;
+  margin: 12px 0 0;
+  padding: 12px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-strong);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* Relatórios: estilos isolados da restante aplicação. */
+.reports-card [hidden] {
+  display: none !important;
+}
+
 .reports-header {
   display: flex;
   align-items: end;

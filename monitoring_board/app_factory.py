@@ -175,6 +175,7 @@ from monitoring_board.services.installation_import import (
     EDITABLE_ASSET_FIELDS,
     missing_asset_fields,
     normalize_fusionsolar_import,
+    normalize_power_to_kw,
     normalize_sigenergy_import,
 )
 from monitoring_board.reporting.billing import decimal_from_value
@@ -4460,10 +4461,52 @@ def create_app() -> Flask:
                     f"Run #{result['run_id']} terminado: {result['completed']} concluídos, {result['failed']} falhados.",
                     "success" if result["status"] == "completed" else "warning",
                 )
+                if (
+                    result["status"] == "completed"
+                    and result["completed"] == 1
+                    and result["failed"] == 0
+                ):
+                    generated_file = g.db.execute(
+                        """
+                        SELECT id
+                        FROM report_generated_files
+                        WHERE run_id = ?
+                          AND status = 'completed'
+                          AND COALESCE(is_auxiliary, 0) = 0
+                        ORDER BY id
+                        LIMIT 1
+                        """,
+                        (result["run_id"],),
+                    ).fetchone()
+                    if generated_file is not None:
+                        return redirect(
+                            url_for(
+                                "download_generated_report",
+                                file_id=int(generated_file["id"]),
+                            )
+                        )
+            except ValueError as exc:
+                LOGGER.warning(
+                    "report_generation_rejected error_code=%s",
+                    type(exc).__name__,
+                )
+                validation_messages = {
+                    "template_type_mismatch": "O template selecionado não é compatível com o tipo de relatório.",
+                    "mixed_client_batch": "As instalações selecionadas pertencem a clientes diferentes.",
+                }
+                flash(
+                    validation_messages.get(
+                        str(exc),
+                        str(exc) or "O pedido de geração é inválido.",
+                    ),
+                    "error",
+                )
             except Exception as exc:
                 LOGGER.warning("report_generation_failed error_code=%s", type(exc).__name__)
                 flash("Falha na geração. Revê o pedido e consulta os logs para detalhe técnico.", "error")
-            return redirect(url_for("exports", tab="history"))
+            return redirect(
+                url_for("exports", tab="history", _anchor="reports-history")
+            )
         page = max(int(request.args.get("page", "1") or 1), 1)
         return redirect(url_for("exports", tab="history", page=page))
 
@@ -4482,12 +4525,38 @@ def create_app() -> Flask:
 
     @app.route("/report-generation/preview")
     def report_generation_preview():
-        portfolio_id = int(request.args.get("portfolio_id", "0") or 0)
-        template_id = int(request.args.get("template_id", "0") or 0)
+        report_type = str(request.args.get("report_type", "portfolio") or "portfolio")
+        if report_type != "portfolio":
+            flash(
+                "A pré-visualização está disponível apenas para relatórios de portefólio.",
+                "warning",
+            )
+            return redirect(url_for("exports", tab="generate"))
+        portfolio_id = parse_int_value(request.args.get("portfolio_id")) or 0
+        if not portfolio_id:
+            flash("Seleciona um portefólio antes de testar a geração.", "error")
+            return redirect(url_for("exports", tab="generate"))
+        template_id = parse_int_value(request.args.get("template_id")) or 0
         template = get_template(g.db, template_id) if template_id else get_default_template(g.db, "portfolio", portfolio_id)
         if template is None:
-            abort(404)
-        validate_template_scope(template, "portfolio", portfolio_id=portfolio_id, client_key=resolve_report_client_key(g.db, portfolio_id=portfolio_id))
+            flash("Não foi encontrado um template de portefólio válido.", "error")
+            return redirect(url_for("exports", tab="generate"))
+        try:
+            validate_template_scope(
+                template,
+                "portfolio",
+                portfolio_id=portfolio_id,
+                client_key=resolve_report_client_key(
+                    g.db,
+                    portfolio_id=portfolio_id,
+                ),
+            )
+        except ValueError:
+            flash(
+                "O template selecionado não é compatível com este portefólio.",
+                "error",
+            )
+            return redirect(url_for("exports", tab="generate"))
         snapshot_id = int(request.args.get("snapshot_id", "0") or 0)
         if snapshot_id:
             result = get_portfolio_snapshot_result(g.db, snapshot_id)
@@ -4649,7 +4718,16 @@ def create_app() -> Flask:
                 },
             )
             g.db.commit()
-            schedule_background_job(app, job_id)
+            if not schedule_background_job(app, job_id):
+                mark_background_job_failed(
+                    g.db,
+                    job_id,
+                    "Nao foi possivel iniciar a pesquisa porque o scheduler nao esta disponivel.",
+                )
+                flash(
+                    "Não foi possível iniciar a pesquisa. Podes tentar novamente.",
+                    "error",
+                )
             return redirect(url_for("installation_import", job_id=job_id))
 
         external_id = request.form.get("external_id", "").strip()
@@ -4705,7 +4783,30 @@ def create_app() -> Flask:
             (job_id, datetime.now().isoformat(timespec="seconds"), import_id),
         )
         g.db.commit()
-        schedule_background_job(app, job_id)
+        if not schedule_background_job(app, job_id):
+            error_message = (
+                "Nao foi possivel iniciar a recolha porque o scheduler "
+                "nao esta disponivel."
+            )
+            mark_background_job_failed(g.db, job_id, error_message)
+            g.db.execute(
+                """
+                UPDATE installation_imports
+                SET status = 'error', access_status = 'error',
+                    last_error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    error_message,
+                    datetime.now().isoformat(timespec="seconds"),
+                    import_id,
+                ),
+            )
+            g.db.commit()
+            flash(
+                "Não foi possível iniciar a recolha. Podes repetir a tentativa.",
+                "error",
+            )
         return redirect(url_for("installation_import", import_id=import_id))
 
     @app.post("/integrations/import/<int:import_id>/check-access")
@@ -4736,15 +4837,83 @@ def create_app() -> Flask:
             (job_id, import_id),
         )
         g.db.commit()
-        schedule_background_job(app, job_id)
-        flash("Verificacao de acesso iniciada em background.", "success")
+        if schedule_background_job(app, job_id):
+            flash("Verificacao de acesso iniciada em background.", "success")
+        else:
+            error_message = (
+                "Nao foi possivel iniciar a verificacao porque o scheduler "
+                "nao esta disponivel."
+            )
+            mark_background_job_failed(g.db, job_id, error_message)
+            g.db.execute(
+                """
+                UPDATE installation_imports
+                SET status = 'error', access_status = 'error',
+                    last_error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    error_message,
+                    datetime.now().isoformat(timespec="seconds"),
+                    import_id,
+                ),
+            )
+            g.db.commit()
+            flash(
+                "Não foi possível iniciar a verificação. Podes tentar novamente.",
+                "error",
+            )
         return redirect(url_for("installation_import", import_id=import_id))
 
     @app.post("/integrations/import/<int:import_id>/confirm")
     def confirm_installation_import(import_id: int) -> str:
         try:
+            existing_import = get_installation_import_context(g.db, import_id)
+            if (
+                existing_import is not None
+                and existing_import.get("status") == "completed"
+                and existing_import.get("asset_id")
+            ):
+                flash(
+                    "Esta instalação já tinha sido importada.",
+                    "warning",
+                )
+                return redirect(
+                    url_for(
+                        "asset_detail",
+                        asset_id=int(existing_import["asset_id"]),
+                        import_id=import_id,
+                    )
+                )
             asset_id, job_id = apply_installation_import(g.db, import_id, request.form)
-            schedule_background_job(app, job_id)
+            if not schedule_background_job(app, job_id):
+                error_message = (
+                    "A instalacao foi importada, mas o sync inicial nao "
+                    "pode ser agendado porque o scheduler nao esta disponivel."
+                )
+                mark_background_job_failed(g.db, job_id, error_message)
+                g.db.execute(
+                    """
+                    UPDATE installation_imports
+                    SET status = 'preview', access_status = 'available',
+                        last_error = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        error_message,
+                        datetime.now().isoformat(timespec="seconds"),
+                        import_id,
+                    ),
+                )
+                g.db.commit()
+                flash(
+                    "A instalação foi criada, mas o sync inicial não arrancou. "
+                    "Repete a confirmação para voltar a tentar.",
+                    "error",
+                )
+                return redirect(
+                    url_for("installation_import", import_id=import_id)
+                )
             refresh_integration_scheduler(app)
             flash(
                 f"Instalacao importada e sincronizacao colocada em background (job #{job_id}).",
@@ -13053,19 +13222,41 @@ def run_background_job_payload(conn: sqlite3.Connection, job_type: str, params: 
         )
 
     if job_type == "fusionsolar_state_sync":
+        target_external_ids = normalize_target_external_ids(
+            params.get("target_external_ids")
+        )
+        if "target_external_ids" in params and not target_external_ids:
+            raise ValueError("O sync dirigido FusionSolar exige pelo menos um ID.")
+        sync_kwargs = (
+            {"target_external_ids": target_external_ids}
+            if "target_external_ids" in params
+            else {}
+        )
         result = run_fusionsolar_sync(
             conn,
             str(params.get("provider") or INTEGRATION_PROVIDER_FUSIONSOLAR),
             trigger_type=str(params.get("trigger_type") or "manual_background"),
+            **sync_kwargs,
         )
         record_api_success(conn, INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_STATE)
         return result
 
     if job_type == "sigenergy_state_sync":
+        target_external_ids = normalize_target_external_ids(
+            params.get("target_external_ids")
+        )
+        if "target_external_ids" in params and not target_external_ids:
+            raise ValueError("O sync dirigido Sigenergy exige pelo menos um ID.")
+        sync_kwargs = (
+            {"target_external_ids": target_external_ids}
+            if "target_external_ids" in params
+            else {}
+        )
         result = run_sigenergy_sync(
             conn,
             str(params.get("provider") or INTEGRATION_PROVIDER_SIGENERGY),
             trigger_type=str(params.get("trigger_type") or "manual_background"),
+            **sync_kwargs,
         )
         record_api_success(conn, INTEGRATION_PROVIDER_SIGENERGY, API_AREA_STATE)
         return result
@@ -15345,13 +15536,6 @@ def normalize_fusionsolar_device_identity(row: dict[str, Any]) -> dict[str, Any]
     }
 
 
-def normalize_power_to_kw(value: Any) -> float | None:
-    parsed = parse_float_value(value)
-    if parsed is None:
-        return None
-    return parsed / 1000 if parsed > 1000 else parsed
-
-
 def infer_inverter_power_from_model(model: str | None) -> float | None:
     normalized = str(model or "").upper().replace(" ", "")
     match = re.search(r"(?:SUN2000-|^)(\d+(?:[.,]\d+)?)(?:KTL|K(?:-|$))", normalized)
@@ -16290,6 +16474,44 @@ def sigenergy_configured_system_ids(config: sqlite3.Row | dict[str, Any]) -> lis
     return [item.strip() for item in re.split(r"[,;\s]+", raw_value) if item.strip()]
 
 
+def active_provider_external_ids(
+    conn: sqlite3.Connection,
+    provider: str,
+) -> list[str]:
+    return [
+        str(row["external_id"]).strip()
+        for row in query_all(
+            conn,
+            """
+            SELECT external_id
+            FROM asset_integrations
+            WHERE provider = ?
+              AND enabled = 1
+              AND COALESCE(external_id, '') != ''
+            ORDER BY id
+            """,
+            (provider,),
+        )
+        if str(row["external_id"] or "").strip()
+    ]
+
+
+def normalize_target_external_ids(value: Any) -> list[str]:
+    if isinstance(value, str):
+        candidates = [value]
+    elif isinstance(value, (list, tuple, set)):
+        candidates = list(value)
+    else:
+        candidates = []
+    return list(
+        dict.fromkeys(
+            str(item).strip()
+            for item in candidates
+            if str(item).strip()
+        )
+    )
+
+
 def build_sigenergy_service_config(config: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     config_map = dict(config)
     endpoints = get_sigenergy_endpoint_config(config_map)
@@ -16591,7 +16813,10 @@ def list_provider_installations_for_import(
         if provider == INTEGRATION_PROVIDER_SIGENERGY:
             service_config = build_sigenergy_service_config(config)
             service_config["system_ids"] = ""
-            rows = sigenergy_service.SigenergyClient(service_config, session=requests.Session()).list_systems()
+            rows = sigenergy_service.SigenergyClient(
+                service_config,
+                session=requests.Session(),
+            ).list_systems(allow_empty=True)
             result = [
                 {
                     "external_id": first_non_empty(row, ["systemId", "id", "stationId", "plantId"]),
@@ -16620,6 +16845,128 @@ def list_provider_installations_for_import(
         raise persist_installation_import_rate_limit(conn, provider, exc) from exc
 
 
+def discover_sigenergy_installation(
+    client: Any,
+    external_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    systems = client.list_systems(allow_empty=True)
+    system = next(
+        (
+            row
+            for row in systems
+            if normalize_sigenergy_system_id_for_compare(
+                first_non_empty(
+                    row,
+                    ["systemId", "id", "stationId", "plantId"],
+                )
+            )
+            == normalize_sigenergy_system_id_for_compare(external_id)
+        ),
+        None,
+    )
+    if system is None:
+        raise SigenergyInstallationAccessPending(
+            f"O System ID {external_id} ainda nao esta acessivel por esta App Key."
+        )
+    energy_flow = client.get_energy_flow(external_id)
+    return normalize_sigenergy_import(system, energy_flow), {
+        "system": system,
+        "energy_flow": energy_flow,
+    }
+
+
+def fusionsolar_device_realtime_for(
+    raw_device: dict[str, Any],
+    realtime_map: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    identity = normalize_fusionsolar_device_identity(raw_device)
+    for key in (
+        identity.get("external_device_id"),
+        identity.get("dev_dn"),
+        identity.get("sn"),
+    ):
+        normalized_key = str(key or "").strip()
+        if normalized_key and normalized_key in realtime_map:
+            return realtime_map[normalized_key]
+    return {}
+
+
+def discover_fusionsolar_installation(
+    client: Any,
+    external_id: str,
+    *,
+    seed: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    station = dict(seed or {})
+    if not station:
+        station = next(
+            (
+                dict(row)
+                for row in client.stations()
+                if str(
+                    first_non_empty(
+                        row,
+                        ["plantCode", "stationCode", "stationId"],
+                    )
+                    or ""
+                ).strip()
+                == external_id
+            ),
+            {},
+        )
+    station.setdefault("plantCode", external_id)
+    station.setdefault("plantName", external_id)
+    realtime = client.station_realtime_kpi([external_id]).get(external_id, {})
+    raw_devices = client.device_list([external_id])
+    realtime_devices = []
+    for raw_device in raw_devices:
+        identity = normalize_fusionsolar_device_identity(raw_device)
+        if (
+            identity.get("dev_type_id") is not None
+            and identity.get("external_device_id")
+        ):
+            realtime_devices.append(identity)
+    device_realtime = (
+        client.device_realtime_kpi(realtime_devices)
+        if realtime_devices
+        else {}
+    )
+    alarms: list[dict[str, Any]] = []
+    try:
+        alarms = client.alarms([external_id]).get(external_id, [])
+    except (ApiRateLimitError, FusionSolarRateLimitError):
+        raise
+    except Exception as exc:
+        logger = (
+            current_app.logger
+            if has_app_context()
+            else logging.getLogger(__name__)
+        )
+        logger.info(
+            "FusionSolar alarms unavailable during installation import for %s: %s",
+            external_id,
+            exc,
+        )
+    if not realtime and not raw_devices and not seed:
+        raise ValueError(
+            f"O Station Code {external_id} nao devolveu dados realtime nem equipamentos."
+        )
+    normalized = normalize_fusionsolar_import(
+        station,
+        realtime,
+        raw_devices,
+        device_realtime,
+        alarms,
+    )
+    return normalized, {
+        "station": station,
+        "realtime": realtime,
+        "devices": raw_devices,
+        "device_realtime": device_realtime,
+        "alarms": alarms,
+    }
+
+
 def fetch_provider_installation_preview(
     conn: sqlite3.Connection,
     provider: str,
@@ -16643,65 +16990,19 @@ def fetch_provider_installation_preview(
             service_config = build_sigenergy_service_config(config)
             service_config["system_ids"] = ""
             client = sigenergy_service.SigenergyClient(service_config, session=requests.Session())
-            systems = client.list_systems()
-            system = next(
-                (
-                    row
-                    for row in systems
-                    if normalize_sigenergy_system_id_for_compare(
-                        first_non_empty(row, ["systemId", "id", "stationId", "plantId"])
-                    )
-                    == normalize_sigenergy_system_id_for_compare(external_id)
-                ),
-                None,
+            normalized, raw = discover_sigenergy_installation(
+                client,
+                external_id,
             )
-            if system is None:
-                complete_installation_import_api_call(conn, provider)
-                raise SigenergyInstallationAccessPending(
-                    f"O System ID {external_id} ainda nao esta acessivel por esta App Key."
-                )
-            flow = client.get_energy_flow(external_id)
-            normalized = normalize_sigenergy_import(system, flow)
-            raw = {"system": system, "energy_flow": flow}
             complete_installation_import_api_call(conn, provider)
             return normalized, sanitize_installation_import_payload(raw)
 
         client = build_fusionsolar_client(config)
-        station = dict(seed or {})
-        station.setdefault("plantCode", external_id)
-        station.setdefault("plantName", external_id)
-        realtime = client.station_realtime_kpi([external_id]).get(external_id, {})
-        devices = client.device_list([external_id])
-        device_realtime = client.device_realtime_kpi(devices) if devices else {}
-        alarms: list[dict[str, Any]] = []
-        try:
-            alarms = client.alarms([external_id]).get(external_id, [])
-        except (ApiRateLimitError, FusionSolarRateLimitError):
-            raise
-        except Exception as exc:
-            current_app.logger.info(
-                "FusionSolar alarms unavailable during installation import for %s: %s",
-                external_id,
-                exc,
-            )
-        if not realtime and not devices and not seed:
-            raise ValueError(
-                f"O Station Code {external_id} nao devolveu dados realtime nem equipamentos."
-            )
-        normalized = normalize_fusionsolar_import(
-            station,
-            realtime,
-            devices,
-            device_realtime,
-            alarms,
+        normalized, raw = discover_fusionsolar_installation(
+            client,
+            external_id,
+            seed=seed,
         )
-        raw = {
-            "station": station,
-            "realtime": realtime,
-            "devices": devices,
-            "device_realtime": device_realtime,
-            "alarms": alarms,
-        }
         complete_installation_import_api_call(conn, provider)
         return normalized, sanitize_installation_import_payload(raw)
     except (ApiRateLimitError, FusionSolarRateLimitError) as exc:
@@ -17072,12 +17373,22 @@ def apply_installation_import(
     import_context = get_installation_import_context(conn, import_id)
     if import_context is None:
         raise ValueError("Pre-visualizacao de importacao nao encontrada.")
+    if (
+        import_context["status"] == "completed"
+        and import_context.get("asset_id")
+        and import_context.get("background_job_id")
+    ):
+        return (
+            int(import_context["asset_id"]),
+            int(import_context["background_job_id"]),
+        )
     if import_context["status"] not in {"preview", "completed"}:
         raise ValueError("A instalacao ainda nao esta pronta para confirmar.")
     normalized = dict(import_context["normalized"])
     provider = str(import_context["provider"])
     external_id = str(import_context["external_id"])
     mode = str(import_context["mode"])
+    enable_auto_sync = form.get("enable_auto_sync") == "on"
     now = datetime.now().isoformat(timespec="seconds")
     editable = {
         field: str(form.get(field, normalized.get(field) or "")).strip()
@@ -17212,12 +17523,21 @@ def apply_installation_import(
 
         if provider == INTEGRATION_PROVIDER_FUSIONSOLAR:
             raw_devices = import_context["raw_payload"].get("devices") or []
+            device_realtime = (
+                import_context["raw_payload"].get("device_realtime") or {}
+            )
             for device in raw_devices:
                 identity = normalize_fusionsolar_device_identity(device)
                 if not identity["external_device_id"]:
                     continue
                 identity["station_code"] = identity["station_code"] or external_id
-                identity["payload"] = device
+                identity["payload"] = {
+                    "device": device,
+                    "realtime": fusionsolar_device_realtime_for(
+                        device,
+                        device_realtime,
+                    ),
+                }
                 identity["enabled"] = 1
                 upsert_provider_device(conn, asset_id, provider, identity)
 
@@ -17248,8 +17568,17 @@ def apply_installation_import(
                 )
 
         conn.execute(
-            "UPDATE integration_configs SET enabled = 1, updated_at = ? WHERE provider = ?",
-            (now, provider),
+            """
+            UPDATE integration_configs
+            SET enabled = 1,
+                auto_sync_enabled = CASE
+                    WHEN ? = 1 THEN 1
+                    ELSE auto_sync_enabled
+                END,
+                updated_at = ?
+            WHERE provider = ?
+            """,
+            (1 if enable_auto_sync else 0, now, provider),
         )
         job_type = (
             "sigenergy_state_sync"
@@ -17259,7 +17588,11 @@ def apply_installation_import(
         job_id, _ = create_background_job(
             conn,
             job_type,
-            {"provider": provider, "trigger_type": "installation_import"},
+            {
+                "provider": provider,
+                "trigger_type": "installation_import",
+                "target_external_ids": [external_id],
+            },
         )
         conn.execute(
             """
@@ -17342,15 +17675,56 @@ def normalize_sigenergy_system_row(
     }
 
 
-def run_sigenergy_check(conn: sqlite3.Connection, provider: str, dry_run: bool = False) -> dict[str, Any]:
+def run_sigenergy_check(
+    conn: sqlite3.Connection,
+    provider: str,
+    dry_run: bool = False,
+    *,
+    target_external_ids: list[str] | None = None,
+    discover_all: bool = False,
+) -> dict[str, Any]:
     config = get_integration_config(conn, provider)
     if config is None:
         raise ValueError("Configuracao Sigenergy nao encontrada.")
     endpoints = get_sigenergy_endpoint_config(config)
     service_config = build_sigenergy_service_config(config)
+    if discover_all:
+        selected_external_ids: list[str] = []
+        service_config["system_ids"] = ""
+    else:
+        selected_external_ids = normalize_target_external_ids(
+            target_external_ids
+            if target_external_ids is not None
+            else active_provider_external_ids(conn, provider)
+        )
+        if not selected_external_ids and target_external_ids is None:
+            # Compatibility for legacy deployments that configured an explicit
+            # allowlist before mappings existed. Active mappings take priority
+            # as soon as at least one is available.
+            selected_external_ids = sigenergy_configured_system_ids(config)
+        service_config["system_ids"] = selected_external_ids
     session = requests.Session()
     client = sigenergy_service.SigenergyClient(service_config, session=session)
-    systems = retry_api_call(client.list_systems, allow_sleep=not has_request_context(), sleeper=time.sleep)
+    if discover_all:
+        systems = retry_api_call(
+            lambda: client.list_systems(allow_empty=True),
+            allow_sleep=not has_request_context(),
+            sleeper=time.sleep,
+        )
+    elif selected_external_ids:
+        systems = retry_api_call(
+            client.list_systems,
+            allow_sleep=not has_request_context(),
+            sleeper=time.sleep,
+        )
+    elif target_external_ids is None:
+        systems = retry_api_call(
+            client.list_systems,
+            allow_sleep=not has_request_context(),
+            sleeper=time.sleep,
+        )
+    else:
+        systems = []
     available_system_ids = [first_non_empty(row, ["systemId", "id", "stationId", "plantId"]) for row in systems if first_non_empty(row, ["systemId", "id", "stationId", "plantId"])]
     normalized_rows: list[dict[str, Any]] = []
     energy_flow_count = 0
@@ -17508,7 +17882,13 @@ def insert_integration_realtime_snapshot(
     )
 
 
-def run_sigenergy_sync(conn: sqlite3.Connection, provider: str = "Sigenergy", trigger_type: str = "manual") -> dict[str, Any]:
+def run_sigenergy_sync(
+    conn: sqlite3.Connection,
+    provider: str = "Sigenergy",
+    trigger_type: str = "manual",
+    *,
+    target_external_ids: list[str] | None = None,
+) -> dict[str, Any]:
     with SIGENERGY_SYNC_LOCK:
         config = get_integration_config(conn, provider)
         if config is None:
@@ -17525,7 +17905,16 @@ def run_sigenergy_sync(conn: sqlite3.Connection, provider: str = "Sigenergy", tr
             source=provider,
         )
         try:
-            result = run_provider_check(conn, provider, dry_run=True)
+            result = (
+                run_sigenergy_check(
+                    conn,
+                    provider,
+                    dry_run=True,
+                    target_external_ids=target_external_ids,
+                )
+                if target_external_ids is not None
+                else run_provider_check(conn, provider, dry_run=True)
+            )
             rows = result["rows"]
             reconcile_sigenergy_onboarding_requests(conn, result.get("available_system_ids", []))
             matched = 0
@@ -17724,6 +18113,7 @@ def run_fusionsolar_check(
     dry_run: bool = False,
     include_diagnostics: bool = True,
     prefer_local_station_inventory: bool = False,
+    target_external_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     config = get_integration_config(conn, provider)
     if config is None:
@@ -17736,21 +18126,37 @@ def run_fusionsolar_check(
     for attempt in range(2):
         try:
             session, _ = get_fusionsolar_session(config, force_login=attempt == 1)
+            target_ids = set(
+                normalize_target_external_ids(target_external_ids)
+            )
+            if target_external_ids is not None and not target_ids:
+                raise ValueError(
+                    "O sync dirigido FusionSolar exige pelo menos um ID."
+                )
             inventory_date = get_app_state_value(
                 conn,
                 FUSIONSOLAR_STATION_INVENTORY_DATE_KEY,
             )
-            use_local_inventory = (
+            use_local_inventory = bool(target_ids) or (
                 prefer_local_station_inventory
                 and inventory_date == current_lisbon_date().isoformat()
             )
-            stations = (
-                load_local_fusionsolar_stations(conn, provider)
-                if use_local_inventory
-                else []
-            )
+            stations = []
+            if use_local_inventory:
+                stations = load_local_fusionsolar_stations(conn, provider)
+                if target_ids:
+                    stations = [
+                        row
+                        for row in stations
+                        if str(
+                            row.get("plantCode")
+                            or row.get("stationCode")
+                            or ""
+                        ).strip()
+                        in target_ids
+                    ]
             station_list_api_calls = 0
-            if not stations:
+            if not stations and not target_ids:
                 stations = fetch_fusionsolar_stations(
                     session,
                     base_url=endpoints["base_url"],
@@ -21035,7 +21441,13 @@ def run_integration_sync(conn: sqlite3.Connection, provider: str, trigger_type: 
     return run_fusionsolar_sync(conn, provider, trigger_type=trigger_type)
 
 
-def run_fusionsolar_sync(conn: sqlite3.Connection, provider: str, trigger_type: str = "manual") -> dict[str, Any]:
+def run_fusionsolar_sync(
+    conn: sqlite3.Connection,
+    provider: str,
+    trigger_type: str = "manual",
+    *,
+    target_external_ids: list[str] | None = None,
+) -> dict[str, Any]:
     if not FUSIONSOLAR_SYNC_LOCK.acquire(blocking=False):
         message = "Sincronizacao FusionSolar ignorada porque ja existe outra em curso."
         LOGGER.info(message)
@@ -21059,7 +21471,14 @@ def run_fusionsolar_sync(conn: sqlite3.Connection, provider: str, trigger_type: 
         conn.commit()
 
         try:
-            if trigger_type == "scheduled_state":
+            if target_external_ids is not None:
+                result = run_fusionsolar_check(
+                    conn,
+                    provider,
+                    dry_run=True,
+                    target_external_ids=target_external_ids,
+                )
+            elif trigger_type == "scheduled_state":
                 result = run_fusionsolar_check(
                     conn,
                     provider,
@@ -21153,10 +21572,13 @@ def run_fusionsolar_sync(conn: sqlite3.Connection, provider: str, trigger_type: 
                     )
                     unresolved += 1
 
+            target_ids = set(
+                normalize_target_external_ids(target_external_ids)
+            )
             mapped_assets = query_all(
                 conn,
                 """
-                SELECT ai.asset_id
+                SELECT ai.asset_id, ai.external_id
                 FROM asset_integrations ai
                 JOIN latest_monitoring_view lm ON lm.asset_id = ai.asset_id
                 WHERE ai.provider = ? AND ai.enabled = 1 AND lm.status IN ('Erro', 'Desconectada')
@@ -21164,6 +21586,8 @@ def run_fusionsolar_sync(conn: sqlite3.Connection, provider: str, trigger_type: 
                 (provider,),
             )
             for row in mapped_assets:
+                if target_ids and str(row["external_id"] or "").strip() not in target_ids:
+                    continue
                 asset_id = int(row["asset_id"])
                 if asset_id in synced_asset_ids:
                     continue
@@ -21247,7 +21671,11 @@ def run_fusionsolar_sync(conn: sqlite3.Connection, provider: str, trigger_type: 
             process_monitoring_alerts(conn, alert_events, batch_id, now)
             conn.commit()
             device_availability: dict[str, Any] | None = None
-            if provider == INTEGRATION_PROVIDER_FUSIONSOLAR and trigger_type not in {"scheduled_state", "manual_background"}:
+            if (
+                provider == INTEGRATION_PROVIDER_FUSIONSOLAR
+                and target_external_ids is None
+                and trigger_type not in {"scheduled_state", "manual_background"}
+            ):
                 try:
                     device_availability = run_fusionsolar_device_availability_sync(conn, provider, trigger_type=trigger_type)
                 except Exception as exc:
