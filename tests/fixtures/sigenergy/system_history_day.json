@@ -1,0 +1,21 @@
+{
+  "code": 0,
+  "msg": "success",
+  "data": {
+    "powerGeneration": 22.94,
+    "powerToGrid": 3.93,
+    "powerSelfConsumption": 19.01,
+    "powerUse": 24.83,
+    "powerFromGrid": 9.67,
+    "powerOneself": 15.16,
+    "esCharging": 6.51,
+    "esDischarging": 0.47,
+    "itemList": [
+      {
+        "dataTime": "2024-04-02 00:00",
+        "pvTotalPower": 0.0,
+        "loadPower": 1.06
+      }
+    ]
+  }
+}

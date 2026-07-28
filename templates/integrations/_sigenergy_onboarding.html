@@ -10,7 +10,11 @@
         <button class="button secondary" type="submit" name="action" value="refresh_sigenergy_onboarding">Atualizar estado</button>
       </div>
     </div>
-    <p class="muted">O proprietario da instalacao podera ter de aprovar o pedido na plataforma Sigenergy. Nao sao criados assets locais durante este pedido.</p>
+    <label class="checkbox-inline">
+      <input type="checkbox" name="confirm_remote_access" value="1" required>
+      <span>Confirmo o envio de um pedido remoto de acesso para este System ID.</span>
+    </label>
+    <p class="muted">Esta acao executa um POST de onboarding auditavel. Nunca e disparada ao atualizar ou descobrir instalacoes. O proprietario podera ter de aprovar o pedido na Sigenergy.</p>
   </form>
 
   {% if sigenergy_onboarding_rows %}

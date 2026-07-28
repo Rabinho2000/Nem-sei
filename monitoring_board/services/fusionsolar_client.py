@@ -10,7 +10,7 @@ from typing import Any, Callable
 import requests
 
 from monitoring_board.services.api_client_base import http_rate_limited_status, http_retryable_status, retry_api_call
-from monitoring_board.services.api_rate_limit import ApiRateLimitError, ApiTransientError
+from monitoring_board.services.api_rate_limit import ApiTransientError
 from monitoring_board.services.fusionsolar import build_provider_url
 from monitoring_board.services.fusionsolar_errors import (
     FusionSolarApiError,

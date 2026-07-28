@@ -149,3 +149,54 @@ def test_sigenergy_connection_test_lists_systems_without_energy_flow(
             {"dry_run": True, "include_energy_flow": False},
         )
     ]
+
+
+def test_sigenergy_onboarding_requires_explicit_remote_confirmation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "sigenergy-onboarding-confirmation.db"
+    app_module.ensure_database(str(db_path))
+    with get_db(str(db_path)) as conn:
+        app_module.ensure_integration_seed_data(conn)
+        conn.commit()
+    calls: list[str] = []
+
+    def fake_onboarding(_conn, _config, system_id, **_kwargs):
+        calls.append(system_id)
+        return {
+            "system_id": system_id,
+            "status": "requested",
+            "message": "pending",
+        }
+
+    monkeypatch.setattr(
+        app_module,
+        "create_sigenergy_onboarding_request",
+        fake_onboarding,
+    )
+    flask_app, original_database, client = authenticated_client(db_path)
+    try:
+        rejected = client.post(
+            "/integrations",
+            data={
+                "csrf_token": "token",
+                "action": "onboard_sigenergy_system",
+                "system_id": "SIG-CONFIRM",
+            },
+        )
+        accepted = client.post(
+            "/integrations",
+            data={
+                "csrf_token": "token",
+                "action": "onboard_sigenergy_system",
+                "system_id": "SIG-CONFIRM",
+                "confirm_remote_access": "1",
+            },
+        )
+    finally:
+        flask_app.config["DATABASE"] = original_database
+
+    assert rejected.status_code == 302
+    assert accepted.status_code == 302
+    assert calls == ["SIG-CONFIRM"]

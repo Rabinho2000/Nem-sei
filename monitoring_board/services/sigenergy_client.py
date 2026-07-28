@@ -60,6 +60,10 @@ class SigenergyClient:
                 login_endpoint=str(config.get("login_endpoint") or ""),
                 systems_endpoint=str(config.get("systems_endpoint") or config.get("plants_endpoint") or ""),
                 energy_flow_endpoint=str(config.get("energy_flow_endpoint") or ""),
+                history_endpoint=str(
+                    config.get("history_endpoint")
+                    or "/openapi/systems/{system_id}/history"
+                ),
                 region=str(config.get("region") or "eu"),
             )
             self.credentials = SigenergyCredentials(
@@ -89,14 +93,19 @@ class SigenergyClient:
     def authenticate(self) -> str:
         return self.get_access_token(force_login=True)
 
-    def get_access_token(self, *, force_login: bool = False) -> str:
+    def get_access_token(
+        self,
+        *,
+        force_login: bool = False,
+        api_area: str = "state",
+    ) -> str:
         now = datetime.now()
         with self.token_lock:
             cached = self.token_cache.get(self.cache_key)
             if cached and not force_login and cached["expires_at"] > now:
                 return str(cached["access_token"])
 
-        data = self._authenticate_payload()
+        data = self._authenticate_payload(api_area=api_area)
         access_token = str(data.get("accessToken") or data.get("access_token") or "").strip()
         if not access_token:
             raise SigenergyApiError("A resposta Sigenergy de login nao trouxe accessToken.", payload=data)
@@ -118,8 +127,9 @@ class SigenergyClient:
         json_payload: Any | None = None,
         validate_code: bool = True,
         refreshed: bool = False,
+        api_area: str = "state",
     ) -> dict[str, Any]:
-        token = self.get_access_token()
+        token = self.get_access_token(api_area=api_area)
 
         def call_once() -> requests.Response:
             try:
@@ -137,7 +147,11 @@ class SigenergyClient:
                 if status_code == 401 and not refreshed:
                     raise SigenergyAuthError("Sigenergy HTTP 401.", status_code=status_code) from exc
                 if http_rate_limited_status(status_code):
-                    raise sigenergy_rate_limit_error("Sigenergy HTTP 429.", response=exc.response) from exc
+                    raise sigenergy_rate_limit_error(
+                        "Sigenergy HTTP 429.",
+                        response=exc.response,
+                        api_area=api_area,
+                    ) from exc
                 if http_retryable_status(status_code):
                     raise ApiTransientError(f"Sigenergy HTTP {status_code}") from exc
                 raise SigenergyApiError(sanitize_sigenergy_error(exc), status_code=status_code, error_type="http") from exc
@@ -150,15 +164,26 @@ class SigenergyClient:
             if refreshed:
                 raise
             self.invalidate_access_token()
-            self.get_access_token(force_login=True)
-            return self.request_json(method, endpoint, json_payload=json_payload, validate_code=validate_code, refreshed=True)
+            self.get_access_token(force_login=True, api_area=api_area)
+            return self.request_json(
+                method,
+                endpoint,
+                json_payload=json_payload,
+                validate_code=validate_code,
+                refreshed=True,
+                api_area=api_area,
+            )
         payload = self._json_response(response)
         if validate_code:
             parse_sigenergy_response(payload)
         return payload
 
     def list_systems(self, *, allow_empty: bool = False) -> list[dict[str, Any]]:
-        payload = self.request_json("GET", self.endpoints.systems_endpoint)
+        payload = self.request_json(
+            "GET",
+            self.endpoints.systems_endpoint,
+            api_area="discovery",
+        )
         rows = rows_from_data(parse_sigenergy_response(payload))
         if not rows and not allow_empty:
             raise SigenergyApiError(
@@ -170,11 +195,38 @@ class SigenergyClient:
     def get_energy_flow(self, system_id: str) -> dict[str, Any]:
         endpoint = self.endpoints.energy_flow_endpoint.replace("{systemId}", "{system_id}")
         endpoint = endpoint.replace("{system_id}", str(system_id))
-        payload = self.request_json("GET", endpoint)
+        payload = self.request_json("GET", endpoint, api_area="state")
         data = parse_sigenergy_response(payload)
         return data if isinstance(data, dict) else {"raw_data": data}
 
-    def _authenticate_payload(self) -> dict[str, Any]:
+    def get_system_history(
+        self,
+        system_id: str,
+        *,
+        level: str,
+        target_date: str | None = None,
+    ) -> dict[str, Any]:
+        endpoint = self.endpoints.history_endpoint.replace(
+            "{systemId}",
+            "{system_id}",
+        ).replace("{system_id}", str(system_id))
+        request_payload: dict[str, Any] = {"level": level}
+        if target_date:
+            request_payload["date"] = target_date
+        payload = self.request_json(
+            "GET",
+            endpoint,
+            json_payload=request_payload,
+            api_area="production",
+        )
+        data = parse_sigenergy_response(payload)
+        if not isinstance(data, dict):
+            raise SigenergyApiError(
+                "O historico Sigenergy nao devolveu um objeto de dados."
+            )
+        return data
+
+    def _authenticate_payload(self, *, api_area: str = "state") -> dict[str, Any]:
         app_key = self.credentials.app_key.strip()
         app_secret = self.credentials.app_secret.strip()
         if not app_key or not app_secret:
@@ -194,7 +246,11 @@ class SigenergyClient:
             except requests.HTTPError as exc:
                 status_code = getattr(exc.response, "status_code", None)
                 if http_rate_limited_status(status_code):
-                    raise sigenergy_rate_limit_error("Sigenergy HTTP 429 auth.", response=exc.response) from exc
+                    raise sigenergy_rate_limit_error(
+                        "Sigenergy HTTP 429 auth.",
+                        response=exc.response,
+                        api_area=api_area,
+                    ) from exc
                 if http_retryable_status(status_code):
                     raise ApiTransientError(f"Sigenergy auth HTTP {status_code}") from exc
                 raise SigenergyApiError(sanitize_sigenergy_error(exc), status_code=status_code, error_type="http") from exc
@@ -221,6 +277,7 @@ def sigenergy_rate_limit_error(
     message: str,
     *,
     response: requests.Response | None = None,
+    api_area: str = "state",
 ) -> ApiRateLimitError:
     cooldown_until = datetime.now() + timedelta(minutes=60)
     retry_after = ""
@@ -238,7 +295,7 @@ def sigenergy_rate_limit_error(
                     cooldown_until = parsed
             except (TypeError, ValueError, OverflowError):
                 pass
-    return ApiRateLimitError("Sigenergy", "state", cooldown_until, message)
+    return ApiRateLimitError("Sigenergy", api_area, cooldown_until, message)
 
 
 def client_from_config(config: dict[str, Any], session: requests.Session | None = None) -> SigenergyClient:
@@ -272,3 +329,18 @@ def list_systems(
 
 def get_energy_flow(config: dict[str, Any], system_id: str, session: requests.Session | None = None) -> dict[str, Any]:
     return client_from_config(config, session=session).get_energy_flow(system_id)
+
+
+def get_system_history(
+    config: dict[str, Any],
+    system_id: str,
+    *,
+    level: str,
+    target_date: str | None = None,
+    session: requests.Session | None = None,
+) -> dict[str, Any]:
+    return client_from_config(config, session=session).get_system_history(
+        system_id,
+        level=level,
+        target_date=target_date,
+    )

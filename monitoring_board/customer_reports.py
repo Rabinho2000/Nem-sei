@@ -215,6 +215,11 @@ def prepare_customer_report(
         config,
         months_count=months_count,
     )
+    grid_import_decimal = (
+        decimal_from_value(report.get("grid_import_kwh"))
+        if report.get("grid_import_kwh") is not None
+        else billing.grid_import_kwh
+    )
     tariff_value = decimal_from_value(report.get("tariff_value_eur")) if report.get("tariff_value_eur") is not None else None
     savings_eur = tariff_value if tariff_value is not None else billing.savings_eur
     gross_benefit_eur = savings_eur + billing.export_revenue_eur
@@ -248,7 +253,7 @@ def prepare_customer_report(
         solcor_payment_eur=decimal_to_float(billing.solcor_payment_eur),
         net_benefit_eur=decimal_to_float(net_benefit_eur),
         billable_energy_kwh=decimal_to_float(billing.billable_energy_kwh),
-        grid_import_kwh=decimal_to_float(billing.grid_import_kwh),
+        grid_import_kwh=decimal_to_float(grid_import_decimal),
         exported_energy_kwh=decimal_to_float(billing.exported_energy_kwh),
         billing_mode=billing.billing_mode.value,
         billing_energy_base=billing.billing_energy_base.value,

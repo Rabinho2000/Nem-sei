@@ -11,24 +11,40 @@ from monitoring_board.services.sigenergy_client import (
     clear_token_cache_for_tests,
     get_access_token,
     get_energy_flow,
+    get_system_history,
     invalidate_access_token,
     list_systems,
 )
 from monitoring_board.services.sigenergy_errors import SigenergyApiError
 from monitoring_board.services.sigenergy_models import (
-    first as _first,
-    float_or_none as _float_or_none,
     map_sigenergy_status,
     normalize_energy_flow,
     normalize_system,
     parse_sigenergy_response,
-    rows_from_data as _rows_from_data,
     sanitize_payload,
     sanitize_sigenergy_error,
 )
 
 
 SigenergyAPIError = SigenergyApiError
+__all__ = [
+    "SigenergyAPIError",
+    "SigenergyClient",
+    "authenticate",
+    "build_sigenergy_url",
+    "clear_token_cache_for_tests",
+    "get_access_token",
+    "get_energy_flow",
+    "get_system_history",
+    "invalidate_access_token",
+    "list_systems",
+    "map_sigenergy_status",
+    "normalize_energy_flow",
+    "normalize_system",
+    "parse_sigenergy_response",
+    "sanitize_payload",
+    "sanitize_sigenergy_error",
+]
 
 
 def normalize_onboarding_response(system_id: str, payload: dict[str, Any]) -> dict[str, Any]:

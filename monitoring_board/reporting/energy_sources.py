@@ -84,6 +84,7 @@ def set_asset_primary_energy_source(
     *,
     asset_id: int,
     provider: str,
+    confirmed: bool = False,
 ) -> None:
     selected = conn.execute(
         """
@@ -97,6 +98,39 @@ def set_asset_primary_energy_source(
     ).fetchone()
     if selected is None:
         raise ValueError("A fonte escolhida nao tem um mapeamento ativo para esta instalacao.")
+    if provider == "Sigenergy":
+        ready = conn.execute(
+            """
+            SELECT 1
+            FROM production_records
+            WHERE asset_id = ? AND provider = 'Sigenergy'
+              AND period_type = 'month' AND data_quality = 'complete'
+              AND production_kwh IS NOT NULL
+              AND consumption_kwh IS NOT NULL
+              AND self_use_kwh IS NOT NULL
+              AND export_kwh IS NOT NULL
+              AND grid_import_kwh IS NOT NULL
+            LIMIT 1
+            """,
+            (asset_id,),
+        ).fetchone()
+        if ready is None:
+            raise ValueError(
+                "A Sigenergy ainda nao tem um mes energetico completo para relatorios."
+            )
+        fusion_mapping = conn.execute(
+            """
+            SELECT 1
+            FROM asset_integrations
+            WHERE asset_id = ? AND provider = 'FusionSolar' AND enabled = 1
+            LIMIT 1
+            """,
+            (asset_id,),
+        ).fetchone()
+        if fusion_mapping is not None and not confirmed:
+            raise ValueError(
+                "Confirma explicitamente a troca da fonte FusionSolar para Sigenergy."
+            )
     conn.execute(
         "UPDATE asset_integrations SET is_primary_energy_source = 0 WHERE asset_id = ?",
         (asset_id,),

@@ -168,6 +168,32 @@ def test_energy_flow_current_by_system() -> None:
     assert session.requests[0]["url"] == "https://sigenergy.example.test/openapi/systems/SIG-001/energyFlow"
 
 
+def test_system_history_uses_documented_daily_contract() -> None:
+    session = QueueSession(
+        {
+            "https://sigenergy.example.test/openapi/auth/login/key": [
+                FakeResponse(load_fixture("auth_success_object.json"))
+            ],
+            "https://sigenergy.example.test/openapi/systems/SIG-001/history": [
+                FakeResponse(load_fixture("system_history_day.json"))
+            ],
+        }
+    )
+
+    history = client(session).get_system_history(
+        "SIG-001",
+        level="Day",
+        target_date="2024-04-02",
+    )
+
+    assert history["powerGeneration"] == 22.94
+    assert session.requests[0]["method"] == "GET"
+    assert session.requests[0]["json"] == {
+        "level": "Day",
+        "date": "2024-04-02",
+    }
+
+
 def test_401_invalidates_token_and_relogs_once() -> None:
     session = QueueSession(
         {
@@ -200,8 +226,30 @@ def test_http_429_raises_common_rate_limit_error() -> None:
         }
     )
 
-    with pytest.raises(ApiRateLimitError, match="Sigenergy HTTP 429"):
+    with pytest.raises(ApiRateLimitError, match="Sigenergy HTTP 429") as error:
         client(session).get_energy_flow("SIG-001")
+    assert error.value.area == "state"
+
+
+def test_discovery_429_is_classified_as_discovery() -> None:
+    session = QueueSession(
+        {
+            "https://sigenergy.example.test/openapi/auth/login/key": [
+                FakeResponse(load_fixture("auth_success_object.json"))
+            ],
+            "https://sigenergy.example.test/openapi/system": [
+                FakeResponse(
+                    {"code": 429, "msg": "too many"},
+                    status_code=429,
+                )
+            ],
+        }
+    )
+
+    with pytest.raises(ApiRateLimitError) as error:
+        client(session).list_systems()
+
+    assert error.value.area == "discovery"
 
 
 def test_http_429_respects_retry_after_seconds() -> None:
