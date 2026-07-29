@@ -215,15 +215,15 @@ def test_add_member_reactivates_inactive_member_and_prevents_active_duplicates(t
 
 def test_update_pending_member_merges_into_existing_asset_member(tmp_path: Path) -> None:
     conn = connect(tmp_path)
-    asset_id = add_asset(conn, "A Colmeia do Minho", "500001022")
-    portfolio_id = repo.create_portfolio(conn, name="Merge Colmeia")
+    asset_id = add_asset(conn, "Instalacao Sintetica", "599999991")
+    portfolio_id = repo.create_portfolio(conn, name="Portfolio Merge")
     existing_id = repo.add_member(conn, portfolio_id=portfolio_id, asset_id=asset_id, external_name="A Colmeia do Minho")
     pending_id = repo.add_member(
         conn,
         portfolio_id=portfolio_id,
         asset_id=None,
-        external_name="A COLMEIA DO MINHO SA",
-        nif="500001022",
+        external_name="INSTALACAO SINTETICA",
+        nif="599999991",
         sub_account="001",
     )
 
@@ -232,8 +232,8 @@ def test_update_pending_member_merges_into_existing_asset_member(tmp_path: Path)
         member_id=pending_id,
         portfolio_id=portfolio_id,
         asset_id=asset_id,
-        external_name="A COLMEIA DO MINHO SA",
-        nif="500001022",
+        external_name="INSTALACAO SINTETICA",
+        nif="599999991",
         sub_account="001",
         notes="",
         active=True,
@@ -243,8 +243,8 @@ def test_update_pending_member_merges_into_existing_asset_member(tmp_path: Path)
     assert len(members) == 1
     assert members[0]["id"] == existing_id
     assert members[0]["asset_id"] == asset_id
-    assert members[0]["external_name"] == "A COLMEIA DO MINHO SA"
-    assert members[0]["nif"] == "500001022"
+    assert members[0]["external_name"] == "INSTALACAO SINTETICA"
+    assert members[0]["nif"] == "599999991"
     assert members[0]["sub_account"] == "001"
     assert members[0]["mapping_status"] == "manual"
     assert conn.execute("SELECT 1 FROM portfolio_assets WHERE id = ?", (pending_id,)).fetchone() is None

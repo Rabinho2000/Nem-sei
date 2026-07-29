@@ -1,0 +1,114 @@
+# Reporting production readiness
+
+Documento vivo da implementação da pipeline operacional de relatórios.
+
+## Estado inicial
+
+- Aplicação Flask server-rendered, SQLite e APScheduler no mesmo processo.
+- `app.py` é uma camada de compatibilidade; a composição principal está em
+  `monitoring_board/app_factory.py`.
+- O schema é criado de forma idempotente por `ensure_database()` e por funções
+  `ensure_*_schema()`. Não existe um framework externo de migrations.
+- `assets` representa instalações e contém atualmente `nif` e `kwp`.
+- `asset_integrations` liga instalações a IDs externos FusionSolar/Sigenergy.
+- `portfolio_groups` e `portfolio_assets` representam portefólios e membros.
+- Aliases são persistidos em `asset_aliases`; decisões de mapping são auditadas
+  em `portfolio_mapping_events`.
+- Não existe ainda uma entidade persistente `customers`.
+- Não existe histórico temporal de potência instalada.
+- `portfolio_report_runs` contém snapshots configuráveis de portefólio, mas não
+  implementa um contrato comum de validação/aprovação para relatórios
+  individuais e de portefólio.
+- `report_generation_runs`, `report_generated_files` e `report_automations`
+  preservam runs, SHA-256, ficheiros e agendamentos.
+- `background_jobs` é a queue persistente executada pelo APScheduler.
+- A qualidade mensal de produção distingue `complete`, `partial`, `missing`,
+  `conflict` e `in_progress`.
+- FusionSolar suporta produção histórica, estado e diagnóstico. Sigenergy
+  suporta apenas descoberta/estado live (`energyFlow`); potência live não é
+  energia e não será integrada para criar kWh.
+- Reporting inclui templates/perfis versionados, billing, tarifas,
+  disponibilidade, importação HelioScope e modelos financeiros.
+- Existe CI GitHub Actions com Python 3.12, lint, compile, smoke imports e pytest.
+- Foram encontrados nomes, NIFs e subcontas operacionais hardcoded em
+  `monitoring_board/portfolio_reports.py`.
+
+## Decisões de arquitetura
+
+1. Alterações de schema serão aditivas, idempotentes e não destrutivas.
+2. Cliente e instalação serão entidades distintas; `assets.customer_id` será
+   opcional.
+3. Potência histórica será resolvida por período, mantendo `assets.kwp` como
+   fallback.
+4. Será introduzido um snapshot comum e imutável, referenciando payload,
+   template, perfil, billing e fontes congelados.
+5. Quality findings terão estrutura (`code`, `severity`, `scope`, `asset_id`,
+   `message`, `source`, `remediation`).
+6. Fecho mensal e novas rotas serão extraídos do monólito sempre que possível.
+7. Automatizações gerarão apenas de snapshots aprovados.
+8. Geração e distribuição serão processos separados. Nesta fase não haverá
+   envio externo.
+9. Todas as avaliações temporais aceitarão uma data/relógio explícito quando a
+   decisão dependa do tempo.
+
+## Contratos de compatibilidade
+
+- Não apagar nem recriar bases existentes.
+- Preservar `portfolio_report_runs`, downloads e histórico de geração.
+- Preservar mappings manuais, aliases, templates e perfis/versionamento.
+- Preservar interfaces FusionSolar, Sigenergy, filas e instalação import.
+- Não chamar APIs durante validação, aprovação ou geração por snapshot.
+- Não inferir energia a partir de potência instantânea.
+- Dados já persistidos por seeds antigas permanecem na base.
+
+## Riscos
+
+- O import de `app` executa bootstrap de schema e inicia APScheduler.
+- O deployment requer exatamente um processo enquanto o scheduler for
+  in-process.
+- SQLite exige writes curtos e transações explícitas nas transições críticas.
+- Documentação histórica ainda descreve partes da arquitetura anterior.
+- A remoção de PII da árvore atual não a remove do histórico Git.
+
+## Plano e progresso
+
+| Fase | Estado | Ficheiros principais |
+| --- | --- | --- |
+| Auditoria inicial | Concluída | este documento, schema, repositories, testes |
+| A — dados hardcoded | Concluída | `portfolio_reports.py`, bootstrap, testes |
+| B — clientes e mapping | Pendente | novos repositories/schema, assets/portfolios |
+| C — capacidade histórica | Pendente | reporting/repository, assets, relatórios |
+| D — snapshots/aprovação | Pendente | reporting snapshots, geração, repositories |
+| E — fecho mensal/quality gate | Pendente | blueprint, services, templates |
+| F — automatizações | Pendente | automation repository/jobs/UI |
+| G — distribuição | Pendente | repository, routes, templates |
+| H — Sigenergy/Expertcom | Pendente | quality findings e documentação |
+| I — UI/arquitetura/CI | Pendente | navegação, CSS, docs, workflow |
+
+## Bloqueios externos
+
+- Permissão `System history` da Expertcom/Sigenergy.
+- Confirmação oficial da unidade de energia histórica.
+- Orçamento/rate limit diário Sigenergy.
+- Parâmetros e credenciais MQTT.
+- Integração real de envio.
+- Tornar a repository privada.
+- Eventual limpeza do histórico com `git filter-repo`.
+
+Estas ações são manuais e ficam fora desta implementação. Não será executada
+limpeza do histórico Git.
+
+## Registo de implementação
+
+### Fase A
+
+- Removida a constante operacional `PORTFOLIO_EXTERNAL_ROWS`.
+- Removida a seed automática de portefólios, membros, nomes, NIFs e subcontas.
+- Removida a ação UI que voltava a aplicar a seed.
+- Mantido `ensure_portfolio_seed_data()` como hook de compatibilidade sem writes,
+  evitando quebra de imports externos.
+- Bases existentes não sofrem deletes nem updates sobre portefólios existentes.
+- Novos ambientes começam sem portefólios e usam importação Excel/CSV ou UI.
+- Testes com entidades operacionais foram substituídos por dados sintéticos.
+- Verificação focada: 72 testes passaram antes do teste adicional de
+  preservação; a suite focada será repetida antes do commit.

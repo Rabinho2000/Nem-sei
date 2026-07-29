@@ -41,7 +41,6 @@ from monitoring_board.portfolio_reports import (
     filter_report_rows,
     import_helioscope_file,
     map_external_portfolio_entity,
-    seed_external_portfolio_rows,
 )
 from monitoring_board.routes.auth import auth_bp
 from monitoring_board.routes.field_routes import field_routes_bp
@@ -3714,11 +3713,6 @@ def create_app() -> Flask:
                         "success",
                     )
                     return redirect(url_for("portfolios", tab="config", portfolio_id=portfolio_id, report_month=report_month_redirect))
-                if action == "seed_external":
-                    seed_external_portfolio_rows(g.db)
-                    g.db.commit()
-                    flash("Lista externa do portfolio importada/atualizada.", "success")
-                    return redirect(url_for("portfolios", tab="config", portfolio_id=portfolio_id_redirect, report_month=report_month_redirect))
                 if action == "add_asset":
                     portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
                     asset_id_raw = request.form.get("asset_id", "").strip()
@@ -6898,12 +6892,7 @@ def ensure_database_indexes(conn: sqlite3.Connection) -> None:
 
 
 def ensure_portfolio_seed_data(conn: sqlite3.Connection) -> None:
-    for name in ("Solcorelios I", "Solcorelios II"):
-        conn.execute(
-            "INSERT OR IGNORE INTO portfolio_groups (name, notes) VALUES (?, '')",
-            (name,),
-        )
-    seed_external_portfolio_rows(conn)
+    """Compatibility hook retained without inserting operational data."""
 
 
 def encode_job_params(params: dict[str, Any]) -> str:

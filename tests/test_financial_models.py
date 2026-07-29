@@ -35,7 +35,7 @@ def connect(tmp_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def add_asset(conn: sqlite3.Connection, *, name: str = "Usinage", nif: str = "505435748", kwp: str = "138.6") -> int:
+def add_asset(conn: sqlite3.Connection, *, name: str = "Instalacao Modelo", nif: str = "599999991", kwp: str = "138.6") -> int:
     cursor = conn.execute(
         "INSERT INTO assets (project_name, nif, kwp, mounting_date, start_contract) VALUES (?, ?, ?, '2024-01-01', '2024-01-01')",
         (name, nif, kwp),
@@ -55,7 +55,7 @@ def financial_workbook(path: Path, *, sheet_name: str = "Prod month", unit_label
     sheet.append(["Consumption (kWh)", *[month * 120 for month in range(1, len(months) + 1)]])
     sheet.append(["Self consumption (kWh)", *[month * 80 for month in range(1, len(months) + 1)]])
     meta = workbook.create_sheet("UPAC")
-    meta["A4"] = "Usinage"
+    meta["A4"] = "Instalacao Modelo"
     meta["D4"] = 138.6
     workbook.save(path)
 
@@ -74,7 +74,7 @@ def usinage_style_financial_workbook(path: Path) -> None:
     sheet.append(["Grand Total", 93600.0, 78000.0, 70200.0, 0.9])
 
     upac = workbook.create_sheet("UPAC")
-    upac["A4"] = "Usinage"
+    upac["A4"] = "Instalacao Modelo"
     upac["D4"] = 138.6
     upac["D6"] = 84546
     upac["H12"] = "Semanal"
@@ -292,7 +292,7 @@ def test_parse_financial_model_workbook_xlsx_and_mwh_conversion(tmp_path: Path) 
 
     parsed = parse_financial_model_workbook(path)
 
-    assert parsed.detected_name == "Usinage"
+    assert parsed.detected_name == "Instalacao Modelo"
     assert parsed.detected_kwp == 138.6
     assert len(parsed.monthly) == 12
     assert parsed.monthly[0]["expected_production_kwh"] == 100000
@@ -445,7 +445,11 @@ def test_financial_model_precedence_over_helioscope_and_year_isolated(tmp_path: 
     conn = connect(tmp_path)
     try:
         asset_id = add_asset(conn)
-        portfolio_id = conn.execute("SELECT id FROM portfolio_groups WHERE name = 'Solcorelios I'").fetchone()["id"]
+        portfolio_id = int(
+            conn.execute(
+                "INSERT INTO portfolio_groups (name, notes) VALUES ('Portfolio Financeiro', '')"
+            ).lastrowid
+        )
         conn.execute("INSERT INTO portfolio_assets (portfolio_id, asset_id, active, mapping_status, mapping_confidence) VALUES (?, ?, 1, 'manual', 1)", (portfolio_id, asset_id))
         source_id = conn.execute(
             "INSERT INTO source_files (asset_id, file_type, original_filename, stored_path, uploaded_at) VALUES (?, 'helioscope', 'h.xlsx', 'h.xlsx', '2026-01-01')",
@@ -476,7 +480,11 @@ def test_preview_not_used_in_reports_and_real_values_stay_none(tmp_path: Path) -
     conn = connect(tmp_path)
     try:
         asset_id = add_asset(conn)
-        portfolio_id = conn.execute("SELECT id FROM portfolio_groups WHERE name = 'Solcorelios I'").fetchone()["id"]
+        portfolio_id = int(
+            conn.execute(
+                "INSERT INTO portfolio_groups (name, notes) VALUES ('Portfolio Preview', '')"
+            ).lastrowid
+        )
         conn.execute("INSERT INTO portfolio_assets (portfolio_id, asset_id, active, mapping_status, mapping_confidence) VALUES (?, ?, 1, 'manual', 1)", (portfolio_id, asset_id))
         path = tmp_path / "model.xlsx"
         financial_workbook(path)

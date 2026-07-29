@@ -163,7 +163,7 @@ def test_service_periods_snapshots_and_excel_use_same_result(tmp_path: Path) -> 
     result = prepare_portfolio_report(
         conn,
         portfolio_id=portfolio_id,
-        portfolio_name="Solcorelios I",
+        portfolio_name="Portfolio Sintetico",
         profile=profile,
         period_type="quarterly",
         year=2026,
