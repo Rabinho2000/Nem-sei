@@ -18,6 +18,7 @@ class SigenergyEndpoints:
     systems_endpoint: str
     energy_flow_endpoint: str
     region: str = "eu"
+    history_endpoint: str = "/openapi/systems/{system_id}/history"
 
 
 @dataclass(frozen=True)

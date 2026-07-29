@@ -93,7 +93,10 @@ def build_asset_close_payload(
     sigenergy_history_status = ""
     sigenergy_unit_confirmed = False
     if provider.casefold() == "sigenergy":
-        sigenergy_history_status = "not_implemented"
+        sigenergy_unit_confirmed = True
+        sigenergy_history_status = (
+            "available" if quality.status == "complete" else "backfill_incomplete"
+        )
     return {
         "asset_id": asset_id,
         "customer_id": asset["customer_id"],

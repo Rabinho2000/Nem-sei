@@ -60,6 +60,10 @@ class SigenergyClient:
                 systems_endpoint=str(config.get("systems_endpoint") or config.get("plants_endpoint") or ""),
                 energy_flow_endpoint=str(config.get("energy_flow_endpoint") or ""),
                 region=str(config.get("region") or "eu"),
+                history_endpoint=str(
+                    config.get("history_endpoint")
+                    or "/openapi/systems/{system_id}/history"
+                ),
             )
             self.credentials = SigenergyCredentials(
                 app_key=str(config.get("username") or config.get("app_key") or ""),
@@ -113,7 +117,9 @@ class SigenergyClient:
         method: str,
         endpoint: str,
         *,
+        params: dict[str, Any] | None = None,
         json_payload: Any | None = None,
+        api_area: str = "state",
         validate_code: bool = True,
         refreshed: bool = False,
     ) -> dict[str, Any]:
@@ -125,6 +131,7 @@ class SigenergyClient:
                     method,
                     build_sigenergy_url(self.endpoints.base_url, endpoint),
                     headers=bearer_headers(token, self.endpoints.region),
+                    params=params,
                     json=json_payload,
                     timeout=30,
                 )
@@ -135,7 +142,9 @@ class SigenergyClient:
                 if status_code == 401 and not refreshed:
                     raise SigenergyAuthError("Sigenergy HTTP 401.", status_code=status_code) from exc
                 if http_rate_limited_status(status_code):
-                    raise sigenergy_rate_limit_error("Sigenergy HTTP 429.") from exc
+                    raise sigenergy_rate_limit_error(
+                        "Sigenergy HTTP 429.", api_area=api_area
+                    ) from exc
                 if http_retryable_status(status_code):
                     raise ApiTransientError(f"Sigenergy HTTP {status_code}") from exc
                 raise SigenergyApiError(sanitize_sigenergy_error(exc), status_code=status_code, error_type="http") from exc
@@ -149,7 +158,15 @@ class SigenergyClient:
                 raise
             self.invalidate_access_token()
             self.get_access_token(force_login=True)
-            return self.request_json(method, endpoint, json_payload=json_payload, validate_code=validate_code, refreshed=True)
+            return self.request_json(
+                method,
+                endpoint,
+                params=params,
+                json_payload=json_payload,
+                api_area=api_area,
+                validate_code=validate_code,
+                refreshed=True,
+            )
         payload = self._json_response(response)
         if validate_code:
             parse_sigenergy_response(payload)
@@ -174,6 +191,28 @@ class SigenergyClient:
         payload = self.request_json("GET", endpoint)
         data = parse_sigenergy_response(payload)
         return data if isinstance(data, dict) else {"raw_data": data}
+
+    def get_system_history(
+        self,
+        system_id: str,
+        *,
+        level: str,
+        target_date: str,
+    ) -> dict[str, Any]:
+        endpoint = self.endpoints.history_endpoint.replace("{systemId}", "{system_id}")
+        endpoint = endpoint.replace("{system_id}", str(system_id))
+        payload = self.request_json(
+            "GET",
+            endpoint,
+            params={"level": level, "date": target_date},
+            api_area="production",
+        )
+        data = parse_sigenergy_response(payload)
+        if not isinstance(data, dict):
+            raise SigenergyApiError(
+                "A resposta de histórico Sigenergy não contém um objeto de dados."
+            )
+        return normalize_system_history(data)
 
     def _authenticate_payload(self) -> dict[str, Any]:
         app_key = self.credentials.app_key.strip()
@@ -228,8 +267,10 @@ def configured_system_rows(system_ids: str | list[str]) -> list[dict[str, str]]:
     return [{"systemId": item, "systemName": item} for item in ids]
 
 
-def sigenergy_rate_limit_error(message: str) -> ApiRateLimitError:
-    return ApiRateLimitError("Sigenergy", "state", datetime.now() + timedelta(minutes=60), message)
+def sigenergy_rate_limit_error(message: str, *, api_area: str = "state") -> ApiRateLimitError:
+    return ApiRateLimitError(
+        "Sigenergy", api_area, datetime.now() + timedelta(minutes=60), message
+    )
 
 
 def client_from_config(config: dict[str, Any], session: requests.Session | None = None) -> SigenergyClient:
@@ -263,3 +304,48 @@ def list_systems(
 
 def get_energy_flow(config: dict[str, Any], system_id: str, session: requests.Session | None = None) -> dict[str, Any]:
     return client_from_config(config, session=session).get_energy_flow(system_id)
+
+
+def get_system_history(
+    config: dict[str, Any],
+    system_id: str,
+    *,
+    level: str,
+    target_date: str,
+    session: requests.Session | None = None,
+) -> dict[str, Any]:
+    return client_from_config(config, session=session).get_system_history(
+        system_id,
+        level=level,
+        target_date=target_date,
+    )
+
+
+def normalize_system_history(data: dict[str, Any]) -> dict[str, Any]:
+    """Map independent energy counters without adding overlapping metrics."""
+    mapping = {
+        "production_kwh": "powerGenerationKwh",
+        "consumption_kwh": "powerUseKwh",
+        "export_kwh": "powerToGridKwh",
+        "grid_import_kwh": "powerFromGridKwh",
+        "self_consumption_kwh": "powerSelfConsumptionKwh",
+        "battery_charging_kwh": "esChargingKwh",
+        "battery_discharging_kwh": "esDischargingKwh",
+    }
+    return {
+        key: _history_number(data.get(source))
+        for key, source in mapping.items()
+    } | {
+        "item_list": data.get("itemList") if isinstance(data.get("itemList"), list) else [],
+        "raw_data": data,
+    }
+
+
+def _history_number(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        number = float(str(value))
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None

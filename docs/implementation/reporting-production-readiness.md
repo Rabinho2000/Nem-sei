@@ -87,8 +87,6 @@ Documento vivo da implementação da pipeline operacional de relatórios.
 
 ## Bloqueios externos
 
-- Permissão `System history` da Expertcom/Sigenergy.
-- Confirmação oficial da unidade de energia histórica.
 - Orçamento/rate limit diário Sigenergy.
 - Parâmetros e credenciais MQTT.
 - Integração real de envio.
@@ -210,8 +208,8 @@ limpeza do histórico Git.
 
 ### Fases H e I
 
-- O readiness Sigenergy no fecho mensal distingue permissão histórica,
-  confirmação de unidade e utilizabilidade do mês; FusionSolar continua válido
+- O readiness Sigenergy exige um mês completo utilizável; a permissão histórica
+  e os campos kWh da Expertcom estão confirmados. FusionSolar continua válido
   quando é a fonte primária completa.
 - A navegação de Relatórios separa Gerar, Fecho mensal, Automatizações,
   Distribuição, Templates e Histórico.
@@ -279,8 +277,6 @@ validar foreign keys, contagens e histórico, e executar um smoke test completo.
 
 Continuam fora desta implementação:
 
-- atribuição da permissão `System history` pela Expertcom;
-- confirmação oficial da unidade histórica em kWh;
 - confirmação do orçamento/rate limit diário Sigenergy;
 - definição documentada de parâmetros e tópicos MQTT;
 - tornar a repository privada;

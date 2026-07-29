@@ -109,16 +109,16 @@ def evaluate_report_quality(
                 row.get("sigenergy_energy_unit_confirmed")
                 or payload.get("sigenergy_energy_unit_confirmed")
             )
-            if history_status in {"forbidden", "missing_permission"}:
+            if history_status in {"backfill_incomplete", "month_unusable"}:
                 findings.append(
                     finding(
-                        "sigenergy_history_forbidden",
+                        "sigenergy_history_incomplete",
                         BLOCKED,
                         scope,
                         asset_id,
-                        "O histórico Sigenergy não está autorizado.",
+                        "O histórico Sigenergy ainda não cobre um mês utilizável.",
                         "sigenergy_history",
-                        "Solicitar à Expertcom a permissão System history.",
+                        "Executar o backfill normal e validar a cobertura mensal completa.",
                     )
                 )
             if not unit_confirmed:

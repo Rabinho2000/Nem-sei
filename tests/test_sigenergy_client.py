@@ -67,11 +67,20 @@ class QueueSession:
         url: str,
         *,
         headers: dict[str, str],
+        params: dict[str, Any] | None,
         json: Any | None,
         timeout: int,
     ) -> FakeResponse:
         assert timeout == 30
-        self.requests.append({"method": method, "url": url, "json": json, "headers": headers})
+        self.requests.append(
+            {
+                "method": method,
+                "url": url,
+                "params": params,
+                "json": json,
+                "headers": headers,
+            }
+        )
         return self.responses_by_url[url].pop(0)
 
 
@@ -152,6 +161,113 @@ def test_energy_flow_current_by_system() -> None:
     assert flow["systemId"] == "SIG-001"
     assert flow["pvPower"] == 4.25
     assert session.requests[0]["url"] == "https://sigenergy.example.test/openapi/systems/SIG-001/energyFlow"
+    assert session.requests[0]["params"] is None
+    assert session.requests[0]["json"] is None
+
+
+def test_history_get_uses_query_parameters_and_maps_energy_without_double_counting() -> None:
+    history_url = "https://sigenergy.example.test/openapi/systems/SIG-001/history"
+    history_data = {
+        "powerGenerationKwh": "42.5",
+        "powerUseKwh": "38.2",
+        "powerToGridKwh": "10.1",
+        "powerFromGridKwh": "5.8",
+        "powerSelfConsumptionKwh": "32.4",
+        "powerOneselfKwh": "31.9",
+        "esChargingKwh": "3.2",
+        "esDischargingKwh": "2.7",
+        "itemList": [{"time": "2026-07-28", "powerGenerationKwh": "42.5"}],
+    }
+    session = QueueSession(
+        {
+            "https://sigenergy.example.test/openapi/auth/login/key": [
+                FakeResponse(load_fixture("auth_success_object.json"))
+            ],
+            history_url: [FakeResponse({"code": 0, "message": "success", "data": history_data})],
+        }
+    )
+
+    result = client(session).get_system_history(
+        "SIG-001", level="Day", target_date="2026-07-28"
+    )
+
+    sent = session.requests[0]
+    assert sent["method"] == "GET"
+    assert sent["params"] == {"level": "Day", "date": "2026-07-28"}
+    assert sent["json"] is None
+    assert result["production_kwh"] == 42.5
+    assert result["consumption_kwh"] == 38.2
+    assert result["export_kwh"] == 10.1
+    assert result["grid_import_kwh"] == 5.8
+    assert result["self_consumption_kwh"] == 32.4
+    assert result["battery_charging_kwh"] == 3.2
+    assert result["battery_discharging_kwh"] == 2.7
+    assert "power_oneself_kwh" not in result
+
+
+def test_history_regression_rejects_json_body_but_accepts_query_parameters() -> None:
+    class QueryOnlySession(QueueSession):
+        def request(self, method, url, *, headers, params, json, timeout):
+            if method == "GET" and json is not None:
+                self.requests.append(
+                    {
+                        "method": method,
+                        "url": url,
+                        "params": params,
+                        "json": json,
+                        "headers": headers,
+                    }
+                )
+                return FakeResponse("<html>CloudFront 403</html>", status_code=403)
+            assert params == {"level": "Day", "date": "2026-07-28"}
+            return super().request(
+                method,
+                url,
+                headers=headers,
+                params=params,
+                json=json,
+                timeout=timeout,
+            )
+
+    history_url = "https://sigenergy.example.test/openapi/systems/SIG-001/history"
+    session = QueryOnlySession(
+        {
+            "https://sigenergy.example.test/openapi/auth/login/key": [
+                FakeResponse(load_fixture("auth_success_object.json"))
+            ],
+            history_url: [
+                FakeResponse(
+                    {
+                        "code": 0,
+                        "message": "success",
+                        "data": {"powerGenerationKwh": 12.3, "itemList": []},
+                    }
+                )
+            ],
+        }
+    )
+
+    history_client = client(session)
+    with pytest.raises(SigenergyApiError) as rejected:
+        history_client.request_json(
+            "GET",
+            "/openapi/systems/SIG-001/history",
+            json_payload={"level": "Day", "date": "2026-07-28"},
+            api_area="production",
+        )
+    assert rejected.value.status_code == 403
+
+    result = history_client.get_system_history(
+        "SIG-001", level="Day", target_date="2026-07-28"
+    )
+
+    assert result["production_kwh"] == 12.3
+    assert session.requests[0]["json"] is not None
+    assert session.requests[1]["params"] == {
+        "level": "Day",
+        "date": "2026-07-28",
+    }
+    assert session.requests[1]["json"] is None
 
 
 def test_401_invalidates_token_and_relogs_once() -> None:

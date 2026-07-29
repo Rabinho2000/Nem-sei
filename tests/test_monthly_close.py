@@ -94,17 +94,17 @@ def test_required_availability_and_customer_are_blocked() -> None:
     }
 
 
-def test_sigenergy_unconfirmed_history_cannot_be_approved() -> None:
+def test_sigenergy_incomplete_history_cannot_be_approved() -> None:
     payload = {
         **complete_row(),
         "energy_provider": "Sigenergy",
-        "sigenergy_history_status": "missing_permission",
+        "sigenergy_history_status": "backfill_incomplete",
         "sigenergy_energy_unit_confirmed": False,
         "availability_pct": "99",
     }
     result = evaluate(payload)
     assert result.status == BLOCKED
     assert {
-        "sigenergy_history_forbidden",
+        "sigenergy_history_incomplete",
         "sigenergy_energy_unit_unconfirmed",
     } <= {item.code for item in result.blockers}
