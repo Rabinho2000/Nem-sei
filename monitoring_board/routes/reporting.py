@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import date, timedelta
 
 from flask import Blueprint, flash, g, redirect, render_template, request, session, url_for
@@ -11,6 +12,11 @@ from monitoring_board.portfolio_report_repository import (
 from monitoring_board.reporting.monthly_close import (
     build_asset_close_payload,
     evaluate_close_payload,
+)
+from monitoring_board.reporting.distribution import (
+    create_distribution,
+    create_recipient,
+    transition_distribution,
 )
 from monitoring_board.reporting.periods import month_bounds
 from monitoring_board.reporting.portfolio import profile_to_config, result_to_dict
@@ -244,6 +250,109 @@ def snapshot_preview(snapshot_id: int):
         snapshot=snapshot,
         events=events,
     )
+
+
+@reporting_bp.route("/distribution")
+def distribution_queue():
+    recipients = g.db.execute(
+        """
+        SELECT r.*, c.name AS customer_name, a.project_name AS asset_name,
+               p.name AS portfolio_name
+        FROM report_recipients r
+        LEFT JOIN customers c ON c.id = r.customer_id
+        LEFT JOIN assets a ON a.id = r.asset_id
+        LEFT JOIN portfolio_groups p ON p.id = r.portfolio_id
+        ORDER BY r.active DESC, r.name COLLATE NOCASE
+        """
+    ).fetchall()
+    distributions = g.db.execute(
+        """
+        SELECT d.*, r.name AS recipient_name, f.filename, f.id AS file_id
+        FROM report_distributions d
+        JOIN report_recipients r ON r.id = d.recipient_id
+        JOIN report_generated_files f ON f.id = d.generated_file_id
+        ORDER BY d.created_at DESC, d.id DESC
+        """
+    ).fetchall()
+    files = g.db.execute(
+        """
+        SELECT f.* FROM report_generated_files f
+        JOIN report_snapshots s ON s.id = f.snapshot_id
+        WHERE f.status = 'completed' AND s.approval_status = 'approved'
+        ORDER BY f.created_at DESC
+        """
+    ).fetchall()
+    return render_template(
+        "reporting/distribution.html",
+        recipients=recipients,
+        distributions=distributions,
+        files=files,
+        customers=g.db.execute("SELECT id, name FROM customers WHERE active = 1 ORDER BY name").fetchall(),
+        assets=g.db.execute("SELECT id, project_name FROM assets ORDER BY project_name").fetchall(),
+        portfolios=g.db.execute("SELECT id, name FROM portfolio_groups WHERE active = 1 ORDER BY name").fetchall(),
+    )
+
+
+@reporting_bp.post("/distribution/recipients")
+def add_distribution_recipient():
+    scope_type = request.form.get("scope_type", "")
+    scope_id = int(request.form.get("scope_id", "0") or 0)
+    try:
+        create_recipient(
+            g.db,
+            name=request.form.get("name", ""),
+            email=request.form.get("email", ""),
+            customer_id=scope_id if scope_type == "customer" else None,
+            asset_id=scope_id if scope_type == "asset" else None,
+            portfolio_id=scope_id if scope_type == "portfolio" else None,
+        )
+        g.db.commit()
+        flash("Destinatário criado.", "success")
+    except (ValueError, sqlite3.IntegrityError):
+        g.db.rollback()
+        flash("Destinatário inválido ou já existente para este âmbito.", "error")
+    return redirect(url_for("reporting.distribution_queue"))
+
+
+@reporting_bp.post("/distribution/items")
+def add_distribution_item():
+    try:
+        create_distribution(
+            g.db,
+            generated_file_id=int(request.form.get("generated_file_id", "0") or 0),
+            recipient_id=int(request.form.get("recipient_id", "0") or 0),
+            actor=str(session.get("username") or ""),
+        )
+        g.db.commit()
+        flash("Ficheiro preparado para distribuição manual.", "success")
+    except ValueError:
+        g.db.rollback()
+        flash("O ficheiro ou destinatário não cumpre os requisitos de distribuição.", "error")
+    return redirect(url_for("reporting.distribution_queue"))
+
+
+@reporting_bp.post("/distribution/items/<int:distribution_id>/<action>")
+def update_distribution_item(distribution_id: int, action: str):
+    targets = {
+        "approve": "approved_to_send",
+        "cancel": "cancelled",
+        "retry": "ready_to_send",
+    }
+    if action not in targets:
+        raise ValueError("invalid_distribution_action")
+    try:
+        transition_distribution(
+            g.db,
+            distribution_id,
+            targets[action],
+            actor=str(session.get("username") or ""),
+        )
+        g.db.commit()
+        flash("Estado de distribuição atualizado.", "success")
+    except ValueError:
+        g.db.rollback()
+        flash("A transição de estado não é permitida.", "error")
+    return redirect(url_for("reporting.distribution_queue"))
 
 
 def normalize_month(value: str) -> str:

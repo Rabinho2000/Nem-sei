@@ -81,7 +81,7 @@ Documento vivo da implementação da pipeline operacional de relatórios.
 | D — snapshots/aprovação | Concluída | reporting snapshots, quality gate, auditoria |
 | E — fecho mensal/quality gate | Concluída | blueprint, services, templates, tests |
 | F — automatizações | Concluída | automation repository/jobs/UI/tests |
-| G — distribuição | Pendente | repository, routes, templates |
+| G — distribuição | Concluída | repository, routes, templates, tests |
 | H — Sigenergy/Expertcom | Pendente | quality findings e documentação |
 | I — UI/arquitetura/CI | Pendente | navegação, CSS, docs, workflow |
 
@@ -192,3 +192,18 @@ limpeza do histórico Git.
   sem fixar permanentemente um snapshot mensal.
 - A deduplicação usa automatização + snapshot; retries de runs falhados
   continuam possíveis e runs interrompidos preservam a recuperação existente.
+
+### Fase G
+
+- Criadas entidades persistentes para destinatários, distribuições e eventos de
+  auditoria, com migrations SQLite idempotentes e não destrutivas.
+- Destinatários exigem email válido e associação persistente a exatamente um
+  cliente, instalação ou portefólio.
+- Só ficheiros íntegros, existentes e ligados a snapshots aprovados podem
+  entrar em `ready_to_send`.
+- A UI permite preparar, aprovar para envio, cancelar, repor falhas e descarregar
+  manualmente o ficheiro existente.
+- A fila termina em `approved_to_send`: não existe SMTP, API de email, webhook,
+  credencial ou envio real nesta implementação.
+- O estado e cada transição ficam auditados; a preparação é idempotente por
+  ficheiro, destinatário e canal.

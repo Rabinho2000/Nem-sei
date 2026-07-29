@@ -18,7 +18,9 @@
 
 <nav class="reports-tabs" aria-label="Área de relatórios">
   <a href="{{ url_for('exports', tab='generate') }}" class="{{ 'active' if active_tab in ['generate', 'history'] else '' }}" aria-current="{{ 'page' if active_tab in ['generate', 'history'] else 'false' }}">Gerar agora</a>
+  <a href="{{ url_for('reporting.monthly_close') }}">Fecho mensal</a>
   <a href="{{ url_for('exports', tab='automations') }}" class="{{ 'active' if active_tab == 'automations' else '' }}" aria-current="{{ 'page' if active_tab == 'automations' else 'false' }}">Automatizações</a>
+  <a href="{{ url_for('reporting.distribution_queue') }}">Distribuição</a>
   <a href="{{ url_for('exports', tab='templates') }}" class="{{ 'active' if active_tab == 'templates' else '' }}" aria-current="{{ 'page' if active_tab == 'templates' else 'false' }}">Templates e regras</a>
 </nav>
 
