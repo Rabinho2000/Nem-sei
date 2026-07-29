@@ -260,3 +260,32 @@ env -i \
 
 O diretório indicado por `DATA_DIR` é descartável. Esta configuração não deve
 conter endpoints, IDs, NIFs, emails, tokens ou dados energéticos reais.
+
+## Verificação final
+
+- `python3 -m compileall -q monitoring_board`: passou.
+- Suite focada final: 130 testes passaram.
+- Suite completa final: 517 testes passaram, 0 falhas.
+- `python scripts/check_tracked_secrets.py`: 254 ficheiros tracked verificados,
+  sem findings.
+- `git diff --check`: passou.
+- Worktree final: limpa.
+
+## Operação e bloqueios externos
+
+Antes de qualquer produção, rever os commits e repetir os testes num staging
+isolado. Aplicar a inicialização idempotente apenas sobre uma cópia da SQLite,
+validar foreign keys, contagens e histórico, e executar um smoke test completo.
+
+Continuam fora desta implementação:
+
+- atribuição da permissão `System history` pela Expertcom;
+- confirmação oficial da unidade histórica em kWh;
+- confirmação do orçamento/rate limit diário Sigenergy;
+- definição documentada de parâmetros e tópicos MQTT;
+- tornar a repository privada;
+- eventual limpeza do histórico Git com `git filter-repo`;
+- integração futura de envio real após escolha de canal e gestão de credenciais.
+
+Nenhuma destas ações foi executada. Também não houve push, merge, deployment,
+Docker, systemctl, sudo, migration externa ou chamada real às APIs.
