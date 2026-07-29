@@ -68,6 +68,12 @@ from monitoring_board.customer_reports import (
     prepare_customer_report,
 )
 from monitoring_board.customer_repository import ensure_customer_schema
+from monitoring_board.asset_capacity_repository import (
+    add_capacity_expansion,
+    ensure_asset_capacity_schema,
+    list_capacity_periods,
+    update_capacity_period,
+)
 from monitoring_board.financial_model_repository import (
     ensure_financial_model_schema,
     get_asset_model as get_financial_model_for_asset,
@@ -1643,6 +1649,7 @@ def create_app() -> Flask:
             (current_installation_group,),
         )
         financial_model = build_asset_financial_model_context(g.db, asset_id=asset_id)
+        capacity_periods = list_capacity_periods(g.db, asset_id)
         requested_import_id = request.args.get("import_id", "").strip()
         installation_import_summary = (
             get_installation_import_context(g.db, int(requested_import_id))
@@ -1677,8 +1684,59 @@ def create_app() -> Flask:
             latest_device_rows=latest_device_rows,
             expected_strings_by_device=expected_strings_by_device,
             financial_model=financial_model,
+            capacity_periods=capacity_periods,
             installation_import_summary=installation_import_summary,
         )
+
+    @app.route("/asset/<int:asset_id>/capacity/expansion", methods=["POST"])
+    def add_asset_capacity_expansion(asset_id: int):
+        try:
+            add_capacity_expansion(
+                g.db,
+                asset_id=asset_id,
+                valid_from=request.form.get("valid_from", ""),
+                installed_power_kwp=request.form.get("installed_power_kwp", ""),
+                reason=request.form.get("reason", ""),
+            )
+            g.db.commit()
+        except ValueError as exc:
+            g.db.rollback()
+            messages = {
+                "capacity_invalid_date": "Indica uma data válida para a expansão.",
+                "capacity_power_must_be_positive": "A potência deve ser positiva.",
+                "capacity_period_overlap": "O novo período sobrepõe-se ao histórico existente.",
+            }
+            flash(messages.get(str(exc), "Não foi possível guardar a expansão."), "error")
+        else:
+            flash("Expansão adicionada ao histórico de potência.", "success")
+        return redirect(url_for("asset_detail", asset_id=asset_id))
+
+    @app.route("/asset/<int:asset_id>/capacity/<int:period_id>", methods=["POST"])
+    def update_asset_capacity_period(asset_id: int, period_id: int):
+        try:
+            update_capacity_period(
+                g.db,
+                period_id=period_id,
+                asset_id=asset_id,
+                valid_from=request.form.get("valid_from", ""),
+                valid_to=request.form.get("valid_to", ""),
+                installed_power_kwp=request.form.get("installed_power_kwp", ""),
+                reason=request.form.get("reason", ""),
+            )
+            g.db.commit()
+        except ValueError as exc:
+            g.db.rollback()
+            messages = {
+                "capacity_invalid_date": "Indica datas válidas.",
+                "capacity_invalid_period": "A data final não pode anteceder a data inicial.",
+                "capacity_power_must_be_positive": "A potência deve ser positiva.",
+                "capacity_period_overlap": "O período sobrepõe-se a outro período.",
+                "capacity_period_not_found": "O período já não existe.",
+            }
+            flash(messages.get(str(exc), "Não foi possível corrigir o período."), "error")
+        else:
+            flash("Período de potência atualizado.", "success")
+        return redirect(url_for("asset_detail", asset_id=asset_id))
 
     @app.route("/asset/<int:asset_id>/financial-model/upload", methods=["POST"])
     def upload_asset_financial_model(asset_id: int):
@@ -6751,6 +6809,7 @@ def ensure_database(path: str) -> None:
         ensure_predefined_export_templates(conn)
         ensure_portfolio_management_schema(conn)
         ensure_customer_schema(conn)
+        ensure_asset_capacity_schema(conn)
         ensure_portfolio_reporting_schema(conn)
         ensure_report_template_schema(conn)
         ensure_financial_model_schema(conn)

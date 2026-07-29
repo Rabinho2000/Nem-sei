@@ -11,6 +11,7 @@ from typing import Any
 
 from openpyxl import Workbook, load_workbook
 
+from monitoring_board.asset_capacity_repository import resolve_capacity_for_period
 from monitoring_board.portfolio_repository import (
     auto_map_portfolio_assets as repository_auto_map_portfolio_assets,
     suggest_mapping,
@@ -722,13 +723,35 @@ def build_portfolio_report_rows(
         expected_grid_import_kwh = float(financial_expected["expected_grid_import_kwh"]) if financial_expected and financial_expected["expected_grid_import_kwh"] is not None else None
         expected_self_consumption_rate_pct = float(financial_expected["expected_self_consumption_rate_pct"]) if financial_expected and financial_expected["expected_self_consumption_rate_pct"] is not None else None
         expected_self_sufficiency_rate_pct = float(financial_expected["expected_self_sufficiency_rate_pct"]) if financial_expected and financial_expected["expected_self_sufficiency_rate_pct"] is not None else None
-        expected_specific_yield = None
-        if expected_kwh is not None and parse_float(asset["kwp"]):
-            expected_specific_yield = expected_kwh / parse_float(asset["kwp"])
         if expected_kwh is None:
             expected = get_latest_helioscope_expected(conn, asset_id, start.month)
             expected_kwh = float(expected["expected_kwh"]) if expected else None
             expected_source = "helioscope" if expected else "none"
+        capacity = (
+            resolve_capacity_for_period(
+                conn,
+                asset_id=asset_id,
+                period_start=start,
+                period_end=end,
+                fallback_kwp=asset["kwp"],
+            )
+            if asset_id is not None
+            else None
+        )
+        installed_power_kwp = (
+            float(capacity.installed_power_kwp)
+            if capacity and capacity.installed_power_kwp is not None
+            else None
+        )
+        if capacity and capacity.ambiguous:
+            warnings.append("ambiguous_installed_power")
+        elif installed_power_kwp is None:
+            warnings.append("missing_installed_power")
+        expected_specific_yield = (
+            expected_kwh / installed_power_kwp
+            if expected_kwh is not None and installed_power_kwp
+            else None
+        )
         if expected_kwh is None:
             warnings.append("missing_helioscope_expected")
         mount_raw = asset["mounting_date"] or asset["start_contract"]
@@ -851,7 +874,8 @@ def build_portfolio_report_rows(
                 "local_installation": asset["project_name"] or "",
                 "nif": asset["nif"] or asset["asset_nif"] or "",
                 "sub_account": asset["sub_account"] or "",
-                "installed_power_kwp": parse_float(asset["kwp"]),
+                "installed_power_kwp": installed_power_kwp,
+                "installed_power_source": capacity.source if capacity else "missing",
                 "actual_production_kwh": round(actual, 2) if actual is not None else None,
                 "raw_daily_production_kwh": round(production_quality.raw_daily_total_kwh, 2) if production_quality.raw_daily_total_kwh is not None else None,
                 "production_quality_status": production_quality.status,

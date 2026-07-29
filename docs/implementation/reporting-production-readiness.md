@@ -77,7 +77,7 @@ Documento vivo da implementação da pipeline operacional de relatórios.
 | Auditoria inicial | Concluída | este documento, schema, repositories, testes |
 | A — dados hardcoded | Concluída | `portfolio_reports.py`, bootstrap, testes |
 | B — clientes e mapping | Concluída | `customer_repository.py`, assets/portfolios |
-| C — capacidade histórica | Pendente | reporting/repository, assets, relatórios |
+| C — capacidade histórica | Concluída | capacity repository, assets, relatórios |
 | D — snapshots/aprovação | Pendente | reporting snapshots, geração, repositories |
 | E — fecho mensal/quality gate | Pendente | blueprint, services, templates |
 | F — automatizações | Pendente | automation repository/jobs/UI |
@@ -129,3 +129,19 @@ limpeza do histórico Git.
   confiança e estado do mapping.
 - Verificação focada: 68 testes passaram, incluindo schema antigo, idempotência,
   dois assets do mesmo cliente, alias, System ID, conflito e mapping manual.
+
+### Fase C
+
+- Criada `asset_capacity_periods` com validade, potência positiva, motivo,
+  origem e auditoria temporal.
+- Backfill inicial só é criado quando existem potência válida e uma data segura
+  (`mounting_date` ou `start_contract`); nenhuma data é inventada.
+- `assets.kwp` permanece como fallback de compatibilidade.
+- Períodos sobrepostos são rejeitados e uma expansão fecha o período anterior.
+- Um período de relatório atravessado por mais de uma capacidade fica ambíguo,
+  em vez de escolher silenciosamente uma potência.
+- Reporting de portefólio resolve a capacidade histórica para specific yield e
+  ponderação de disponibilidade.
+- UI do asset permite consultar, corrigir e adicionar expansões.
+- Verificação focada: 70 testes passaram. A primeira execução encontrou apenas
+  uma coluna errada na nova fixture, corrigida para o schema real.

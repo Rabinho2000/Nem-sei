@@ -14,6 +14,44 @@
 
 {% include "integrations/_import_summary.html" %}
 
+<section class="card">
+  <div class="section-title">
+    <div>
+      <h3>Histórico de potência instalada</h3>
+      <p class="muted">A potência do asset continua a ser usada como fallback quando não existe um período aplicável.</p>
+    </div>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Desde</th><th>Até</th><th>kWp</th><th>Origem</th><th>Motivo</th><th>Ação</th></tr></thead>
+      <tbody>
+        {% for period in capacity_periods %}
+          <tr>
+              <td><input form="capacity-period-{{ period.id }}" type="date" name="valid_from" value="{{ period.valid_from }}" required aria-label="Início do período"></td>
+              <td><input form="capacity-period-{{ period.id }}" type="date" name="valid_to" value="{{ period.valid_to or '' }}" aria-label="Fim do período"></td>
+              <td><input form="capacity-period-{{ period.id }}" type="number" name="installed_power_kwp" min="0.001" step="0.001" value="{{ period.installed_power_kwp }}" required aria-label="Potência instalada kWp"></td>
+              <td>{{ period.source }}</td>
+              <td><input form="capacity-period-{{ period.id }}" type="text" name="reason" value="{{ period.reason or '' }}" aria-label="Motivo do período"></td>
+              <td>
+                <form id="capacity-period-{{ period.id }}" method="post" action="{{ url_for('update_asset_capacity_period', asset_id=asset.id, period_id=period.id) }}">
+                  <button class="button secondary small" type="submit">Corrigir</button>
+                </form>
+              </td>
+          </tr>
+        {% else %}
+          <tr><td colspan="6" class="muted">Sem histórico temporal; fallback atual: {{ asset.kwp or '-' }} kWp.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <form class="inline-form top-space" method="post" action="{{ url_for('add_asset_capacity_expansion', asset_id=asset.id) }}">
+    <label>Data da expansão <input type="date" name="valid_from" required></label>
+    <label>Nova potência kWp <input type="number" name="installed_power_kwp" min="0.001" step="0.001" required></label>
+    <label>Motivo <input type="text" name="reason" placeholder="Expansão, correção..."></label>
+    <button class="button" type="submit">Adicionar expansão</button>
+  </form>
+</section>
+
 <datalist id="installation-group-options">
   {% for group in installation_groups %}
     <option value="{{ group.name }}">{{ group.member_count }} central{{ '' if group.member_count == 1 else 's' }}</option>
