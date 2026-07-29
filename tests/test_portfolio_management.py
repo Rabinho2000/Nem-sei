@@ -106,6 +106,98 @@ def test_mapping_decisions_exact_fuzzy_conflict_and_manual(tmp_path: Path) -> No
     assert conn.execute("SELECT asset_id FROM portfolio_assets WHERE id = ?", (member_id,)).fetchone()[0] is None
 
 
+def test_same_customer_nif_uses_installation_alias_or_stays_pending(tmp_path: Path) -> None:
+    conn = connect(tmp_path)
+    north = add_asset(conn, "Central Norte", "599999991")
+    south = add_asset(conn, "Central Sul", "599999991")
+    repo.upsert_alias(conn, asset_id=north, alias_name="Armazem Norte", source="manual")
+
+    selected = repo.suggest_mapping(
+        conn,
+        external_name="Armazem Norte",
+        nif="599999991",
+    )
+    pending = repo.suggest_mapping(conn, external_name="", nif="599999991")
+
+    assert selected.auto_mappable is True
+    assert selected.asset_id == north
+    assert selected.method == "alias_exact"
+    assert pending.status == "mapping_pending"
+    assert pending.asset_id is None
+    assert {candidate.asset_id for candidate in pending.candidates} == {north, south}
+    assert "customer_multiple_assets" in pending.warnings
+
+
+def test_same_customer_nif_uses_system_id_and_detects_contradiction(tmp_path: Path) -> None:
+    conn = connect(tmp_path)
+    north = add_asset(conn, "Central Norte", "599999991")
+    south = add_asset(conn, "Central Sul", "599999991")
+    other = add_asset(conn, "Central Externa", "588888882")
+    conn.execute(
+        """
+        INSERT INTO asset_integrations (
+            asset_id, provider, external_id, external_name, enabled
+        ) VALUES (?, 'FusionSolar', 'STATION-NORTH', 'Central Norte', 1)
+        """,
+        (north,),
+    )
+    conn.execute(
+        """
+        INSERT INTO asset_integrations (
+            asset_id, provider, external_id, external_name, enabled
+        ) VALUES (?, 'FusionSolar', 'STATION-OTHER', 'Central Externa', 1)
+        """,
+        (other,),
+    )
+
+    selected = repo.suggest_mapping(
+        conn,
+        external_name="",
+        nif="599999991",
+        external_id="STATION-NORTH",
+    )
+    conflict = repo.suggest_mapping(
+        conn,
+        external_name="",
+        nif="599999991",
+        external_id="STATION-OTHER",
+    )
+
+    assert selected.auto_mappable is True
+    assert selected.asset_id == north
+    assert selected.method == "external_id_exact"
+    assert conflict.status == "mapping_conflict"
+    assert conflict.asset_id is None
+    assert "identifier_disagreement" in conflict.warnings
+    assert south != north
+
+
+def test_auto_mapping_preserves_existing_manual_mapping(tmp_path: Path) -> None:
+    conn = connect(tmp_path)
+    selected = add_asset(conn, "Central Selecionada", "599999991")
+    competing = add_asset(conn, "Nome Externo", "588888882")
+    portfolio_id = repo.create_portfolio(conn, name="Portfolio Manual")
+    member_id = repo.add_member(
+        conn,
+        portfolio_id=portfolio_id,
+        asset_id=selected,
+        external_name="Nome Externo",
+        nif="588888882",
+        mapping_method="manual",
+    )
+
+    repo.auto_map_portfolio_assets(conn, portfolio_id)
+
+    row = conn.execute(
+        "SELECT asset_id, mapping_method, mapping_status FROM portfolio_assets WHERE id = ?",
+        (member_id,),
+    ).fetchone()
+    assert row["asset_id"] == selected
+    assert row["asset_id"] != competing
+    assert row["mapping_method"] == "manual"
+    assert row["mapping_status"] == "manual"
+
+
 def test_portfolio_crud_members_order_copy_move_and_delete_rules(tmp_path: Path) -> None:
     conn = connect(tmp_path)
     asset_a = add_asset(conn, "Central A")

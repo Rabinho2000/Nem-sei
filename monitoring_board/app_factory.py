@@ -67,6 +67,7 @@ from monitoring_board.customer_reports import (
     detect_report_type,
     prepare_customer_report,
 )
+from monitoring_board.customer_repository import ensure_customer_schema
 from monitoring_board.financial_model_repository import (
     ensure_financial_model_schema,
     get_asset_model as get_financial_model_for_asset,
@@ -3305,6 +3306,7 @@ def create_app() -> Flask:
                 g.db,
                 external_name=member["external_name"] or "",
                 nif=member["nif"] or "",
+                sub_account=member["sub_account"] or "",
                 context=mapping_context,
             )
             for member in members
@@ -6748,6 +6750,7 @@ def ensure_database(path: str) -> None:
         populate_missing_group_metadata(conn)
         ensure_predefined_export_templates(conn)
         ensure_portfolio_management_schema(conn)
+        ensure_customer_schema(conn)
         ensure_portfolio_reporting_schema(conn)
         ensure_report_template_schema(conn)
         ensure_financial_model_schema(conn)

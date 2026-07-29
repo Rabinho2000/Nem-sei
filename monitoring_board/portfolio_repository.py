@@ -204,9 +204,18 @@ def list_portfolio_members(conn: sqlite3.Connection, portfolio_id: int) -> list[
     return query_all(
         conn,
         """
-        SELECT pa.*, a.project_name, a.nif AS asset_nif, a.alias_blob
+        SELECT pa.*, a.project_name, a.nif AS asset_nif, a.alias_blob,
+               c.name AS customer_name, c.nif AS customer_nif,
+               (
+                   SELECT GROUP_CONCAT(ai.provider || ': ' || ai.external_id, ' | ')
+                   FROM asset_integrations ai
+                   WHERE ai.asset_id = a.id
+                     AND ai.enabled = 1
+                     AND COALESCE(ai.external_id, '') != ''
+               ) AS external_ids
         FROM portfolio_assets pa
         LEFT JOIN assets a ON a.id = pa.asset_id
+        LEFT JOIN customers c ON c.id = a.customer_id
         WHERE pa.portfolio_id = ?
         ORDER BY pa.display_order, pa.id
         """,
@@ -631,7 +640,44 @@ def rebuild_asset_alias_blob(conn: sqlite3.Connection, asset_id: int) -> None:
 
 
 def mapping_context(conn: sqlite3.Connection) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
-    assets = tuple(dict(row) for row in query_all(conn, "SELECT id, project_name, nif FROM assets ORDER BY id"))
+    asset_rows = [
+        dict(row)
+        for row in query_all(
+            conn,
+            """
+            SELECT a.id, a.project_name, a.nif, a.customer_id,
+                   c.name AS customer_name
+            FROM assets a
+            LEFT JOIN customers c ON c.id = a.customer_id
+            ORDER BY a.id
+            """,
+        )
+    ]
+    external_ids: dict[int, set[str]] = {}
+    for row in query_all(
+        conn,
+        """
+        SELECT asset_id, external_id
+        FROM asset_integrations
+        WHERE enabled = 1 AND COALESCE(external_id, '') != ''
+        """,
+    ):
+        external_ids.setdefault(int(row["asset_id"]), set()).add(str(row["external_id"]))
+    sub_accounts: dict[int, set[str]] = {}
+    for row in query_all(
+        conn,
+        """
+        SELECT asset_id, sub_account
+        FROM portfolio_assets
+        WHERE asset_id IS NOT NULL AND COALESCE(sub_account, '') != ''
+        """,
+    ):
+        sub_accounts.setdefault(int(row["asset_id"]), set()).add(str(row["sub_account"]))
+    for asset in asset_rows:
+        asset_id = int(asset["id"])
+        asset["external_ids"] = tuple(sorted(external_ids.get(asset_id, set())))
+        asset["sub_accounts"] = tuple(sorted(sub_accounts.get(asset_id, set())))
+    assets = tuple(asset_rows)
     aliases = tuple(dict(row) for row in query_all(conn, "SELECT id, asset_id, alias_name, normalized_alias, active FROM asset_aliases ORDER BY id"))
     extras: list[dict[str, Any]] = []
     for row in query_all(conn, "SELECT DISTINCT asset_id, external_name FROM portfolio_assets WHERE asset_id IS NOT NULL AND COALESCE(external_name, '') != ''"):
@@ -644,14 +690,26 @@ def suggest_mapping(
     *,
     external_name: str,
     nif: str = "",
+    external_id: str = "",
+    sub_account: str = "",
     context: tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]] | None = None,
 ) -> MappingDecision:
     assets, aliases = context if context is not None else mapping_context(conn)
-    return decide_mapping(external_name=external_name, nif=nif, assets=assets, aliases=aliases)
+    return decide_mapping(
+        external_name=external_name,
+        nif=nif,
+        external_id=external_id,
+        sub_account=sub_account,
+        assets=assets,
+        aliases=aliases,
+    )
 
 
 def auto_map_portfolio_assets(conn: sqlite3.Connection, portfolio_id: int | None = None) -> dict[str, int]:
-    conditions = ["active = 1"]
+    conditions = [
+        "active = 1",
+        "NOT (asset_id IS NOT NULL AND COALESCE(mapping_method, '') IN ('manual', 'manual_merge'))",
+    ]
     params: list[Any] = []
     if portfolio_id:
         conditions.append("portfolio_id = ?")
@@ -660,7 +718,13 @@ def auto_map_portfolio_assets(conn: sqlite3.Connection, portfolio_id: int | None
     context = mapping_context(conn)
     mapped = pending = conflicts = 0
     for row in rows:
-        decision = suggest_mapping(conn, external_name=row["external_name"] or "", nif=row["nif"] or "", context=context)
+        decision = suggest_mapping(
+            conn,
+            external_name=row["external_name"] or "",
+            nif=row["nif"] or "",
+            sub_account=row["sub_account"] or "",
+            context=context,
+        )
         if decision.auto_mappable and decision.asset_id is not None:
             mapped += 1
             conn.execute(
@@ -872,7 +936,13 @@ def create_import_preview(conn: sqlite3.Connection, *, portfolio_id: int | None,
             conflict = conn.execute("SELECT asset_id FROM asset_aliases WHERE normalized_alias = ?", (normalized_alias,)).fetchone()
             if conflict and asset_id and int(conflict["asset_id"]) != asset_id:
                 errors.append("alias_conflict")
-        decision = suggest_mapping(conn, external_name=external_name or str(normalized.get("asset_name") or ""), nif=str(normalized.get("nif") or ""))
+        decision = suggest_mapping(
+            conn,
+            external_name=external_name or str(normalized.get("asset_name") or ""),
+            nif=str(normalized.get("nif") or ""),
+            external_id=str(normalized.get("external_id") or ""),
+            sub_account=str(normalized.get("sub_account") or ""),
+        )
         if asset_id is not None:
             decision = MappingDecision(asset_id, "manual", 1.0, "strong", "mapped", (), auto_mappable=False)
         if sheet == "Portfolios":

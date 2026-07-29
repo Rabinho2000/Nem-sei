@@ -76,7 +76,7 @@ Documento vivo da implementação da pipeline operacional de relatórios.
 | --- | --- | --- |
 | Auditoria inicial | Concluída | este documento, schema, repositories, testes |
 | A — dados hardcoded | Concluída | `portfolio_reports.py`, bootstrap, testes |
-| B — clientes e mapping | Pendente | novos repositories/schema, assets/portfolios |
+| B — clientes e mapping | Concluída | `customer_repository.py`, assets/portfolios |
 | C — capacidade histórica | Pendente | reporting/repository, assets, relatórios |
 | D — snapshots/aprovação | Pendente | reporting snapshots, geração, repositories |
 | E — fecho mensal/quality gate | Pendente | blueprint, services, templates |
@@ -112,3 +112,20 @@ limpeza do histórico Git.
 - Testes com entidades operacionais foram substituídos por dados sintéticos.
 - Verificação focada: 72 testes passaram antes do teste adicional de
   preservação; a suite focada será repetida antes do commit.
+
+### Fase B
+
+- Criada a entidade `customers` e a ligação opcional `assets.customer_id`.
+- Backfill idempotente agrupa assets por NIF normalizado sem fundir instalações.
+- Assets sem NIF permanecem sem cliente.
+- Nomes divergentes no mesmo NIF ativam `review_required` e uma nota de revisão.
+- Mapping por NIF único mantém compatibilidade.
+- NIF com vários assets restringe candidatos e exige alias, nome, external ID
+  ou subconta suficiente para identificar a instalação.
+- Identificadores exatos contraditórios com o cliente produzem
+  `mapping_conflict`.
+- Mappings manuais existentes não são alterados pelo auto-mapping.
+- UI de portefólios mostra cliente, instalação, NIF, IDs externos, método,
+  confiança e estado do mapping.
+- Verificação focada: 68 testes passaram, incluindo schema antigo, idempotência,
+  dois assets do mesmo cliente, alias, System ID, conflito e mapping manual.

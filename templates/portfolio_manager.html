@@ -162,6 +162,7 @@
                 <tr>
                   <th><label class="sr-only" for="select-all-members">Selecionar todos</label><input id="select-all-members" type="checkbox"></th>
                   <th>Instalacao local</th>
+                  <th>Cliente</th>
                   <th>Nome externo</th>
                   <th>NIF</th>
                   <th>Subconta</th>
@@ -175,12 +176,20 @@
                   <tr id="member-{{ member.id }}">
                     <td><input class="member-select" type="checkbox" value="{{ member.id }}" aria-label="Selecionar {{ member.project_name or member.external_name or member.id }}"></td>
                     <td>{{ member.project_name or 'Sem associacao local' }}</td>
+                    <td>
+                      {{ member.customer_name or 'Sem cliente' }}<br>
+                      <small>NIF {{ member.customer_nif or member.asset_nif or member.nif or '-' }}</small>
+                    </td>
                     <td>{{ member.external_name or '-' }}</td>
                     <td>{{ member.asset_nif or member.nif or '-' }}</td>
                     <td>{{ member.sub_account or '-' }}</td>
-                    <td><span class="chip {{ 'warning' if not member.asset_id or member.mapping_status == 'mapping_conflict' else 'success' }}">{{ member.mapping_status or ('manual' if member.asset_id else 'mapping_pending') }}</span></td>
+                    <td>
+                      <span class="chip {{ 'warning' if not member.asset_id or member.mapping_status == 'mapping_conflict' else 'success' }}">{{ member.mapping_status or ('manual' if member.asset_id else 'mapping_pending') }}</span><br>
+                      <small>{{ member.mapping_method or 'unmapped' }} · {{ "%.0f%%"|format((member.mapping_confidence or 0) * 100) }}</small>
+                    </td>
                     <td>
                       <small>Alias: {{ member.alias_blob or '-' }}</small><br>
+                      <small>IDs: {{ member.external_ids or '-' }}</small><br>
                       <small>{{ 'Ativo' if member.active else 'Inativo' }}</small>
                     </td>
                     <td class="row-actions">
@@ -203,7 +212,7 @@
                     </td>
                   </tr>
                 {% else %}
-                  <tr><td colspan="8" class="muted">Este portfolio ainda nao tem instalacoes.</td></tr>
+                  <tr><td colspan="9" class="muted">Este portfolio ainda nao tem instalacoes.</td></tr>
                 {% endfor %}
               </tbody>
             </table>
