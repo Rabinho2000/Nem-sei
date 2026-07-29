@@ -83,7 +83,7 @@ Documento vivo da implementação da pipeline operacional de relatórios.
 | F — automatizações | Concluída | automation repository/jobs/UI/tests |
 | G — distribuição | Concluída | repository, routes, templates, tests |
 | H — Sigenergy/Expertcom | Concluída localmente | quality findings, tests, documentação |
-| I — UI/arquitetura/CI | Em curso | navegação, arquitetura, docs, workflow |
+| I — UI/arquitetura/CI | Concluída | navegação, arquitetura, docs, workflow, E2E |
 
 ## Bloqueios externos
 
@@ -207,3 +207,56 @@ limpeza do histórico Git.
   credencial ou envio real nesta implementação.
 - O estado e cada transição ficam auditados; a preparação é idempotente por
   ficheiro, destinatário e canal.
+
+### Fases H e I
+
+- O readiness Sigenergy no fecho mensal distingue permissão histórica,
+  confirmação de unidade e utilizabilidade do mês; FusionSolar continua válido
+  quando é a fonte primária completa.
+- A navegação de Relatórios separa Gerar, Fecho mensal, Automatizações,
+  Distribuição, Templates e Histórico.
+- A lógica nova foi extraída para módulos de snapshots, quality gate, fecho
+  mensal, distribuição e blueprint própria, sem refatorização global do
+  `app_factory.py`.
+- O CI mantém compileall e suite completa e acrescenta `git diff --check` e um
+  scanner simples de ficheiros tracked que nunca imprime o conteúdo detetado.
+- Adicionados testes end-to-end SQLite, sem rede, para o fluxo aprovado e para
+  o fluxo bloqueado por produção parcial.
+
+## Ambiente de testes completamente isolado
+
+1. Criar uma cópia de trabalho e uma branch próprias; nunca apontar para
+   `/opt/server/apps/Nem-sei`.
+2. Criar um diretório temporário novo para `DATA_DIR` e uma virtualenv dedicada.
+3. Construir uma configuração de teste apenas com valores sintéticos:
+   `FLASK_SECRET_KEY`, `APP_PASSWORD`, `APP_USERNAME` e todas as integrações
+   externas desativadas.
+4. Não copiar `.env`, SQLite, uploads, PDFs, backups ou credenciais de produção.
+5. Usar fixtures/mocks para FusionSolar e Sigenergy e bloquear rede no runner.
+6. Inicializar uma SQLite vazia através de `ensure_database`; para ensaiar
+   upgrades, usar apenas uma cópia sanitizada e descartável de um schema antigo.
+7. Usar um diretório de uploads dentro do `DATA_DIR` temporário para garantir
+   que path, tamanho e SHA-256 são exercitados sem tocar storage real.
+8. Executar compileall, testes focados, suite completa, scanner e
+   `git diff --check`; destruir o diretório temporário no fim.
+
+Exemplo sem Docker, deployment, migrations externas ou rede:
+
+```bash
+python3 -m venv /tmp/nem-sei-venv
+/tmp/nem-sei-venv/bin/pip install -r requirements.txt
+test_data="$(mktemp -d /tmp/nem-sei-tests.XXXXXX)"
+env -i \
+  PATH="/tmp/nem-sei-venv/bin:/usr/bin:/bin" \
+  HOME=/tmp \
+  DATA_DIR="$test_data" \
+  FLASK_SECRET_KEY=test-only-secret \
+  APP_USERNAME=tester \
+  APP_PASSWORD=test-only-password \
+  DISABLE_INTEGRATION_SCHEDULER=1 \
+  DISABLE_SIGENERGY_SCHEDULER=1 \
+  /tmp/nem-sei-venv/bin/python -m pytest -q
+```
+
+O diretório indicado por `DATA_DIR` é descartável. Esta configuração não deve
+conter endpoints, IDs, NIFs, emails, tokens ou dados energéticos reais.
