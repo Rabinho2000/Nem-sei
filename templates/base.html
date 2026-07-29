@@ -38,7 +38,7 @@
           <a href="{{ url_for('renewals') }}" class="{{ 'active' if request.endpoint == 'renewals' else '' }}">Renovacoes</a>
           <a href="{{ url_for('portfolio_manager') }}" class="{{ 'active' if request.endpoint and request.endpoint.startswith('portfolio_manager') else '' }}">Gestor portfolios</a>
           <a href="{{ url_for('portfolios') }}" class="{{ 'active' if request.endpoint in ['portfolios', 'upload_portfolio_helioscope', 'upload_portfolio_invoice'] else '' }}">Portfolios</a>
-          <a href="{{ url_for('exports') }}" class="{{ 'active' if request.endpoint in ['exports', 'report_generation', 'report_generation_preview', 'download_generated_report', 'report_templates', 'report_automations', 'toggle_report_automation', 'run_report_automation_now', 'remove_report_automation'] else '' }}">Relatórios</a>
+          <a href="{{ url_for('exports') }}" class="{{ 'active' if (request.endpoint in ['exports', 'report_generation', 'report_generation_preview', 'download_generated_report', 'report_templates', 'report_automations', 'toggle_report_automation', 'run_report_automation_now', 'remove_report_automation']) or (request.endpoint and request.endpoint.startswith('reporting.')) else '' }}">Relatórios</a>
           <a href="{{ url_for('settings') }}" class="{{ 'active' if request.endpoint == 'settings' else '' }}">Importacao</a>
         </nav>
         {% if current_username %}

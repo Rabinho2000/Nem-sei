@@ -34,6 +34,11 @@ class ReportSnapshot:
     profile_id: int | None
     profile_version: int | None
     engine_version: str
+    profile_snapshot: dict[str, Any]
+    template_snapshot: dict[str, Any]
+    billing_snapshot: dict[str, Any]
+    energy_sources: tuple[dict[str, Any], ...]
+    coverage: dict[str, Any]
 
 
 def ensure_report_snapshot_schema(conn: sqlite3.Connection) -> None:
@@ -428,6 +433,11 @@ def snapshot_from_row(row: sqlite3.Row) -> ReportSnapshot:
         profile_id=int(row["profile_id"]) if row["profile_id"] is not None else None,
         profile_version=int(row["profile_version"]) if row["profile_version"] is not None else None,
         engine_version=str(row["engine_version"]),
+        profile_snapshot=json.loads(row["profile_snapshot_json"] or "{}"),
+        template_snapshot=json.loads(row["template_snapshot_json"] or "{}"),
+        billing_snapshot=json.loads(row["billing_snapshot_json"] or "{}"),
+        energy_sources=tuple(json.loads(row["energy_sources_json"] or "[]")),
+        coverage=json.loads(row["coverage_json"] or "{}"),
     )
 
 

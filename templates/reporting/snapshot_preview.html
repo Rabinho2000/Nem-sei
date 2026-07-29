@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="reports-header">
+  <div>
+    <p class="eyebrow">Snapshot #{{ snapshot.id }}</p>
+    <h2>Preview do fecho mensal</h2>
+    {% if snapshot.approval_status != 'approved' %}
+      <p class="flash warning"><strong>Rascunho não aprovado.</strong> Os dados e valores financeiros não são finais.</p>
+    {% endif %}
+  </div>
+  <a class="button secondary" href="{{ url_for('reporting.monthly_close', report_month=snapshot.period_start[:7], scope_type=snapshot.scope_type) }}">Voltar</a>
+</section>
+<section class="card reports-card">
+  <div class="reports-layout">
+    <div><span class="muted">Estado</span><p>{{ snapshot.approval_status }}</p></div>
+    <div><span class="muted">Qualidade</span><p>{{ snapshot.quality_status }}</p></div>
+    <div><span class="muted">Período</span><p>{{ snapshot.period_start }} — {{ snapshot.period_end }}</p></div>
+    <div><span class="muted">Hash</span><p><code>{{ snapshot.data_hash }}</code></p></div>
+  </div>
+  {% if snapshot.blockers %}<h3>Bloqueios</h3><ul>{% for item in snapshot.blockers %}<li><strong>{{ item.code }}</strong>: {{ item.message }} {{ item.remediation }}</li>{% endfor %}</ul>{% endif %}
+  {% if snapshot.warnings %}<h3>Avisos</h3><ul>{% for item in snapshot.warnings %}<li><strong>{{ item.code }}</strong>: {{ item.message }}</li>{% endfor %}</ul>{% endif %}
+</section>
+<section class="card reports-card">
+  <h3>Ações</h3>
+  <div class="button-row">
+    {% if snapshot.approval_status not in ['approved', 'rejected'] %}
+      <form method="post" action="{{ url_for('reporting.validate_monthly_snapshot', snapshot_id=snapshot.id) }}"><button class="button secondary" type="submit">Validar</button></form>
+      <form method="post" action="{{ url_for('reporting.approve_monthly_snapshot', snapshot_id=snapshot.id) }}"><button class="button" type="submit" {% if snapshot.validation_status != 'validated' %}disabled title="É necessário validar sem bloqueios."{% endif %}>Aprovar</button></form>
+      <form method="post" action="{{ url_for('reporting.reject_monthly_snapshot', snapshot_id=snapshot.id) }}">
+        <label>Motivo da rejeição <input name="reason" required></label>
+        <button class="button danger" type="submit">Rejeitar</button>
+      </form>
+    {% else %}<p class="muted">Este snapshot está congelado. Uma atualização de dados exige um novo snapshot.</p>{% endif %}
+  </div>
+</section>
+<section class="card reports-card">
+  <h3>Dados congelados</h3>
+  <div class="table-wrap"><pre aria-label="Payload congelado">{{ snapshot.payload | tojson(indent=2) }}</pre></div>
+</section>
+<section class="card reports-card">
+  <h3>Auditoria</h3>
+  <div class="table-wrap">
+    <table class="reports-table">
+      <thead><tr><th>Data</th><th>Evento</th><th>Utilizador</th><th>Motivo</th></tr></thead>
+      <tbody>{% for event in events %}<tr><td>{{ event.created_at }}</td><td>{{ event.event_type }}</td><td>{{ event.actor or 'Sistema' }}</td><td>{{ event.reason or '—' }}</td></tr>{% endfor %}</tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

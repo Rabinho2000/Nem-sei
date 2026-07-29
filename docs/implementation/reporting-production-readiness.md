@@ -79,7 +79,7 @@ Documento vivo da implementação da pipeline operacional de relatórios.
 | B — clientes e mapping | Concluída | `customer_repository.py`, assets/portfolios |
 | C — capacidade histórica | Concluída | capacity repository, assets, relatórios |
 | D — snapshots/aprovação | Concluída | reporting snapshots, quality gate, auditoria |
-| E — fecho mensal/quality gate | Pendente | blueprint, services, templates |
+| E — fecho mensal/quality gate | Concluída | blueprint, services, templates, tests |
 | F — automatizações | Pendente | automation repository/jobs/UI |
 | G — distribuição | Pendente | repository, routes, templates |
 | H — Sigenergy/Expertcom | Pendente | quality findings e documentação |
@@ -161,3 +161,19 @@ limpeza do histórico Git.
   `report_generation_runs` e `report_generated_files` não foram removidas nem
   reescritas.
 - Verificação focada: 59 testes passaram.
+
+### Fase E
+
+- Criada a área operacional `/reporting/monthly-close`, isolada numa blueprint.
+- O fecho permite selecionar mês e âmbito, criar snapshots individuais ou de
+  portefólio, validar, aprovar, rejeitar e consultar versões anteriores.
+- O preview identifica explicitamente rascunhos, dados não aprovados e valores
+  financeiros não finais.
+- O quality gate usa findings estruturados com código, severidade, âmbito,
+  instalação, origem e remediação.
+- A obrigatoriedade de billing, tarifa e disponibilidade é derivada das secções
+  e métricas do template congelado.
+- Produção incompleta/conflitante, mapping, fonte energética, cliente exigido,
+  capacidade ambígua e limitações Sigenergy bloqueiam aprovação.
+- Disponibilidade e invoice opcionais geram avisos sem transformar subtotais em
+  resultados finais.

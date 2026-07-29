@@ -44,6 +44,7 @@ from monitoring_board.portfolio_reports import (
 )
 from monitoring_board.routes.auth import auth_bp
 from monitoring_board.routes.field_routes import field_routes_bp
+from monitoring_board.routes.reporting import reporting_bp
 from monitoring_board import runtime as runtime_module
 from monitoring_board.runtime import (
     BACKUP_DIR,
@@ -740,6 +741,7 @@ def create_app() -> Flask:
 
     ensure_database(app.config["DATABASE"])
     app.register_blueprint(field_routes_bp)
+    app.register_blueprint(reporting_bp)
     with closing(get_db(app.config["DATABASE"])) as bootstrap_conn:
         populate_missing_installation_groups(bootstrap_conn)
         populate_missing_group_metadata(bootstrap_conn)

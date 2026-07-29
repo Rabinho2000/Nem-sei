@@ -212,7 +212,22 @@ def evaluate_report_quality(
 def report_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
     rows = payload.get("rows")
     if isinstance(rows, list):
-        return [row for row in rows if isinstance(row, dict)]
+        normalized: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            values = row.get("values")
+            if isinstance(values, dict):
+                normalized.append(
+                    {
+                        **values,
+                        "asset_id": row.get("asset_id") or values.get("asset_id"),
+                        "warnings": row.get("warnings") or values.get("warnings") or (),
+                    }
+                )
+            else:
+                normalized.append(row)
+        return normalized
     return [payload]
 
 
