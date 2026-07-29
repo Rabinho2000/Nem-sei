@@ -80,7 +80,7 @@ Documento vivo da implementação da pipeline operacional de relatórios.
 | C — capacidade histórica | Concluída | capacity repository, assets, relatórios |
 | D — snapshots/aprovação | Concluída | reporting snapshots, quality gate, auditoria |
 | E — fecho mensal/quality gate | Concluída | blueprint, services, templates, tests |
-| F — automatizações | Pendente | automation repository/jobs/UI |
+| F — automatizações | Concluída | automation repository/jobs/UI/tests |
 | G — distribuição | Pendente | repository, routes, templates |
 | H — Sigenergy/Expertcom | Pendente | quality findings e documentação |
 | I — UI/arquitetura/CI | Pendente | navegação, CSS, docs, workflow |
@@ -177,3 +177,18 @@ limpeza do histórico Git.
   capacidade ambígua e limitações Sigenergy bloqueiam aprovação.
 - Disponibilidade e invoice opcionais geram avisos sem transformar subtotais em
   resultados finais.
+
+### Fase F
+
+- O scheduler e a ação `Executar agora` procuram exclusivamente o snapshot
+  aprovado do mês fechado anterior, com scope, template e perfil compatíveis.
+- A geração valida o hash ao carregar o snapshot e reconstrói template, perfil
+  e payload apenas a partir da configuração congelada.
+- Sem snapshot aprovado, a execução fica `blocked`, persiste o motivo e não
+  cria qualquer ficheiro.
+- Runs suportam `queued`, `running`, `completed`, `partial`, `failed`,
+  `blocked` e `skipped`.
+- `report_automations` mantém o último snapshot e o último motivo de bloqueio,
+  sem fixar permanentemente um snapshot mensal.
+- A deduplicação usa automatização + snapshot; retries de runs falhados
+  continuam possíveis e runs interrompidos preservam a recuperação existente.

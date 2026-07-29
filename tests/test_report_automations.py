@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from datetime import date
 from typing import Any
 
 import pytest
@@ -17,6 +18,14 @@ from monitoring_board.report_template_repository import (
     list_report_automations,
     save_report_automation,
 )
+from monitoring_board.reporting.quality_gate import evaluate_report_quality
+from monitoring_board.reporting.snapshots import (
+    approve_snapshot,
+    create_snapshot,
+    reject_snapshot,
+    validate_snapshot,
+)
+from monitoring_board.reporting.templates import template_to_config
 
 
 def seed_asset(conn: sqlite3.Connection, name: str = "Central Automática") -> int:
@@ -345,7 +354,7 @@ def test_stale_automated_run_is_recovered_after_restart(tmp_path) -> None:
     assert "interrompida" in run["error_message"]
 
 
-def test_automation_preparation_failure_is_visible_in_run_history(tmp_path) -> None:
+def test_automation_without_approved_snapshot_is_blocked(tmp_path) -> None:
     db_path = tmp_path / "automation-failure.db"
     app_module.ensure_database(str(db_path))
     with get_db(str(db_path)) as conn:
@@ -366,15 +375,141 @@ def test_automation_preparation_failure_is_visible_in_run_history(tmp_path) -> N
             formats=["pdf"],
             include_availability=0,
         )
-        conn.execute("UPDATE report_templates SET active = 0 WHERE id = ?", (template.id,))
         conn.commit()
 
-        with pytest.raises(ValueError):
-            app_module.run_report_automation_generation(conn, automation_id)
+        result = app_module.run_report_automation_generation(
+            conn, automation_id, reference_date=date(2026, 7, 5)
+        )
         run = conn.execute(
             "SELECT status, error_message FROM report_generation_runs WHERE automation_id = ?",
             (automation_id,),
         ).fetchone()
 
-    assert run["status"] == "failed"
-    assert run["error_message"] == "Falha ao preparar a execução automática."
+    assert result["status"] == "blocked"
+    assert run["status"] == "blocked"
+    assert "snapshot aprovado" in run["error_message"]
+
+
+def test_automation_generates_only_from_approved_snapshot(tmp_path) -> None:
+    db_path = tmp_path / "automation-approved.db"
+    app_module.ensure_database(str(db_path))
+    with get_db(str(db_path)) as conn:
+        asset_id = seed_asset(conn)
+        template = get_default_template(conn, "individual")
+        automation_id = save_report_automation(
+            conn,
+            automation_id=None,
+            name="Snapshot aprovado",
+            active=1,
+            report_type="individual",
+            asset_id=asset_id,
+            portfolio_id=None,
+            template_id=int(template.id),
+            profile_id=None,
+            schedule_day=2,
+            schedule_time="09:00",
+            formats=["pdf", "excel"],
+            include_availability=0,
+        )
+        payload = {
+            "asset_id": asset_id,
+            "installation": "Central congelada",
+            "energy_provider": "FusionSolar",
+            "production_quality_status": "complete",
+            "production_source": "monthly",
+            "production_kwh": "321.00",
+            "availability_pct": "99.0",
+            "invoice_status": "confirmed",
+        }
+        snapshot_id = create_snapshot(
+            conn,
+            scope_type="individual",
+            asset_id=asset_id,
+            period_type="monthly",
+            period_start="2026-06-01",
+            period_end="2026-06-30",
+            payload=payload,
+            template_id=template.id,
+            template_version=1,
+            template_snapshot=template_to_config(template),
+            engine_version="test-engine",
+        )
+        quality = evaluate_report_quality(payload, scope="individual")
+        validate_snapshot(conn, snapshot_id, quality)
+        approve_snapshot(conn, snapshot_id, actor="tester")
+        conn.execute("UPDATE assets SET project_name = 'Nome mutável' WHERE id = ?", (asset_id,))
+        conn.commit()
+
+        result = app_module.run_report_automation_generation(
+            conn,
+            automation_id,
+            reference_date=date(2026, 7, 5),
+        )
+        files = conn.execute(
+            "SELECT * FROM report_generated_files WHERE run_id = ? ORDER BY format",
+            (result["run_id"],),
+        ).fetchall()
+        duplicate = app_module.run_report_automation_generation(
+            conn,
+            automation_id,
+            reference_date=date(2026, 7, 5),
+        )
+
+    assert result["status"] == "completed"
+    assert result["snapshot_id"] == snapshot_id
+    assert {row["format"] for row in files} == {"pdf", "xlsx"}
+    assert all(row["snapshot_id"] == snapshot_id and row["sha256"] for row in files)
+    assert duplicate["duplicate"] is True
+
+
+def test_rejected_snapshot_does_not_bypass_automation_gate(tmp_path) -> None:
+    db_path = tmp_path / "automation-rejected.db"
+    app_module.ensure_database(str(db_path))
+    with get_db(str(db_path)) as conn:
+        asset_id = seed_asset(conn)
+        template = get_default_template(conn, "individual")
+        automation_id = save_report_automation(
+            conn,
+            automation_id=None,
+            name="Snapshot rejeitado",
+            active=1,
+            report_type="individual",
+            asset_id=asset_id,
+            portfolio_id=None,
+            template_id=int(template.id),
+            profile_id=None,
+            schedule_day=2,
+            schedule_time="09:00",
+            formats=["pdf"],
+            include_availability=0,
+        )
+        payload = {
+            "asset_id": asset_id,
+            "energy_provider": "FusionSolar",
+            "production_quality_status": "partial",
+        }
+        snapshot_id = create_snapshot(
+            conn,
+            scope_type="individual",
+            asset_id=asset_id,
+            period_type="monthly",
+            period_start="2026-06-01",
+            period_end="2026-06-30",
+            payload=payload,
+            template_id=template.id,
+            template_version=1,
+            template_snapshot=template_to_config(template),
+            engine_version="test-engine",
+        )
+        reject_snapshot(conn, snapshot_id, actor="tester", reason="Produção parcial")
+        conn.commit()
+
+        result = app_module.run_report_automation_generation(
+            conn, automation_id, reference_date=date(2026, 7, 5)
+        )
+        file_count = conn.execute(
+            "SELECT COUNT(*) FROM report_generated_files"
+        ).fetchone()[0]
+
+    assert result["status"] == "blocked"
+    assert file_count == 0

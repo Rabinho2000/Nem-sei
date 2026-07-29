@@ -118,6 +118,10 @@ def ensure_report_template_schema(conn: sqlite3.Connection) -> None:
             target_period TEXT NOT NULL DEFAULT 'previous_closed_month',
             formats_json TEXT NOT NULL DEFAULT '["pdf"]',
             include_availability INTEGER NOT NULL DEFAULT 0,
+            approval_required INTEGER NOT NULL DEFAULT 1,
+            distribution_mode TEXT NOT NULL DEFAULT 'manual',
+            last_blocked_reason TEXT DEFAULT '',
+            last_snapshot_id INTEGER,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE,
@@ -148,6 +152,10 @@ def ensure_report_template_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "report_automations", "target_period TEXT NOT NULL DEFAULT 'previous_closed_month'")
     ensure_column(conn, "report_automations", "formats_json TEXT NOT NULL DEFAULT '[\"pdf\"]'")
     ensure_column(conn, "report_automations", "include_availability INTEGER NOT NULL DEFAULT 0")
+    ensure_column(conn, "report_automations", "approval_required INTEGER NOT NULL DEFAULT 1")
+    ensure_column(conn, "report_automations", "distribution_mode TEXT NOT NULL DEFAULT 'manual'")
+    ensure_column(conn, "report_automations", "last_blocked_reason TEXT DEFAULT ''")
+    ensure_column(conn, "report_automations", "last_snapshot_id INTEGER")
     conn.execute(
         """
         CREATE UNIQUE INDEX IF NOT EXISTS idx_report_generation_automation_period_active
@@ -334,7 +342,7 @@ def create_generation_run(conn: sqlite3.Connection, *, template_id: int | None, 
 
 
 def finish_generation_run(conn: sqlite3.Connection, run_id: int, *, status: str, completed_count: int, failed_count: int, skipped_count: int = 0, warnings: list[str] | None = None, error_message: str = "") -> None:
-    if status not in {"running", "completed", "partial", "failed"}:
+    if status not in {"queued", "running", "completed", "partial", "failed", "blocked", "skipped"}:
         raise ValueError("invalid_generation_run_status")
     conn.execute(
         """

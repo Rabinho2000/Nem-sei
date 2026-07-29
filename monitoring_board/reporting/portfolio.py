@@ -5,7 +5,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from monitoring_board.reporting.models import ReportingPeriod
+from monitoring_board.reporting.models import ReportPeriodType, ReportingPeriod
 from monitoring_board.reporting.financial_quality import (
     apply_production_financial_gate,
     financial_quality_warnings,
@@ -415,6 +415,77 @@ def result_to_dict(result: PortfolioReportResult) -> dict[str, Any]:
         "engine_version": result.engine_version,
         "generated_at": result.generated_at.isoformat(timespec="seconds"),
     }
+
+
+def result_from_dict(payload: dict[str, Any]) -> PortfolioReportResult:
+    """Rebuild a renderable result exclusively from an immutable snapshot."""
+    period_data = dict(payload.get("period") or {})
+    profile = profile_from_config(
+        dict(payload.get("profile") or {}),
+        profile_id=None,
+        portfolio_id=int(payload.get("portfolio_id") or 0) or None,
+    )
+    period = ReportingPeriod(
+        period_type=ReportPeriodType(str(period_data.get("type") or "monthly")),
+        start=date.fromisoformat(str(period_data["start"])),
+        end=date.fromisoformat(str(period_data["end"])),
+        label=str(period_data.get("label") or ""),
+        month_count=len(period_data.get("months") or ()) or 1,
+        included_months=tuple(
+            date.fromisoformat(str(item)) for item in period_data.get("months") or ()
+        ),
+    )
+    coverage = dict(payload.get("coverage") or {})
+    comparison_data = payload.get("comparison")
+    return PortfolioReportResult(
+        portfolio_id=int(payload["portfolio_id"]),
+        portfolio_name=str(payload.get("portfolio_name") or ""),
+        profile=profile,
+        profile_version=int(payload.get("profile_version") or 1),
+        period=period,
+        columns=tuple(
+            PortfolioReportColumn(**item)
+            for item in payload.get("columns") or ()
+            if isinstance(item, dict)
+        ),
+        rows=tuple(
+            PortfolioReportRow(
+                asset_id=item.get("asset_id"),
+                values=dict(item.get("values") or {}),
+                warnings=tuple(item.get("warnings") or ()),
+                severity=str(item.get("severity") or "ok"),
+            )
+            for item in payload.get("rows") or ()
+            if isinstance(item, dict)
+        ),
+        summary=PortfolioReportSummary(
+            values=dict((payload.get("summary") or {}).get("values") or {}),
+            warnings=tuple((payload.get("summary") or {}).get("warnings") or ()),
+        ),
+        comparison=(
+            None
+            if not isinstance(comparison_data, dict)
+            else PortfolioComparisonResult(
+                mode=str(comparison_data.get("mode") or ""),
+                values=dict(comparison_data.get("values") or {}),
+                warnings=tuple(comparison_data.get("warnings") or ()),
+            )
+        ),
+        coverage=PortfolioDataCoverage(
+            global_pct=Decimal(str(coverage.get("global_pct") or 0)),
+            by_source={
+                key: Decimal(str(value))
+                for key, value in (coverage.get("by_source") or {}).items()
+            },
+            complete_installations=int(coverage.get("complete_installations") or 0),
+            incomplete_installations=int(coverage.get("incomplete_installations") or 0),
+            missing_months=tuple(coverage.get("missing_months") or ()),
+        ),
+        warnings=tuple(payload.get("warnings") or ()),
+        metadata=dict(payload.get("metadata") or {}),
+        engine_version=str(payload.get("engine_version") or ENGINE_VERSION),
+        generated_at=datetime.fromisoformat(str(payload.get("generated_at"))),
+    )
 
 
 def profile_to_config(profile: PortfolioReportProfile) -> dict[str, Any]:

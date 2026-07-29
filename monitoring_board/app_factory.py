@@ -161,7 +161,9 @@ from monitoring_board.reporting.portfolio import (
     aggregate_rows,
     profile_from_config,
     profile_to_config,
+    result_from_dict as portfolio_result_from_dict,
 )
+from monitoring_board.reporting.snapshots import approved_snapshot_for_period
 from monitoring_board.reporting.templates import default_template, template_from_config, template_to_config, validate_template_scope
 from monitoring_board.services.report_rendering import (
     MAX_BATCH_ASSETS,
@@ -11493,69 +11495,226 @@ def validate_report_automation_form(conn: sqlite3.Connection, form: Any) -> dict
     }
 
 
-def run_report_automation_generation(conn: sqlite3.Connection, automation_id: int) -> dict[str, Any]:
+def run_report_automation_generation(
+    conn: sqlite3.Connection,
+    automation_id: int,
+    *,
+    reference_date: date | None = None,
+    output_dir: Path | None = None,
+) -> dict[str, Any]:
     automation = get_report_automation(conn, automation_id)
     if automation is None:
         raise ValueError("Automatização não encontrada.")
-    previous_month_end = current_lisbon_date().replace(day=1) - timedelta(days=1)
+    previous_month_end = (reference_date or current_lisbon_date()).replace(
+        day=1
+    ) - timedelta(days=1)
     report_month = previous_month_end.strftime("%Y-%m")
+    period = build_period("monthly", report_month=report_month)
     try:
-        formats = json.loads(automation["formats_json"] or '["pdf"]')
+        raw_formats = json.loads(automation["formats_json"] or '["pdf"]')
     except (TypeError, json.JSONDecodeError):
-        formats = ["pdf"]
-    form = MultiDict(
-        [
-            ("report_type", str(automation["report_type"])),
-            ("template_id", str(automation["template_id"])),
-            ("portfolio_id", str(automation["portfolio_id"] or "")),
-            ("profile_id", str(automation["profile_id"] or "")),
-            ("asset_id", str(automation["asset_id"] or "")),
-            ("period_type", "monthly"),
-            ("report_month", report_month),
-            ("include_availability", "on" if automation["include_availability"] else ""),
-            *[("formats", str(fmt)) for fmt in formats],
-        ]
+        raw_formats = ["pdf"]
+    formats = tuple(
+        item for item in validate_formats(str(automation["report_type"]), raw_formats)
+        if item != "zip"
     )
-    try:
-        return execute_persisted_report_generation(
+    snapshot = approved_snapshot_for_period(
+        conn,
+        scope_type=str(automation["report_type"]),
+        asset_id=automation["asset_id"],
+        portfolio_id=automation["portfolio_id"],
+        period_start=period.start.isoformat(),
+        template_id=automation["template_id"],
+        profile_id=automation["profile_id"],
+    )
+    if snapshot is None:
+        reason = "Não existe um snapshot aprovado compatível para o mês fechado."
+        run_id = create_generation_run(
             conn,
-            form,
-            output_dir=UPLOAD_DIR / "generated_reports",
+            template_id=automation["template_id"],
+            template_version=latest_template_version(conn, automation["template_id"]),
+            report_type=automation["report_type"],
+            portfolio_id=automation["portfolio_id"],
+            asset_id=automation["asset_id"],
             automation_id=automation_id,
+            period_type="monthly",
+            period_start=period.start.isoformat(),
+            period_end=period.end.isoformat(),
+            requested_count=len(formats),
         )
-    except Exception:
-        period = build_period("monthly", report_month=report_month)
-        existing = conn.execute(
+        finish_generation_run(
+            conn,
+            run_id,
+            status="blocked",
+            completed_count=0,
+            failed_count=0,
+            skipped_count=len(formats),
+            error_message=reason,
+        )
+        conn.execute(
             """
-            SELECT id FROM report_generation_runs
-            WHERE automation_id = ? AND period_start = ?
-            ORDER BY id DESC LIMIT 1
+            UPDATE report_automations
+            SET last_blocked_reason = ?, last_snapshot_id = NULL, updated_at = ?
+            WHERE id = ?
             """,
-            (automation_id, period.start.isoformat()),
-        ).fetchone()
-        if existing is None:
-            run_id = create_generation_run(
-                conn,
-                template_id=automation["template_id"],
-                template_version=latest_template_version(conn, automation["template_id"]),
-                report_type=automation["report_type"],
-                portfolio_id=automation["portfolio_id"],
-                asset_id=automation["asset_id"],
-                automation_id=automation_id,
-                period_type="monthly",
-                period_start=period.start.isoformat(),
-                period_end=period.end.isoformat(),
-                requested_count=max(1, len(formats)),
+            (reason, datetime.now().isoformat(timespec="seconds"), automation_id),
+        )
+        conn.commit()
+        return {
+            "run_id": run_id,
+            "status": "blocked",
+            "completed": 0,
+            "failed": 0,
+            "duplicate": False,
+            "reason": reason,
+        }
+    duplicate = conn.execute(
+        """
+        SELECT id, status FROM report_generation_runs
+        WHERE automation_id = ? AND snapshot_id = ?
+          AND status IN ('running', 'completed')
+        ORDER BY id DESC LIMIT 1
+        """,
+        (automation_id, snapshot.id),
+    ).fetchone()
+    if duplicate:
+        return {
+            "run_id": int(duplicate["id"]),
+            "status": str(duplicate["status"]),
+            "completed": 0,
+            "failed": 0,
+            "duplicate": True,
+        }
+    template = template_from_config(
+        snapshot.template_snapshot,
+        template_id=snapshot.template_id,
+        portfolio_id=snapshot.portfolio_id,
+    )
+    run_id = create_generation_run(
+        conn,
+        template_id=snapshot.template_id,
+        template_version=int(snapshot.template_version or 1),
+        report_type=snapshot.scope_type,
+        portfolio_id=snapshot.portfolio_id,
+        asset_id=snapshot.asset_id,
+        snapshot_id=snapshot.id,
+        automation_id=automation_id,
+        period_type="monthly",
+        period_start=snapshot.period_start,
+        period_end=snapshot.period_end,
+        requested_count=len(formats),
+    )
+    conn.commit()
+    completed = 0
+    failed = 0
+    warnings: list[str] = []
+    try:
+        for fmt in formats:
+            try:
+                if snapshot.scope_type == "portfolio":
+                    result = portfolio_result_from_dict(snapshot.payload)
+                    rendered = (
+                        render_portfolio_pdf(result, template)
+                        if fmt == "pdf"
+                        else render_portfolio_excel(result, template)
+                    )
+                else:
+                    report = {
+                        **snapshot.payload,
+                        "asset": {
+                            "id": snapshot.asset_id,
+                            "project_name": snapshot.payload.get("installation") or "",
+                        },
+                        "report_month": report_month,
+                        "period_start": snapshot.period_start,
+                        "period_end": snapshot.period_end,
+                        "engine_version": snapshot.engine_version,
+                    }
+                    rendered = (
+                        render_individual_pdf(report, template)
+                        if fmt == "pdf"
+                        else render_individual_excel(report, template)
+                    )
+                register_rendered_generation_file(
+                    conn,
+                    output_dir or (UPLOAD_DIR / "generated_reports"),
+                    run_id,
+                    rendered,
+                    portfolio_id=snapshot.portfolio_id,
+                    asset_id=snapshot.asset_id,
+                    snapshot_id=snapshot.id,
+                )
+                completed += 1
+                warnings.extend(rendered.warnings)
+            except Exception as exc:
+                failed += 1
+                LOGGER.warning(
+                    "report_automation_snapshot_render_failed automation_id=%s snapshot_id=%s format=%s error_code=%s",
+                    automation_id,
+                    snapshot.id,
+                    fmt,
+                    type(exc).__name__,
+                )
+                add_failed_generation_file(
+                    conn,
+                    run_id,
+                    {
+                        "format": fmt,
+                        "period": {
+                            "period_type": "monthly",
+                            "period_start": snapshot.period_start,
+                            "period_end": snapshot.period_end,
+                        },
+                    },
+                    str(exc),
+                    portfolio_id=snapshot.portfolio_id,
+                    asset_id=snapshot.asset_id,
+                    snapshot_id=snapshot.id,
+                )
+        status = "completed" if completed and not failed else (
+            "partial" if completed else "failed"
+        )
+        finish_generation_run(
+            conn,
+            run_id,
+            status=status,
+            completed_count=completed,
+            failed_count=failed,
+            warnings=sorted(set(warnings)),
+            error_message="" if completed else "Todos os outputs falharam.",
+        )
+        conn.execute(
+            """
+            UPDATE report_automations
+            SET last_blocked_reason = '', last_snapshot_id = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                snapshot.id,
+                datetime.now().isoformat(timespec="seconds"),
+                automation_id,
             )
-            finish_generation_run(
-                conn,
-                run_id,
-                status="failed",
-                completed_count=0,
-                failed_count=max(1, len(formats)),
-                error_message="Falha ao preparar a execução automática.",
-            )
-            conn.commit()
+        )
+        conn.commit()
+        return {
+            "run_id": run_id,
+            "status": status,
+            "completed": completed,
+            "failed": failed,
+            "duplicate": False,
+            "snapshot_id": snapshot.id,
+        }
+    except Exception:
+        conn.rollback()
+        finish_generation_run(
+            conn,
+            run_id,
+            status="failed",
+            completed_count=completed,
+            failed_count=max(failed, 1),
+            error_message="Falha ao gerar a partir do snapshot aprovado.",
+        )
+        conn.commit()
         raise
 
 
