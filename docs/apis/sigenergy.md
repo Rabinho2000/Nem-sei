@@ -56,3 +56,20 @@ Não existem endpoints implementados para:
 - controlo remoto.
 
 O onboarding existente na app fica como compatibilidade operacional da UI atual, mas não faz parte do client de estado Sigenergy documentado aqui.
+
+## Readiness para fecho mensal
+
+O fecho mensal mantém FusionSolar como fonte primária quando é a fonte mensal
+válida. `energyFlow` representa estado/potência live e nunca é integrado para
+inventar kWh.
+
+Um snapshot que dependa de Sigenergy fica bloqueado quando:
+
+- a permissão externa `System history` devolve 403 ou não está atribuída;
+- a unidade de energia ainda não foi confirmada oficialmente;
+- o backfill não cobre o mês completo;
+- o mês não passou a validação de qualidade.
+
+Os findings mostram a remediação operacional. A aplicação não altera permissões,
+não define `SIGENERGY_HISTORY_ENERGY_UNIT=kWh`, não inventa tópicos MQTT e não
+gera valores sintéticos.

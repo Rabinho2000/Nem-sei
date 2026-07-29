@@ -82,8 +82,8 @@ Documento vivo da implementação da pipeline operacional de relatórios.
 | E — fecho mensal/quality gate | Concluída | blueprint, services, templates, tests |
 | F — automatizações | Concluída | automation repository/jobs/UI/tests |
 | G — distribuição | Concluída | repository, routes, templates, tests |
-| H — Sigenergy/Expertcom | Pendente | quality findings e documentação |
-| I — UI/arquitetura/CI | Pendente | navegação, CSS, docs, workflow |
+| H — Sigenergy/Expertcom | Concluída localmente | quality findings, tests, documentação |
+| I — UI/arquitetura/CI | Em curso | navegação, arquitetura, docs, workflow |
 
 ## Bloqueios externos
 
