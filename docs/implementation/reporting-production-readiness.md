@@ -78,7 +78,7 @@ Documento vivo da implementação da pipeline operacional de relatórios.
 | A — dados hardcoded | Concluída | `portfolio_reports.py`, bootstrap, testes |
 | B — clientes e mapping | Concluída | `customer_repository.py`, assets/portfolios |
 | C — capacidade histórica | Concluída | capacity repository, assets, relatórios |
-| D — snapshots/aprovação | Pendente | reporting snapshots, geração, repositories |
+| D — snapshots/aprovação | Concluída | reporting snapshots, quality gate, auditoria |
 | E — fecho mensal/quality gate | Pendente | blueprint, services, templates |
 | F — automatizações | Pendente | automation repository/jobs/UI |
 | G — distribuição | Pendente | repository, routes, templates |
@@ -145,3 +145,19 @@ limpeza do histórico Git.
 - UI do asset permite consultar, corrigir e adicionar expansões.
 - Verificação focada: 70 testes passaram. A primeira execução encontrou apenas
   uma coluna errada na nova fixture, corrigida para o schema real.
+
+### Fase D
+
+- Criado contrato comum `report_snapshots` para scope individual e portefólio.
+- Payload, template, perfil, billing, fontes, versões, cobertura, período e
+  engine version integram um envelope canónico com SHA-256 determinístico.
+- Criados estados de validação/aprovação e `report_snapshot_events`.
+- Trigger SQLite impede alterações ao conteúdo congelado após aprovação.
+- Validação confirma o hash antes de qualquer transição.
+- Aprovação exige validação sem blockers; rejeição exige motivo.
+- Seleção de snapshot final devolve exclusivamente snapshots aprovados e com
+  hash válido.
+- As estruturas históricas `portfolio_report_runs`,
+  `report_generation_runs` e `report_generated_files` não foram removidas nem
+  reescritas.
+- Verificação focada: 59 testes passaram.

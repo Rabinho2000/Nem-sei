@@ -249,6 +249,7 @@ from monitoring_board.reporting.validation import (
     parse_billing_values_source,
     validate_report_asset_selection,
 )
+from monitoring_board.reporting.snapshots import ensure_report_snapshot_schema
 from monitoring_board.reporting.tariffs import result_to_legacy_dict, value_tariff_energy, with_billing_fallback
 from monitoring_board.services.invoice_extraction import extract_invoice_file, sha256_file, validate_invoice_file_content
 from monitoring_board.services.fusionsolar import (
@@ -6810,6 +6811,7 @@ def ensure_database(path: str) -> None:
         ensure_portfolio_management_schema(conn)
         ensure_customer_schema(conn)
         ensure_asset_capacity_schema(conn)
+        ensure_report_snapshot_schema(conn)
         ensure_portfolio_reporting_schema(conn)
         ensure_report_template_schema(conn)
         ensure_financial_model_schema(conn)
