@@ -25,7 +25,26 @@
               <strong>{{ row.external_name or row.mapped_external_name or row.external_id }}</strong>
             </td>
             <td>{{ row.external_id }}</td>
-            <td>{{ row.project_name or 'Por associar' }}</td>
+            <td>
+              <div>{{ row.project_name or 'Por associar' }}</div>
+              <form method="post" class="stack-form">
+                <input type="hidden" name="action" value="set_sigenergy_asset_association">
+                <input type="hidden" name="external_id" value="{{ row.external_id }}">
+                <label>Associacao local
+                  <select name="asset_id">
+                    <option value="">Sem associacao</option>
+                    {% for asset in assets_for_mapping %}
+                      <option value="{{ asset.id }}" {% if row.asset_id == asset.id %}selected{% endif %}>
+                        {{ asset.project_name }}
+                      </option>
+                    {% endfor %}
+                  </select>
+                </label>
+                <button class="button secondary" type="submit">
+                  {{ 'Alterar' if row.asset_id else 'Associar' }}
+                </button>
+              </form>
+            </td>
             <td>
               {% if row.access_status == 'unauthorized' %}
                 Sem autorizacao

@@ -201,6 +201,7 @@ from monitoring_board.reporting.data_quality import (
 from monitoring_board.reporting.energy_sources import (
     resolve_asset_energy_source,
     set_asset_primary_energy_source,
+    set_sigenergy_asset_association,
 )
 from monitoring_board.services.energy_facts import (
     parse_sigenergy_daily_history,
@@ -5444,6 +5445,26 @@ def create_app() -> Flask:
                 except Exception as exc:
                     flash(f"Nao foi possivel definir a fonte primaria: {exc}", "error")
                 return redirect(url_for("integrations") + "#integrations-sigenergy")
+
+            if action == "set_sigenergy_asset_association":
+                try:
+                    raw_asset_id = request.form.get("asset_id", "").strip()
+                    set_sigenergy_asset_association(
+                        g.db,
+                        external_id=request.form.get("external_id", "").strip(),
+                        asset_id=int(raw_asset_id) if raw_asset_id else None,
+                    )
+                    g.db.commit()
+                    flash("Associacao local Sigenergy atualizada.", "success")
+                except Exception as exc:
+                    g.db.rollback()
+                    flash(
+                        f"Nao foi possivel atualizar a associacao local: {exc}",
+                        "error",
+                    )
+                return redirect(
+                    url_for("integrations") + "#integrations-sigenergy"
+                )
 
             if action == "sync_sigenergy_now":
                 try:
