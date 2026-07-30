@@ -9,6 +9,13 @@ import requests
 import app as app_module
 from monitoring_board.db import get_db
 from monitoring_board.services.api_rate_limit import ApiRateLimitError, mark_api_cooldown
+from monitoring_board.services.sigenergy_contracts import (
+    AccessStatus,
+    ScopedProviderError,
+    SyncBatchResult,
+    SyncStatus,
+    SystemSyncResult,
+)
 
 
 class HttpResponse:
@@ -213,16 +220,56 @@ def test_fusionsolar_305_relogs_once(tmp_path, monkeypatch) -> None:
 def test_sigenergy_429_marks_persistent_cooldown(tmp_path, monkeypatch) -> None:
     db_path = tmp_path / "sigenergy-429.db"
     app_module.ensure_database(str(db_path))
+    cooldown_until = datetime.now() + timedelta(minutes=60)
+    attempted_at = datetime.now().isoformat(timespec="seconds")
 
-    def fake_provider_check(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
-        raise ApiRateLimitError(
-            app_module.INTEGRATION_PROVIDER_SIGENERGY,
-            app_module.API_AREA_STATE,
-            datetime.now() + timedelta(minutes=60),
-            "Sigenergy HTTP 429",
-        )
+    class RateLimitedSigenergyService:
+        def sync_all_mappings(self, **_kwargs: Any) -> SyncBatchResult:
+            error = ScopedProviderError(
+                provider=app_module.INTEGRATION_PROVIDER_SIGENERGY,
+                operation="state_sync",
+                external_id="SIG-429",
+                occurred_at=attempted_at,
+                category="rate_limited",
+                message="Sigenergy HTTP 429",
+                http_status=429,
+            )
+            result = SystemSyncResult(
+                external_id="SIG-429",
+                status=SyncStatus.RATE_LIMITED,
+                attempted_at=attempted_at,
+                asset_id=1,
+                access_status=AccessStatus.UNKNOWN,
+                error=error,
+                cooldown_until=cooldown_until,
+            )
+            return SyncBatchResult(
+                SyncStatus.RATE_LIMITED,
+                (result,),
+                attempted_at,
+                attempted_at,
+            )
 
-    monkeypatch.setattr(app_module, "run_sigenergy_check", fake_provider_check)
+    monkeypatch.setattr(
+        app_module,
+        "build_sigenergy_operation_service",
+        lambda *_args, **_kwargs: RateLimitedSigenergyService(),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "cleanup_sigenergy_snapshots",
+        lambda *_args, **_kwargs: 0,
+    )
+    monkeypatch.setattr(
+        app_module,
+        "notify_api_rate_limit",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        app_module,
+        "process_monitoring_alerts",
+        lambda *_args, **_kwargs: None,
+    )
     with get_db(str(db_path)) as conn:
         now = datetime.now().isoformat(timespec="seconds")
         conn.execute(

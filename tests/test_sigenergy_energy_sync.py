@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import app as app_module
+import pytest
 from monitoring_board.db import get_db
+from monitoring_board.services.api_rate_limit import ApiRateLimitError
 
 
 def configure_sigenergy_asset(conn, *, external_id: str) -> int:
@@ -158,8 +160,82 @@ def test_daily_history_403_isolated_to_target_installation(
             "SELECT COUNT(*) FROM energy_interval_facts"
         ).fetchone()[0]
 
-    assert result["status"] == "forbidden"
+    assert result["status"] == "failed"
+    assert result["legacy_status"] == "forbidden"
     assert inventory["SIG-FORBIDDEN"]["data_quality"] == "missing"
-    assert "HTTP 403" in inventory["SIG-FORBIDDEN"]["last_error"]
+    assert inventory["SIG-FORBIDDEN"]["last_error"] in (None, "")
     assert inventory["SIG-OTHER"]["last_error"] in (None, "")
+    assert fact_count == 0
+    with get_db(str(db_path)) as conn:
+        scoped = conn.execute(
+            """
+            SELECT operation, external_id, status, http_status
+            FROM provider_operation_state
+            WHERE provider = 'Sigenergy'
+              AND operation = 'history'
+              AND external_id = 'SIG-FORBIDDEN'
+            """
+        ).fetchone()
+    assert dict(scoped) == {
+        "operation": "history",
+        "external_id": "SIG-FORBIDDEN",
+        "status": "failed",
+        "http_status": 403,
+    }
+
+
+def test_daily_history_rate_limit_is_scoped_and_surfaces_cooldown(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "sigenergy-energy-rate-limit.db"
+    app_module.ensure_database(str(db_path))
+    cooldown = datetime.now() + timedelta(minutes=30)
+
+    class RateLimitedClient:
+        def __init__(self, _config, session=None) -> None:
+            self.session = session
+
+        def get_system_history(self, _system_id, *, level, target_date):
+            raise ApiRateLimitError(
+                "Sigenergy",
+                "production",
+                cooldown,
+                "history limited",
+            )
+
+    monkeypatch.setattr(
+        app_module.sigenergy_service,
+        "SigenergyClient",
+        RateLimitedClient,
+    )
+    with get_db(str(db_path)) as conn:
+        configure_sigenergy_asset(conn, external_id="SIG-LIMITED")
+        with pytest.raises(ApiRateLimitError) as error:
+            app_module.run_sigenergy_daily_energy_sync(
+                conn,
+                external_id="SIG-LIMITED",
+                target_date=date(2020, 1, 2),
+            )
+        scoped = conn.execute(
+            """
+            SELECT operation, external_id, status, http_status
+            FROM provider_operation_state
+            WHERE provider = 'Sigenergy'
+              AND operation = 'history'
+              AND external_id = 'SIG-LIMITED'
+            """
+        ).fetchone()
+        fact_count = conn.execute(
+            "SELECT COUNT(*) FROM energy_interval_facts"
+        ).fetchone()[0]
+
+    assert error.value.area == "production"
+    assert error.value.cooldown_until == cooldown
+    assert dict(scoped) == {
+        "operation": "history",
+        "external_id": "SIG-LIMITED",
+        "status": "rate_limited",
+        "http_status": 429,
+    }
     assert fact_count == 0

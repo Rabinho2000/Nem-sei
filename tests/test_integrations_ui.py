@@ -4,6 +4,16 @@ from datetime import datetime
 
 import app as app_module
 from monitoring_board.db import get_db
+from monitoring_board.repositories import sigenergy as sigenergy_repository
+from monitoring_board.services.sigenergy_contracts import (
+    CredentialOutcome,
+    CredentialStatus,
+    CredentialTestResult,
+    OPERATION_ACCESS,
+    OPERATION_CREDENTIALS,
+    OPERATION_DISCOVERY,
+    OPERATION_STATE_SYNC,
+)
 
 
 def authenticated_client(db_path):
@@ -113,7 +123,7 @@ def test_sigenergy_ui_hides_technical_endpoints_and_manual_system_allowlist(
     assert 'value="refresh_sigenergy_systems"' in html
 
 
-def test_sigenergy_connection_test_lists_systems_without_energy_flow(
+def test_sigenergy_credentials_action_only_authenticates(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -121,15 +131,20 @@ def test_sigenergy_connection_test_lists_systems_without_energy_flow(
     app_module.ensure_database(str(db_path))
     calls = []
 
-    def fake_check(_conn, provider, **kwargs):
-        calls.append((provider, kwargs))
-        return {
-            "station_count": 2,
-            "realtime_count": 0,
-            "failed_realtime_count": 0,
-        }
+    def fake_credentials(_conn):
+        calls.append("credentials")
+        return CredentialTestResult(
+            CredentialOutcome.AUTHENTICATED,
+            CredentialStatus.VALID,
+            "2026-07-30T18:00:00",
+        )
 
-    monkeypatch.setattr(app_module, "run_sigenergy_check", fake_check)
+    monkeypatch.setattr(
+        app_module,
+        "test_sigenergy_credentials",
+        fake_credentials,
+    )
+    assert not hasattr(app_module, "run_sigenergy_check")
     flask_app, original_database, client = authenticated_client(db_path)
     try:
         response = client.post(
@@ -143,12 +158,7 @@ def test_sigenergy_connection_test_lists_systems_without_energy_flow(
         flask_app.config["DATABASE"] = original_database
 
     assert response.status_code == 302
-    assert calls == [
-        (
-            app_module.INTEGRATION_PROVIDER_SIGENERGY,
-            {"dry_run": True, "include_energy_flow": False},
-        )
-    ]
+    assert calls == ["credentials"]
 
 
 def test_sigenergy_onboarding_requires_explicit_remote_confirmation(
@@ -318,6 +328,110 @@ def test_sigenergy_ui_identifies_direct_energy_flow_validation(
     assert response.status_code == 200
     assert "Expertcom" in html
     assert "TZXRS1780315946" in html
-    assert "Acessivel" in html
-    assert "Validacao direta por energyFlow" in html
-    assert "nao devolvida por /openapi/system" in html
+    assert "Acessível" in html
+    assert "Validação direta por energyFlow" in html
+    assert "não devolvida por /openapi/system" not in html
+
+
+def test_sigenergy_ui_keeps_valid_credentials_and_restricted_discovery_separate(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "sigenergy-independent-global-states.db"
+    app_module.ensure_database(str(db_path))
+    with get_db(str(db_path)) as conn:
+        sigenergy_repository.record_operation_result(
+            conn,
+            operation=OPERATION_CREDENTIALS,
+            status="valid",
+            occurred_at="2026-07-30T18:00:00",
+            succeeded=True,
+        )
+        sigenergy_repository.record_operation_result(
+            conn,
+            operation=OPERATION_DISCOVERY,
+            status="restricted",
+            occurred_at="2026-07-30T18:01:00",
+            message="Access restriction",
+            api_code="1201",
+        )
+        conn.commit()
+
+    flask_app, original_database, client = authenticated_client(db_path)
+    try:
+        response = client.get("/integrations")
+    finally:
+        flask_app.config["DATABASE"] = original_database
+
+    html = " ".join(response.get_data(as_text=True).split())
+    assert response.status_code == 200
+    assert "Credenciais</span> <strong>valid</strong>" in html
+    assert "Descoberta</span> <strong>restricted</strong>" in html
+    assert "a verificação direta continua disponível" in html
+    assert "0 instalações autorizadas" not in html
+
+
+def test_sigenergy_ui_shows_only_scoped_historical_error_with_identity(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "sigenergy-scoped-error-ui.db"
+    app_module.ensure_database(str(db_path))
+    now = "2026-07-30T18:02:03"
+    with get_db(str(db_path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO provider_system_inventory (
+                provider, external_id, external_name, metadata_json,
+                access_status, validation_method, first_discovered_at,
+                last_discovered_at, operational_status, sync_status,
+                data_quality, created_at, updated_at
+            ) VALUES (
+                'Sigenergy', 'SIG-SCOPED', 'Scoped site', '{}',
+                'accessible', 'direct_energy_flow', ?, ?, 'offline',
+                'failed', 'missing', ?, ?
+            )
+            """,
+            (now, now, now, now),
+        )
+        sigenergy_repository.record_operation_result(
+            conn,
+            operation=OPERATION_ACCESS,
+            external_id="SIG-SCOPED",
+            status="accessible",
+            occurred_at="2026-07-30T18:01:00",
+            succeeded=True,
+        )
+        sigenergy_repository.record_operation_result(
+            conn,
+            operation=OPERATION_STATE_SYNC,
+            external_id="SIG-SCOPED",
+            status="failed",
+            occurred_at=now,
+            message="scoped provider failure",
+            http_status=500,
+            api_code="9000",
+        )
+        conn.execute(
+            """
+            UPDATE integration_configs
+            SET last_error = 'unrelated-global-error-SIG-OTHER'
+            WHERE provider = 'Sigenergy'
+            """
+        )
+        conn.commit()
+
+    flask_app, original_database, client = authenticated_client(db_path)
+    try:
+        response = client.get("/integrations")
+    finally:
+        flask_app.config["DATABASE"] = original_database
+
+    html = " ".join(response.get_data(as_text=True).split())
+    assert response.status_code == 200
+    assert "Acessível" in html
+    assert "offline" in html
+    assert "Último erro · state_sync" in html
+    assert "scoped provider failure" in html
+    assert "System ID SIG-SCOPED · 2026-07-30T18:02:03" in html
+    assert "HTTP 500" in html
+    assert "code 9000" in html
+    assert "unrelated-global-error-SIG-OTHER" not in html

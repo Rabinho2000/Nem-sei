@@ -91,10 +91,11 @@ FUSIONSOLAR_DIAGNOSTICS_SYNC_TIME=00:30
 
 ## Integracao Sigenergy
 
-Esta fase suporta apenas monitorizacao atual Sigenergy: autenticacao por App
-Key/App Secret, lista de instalacoes e `energyFlow` atual. Ainda nao inclui
-historico de producao, alarmes, inversores, strings, disponibilidade por
-inversor ou controlo remoto.
+A integração separa autenticação, descoberta opcional, validação direta,
+associação local, estado live, histórico e onboarding. A descoberta
+`GET /openapi/system` não é uma pré-condição: uma conta que devolva
+`code=1201` pode continuar a validar um System ID conhecido, sincronizar os
+mappings ativos e importar histórico diretamente.
 
 No `.env`, preencher:
 
@@ -106,41 +107,46 @@ SIGENERGY_BASE_URL=https://api-eu.sigencloud.com
 SIGENERGY_AUTH_ENDPOINT=/openapi/auth/login/key
 SIGENERGY_SYSTEMS_ENDPOINT=/openapi/system
 SIGENERGY_ENERGY_FLOW_ENDPOINT=/openapi/systems/{system_id}/energyFlow
+SIGENERGY_HISTORY_ENDPOINT=/openapi/systems/{system_id}/history
+SIGENERGY_HISTORY_ENERGY_UNIT=kWh
 SIGENERGY_ONBOARD_ENDPOINT=/openapi/board/onboard
 SIGENERGY_REGION=eu
 SIGENERGY_STATE_SYNC_INTERVAL_HOURS=1
 SIGENERGY_SNAPSHOT_RETENTION_DAYS=90
 ```
 
-Se a conta nao devolver a lista de sistemas, usar `SIGENERGY_SYSTEM_IDS` com os
-IDs separados por virgula. Nao enviar App Secret, tokens, `.env`, bases de
-dados, logs ou exports para Git.
+`SIGENERGY_SYSTEM_IDS` foi descontinuada e nunca autoriza uma instalação nem
+fornece candidatos ao scheduler. A coluna homónima da base é mantida apenas
+para compatibilidade aditiva de schema. Não enviar App Secret, tokens, `.env`,
+bases de dados, logs ou exports para Git.
 
-Na interface, abrir `Integracoes > Sigenergy`, guardar a configuracao, usar
-`Testar ligacao` para validar autenticacao/lista/energy flow sem escrever dados
-e `Sincronizar agora` para gravar snapshots e registos de monitorizacao.
+Na interface, abrir `Integracoes > Sigenergy`. As ações são independentes:
 
-Para pedir acesso a uma nova instalacao, usar o bloco `Onboarding Sigenergy` na
-mesma pagina e enviar um unico System ID. O pedido chama
-`POST /openapi/board/onboard` com payload `["SYSTEM_ID"]`; a app guarda o
-codigo e mensagem devolvidos pelo provider sem tokens nem secrets. O proprietario
-da instalacao podera ter de aprovar o acesso na Sigenergy. Usar `Atualizar
-estado` ou uma sincronizacao futura para reconciliar: quando o System ID aparecer
-em `/openapi/system`, o pedido passa para `approved`.
+- `Testar credenciais` só autentica;
+- `Atualizar descoberta` só lista instalações;
+- `Verificar System ID` chama `energyFlow` diretamente e não cria asset;
+- `Sincronizar instalações associadas` usa apenas mappings ativos;
+- `Importar histórico` cria um job idempotente por dia terminado.
+
+O onboarding é uma ação remota explícita e separada. Uma validação direta
+bem-sucedida não altera a resposta formal do provider.
 
 Estados de onboarding principais:
 
 - `requested`: pedido enviado.
-- `already_requested_or_onboarded`: codigo conservador para respostas como
-  `1401` ate o sistema aparecer na lista autorizada.
-- `approved`: sistema encontrado na lista Sigenergy.
+- `provider_pending`: resposta como `1401`, ainda sem aprovação formal.
+- `provider_approved`: aprovação formal do provider.
+- `provider_rejected`: rejeição formal do provider.
+- `access_confirmed_independently`: acesso confirmado por operação separada,
+  sem reescrever o pedido original.
+- `superseded`: pedido substituído.
 - `failed`: pedido rejeitado ou erro do provider.
 
 Nao existe suporte a Bearer token estatico (`SIGENERGY_BEARER`); a integracao
 usa sempre App Key/App Secret, token temporario em cache e renovacao automatica
-apos HTTP 401. Se parte das chamadas `energyFlow` falhar, a sincronizacao fica
-com estado `partial`, preserva o ultimo estado valido e guarda o erro sanitizado.
-Snapshots Sigenergy sao limpos uma vez por dia conforme
+apos HTTP 401. Falhas são guardadas por operação e por System ID. Se uma
+instalação falhar, as restantes continuam e o batch fica `partial`. Snapshots
+Sigenergy são limpos uma vez por dia conforme
 `SIGENERGY_SNAPSHOT_RETENTION_DAYS`, mantendo sempre o snapshot mais recente de
 cada sistema.
 
@@ -168,8 +174,11 @@ Sigenergy:
 - `integration-state-sigenergy-hourly`: estado atual/`energyFlow`, no maximo uma
   vez por hora. So e agendado se a integracao estiver ativa e
   `auto_sync_enabled` estiver ligado na UI.
-- A app nao agenda producao nem historico Sigenergy enquanto nao houver
-  endpoints/configuracao validados para isso.
+- Os candidatos são exclusivamente `asset_integrations` Sigenergy ativos; o
+  job nunca chama discovery.
+- O histórico é solicitado manualmente por intervalo e cria
+  `sigenergy_energy_sync` por System ID e dia terminado. Dias completos são
+  retomados sem duplicação.
 
 Rate limit e backoff:
 

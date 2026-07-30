@@ -30,9 +30,10 @@ Sigenergy tests in `tests/test_sigenergy_provider_contracts.py` pin JSON-string/
 - FusionSolar collectTime timezone semantics are not authoritative yet. The app currently accepts milliseconds, seconds, ISO dates, and `dd/mm/yyyy` fallback strings, and timestamp conversion still follows the current host-local `datetime.fromtimestamp()` behavior. Real account samples are needed before changing this.
 - FusionSolar production values are treated as kWh when selected from `PVYield`, then `inverterYield`, then legacy `inverter_power`. The tests pin current priority and raw value capture, but real account samples should confirm which key best represents customer-facing production for each target plant/API version.
 - FusionSolar rate-limit and session-expiry handling still depends on string matching around `failCode` values, including `407`, `305`, and `USER_MUST_RELOGIN`. The tests pin current recognized payloads, not every provider message variant.
-- Sigenergy rate-limit and token-expiry codes are not fully known. Current tests pin a generic non-zero code path and error persistence, including a fixture code shaped like `42901`, but exact throttle/expired-token contracts need real provider samples.
-- Sigenergy realtime and energy-flow freshness/rate limits are still assumptions. The app fetches system list, realtime data, and energy flow through current request cadence without a Sigenergy-specific cooldown strategy.
-- Configured-system fallback behavior remains intentional: configured `SIGENERGY_SYSTEM_IDS` can bypass automatic system listing when the account/API does not expose systems. That behavior should be rechecked with real accounts before relying on it for every deployment.
+- Sigenergy provider-specific throttle and token-expiry API codes are not fully known. HTTP 401 refresh and HTTP 429 cooldown are handled explicitly; other non-zero codes remain operation-scoped provider errors.
+- Sigenergy realtime and energy-flow freshness guarantees are still assumptions. Calls use the persistent account/API-area queue and its configurable cadence.
+- A real account confirmed discovery `code=1201` while direct `energyFlow` and daily history remained available. Discovery is therefore optional and cannot gate direct access, sync or history.
+- The former configured-system fallback was removed. `SIGENERGY_SYSTEM_IDS` is deprecated and never authorizes a system or supplies sync candidates.
 
 ## Do Not Rely On Yet
 
@@ -41,7 +42,7 @@ Sigenergy tests in `tests/test_sigenergy_provider_contracts.py` pin JSON-string/
 - Provider-wide guarantees that `PVYield`, `inverterYield`, and `inverter_power` always use the same unit and business meaning across all target accounts.
 - Exhaustive FusionSolar `failCode` message text matching across languages or API versions.
 - Sigenergy realtime and energy-flow freshness guarantees for large accounts or high-frequency scheduled syncs.
-- Sigenergy configured-system fallback as a substitute for validating the account's system-list permissions and payload shape.
+- Discovery results as proof that a known System ID is inaccessible; direct `energyFlow` is the independent access check.
 
 ## Regression Commands
 

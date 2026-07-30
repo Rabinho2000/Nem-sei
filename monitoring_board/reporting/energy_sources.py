@@ -3,6 +3,10 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
+from monitoring_board.services.sigenergy_mapping import (
+    map_sigenergy_system,
+)
+
 
 def resolve_asset_energy_source(
     conn: sqlite3.Connection,
@@ -84,17 +88,20 @@ def set_asset_primary_energy_source(
     *,
     asset_id: int,
     provider: str,
+    external_id: str = "",
     confirmed: bool = False,
 ) -> None:
     selected = conn.execute(
         """
-        SELECT id
+        SELECT id, external_id
         FROM asset_integrations
         WHERE asset_id = ? AND provider = ? AND enabled = 1
           AND COALESCE(external_id, '') != ''
+          AND (? = '' OR external_id = ?)
+        ORDER BY id
         LIMIT 1
         """,
-        (asset_id, provider),
+        (asset_id, provider, external_id, external_id),
     ).fetchone()
     if selected is None:
         raise ValueError("A fonte escolhida nao tem um mapeamento ativo para esta instalacao.")
@@ -104,6 +111,7 @@ def set_asset_primary_energy_source(
             SELECT 1
             FROM production_records
             WHERE asset_id = ? AND provider = 'Sigenergy'
+              AND external_id = ?
               AND period_type = 'month' AND data_quality = 'complete'
               AND production_kwh IS NOT NULL
               AND consumption_kwh IS NOT NULL
@@ -112,7 +120,7 @@ def set_asset_primary_energy_source(
               AND grid_import_kwh IS NOT NULL
             LIMIT 1
             """,
-            (asset_id,),
+            (asset_id, str(selected["external_id"])),
         ).fetchone()
         if ready is None:
             raise ValueError(
@@ -146,50 +154,13 @@ def set_sigenergy_asset_association(
     *,
     external_id: str,
     asset_id: int | None,
+    actor: str = "",
 ) -> None:
-    """Create, change, or remove a Sigenergy mapping without remote calls."""
+    """Compatibility wrapper for the dedicated mapping service."""
 
-    inventory = conn.execute(
-        """
-        SELECT external_name
-        FROM provider_system_inventory
-        WHERE provider = 'Sigenergy' AND external_id = ?
-        """,
-        (external_id,),
-    ).fetchone()
-    if inventory is None:
-        raise ValueError("O sistema Sigenergy nao existe no inventario local.")
-    if asset_id is None:
-        conn.execute(
-            """
-            DELETE FROM asset_integrations
-            WHERE provider = 'Sigenergy' AND external_id = ?
-            """,
-            (external_id,),
-        )
-        return
-    asset = conn.execute(
-        "SELECT id FROM assets WHERE id = ?",
-        (asset_id,),
-    ).fetchone()
-    if asset is None:
-        raise ValueError("O asset local escolhido nao existe.")
-    conn.execute(
-        """
-        INSERT INTO asset_integrations (
-            asset_id, provider, external_id, external_name, enabled,
-            is_primary_energy_source, last_sync_at, last_status, last_error
-        ) VALUES (?, 'Sigenergy', ?, ?, 1, 0, NULL, NULL, '')
-        ON CONFLICT(provider, external_id) DO UPDATE SET
-            asset_id = excluded.asset_id,
-            external_name = excluded.external_name,
-            enabled = 1,
-            is_primary_energy_source = 0,
-            last_error = ''
-        """,
-        (
-            asset_id,
-            external_id,
-            str(inventory["external_name"] or external_id),
-        ),
+    map_sigenergy_system(
+        conn,
+        external_id=external_id,
+        asset_id=asset_id,
+        actor=actor,
     )

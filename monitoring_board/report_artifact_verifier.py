@@ -208,6 +208,7 @@ def main() -> int:
     parser.add_argument("--file-id", type=int)
     args = parser.parse_args()
     with get_db(str(DB_PATH)) as conn:
+        conn.execute("PRAGMA query_only = ON")
         result = verify_expertcom_report(
             conn,
             storage_root=UPLOAD_DIR / "generated_reports",

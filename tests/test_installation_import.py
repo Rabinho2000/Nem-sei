@@ -9,6 +9,13 @@ from werkzeug.datastructures import MultiDict
 
 import app as app_module
 from monitoring_board.db import get_db
+from monitoring_board.repositories import sigenergy as sigenergy_repository
+from monitoring_board.services.sigenergy_contracts import (
+    AccessOutcome,
+    AccessStatus,
+    OperationalStatus,
+    SystemAccessResult,
+)
 from monitoring_board.services.sigenergy_errors import SigenergyApiError
 
 
@@ -65,6 +72,18 @@ def preview_import(
     target_asset_id: int | None = None,
     raw_payload: dict | None = None,
 ) -> int:
+    access_status = "accessible" if provider == "Sigenergy" else "available"
+    preview = normalized(provider, external_id, name)
+    if provider == "Sigenergy":
+        preview["validation_method"] = "direct_energy_flow"
+        sigenergy_repository.upsert_accessible_system(
+            conn,
+            external_id=external_id,
+            external_name=name,
+            energy_flow={"preview_fields": []},
+            operational_status=OperationalStatus.OPERATIONAL,
+            observed_at=preview["fetched_at"],
+        )
     import_id = app_module.upsert_installation_import_preview(
         conn,
         provider=provider,
@@ -73,8 +92,8 @@ def preview_import(
         mode=mode,
         target_asset_id=target_asset_id,
         status="preview",
-        access_status="available",
-        normalized=normalized(provider, external_id, name),
+        access_status=access_status,
+        normalized=preview,
         raw_payload=raw_payload or {},
         created_by="test",
     )
@@ -98,6 +117,25 @@ def confirm_form(name: str, *, target_asset_id: int | None = None, apply_fields:
         values.append(("target_asset_id", str(target_asset_id)))
     values.extend(("apply_field", field) for field in (apply_fields or []))
     return MultiDict(values)
+
+
+def inaccessible_result(
+    external_id: str,
+    *,
+    outcome: AccessOutcome = AccessOutcome.UNAUTHORIZED,
+    message: str = "forbidden",
+) -> SystemAccessResult:
+    access_status = {
+        AccessOutcome.UNAUTHORIZED: AccessStatus.UNAUTHORIZED,
+        AccessOutcome.NOT_FOUND: AccessStatus.NOT_FOUND,
+    }.get(outcome, AccessStatus.ERROR)
+    return SystemAccessResult(
+        external_id,
+        outcome,
+        access_status,
+        datetime.now().isoformat(timespec="seconds"),
+        message=message,
+    )
 
 
 def configure_provider(conn, provider: str, *, system_ids: str = "") -> None:
@@ -228,7 +266,7 @@ def test_sigenergy_missing_access_sends_only_one_onboarding_request(tmp_path, mo
             """
             SELECT daily_call_count
             FROM production_api_queue_state
-            WHERE provider = 'sigenergy' AND api_area = 'discovery'
+            WHERE provider = 'sigenergy' AND api_area = 'onboarding'
             """
         ).fetchone()
 
@@ -294,7 +332,7 @@ def test_sigenergy_import_list_and_preview_use_the_common_queue(
 
     assert [row["external_id"] for row in listed] == ["SIG-QUEUE"]
     assert preview["external_id"] == "SIG-QUEUE"
-    assert queue_rows["discovery"] == 2
+    assert queue_rows["discovery"] == 1
     assert queue_rows["state"] == 1
 
 
@@ -364,10 +402,10 @@ def test_access_check_resumes_pending_import_without_duplicate_data(tmp_path, mo
             (import_id,),
         ).fetchone()
         assert result["status"] == "preview"
-        assert result["access_status"] == "available"
+        assert result["access_status"] == "accessible"
         assert imported["status"] == "preview"
-        assert imported["access_status"] == "available"
-        assert onboarding["status"] == "approved"
+        assert imported["access_status"] == "accessible"
+        assert onboarding["status"] == "requested"
         assert conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 0
 
 
@@ -644,7 +682,9 @@ def test_sigenergy_access_pending_requires_explicit_onboarding_and_creates_no_ma
             app_module,
             "fetch_provider_installation_preview",
             lambda *args, **kwargs: (_ for _ in ()).throw(
-                app_module.SigenergyInstallationAccessPending("pending")
+                app_module.SigenergyInstallationAccessPending(
+                    inaccessible_result("SIG-FAIL")
+                )
             ),
         )
         result = app_module.run_installation_import_preview_job(conn, import_id)
@@ -653,13 +693,11 @@ def test_sigenergy_access_pending_requires_explicit_onboarding_and_creates_no_ma
             "SELECT * FROM installation_imports WHERE id = ?", (import_id,)
         ).fetchone()
         assert result["status"] == "access_pending"
-        assert result["access_status"] == "not_returned"
-        assert result["message"] == (
-            "A instalação não foi devolvida pela App Key configurada."
-        )
+        assert result["access_status"] == "unauthorized"
+        assert result["message"] == "forbidden"
         assert result["onboarding_required"] is True
         assert row["status"] == "access_pending"
-        assert row["access_status"] == "not_returned"
+        assert row["access_status"] == "unauthorized"
         assert row["last_error"] == result["message"]
         assert conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM asset_integrations").fetchone()[0] == 0
@@ -723,7 +761,9 @@ def test_sigenergy_missing_system_with_real_onboarding_stays_pending_approval(
             app_module,
             "fetch_provider_installation_preview",
             lambda *args, **kwargs: (_ for _ in ()).throw(
-                app_module.SigenergyInstallationAccessPending("pending")
+                app_module.SigenergyInstallationAccessPending(
+                    inaccessible_result("SIG-PENDING")
+                )
             ),
         )
 
@@ -736,11 +776,11 @@ def test_sigenergy_missing_system_with_real_onboarding_stays_pending_approval(
             (import_id,),
         ).fetchone()
 
-    assert result["access_status"] == "pending_approval"
+    assert result["access_status"] == "unauthorized"
     assert result["onboarding_required"] is False
     assert result["onboarding_request_id"] == request_id
     assert result["onboarding_reused"] is True
-    assert row["access_status"] == "pending_approval"
+    assert row["access_status"] == "unauthorized"
     assert row["onboarding_request_id"] == request_id
 
 
@@ -836,9 +876,9 @@ def test_sigenergy_missing_from_discovery_uses_direct_energy_flow_without_onboar
 
     assert first["status"] == second["status"] == "preview"
     assert first["validation_method"] == "direct_energy_flow"
-    assert list_calls == [True, True]
+    assert list_calls == []
     assert installation_import["status"] == "preview"
-    assert installation_import["access_status"] == "available"
+    assert installation_import["access_status"] == "accessible"
     assert installation_import["validation_method"] == "direct_energy_flow"
     assert installation_import["external_name"] == "Expertcom"
     assert "validação direta energyFlow" in installation_import["source_label"]
@@ -865,9 +905,9 @@ def test_sigenergy_missing_from_discovery_uses_direct_energy_flow_without_onboar
     assert response.status_code == 200
     assert "Expertcom" in html
     assert "TZXRS1780315946" in html
-    assert "Acesso disponível" in html
+    assert "Acesso confirmado" in html
     assert "validado diretamente por energyFlow" in html
-    assert "não foi devolvida por /openapi/system" in normalized_html
+    assert "não foi devolvida por /openapi/system" not in normalized_html
 
 
 @pytest.mark.parametrize("status_code", [401, 403, 404])
@@ -925,8 +965,10 @@ def test_sigenergy_direct_validation_failure_creates_no_asset_or_onboarding(
         )
         conn.commit()
 
-        with pytest.raises(SigenergyApiError):
-            app_module.run_installation_import_preview_job(conn, import_id)
+        result = app_module.run_installation_import_preview_job(
+            conn,
+            import_id,
+        )
 
         installation_import = conn.execute(
             "SELECT * FROM installation_imports WHERE id = ?",
@@ -936,10 +978,20 @@ def test_sigenergy_direct_validation_failure_creates_no_asset_or_onboarding(
             "SELECT * FROM sigenergy_access_validations"
         ).fetchone()
 
-        assert installation_import["status"] == "error"
-        assert installation_import["access_status"] == "error"
+        expected_outcome = {
+            401: "auth_failed",
+            403: "unauthorized",
+            404: "not_found",
+        }[status_code]
+        expected_import_status = (
+            "error" if status_code == 401 else "access_pending"
+        )
+        assert result["status"] == expected_import_status
+        assert result["access_status"] == expected_outcome
+        assert installation_import["status"] == expected_import_status
+        assert installation_import["access_status"] == expected_outcome
         assert "secret-token" not in installation_import["last_error"]
-        assert validation["outcome"] == "failed"
+        assert validation["outcome"] == expected_outcome
         assert validation["status_code"] == status_code
         assert "secret-token" not in validation["sanitized_error"]
         assert conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 0
@@ -978,7 +1030,9 @@ def test_sigenergy_not_returned_ui_never_claims_request_was_sent(
             app_module,
             "fetch_provider_installation_preview",
             lambda *args, **kwargs: (_ for _ in ()).throw(
-                app_module.SigenergyInstallationAccessPending("pending")
+                app_module.SigenergyInstallationAccessPending(
+                    inaccessible_result("SIG-NOT-RETURNED")
+                )
             ),
         )
         app_module.run_installation_import_preview_job(conn, import_id)
@@ -993,8 +1047,8 @@ def test_sigenergy_not_returned_ui_never_claims_request_was_sent(
 
     html = response.get_data(as_text=True)
     assert response.status_code == 200
-    assert "Não devolvida pela App Key" in html
-    assert "A instalação não foi devolvida pela App Key configurada." in html
+    assert "Sem autorização para este System ID" in html
+    assert "O energyFlow direto recusou acesso" in html
     assert "Pedido enviado — aguarda aprovação" not in html
 
 
@@ -1105,9 +1159,9 @@ def test_sigenergy_pending_approval_migration_preserves_real_requests(
             (with_request,),
         ).fetchone()
 
-    assert migrated["access_status"] == "not_returned"
+    assert migrated["access_status"] == "unknown"
     assert migrated["last_error"] == (
-        "A instalação não foi devolvida pela App Key configurada."
+        "O acesso ainda não foi verificado pelo fluxo direto."
     )
     assert preserved["access_status"] == "pending_approval"
 
@@ -1118,32 +1172,17 @@ def test_sigenergy_accessible_import_syncs_only_new_mapping_despite_fixed_ids(
 ) -> None:
     db_path = tmp_path / "sigenergy-targeted-sync.db"
     app_module.ensure_database(str(db_path))
-    client_configs: list[object] = []
+    legacy_config_keys: list[bool] = []
+    discovery_calls: list[bool] = []
 
     class FakeClient:
         def __init__(self, config, session=None) -> None:
-            client_configs.append(config.get("system_ids"))
-            self.system_ids = config.get("system_ids")
+            legacy_config_keys.append("system_ids" in config)
             self.session = session
 
         def list_systems(self, *, allow_empty: bool = False):
-            if allow_empty:
-                return [
-                    {
-                        "systemId": "SIG-NEW",
-                        "systemName": "Nova Sigenergy",
-                        "status": "Normal",
-                        "address": "Rua API",
-                    }
-                ]
-            return [
-                {
-                    "systemId": item,
-                    "systemName": item,
-                    "status": "Normal",
-                }
-                for item in self.system_ids
-            ]
+            discovery_calls.append(allow_empty)
+            raise AssertionError("direct import/sync called discovery")
 
         def get_energy_flow(self, system_id: str):
             assert system_id == "SIG-NEW"
@@ -1204,34 +1243,32 @@ def test_sigenergy_accessible_import_syncs_only_new_mapping_despite_fixed_ids(
         ).fetchall()
 
     assert json.loads(job["params_json"])["target_external_ids"] == ["SIG-NEW"]
-    assert client_configs[0] == ""
-    assert client_configs[-1] == ""
+    assert legacy_config_keys and not any(legacy_config_keys)
+    assert discovery_calls == []
     assert result["matched"] == 1
     assert {row["external_id"] for row in snapshots} == {"SIG-NEW"}
 
 
-def test_sigenergy_normal_sync_uses_full_discovery_and_ignores_manual_ids(
+def test_sigenergy_normal_sync_uses_only_enabled_mappings_and_ignores_manual_ids(
     tmp_path,
     monkeypatch,
 ) -> None:
     db_path = tmp_path / "sigenergy-active-mappings.db"
     app_module.ensure_database(str(db_path))
-    configured_ids: list[object] = []
+    legacy_config_keys: list[bool] = []
+    energy_flow_calls: list[str] = []
 
     class FakeClient:
         def __init__(self, config, session=None) -> None:
-            configured_ids.append(config.get("system_ids"))
-            self.system_ids = config.get("system_ids")
+            legacy_config_keys.append("system_ids" in config)
             self.session = session
 
         def list_systems(self, *, allow_empty: bool = False):
-            return [
-                {"systemId": "SIG-ACTIVE", "systemName": "Active", "status": "Normal"},
-                {"systemId": "SIG-UNMAPPED", "systemName": "Unmapped", "status": "Normal"},
-            ]
+            raise AssertionError("automatic sync called discovery")
 
-        def get_energy_flow(self, _system_id: str):
-            return {"pvPower": 1.0}
+        def get_energy_flow(self, system_id: str):
+            energy_flow_calls.append(system_id)
+            return {"pvPower": 1.0, "systemStatus": "Normal"}
 
     monkeypatch.setattr(
         app_module.sigenergy_service,
@@ -1267,16 +1304,17 @@ def test_sigenergy_normal_sync_uses_full_discovery_and_ignores_manual_ids(
             (disabled_asset,),
         )
         conn.commit()
-        result = app_module.run_sigenergy_check(
+        result = app_module.run_sigenergy_sync(
             conn,
             "Sigenergy",
-            dry_run=True,
+            trigger_type="scheduled",
         )
 
-    assert configured_ids == [""]
-    assert [row["external_id"] for row in result["rows"]] == [
-        "SIG-ACTIVE",
-        "SIG-UNMAPPED",
+    assert legacy_config_keys == [False]
+    assert energy_flow_calls == ["SIG-ACTIVE"]
+    assert result["matched"] == 1
+    assert [row["external_id"] for row in result["systems"]] == [
+        "SIG-ACTIVE"
     ]
 
 

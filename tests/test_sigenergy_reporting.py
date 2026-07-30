@@ -361,6 +361,112 @@ def test_fusionsolar_to_ready_sigenergy_switch_requires_confirmation(
     assert selected["provider"] == "Sigenergy"
 
 
+def test_sigenergy_primary_gate_uses_the_selected_mapping_external_id(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "sigenergy-primary-external-id.db"
+    ensure_database(str(db_path))
+    with get_db(str(db_path)) as conn:
+        asset_id = _sigenergy_asset(conn, "Sigenergy External ID Gate")
+        conn.execute(
+            """
+            UPDATE asset_integrations
+            SET is_primary_energy_source = 0
+            WHERE asset_id = ?
+            """,
+            (asset_id,),
+        )
+        now = datetime.now().isoformat(timespec="seconds")
+        conn.execute(
+            """
+            INSERT INTO production_records (
+                asset_id, provider, external_id, period_type, period_date,
+                production_kwh, consumption_kwh, self_use_kwh, export_kwh,
+                grid_import_kwh, data_quality, created_at, updated_at
+            ) VALUES (
+                ?, 'Sigenergy', 'DIFFERENT-SYSTEM', 'month', '2026-01-01',
+                100, 80, 60, 40, 20, 'complete', ?, ?
+            )
+            """,
+            (asset_id, now, now),
+        )
+
+        with pytest.raises(ValueError, match="mes energetico completo"):
+            set_asset_primary_energy_source(
+                conn,
+                asset_id=asset_id,
+                provider="Sigenergy",
+                confirmed=True,
+            )
+
+
+def test_sigenergy_primary_selection_targets_the_requested_external_id(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "sigenergy-primary-explicit-mapping.db"
+    ensure_database(str(db_path))
+    with get_db(str(db_path)) as conn:
+        asset_id = _sigenergy_asset(conn, "Sigenergy Explicit Primary")
+        first_external_id = f"SIG-{asset_id}"
+        conn.execute(
+            """
+            UPDATE asset_integrations
+            SET is_primary_energy_source = 0
+            WHERE asset_id = ?
+            """,
+            (asset_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO asset_integrations (
+                asset_id, provider, external_id, external_name, enabled,
+                is_primary_energy_source
+            ) VALUES (
+                ?, 'Sigenergy', 'SIG-SECOND', 'Second system', 1, 0
+            )
+            """,
+            (asset_id,),
+        )
+        now = datetime.now().isoformat(timespec="seconds")
+        conn.execute(
+            """
+            INSERT INTO production_records (
+                asset_id, provider, external_id, period_type, period_date,
+                production_kwh, consumption_kwh, self_use_kwh, export_kwh,
+                grid_import_kwh, data_quality, created_at, updated_at
+            ) VALUES (
+                ?, 'Sigenergy', 'SIG-SECOND', 'month', '2026-01-01',
+                100, 80, 60, 40, 20, 'complete', ?, ?
+            )
+            """,
+            (asset_id, now, now),
+        )
+
+        set_asset_primary_energy_source(
+            conn,
+            asset_id=asset_id,
+            provider="Sigenergy",
+            external_id="SIG-SECOND",
+            confirmed=True,
+        )
+        mappings = {
+            row["external_id"]: row["is_primary_energy_source"]
+            for row in conn.execute(
+                """
+                SELECT external_id, is_primary_energy_source
+                FROM asset_integrations
+                WHERE asset_id = ? AND provider = 'Sigenergy'
+                """,
+                (asset_id,),
+            )
+        }
+
+    assert mappings == {
+        first_external_id: 0,
+        "SIG-SECOND": 1,
+    }
+
+
 def _quality_payload(provider: str) -> dict:
     return {
         "asset_id": 1,

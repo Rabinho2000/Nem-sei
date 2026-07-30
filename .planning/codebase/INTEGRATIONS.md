@@ -25,13 +25,14 @@
 ## Sigenergy API
 
 - Provider/type: Sigenergy / mySigen cloud API.
-- Implementation file: `app.py`; integration settings share the `integration_configs`, `asset_integrations`, `integration_sync_runs`, and `integration_unresolved` tables.
-- Configuration keys: `SIGENERGY_ENABLED`, `SIGENERGY_APP_KEY`, `SIGENERGY_APP_SECRET`, `SIGENERGY_BASE_URL`, `SIGENERGY_AUTH_ENDPOINT`, `SIGENERGY_SYSTEMS_ENDPOINT`, `SIGENERGY_REALTIME_ENDPOINT`, `SIGENERGY_ENERGY_FLOW_ENDPOINT`, `SIGENERGY_REGION`, `SIGENERGY_SYSTEM_IDS`, `SIGENERGY_SYSTEM_ID`, and `SIGENERGY_SYNC_HOURS`.
-- Defaults in `.env.example` / `app.py`: base URL `https://api-eu.sigencloud.com`, auth endpoint `/openapi/auth/login/key`, systems endpoint `/openapi/system/list`, realtime endpoint `/openapi/system/realtime/data`, energy flow endpoint `/openapi/systems/{system_id}/energyFlow`, and region `eu`.
-- Auth flow: `get_sigenergy_token()` base64-encodes `app_key:app_secret`, posts it as JSON `key`, validates response code, extracts `accessToken`, and caches it until shortly before expiry.
+- Implementation files: HTTP in `monitoring_board/services/sigenergy_client.py`, explicit operations in `sigenergy_operations.py`, history/backfill in `sigenergy_history.py`, mapping/onboarding in their dedicated services, and persistence in `monitoring_board/repositories/sigenergy.py`.
+- Configuration keys: `SIGENERGY_ENABLED`, `SIGENERGY_APP_KEY`, `SIGENERGY_APP_SECRET`, `SIGENERGY_BASE_URL`, `SIGENERGY_AUTH_ENDPOINT`, `SIGENERGY_SYSTEMS_ENDPOINT`, `SIGENERGY_ENERGY_FLOW_ENDPOINT`, `SIGENERGY_HISTORY_ENDPOINT`, `SIGENERGY_HISTORY_ENERGY_UNIT`, `SIGENERGY_ONBOARD_ENDPOINT`, `SIGENERGY_REGION`, and the API-area rate-limit settings.
+- Defaults in `.env.example`: base URL `https://api-eu.sigencloud.com`, auth endpoint `/openapi/auth/login/key`, systems endpoint `/openapi/system`, energy-flow endpoint `/openapi/systems/{system_id}/energyFlow`, history endpoint `/openapi/systems/{system_id}/history`, and region `eu`.
+- Auth flow: `SigenergyClient` base64-encodes `app_key:app_secret`, posts it as JSON `key`, validates the response code, extracts `accessToken`, and caches it until shortly before expiry.
 - Request headers: `Authorization: Bearer <token>`, `sigen-region`, `Accept: application/json`, and `Content-Type: application/json`.
-- Fallback behavior: configured `SIGENERGY_SYSTEM_IDS` bypasses automatic system listing when the account/API does not expose systems.
-- Data flow: fetched systems, realtime data, and energy-flow values are normalized to the same provider-row shape used by the generic integration sync path.
+- Discovery is optional. `code=1201` is scoped to discovery as `restricted`; direct access, sync and history use an explicit System ID without calling discovery.
+- `SIGENERGY_SYSTEM_IDS` is deprecated and has no runtime effect. Automatic and global manual sync candidates come only from enabled Sigenergy rows in `asset_integrations`.
+- Data stored locally: inventory and independent state dimensions in `provider_system_inventory`, operation-scoped state/events, mappings in `asset_integrations`, live snapshots, daily facts/records and monthly materialization.
 
 ## Telegram Bot API
 

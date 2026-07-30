@@ -19,9 +19,11 @@ from monitoring_board.services.energy_facts import (
     persist_sigenergy_daily_history,
 )
 from monitoring_board.services.sigenergy_client import (
+    SigenergyClient,
+)
+from monitoring_board.services.sigenergy_preview_policy import (
     EXPERTCOM_SIGENERGY_BASE_URL,
     EXPERTCOM_SIGENERGY_SYSTEM_ID,
-    SigenergyClient,
     SigenergyPreviewReadOnlyPolicy,
 )
 from monitoring_board.services.sigenergy_models import (

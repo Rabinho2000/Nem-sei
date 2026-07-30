@@ -54,7 +54,8 @@ def normalize_onboarding_response(system_id: str, payload: dict[str, Any]) -> di
     if code in (0, "0", None):
         status = "requested"
     elif provider_code == "1401":
-        status = "already_requested_or_onboarded"
+        # Code 1401 does not prove provider approval; preserve it as pending.
+        status = "provider_pending"
     else:
         status = "failed"
     return {

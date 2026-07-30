@@ -73,7 +73,14 @@ def parse_sigenergy_response(payload: Any) -> Any:
         raise SigenergyApiError("Resposta Sigenergy invalida: payload JSON inesperado.")
     code = payload.get("code")
     if code not in (None, 0, "0"):
-        raise SigenergyApiError(sanitize_sigenergy_error(f"{payload.get('msg') or 'Pedido Sigenergy falhou.'} (code={code})"), payload=payload)
+        raise SigenergyApiError(
+            sanitize_sigenergy_error(
+                f"{payload.get('msg') or 'Pedido Sigenergy falhou.'} "
+                f"(code={code})"
+            ),
+            payload=payload,
+            api_code=code,
+        )
     data = payload.get("data")
     if isinstance(data, str):
         try:
