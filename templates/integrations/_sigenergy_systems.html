@@ -52,6 +52,12 @@
                 Nao devolvida
               {% else %}
                 Acessivel
+                {% if row.validation_method == 'direct_energy_flow' %}
+                  <div class="muted">
+                    Validacao direta por energyFlow; nao devolvida por
+                    /openapi/system.
+                  </div>
+                {% endif %}
               {% endif %}
             </td>
             <td>{{ row.normalized_status or row.last_state or '-' }}<div class="muted">{{ row.collected_at or row.last_state_at or '-' }}</div></td>

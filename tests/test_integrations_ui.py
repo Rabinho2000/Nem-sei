@@ -283,3 +283,41 @@ def test_sigenergy_local_association_can_change_and_remove_in_preview(
         flask_app.config["DATABASE"] = original_database
 
     assert mapping_count == 0
+
+
+def test_sigenergy_ui_identifies_direct_energy_flow_validation(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "sigenergy-direct-validation-ui.db"
+    app_module.ensure_database(str(db_path))
+    now = datetime.now().isoformat(timespec="seconds")
+    with get_db(str(db_path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO provider_system_inventory (
+                provider, external_id, external_name, metadata_json,
+                access_status, validation_method, first_discovered_at,
+                last_discovered_at, data_quality, created_at, updated_at
+            ) VALUES (
+                'Sigenergy', 'TZXRS1780315946', 'Expertcom',
+                '{"systemId":"TZXRS1780315946","systemName":"Expertcom"}',
+                'accessible', 'direct_energy_flow', ?, ?, 'missing', ?, ?
+            )
+            """,
+            (now, now, now, now),
+        )
+        conn.commit()
+
+    flask_app, original_database, client = authenticated_client(db_path)
+    try:
+        response = client.get("/integrations")
+    finally:
+        flask_app.config["DATABASE"] = original_database
+
+    html = " ".join(response.get_data(as_text=True).split())
+    assert response.status_code == 200
+    assert "Expertcom" in html
+    assert "TZXRS1780315946" in html
+    assert "Acessivel" in html
+    assert "Validacao direta por energyFlow" in html
+    assert "nao devolvida por /openapi/system" in html

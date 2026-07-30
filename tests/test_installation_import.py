@@ -824,6 +824,7 @@ def test_sigenergy_missing_from_discovery_uses_direct_energy_flow_without_onboar
             WHERE provider = 'Sigenergy' AND external_id = 'TZXRS1780315946'
             """
         ).fetchone()
+        inventory_metadata = json.loads(inventory["metadata_json"])
         validations = conn.execute(
             """
             SELECT * FROM sigenergy_access_validations
@@ -845,6 +846,8 @@ def test_sigenergy_missing_from_discovery_uses_direct_energy_flow_without_onboar
     assert inventory["access_status"] == "accessible"
     assert inventory["validation_method"] == "direct_energy_flow"
     assert inventory["external_name"] == "Expertcom"
+    assert inventory_metadata["systemId"] == "TZXRS1780315946"
+    assert inventory_metadata["systemName"] == "Expertcom"
     assert [row["outcome"] for row in validations] == [
         "available",
         "available",

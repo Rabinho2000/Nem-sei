@@ -18120,6 +18120,8 @@ def record_sigenergy_access_validation(
     if outcome != "available":
         return
     metadata = {
+        "systemId": system_id,
+        "systemName": external_name or system_id,
         "validation_method": "direct_energy_flow",
         "discovery_returned": False,
     }
