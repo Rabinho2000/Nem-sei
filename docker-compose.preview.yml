@@ -1,0 +1,46 @@
+name: nem-sei-preview
+
+services:
+  monitoring-board:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env.preview
+    environment:
+      APP_ENV: preview
+      DATA_DIR: /data
+      EXTERNAL_ACTIONS_ENABLED: "false"
+      FUSIONSOLAR_DIAGNOSTICS_SYNC_ENABLED: "false"
+      FUSIONSOLAR_PRODUCTION_SYNC_ENABLED: "false"
+      PREVIEW_BANNER: "true"
+      SCHEDULER_ENABLED: "false"
+      SESSION_COOKIE_SECURE: "false"
+      SIGENERGY_ENABLED: "false"
+      TELEGRAM_ALERTS_ENABLED: "false"
+      TELEGRAM_DAILY_SUMMARY_ENABLED: "false"
+      TMPDIR: /preview-tmp
+    volumes:
+      - ./runtime:/data
+      - ./runtime/tmp:/preview-tmp
+    ports:
+      - "0.0.0.0:5002:5000"
+    command: gunicorn -w 1 --threads 4 -b 0.0.0.0:5000 app:app
+    networks:
+      - preview-internal
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          response = urllib.request.urlopen("http://127.0.0.1:5000/login", timeout=5);
+          raise SystemExit(0 if response.status == 200 else 1)
+      interval: 15s
+      timeout: 6s
+      retries: 12
+      start_period: 20s
+
+networks:
+  preview-internal:
+    internal: true

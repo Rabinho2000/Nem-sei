@@ -6,7 +6,13 @@
     <title>{{ title or "Login" }}</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
   </head>
-  <body>
+  <body class="{{ 'preview-environment' if preview_banner else '' }}">
+    {% if preview_banner %}
+      <div class="preview-banner" role="status">
+        PREVIEW / NÃO PRODUÇÃO
+        <span>Ações externas e automatizações estão desativadas.</span>
+      </div>
+    {% endif %}
     <main class="login-page">
       <section class="card login-card">
         <p class="eyebrow">Solcoraction</p>

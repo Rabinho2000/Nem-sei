@@ -1,5 +1,6 @@
 # Local configuration and secrets
 .env
+.env.preview
 *.env
 SolarFusionAPI.txt
 

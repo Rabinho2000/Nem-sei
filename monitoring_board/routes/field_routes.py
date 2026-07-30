@@ -18,6 +18,11 @@ import requests
 from flask import Blueprint, Response, current_app, flash, g, redirect, render_template, request, url_for
 
 from monitoring_board.db import ensure_column, get_db, query_all
+from monitoring_board.preview_safety import (
+    PREVIEW_DISABLED_MESSAGE,
+    external_actions_enabled,
+    require_external_actions_enabled,
+)
 
 
 field_routes_bp = Blueprint("field_routes", __name__, url_prefix="/field-routes")
@@ -316,6 +321,9 @@ def confirm_asset_location(asset_id: int) -> str:
 
 @field_routes_bp.route("/geocode-missing", methods=["POST"])
 def geocode_missing_assets() -> str:
+    if not external_actions_enabled():
+        flash(PREVIEW_DISABLED_MESSAGE, "warning")
+        return redirect(url_for("field_routes.field_routes", **read_filters()))
     ensure_field_routes_schema(current_app.config["DATABASE"])
     filters = read_filters()
     assets = [
@@ -843,6 +851,7 @@ def fetch_openrouteservice_segments(points: list[RoutePoint]) -> dict[str, Any] 
     api_key = openrouteservice_api_key()
     if not api_key or len(points) < 2:
         return None
+    require_external_actions_enabled()
     coordinates = [[point.longitude, point.latitude] for point in points]
     try:
         response = requests.post(
@@ -981,6 +990,7 @@ def fetch_openrouteservice_route(ordered_stops: list[RouteStop]) -> dict[str, An
     api_key = openrouteservice_api_key()
     if not api_key or len(ordered_stops) < 2:
         return None
+    require_external_actions_enabled()
 
     coordinates = [[stop.longitude, stop.latitude] for stop in ordered_stops]
     try:
@@ -1020,6 +1030,7 @@ def geocode_asset(row: sqlite3.Row) -> dict[str, Any] | None:
     query_texts = build_geocode_queries(row)
     if not api_key or not query_texts:
         return None
+    require_external_actions_enabled()
 
     features: list[dict[str, Any]] = []
     try:

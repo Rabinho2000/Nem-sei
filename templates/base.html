@@ -7,7 +7,13 @@
     <title>{{ title or "Monitoring Board" }}</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
   </head>
-  <body>
+  <body class="{{ 'preview-environment' if preview_banner else '' }}">
+    {% if preview_banner %}
+      <div class="preview-banner" role="status">
+        PREVIEW / NÃO PRODUÇÃO
+        <span>Ações externas e automatizações estão desativadas.</span>
+      </div>
+    {% endif %}
     <div class="shell">
       <aside class="sidebar">
         <div>

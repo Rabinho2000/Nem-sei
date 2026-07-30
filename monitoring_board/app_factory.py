@@ -42,6 +42,12 @@ from monitoring_board.portfolio_reports import (
     import_helioscope_file,
     map_external_portfolio_entity,
 )
+from monitoring_board.preview_safety import (
+    PREVIEW_DISABLED_MESSAGE,
+    external_actions_enabled,
+    preview_enabled,
+    scheduler_enabled,
+)
 from monitoring_board.routes.auth import auth_bp
 from monitoring_board.routes.field_routes import field_routes_bp
 from monitoring_board.routes.reporting import reporting_bp
@@ -752,6 +758,8 @@ def create_app() -> Flask:
     app.config["SESSION_COOKIE_HTTPONLY"] = True
     app.config["SESSION_COOKIE_SAMESITE"] = os.environ.get("SESSION_COOKIE_SAMESITE", "Lax").strip() or "Lax"
     app.config["SESSION_COOKIE_SECURE"] = env_flag("SESSION_COOKIE_SECURE", False)
+    app.config["PREVIEW_BANNER"] = preview_enabled()
+    app.config["EXTERNAL_ACTIONS_ENABLED"] = external_actions_enabled()
     app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=12)
     configure_logging(app, LOG_DIR)
     app.logger.info("Using database at %s", app.config["DATABASE"])
@@ -819,6 +827,8 @@ def create_app() -> Flask:
             "reference_diagnostic": reference_diagnostic,
             "csrf_token": csrf_token,
             "current_username": session.get("username"),
+            "preview_banner": app.config["PREVIEW_BANNER"],
+            "external_actions_enabled": app.config["EXTERNAL_ACTIONS_ENABLED"],
         }
 
     @app.errorhandler(400)
@@ -1148,6 +1158,9 @@ def create_app() -> Flask:
     @app.route("/performance", methods=["GET", "POST"])
     def performance() -> str:
         if request.method == "POST":
+            if not external_actions_enabled():
+                flash(PREVIEW_DISABLED_MESSAGE, "warning")
+                return redirect(url_for("performance"))
             action = request.form.get("action", "sync_availability").strip()
             if action == "sync_availability":
                 result = run_fusionsolar_device_availability_sync(
@@ -1278,6 +1291,9 @@ def create_app() -> Flask:
 
     @app.route("/performance/backfill", methods=["GET", "POST"])
     def performance_backfill() -> str:
+        if request.method == "POST" and not external_actions_enabled():
+            flash(PREVIEW_DISABLED_MESSAGE, "warning")
+            return redirect(url_for("performance_backfill"))
         current_year = date.today().year
         period_type = request.values.get("period_type", "day").strip()
         if period_type not in {"day", "month"}:
@@ -4805,6 +4821,9 @@ def create_app() -> Flask:
 
     @app.route("/integrations/import", methods=["GET", "POST"])
     def installation_import() -> str:
+        if request.method == "POST" and not external_actions_enabled():
+            flash(PREVIEW_DISABLED_MESSAGE, "warning")
+            return redirect(url_for("installation_import"))
         assets_for_import = query_all(
             g.db,
             "SELECT * FROM assets ORDER BY project_name COLLATE NOCASE",
@@ -5005,6 +5024,9 @@ def create_app() -> Flask:
 
     @app.post("/integrations/import/<int:import_id>/check-access")
     def check_installation_import_access(import_id: int) -> str:
+        if not external_actions_enabled():
+            flash(PREVIEW_DISABLED_MESSAGE, "warning")
+            return redirect(url_for("installation_import", import_id=import_id))
         import_context = get_installation_import_context(g.db, import_id)
         if import_context is None:
             abort(404)
@@ -5061,6 +5083,9 @@ def create_app() -> Flask:
 
     @app.post("/integrations/import/<int:import_id>/confirm")
     def confirm_installation_import(import_id: int) -> str:
+        if not external_actions_enabled():
+            flash(PREVIEW_DISABLED_MESSAGE, "warning")
+            return redirect(url_for("installation_import", import_id=import_id))
         try:
             existing_import = get_installation_import_context(g.db, import_id)
             if (
@@ -5124,6 +5149,24 @@ def create_app() -> Flask:
         provider = INTEGRATION_PROVIDER_FUSIONSOLAR
         if request.method == "POST":
             action = request.form.get("action", "").strip()
+            external_actions = {
+                "test_connection",
+                "test_fusionsolar_connection",
+                "test_sigenergy_connection",
+                "onboard_sigenergy_system",
+                "refresh_sigenergy_onboarding",
+                "refresh_sigenergy_systems",
+                "sync_sigenergy_energy",
+                "sync_sigenergy_now",
+                "sync_now",
+                "sync_provider_state_now",
+                "sync_fusionsolar_production_now",
+                "sync_fusionsolar_diagnostics_now",
+                "test_telegram",
+            }
+            if action in external_actions and not external_actions_enabled():
+                flash(PREVIEW_DISABLED_MESSAGE, "warning")
+                return redirect(url_for("integrations"))
             if action == "save_config":
                 auto_sync_enabled = 1 if request.form.get("auto_sync_enabled") == "on" else 0
                 enabled = 1 if request.form.get("enabled") == "on" else 0
@@ -13213,6 +13256,10 @@ def get_integration_config(conn: sqlite3.Connection, provider: str) -> dict[str,
 
 def start_integration_scheduler(app: Flask) -> None:
     global SCHEDULER
+    if not scheduler_enabled():
+        app.logger.warning("APScheduler disabled by preview/runtime policy.")
+        SCHEDULER = None
+        return
     if SCHEDULER is not None:
         return
     SCHEDULER = BackgroundScheduler(timezone="Europe/Lisbon")

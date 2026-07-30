@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 import requests
 
+from monitoring_board.preview_safety import require_external_actions_enabled
 from monitoring_board.services.api_client_base import http_rate_limited_status, http_retryable_status, retry_api_call
 from monitoring_board.services.api_rate_limit import ApiRateLimitError, ApiTransientError
 from monitoring_board.services.sigenergy_errors import SigenergyApiError, SigenergyAuthError
@@ -130,6 +131,7 @@ class SigenergyClient:
         refreshed: bool = False,
         api_area: str = "state",
     ) -> dict[str, Any]:
+        require_external_actions_enabled()
         token = self.get_access_token(api_area=api_area)
 
         def call_once() -> requests.Response:
@@ -230,6 +232,7 @@ class SigenergyClient:
         return data
 
     def _authenticate_payload(self, *, api_area: str = "state") -> dict[str, Any]:
+        require_external_actions_enabled()
         app_key = self.credentials.app_key.strip()
         app_secret = self.credentials.app_secret.strip()
         if not app_key or not app_secret:

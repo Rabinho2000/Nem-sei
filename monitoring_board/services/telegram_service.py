@@ -6,6 +6,8 @@ from typing import Any
 
 import requests
 
+from monitoring_board.preview_safety import require_external_actions_enabled
+
 
 LOGGER = logging.getLogger(__name__)
 TELEGRAM_SEND_MESSAGE_URL = "https://api.telegram.org/bot{token}/sendMessage"
@@ -55,6 +57,7 @@ def is_telegram_configured() -> bool:
 
 
 def send_telegram_message(text: str) -> bool:
+    require_external_actions_enabled()
     config = get_telegram_config()
     token = config["token"]
     chat_id = config["chat_id"]
