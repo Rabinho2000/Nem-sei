@@ -19,7 +19,10 @@ As variáveis atuais continuam compatíveis:
 - `SIGENERGY_REGION`
 - `SIGENERGY_SYSTEM_IDS`
 
-`SIGENERGY_SYSTEM_IDS` é o fallback quando a API não devolve lista de sistemas ou quando se quer limitar explicitamente os sistemas monitorizados.
+O client normal descobre os sistemas autorizados através de `/openapi/system`.
+O worker isolado da preview usa, adicionalmente,
+`SIGENERGY_ALLOWED_SYSTEM_IDS`, que é uma allowlist obrigatória e não um
+fallback de descoberta.
 
 ## Implementado
 
@@ -54,15 +57,20 @@ sobrepostos:
 | --- | --- | --- |
 | `powerGenerationKwh` | `production_kwh` | Produção PV principal do período. |
 | `powerUseKwh` | `consumption_kwh` | Consumo total. |
+| `powerOneselfKwh` | `self_use_kwh` | Energia verde fornecida à carga, usada no balanço dos relatórios. |
 | `powerToGridKwh` | `export_kwh` | Energia exportada para a rede. |
 | `powerFromGridKwh` | `grid_import_kwh` | Energia importada da rede. |
-| `powerSelfConsumptionKwh` | `self_consumption_kwh` | Produção autoconsumida. |
-| `esChargingKwh` | `battery_charging_kwh` | Energia carregada na bateria. |
-| `esDischargingKwh` | `battery_discharging_kwh` | Energia descarregada da bateria. |
-| `itemList` | `item_list` | Detalhe devolvido, preservado sem agregação implícita. |
+| `esChargingKwh` | `battery_charge_kwh` | Energia carregada na bateria. |
+| `esDischargingKwh` | `battery_discharge_kwh` | Energia descarregada da bateria. |
 
-`powerOneselfKwh` é preservado no payload bruto, mas não é somado nem usado
-como segunda medida de autoconsumo, evitando dupla contagem.
+Os nomes legacy sem `Kwh` continuam aceites apenas como fallback. Quando as
+duas variantes existem, vence a variante `Kwh` e os valores nunca são somados.
+Campos ausentes permanecem `NULL`, nunca zero.
+
+`powerSelfConsumptionKwh` é um contador distinto do lado da produção. É
+preservado, juntamente com `itemList` e todos os restantes campos originais, no
+`payload_json` sanitizado, mas não é convertido numa segunda métrica de
+autoconsumo nem somado a `self_use_kwh`.
 
 ## Token, 401 e rate limit
 
@@ -98,10 +106,17 @@ Os findings mostram a remediação operacional. A aplicação não altera permis
 não inventa tópicos MQTT e não gera valores sintéticos. Um único dia read-only
 confirma o contrato e a permissão, mas não constitui um backfill mensal.
 
-## Backfill
+## Persistência e backfill
 
-Não foi executado qualquer backfill nesta alteração. A aplicação ainda não
-expõe um job normal de persistência histórica Sigenergy; portanto não é seguro
-fornecer um comando ad-hoc que contorne fila, cooldown e auditoria. Quando esse
-job for disponibilizado, o backfill deverá ser submetido pela UI/fila normal,
-limitado a um System ID e intervalo explícitos, com orçamento diário confirmado.
+A aplicação expõe o job `sigenergy_energy_sync` e a UI usa
+`enqueue_sigenergy_energy_backfill` para criar, de forma idempotente, um job por
+dia terminado. Cada resposta é persistida em `energy_interval_facts`,
+materializada como registo diário em `production_records` e volta a
+materializar o total mensal.
+
+Na preview, o comando administrativo `sigenergy-backfill` executa o mesmo
+contrato de parsing e persistência diretamente num worker one-shot. O intervalo
+fica limitado a 31 dias terminados, as chamadas são sequenciais e respeitam o
+intervalo mínimo de 300 segundos já usado pela política de produção Sigenergy.
+O worker para novas tentativas quando recebe rate limit. Nenhum destes
+mecanismos foi executado durante a alteração do código.

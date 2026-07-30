@@ -23,10 +23,21 @@ from monitoring_board.services.energy_facts import (
     parse_sigenergy_daily_history,
     persist_sigenergy_daily_history,
 )
+from monitoring_board.services.sigenergy_client import SigenergyClient
+from monitoring_board.services.sigenergy_models import (
+    SigenergyCredentials,
+    SigenergyEndpoints,
+)
 
 
 HISTORY_FIXTURE = (
     Path(__file__).parent / "fixtures" / "sigenergy" / "system_history_day.json"
+)
+HISTORY_KWH_FIXTURE = (
+    Path(__file__).parent
+    / "fixtures"
+    / "sigenergy"
+    / "system_history_day_kwh.json"
 )
 
 
@@ -124,6 +135,113 @@ def test_official_history_fixture_flows_from_fact_to_complete_report(tmp_path) -
     assert report["grid_import_kwh"] == pytest.approx(9.67 * 28)
     assert report["production_quality_status"] == "complete"
     assert report["production_is_final"] is True
+
+
+def test_real_kwh_response_flows_client_to_complete_month_and_report(
+    tmp_path,
+) -> None:
+    history_response = json.loads(
+        HISTORY_KWH_FIXTURE.read_text(encoding="utf-8")
+    )
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class Session:
+        def post(self, *_args, **_kwargs):
+            return Response(
+                {
+                    "code": 0,
+                    "data": {
+                        "accessToken": "e2e-token",
+                        "expiresIn": 1200,
+                    },
+                }
+            )
+
+        def request(self, *_args, **_kwargs):
+            return Response(history_response)
+
+    client = SigenergyClient(
+        SigenergyEndpoints(
+            base_url="https://sigenergy.example.test",
+            login_endpoint="/openapi/auth/login/key",
+            systems_endpoint="/openapi/system",
+            energy_flow_endpoint="/openapi/systems/{system_id}/energyFlow",
+            history_endpoint="/openapi/systems/{system_id}/history",
+            region="eu",
+        ),
+        SigenergyCredentials("e2e-key", "e2e-secret"),
+        session=Session(),
+        token_cache={},
+    )
+    db_path = tmp_path / "sigenergy-real-kwh-e2e.db"
+    ensure_database(str(db_path))
+    with get_db(str(db_path)) as conn:
+        asset_id = _sigenergy_asset(conn, "Expertcom")
+        external_id = f"SIG-{asset_id}"
+        for day in range(1, 29):
+            history = client.get_system_history(
+                external_id,
+                level="Day",
+                target_date=date(2026, 2, day).isoformat(),
+            )
+            fact = parse_sigenergy_daily_history(
+                history,
+                system_id=external_id,
+                period_date=date(2026, 2, day),
+                confirmed_unit="kWh",
+            )
+            persist_sigenergy_daily_history(
+                conn,
+                asset_id=asset_id,
+                fact=fact,
+            )
+        conn.commit()
+        daily_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM production_records
+            WHERE asset_id = ? AND provider = 'Sigenergy'
+              AND period_type = 'day' AND data_quality = 'complete'
+            """,
+            (asset_id,),
+        ).fetchone()[0]
+        monthly = conn.execute(
+            """
+            SELECT *
+            FROM production_records
+            WHERE asset_id = ? AND provider = 'Sigenergy'
+              AND period_type = 'month' AND period_date = '2026-02-01'
+            """,
+            (asset_id,),
+        ).fetchone()
+        report = build_fusionsolar_customer_production_report(
+            conn,
+            asset_id=asset_id,
+            report_month="2026-02",
+            electricity_price=0.2,
+            sell_price=0.05,
+            reference_date=date(2026, 3, 1),
+        )
+
+    assert daily_count == 28
+    assert monthly["data_quality"] == "complete"
+    assert monthly["production_kwh"] == pytest.approx(22.94 * 28)
+    assert monthly["consumption_kwh"] == pytest.approx(24.83 * 28)
+    assert monthly["self_use_kwh"] == pytest.approx(15.16 * 28)
+    assert monthly["export_kwh"] == pytest.approx(3.93 * 28)
+    assert monthly["grid_import_kwh"] == pytest.approx(9.67 * 28)
+    assert report["production_kwh"] == pytest.approx(22.94 * 28)
+    assert report["self_use_kwh"] == pytest.approx(15.16 * 28)
+    assert report["production_quality_status"] == "complete"
 
 
 def test_sigenergy_report_with_missing_kwh_never_queues_fusionsolar_or_finalizes_financials(
