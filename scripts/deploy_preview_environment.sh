@@ -10,6 +10,7 @@ readonly COMPOSE_FILE="${PREVIEW_ROOT}/docker-compose.preview.yml"
 readonly PREVIEW_ENV="${PREVIEW_ROOT}/.env.preview"
 readonly PREVIEW_DB="${PREVIEW_ROOT}/runtime/monitoring_board.db"
 readonly PRODUCTION_DB="${PRODUCTION_ROOT}/data/monitoring_board.db"
+readonly SANITIZE_SQL="${PREVIEW_ROOT}/scripts/sanitize_preview.sql"
 readonly PREVIEW_URL="http://127.0.0.1:5002/login"
 readonly PRODUCTION_URL="http://127.0.0.1:5000/login"
 
@@ -36,6 +37,7 @@ validate_scope() {
   [[ -d "${PREVIEW_ROOT}/.git" ]] || die "Clone de preview inexistente."
   [[ -f "${COMPOSE_FILE}" ]] || die "Compose de preview inexistente."
   [[ -f "${PREVIEW_ENV}" ]] || die ".env.preview inexistente."
+  [[ -f "${SANITIZE_SQL}" ]] || die "SQL de sanitização inexistente."
   [[ "$(stat -c '%a' "${PREVIEW_ENV}")" == "600" ]] ||
     die ".env.preview deve ter permissões 600."
   [[ "$(git_preview rev-parse --show-toplevel)" == "${PREVIEW_ROOT}" ]] ||
@@ -114,32 +116,7 @@ backup_production_database() {
 
 sanitize_preview_database() {
   [[ -f "${PREVIEW_DB}" ]] || die "Base de preview inexistente."
-  sqlite3 "${PREVIEW_DB}" <<'SQL'
-UPDATE integration_configs
-SET username = '',
-    password = '',
-    enabled = 0,
-    auto_sync_enabled = 0,
-    production_sync_enabled = 0,
-    diagnostics_sync_enabled = 0,
-    last_error = 'Disabled in preview copy';
-INSERT INTO alert_settings (key, value)
-VALUES ('TELEGRAM_ALERTS_ENABLED', 'false')
-ON CONFLICT(key) DO UPDATE SET value = 'false';
-UPDATE report_automations
-SET active = 0,
-    last_blocked_reason = 'Disabled in preview copy';
-UPDATE background_jobs
-SET status = 'failed',
-    error_message = 'Disabled in preview copy',
-    finished_at = datetime('now')
-WHERE status IN ('pending', 'running', 'retry_wait');
-UPDATE report_distributions
-SET status = 'cancelled',
-    error_message = 'Disabled in preview copy',
-    updated_at = datetime('now')
-WHERE status IN ('ready_to_send', 'approved', 'sending');
-SQL
+  sqlite3 "${PREVIEW_DB}" < "${SANITIZE_SQL}"
   sqlite3 "${PREVIEW_DB}" "PRAGMA quick_check;" | grep -qx 'ok' ||
     die "Cópia SQLite sanitizada falhou quick_check."
 }
@@ -162,14 +139,36 @@ refresh_data() {
 }
 
 update_preview() {
+  local update_completed=false
+
+  recover_preview_update() {
+    local exit_code="$1"
+    trap - ERR
+    printf 'ERROR: atualização do preview falhou (código %s).\n' "${exit_code}" >&2
+    compose ps >&2 || true
+    compose logs --tail 100 monitoring-board >&2 || true
+    printf 'A tentar recuperar apenas o serviço de preview...\n' >&2
+    compose up --detach monitoring-board >&2 || true
+    compose ps >&2 || true
+    curl --fail --silent --show-error --location --max-time 15 \
+      --output /dev/null "${PRODUCTION_URL}" ||
+      printf 'AVISO: não foi possível reconfirmar a produção após a falha.\n' >&2
+    return "${exit_code}"
+  }
+
+  trap 'exit_code=$?; if [[ "${update_completed}" != true ]]; then recover_preview_update "${exit_code}"; fi' ERR
   check_url "${PRODUCTION_URL}" "Produção"
   git_preview fetch origin "${PREVIEW_BRANCH}"
   git_preview merge --ff-only "origin/${PREVIEW_BRANCH}"
   validate_scope
   compose build monitoring-board
+  compose stop monitoring-board
   run_schema
   compose up --detach --remove-orphans monitoring-board
   wait_for_preview
+  check_url "${PRODUCTION_URL}" "Produção"
+  update_completed=true
+  trap - ERR
 }
 
 show_status() {
