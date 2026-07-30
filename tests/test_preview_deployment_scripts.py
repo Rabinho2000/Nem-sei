@@ -80,7 +80,7 @@ def test_update_stops_old_preview_before_running_schema() -> None:
 
 def test_monitoring_board_is_only_on_internal_network() -> None:
     compose = PREVIEW_COMPOSE.read_text()
-    service = compose_service("monitoring-board", "preview-gateway")
+    service = compose_service("monitoring-board", "sigenergy-preview-sync")
     networks = compose.split("\nnetworks:\n", 1)[1]
 
     assert "    networks:\n      - preview-internal\n" in service
@@ -91,10 +91,12 @@ def test_monitoring_board_is_only_on_internal_network() -> None:
 
 def test_gateway_is_the_only_published_service() -> None:
     compose = PREVIEW_COMPOSE.read_text()
-    app = compose_service("monitoring-board", "preview-gateway")
+    app = compose_service("monitoring-board", "sigenergy-preview-sync")
+    worker = compose_service("sigenergy-preview-sync", "preview-gateway")
     gateway = compose_service("preview-gateway", "preview-internal")
 
     assert "    ports:" not in app
+    assert "    ports:" not in worker
     assert '    ports:\n      - "0.0.0.0:5002:8080"\n' in gateway
     assert (
         "    networks:\n      - preview-internal\n      - preview-edge\n"
@@ -105,18 +107,64 @@ def test_gateway_is_the_only_published_service() -> None:
     assert compose.count("    ports:") == 1
 
 
+def test_sigenergy_worker_is_one_shot_and_egress_isolated() -> None:
+    app = compose_service("monitoring-board", "sigenergy-preview-sync")
+    worker = compose_service("sigenergy-preview-sync", "preview-gateway")
+    gateway = compose_service("preview-gateway", "preview-internal")
+
+    assert "    image: nem-sei-preview-app:local\n" in app
+    assert "    image: nem-sei-preview-app:local\n" in worker
+    assert "    restart: \"no\"\n" in worker
+    assert "    profiles:\n      - sigenergy-preview\n" in worker
+    assert "      - .env.sigenergy-preview\n" in worker
+    assert "      - ./runtime:/data\n" in worker
+    assert "      - preview-egress\n" in worker
+    assert "preview-internal" not in worker
+    assert "preview-edge" not in worker
+    assert "    ports:" not in worker
+    assert ".env.sigenergy-preview" not in app
+    assert ".env.sigenergy-preview" not in gateway
+    assert "SIGENERGY_APP_KEY" not in app
+    assert "SIGENERGY_APP_SECRET" not in app
+    assert '      SCHEDULER_ENABLED: "false"\n' in worker
+    assert '      EXTERNAL_ACTIONS_ENABLED: "false"\n' in worker
+    assert '      FUSIONSOLAR_PRODUCTION_SYNC_ENABLED: "false"\n' in worker
+    assert '      SIGENERGY_PRODUCTION_MIN_INTERVAL_SECONDS: "300"\n' in worker
+    assert '      TELEGRAM_ALERTS_ENABLED: "false"\n' in worker
+
+
 def test_runtime_and_preview_environment_are_excluded_from_build_context() -> None:
     patterns = set(DOCKERIGNORE.read_text().splitlines())
 
     assert "runtime/" in patterns
     assert "**/runtime/" in patterns
     assert ".env.preview" in patterns
+    assert ".env.*" in patterns
     assert {"*.db", "*.sqlite", "*.sqlite3"} <= patterns
     assert {"uploads/", "backups/", "logs/", "data/"} <= patterns
     for script_path in (INSTALL_SCRIPT, DEPLOY_SCRIPT):
         script = script_path.read_text()
         assert "validate_build_context()" in script
         assert "validate_build_context\n" in script
+
+
+def test_installer_and_admin_command_protect_sigenergy_credentials() -> None:
+    installer = INSTALL_SCRIPT.read_text()
+    deploy = DEPLOY_SCRIPT.read_text()
+
+    assert 'readonly SIGENERGY_PREVIEW_ENV="${PREVIEW_ROOT}/.env.sigenergy-preview"' in installer
+    assert "SIGENERGY_APP_KEY=" in installer
+    assert "SIGENERGY_APP_SECRET=" in installer
+    assert "SIGENERGY_BASE_URL=https://api-eu.sigencloud.com" in installer
+    assert "SIGENERGY_ALLOWED_SYSTEM_IDS=TZXRS1780315946" in installer
+    assert "install -m 0600 -o root -g root" in installer
+    assert "validate_sigenergy_preview_env" in deploy
+    assert "sigenergy-discover" in deploy
+    assert "sigenergy-state" in deploy
+    assert "sigenergy-backfill" in deploy
+    assert "sigenergy-check" in deploy
+    assert "SIGENERGY_APP_KEY=' \"${PREVIEW_ENV}\"" in deploy
+    assert "SIGENERGY_APP_SECRET=' \"${PREVIEW_ENV}\"" in deploy
 
 
 def test_status_checks_both_services_and_published_port() -> None:

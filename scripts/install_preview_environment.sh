@@ -6,6 +6,7 @@ readonly PREVIEW_ROOT="/opt/server/apps/Nem-sei-preview"
 readonly PRODUCTION_ROOT="/opt/server/apps/Nem-sei"
 readonly PREVIEW_BRANCH="codex/server-dev-2026-07-29"
 readonly DEPLOY_TARGET="/usr/local/bin/deploy-nem-sei-preview"
+readonly SIGENERGY_PREVIEW_ENV="${PREVIEW_ROOT}/.env.sigenergy-preview"
 
 die() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -18,6 +19,7 @@ validate_build_context() {
     'runtime/' \
     '**/runtime/' \
     '.env.preview' \
+    '.env.*' \
     '*.db' \
     '*.sqlite' \
     '*.sqlite3'
@@ -117,6 +119,24 @@ OPENROUTESERVICE_API_KEY=
 EOF
   chmod 600 "${PREVIEW_ROOT}/.env.preview"
   chown root:root "${PREVIEW_ROOT}/.env.preview"
+fi
+
+if [[ -f "${SIGENERGY_PREVIEW_ENV}" ]]; then
+  [[ "$(stat -c '%a' "${SIGENERGY_PREVIEW_ENV}")" == "600" ]] ||
+    die ".env.sigenergy-preview existente deve ter permissões 600."
+  [[ "$(stat -c '%U:%G' "${SIGENERGY_PREVIEW_ENV}")" == "root:root" ]] ||
+    die ".env.sigenergy-preview existente deve pertencer a root:root."
+  printf 'A preservar .env.sigenergy-preview existente.\n'
+else
+  install -m 0600 -o root -g root /dev/null "${SIGENERGY_PREVIEW_ENV}"
+  cat > "${SIGENERGY_PREVIEW_ENV}" <<'EOF'
+SIGENERGY_APP_KEY=
+SIGENERGY_APP_SECRET=
+SIGENERGY_BASE_URL=https://api-eu.sigencloud.com
+SIGENERGY_REGION=eu
+SIGENERGY_HISTORY_ENERGY_UNIT=kWh
+SIGENERGY_ALLOWED_SYSTEM_IDS=TZXRS1780315946
+EOF
 fi
 
 install -d -m 0750 -o root -g root \

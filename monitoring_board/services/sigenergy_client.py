@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Any, Callable
@@ -26,6 +27,99 @@ from monitoring_board.services.sigenergy_models import (
 
 _TOKEN_CACHE: dict[str, dict[str, Any]] = {}
 _TOKEN_LOCK = threading.Lock()
+
+EXPERTCOM_SIGENERGY_BASE_URL = "https://api-eu.sigencloud.com"
+EXPERTCOM_SIGENERGY_SYSTEM_ID = "TZXRS1780315946"
+
+
+@dataclass(frozen=True)
+class SigenergyPreviewReadOnlyPolicy:
+    """Exact outbound allowlist for the one-shot Expertcom preview worker."""
+
+    base_url: str = EXPERTCOM_SIGENERGY_BASE_URL
+    system_id: str = EXPERTCOM_SIGENERGY_SYSTEM_ID
+
+    def validate_endpoints(self, endpoints: SigenergyEndpoints) -> None:
+        expected = {
+            "base_url": self.base_url,
+            "login_endpoint": "/openapi/auth/login/key",
+            "systems_endpoint": "/openapi/system",
+            "energy_flow_endpoint": (
+                f"/openapi/systems/{self.system_id}/energyFlow"
+            ),
+            "history_endpoint": f"/openapi/systems/{self.system_id}/history",
+            "region": "eu",
+        }
+        actual = {
+            "base_url": endpoints.base_url.rstrip("/"),
+            "login_endpoint": self._path(endpoints.login_endpoint),
+            "systems_endpoint": self._path(endpoints.systems_endpoint),
+            "energy_flow_endpoint": self._path(
+                endpoints.energy_flow_endpoint.replace(
+                    "{systemId}", self.system_id
+                ).replace("{system_id}", self.system_id)
+            ),
+            "history_endpoint": self._path(
+                endpoints.history_endpoint.replace(
+                    "{systemId}", self.system_id
+                ).replace("{system_id}", self.system_id)
+            ),
+            "region": endpoints.region,
+        }
+        if actual != expected:
+            raise SigenergyApiError(
+                "A configuracao do worker Sigenergy preview nao corresponde "
+                "a allowlist read-only da Expertcom."
+            )
+
+    def authorize_login(self, endpoint: str) -> None:
+        if self._path(endpoint) != "/openapi/auth/login/key":
+            raise SigenergyApiError(
+                "Endpoint Sigenergy recusado pela allowlist read-only da preview."
+            )
+
+    def authorize_request(self, method: str, endpoint: str) -> None:
+        allowed = {
+            "/openapi/system",
+            f"/openapi/systems/{self.system_id}/energyFlow",
+            f"/openapi/systems/{self.system_id}/history",
+        }
+        if method.upper() != "GET" or self._path(endpoint) not in allowed:
+            raise SigenergyApiError(
+                "Endpoint Sigenergy recusado pela allowlist read-only da preview."
+            )
+
+    def authorize_system_id(self, system_id: str) -> None:
+        if str(system_id).strip() != self.system_id:
+            raise SigenergyApiError(
+                "System ID Sigenergy recusado pela allowlist read-only da preview."
+            )
+
+    def validate_discovered_systems(
+        self,
+        systems: list[dict[str, Any]],
+    ) -> None:
+        returned_ids = {
+            str(
+                row.get("systemId")
+                or row.get("id")
+                or row.get("stationId")
+                or row.get("plantId")
+                or ""
+            ).strip()
+            for row in systems
+        }
+        returned_ids.discard("")
+        refused = returned_ids - {self.system_id}
+        if refused:
+            raise SigenergyApiError(
+                "A descoberta Sigenergy devolveu um System ID fora da "
+                "allowlist read-only da preview."
+            )
+
+    @staticmethod
+    def _path(endpoint: str) -> str:
+        return "/" + str(endpoint or "").strip().lstrip("/")
 
 
 def clear_token_cache_for_tests() -> None:
@@ -53,6 +147,7 @@ class SigenergyClient:
         token_lock: threading.Lock | None = None,
         allow_sleep: bool = False,
         sleeper: Callable[[float], None] = time.sleep,
+        read_only_policy: SigenergyPreviewReadOnlyPolicy | None = None,
     ) -> None:
         if isinstance(endpoints, dict):
             config = endpoints
@@ -82,6 +177,9 @@ class SigenergyClient:
         self.token_lock = token_lock or _TOKEN_LOCK
         self.allow_sleep = allow_sleep
         self.sleeper = sleeper
+        self.read_only_policy = read_only_policy
+        if self.read_only_policy is not None:
+            self.read_only_policy.validate_endpoints(self.endpoints)
 
     @property
     def cache_key(self) -> str:
@@ -131,7 +229,10 @@ class SigenergyClient:
         refreshed: bool = False,
         api_area: str = "state",
     ) -> dict[str, Any]:
-        require_external_actions_enabled()
+        if self.read_only_policy is None:
+            require_external_actions_enabled()
+        else:
+            self.read_only_policy.authorize_request(method, endpoint)
         token = self.get_access_token(api_area=api_area)
 
         def call_once() -> requests.Response:
@@ -190,6 +291,8 @@ class SigenergyClient:
             api_area="discovery",
         )
         rows = rows_from_data(parse_sigenergy_response(payload))
+        if self.read_only_policy is not None:
+            self.read_only_policy.validate_discovered_systems(rows)
         if not rows and not allow_empty:
             raise SigenergyApiError(
                 "A API Sigenergy respondeu com sucesso, mas sem sistemas. Confirma se a App Key tem sistemas autorizados.",
@@ -198,6 +301,8 @@ class SigenergyClient:
         return rows
 
     def get_energy_flow(self, system_id: str) -> dict[str, Any]:
+        if self.read_only_policy is not None:
+            self.read_only_policy.authorize_system_id(system_id)
         endpoint = self.endpoints.energy_flow_endpoint.replace("{systemId}", "{system_id}")
         endpoint = endpoint.replace("{system_id}", str(system_id))
         payload = self.request_json("GET", endpoint, api_area="state")
@@ -211,6 +316,8 @@ class SigenergyClient:
         level: str,
         target_date: str | None = None,
     ) -> dict[str, Any]:
+        if self.read_only_policy is not None:
+            self.read_only_policy.authorize_system_id(system_id)
         endpoint = self.endpoints.history_endpoint.replace(
             "{systemId}",
             "{system_id}",
@@ -232,7 +339,12 @@ class SigenergyClient:
         return data
 
     def _authenticate_payload(self, *, api_area: str = "state") -> dict[str, Any]:
-        require_external_actions_enabled()
+        if self.read_only_policy is None:
+            require_external_actions_enabled()
+        else:
+            self.read_only_policy.authorize_login(
+                self.endpoints.login_endpoint
+            )
         app_key = self.credentials.app_key.strip()
         app_secret = self.credentials.app_secret.strip()
         if not app_key or not app_secret:

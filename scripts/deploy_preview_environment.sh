@@ -8,6 +8,7 @@ readonly PREVIEW_BRANCH="codex/server-dev-2026-07-29"
 readonly COMPOSE_PROJECT="nem-sei-preview"
 readonly COMPOSE_FILE="${PREVIEW_ROOT}/docker-compose.preview.yml"
 readonly PREVIEW_ENV="${PREVIEW_ROOT}/.env.preview"
+readonly SIGENERGY_PREVIEW_ENV="${PREVIEW_ROOT}/.env.sigenergy-preview"
 readonly PREVIEW_DB="${PREVIEW_ROOT}/runtime/monitoring_board.db"
 readonly PRODUCTION_DB="${PRODUCTION_ROOT}/data/monitoring_board.db"
 readonly SANITIZE_SQL="${PREVIEW_ROOT}/scripts/sanitize_preview.sql"
@@ -40,6 +41,10 @@ validate_scope() {
   [[ -f "${SANITIZE_SQL}" ]] || die "SQL de sanitização inexistente."
   [[ "$(stat -c '%a' "${PREVIEW_ENV}")" == "600" ]] ||
     die ".env.preview deve ter permissões 600."
+  grep -qx 'SIGENERGY_APP_KEY=' "${PREVIEW_ENV}" ||
+    die "A App Key Sigenergy não pode existir no monitoring-board."
+  grep -qx 'SIGENERGY_APP_SECRET=' "${PREVIEW_ENV}" ||
+    die "O App Secret Sigenergy não pode existir no monitoring-board."
   [[ "$(git_preview rev-parse --show-toplevel)" == "${PREVIEW_ROOT}" ]] ||
     die "Git root não corresponde ao preview."
   [[ "$(git_preview branch --show-current)" == "${PREVIEW_BRANCH}" ]] ||
@@ -63,6 +68,26 @@ validate_scope() {
   done
 }
 
+validate_sigenergy_preview_env() {
+  [[ -f "${SIGENERGY_PREVIEW_ENV}" ]] ||
+    die ".env.sigenergy-preview inexistente."
+  [[ "$(stat -c '%a' "${SIGENERGY_PREVIEW_ENV}")" == "600" ]] ||
+    die ".env.sigenergy-preview deve ter permissões 600."
+  [[ "$(stat -c '%U:%G' "${SIGENERGY_PREVIEW_ENV}")" == "root:root" ]] ||
+    die ".env.sigenergy-preview deve pertencer a root:root."
+  grep -qx 'SIGENERGY_BASE_URL=https://api-eu.sigencloud.com' \
+    "${SIGENERGY_PREVIEW_ENV}" ||
+    die "Base URL Sigenergy fora da allowlist."
+  grep -qx 'SIGENERGY_REGION=eu' "${SIGENERGY_PREVIEW_ENV}" ||
+    die "Região Sigenergy fora da allowlist."
+  grep -qx 'SIGENERGY_HISTORY_ENERGY_UNIT=kWh' \
+    "${SIGENERGY_PREVIEW_ENV}" ||
+    die "Unidade histórica Sigenergy inválida."
+  grep -qx 'SIGENERGY_ALLOWED_SYSTEM_IDS=TZXRS1780315946' \
+    "${SIGENERGY_PREVIEW_ENV}" ||
+    die "System ID Sigenergy fora da allowlist."
+}
+
 compose() {
   docker compose \
     --project-name "${COMPOSE_PROJECT}" \
@@ -71,12 +96,20 @@ compose() {
     "$@"
 }
 
+run_sigenergy_worker() {
+  validate_sigenergy_preview_env
+  compose --profile sigenergy-preview run --rm --no-deps \
+    sigenergy-preview-sync \
+    python -m monitoring_board.sigenergy_preview_worker "$@"
+}
+
 validate_build_context() {
   local required_pattern
   for required_pattern in \
     'runtime/' \
     '**/runtime/' \
     '.env.preview' \
+    '.env.*' \
     '*.db' \
     '*.sqlite' \
     '*.sqlite3'
@@ -243,8 +276,28 @@ main() {
     status)
       show_status
       ;;
+    sigenergy-discover)
+      [[ "$#" -eq 1 ]] ||
+        die "Uso: deploy-nem-sei-preview sigenergy-discover"
+      run_sigenergy_worker discover
+      ;;
+    sigenergy-state)
+      [[ "$#" -eq 1 ]] ||
+        die "Uso: deploy-nem-sei-preview sigenergy-state"
+      run_sigenergy_worker state
+      ;;
+    sigenergy-backfill)
+      [[ "$#" -eq 3 ]] ||
+        die "Uso: deploy-nem-sei-preview sigenergy-backfill AAAA-MM-DD AAAA-MM-DD"
+      run_sigenergy_worker backfill "$2" "$3"
+      ;;
+    sigenergy-check)
+      [[ "$#" -eq 1 ]] ||
+        die "Uso: deploy-nem-sei-preview sigenergy-check"
+      run_sigenergy_worker check
+      ;;
     *)
-      die "Uso: deploy-nem-sei-preview {update|refresh-data [yes]|start|stop|status}"
+      die "Uso: deploy-nem-sei-preview {update|refresh-data [yes]|start|stop|status|sigenergy-discover|sigenergy-state|sigenergy-backfill AAAA-MM-DD AAAA-MM-DD|sigenergy-check}"
       ;;
   esac
 }

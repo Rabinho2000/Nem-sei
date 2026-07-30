@@ -9,7 +9,12 @@ import pytest
 import requests
 
 from monitoring_board.services.api_rate_limit import ApiRateLimitError
-from monitoring_board.services.sigenergy_client import SigenergyClient
+from monitoring_board.services.sigenergy_client import (
+    EXPERTCOM_SIGENERGY_BASE_URL,
+    EXPERTCOM_SIGENERGY_SYSTEM_ID,
+    SigenergyClient,
+    SigenergyPreviewReadOnlyPolicy,
+)
 from monitoring_board.services.sigenergy_errors import SigenergyApiError
 from monitoring_board.services.sigenergy_models import (
     SigenergyCredentials,
@@ -101,6 +106,95 @@ def client(session: QueueSession, *, system_ids: str = "", token_cache: dict[str
         token_cache=token_cache if token_cache is not None else {},
         sleeper=lambda _seconds: None,
     )
+
+
+def preview_client(
+    session: QueueSession,
+    *,
+    base_url: str = EXPERTCOM_SIGENERGY_BASE_URL,
+) -> SigenergyClient:
+    return SigenergyClient(
+        SigenergyEndpoints(
+            base_url=base_url,
+            login_endpoint="/openapi/auth/login/key",
+            systems_endpoint="/openapi/system",
+            energy_flow_endpoint=(
+                f"/openapi/systems/{EXPERTCOM_SIGENERGY_SYSTEM_ID}/energyFlow"
+            ),
+            history_endpoint=(
+                f"/openapi/systems/{EXPERTCOM_SIGENERGY_SYSTEM_ID}/history"
+            ),
+            region="eu",
+        ),
+        SigenergyCredentials("fixture-app-key", "fixture-app-secret"),
+        session=session,
+        token_cache={},
+        read_only_policy=SigenergyPreviewReadOnlyPolicy(),
+    )
+
+
+def test_preview_policy_allows_only_expertcom_read_endpoints(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "preview")
+    monkeypatch.setenv("EXTERNAL_ACTIONS_ENABLED", "false")
+    login_url = f"{EXPERTCOM_SIGENERGY_BASE_URL}/openapi/auth/login/key"
+    flow_url = (
+        f"{EXPERTCOM_SIGENERGY_BASE_URL}/openapi/systems/"
+        f"{EXPERTCOM_SIGENERGY_SYSTEM_ID}/energyFlow"
+    )
+    session = QueueSession(
+        {
+            login_url: [FakeResponse(load_fixture("auth_success_object.json"))],
+            flow_url: [FakeResponse(load_fixture("energy_flow.json"))],
+        }
+    )
+    read_only_client = preview_client(session)
+
+    read_only_client.get_energy_flow(EXPERTCOM_SIGENERGY_SYSTEM_ID)
+
+    with pytest.raises(SigenergyApiError, match="allowlist"):
+        read_only_client.get_energy_flow("OTHER-SYSTEM")
+    with pytest.raises(SigenergyApiError, match="allowlist"):
+        read_only_client.request_json(
+            "POST",
+            "/openapi/board/onboard",
+            json_payload={"systemId": EXPERTCOM_SIGENERGY_SYSTEM_ID},
+        )
+    assert [call["method"] for call in session.requests] == ["GET"]
+
+
+def test_preview_policy_refuses_different_base_url() -> None:
+    with pytest.raises(SigenergyApiError, match="allowlist"):
+        preview_client(QueueSession({}), base_url="https://example.invalid")
+
+
+def test_preview_policy_refuses_discovered_system_outside_allowlist() -> None:
+    login_url = f"{EXPERTCOM_SIGENERGY_BASE_URL}/openapi/auth/login/key"
+    systems_url = f"{EXPERTCOM_SIGENERGY_BASE_URL}/openapi/system"
+    session = QueueSession(
+        {
+            login_url: [FakeResponse(load_fixture("auth_success_object.json"))],
+            systems_url: [
+                FakeResponse(
+                    {
+                        "code": 0,
+                        "data": {
+                            "list": [
+                                {
+                                    "systemId": "OTHER-SYSTEM",
+                                    "systemName": "Refused",
+                                }
+                            ]
+                        },
+                    }
+                )
+            ],
+        }
+    )
+
+    with pytest.raises(SigenergyApiError, match="System ID"):
+        preview_client(session).list_systems()
 
 
 def test_login_extracts_token_and_sends_region_header() -> None:
