@@ -6476,6 +6476,7 @@ def ensure_database(path: str) -> None:
                 external_name TEXT,
                 metadata_json TEXT NOT NULL DEFAULT '{}',
                 access_status TEXT NOT NULL DEFAULT 'accessible',
+                validation_method TEXT NOT NULL DEFAULT 'discovery',
                 first_discovered_at TEXT NOT NULL,
                 last_discovered_at TEXT NOT NULL,
                 last_state TEXT,
@@ -6543,6 +6544,7 @@ def ensure_database(path: str) -> None:
                 asset_id INTEGER,
                 status TEXT NOT NULL,
                 access_status TEXT NOT NULL DEFAULT 'available',
+                validation_method TEXT NOT NULL DEFAULT 'discovery',
                 source_label TEXT NOT NULL,
                 normalized_json TEXT,
                 raw_payload_json TEXT,
@@ -6558,6 +6560,18 @@ def ensure_database(path: str) -> None:
                 FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE SET NULL,
                 FOREIGN KEY (onboarding_request_id) REFERENCES sigenergy_onboarding_requests(id) ON DELETE SET NULL,
                 FOREIGN KEY (background_job_id) REFERENCES background_jobs(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS sigenergy_access_validations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                system_id TEXT NOT NULL,
+                validation_method TEXT NOT NULL,
+                discovery_returned INTEGER NOT NULL DEFAULT 0,
+                outcome TEXT NOT NULL,
+                status_code INTEGER,
+                sanitized_error TEXT,
+                details_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS provider_devices (
@@ -7082,6 +7096,8 @@ def ensure_database(path: str) -> None:
         ensure_column(conn, "portfolio_report_rows", "covered_period TEXT")
         ensure_column(conn, "portfolio_report_rows", "quality_status TEXT")
         ensure_column(conn, "sigenergy_onboarding_requests", "installation_import_id INTEGER")
+        ensure_column(conn, "provider_system_inventory", "validation_method TEXT NOT NULL DEFAULT 'discovery'")
+        ensure_column(conn, "installation_imports", "validation_method TEXT NOT NULL DEFAULT 'discovery'")
         migrate_sigenergy_import_access_statuses(conn)
         ensure_api_call_state_schema(conn)
         ensure_api_queue_schema(conn)
@@ -18066,6 +18082,80 @@ def discover_fusionsolar_installation(
     }
 
 
+def record_sigenergy_access_validation(
+    conn: sqlite3.Connection,
+    *,
+    system_id: str,
+    outcome: str,
+    external_name: str = "",
+    energy_flow: dict[str, Any] | None = None,
+    status_code: int | None = None,
+    error: str = "",
+) -> None:
+    now = datetime.now().isoformat(timespec="seconds")
+    safe_error = sigenergy_service.sanitize_sigenergy_error(error)[:2000]
+    safe_details = {
+        "source": "direct_energy_flow",
+        "discovery_returned": False,
+        "energy_flow_fields": sorted(
+            str(key) for key in (energy_flow or {}).keys()
+        ),
+    }
+    conn.execute(
+        """
+        INSERT INTO sigenergy_access_validations (
+            system_id, validation_method, discovery_returned, outcome,
+            status_code, sanitized_error, details_json, created_at
+        ) VALUES (?, 'direct_energy_flow', 0, ?, ?, ?, ?, ?)
+        """,
+        (
+            system_id,
+            outcome,
+            status_code,
+            safe_error,
+            json.dumps(safe_details, ensure_ascii=True, sort_keys=True),
+            now,
+        ),
+    )
+    if outcome != "available":
+        return
+    metadata = {
+        "validation_method": "direct_energy_flow",
+        "discovery_returned": False,
+    }
+    conn.execute(
+        """
+        INSERT INTO provider_system_inventory (
+            provider, external_id, external_name, metadata_json,
+            access_status, validation_method, first_discovered_at,
+            last_discovered_at, last_state, data_quality, last_error,
+            created_at, updated_at
+        ) VALUES (
+            'Sigenergy', ?, ?, ?, 'accessible', 'direct_energy_flow',
+            ?, ?, 'Acessível', 'missing', '', ?, ?
+        )
+        ON CONFLICT(provider, external_id) DO UPDATE SET
+            external_name = excluded.external_name,
+            metadata_json = excluded.metadata_json,
+            access_status = 'accessible',
+            validation_method = 'direct_energy_flow',
+            last_discovered_at = excluded.last_discovered_at,
+            last_state = excluded.last_state,
+            last_error = '',
+            updated_at = excluded.updated_at
+        """,
+        (
+            system_id,
+            external_name or system_id,
+            json.dumps(metadata, ensure_ascii=True, sort_keys=True),
+            now,
+            now,
+            now,
+            now,
+        ),
+    )
+
+
 def fetch_provider_installation_preview(
     conn: sqlite3.Connection,
     provider: str,
@@ -18114,30 +18204,73 @@ def fetch_provider_installation_preview(
                 ),
                 None,
             )
-            if system is None:
-                raise SigenergyInstallationAccessPending(
-                    f"O System ID {external_id} ainda nao esta acessivel por esta App Key."
-                )
             complete_installation_import_api_call(
                 conn,
                 provider,
                 API_AREA_DISCOVERY,
             )
             begin_installation_import_api_call(conn, provider, API_AREA_STATE)
-            energy_flow = execute_queued_sigenergy_call(
-                conn,
-                config,
-                lambda: client.get_energy_flow(external_id),
-                api_area=API_AREA_STATE,
-                priority=4,
-            )
+            try:
+                energy_flow = execute_queued_sigenergy_call(
+                    conn,
+                    config,
+                    lambda: client.get_energy_flow(external_id),
+                    api_area=API_AREA_STATE,
+                    priority=4,
+                )
+            except Exception as exc:
+                if system is None:
+                    record_sigenergy_access_validation(
+                        conn,
+                        system_id=external_id,
+                        outcome="failed",
+                        status_code=getattr(exc, "status_code", None),
+                        error=sigenergy_service.sanitize_sigenergy_error(exc),
+                    )
+                raise
             complete_installation_import_api_call(
                 conn,
                 provider,
                 API_AREA_STATE,
             )
+            validation_method = "discovery"
+            if system is None:
+                seed_row = dict(seed or {})
+                external_name = str(
+                    first_non_empty(
+                        seed_row,
+                        ["systemName", "name", "external_name", "project_name"],
+                    )
+                    or external_id
+                ).strip()
+                system = {
+                    "systemId": external_id,
+                    "systemName": external_name,
+                }
+                validation_method = "direct_energy_flow"
+                record_sigenergy_access_validation(
+                    conn,
+                    system_id=external_id,
+                    outcome="available",
+                    external_name=external_name,
+                    energy_flow=energy_flow,
+                )
             normalized = normalize_sigenergy_import(system, energy_flow)
-            raw = {"system": system, "energy_flow": energy_flow}
+            normalized["validation_method"] = validation_method
+            normalized["discovery_returned"] = validation_method == "discovery"
+            if validation_method == "direct_energy_flow":
+                normalized["source_label"] = (
+                    "Sigenergy API · validação direta energyFlow "
+                    "(não devolvida por /openapi/system)"
+                )
+            raw = {
+                "system": system,
+                "energy_flow": energy_flow,
+                "validation": {
+                    "method": validation_method,
+                    "discovery_returned": validation_method == "discovery",
+                },
+            }
             return normalized, sanitize_installation_import_payload(raw)
 
         begin_installation_import_api_call(conn, provider)
@@ -18174,12 +18307,22 @@ def run_installation_import_preview_job(
         raise ValueError("Importacao de instalacao nao encontrada.")
     provider = str(import_context["provider"])
     external_id = str(import_context["external_id"])
+    effective_seed = seed
+    if provider == INTEGRATION_PROVIDER_SIGENERGY and effective_seed is None:
+        effective_seed = {
+            "systemId": external_id,
+            "systemName": (
+                import_context.get("external_name")
+                or import_context.get("normalized", {}).get("external_name")
+                or external_id
+            ),
+        }
     try:
         normalized, raw_payload = fetch_provider_installation_preview(
             conn,
             provider,
             external_id,
-            seed=seed,
+            seed=effective_seed,
         )
         upsert_installation_import_preview(
             conn,
@@ -18215,6 +18358,10 @@ def run_installation_import_preview_job(
             "import_id": import_id,
             "status": "preview",
             "access_status": "available",
+            "validation_method": normalized.get(
+                "validation_method",
+                "discovery",
+            ),
         }
     except SigenergyInstallationAccessPending:
         onboarding = active_sigenergy_onboarding_for_import(conn, import_id)
@@ -18361,13 +18508,20 @@ def upsert_installation_import_preview(
         "SELECT id, status FROM installation_imports WHERE provider = ? AND external_id = ?",
         (provider, external_id),
     ).fetchone()
+    validation_method = str(
+        normalized.get("validation_method") or "discovery"
+    )
+    source_label = str(
+        normalized.get("source_label") or f"{provider} API"
+    )
     values = (
         external_name,
         mode,
         target_asset_id,
         status,
         access_status,
-        f"{provider} API",
+        validation_method,
+        source_label,
         json.dumps(normalized, ensure_ascii=True, sort_keys=True),
         json.dumps(sanitize_installation_import_payload(raw_payload), ensure_ascii=True, sort_keys=True),
         normalized.get("fetched_at") or now,
@@ -18400,7 +18554,8 @@ def upsert_installation_import_preview(
             """
             UPDATE installation_imports
             SET external_name = ?, mode = ?, target_asset_id = ?, status = ?, access_status = ?,
-                source_label = ?, normalized_json = ?, raw_payload_json = ?, fetched_at = ?,
+                validation_method = ?, source_label = ?, normalized_json = ?,
+                raw_payload_json = ?, fetched_at = ?,
                 last_error = ?, created_by = ?, updated_at = ?
             WHERE id = ?
             """,
@@ -18411,9 +18566,10 @@ def upsert_installation_import_preview(
         """
         INSERT INTO installation_imports (
             provider, external_id, external_name, mode, target_asset_id, status,
-            access_status, source_label, normalized_json, raw_payload_json, fetched_at,
+            access_status, validation_method, source_label, normalized_json,
+            raw_payload_json, fetched_at,
             last_error, created_by, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             provider,

@@ -71,7 +71,8 @@ def test_worker_discovery_updates_inventory_without_creating_assets(
     ensure_database(str(db_path))
 
     class Client:
-        def list_systems(self):
+        def list_systems(self, *, allow_empty=False):
+            assert allow_empty is True
             return [
                 {
                     "systemId": EXPERTCOM_SIGENERGY_SYSTEM_ID,
@@ -88,8 +89,45 @@ def test_worker_discovery_updates_inventory_without_creating_assets(
         asset_count = conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
 
     assert result["assets_created"] == 0
+    assert result["validation_method"] == "discovery"
     assert len(inventory) == 1
     assert inventory[0]["external_name"] == "Expertcom"
+    assert asset_count == 0
+
+
+def test_worker_discovery_validates_expertcom_directly_when_list_is_empty(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "preview-direct-discovery.db"
+    ensure_database(str(db_path))
+    flow_calls: list[str] = []
+
+    class Client:
+        def list_systems(self, *, allow_empty=False):
+            assert allow_empty is True
+            return []
+
+        def get_energy_flow(self, system_id):
+            flow_calls.append(system_id)
+            return {"pvPower": 3.4, "loadPower": 1.2}
+
+    with get_db(str(db_path)) as conn:
+        result = discover(conn, Client())
+        inventory = conn.execute(
+            "SELECT * FROM provider_system_inventory"
+        ).fetchone()
+        validation = conn.execute(
+            "SELECT * FROM sigenergy_access_validations"
+        ).fetchone()
+        asset_count = conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
+
+    assert flow_calls == [EXPERTCOM_SIGENERGY_SYSTEM_ID]
+    assert result["name"] == "Expertcom"
+    assert result["validation_method"] == "direct_energy_flow"
+    assert result["discovery_returned"] is False
+    assert inventory["access_status"] == "accessible"
+    assert inventory["validation_method"] == "direct_energy_flow"
+    assert validation["outcome"] == "available"
     assert asset_count == 0
 
 
