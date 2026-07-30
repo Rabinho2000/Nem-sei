@@ -10,11 +10,11 @@ from monitoring_board.reporting.quality_gate import QualityGateResult, evaluate_
 from monitoring_board.reporting.repositories import (
     detect_tariff_validity_warnings,
     get_asset_billing_config_row,
-    get_latest_helioscope_expected,
     get_monthly_availability,
     get_monthly_production_record,
     list_daily_production_records,
 )
+from monitoring_board.services.financial_models import resolve_expected_production_for_month
 
 
 def build_asset_close_payload(
@@ -68,7 +68,16 @@ def build_asset_close_payload(
         period_end=end,
         fallback_kwp=asset["kwp"],
     )
-    expected = get_latest_helioscope_expected(conn, asset_id, start.month)
+    mount_raw = asset["mounting_date"] or asset["start_contract"]
+    mounting_date = None
+    if mount_raw:
+        try:
+            mounting_date = date.fromisoformat(str(mount_raw)[:10])
+        except ValueError:
+            pass
+    expected = resolve_expected_production_for_month(
+        conn, asset_id=asset_id, period=start, mounting_date=mounting_date
+    )
     tariff_warnings = detect_tariff_validity_warnings(
         conn, asset_id=asset_id, start=start, end=end
     )
@@ -116,8 +125,21 @@ def build_asset_close_payload(
         "production_available_days": quality.available_days,
         "production_missing_dates": [item.isoformat() for item in quality.missing_dates],
         "production_coverage_pct": round(quality.coverage_ratio * 100, 2),
-        "expected_production_kwh": float(expected["expected_kwh"]) if expected else None,
-        "expected_production_source": "helioscope" if expected else "none",
+        "expected_production_kwh": expected["expected_production_kwh"],
+        "expected_production_base_kwh": expected["expected_production_base_kwh"],
+        "adjusted_expected_kwh": expected["adjusted_expected_production_kwh"],
+        "expected_production_source": expected["expected_production_source"],
+        "financial_model_id": expected["financial_model_id"],
+        "financial_model_version": expected["financial_model_version"],
+        "financial_model_effective_date": expected["financial_model_effective_date"],
+        "degradation_factor": expected["degradation_factor"],
+        "performance_vs_expected_pct": (
+            quality.production_kwh / expected["adjusted_expected_production_kwh"] * 100
+            if quality.production_kwh is not None
+            and expected["adjusted_expected_production_kwh"] is not None
+            and expected["adjusted_expected_production_kwh"] > 0
+            else None
+        ),
         "installed_power_kwp": (
             str(capacity.installed_power_kwp)
             if capacity.installed_power_kwp is not None
@@ -144,6 +166,7 @@ def evaluate_close_payload(
     requires_financials: bool,
     requires_availability: bool,
     requires_customer: bool,
+    requires_expected_production: bool = False,
 ) -> QualityGateResult:
     return evaluate_report_quality(
         payload,
@@ -151,4 +174,5 @@ def evaluate_close_payload(
         requires_financials=requires_financials,
         requires_availability=requires_availability,
         requires_customer=requires_customer,
+        requires_expected_production=requires_expected_production,
     )

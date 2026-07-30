@@ -258,7 +258,8 @@ def test_report_flags_missing_data(tmp_path: Path) -> None:
 
     assert row["data_status"] == "missing_data"
     assert "missing_monthly_production" in row["warnings"]
-    assert "missing_helioscope_expected" in row["warnings"]
+    assert "missing_financial_model" in row["warnings"]
+    assert row["expected_production_source"] == "missing"
     assert "missing_tariff" in row["warnings"]
 
 

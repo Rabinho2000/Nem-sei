@@ -420,6 +420,54 @@ def get_active_expected_for_month(conn: sqlite3.Connection, *, asset_id: int | N
     return active_model_for_month(conn, asset_id=asset_id, year=year, month=month)
 
 
+def resolve_expected_production_for_month(
+    conn: sqlite3.Connection,
+    *,
+    asset_id: int | None,
+    period: date,
+    mounting_date: date | None,
+) -> dict[str, Any]:
+    """Resolve and freeze the financial-model production applicable to a month.
+
+    This is deliberately the only resolver used by the new reporting pipeline.
+    HelioScope remains importable for legacy screens, but is never consulted here.
+    """
+    from monitoring_board.reporting.degradation import calculate_degradation_factor
+
+    row = get_active_expected_for_month(
+        conn, asset_id=asset_id, year=period.year, month=period.month
+    )
+    if row is None or row["expected_production_kwh"] is None:
+        return {
+            "expected_production_kwh": None,
+            "expected_production_base_kwh": None,
+            "adjusted_expected_production_kwh": None,
+            "expected_production_source": "missing",
+            "financial_model_id": None,
+            "financial_model_version": None,
+            "financial_model_effective_date": None,
+            "degradation_factor": None,
+        }
+    base_kwh = float(row["expected_production_kwh"])
+    factor = calculate_degradation_factor(mounting_date, period)
+    return {
+        "expected_production_kwh": base_kwh,
+        "expected_production_base_kwh": base_kwh,
+        "adjusted_expected_production_kwh": base_kwh * factor,
+        "expected_production_source": "financial_model",
+        "financial_model_id": int(row["financial_model_id"]),
+        "financial_model_version": (
+            int(row["financial_model_version"])
+            if row["financial_model_version"] is not None
+            else None
+        ),
+        "financial_model_effective_date": row["financial_model_effective_date"],
+        "financial_model_base_year": int(row["financial_model_base_year"]),
+        "degradation_factor": factor,
+        "model_monthly": row,
+    }
+
+
 def parse_model_details_json(model: sqlite3.Row | None) -> dict[str, Any]:
     if model is None or "details_json" not in model.keys():
         return {}

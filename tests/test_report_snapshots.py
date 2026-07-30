@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
-
 import pytest
 
 from app import ensure_database
@@ -52,6 +50,25 @@ def ready_payload(asset_id: int) -> dict:
         "availability_pct": "99.0",
         "invoice_status": "confirmed",
     }
+
+
+def test_missing_financial_model_blocks_only_when_template_depends_on_expected_production(tmp_path) -> None:
+    conn = connect(tmp_path)
+    asset_id = add_asset(conn)
+    payload = {
+        **ready_payload(asset_id),
+        "expected_production_kwh": None,
+        "expected_production_source": "missing",
+    }
+
+    optional = evaluate_report_quality(payload, scope="individual")
+    required = evaluate_report_quality(
+        payload, scope="individual", requires_expected_production=True
+    )
+
+    assert optional.status == "warning"
+    assert required.status == BLOCKED
+    assert required.blockers[0].code == "missing_financial_model_expected_production"
 
 
 def test_individual_snapshot_hash_is_deterministic_and_freezes_configuration(tmp_path) -> None:

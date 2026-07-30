@@ -441,7 +441,7 @@ def test_create_preview_confirm_version_and_duplicate_hash(tmp_path: Path) -> No
         conn.close()
 
 
-def test_financial_model_precedence_over_helioscope_and_year_isolated(tmp_path: Path) -> None:
+def test_financial_model_is_used_without_helioscope_fallback_and_repeats_after_base_year(tmp_path: Path) -> None:
     conn = connect(tmp_path)
     try:
         asset_id = add_asset(conn)
@@ -470,8 +470,28 @@ def test_financial_model_precedence_over_helioscope_and_year_isolated(tmp_path: 
 
         assert row_2026["expected_production_kwh"] == 100
         assert row_2026["expected_production_source"] == "financial_model"
-        assert row_2027["expected_production_source"] == "helioscope"
-        assert row_2027["expected_production_kwh"] == 50
+        assert row_2027["expected_production_source"] == "financial_model"
+        assert row_2027["expected_production_kwh"] == 100
+        assert row_2027["financial_model_id"] == model_id
+        assert row_2027["financial_model_version"] == 1
+        assert row_2027["financial_model_effective_date"]
+        assert row_2027["adjusted_expected_kwh"] < row_2027["expected_production_kwh"]
+        assert row_2027["expected_specific_yield"] == round(
+            row_2027["adjusted_expected_kwh"] / row_2027["installed_power_kwp"], 2
+        )
+        assert row_2027["helioscope_expected_kwh"] is None
+
+        conn.execute(
+            "UPDATE financial_model_monthly SET expected_production_kwh = 0 WHERE financial_model_id = ? AND month = 1",
+            (model_id,),
+        )
+        zero_row = next(
+            row
+            for row in build_portfolio_report_rows(conn, portfolio_id, "2026-01")
+            if row["asset_id"] == asset_id
+        )
+        assert zero_row["performance_vs_expected_pct"] is None
+        assert zero_row["deviation_pct"] is None
     finally:
         conn.close()
 
@@ -493,7 +513,8 @@ def test_preview_not_used_in_reports_and_real_values_stay_none(tmp_path: Path) -
 
         row = next(row for row in build_portfolio_report_rows(conn, portfolio_id, "2026-01") if row["asset_id"] == asset_id)
 
-        assert row["expected_production_source"] == "none"
+        assert row["expected_production_source"] == "missing"
+        assert "missing_financial_model" in row["warnings"]
         assert row["actual_production_kwh"] is None
         assert row["self_use_kwh"] is None
         assert row["export_kwh"] is None

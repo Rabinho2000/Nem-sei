@@ -143,9 +143,13 @@ METRIC_CATALOG: dict[str, PortfolioMetricDefinition] = {
     "expected_self_sufficiency_rate_pct": PortfolioMetricDefinition("expected_self_sufficiency_rate_pct", "Taxa AS prevista", "Taxa de autossuficiencia prevista", "Previsao", "%", "number", 2, "recalculate"),
     "expected_specific_yield": PortfolioMetricDefinition("expected_specific_yield", "Specific yield previsto", "Producao prevista por kWp", "Previsao", "kWh/kWp", "number", 2, "recalculate"),
     "expected_production_source": PortfolioMetricDefinition("expected_production_source", "Origem prevista", "Origem da producao prevista", "Previsao", "", "text", 0, "none", False, False),
+    "financial_model_id": PortfolioMetricDefinition("financial_model_id", "Modelo financeiro", "Identificador do modelo financeiro congelado", "Previsao", "", "number", 0, "none", False, False),
+    "financial_model_version": PortfolioMetricDefinition("financial_model_version", "Versao do modelo", "Versao do modelo financeiro congelado", "Previsao", "", "number", 0, "none", False, False),
+    "financial_model_effective_date": PortfolioMetricDefinition("financial_model_effective_date", "Data efetiva do modelo", "Data efetiva do modelo financeiro congelado", "Previsao", "", "text", 0, "none", False, False),
     "adjusted_expected_kwh": PortfolioMetricDefinition("adjusted_expected_kwh", "Esperada ajustada", "Producao esperada ajustada", "Performance", "kWh", "number", 2, "sum"),
     "deviation_kwh": PortfolioMetricDefinition("deviation_kwh", "Desvio", "Desvio de producao", "Performance", "kWh", "number", 2, "recalculate"),
     "deviation_pct": PortfolioMetricDefinition("deviation_pct", "Desvio %", "Desvio percentual", "Performance", "%", "number", 2, "recalculate"),
+    "performance_vs_expected_pct": PortfolioMetricDefinition("performance_vs_expected_pct", "Performance vs esperado", "Producao real / producao esperada ajustada; nao e PR tecnico", "Performance", "%", "number", 2, "recalculate"),
     "specific_yield": PortfolioMetricDefinition("specific_yield", "Specific yield", "Producao por kWp", "Performance", "kWh/kWp", "number", 2, "recalculate"),
     "availability_pct": PortfolioMetricDefinition("availability_pct", "Disponibilidade", "Disponibilidade ponderada", "Disponibilidade", "%", "number", 2, "weighted_avg"),
     "self_use_kwh": PortfolioMetricDefinition("self_use_kwh", "Autoconsumo", "Energia autoconsumida", "Autoconsumo", "kWh", "number", 2, "sum"),
@@ -170,7 +174,7 @@ METRIC_CATALOG: dict[str, PortfolioMetricDefinition] = {
 
 DEFAULT_PROFILE_COLUMNS = {
     "Resumo operacional": ("installation", "actual_production_kwh", "production_quality_status", "production_coverage_pct", "adjusted_expected_kwh", "deviation_pct", "availability_pct", "estimated_value_eur", "data_status"),
-    "Performance": ("installation", "installed_power_kwp", "actual_production_kwh", "specific_yield", "adjusted_expected_kwh", "deviation_kwh", "deviation_pct", "availability_pct"),
+    "Performance": ("installation", "installed_power_kwp", "actual_production_kwh", "specific_yield", "adjusted_expected_kwh", "deviation_kwh", "deviation_pct", "performance_vs_expected_pct", "availability_pct"),
     "Financeiro": ("installation", "self_use_kwh", "export_kwh", "estimated_value_eur", "export_revenue_eur", "esco_payment_eur", "net_benefit_eur"),
     "Qualidade dos dados": ("installation", "mapping_confidence", "production_quality_status", "production_coverage_pct", "raw_daily_production_kwh", "coverage_pct", "invoice_status", "tariff_type", "warning_count", "warning_labels"),
     "Completo": tuple(METRIC_CATALOG.keys()),
@@ -367,7 +371,7 @@ def comparison_values(current: PortfolioReportSummary, previous: PortfolioReport
 
 
 def data_coverage(rows: tuple[PortfolioReportRow, ...], months: tuple[date, ...]) -> PortfolioDataCoverage:
-    sources = ("production", "helioscope", "availability", "tariff", "self_use", "invoice", "mapping")
+    sources = ("production", "financial_model", "availability", "tariff", "self_use", "invoice", "mapping")
     by_source: dict[str, Decimal] = {}
     expected_months = len(months) or 1
     expected_slots = len(rows) * expected_months

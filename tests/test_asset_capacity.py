@@ -198,4 +198,6 @@ def test_portfolio_specific_yield_uses_historical_capacity(tmp_path) -> None:
 
     assert row["installed_power_kwp"] == 20
     assert row["installed_power_source"] == "capacity_history"
-    assert row["expected_specific_yield"] == 10
+    # Historical HelioScope data is retained but is not a reporting fallback.
+    assert row["expected_specific_yield"] is None
+    assert row["expected_production_source"] == "missing"

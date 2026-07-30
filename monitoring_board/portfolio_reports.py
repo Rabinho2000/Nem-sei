@@ -19,7 +19,6 @@ from monitoring_board.portfolio_repository import (
 from monitoring_board.reporting.availability import calculate_weighted_portfolio_availability
 from monitoring_board.reporting.billing import calculate_billing, decimal_from_value, detect_report_type_value
 from monitoring_board.reporting.data_quality import evaluate_monthly_production_quality
-from monitoring_board.reporting.degradation import calculate_degradation_factor
 from monitoring_board.reporting.financial_quality import (
     apply_production_financial_gate,
     financial_quality_warnings,
@@ -29,7 +28,6 @@ from monitoring_board.reporting.periods import month_bounds
 from monitoring_board.reporting.repositories import (
     detect_tariff_validity_warnings,
     get_asset_billing_config,
-    get_latest_helioscope_expected,
     get_latest_tariff,
     get_monthly_availability,
     get_monthly_production_record,
@@ -44,7 +42,7 @@ from monitoring_board.reporting.repositories import (
     save_asset_tariff,
     upsert_asset_billing_config,
 )
-from monitoring_board.services.financial_models import get_active_expected_for_month
+from monitoring_board.services.financial_models import resolve_expected_production_for_month
 from monitoring_board.reporting.tariffs import (
     classify_tariff_period as tariff_classify_tariff_period,
     result_to_legacy_dict,
@@ -714,19 +712,27 @@ def build_portfolio_report_rows(
         warnings.extend(production_quality.warnings)
         if production_quality.status in {"partial", "missing", "conflict"}:
             warnings.append("missing_monthly_production")
-        financial_expected = get_active_expected_for_month(conn, asset_id=asset_id, year=start.year, month=start.month)
-        expected_source = "financial_model" if financial_expected else "none"
-        expected_kwh = float(financial_expected["expected_production_kwh"]) if financial_expected and financial_expected["expected_production_kwh"] is not None else None
+        mount_raw = asset["mounting_date"] or asset["start_contract"]
+        mounting = None
+        if mount_raw:
+            try:
+                mounting = datetime.fromisoformat(str(mount_raw)[:10]).date()
+            except ValueError:
+                warnings.append("invalid_mounting_date")
+        else:
+            warnings.append("missing_mounting_date")
+        expected_resolution = resolve_expected_production_for_month(
+            conn, asset_id=asset_id, period=start, mounting_date=mounting
+        )
+        financial_expected = expected_resolution.get("model_monthly")
+        expected_source = expected_resolution["expected_production_source"]
+        expected_kwh = expected_resolution["expected_production_kwh"]
         expected_consumption_kwh = float(financial_expected["expected_consumption_kwh"]) if financial_expected and financial_expected["expected_consumption_kwh"] is not None else None
         expected_self_use_kwh = float(financial_expected["expected_self_use_kwh"]) if financial_expected and financial_expected["expected_self_use_kwh"] is not None else None
         expected_export_kwh = float(financial_expected["expected_export_kwh"]) if financial_expected and financial_expected["expected_export_kwh"] is not None else None
         expected_grid_import_kwh = float(financial_expected["expected_grid_import_kwh"]) if financial_expected and financial_expected["expected_grid_import_kwh"] is not None else None
         expected_self_consumption_rate_pct = float(financial_expected["expected_self_consumption_rate_pct"]) if financial_expected and financial_expected["expected_self_consumption_rate_pct"] is not None else None
         expected_self_sufficiency_rate_pct = float(financial_expected["expected_self_sufficiency_rate_pct"]) if financial_expected and financial_expected["expected_self_sufficiency_rate_pct"] is not None else None
-        if expected_kwh is None:
-            expected = get_latest_helioscope_expected(conn, asset_id, start.month)
-            expected_kwh = float(expected["expected_kwh"]) if expected else None
-            expected_source = "helioscope" if expected else "none"
         capacity = (
             resolve_capacity_for_period(
                 conn,
@@ -747,24 +753,15 @@ def build_portfolio_report_rows(
             warnings.append("ambiguous_installed_power")
         elif installed_power_kwp is None:
             warnings.append("missing_installed_power")
+        if expected_kwh is None:
+            warnings.append("missing_financial_model")
+        factor = expected_resolution["degradation_factor"]
+        adjusted = expected_resolution["adjusted_expected_production_kwh"]
         expected_specific_yield = (
-            expected_kwh / installed_power_kwp
-            if expected_kwh is not None and installed_power_kwp
+            adjusted / installed_power_kwp
+            if adjusted is not None and installed_power_kwp
             else None
         )
-        if expected_kwh is None:
-            warnings.append("missing_helioscope_expected")
-        mount_raw = asset["mounting_date"] or asset["start_contract"]
-        mounting = None
-        if mount_raw:
-            try:
-                mounting = datetime.fromisoformat(str(mount_raw)[:10]).date()
-            except ValueError:
-                warnings.append("invalid_mounting_date")
-        else:
-            warnings.append("missing_mounting_date")
-        factor = calculate_degradation_factor(mounting, start)
-        adjusted = expected_kwh * factor if expected_kwh is not None else None
         deviation = actual - adjusted if actual is not None and adjusted is not None else None
         deviation_pct = (deviation / adjusted * 100) if deviation is not None and adjusted else None
         availability = get_monthly_availability(conn, asset_id, start, end) if asset_id is not None else None
@@ -904,7 +901,7 @@ def build_portfolio_report_rows(
                 "export_kwh": round(export_kwh, 2) if export_kwh is not None else None,
                 "consumption_kwh": round(consumption_kwh, 2) if consumption_kwh is not None else None,
                 "grid_import_kwh": round(grid_import_kwh, 2) if grid_import_kwh is not None else None,
-                "helioscope_expected_kwh": round(expected_kwh, 2) if expected_kwh is not None else None,
+                "helioscope_expected_kwh": None,
                 "expected_production_kwh": round(expected_kwh, 2) if expected_kwh is not None else None,
                 "expected_consumption_kwh": round(expected_consumption_kwh, 2) if expected_consumption_kwh is not None else None,
                 "expected_self_use_kwh": round(expected_self_use_kwh, 2) if expected_self_use_kwh is not None else None,
@@ -914,10 +911,18 @@ def build_portfolio_report_rows(
                 "expected_self_sufficiency_rate_pct": round(expected_self_sufficiency_rate_pct, 2) if expected_self_sufficiency_rate_pct is not None else None,
                 "expected_specific_yield": round(expected_specific_yield, 2) if expected_specific_yield is not None else None,
                 "expected_production_source": expected_source,
+                "financial_model_id": expected_resolution["financial_model_id"],
+                "financial_model_version": expected_resolution["financial_model_version"],
+                "financial_model_effective_date": expected_resolution["financial_model_effective_date"],
                 "adjusted_expected_kwh": round(adjusted, 2) if adjusted is not None else None,
-                "degradation_factor": round(factor, 6),
+                "degradation_factor": round(factor, 6) if factor is not None else None,
                 "deviation_kwh": round(deviation, 2) if deviation is not None else None,
                 "deviation_pct": round(deviation_pct, 2) if deviation_pct is not None else None,
+                "performance_vs_expected_pct": (
+                    round(actual / adjusted * 100, 2)
+                    if actual is not None and adjusted is not None and adjusted > 0
+                    else None
+                ),
                 "availability_pct": availability,
                 "tariff_type": tariff["tariff_type"] if tariff else "",
                 "estimated_value_eur": tariff_result["estimated_value_eur"],

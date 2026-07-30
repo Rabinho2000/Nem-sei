@@ -307,15 +307,21 @@ def active_model_for_month(conn: sqlite3.Connection, *, asset_id: int | None, ye
         return None
     return conn.execute(
         """
-        SELECT fm.*, fmm.*
+        SELECT
+            fmm.*,
+            fm.id AS financial_model_id,
+            fm.version AS financial_model_version,
+            fm.base_year AS financial_model_base_year,
+            COALESCE(fm.confirmed_at, fm.created_at) AS financial_model_effective_date
         FROM financial_models fm
         JOIN financial_model_monthly fmm ON fmm.financial_model_id = fm.id
         WHERE fm.asset_id = ?
-          AND fm.base_year = ?
+          AND fm.base_year <= ?
           AND fmm.month = ?
           AND fm.status = 'confirmed'
           AND fm.active = 1
           AND fm.archived_at IS NULL
+        ORDER BY fm.base_year DESC, COALESCE(fm.version, 0) DESC, fm.id DESC
         LIMIT 1
         """,
         (asset_id, year, month),

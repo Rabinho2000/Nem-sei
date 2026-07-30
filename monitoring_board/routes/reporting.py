@@ -184,6 +184,19 @@ def validate_monthly_snapshot(snapshot_id: int):
         requires_financials=bool(metrics & {"financial", "net_benefit_eur", "estimated_value_eur"}) or "financial" in sections,
         requires_availability="availability" in sections,
         requires_customer=snapshot.scope_type == "portfolio",
+        requires_expected_production=bool(
+            metrics
+            & {
+                "expected_production_kwh",
+                "adjusted_expected_kwh",
+                "expected_specific_yield",
+                "deviation_kwh",
+                "deviation_pct",
+                "performance_vs_expected_pct",
+                "performance_ratio",
+            }
+        )
+        or bool(sections & {"performance", "expected_production", "financial"}),
     )
     status = validate_snapshot(
         g.db,

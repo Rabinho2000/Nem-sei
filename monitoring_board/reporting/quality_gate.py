@@ -44,11 +44,36 @@ def evaluate_report_quality(
     requires_financials: bool = False,
     requires_availability: bool = False,
     requires_customer: bool = False,
+    requires_expected_production: bool = False,
 ) -> QualityGateResult:
     rows = report_rows(payload)
     findings: list[QualityFinding] = []
     for row in rows:
         asset_id = int(row.get("asset_id") or 0) or None
+        expected_fields_present = requires_expected_production or any(
+            key in row
+            for key in (
+                "expected_production_kwh",
+                "expected_production_source",
+                "financial_model_id",
+            )
+        )
+        expected_missing = expected_fields_present and (
+            row.get("expected_production_kwh") is None
+            or row.get("expected_production_source") != "financial_model"
+        )
+        if expected_missing:
+            findings.append(
+                finding(
+                    "missing_financial_model_expected_production",
+                    BLOCKED if requires_expected_production else WARNING,
+                    scope,
+                    asset_id,
+                    "Não existe produção esperada de um modelo financeiro ativo para o mês.",
+                    "financial_model",
+                    "Ativar um modelo financeiro aplicável ao período e criar um novo snapshot.",
+                )
+            )
         mapping = str(row.get("mapping_status") or "")
         if mapping in {"mapping_pending", "mapping_conflict", "unmapped"} or (
             scope == "portfolio" and not asset_id
