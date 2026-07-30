@@ -819,6 +819,9 @@ def create_app() -> Flask:
             "asset_monitoring_statuses": ASSET_MONITORING_STATUSES,
             "renewal_statuses": RENEWAL_STATUSES,
             "integration_status_colors": INTEGRATION_STATUS_COLORS,
+            "installation_access_status_labels": (
+                INSTALLATION_ACCESS_STATUS_LABELS
+            ),
             "om_status_label": om_status_label,
             "format_date_pt": format_date_pt,
             "format_number": format_number,
@@ -7079,6 +7082,7 @@ def ensure_database(path: str) -> None:
         ensure_column(conn, "portfolio_report_rows", "covered_period TEXT")
         ensure_column(conn, "portfolio_report_rows", "quality_status TEXT")
         ensure_column(conn, "sigenergy_onboarding_requests", "installation_import_id INTEGER")
+        migrate_sigenergy_import_access_statuses(conn)
         ensure_api_call_state_schema(conn)
         ensure_api_queue_schema(conn)
         ensure_sampled_availability_schema(conn)
@@ -17583,10 +17587,78 @@ def build_sigenergy_monitoring_notes(row: dict[str, Any]) -> str:
 
 SIGENERGY_SYSTEM_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 SIGENERGY_ACTIVE_ONBOARDING_STATUSES = {"requested", "already_requested", "already_requested_or_onboarded"}
+SIGENERGY_NOT_RETURNED_MESSAGE = (
+    "A instalação não foi devolvida pela App Key configurada."
+)
+INSTALLATION_ACCESS_STATUS_LABELS = {
+    "not_returned": "Não devolvida pela App Key",
+    "pending_approval": "Pedido enviado — aguarda aprovação",
+    "available": "Acesso disponível",
+    "error": "Erro na verificação",
+}
 
 
 class SigenergyInstallationAccessPending(ValueError):
     pass
+
+
+def active_sigenergy_onboarding_for_import(
+    conn: sqlite3.Connection,
+    import_id: int,
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT request.*
+        FROM sigenergy_onboarding_requests request
+        JOIN installation_imports import_row ON import_row.id = ?
+        WHERE (
+                request.installation_import_id = import_row.id
+                OR request.id = import_row.onboarding_request_id
+              )
+          AND request.status IN (
+              'requested',
+              'already_requested',
+              'already_requested_or_onboarded'
+          )
+        ORDER BY request.id DESC
+        LIMIT 1
+        """,
+        (import_id,),
+    ).fetchone()
+
+
+def migrate_sigenergy_import_access_statuses(
+    conn: sqlite3.Connection,
+) -> int:
+    cursor = conn.execute(
+        """
+        UPDATE installation_imports
+        SET access_status = 'not_returned',
+            last_error = ?,
+            updated_at = ?
+        WHERE provider = 'Sigenergy'
+          AND status = 'access_pending'
+          AND access_status = 'pending_approval'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM sigenergy_onboarding_requests request
+              WHERE (
+                      request.installation_import_id = installation_imports.id
+                      OR request.id = installation_imports.onboarding_request_id
+                    )
+                AND request.status IN (
+                    'requested',
+                    'already_requested',
+                    'already_requested_or_onboarded'
+                )
+          )
+        """,
+        (
+            SIGENERGY_NOT_RETURNED_MESSAGE,
+            datetime.now().isoformat(timespec="seconds"),
+        ),
+    )
+    return int(cursor.rowcount or 0)
 
 
 def normalize_sigenergy_system_id_for_compare(system_id: str) -> str:
@@ -18130,12 +18202,38 @@ def run_installation_import_preview_job(
                 SET status = 'approved', last_checked_at = ?,
                     approved_at = COALESCE(approved_at, ?), updated_at = ?, last_error = ''
                 WHERE installation_import_id = ?
+                   OR id = (
+                       SELECT onboarding_request_id
+                       FROM installation_imports
+                       WHERE id = ?
+                   )
                 """,
-                (now, now, now, import_id),
+                (now, now, now, import_id, import_id),
             )
         conn.commit()
-        return {"import_id": import_id, "status": "preview"}
+        return {
+            "import_id": import_id,
+            "status": "preview",
+            "access_status": "available",
+        }
     except SigenergyInstallationAccessPending:
+        onboarding = active_sigenergy_onboarding_for_import(conn, import_id)
+        onboarding_request_id = (
+            int(onboarding["id"]) if onboarding is not None else None
+        )
+        access_status = (
+            "pending_approval"
+            if onboarding_request_id is not None
+            else "not_returned"
+        )
+        access_message = (
+            str(
+                onboarding["provider_message"]
+                or "O pedido de acesso está pendente de aprovação."
+            )
+            if onboarding is not None
+            else SIGENERGY_NOT_RETURNED_MESSAGE
+        )
         normalized = {
             "provider": provider,
             "source_label": f"{provider} API",
@@ -18152,18 +18250,37 @@ def run_installation_import_preview_job(
             mode=import_context["mode"],
             target_asset_id=import_context.get("target_asset_id"),
             status="access_pending",
-            access_status="pending_approval",
+            access_status=access_status,
             normalized=normalized,
             raw_payload={},
             created_by=str(import_context.get("created_by") or ""),
+        )
+        conn.execute(
+            """
+            UPDATE installation_imports
+            SET onboarding_request_id = ?, last_error = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                onboarding_request_id,
+                (
+                    access_message
+                    if onboarding_request_id is None
+                    else ""
+                ),
+                datetime.now().isoformat(timespec="seconds"),
+                import_id,
+            ),
         )
         conn.commit()
         return {
             "import_id": import_id,
             "status": "access_pending",
-            "onboarding_required": True,
-            "onboarding_request_id": None,
-            "onboarding_reused": False,
+            "access_status": access_status,
+            "message": access_message,
+            "onboarding_required": onboarding_request_id is None,
+            "onboarding_request_id": onboarding_request_id,
+            "onboarding_reused": onboarding_request_id is not None,
         }
     except ApiRateLimitError as exc:
         safe_error = sigenergy_service.sanitize_sigenergy_error(exc)
@@ -18367,6 +18484,19 @@ def get_installation_import_context(
     )
     result["background_job"] = (
         dict(background_job_row) if background_job_row is not None else None
+    )
+    result["access_status_label"] = INSTALLATION_ACCESS_STATUS_LABELS.get(
+        str(result.get("access_status") or ""),
+        str(result.get("access_status") or ""),
+    )
+    result["onboarding_required"] = (
+        result.get("status") == "access_pending"
+        and result.get("access_status") == "not_returned"
+    )
+    result["access_message"] = (
+        SIGENERGY_NOT_RETURNED_MESSAGE
+        if result.get("access_status") == "not_returned"
+        else str(result.get("last_error") or "")
     )
     return result
 

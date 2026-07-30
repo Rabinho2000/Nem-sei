@@ -130,11 +130,17 @@
   {% elif import_context.status in ["access_pending", "error"] %}
     <section class="card import-access-state">
       <span class="status-pill {{ 'warning' if import_context.status == 'access_pending' else 'error' }}">
-        {{ "Pedido enviado — aguarda aprovação" if import_context.status == "access_pending" else "Não foi possível pedir acesso" }}
+        {{ import_context.access_status_label }}
       </span>
       <h3>{{ import_context.provider }} · {{ import_context.external_id }}</h3>
-      <p class="muted">O pedido fica ligado a esta importação. Verificar novamente não envia pedidos duplicados.</p>
-      {% if import_context.last_error %}<p class="callout error">{{ import_context.last_error }}</p>{% endif %}
+      {% if import_context.access_status == "not_returned" %}
+        <p class="muted">A instalação não foi devolvida pela App Key configurada.</p>
+        <p class="muted">Se for necessário pedir acesso, o onboarding tem de ser iniciado explicitamente.</p>
+      {% elif import_context.access_status == "pending_approval" %}
+        <p class="muted">O pedido de onboarding está ligado a esta importação. Verificar novamente não envia pedidos duplicados.</p>
+      {% elif import_context.last_error %}
+        <p class="callout error">{{ import_context.last_error }}</p>
+      {% endif %}
       <form method="post" action="{{ url_for('check_installation_import_access', import_id=import_context.id) }}">
         <button class="button" type="submit">
           {{ "Verificar acesso" if import_context.status == "access_pending" else "Repetir recolha" }}
