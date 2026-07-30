@@ -95,27 +95,22 @@ class SigenergyPreviewReadOnlyPolicy:
                 "System ID Sigenergy recusado pela allowlist read-only da preview."
             )
 
-    def validate_discovered_systems(
+    def filter_discovered_systems(
         self,
         systems: list[dict[str, Any]],
-    ) -> None:
-        returned_ids = {
-            str(
+    ) -> list[dict[str, Any]]:
+        allowed: list[dict[str, Any]] = []
+        for row in systems:
+            returned_id = str(
                 row.get("systemId")
                 or row.get("id")
                 or row.get("stationId")
                 or row.get("plantId")
                 or ""
             ).strip()
-            for row in systems
-        }
-        returned_ids.discard("")
-        refused = returned_ids - {self.system_id}
-        if refused:
-            raise SigenergyApiError(
-                "A descoberta Sigenergy devolveu um System ID fora da "
-                "allowlist read-only da preview."
-            )
+            if returned_id == self.system_id:
+                allowed.append(row)
+        return allowed
 
     @staticmethod
     def _path(endpoint: str) -> str:
@@ -292,7 +287,7 @@ class SigenergyClient:
         )
         rows = rows_from_data(parse_sigenergy_response(payload))
         if self.read_only_policy is not None:
-            self.read_only_policy.validate_discovered_systems(rows)
+            rows = self.read_only_policy.filter_discovered_systems(rows)
         if not rows and not allow_empty:
             raise SigenergyApiError(
                 "A API Sigenergy respondeu com sucesso, mas sem sistemas. Confirma se a App Key tem sistemas autorizados.",

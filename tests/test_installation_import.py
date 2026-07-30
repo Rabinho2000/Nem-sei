@@ -9,6 +9,7 @@ from werkzeug.datastructures import MultiDict
 
 import app as app_module
 from monitoring_board.db import get_db
+from monitoring_board.services.sigenergy_errors import SigenergyApiError
 
 
 def authenticated_client(db_path):
@@ -751,7 +752,7 @@ def test_sigenergy_missing_system_with_real_onboarding_stays_pending_approval(
     ],
     ids=["empty-list", "requested-id-absent"],
 )
-def test_sigenergy_discovery_never_auto_requests_onboarding_when_access_is_pending(
+def test_sigenergy_missing_from_discovery_uses_direct_energy_flow_without_onboarding(
     tmp_path,
     monkeypatch,
     available_systems,
@@ -769,7 +770,12 @@ def test_sigenergy_discovery_never_auto_requests_onboarding_when_access_is_pendi
             return available_systems
 
         def get_energy_flow(self, _system_id: str):
-            raise AssertionError("Energy flow must not be requested without access")
+            assert _system_id == "TZXRS1780315946"
+            return {
+                "pvPower": 4.2,
+                "loadPower": 1.5,
+                "batterySoc": 73,
+            }
 
     monkeypatch.setattr(
         app_module.sigenergy_service,
@@ -788,29 +794,23 @@ def test_sigenergy_discovery_never_auto_requests_onboarding_when_access_is_pendi
         import_id = app_module.upsert_installation_import_preview(
             conn,
             provider="Sigenergy",
-            external_id="SIG-REQUESTED",
-            external_name="SIG-REQUESTED",
+            external_id="TZXRS1780315946",
+            external_name="Expertcom",
             mode="create",
             target_asset_id=None,
             status="queued",
             access_status="checking",
             normalized={
-                "external_id": "SIG-REQUESTED",
-                "external_name": "SIG-REQUESTED",
+                "external_id": "TZXRS1780315946",
+                "external_name": "Expertcom",
             },
             raw_payload={},
             created_by="test",
         )
         conn.commit()
 
-        first = app_module.run_installation_import_preview_job(
-            conn,
-            import_id,
-        )
-        second = app_module.run_installation_import_preview_job(
-            conn,
-            import_id,
-        )
+        first = app_module.run_installation_import_preview_job(conn, import_id)
+        second = app_module.run_installation_import_preview_job(conn, import_id)
         installation_import = conn.execute(
             "SELECT * FROM installation_imports WHERE id = ?",
             (import_id,),
@@ -818,13 +818,137 @@ def test_sigenergy_discovery_never_auto_requests_onboarding_when_access_is_pendi
         onboarding_count = conn.execute(
             "SELECT COUNT(*) FROM sigenergy_onboarding_requests"
         ).fetchone()[0]
+        inventory = conn.execute(
+            """
+            SELECT * FROM provider_system_inventory
+            WHERE provider = 'Sigenergy' AND external_id = 'TZXRS1780315946'
+            """
+        ).fetchone()
+        inventory_metadata = json.loads(inventory["metadata_json"])
+        validations = conn.execute(
+            """
+            SELECT * FROM sigenergy_access_validations
+            WHERE system_id = 'TZXRS1780315946'
+            ORDER BY id
+            """
+        ).fetchall()
+        asset_count = conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
 
-    assert first["status"] == second["status"] == "access_pending"
+    assert first["status"] == second["status"] == "preview"
+    assert first["validation_method"] == "direct_energy_flow"
     assert list_calls == [True, True]
-    assert installation_import["status"] == "access_pending"
-    assert installation_import["access_status"] == "not_returned"
+    assert installation_import["status"] == "preview"
+    assert installation_import["access_status"] == "available"
+    assert installation_import["validation_method"] == "direct_energy_flow"
+    assert installation_import["external_name"] == "Expertcom"
+    assert "validação direta energyFlow" in installation_import["source_label"]
     assert installation_import["onboarding_request_id"] is None
+    assert inventory["access_status"] == "accessible"
+    assert inventory["validation_method"] == "direct_energy_flow"
+    assert inventory["external_name"] == "Expertcom"
+    assert inventory_metadata["systemId"] == "TZXRS1780315946"
+    assert inventory_metadata["systemName"] == "Expertcom"
+    assert [row["outcome"] for row in validations] == [
+        "available",
+        "available",
+    ]
     assert onboarding_count == 0
+    assert asset_count == 0
+
+    flask_app, original_database, client = authenticated_client(db_path)
+    try:
+        response = client.get(f"/integrations/import?import_id={import_id}")
+    finally:
+        flask_app.config["DATABASE"] = original_database
+    html = response.get_data(as_text=True)
+    normalized_html = " ".join(html.split())
+    assert response.status_code == 200
+    assert "Expertcom" in html
+    assert "TZXRS1780315946" in html
+    assert "Acesso disponível" in html
+    assert "validado diretamente por energyFlow" in html
+    assert "não foi devolvida por /openapi/system" in normalized_html
+
+
+@pytest.mark.parametrize("status_code", [401, 403, 404])
+def test_sigenergy_direct_validation_failure_creates_no_asset_or_onboarding(
+    tmp_path,
+    monkeypatch,
+    status_code,
+) -> None:
+    db_path = tmp_path / f"sigenergy-direct-{status_code}.db"
+    app_module.ensure_database(str(db_path))
+
+    class FakeClient:
+        def __init__(self, _config, session=None) -> None:
+            self.session = session
+
+        def list_systems(self, *, allow_empty: bool = False):
+            assert allow_empty is True
+            return []
+
+        def get_energy_flow(self, _system_id: str):
+            raise SigenergyApiError(
+                f"Sigenergy HTTP {status_code} Bearer secret-token",
+                status_code=status_code,
+            )
+
+    monkeypatch.setattr(
+        app_module.sigenergy_service,
+        "SigenergyClient",
+        FakeClient,
+    )
+    monkeypatch.setattr(
+        app_module,
+        "create_sigenergy_onboarding_request",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Onboarding must never be requested automatically")
+        ),
+    )
+    with get_db(str(db_path)) as conn:
+        configure_provider(conn, "Sigenergy")
+        import_id = app_module.upsert_installation_import_preview(
+            conn,
+            provider="Sigenergy",
+            external_id="TZXRS1780315946",
+            external_name="Expertcom",
+            mode="create",
+            target_asset_id=None,
+            status="queued",
+            access_status="checking",
+            normalized={
+                "external_id": "TZXRS1780315946",
+                "external_name": "Expertcom",
+            },
+            raw_payload={},
+            created_by="test",
+        )
+        conn.commit()
+
+        with pytest.raises(SigenergyApiError):
+            app_module.run_installation_import_preview_job(conn, import_id)
+
+        installation_import = conn.execute(
+            "SELECT * FROM installation_imports WHERE id = ?",
+            (import_id,),
+        ).fetchone()
+        validation = conn.execute(
+            "SELECT * FROM sigenergy_access_validations"
+        ).fetchone()
+
+        assert installation_import["status"] == "error"
+        assert installation_import["access_status"] == "error"
+        assert "secret-token" not in installation_import["last_error"]
+        assert validation["outcome"] == "failed"
+        assert validation["status_code"] == status_code
+        assert "secret-token" not in validation["sanitized_error"]
+        assert conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM asset_integrations"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sigenergy_onboarding_requests"
+        ).fetchone()[0] == 0
 
 
 def test_sigenergy_not_returned_ui_never_claims_request_was_sent(

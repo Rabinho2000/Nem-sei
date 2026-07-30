@@ -154,6 +154,13 @@
           <p class="eyebrow">Pré-visualização</p>
           <h3>{{ data.external_name or data.external_id }}</h3>
           <p class="muted">{{ import_context.source_label }} · recolhido em {{ data.fetched_at or import_context.fetched_at }}</p>
+          <p class="muted">Acesso: {{ import_context.access_status_label }}</p>
+          {% if import_context.validation_method == "direct_energy_flow" %}
+            <p class="callout">
+              Acesso validado diretamente por energyFlow. Esta instalação não
+              foi devolvida por /openapi/system.
+            </p>
+          {% endif %}
         </div>
         <span class="status-pill">{{ data.operational_status or "Sem dados" }}</span>
       </div>

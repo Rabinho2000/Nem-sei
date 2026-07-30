@@ -12,6 +12,9 @@
         <div>
           <strong>{{ row.provider }} · {{ row.external_name or row.external_id }}</strong>
           <span>{{ row.external_id }} · {{ row.project_name or "Sem asset associado" }}</span>
+          {% if row.validation_method == "direct_energy_flow" %}
+            <small class="muted">Acesso validado diretamente por energyFlow; não devolvida por /openapi/system.</small>
+          {% endif %}
         </div>
         <div>
           <span class="status-pill">{{ installation_access_status_labels.get(row.access_status, row.access_status) }}</span>

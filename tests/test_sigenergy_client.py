@@ -169,7 +169,7 @@ def test_preview_policy_refuses_different_base_url() -> None:
         preview_client(QueueSession({}), base_url="https://example.invalid")
 
 
-def test_preview_policy_refuses_discovered_system_outside_allowlist() -> None:
+def test_preview_policy_filters_discovered_systems_outside_allowlist() -> None:
     login_url = f"{EXPERTCOM_SIGENERGY_BASE_URL}/openapi/auth/login/key"
     systems_url = f"{EXPERTCOM_SIGENERGY_BASE_URL}/openapi/system"
     session = QueueSession(
@@ -193,8 +193,41 @@ def test_preview_policy_refuses_discovered_system_outside_allowlist() -> None:
         }
     )
 
-    with pytest.raises(SigenergyApiError, match="System ID"):
-        preview_client(session).list_systems()
+    assert preview_client(session).list_systems(allow_empty=True) == []
+
+
+def test_preview_policy_keeps_only_expertcom_from_mixed_discovery() -> None:
+    login_url = f"{EXPERTCOM_SIGENERGY_BASE_URL}/openapi/auth/login/key"
+    systems_url = f"{EXPERTCOM_SIGENERGY_BASE_URL}/openapi/system"
+    expertcom = {
+        "systemId": EXPERTCOM_SIGENERGY_SYSTEM_ID,
+        "systemName": "Expertcom",
+    }
+    session = QueueSession(
+        {
+            login_url: [FakeResponse(load_fixture("auth_success_object.json"))],
+            systems_url: [
+                FakeResponse(
+                    {
+                        "code": 0,
+                        "data": {
+                            "list": [
+                                {
+                                    "systemId": "OTHER-SYSTEM",
+                                    "systemName": "Ignored",
+                                },
+                                expertcom,
+                            ]
+                        },
+                    }
+                )
+            ],
+        }
+    )
+
+    assert preview_client(session).list_systems(allow_empty=True) == [
+        expertcom
+    ]
 
 
 def test_login_extracts_token_and_sends_region_header() -> None:

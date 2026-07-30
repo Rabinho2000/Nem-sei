@@ -156,29 +156,42 @@ def discover(
     conn: sqlite3.Connection,
     client: SigenergyClient,
 ) -> dict[str, Any]:
-    systems = client.list_systems()
+    systems = client.list_systems(allow_empty=True)
     selected = [
         system
         for system in systems
         if normalize_system(system)["external_id"]
         == EXPERTCOM_SIGENERGY_SYSTEM_ID
     ]
-    if len(selected) != 1:
-        raise ValueError("A descoberta nao devolveu exatamente a Expertcom.")
-    system = selected[0]
+    if len(selected) > 1:
+        raise ValueError("A descoberta devolveu a Expertcom mais de uma vez.")
+    validation_method = "discovery"
+    discovery_returned = bool(selected)
+    if selected:
+        system = selected[0]
+    else:
+        client.get_energy_flow(EXPERTCOM_SIGENERGY_SYSTEM_ID)
+        system = {
+            "systemId": EXPERTCOM_SIGENERGY_SYSTEM_ID,
+            "systemName": EXPERTCOM_NAME,
+            "validation_method": "direct_energy_flow",
+            "discovery_returned": False,
+        }
+        validation_method = "direct_energy_flow"
     normalized = normalize_system(system)
     now = datetime.now(LISBON).replace(tzinfo=None).isoformat(timespec="seconds")
     conn.execute(
         """
         INSERT INTO provider_system_inventory (
             provider, external_id, external_name, metadata_json,
-            access_status, first_discovered_at, last_discovered_at,
+            access_status, validation_method, first_discovered_at, last_discovered_at,
             last_state, data_quality, last_error, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, 'accessible', ?, ?, ?, 'missing', '', ?, ?)
+        ) VALUES (?, ?, ?, ?, 'accessible', ?, ?, ?, ?, 'missing', '', ?, ?)
         ON CONFLICT(provider, external_id) DO UPDATE SET
             external_name = excluded.external_name,
             metadata_json = excluded.metadata_json,
             access_status = 'accessible',
+            validation_method = excluded.validation_method,
             last_discovered_at = excluded.last_discovered_at,
             last_state = excluded.last_state,
             last_error = '',
@@ -189,6 +202,7 @@ def discover(
             EXPERTCOM_SIGENERGY_SYSTEM_ID,
             normalized["external_name"],
             json.dumps(sanitize_payload(system), ensure_ascii=True),
+            validation_method,
             now,
             now,
             normalized["normalized_status"],
@@ -196,11 +210,34 @@ def discover(
             now,
         ),
     )
+    if validation_method == "direct_energy_flow":
+        conn.execute(
+            """
+            INSERT INTO sigenergy_access_validations (
+                system_id, validation_method, discovery_returned, outcome,
+                status_code, sanitized_error, details_json, created_at
+            ) VALUES (?, 'direct_energy_flow', 0, 'available', NULL, '', ?, ?)
+            """,
+            (
+                EXPERTCOM_SIGENERGY_SYSTEM_ID,
+                json.dumps(
+                    {
+                        "source": "preview_read_only_worker",
+                        "discovery_returned": False,
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                ),
+                now,
+            ),
+        )
     conn.commit()
     return {
         "name": normalized["external_name"],
         "system_id": EXPERTCOM_SIGENERGY_SYSTEM_ID,
         "status": "discovered",
+        "validation_method": validation_method,
+        "discovery_returned": discovery_returned,
         "assets_created": 0,
     }
 
@@ -431,19 +468,22 @@ def backfill(
 
 
 def check(client: SigenergyClient) -> dict[str, Any]:
-    systems = client.list_systems()
-    if not any(
+    systems = client.list_systems(allow_empty=True)
+    discovery_returned = any(
         normalize_system(system)["external_id"]
         == EXPERTCOM_SIGENERGY_SYSTEM_ID
         for system in systems
-    ):
-        raise ValueError("A Expertcom nao foi devolvida pela descoberta.")
+    )
     client.get_energy_flow(EXPERTCOM_SIGENERGY_SYSTEM_ID)
     return {
         "name": EXPERTCOM_NAME,
         "system_id": EXPERTCOM_SIGENERGY_SYSTEM_ID,
         "base_url": EXPERTCOM_SIGENERGY_BASE_URL,
         "status": "read_only_access_ok",
+        "validation_method": (
+            "discovery" if discovery_returned else "direct_energy_flow"
+        ),
+        "discovery_returned": discovery_returned,
     }
 
 
