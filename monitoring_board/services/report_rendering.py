@@ -18,10 +18,17 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-from monitoring_board.runtime import resolve_runtime_file_path
+from monitoring_board.customer_reports import CustomerReportVisualStyle, build_customer_report_pdf
+from monitoring_board.runtime import BASE_DIR, resolve_runtime_file_path
 from monitoring_board.reporting.financial_quality import PRODUCTION_FINANCIALS_NOT_FINAL_WARNING
 from monitoring_board.reporting.portfolio import METRIC_CATALOG, PortfolioReportResult
-from monitoring_board.reporting.templates import ReportTemplate, enabled_sections_in_order
+from monitoring_board.reporting.templates import (
+    RENDERER_GENERIC_INDIVIDUAL,
+    RENDERER_GENERIC_PORTFOLIO,
+    RENDERER_SOLCOR_INDIVIDUAL,
+    ReportTemplate,
+    enabled_sections_in_order,
+)
 from monitoring_board.services.portfolio_reporting import export_portfolio_result_workbook, format_cell
 
 
@@ -130,12 +137,42 @@ def render_portfolio_html_section(result: PortfolioReportResult, key: str, title
     return ""
 
 
+def template_pdf_styles(template: ReportTemplate):
+    styles = getSampleStyleSheet()
+    primary = colors.HexColor(template.branding.primary_color)
+    secondary = colors.HexColor(template.branding.secondary_color)
+    styles["Title"].textColor = primary
+    styles["Heading2"].textColor = secondary
+    styles["Normal"].textColor = primary
+    return styles
+
+
+def template_table(data: list[list[Any]], template: ReportTemplate, *, font_size: int = 8, **kwargs) -> Table:
+    table = Table(data, **kwargs)
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(template.branding.primary_color)),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("LINEBELOW", (0, 0), (-1, 0), 1.2, colors.HexColor(template.branding.secondary_color)),
+                ("TEXTCOLOR", (0, 1), (0, -1), colors.HexColor(template.branding.primary_color)),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
+                ("FONTSIZE", (0, 0), (-1, -1), font_size),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ]
+        )
+    )
+    return table
+
+
 def render_portfolio_pdf(result: PortfolioReportResult, template: ReportTemplate) -> RenderedFile:
+    if template.renderer != RENDERER_GENERIC_PORTFOLIO:
+        raise ValueError("unsupported_portfolio_renderer")
     buffer = io.BytesIO()
     pagesize = landscape(A4) if template.orientation == "landscape" else A4
     top, right, bottom, left = template.margins_mm
     doc = SimpleDocTemplate(buffer, pagesize=pagesize, leftMargin=left * mm, rightMargin=right * mm, topMargin=top * mm, bottomMargin=bottom * mm)
-    styles = getSampleStyleSheet()
+    styles = template_pdf_styles(template)
     story: list[Any] = [
         Paragraph(expand_pattern(template.title, result=result) or f"{result.portfolio_name} - {result.period.label}", styles["Title"]),
         Paragraph(template.subtitle or template.branding.company_name, styles["Normal"]),
@@ -165,11 +202,11 @@ def render_portfolio_pdf(result: PortfolioReportResult, template: ReportTemplate
 def append_portfolio_pdf_section(story: list[Any], styles: Any, result: PortfolioReportResult, template: ReportTemplate, key: str, title: str) -> None:
     if key in {"cover", "executive_summary", "kpis"}:
         story.append(Paragraph(title, styles["Heading2"]))
-        story.append(Table([["Metrica", "Valor"], *[[METRIC_CATALOG[item].label if item in METRIC_CATALOG else item, str(format_cell(value))] for item, value in result.summary.values.items()]], hAlign="LEFT", repeatRows=1))
+        story.append(template_table([["Metrica", "Valor"], *[[METRIC_CATALOG[item].label if item in METRIC_CATALOG else item, str(format_cell(value))] for item, value in result.summary.values.items()]], template, hAlign="LEFT", repeatRows=1))
         story.append(Spacer(1, 10))
     elif key == "comparison" and result.comparison:
         story.append(Paragraph(title, styles["Heading2"]))
-        story.append(Table([["Metrica", "Atual", "Anterior", "Diferenca"], *[[METRIC_CATALOG[item].label if item in METRIC_CATALOG else item, str(values.get("current")), str(values.get("previous")), str(values.get("delta"))] for item, values in result.comparison.values.items()]], hAlign="LEFT", repeatRows=1))
+        story.append(template_table([["Metrica", "Atual", "Anterior", "Diferenca"], *[[METRIC_CATALOG[item].label if item in METRIC_CATALOG else item, str(values.get("current")), str(values.get("previous")), str(values.get("delta"))] for item, values in result.comparison.values.items()]], template, hAlign="LEFT", repeatRows=1))
         story.append(Spacer(1, 10))
     elif key == "installations_table":
         first_column = result.columns[:1]
@@ -180,8 +217,7 @@ def append_portfolio_pdf_section(story: list[Any], styles: Any, result: Portfoli
             table_rows = [[column.label for column in columns]]
             for row in result.rows:
                 table_rows.append([clip(str(format_cell(row.values.get(column.metric_key)) or "-")) for column in columns])
-            table = Table(table_rows, repeatRows=1, hAlign="LEFT")
-            table.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(template.branding.primary_color)), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("GRID", (0, 0), (-1, -1), 0.25, colors.lightgrey), ("FONTSIZE", (0, 0), (-1, -1), 7)]))
+            table = template_table(table_rows, template, font_size=7, repeatRows=1, hAlign="LEFT")
             story.append(Paragraph(f"{title} {chunk_index}/{len(chunks)}", styles["Heading2"]))
             story.append(table)
             story.append(Spacer(1, 8))
@@ -193,10 +229,60 @@ def append_portfolio_pdf_section(story: list[Any], styles: Any, result: Portfoli
 
 
 def render_individual_pdf(report: dict[str, Any], template: ReportTemplate) -> RenderedFile:
+    if template.renderer == RENDERER_SOLCOR_INDIVIDUAL:
+        if template.branding.logo_path:
+            logo_path = resolve_runtime_file_path(template.branding.logo_path)
+        elif template.branding.company_name.strip().casefold() in {
+            "",
+            "solcor",
+            "solcoraction",
+        }:
+            logo_path = BASE_DIR / "static" / "solcor-logo.png"
+        else:
+            logo_path = None
+        prepared_report = dict(report)
+        report_model = str(report.get("report_type") or "epc").lower()
+        prepared_report["report_type"] = report_model if report_model in {"epc", "esco"} else "epc"
+        for key in (
+            "production_kwh",
+            "self_use_kwh",
+            "export_kwh",
+            "consumption_kwh",
+            "total_benefit_eur",
+            "savings_eur",
+            "export_revenue_eur",
+            "solcor_payment_eur",
+            "net_benefit_eur",
+            "autoconsumption_pct",
+            "self_sufficiency_pct",
+        ):
+            prepared_report.setdefault(key, None)
+        prepared_report.setdefault("tariff_rows", [])
+        asset = report.get("asset") or {}
+        return checked_file(
+            RenderedFile(
+                filename=safe_filename(expand_individual_pattern(template.filename_pattern or "{asset}_{period}", report), extension="pdf"),
+                content=build_customer_report_pdf(
+                    prepared_report,
+                    logo_path=logo_path if logo_path and logo_path.is_file() else None,
+                    visual_style=individual_solcor_visual_style(template, prepared_report),
+                ),
+                mimetype="application/pdf",
+                fmt="pdf",
+                asset_id=int(asset.get("id") or asset.get("asset_id") or report.get("asset_id") or 0) or None,
+                period_type=str(report.get("period_type") or "monthly"),
+                period_start=str(report.get("period_start") or report.get("month_start") or ""),
+                period_end=str(report.get("period_end") or report.get("month_end") or ""),
+                warnings=tuple(report.get("warnings") or report.get("billing_warnings") or ()),
+            )
+        )
+    if template.renderer != RENDERER_GENERIC_INDIVIDUAL:
+        raise ValueError("unsupported_individual_renderer")
     buffer = io.BytesIO()
     top, right, bottom, left = template.margins_mm
-    doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=left * mm, rightMargin=right * mm, topMargin=top * mm, bottomMargin=bottom * mm)
-    styles = getSampleStyleSheet()
+    pagesize = landscape(A4) if template.orientation == "landscape" else A4
+    doc = SimpleDocTemplate(buffer, pagesize=pagesize, leftMargin=left * mm, rightMargin=right * mm, topMargin=top * mm, bottomMargin=bottom * mm)
+    styles = template_pdf_styles(template)
     asset = report.get("asset") or {}
     title = expand_individual_pattern(template.title or "{asset} - {period}", report)
     story: list[Any] = [Paragraph(title, styles["Title"]), Paragraph(template.subtitle, styles["Normal"]), Spacer(1, 12)]
@@ -206,7 +292,7 @@ def render_individual_pdf(report: dict[str, Any], template: ReportTemplate) -> R
         if not rows:
             continue
         story.append(Paragraph(section.title, styles["Heading2"]))
-        story.append(Table(rows, hAlign="LEFT", repeatRows=1))
+        story.append(template_table(rows, template, hAlign="LEFT", repeatRows=1))
         story.append(Spacer(1, 8))
     doc.build(story, onFirstPage=page_footer(template), onLaterPages=page_footer(template))
     return checked_file(
@@ -221,6 +307,56 @@ def render_individual_pdf(report: dict[str, Any], template: ReportTemplate) -> R
             period_end=str(report.get("period_end") or report.get("month_end") or ""),
             warnings=tuple(report.get("warnings") or report.get("billing_warnings") or ()),
         )
+    )
+
+
+def individual_solcor_visual_style(
+    template: ReportTemplate,
+    report: dict[str, Any],
+) -> CustomerReportVisualStyle:
+    asset = report.get("asset") or {}
+    asset_name = str(asset.get("project_name") or asset.get("name") or "Instalacao")
+    period = str(report.get("period_label") or report.get("report_month") or "")
+    months_count = int(report.get("months_count") or 1)
+    historical_subtitle = (
+        "Relatório Mensal - Energia Solar"
+        if months_count == 1
+        else f"Relatório {period} - Energia Solar"
+    )
+    is_legacy_seed_copy = (
+        template.title == "{asset} - {period}"
+        and template.subtitle == "Relatorio de performance"
+    )
+    title = (
+        asset_name
+        if is_legacy_seed_copy
+        else expand_individual_text(template.title, report) or asset_name
+    )
+    subtitle = (
+        historical_subtitle
+        if is_legacy_seed_copy
+        else expand_individual_text(template.subtitle, report) or historical_subtitle
+    )
+    return CustomerReportVisualStyle(
+        title=title,
+        subtitle=subtitle,
+        company_name=template.branding.company_name,
+        primary_color=template.branding.primary_color,
+        secondary_color=template.branding.secondary_color,
+        footer=template.branding.footer,
+        contacts=template.branding.contacts,
+        disclaimer=template.branding.disclaimer,
+        enabled_sections=frozenset(
+            section.key for section in enabled_sections_in_order(template)
+        ),
+    )
+
+
+def expand_individual_text(pattern: str, report: dict[str, Any]) -> str:
+    asset = report.get("asset") or {}
+    return (pattern or "").format(
+        asset=asset.get("project_name") or asset.get("name") or "Instalacao",
+        period=report.get("period_label") or report.get("report_month") or "",
     )
 
 
@@ -467,6 +603,9 @@ def page_footer(template: ReportTemplate):
     def draw(canvas, doc):
         canvas.saveState()
         canvas.setFont("Helvetica", 8)
+        canvas.setFillColor(colors.HexColor(template.branding.primary_color))
+        canvas.setStrokeColor(colors.HexColor(template.branding.secondary_color))
+        canvas.line(doc.leftMargin, 20, doc.pagesize[0] - doc.rightMargin, 20)
         footer = " - ".join(item for item in (template.branding.footer, template.branding.contacts, template.branding.disclaimer) if item)
         canvas.drawString(doc.leftMargin, 12, clip(footer, 160))
         canvas.drawRightString(doc.pagesize[0] - doc.rightMargin, 12, f"Pag. {doc.page}")

@@ -192,6 +192,15 @@ from monitoring_board.reporting.data_quality import (
     evaluate_monthly_production_quality,
     production_quality_notice,
 )
+from monitoring_board.reporting.energy_sources import (
+    resolve_asset_energy_source,
+    set_asset_primary_energy_source,
+)
+from monitoring_board.services.energy_facts import (
+    parse_sigenergy_daily_history,
+    persist_sigenergy_daily_history,
+    sigenergy_energy_readiness,
+)
 from monitoring_board.reporting.invoices import normalize_date, is_supported_invoice_extension, validate_invoice_values, warnings_require_override
 from monitoring_board.reporting.availability import (
     apply_inverter_edge_tolerance as reporting_apply_inverter_edge_tolerance,
@@ -289,7 +298,6 @@ from monitoring_board.services.fusionsolar_models import (
     parse_collect_date as parse_client_collect_date,
 )
 from monitoring_board.services import sigenergy as sigenergy_service
-from monitoring_board.services.api_client_base import retry_api_call
 from monitoring_board.services.api_rate_limit import (
     ApiRateLimitError,
     active_cooldown_until,
@@ -438,6 +446,9 @@ INTEGRATION_PROVIDER_OPTIONS = [INTEGRATION_PROVIDER_FUSIONSOLAR, INTEGRATION_PR
 API_AREA_STATE = "state"
 API_AREA_PRODUCTION = "production"
 API_AREA_DIAGNOSTICS = "diagnostics"
+API_AREA_DISCOVERY = "discovery"
+API_AREA_TELEMETRY = "telemetry"
+API_AREA_ALARMS = "alarms"
 BACKGROUND_JOB_TYPES_PERFORMANCE = (
     "installation_import_list",
     "installation_import_preview",
@@ -451,6 +462,7 @@ BACKGROUND_JOB_TYPES_PERFORMANCE = (
     "fusionsolar_report_wat_request",
     "fusionsolar_realtime_materialize_cleanup",
     "sigenergy_state_sync",
+    "sigenergy_energy_sync",
     "performance_reference_recalculation",
 )
 FUSIONSOLAR_PRODUCTION_JOB_TYPES = (
@@ -469,6 +481,10 @@ FUSIONSOLAR_BACKGROUND_JOB_TYPES = (
     *FUSIONSOLAR_PRODUCTION_JOB_TYPES,
     *FUSIONSOLAR_WAT_JOB_TYPES,
     "fusionsolar_realtime_materialize_cleanup",
+)
+SIGENERGY_BACKGROUND_JOB_TYPES = (
+    "sigenergy_state_sync",
+    "sigenergy_energy_sync",
 )
 BACKGROUND_JOB_STALE_RUNNING_MINUTES = 30
 DEFAULT_FUSIONSOLAR_SYNC_HOURS = "08:00,14:00"
@@ -489,6 +505,7 @@ DEFAULT_SIGENERGY_BASE_URL = "https://api-eu.sigencloud.com"
 DEFAULT_SIGENERGY_AUTH_ENDPOINT = "/openapi/auth/login/key"
 DEFAULT_SIGENERGY_SYSTEMS_ENDPOINT = "/openapi/system"
 DEFAULT_SIGENERGY_ENERGY_FLOW_ENDPOINT = "/openapi/systems/{system_id}/energyFlow"
+DEFAULT_SIGENERGY_HISTORY_ENDPOINT = "/openapi/systems/{system_id}/history"
 DEFAULT_SIGENERGY_ONBOARD_ENDPOINT = "/openapi/board/onboard"
 DEFAULT_SIGENERGY_REGION = "eu"
 DEFAULT_SIGENERGY_SYNC_HOURS = "08:00,14:00"
@@ -5181,7 +5198,16 @@ def create_app() -> Flask:
                     if item_config is None or not item_config["enabled"]:
                         continue
                     try:
-                        result = run_provider_check(g.db, item_provider, dry_run=True)
+                        result = (
+                            run_sigenergy_check(
+                                g.db,
+                                item_provider,
+                                dry_run=True,
+                                include_energy_flow=False,
+                            )
+                            if item_provider == INTEGRATION_PROVIDER_SIGENERGY
+                            else run_provider_check(g.db, item_provider, dry_run=True)
+                        )
                         messages.append(
                             f"{item_provider}: {result['station_count']} centrais, {result['realtime_count']} respostas realtime"
                         )
@@ -5223,9 +5249,9 @@ def create_app() -> Flask:
                     UPDATE integration_configs
                     SET username = ?,
                         password = CASE WHEN ? = 0 AND ? != '' THEN ? ELSE password END,
-                        base_url = ?, login_endpoint = ?, plants_endpoint = ?,
-                        energy_flow_endpoint = ?, onboard_endpoint = ?, enabled = ?, auto_sync_enabled = ?,
-                        state_sync_interval_hours = ?, sync_hours = ?, region = ?, system_ids = ?, snapshot_retention_days = ?, updated_at = ?
+                        enabled = ?, auto_sync_enabled = ?,
+                        state_sync_interval_hours = ?, sync_hours = ?, region = ?,
+                        snapshot_retention_days = ?, updated_at = ?
                     WHERE provider = ?
                     """,
                     (
@@ -5233,17 +5259,11 @@ def create_app() -> Flask:
                         1 if env_secret_configured else 0,
                         submitted_secret,
                         submitted_secret,
-                        request.form.get("base_url", DEFAULT_SIGENERGY_BASE_URL).strip(),
-                        request.form.get("login_endpoint", DEFAULT_SIGENERGY_AUTH_ENDPOINT).strip(),
-                        request.form.get("plants_endpoint", DEFAULT_SIGENERGY_SYSTEMS_ENDPOINT).strip(),
-                        request.form.get("energy_flow_endpoint", DEFAULT_SIGENERGY_ENERGY_FLOW_ENDPOINT).strip(),
-                        request.form.get("onboard_endpoint", DEFAULT_SIGENERGY_ONBOARD_ENDPOINT).strip(),
                         enabled,
                         auto_sync_enabled,
                         state_sync_interval_hours,
                         f"{state_sync_interval_hours}:00",
                         request.form.get("region", DEFAULT_SIGENERGY_REGION).strip() or DEFAULT_SIGENERGY_REGION,
-                        request.form.get("system_ids", "").strip(),
                         parse_int_value(request.form.get("snapshot_retention_days", str(DEFAULT_SIGENERGY_SNAPSHOT_RETENTION_DAYS))) or DEFAULT_SIGENERGY_SNAPSHOT_RETENTION_DAYS,
                         datetime.now().isoformat(timespec="seconds"),
                         sig_provider,
@@ -5256,10 +5276,15 @@ def create_app() -> Flask:
 
             if action == "test_sigenergy_connection":
                 try:
-                    result = run_sigenergy_check(g.db, INTEGRATION_PROVIDER_SIGENERGY, dry_run=True)
+                    result = run_sigenergy_check(
+                        g.db,
+                        INTEGRATION_PROVIDER_SIGENERGY,
+                        dry_run=True,
+                        include_energy_flow=False,
+                    )
                     flash(
-                        f"Ligacao Sigenergy validada: {result['station_count']} instalacoes, {result['realtime_count']} energy flow, {result['failed_realtime_count']} falhas.",
-                        "success" if not result["failed_realtime_count"] else "warning",
+                        f"Ligacao Sigenergy validada: autenticacao concluida e {result['station_count']} instalacoes autorizadas encontradas.",
+                        "success",
                     )
                 except Exception as exc:
                     flash(f"Falha no teste de ligacao Sigenergy: {exc}", "error")
@@ -5267,6 +5292,10 @@ def create_app() -> Flask:
 
             if action == "onboard_sigenergy_system":
                 try:
+                    if request.form.get("confirm_remote_access") != "1":
+                        raise ValueError(
+                            "Confirma que pretendes enviar um pedido remoto de acesso."
+                        )
                     config = get_integration_config(g.db, INTEGRATION_PROVIDER_SIGENERGY)
                     if config is None:
                         raise ValueError("Configuracao Sigenergy nao encontrada.")
@@ -5287,12 +5316,90 @@ def create_app() -> Flask:
 
             if action == "refresh_sigenergy_onboarding":
                 try:
-                    result = run_sigenergy_check(g.db, INTEGRATION_PROVIDER_SIGENERGY, dry_run=True)
-                    approved = reconcile_sigenergy_onboarding_requests(g.db, result.get("available_system_ids", []))
+                    result = run_sigenergy_discovery(
+                        g.db,
+                        INTEGRATION_PROVIDER_SIGENERGY,
+                        persist=True,
+                    )
+                    approved = reconcile_sigenergy_onboarding_requests(
+                        g.db,
+                        result.get("available_system_ids", []),
+                    )
                     g.db.commit()
                     flash(f"Pedidos Sigenergy atualizados. {approved} aprovados encontrados.", "success")
                 except Exception as exc:
                     flash(f"Falha ao atualizar pedidos Sigenergy: {sigenergy_service.sanitize_sigenergy_error(exc)}", "error")
+                return redirect(url_for("integrations") + "#integrations-sigenergy")
+
+            if action == "refresh_sigenergy_systems":
+                try:
+                    result = run_sigenergy_discovery(
+                        g.db,
+                        INTEGRATION_PROVIDER_SIGENERGY,
+                        persist=True,
+                    )
+                    g.db.commit()
+                    flash(
+                        f"Descoberta Sigenergy atualizada: {result['station_count']} instalacoes autorizadas.",
+                        "success",
+                    )
+                except Exception as exc:
+                    flash(
+                        "Falha ao atualizar instalacoes Sigenergy: "
+                        + sigenergy_service.sanitize_sigenergy_error(exc),
+                        "error",
+                    )
+                return redirect(url_for("integrations") + "#integrations-sigenergy")
+
+            if action == "sync_sigenergy_energy":
+                try:
+                    date_from = parse_date_value(
+                        request.form.get("date_from", "")
+                    )
+                    date_to = parse_date_value(request.form.get("date_to", ""))
+                    if date_from is None or date_to is None:
+                        raise ValueError("Indica um intervalo energetico valido.")
+                    jobs = enqueue_sigenergy_energy_backfill(
+                        g.db,
+                        external_id=request.form.get("external_id", ""),
+                        date_from=date_from,
+                        date_to=date_to,
+                    )
+                    g.db.commit()
+                    for job_id, _created in jobs:
+                        schedule_background_job(app, job_id)
+                    created_count = sum(1 for _job_id, created in jobs if created)
+                    flash(
+                        f"Backfill Sigenergy preparado: {created_count} dias novos, "
+                        f"{len(jobs) - created_count} ja estavam em fila.",
+                        "success",
+                    )
+                except Exception as exc:
+                    flash(
+                        "Nao foi possivel preparar o historico Sigenergy: "
+                        + sigenergy_service.sanitize_sigenergy_error(exc),
+                        "error",
+                    )
+                return redirect(url_for("integrations") + "#integrations-sigenergy")
+
+            if action == "set_primary_energy_source":
+                try:
+                    asset_id = int(request.form.get("asset_id") or 0)
+                    source_provider = request.form.get("provider", "").strip()
+                    if source_provider not in INTEGRATION_PROVIDER_OPTIONS:
+                        raise ValueError("Fornecedor de energia invalido.")
+                    set_asset_primary_energy_source(
+                        g.db,
+                        asset_id=asset_id,
+                        provider=source_provider,
+                        confirmed=(
+                            request.form.get("confirm_source_switch") == "1"
+                        ),
+                    )
+                    g.db.commit()
+                    flash("Fonte primaria de energia atualizada.", "success")
+                except Exception as exc:
+                    flash(f"Nao foi possivel definir a fonte primaria: {exc}", "error")
                 return redirect(url_for("integrations") + "#integrations-sigenergy")
 
             if action == "sync_sigenergy_now":
@@ -5627,25 +5734,72 @@ def create_app() -> Flask:
         sigenergy_system_rows = query_all(
             g.db,
             """
+            WITH latest_snapshot AS (
+                SELECT *
+                FROM (
+                    SELECT
+                        s.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY s.provider, s.external_id
+                            ORDER BY s.collected_at DESC, s.id DESC
+                        ) AS rn
+                    FROM integration_realtime_snapshots s
+                    WHERE s.provider = ?
+                )
+                WHERE rn = 1
+            )
             SELECT
-                s.*,
+                inventory.*,
+                snapshot.collected_at,
+                snapshot.normalized_status,
+                snapshot.pv_power_kw,
+                snapshot.load_power_kw,
+                snapshot.battery_soc_pct,
                 ai.asset_id,
+                ai.is_primary_energy_source,
                 a.project_name,
                 ai.external_name AS mapped_external_name,
-                ai.last_error
-            FROM (
-                SELECT *,
-                       ROW_NUMBER() OVER (PARTITION BY provider, external_id ORDER BY collected_at DESC, id DESC) AS rn
-                FROM integration_realtime_snapshots
-                WHERE provider = ?
-            ) s
+                COALESCE(NULLIF(inventory.last_error, ''), ai.last_error, '') AS display_error
+            FROM provider_system_inventory inventory
+            LEFT JOIN latest_snapshot snapshot
+              ON snapshot.provider = inventory.provider
+             AND snapshot.external_id = inventory.external_id
             LEFT JOIN asset_integrations ai
-              ON ai.provider = s.provider AND ai.external_id = s.external_id AND ai.enabled = 1
+              ON ai.provider = inventory.provider
+             AND ai.external_id = inventory.external_id
+             AND ai.enabled = 1
             LEFT JOIN assets a ON a.id = ai.asset_id
-            WHERE s.rn = 1
-            ORDER BY COALESCE(a.project_name, ai.external_name, s.external_id) COLLATE NOCASE
+            WHERE inventory.provider = ?
+            ORDER BY COALESCE(a.project_name, inventory.external_name, inventory.external_id) COLLATE NOCASE
             """,
-            (INTEGRATION_PROVIDER_SIGENERGY,),
+            (
+                INTEGRATION_PROVIDER_SIGENERGY,
+                INTEGRATION_PROVIDER_SIGENERGY,
+            ),
+        )
+        sigenergy_system_rows = [
+            {
+                **dict(row),
+                **sigenergy_energy_readiness(
+                    g.db,
+                    external_id=str(row["external_id"]),
+                    asset_id=(
+                        int(row["asset_id"])
+                        if row["asset_id"] is not None
+                        else None
+                    ),
+                ),
+            }
+            for row in sigenergy_system_rows
+        ]
+        sigenergy_default_history_date = (
+            current_lisbon_date() - timedelta(days=1)
+        ).isoformat()
+        sigenergy_history_unit_confirmed = (
+            os.environ.get("SIGENERGY_HISTORY_ENERGY_UNIT", "")
+            .strip()
+            .lower()
+            == "kwh"
         )
         sigenergy_onboarding_rows = query_all(
             g.db,
@@ -5682,6 +5836,24 @@ def create_app() -> Flask:
             """,
             (INTEGRATION_PROVIDER_SIGENERGY,),
         ).fetchone()
+        sigenergy_summary = {
+            "accessible": sum(
+                1
+                for row in sigenergy_system_rows
+                if row["access_status"] == "accessible"
+            ),
+            "mapped": sum(1 for row in sigenergy_system_rows if row["asset_id"]),
+            "unmapped": sum(
+                1
+                for row in sigenergy_system_rows
+                if row["access_status"] == "accessible" and not row["asset_id"]
+            ),
+            "unauthorized": sum(
+                1
+                for row in sigenergy_system_rows
+                if row["access_status"] == "unauthorized"
+            ),
+        }
         link_audit_rows = get_fusionsolar_link_audit_rows(g.db, provider)
         link_audit_counts = {
             "ok": sum(1 for row in link_audit_rows if row["verdict"] == "OK"),
@@ -5739,6 +5911,9 @@ def create_app() -> Flask:
             sigenergy_onboarding_rows=sigenergy_onboarding_rows,
             installation_import_rows=installation_import_rows,
             sigenergy_last_run=sigenergy_last_run,
+            sigenergy_summary=sigenergy_summary,
+            sigenergy_default_history_date=sigenergy_default_history_date,
+            sigenergy_history_unit_confirmed=sigenergy_history_unit_confirmed,
             link_audit_rows=link_audit_rows,
             link_audit_counts=link_audit_counts,
             assets_for_mapping=assets_for_mapping,
@@ -6227,6 +6402,53 @@ def ensure_database(path: str) -> None:
                 FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE SET NULL
             );
 
+            CREATE TABLE IF NOT EXISTS provider_system_inventory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                external_name TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                access_status TEXT NOT NULL DEFAULT 'accessible',
+                first_discovered_at TEXT NOT NULL,
+                last_discovered_at TEXT NOT NULL,
+                last_state TEXT,
+                last_state_at TEXT,
+                last_telemetry_at TEXT,
+                data_quality TEXT NOT NULL DEFAULT 'missing',
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(provider, external_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS energy_interval_facts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset_id INTEGER,
+                provider TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                period_start TEXT NOT NULL,
+                period_end TEXT NOT NULL,
+                timezone TEXT NOT NULL DEFAULT 'Europe/Lisbon',
+                granularity TEXT NOT NULL,
+                production_kwh REAL,
+                consumption_kwh REAL,
+                self_use_kwh REAL,
+                export_kwh REAL,
+                grid_import_kwh REAL,
+                battery_charge_kwh REAL,
+                battery_discharge_kwh REAL,
+                ev_charge_kwh REAL,
+                heat_pump_kwh REAL,
+                provenance TEXT NOT NULL,
+                data_quality TEXT NOT NULL,
+                source_event_id TEXT,
+                payload_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(provider, external_id, period_start, period_end, provenance),
+                FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE SET NULL
+            );
+
             CREATE TABLE IF NOT EXISTS sigenergy_onboarding_requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 system_id TEXT NOT NULL,
@@ -6410,6 +6632,17 @@ def ensure_database(path: str) -> None:
                 period_type TEXT NOT NULL,
                 period_date TEXT NOT NULL,
                 production_kwh REAL,
+                consumption_kwh REAL,
+                self_use_kwh REAL,
+                export_kwh REAL,
+                grid_import_kwh REAL,
+                battery_charge_kwh REAL,
+                battery_discharge_kwh REAL,
+                ev_charge_kwh REAL,
+                heat_pump_kwh REAL,
+                source_timezone TEXT,
+                source_granularity TEXT,
+                provenance TEXT,
                 specific_yield REAL,
                 expected_kwh REAL,
                 expected_specific_yield REAL,
@@ -6754,10 +6987,12 @@ def ensure_database(path: str) -> None:
         ensure_column(conn, "integration_configs", "device_real_time_endpoint TEXT")
         ensure_column(conn, "integration_configs", "device_history_endpoint TEXT")
         ensure_column(conn, "integration_configs", "energy_flow_endpoint TEXT")
+        ensure_column(conn, "integration_configs", "history_endpoint TEXT")
         ensure_column(conn, "integration_configs", "onboard_endpoint TEXT")
         ensure_column(conn, "integration_configs", "region TEXT")
         ensure_column(conn, "integration_configs", "system_ids TEXT")
         ensure_column(conn, "integration_configs", "snapshot_retention_days INTEGER")
+        ensure_column(conn, "integration_configs", "last_discovery_at TEXT")
         ensure_column(conn, "integration_configs", "day_kpi_endpoint TEXT")
         ensure_column(conn, "integration_configs", "month_kpi_endpoint TEXT")
         ensure_column(conn, "integration_configs", "production_sync_enabled INTEGER DEFAULT 1")
@@ -6767,6 +7002,18 @@ def ensure_database(path: str) -> None:
         ensure_column(conn, "integration_configs", "diagnostics_sync_time TEXT")
         ensure_column(conn, "background_jobs", "next_attempt_at TEXT")
         ensure_column(conn, "background_jobs", "wait_reason TEXT")
+        ensure_column(conn, "asset_integrations", "is_primary_energy_source INTEGER DEFAULT 0")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_asset_integrations_primary_source
+            ON asset_integrations(asset_id, is_primary_energy_source, enabled)
+            """
+        )
+        ensure_column(conn, "portfolio_report_rows", "energy_provider TEXT")
+        ensure_column(conn, "portfolio_report_rows", "data_origin TEXT")
+        ensure_column(conn, "portfolio_report_rows", "granularity TEXT")
+        ensure_column(conn, "portfolio_report_rows", "covered_period TEXT")
+        ensure_column(conn, "portfolio_report_rows", "quality_status TEXT")
         ensure_column(conn, "sigenergy_onboarding_requests", "installation_import_id INTEGER")
         ensure_api_call_state_schema(conn)
         ensure_api_queue_schema(conn)
@@ -6798,6 +7045,17 @@ def ensure_database(path: str) -> None:
         ensure_column(conn, "production_records", "selected_production_key TEXT")
         ensure_column(conn, "production_records", "selected_production_raw_value TEXT")
         ensure_column(conn, "production_records", "reference_diagnostic_json TEXT")
+        ensure_column(conn, "production_records", "consumption_kwh REAL")
+        ensure_column(conn, "production_records", "self_use_kwh REAL")
+        ensure_column(conn, "production_records", "export_kwh REAL")
+        ensure_column(conn, "production_records", "grid_import_kwh REAL")
+        ensure_column(conn, "production_records", "battery_charge_kwh REAL")
+        ensure_column(conn, "production_records", "battery_discharge_kwh REAL")
+        ensure_column(conn, "production_records", "ev_charge_kwh REAL")
+        ensure_column(conn, "production_records", "heat_pump_kwh REAL")
+        ensure_column(conn, "production_records", "source_timezone TEXT")
+        ensure_column(conn, "production_records", "source_granularity TEXT")
+        ensure_column(conn, "production_records", "provenance TEXT")
         ensure_column(conn, "production_hourly_records", "self_use_kwh REAL")
         ensure_column(conn, "production_hourly_records", "export_kwh REAL")
         ensure_column(conn, "production_hourly_records", "consumption_kwh REAL")
@@ -6879,6 +7137,12 @@ def ensure_database_indexes(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_asset_integrations_provider_enabled_asset
             ON asset_integrations(provider, enabled, asset_id);
+
+        CREATE INDEX IF NOT EXISTS idx_provider_system_inventory_access
+            ON provider_system_inventory(provider, access_status, last_discovered_at);
+
+        CREATE INDEX IF NOT EXISTS idx_energy_interval_facts_asset_period
+            ON energy_interval_facts(asset_id, provider, period_start, period_end);
 
         CREATE INDEX IF NOT EXISTS idx_tickets_asset_status
             ON tickets(asset_id, status);
@@ -10129,6 +10393,20 @@ def get_fusionsolar_report_assets(conn: sqlite3.Connection) -> list[dict[str, An
     rows = query_all(
         conn,
         """
+        WITH ranked_sources AS (
+            SELECT
+                ai.*,
+                ROW_NUMBER() OVER (
+                    PARTITION BY ai.asset_id
+                    ORDER BY
+                        COALESCE(ai.is_primary_energy_source, 0) DESC,
+                        CASE WHEN ai.provider = 'FusionSolar' THEN 0 ELSE 1 END,
+                        ai.id
+                ) AS source_rank
+            FROM asset_integrations ai
+            WHERE ai.enabled = 1
+              AND COALESCE(ai.external_id, '') != ''
+        )
         SELECT
             a.id AS asset_id,
             a.project_name,
@@ -10139,15 +10417,13 @@ def get_fusionsolar_report_assets(conn: sqlite3.Connection) -> list[dict[str, An
             a.coverage_type,
             a.sell_to,
             ai.external_id,
-            ai.external_name
-        FROM asset_integrations ai
+            ai.external_name,
+            ai.provider AS energy_provider
+        FROM ranked_sources ai
         JOIN assets a ON a.id = ai.asset_id
-        WHERE ai.provider = ?
-          AND ai.enabled = 1
-          AND COALESCE(ai.external_id, '') != ''
+        WHERE ai.source_rank = 1
         ORDER BY a.project_name COLLATE NOCASE
         """,
-        (INTEGRATION_PROVIDER_FUSIONSOLAR,),
     )
     assets = [dict(row) for row in rows]
     for asset in assets:
@@ -10210,14 +10486,24 @@ def normalize_customer_production_record(row: sqlite3.Row, fallback_date: date) 
     payload = parse_production_record_payload(row)
     normalized = normalize_customer_kpi_row(payload, fallback_date)
     record_date = parse_date_value(row["period_date"]) or fallback_date
-    production_kwh = parse_float_value(row["production_kwh"])
-    if production_kwh is not None:
-        normalized["production_kwh"] = production_kwh
+    for field in (
+        "production_kwh",
+        "consumption_kwh",
+        "self_use_kwh",
+        "export_kwh",
+        "grid_import_kwh",
+    ):
+        value = parse_float_value(row[field])
+        if value is not None:
+            normalized[field] = value
     normalized["date"] = record_date
     return normalized
 
 
 def _get_fusionsolar_report_asset(conn: sqlite3.Connection, asset_id: int) -> sqlite3.Row:
+    source = resolve_asset_energy_source(conn, asset_id)
+    if source is None:
+        raise ValueError("A instalacao nao tem uma fonte primaria de energia ativa.")
     asset = conn.execute(
         """
         SELECT
@@ -10230,7 +10516,8 @@ def _get_fusionsolar_report_asset(conn: sqlite3.Connection, asset_id: int) -> sq
             a.coverage_type,
             a.sell_to,
             ai.external_id,
-            ai.external_name
+            ai.external_name,
+            ai.provider AS energy_provider
         FROM asset_integrations ai
         JOIN assets a ON a.id = ai.asset_id
         WHERE a.id = ?
@@ -10239,10 +10526,10 @@ def _get_fusionsolar_report_asset(conn: sqlite3.Connection, asset_id: int) -> sq
           AND COALESCE(ai.external_id, '') != ''
         LIMIT 1
         """,
-        (asset_id, INTEGRATION_PROVIDER_FUSIONSOLAR),
+        (asset_id, source["provider"]),
     ).fetchone()
     if asset is None:
-        raise ValueError("A instalacao nao tem mapeamento FusionSolar ativo.")
+        raise ValueError("A instalacao nao tem uma fonte primaria de energia ativa.")
     return asset
 
 
@@ -10262,6 +10549,7 @@ def _empty_month_row(month_start: date) -> dict[str, Any]:
         "self_use_kwh": None,
         "export_kwh": None,
         "consumption_kwh": None,
+        "grid_import_kwh": None,
         "source": "Sem dados",
     }
 
@@ -10320,11 +10608,19 @@ def _aggregate_customer_rows_for_period(
             row = _empty_month_row(month_start)
             distinct_daily = {item["date"]: item for item in month_daily}
             complete_daily = list(distinct_daily.values())
+
+            def complete_daily_total(field: str) -> float | None:
+                values = [item.get(field) for item in complete_daily]
+                if not values or any(value is None for value in values):
+                    return None
+                return sum(float(value) for value in values)
+
             row.update(
                 production_kwh=quality.production_kwh,
-                self_use_kwh=sum(float(item.get("self_use_kwh") or 0.0) for item in complete_daily),
-                export_kwh=sum(float(item.get("export_kwh") or 0.0) for item in complete_daily),
-                consumption_kwh=sum(float(item.get("consumption_kwh") or 0.0) for item in complete_daily),
+                self_use_kwh=complete_daily_total("self_use_kwh"),
+                export_kwh=complete_daily_total("export_kwh"),
+                consumption_kwh=complete_daily_total("consumption_kwh"),
+                grid_import_kwh=complete_daily_total("grid_import_kwh"),
                 source="Diario local",
             )
             months_with_data.append(month_start.strftime("%Y-%m"))
@@ -10358,12 +10654,16 @@ def _aggregate_customer_rows_for_period(
     def final_total(key: str) -> float | None:
         if not all_months_final:
             return None
-        return sum(float(item.get(key) or 0.0) for item in selected_month_rows)
+        values = [item.get(key) for item in selected_month_rows]
+        if any(value is None for value in values):
+            return None
+        return sum(float(value) for value in values)
 
     production_kwh = final_total("production_kwh")
     self_use_kwh = final_total("self_use_kwh")
     export_kwh = final_total("export_kwh")
     consumption_kwh = final_total("consumption_kwh")
+    grid_import_kwh = final_total("grid_import_kwh")
     coverage_pct = round(len(months_with_data) / period.month_count * 100, 2) if period.month_count else 0.0
     if missing_months:
         report_notes.append("Meses sem produção final: " + ", ".join(missing_months) + ".")
@@ -10381,6 +10681,7 @@ def _aggregate_customer_rows_for_period(
         "self_use_kwh": self_use_kwh,
         "export_kwh": export_kwh,
         "consumption_kwh": consumption_kwh,
+        "grid_import_kwh": grid_import_kwh,
         "months_with_data": months_with_data,
         "missing_months": missing_months,
         "months_requiring_fallback": months_requiring_fallback,
@@ -10649,6 +10950,7 @@ def _report_payload_for_period(
         "self_use_kwh": aggregate["self_use_kwh"],
         "export_kwh": aggregate["export_kwh"],
         "consumption_kwh": aggregate["consumption_kwh"],
+        "grid_import_kwh": aggregate["grid_import_kwh"],
         "electricity_price": electricity_price,
         "sell_price": sell_price,
         "data_source": data_source,
@@ -10719,6 +11021,20 @@ def build_local_customer_production_report(
         data_source="Dados locais",
         tariff_result=tariff_result,
     )
+    report.update(
+        {
+            "energy_provider": asset["energy_provider"],
+            "data_origin": "production_records",
+            "data_granularity": (
+                "month+day" if monthly_records and daily_records
+                else "month" if monthly_records
+                else "day" if daily_records
+                else "missing"
+            ),
+            "covered_period": f"{period.start.isoformat()}/{period.end.isoformat()}",
+            "data_quality": aggregate.get("production_status", "missing"),
+        }
+    )
     return prepare_customer_report(
         report,
         solcor_price_per_kwh=solcor_price_per_kwh,
@@ -10741,6 +11057,13 @@ def ensure_report_data_requests(
     warnings: list[str] = []
     reused_count = 0
     queued_count = 0
+    sources_by_asset = {
+        asset_id: (
+            resolve_asset_energy_source(conn, asset_id)
+            or {"provider": INTEGRATION_PROVIDER_FUSIONSOLAR}
+        )
+        for asset_id in normalized_asset_ids
+    }
     for month_start in period.included_months:
         month_label = month_start.strftime("%Y-%m")
         if month_start >= current_month:
@@ -10748,10 +11071,13 @@ def ensure_report_data_requests(
         missing_production_ids = [
             asset_id
             for asset_id in normalized_asset_ids
+            if sources_by_asset.get(asset_id)
+            and sources_by_asset[asset_id]["provider"]
+            == INTEGRATION_PROVIDER_FUSIONSOLAR
             if evaluate_local_monthly_production_quality(
                 conn,
                 asset_id=asset_id,
-                provider=INTEGRATION_PROVIDER_FUSIONSOLAR,
+                provider=str(sources_by_asset[asset_id]["provider"]),
                 month_start=month_start,
                 reference_date=reference_date,
             ).status
@@ -10775,12 +11101,33 @@ def ensure_report_data_requests(
             warnings.append(
                 f"production_collection_pending:{month_label}:job_{job_id}"
             )
+        for asset_id in normalized_asset_ids:
+            source = sources_by_asset.get(asset_id)
+            if source is None:
+                warnings.append(f"energy_source_missing:asset_{asset_id}")
+                continue
+            if source["provider"] != INTEGRATION_PROVIDER_SIGENERGY:
+                continue
+            quality = evaluate_local_monthly_production_quality(
+                conn,
+                asset_id=asset_id,
+                provider=INTEGRATION_PROVIDER_SIGENERGY,
+                month_start=month_start,
+                reference_date=reference_date,
+            )
+            if quality.status != "complete":
+                warnings.append(
+                    f"dados insuficientes para calculo financeiro:{month_label}:asset_{asset_id}"
+                )
 
         if include_wat:
             wat_end = month_end(month_start)
             missing_wat_ids = [
                 asset_id
                 for asset_id in normalized_asset_ids
+                if sources_by_asset.get(asset_id)
+                and sources_by_asset[asset_id]["provider"]
+                == INTEGRATION_PROVIDER_FUSIONSOLAR
                 if not real_wat_period_is_complete(
                     conn,
                     asset_id=asset_id,
@@ -11103,6 +11450,13 @@ def add_customer_report_availability(
     period: ReportingPeriod,
     ensure_requests: bool = True,
 ) -> bool:
+    source = resolve_asset_energy_source(conn, asset_id)
+    if source is None or source["provider"] != INTEGRATION_PROVIDER_FUSIONSOLAR:
+        report["availability_error"] = "availability_not_supported_by_provider"
+        report.setdefault("report_notes", []).append(
+            "Disponibilidade nao suportada para a fonte de energia selecionada."
+        )
+        return False
     if ensure_requests:
         requests = ensure_report_data_requests(
             conn,
@@ -12587,13 +12941,18 @@ def get_sigenergy_env_config() -> dict[str, str]:
         "login_endpoint": os.environ.get("SIGENERGY_AUTH_ENDPOINT", DEFAULT_SIGENERGY_AUTH_ENDPOINT).strip(),
         "plants_endpoint": os.environ.get("SIGENERGY_SYSTEMS_ENDPOINT", DEFAULT_SIGENERGY_SYSTEMS_ENDPOINT).strip(),
         "energy_flow_endpoint": os.environ.get("SIGENERGY_ENERGY_FLOW_ENDPOINT", DEFAULT_SIGENERGY_ENERGY_FLOW_ENDPOINT).strip(),
+        "history_endpoint": os.environ.get(
+            "SIGENERGY_HISTORY_ENDPOINT",
+            DEFAULT_SIGENERGY_HISTORY_ENDPOINT,
+        ).strip(),
         "onboard_endpoint": os.environ.get("SIGENERGY_ONBOARD_ENDPOINT", DEFAULT_SIGENERGY_ONBOARD_ENDPOINT).strip(),
         "day_kpi_endpoint": "",
         "month_kpi_endpoint": "",
         "sync_hours": os.environ.get("SIGENERGY_SYNC_HOURS", DEFAULT_SIGENERGY_SYNC_HOURS).strip(),
         "state_sync_interval_hours": os.environ.get("SIGENERGY_STATE_SYNC_INTERVAL_HOURS", "").strip(),
         "region": os.environ.get("SIGENERGY_REGION", DEFAULT_SIGENERGY_REGION).strip() or DEFAULT_SIGENERGY_REGION,
-        "system_ids": os.environ.get("SIGENERGY_SYSTEM_IDS", os.environ.get("SIGENERGY_SYSTEM_ID", "")).strip(),
+        # Legacy only. Manual IDs must never affect discovery or synchronization.
+        "system_ids": "",
         "snapshot_retention_days": os.environ.get("SIGENERGY_SNAPSHOT_RETENTION_DAYS", str(DEFAULT_SIGENERGY_SNAPSHOT_RETENTION_DAYS)).strip(),
         "enabled": os.environ.get("SIGENERGY_ENABLED", "").strip(),
     }
@@ -12702,13 +13061,13 @@ def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
                 login_endpoint = CASE WHEN COALESCE(login_endpoint, '') = '' THEN ? ELSE login_endpoint END,
                 plants_endpoint = CASE WHEN COALESCE(plants_endpoint, '') = '' THEN ? ELSE plants_endpoint END,
                 energy_flow_endpoint = CASE WHEN COALESCE(energy_flow_endpoint, '') = '' THEN ? ELSE energy_flow_endpoint END,
+                history_endpoint = CASE WHEN COALESCE(history_endpoint, '') = '' THEN ? ELSE history_endpoint END,
                 onboard_endpoint = CASE WHEN COALESCE(onboard_endpoint, '') = '' THEN ? ELSE onboard_endpoint END,
                 sync_hours = CASE WHEN COALESCE(sync_hours, '') = '' THEN ? ELSE sync_hours END,
                 state_sync_interval_hours = CASE WHEN state_sync_interval_hours IS NULL OR state_sync_interval_hours < 1 THEN ? ELSE state_sync_interval_hours END,
                 production_sync_enabled = 0,
                 diagnostics_sync_enabled = 0,
                 region = CASE WHEN COALESCE(region, '') = '' THEN ? ELSE region END,
-                system_ids = CASE WHEN COALESCE(system_ids, '') = '' THEN ? ELSE system_ids END,
                 snapshot_retention_days = CASE WHEN snapshot_retention_days IS NULL OR snapshot_retention_days <= 0 THEN ? ELSE snapshot_retention_days END,
                 enabled = CASE WHEN ? = 1 THEN 1 ELSE enabled END,
                 updated_at = ?
@@ -12720,11 +13079,11 @@ def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
                 sigenergy_env["login_endpoint"],
                 sigenergy_env["plants_endpoint"],
                 sigenergy_env["energy_flow_endpoint"],
+                sigenergy_env["history_endpoint"],
                 sigenergy_env["onboard_endpoint"],
                 sigenergy_env["sync_hours"],
                 DEFAULT_STATE_SYNC_INTERVAL_HOURS,
                 sigenergy_env["region"],
-                sigenergy_env["system_ids"],
                 int(sigenergy_env["snapshot_retention_days"] or DEFAULT_SIGENERGY_SNAPSHOT_RETENTION_DAYS),
                 sigenergy_enabled,
                 datetime.now().isoformat(timespec="seconds"),
@@ -12736,11 +13095,12 @@ def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         INSERT INTO integration_configs (
-            provider, username, password, base_url, login_endpoint, plants_endpoint, energy_flow_endpoint, onboard_endpoint,
+            provider, username, password, base_url, login_endpoint, plants_endpoint,
+            energy_flow_endpoint, history_endpoint, onboard_endpoint,
             day_kpi_endpoint, month_kpi_endpoint, region, system_ids, snapshot_retention_days,
             enabled, auto_sync_enabled, sync_hours, production_sync_enabled, diagnostics_sync_enabled,
             state_sync_interval_hours, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             INTEGRATION_PROVIDER_SIGENERGY,
@@ -12750,6 +13110,7 @@ def ensure_integration_seed_data(conn: sqlite3.Connection) -> None:
             sigenergy_env["login_endpoint"],
             sigenergy_env["plants_endpoint"],
             sigenergy_env["energy_flow_endpoint"],
+            sigenergy_env["history_endpoint"],
             sigenergy_env["onboard_endpoint"],
             "",
             "",
@@ -12807,6 +13168,7 @@ def get_integration_config(conn: sqlite3.Connection, provider: str) -> dict[str,
             "login_endpoint": "SIGENERGY_AUTH_ENDPOINT",
             "plants_endpoint": "SIGENERGY_SYSTEMS_ENDPOINT",
             "energy_flow_endpoint": "SIGENERGY_ENERGY_FLOW_ENDPOINT",
+            "history_endpoint": "SIGENERGY_HISTORY_ENDPOINT",
             "onboard_endpoint": "SIGENERGY_ONBOARD_ENDPOINT",
             "sync_hours": "SIGENERGY_SYNC_HOURS",
             "state_sync_interval_hours": "SIGENERGY_STATE_SYNC_INTERVAL_HOURS",
@@ -12822,6 +13184,9 @@ def get_integration_config(conn: sqlite3.Connection, provider: str) -> dict[str,
         config["login_endpoint"] = config.get("login_endpoint") or DEFAULT_SIGENERGY_AUTH_ENDPOINT
         config["plants_endpoint"] = config.get("plants_endpoint") or DEFAULT_SIGENERGY_SYSTEMS_ENDPOINT
         config["energy_flow_endpoint"] = config.get("energy_flow_endpoint") or DEFAULT_SIGENERGY_ENERGY_FLOW_ENDPOINT
+        config["history_endpoint"] = (
+            config.get("history_endpoint") or DEFAULT_SIGENERGY_HISTORY_ENDPOINT
+        )
         config["onboard_endpoint"] = config.get("onboard_endpoint") or DEFAULT_SIGENERGY_ONBOARD_ENDPOINT
         config["sync_hours"] = config.get("sync_hours") or DEFAULT_SIGENERGY_SYNC_HOURS
         config["state_sync_interval_hours"] = normalize_positive_int(
@@ -12838,11 +13203,7 @@ def get_integration_config(conn: sqlite3.Connection, provider: str) -> dict[str,
             config["env_overrides"]["region"] = True
         else:
             config["region"] = config.get("region") or DEFAULT_SIGENERGY_REGION
-        if env_config["system_ids"]:
-            config["system_ids"] = env_config["system_ids"]
-            config["env_overrides"]["system_ids"] = True
-        else:
-            config["system_ids"] = config.get("system_ids") or ""
+        config["system_ids"] = ""
         config["password_configured"] = bool(config.get("password"))
         config["password_source"] = "env" if env_config["password"] else ("database" if config.get("password") else "")
         if env_config["enabled"].lower() in {"1", "true", "yes", "sim", "on"}:
@@ -13630,6 +13991,24 @@ def run_background_job_payload(conn: sqlite3.Connection, job_type: str, params: 
         record_api_success(conn, INTEGRATION_PROVIDER_SIGENERGY, API_AREA_STATE)
         return result
 
+    if job_type == "sigenergy_energy_sync":
+        target_date = parse_date_value(str(params.get("target_date") or ""))
+        external_id = str(params.get("external_id") or "").strip()
+        if target_date is None or not external_id:
+            raise ValueError("O sync energetico Sigenergy exige sistema e data.")
+        result = run_sigenergy_daily_energy_sync(
+            conn,
+            external_id=external_id,
+            target_date=target_date,
+        )
+        if result.get("status") == "success":
+            record_api_success(
+                conn,
+                INTEGRATION_PROVIDER_SIGENERGY,
+                API_AREA_PRODUCTION,
+            )
+        return result
+
     if job_type == "fusionsolar_production_sync":
         target_date = parse_date_value(str(params.get("target_date") or ""))
         if target_date is None:
@@ -13759,6 +14138,8 @@ def background_job_api_scope(job_type: str, params: dict[str, Any]) -> tuple[str
         return provider or INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_DIAGNOSTICS
     if job_type == "sigenergy_state_sync":
         return provider or INTEGRATION_PROVIDER_SIGENERGY, API_AREA_STATE
+    if job_type == "sigenergy_energy_sync":
+        return provider or INTEGRATION_PROVIDER_SIGENERGY, API_AREA_PRODUCTION
     return "", ""
 
 
@@ -13865,28 +14246,41 @@ def build_production_api_queue_observability(
         INTEGRATION_PROVIDER_SIGENERGY,
     )
     if sigenergy_config is not None:
-        sigenergy_endpoint = str(sigenergy_config["energy_flow_endpoint"] or "")
-        ensure_api_queue_state(
+        sigenergy_account = sigenergy_account_key(sigenergy_config)
+        for sigenergy_area in (
+            API_AREA_DISCOVERY,
+            API_AREA_STATE,
+            API_AREA_PRODUCTION,
+            API_AREA_TELEMETRY,
+            API_AREA_ALARMS,
+        ):
+            ensure_api_queue_state(
+                conn,
+                provider=INTEGRATION_PROVIDER_SIGENERGY.lower(),
+                account_key_value=sigenergy_account,
+                api_area=sigenergy_area,
+                policy=sigenergy_api_policy(sigenergy_area),
+            )
+        sigenergy_account_state = get_account_queue_state(
             conn,
             provider=INTEGRATION_PROVIDER_SIGENERGY.lower(),
-            account_key_value=production_api_account_key(
-                provider=INTEGRATION_PROVIDER_SIGENERGY,
-                username=str(sigenergy_config["username"] or ""),
-                base_url=str(sigenergy_config["base_url"] or ""),
-                endpoint=sigenergy_endpoint,
-            ),
-            api_area=PRODUCTION_KPI_AREA,
-            policy=sigenergy_production_kpi_policy(),
+            account_key_value=sigenergy_account,
         )
+    else:
+        sigenergy_account_state = {}
+    observed_job_types = (
+        *FUSIONSOLAR_BACKGROUND_JOB_TYPES,
+        *SIGENERGY_BACKGROUND_JOB_TYPES,
+    )
     waiting_rows = conn.execute(
         f"""
         SELECT job_type, COUNT(*) AS total
         FROM background_jobs
-        WHERE job_type IN ({", ".join("?" for _ in FUSIONSOLAR_BACKGROUND_JOB_TYPES)})
+        WHERE job_type IN ({", ".join("?" for _ in observed_job_types)})
           AND status IN ('waiting_api_slot', 'waiting_rate_limit')
         GROUP BY job_type
         """,
-        FUSIONSOLAR_BACKGROUND_JOB_TYPES,
+        observed_job_types,
     ).fetchall()
     waiting_by_type = {
         str(item["job_type"]): int(item["total"])
@@ -13963,10 +14357,28 @@ def build_production_api_queue_observability(
             row["sampled_availability_states"] = sampled_states
             row["real_wat_days"] = real_wat_days
         else:
-            row["waiting_jobs"] = 0
-            row["waiting_jobs_by_priority"] = {}
-            row["account_last_407_at"] = None
-            row["account_cooldown_until"] = None
+            relevant_types = (
+                ("sigenergy_energy_sync",)
+                if row["api_area"] == API_AREA_PRODUCTION
+                else ("sigenergy_state_sync",)
+                if row["api_area"] == API_AREA_STATE
+                else ()
+            )
+            row["waiting_jobs"] = sum(
+                waiting_by_type.get(job_type, 0)
+                for job_type in relevant_types
+            )
+            row["waiting_jobs_by_priority"] = {
+                production_job_priority(job_type): waiting_by_type[job_type]
+                for job_type in relevant_types
+                if waiting_by_type.get(job_type, 0)
+            }
+            row["account_last_407_at"] = sigenergy_account_state.get(
+                "last_407_at"
+            )
+            row["account_cooldown_until"] = sigenergy_account_state.get(
+                "cooldown_until"
+            )
             row["report_requests_reused"] = 0
             row["days_recalculated_from_db"] = 0
             row["sampled_availability_states"] = {}
@@ -14063,6 +14475,7 @@ def build_integration_api_controls(conn: sqlite3.Connection) -> list[dict[str, A
         (INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_PRODUCTION): "fusionsolar_production_sync",
         (INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_DIAGNOSTICS): "fusionsolar_inverter_availability_backfill",
         (INTEGRATION_PROVIDER_SIGENERGY, API_AREA_STATE): "sigenergy_state_sync",
+        (INTEGRATION_PROVIDER_SIGENERGY, API_AREA_PRODUCTION): "sigenergy_energy_sync",
     }
     scheduler_jobs = {
         (INTEGRATION_PROVIDER_FUSIONSOLAR, API_AREA_STATE): "integration-state-fusionsolar-hourly",
@@ -14079,6 +14492,15 @@ def build_integration_api_controls(conn: sqlite3.Connection) -> list[dict[str, A
         provider_areas = [API_AREA_STATE]
         if provider == INTEGRATION_PROVIDER_FUSIONSOLAR:
             provider_areas.extend([API_AREA_PRODUCTION, API_AREA_DIAGNOSTICS])
+        else:
+            provider_areas.extend(
+                [
+                    API_AREA_DISCOVERY,
+                    API_AREA_PRODUCTION,
+                    API_AREA_TELEMETRY,
+                    API_AREA_ALARMS,
+                ]
+            )
         areas: dict[str, dict[str, Any]] = {}
         for area in provider_areas:
             state = state_rows.get((provider, area), {})
@@ -14114,7 +14536,11 @@ def build_integration_api_controls(conn: sqlite3.Connection) -> list[dict[str, A
                 "enabled": bool(config.get("enabled")),
                 "credentials_ok": credentials_ok,
                 "state_enabled": bool(config.get("auto_sync_enabled")),
-                "production_enabled": bool(config.get("production_sync_enabled")) if provider == INTEGRATION_PROVIDER_FUSIONSOLAR else False,
+                "production_enabled": (
+                    bool(config.get("production_sync_enabled"))
+                    if provider == INTEGRATION_PROVIDER_FUSIONSOLAR
+                    else True
+                ),
                 "diagnostics_enabled": bool(config.get("diagnostics_sync_enabled")) if provider == INTEGRATION_PROVIDER_FUSIONSOLAR else False,
                 "auto_sync_enabled": bool(config.get("auto_sync_enabled")),
                 "state_interval_hours": config.get("state_sync_interval_hours") or DEFAULT_STATE_SYNC_INTERVAL_HOURS,
@@ -14812,13 +15238,144 @@ def fusionsolar_production_kpi_policy() -> ApiQueuePolicy:
 
 def sigenergy_production_kpi_policy() -> ApiQueuePolicy:
     return ApiQueuePolicy(
-        min_interval_seconds=parse_env_optional_positive_int(
-            "SIGENERGY_PRODUCTION_MIN_INTERVAL_SECONDS"
+        min_interval_seconds=parse_env_positive_int(
+            "SIGENERGY_PRODUCTION_MIN_INTERVAL_SECONDS",
+            300,
         ),
         daily_budget=parse_env_optional_positive_int(
             "SIGENERGY_PRODUCTION_DAILY_BUDGET"
         ),
     )
+
+
+def sigenergy_api_policy(api_area: str) -> ApiQueuePolicy:
+    prefix = {
+        API_AREA_DISCOVERY: "DISCOVERY",
+        API_AREA_STATE: "STATE",
+        API_AREA_TELEMETRY: "TELEMETRY",
+        API_AREA_ALARMS: "ALARMS",
+        API_AREA_PRODUCTION: "PRODUCTION",
+    }.get(api_area, api_area.upper())
+    min_interval = parse_env_optional_positive_int(
+        f"SIGENERGY_{prefix}_MIN_INTERVAL_SECONDS"
+    )
+    daily_budget = parse_env_optional_positive_int(
+        f"SIGENERGY_{prefix}_DAILY_BUDGET"
+    )
+    if min_interval is None:
+        min_interval = parse_env_optional_positive_int(
+            "SIGENERGY_API_MIN_INTERVAL_SECONDS"
+        )
+    if daily_budget is None:
+        daily_budget = parse_env_optional_positive_int(
+            "SIGENERGY_API_DAILY_BUDGET"
+        )
+    if api_area == API_AREA_PRODUCTION and min_interval is None:
+        min_interval = 300
+    return ApiQueuePolicy(
+        min_interval_seconds=min_interval,
+        daily_budget=daily_budget,
+    )
+
+
+def sigenergy_account_key(config: sqlite3.Row | dict[str, Any]) -> str:
+    config_map = dict(config)
+    return production_api_account_key(
+        provider=INTEGRATION_PROVIDER_SIGENERGY,
+        username=str(config_map.get("username") or ""),
+        base_url=str(config_map.get("base_url") or ""),
+        endpoint="account",
+    )
+
+
+def execute_queued_sigenergy_call(
+    conn: sqlite3.Connection,
+    config: sqlite3.Row | dict[str, Any],
+    callback: Any,
+    *,
+    api_area: str,
+    priority: int,
+) -> Any:
+    """Execute one Sigenergy request through the persistent common queue."""
+
+    context = PRODUCTION_KPI_CALL_CONTEXT.get() or {}
+    lease_owner = str(
+        context.get("lease_owner")
+        or f"sigenergy-{threading.get_ident()}-{time.monotonic_ns()}"
+    )
+    account_key_value = sigenergy_account_key(config)
+    provider_key = INTEGRATION_PROVIDER_SIGENERGY.lower()
+    account_reservation = reserve_account_lease(
+        conn,
+        provider=provider_key,
+        account_key_value=account_key_value,
+        lease_owner=lease_owner,
+    )
+    if not account_reservation.granted:
+        raise ApiSlotUnavailableError(
+            provider=INTEGRATION_PROVIDER_SIGENERGY,
+            account_key=account_key_value,
+            api_area=api_area,
+            next_attempt_at=account_reservation.next_attempt_at,
+            wait_reason=account_reservation.wait_reason,
+        )
+    area_reserved = False
+    try:
+        reservation = reserve_api_slot(
+            conn,
+            provider=provider_key,
+            account_key_value=account_key_value,
+            api_area=api_area,
+            lease_owner=lease_owner,
+            priority=priority,
+            policy=sigenergy_api_policy(api_area),
+        )
+        if not reservation.granted:
+            raise ApiSlotUnavailableError(
+                provider=INTEGRATION_PROVIDER_SIGENERGY,
+                account_key=account_key_value,
+                api_area=api_area,
+                next_attempt_at=reservation.next_attempt_at,
+                wait_reason=reservation.wait_reason,
+            )
+        area_reserved = True
+        return callback()
+    except ApiRateLimitError as exc:
+        cooldown_until = exc.cooldown_until
+        record_account_407(
+            conn,
+            provider=provider_key,
+            account_key_value=account_key_value,
+            cooldown_until=cooldown_until,
+        )
+        record_production_api_407(
+            conn,
+            provider=provider_key,
+            account_key_value=account_key_value,
+            api_area=api_area,
+            cooldown_until=cooldown_until,
+        )
+        raise ApiRateLimitError(
+            INTEGRATION_PROVIDER_SIGENERGY,
+            api_area,
+            cooldown_until,
+            exc.message,
+        ) from exc
+    finally:
+        if area_reserved:
+            release_api_lease(
+                conn,
+                provider=provider_key,
+                account_key_value=account_key_value,
+                api_area=api_area,
+                lease_owner=lease_owner,
+            )
+        release_account_lease(
+            conn,
+            provider=provider_key,
+            account_key_value=account_key_value,
+            lease_owner=lease_owner,
+        )
 
 
 def fusionsolar_wat_policy() -> ApiQueuePolicy:
@@ -14856,6 +15413,8 @@ def parse_env_optional_positive_int(name: str) -> int | None:
 
 
 def production_job_priority(job_type: str) -> int:
+    if job_type == "sigenergy_energy_sync":
+        return 3
     if job_type == "fusionsolar_production_sync":
         return 1
     if job_type == "fusionsolar_month_close":
@@ -16834,13 +17393,13 @@ def get_sigenergy_endpoint_config(config: sqlite3.Row | dict[str, Any]) -> dict[
         "login_endpoint": str(config_map.get("login_endpoint") or DEFAULT_SIGENERGY_AUTH_ENDPOINT).strip() or DEFAULT_SIGENERGY_AUTH_ENDPOINT,
         "systems_endpoint": str(config_map.get("plants_endpoint") or DEFAULT_SIGENERGY_SYSTEMS_ENDPOINT).strip() or DEFAULT_SIGENERGY_SYSTEMS_ENDPOINT,
         "energy_flow_endpoint": str(legacy_energy_flow or DEFAULT_SIGENERGY_ENERGY_FLOW_ENDPOINT).strip() or DEFAULT_SIGENERGY_ENERGY_FLOW_ENDPOINT,
+        "history_endpoint": str(
+            config_map.get("history_endpoint")
+            or DEFAULT_SIGENERGY_HISTORY_ENDPOINT
+        ).strip()
+        or DEFAULT_SIGENERGY_HISTORY_ENDPOINT,
         "region": str(config_map.get("region") or DEFAULT_SIGENERGY_REGION).strip() or DEFAULT_SIGENERGY_REGION,
     }
-
-
-def sigenergy_configured_system_ids(config: sqlite3.Row | dict[str, Any]) -> list[str]:
-    raw_value = str(dict(config).get("system_ids") or "").strip()
-    return [item.strip() for item in re.split(r"[,;\s]+", raw_value) if item.strip()]
 
 
 def active_provider_external_ids(
@@ -16892,9 +17451,10 @@ def build_sigenergy_service_config(config: sqlite3.Row | dict[str, Any]) -> dict
         "systems_endpoint": endpoints["systems_endpoint"],
         "plants_endpoint": endpoints["systems_endpoint"],
         "energy_flow_endpoint": endpoints["energy_flow_endpoint"],
+        "history_endpoint": endpoints["history_endpoint"],
         "onboard_endpoint": str(config_map.get("onboard_endpoint") or DEFAULT_SIGENERGY_ONBOARD_ENDPOINT).strip() or DEFAULT_SIGENERGY_ONBOARD_ENDPOINT,
         "region": endpoints["region"],
-        "system_ids": str(config_map.get("system_ids") or "").strip(),
+        "system_ids": "",
     }
 
 
@@ -17075,7 +17635,17 @@ def create_sigenergy_onboarding_request(
             "reused": True,
         }
     service_config = build_sigenergy_service_config(config)
-    result = sigenergy_service.onboard_system(service_config, system_id, session=requests.Session())
+    result = execute_queued_sigenergy_call(
+        conn,
+        config,
+        lambda: sigenergy_service.onboard_system(
+            service_config,
+            system_id,
+            session=requests.Session(),
+        ),
+        api_area=API_AREA_DISCOVERY,
+        priority=4,
+    )
     request_id = upsert_sigenergy_onboarding_request(conn, system_id=system_id, requested_by=requested_by, result=result)
     if installation_import_id:
         conn.execute(
@@ -17127,17 +17697,19 @@ def sanitize_installation_import_payload(value: Any) -> Any:
 def begin_installation_import_api_call(
     conn: sqlite3.Connection,
     provider: str,
+    api_area: str = API_AREA_STATE,
 ) -> None:
-    require_not_in_cooldown(conn, provider, API_AREA_STATE)
-    record_api_attempt(conn, provider, API_AREA_STATE)
+    require_not_in_cooldown(conn, provider, api_area)
+    record_api_attempt(conn, provider, api_area)
     conn.commit()
 
 
 def complete_installation_import_api_call(
     conn: sqlite3.Connection,
     provider: str,
+    api_area: str = API_AREA_STATE,
 ) -> None:
-    record_api_success(conn, provider, API_AREA_STATE)
+    record_api_success(conn, provider, api_area)
     conn.commit()
 
 
@@ -17145,6 +17717,7 @@ def persist_installation_import_rate_limit(
     conn: sqlite3.Connection,
     provider: str,
     exc: ApiRateLimitError | FusionSolarRateLimitError,
+    api_area: str = API_AREA_STATE,
 ) -> ApiRateLimitError:
     cooldown_until = (
         exc.cooldown_until
@@ -17154,14 +17727,14 @@ def persist_installation_import_rate_limit(
     mark_api_cooldown(
         conn,
         provider,
-        API_AREA_STATE,
+        api_area,
         str(exc),
         cooldown_until=cooldown_until,
     )
     conn.commit()
     return ApiRateLimitError(
         provider,
-        API_AREA_STATE,
+        api_area,
         cooldown_until,
         str(exc),
     )
@@ -17177,15 +17750,27 @@ def list_provider_installations_for_import(
     if not config.get("username") or not config.get("password"):
         credential_label = "App Key/App Secret" if provider == INTEGRATION_PROVIDER_SIGENERGY else "utilizador/password"
         raise ValueError(f"Faltam credenciais {credential_label} para {provider}.")
-    begin_installation_import_api_call(conn, provider)
+    api_area = (
+        API_AREA_DISCOVERY
+        if provider == INTEGRATION_PROVIDER_SIGENERGY
+        else API_AREA_STATE
+    )
+    begin_installation_import_api_call(conn, provider, api_area)
     try:
         if provider == INTEGRATION_PROVIDER_SIGENERGY:
             service_config = build_sigenergy_service_config(config)
             service_config["system_ids"] = ""
-            rows = sigenergy_service.SigenergyClient(
+            client = sigenergy_service.SigenergyClient(
                 service_config,
                 session=requests.Session(),
-            ).list_systems(allow_empty=True)
+            )
+            rows = execute_queued_sigenergy_call(
+                conn,
+                config,
+                lambda: client.list_systems(allow_empty=True),
+                api_area=API_AREA_DISCOVERY,
+                priority=4,
+            )
             result = [
                 {
                     "external_id": first_non_empty(row, ["systemId", "id", "stationId", "plantId"]),
@@ -17208,10 +17793,15 @@ def list_provider_installations_for_import(
                 for row in rows
                 if first_non_empty(row, ["plantCode", "stationCode", "stationId"])
             ]
-        complete_installation_import_api_call(conn, provider)
+        complete_installation_import_api_call(conn, provider, api_area)
         return result
     except (ApiRateLimitError, FusionSolarRateLimitError) as exc:
-        raise persist_installation_import_rate_limit(conn, provider, exc) from exc
+        raise persist_installation_import_rate_limit(
+            conn,
+            provider,
+            exc,
+            api_area,
+        ) from exc
 
 
 def discover_sigenergy_installation(
@@ -17354,18 +17944,63 @@ def fetch_provider_installation_preview(
         raise ValueError(f"Faltam credenciais {credential_label} para {provider}.")
 
     try:
-        begin_installation_import_api_call(conn, provider)
         if provider == INTEGRATION_PROVIDER_SIGENERGY:
             service_config = build_sigenergy_service_config(config)
             service_config["system_ids"] = ""
             client = sigenergy_service.SigenergyClient(service_config, session=requests.Session())
-            normalized, raw = discover_sigenergy_installation(
-                client,
-                external_id,
+            begin_installation_import_api_call(
+                conn,
+                provider,
+                API_AREA_DISCOVERY,
             )
-            complete_installation_import_api_call(conn, provider)
+            systems = execute_queued_sigenergy_call(
+                conn,
+                config,
+                lambda: client.list_systems(allow_empty=True),
+                api_area=API_AREA_DISCOVERY,
+                priority=4,
+            )
+            system = next(
+                (
+                    row
+                    for row in systems
+                    if normalize_sigenergy_system_id_for_compare(
+                        first_non_empty(
+                            row,
+                            ["systemId", "id", "stationId", "plantId"],
+                        )
+                    )
+                    == normalize_sigenergy_system_id_for_compare(external_id)
+                ),
+                None,
+            )
+            if system is None:
+                raise SigenergyInstallationAccessPending(
+                    f"O System ID {external_id} ainda nao esta acessivel por esta App Key."
+                )
+            complete_installation_import_api_call(
+                conn,
+                provider,
+                API_AREA_DISCOVERY,
+            )
+            begin_installation_import_api_call(conn, provider, API_AREA_STATE)
+            energy_flow = execute_queued_sigenergy_call(
+                conn,
+                config,
+                lambda: client.get_energy_flow(external_id),
+                api_area=API_AREA_STATE,
+                priority=4,
+            )
+            complete_installation_import_api_call(
+                conn,
+                provider,
+                API_AREA_STATE,
+            )
+            normalized = normalize_sigenergy_import(system, energy_flow)
+            raw = {"system": system, "energy_flow": energy_flow}
             return normalized, sanitize_installation_import_payload(raw)
 
+        begin_installation_import_api_call(conn, provider)
         client = build_fusionsolar_client(config)
         normalized, raw = discover_fusionsolar_installation(
             client,
@@ -17375,7 +18010,17 @@ def fetch_provider_installation_preview(
         complete_installation_import_api_call(conn, provider)
         return normalized, sanitize_installation_import_payload(raw)
     except (ApiRateLimitError, FusionSolarRateLimitError) as exc:
-        raise persist_installation_import_rate_limit(conn, provider, exc) from exc
+        api_area = (
+            exc.area
+            if isinstance(exc, ApiRateLimitError)
+            else API_AREA_STATE
+        )
+        raise persist_installation_import_rate_limit(
+            conn,
+            provider,
+            exc,
+            api_area,
+        ) from exc
 
 
 def run_installation_import_preview_job(
@@ -17445,52 +18090,12 @@ def run_installation_import_preview_job(
             created_by=str(import_context.get("created_by") or ""),
         )
         conn.commit()
-        try:
-            config = get_integration_config(conn, provider)
-            if config is None:
-                raise ValueError("Configuracao Sigenergy nao encontrada.")
-            result = create_sigenergy_onboarding_request(
-                conn,
-                config,
-                external_id,
-                requested_by=str(import_context.get("created_by") or ""),
-                installation_import_id=import_id,
-            )
-        except Exception as onboarding_exc:
-            safe_error = sigenergy_service.sanitize_sigenergy_error(onboarding_exc)
-            conn.execute(
-                """
-                UPDATE installation_imports
-                SET status = 'error', access_status = 'error', last_error = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (safe_error, datetime.now().isoformat(timespec="seconds"), import_id),
-            )
-            conn.commit()
-            raise
-        conn.execute(
-            """
-            UPDATE installation_imports
-            SET onboarding_request_id = ?, last_error = '', updated_at = ?
-            WHERE id = ?
-            """,
-            (result["request_id"], datetime.now().isoformat(timespec="seconds"), import_id),
-        )
-        now = datetime.now().isoformat(timespec="seconds")
-        conn.execute(
-            """
-            UPDATE sigenergy_onboarding_requests
-            SET last_checked_at = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (now, now, result["request_id"]),
-        )
-        conn.commit()
         return {
             "import_id": import_id,
             "status": "access_pending",
-            "onboarding_request_id": result["request_id"],
-            "onboarding_reused": bool(result.get("reused")),
+            "onboarding_required": True,
+            "onboarding_request_id": None,
+            "onboarding_reused": False,
         }
     except ApiRateLimitError as exc:
         safe_error = sigenergy_service.sanitize_sigenergy_error(exc)
@@ -18044,6 +18649,304 @@ def normalize_sigenergy_system_row(
     }
 
 
+def upsert_provider_system_inventory(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    systems: list[dict[str, Any]],
+) -> list[str]:
+    now = datetime.now(LISBON_TIMEZONE).replace(tzinfo=None).isoformat(
+        timespec="seconds"
+    )
+    conn.execute(
+        """
+        UPDATE provider_system_inventory
+        SET access_status = 'not_returned',
+            last_error = 'A instalacao nao foi devolvida na ultima descoberta.',
+            updated_at = ?
+        WHERE provider = ? AND access_status = 'accessible'
+        """,
+        (now, provider),
+    )
+    discovered_ids: list[str] = []
+    for system in systems:
+        normalized = sigenergy_service.normalize_system(system)
+        external_id = str(normalized["external_id"])
+        discovered_ids.append(external_id)
+        conn.execute(
+            """
+            INSERT INTO provider_system_inventory (
+                provider, external_id, external_name, metadata_json,
+                access_status, first_discovered_at, last_discovered_at,
+                last_state, data_quality, last_error, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'accessible', ?, ?, ?, 'missing', '', ?, ?)
+            ON CONFLICT(provider, external_id) DO UPDATE SET
+                external_name = excluded.external_name,
+                metadata_json = excluded.metadata_json,
+                access_status = 'accessible',
+                last_discovered_at = excluded.last_discovered_at,
+                last_state = CASE
+                    WHEN excluded.last_state != 'Sem dados' THEN excluded.last_state
+                    ELSE provider_system_inventory.last_state
+                END,
+                last_error = '',
+                updated_at = excluded.updated_at
+            """,
+            (
+                provider,
+                external_id,
+                normalized["external_name"],
+                json.dumps(
+                    sigenergy_service.sanitize_payload(system),
+                    ensure_ascii=True,
+                ),
+                now,
+                now,
+                normalized["normalized_status"],
+                now,
+                now,
+            ),
+        )
+    conn.execute(
+        """
+        UPDATE integration_configs
+        SET last_discovery_at = ?, updated_at = ?
+        WHERE provider = ?
+        """,
+        (now, now, provider),
+    )
+    return discovered_ids
+
+
+def update_provider_inventory_state(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    external_id: str,
+    status: str,
+    error: str = "",
+    unauthorized: bool = False,
+) -> None:
+    now = datetime.now(LISBON_TIMEZONE).replace(tzinfo=None).isoformat(
+        timespec="seconds"
+    )
+    conn.execute(
+        """
+        UPDATE provider_system_inventory
+        SET access_status = ?,
+            last_state = ?,
+            last_state_at = ?,
+            last_error = ?,
+            updated_at = ?
+        WHERE provider = ? AND external_id = ?
+        """,
+        (
+            "unauthorized" if unauthorized else "accessible",
+            status,
+            now,
+            error[:2000],
+            now,
+            provider,
+            external_id,
+        ),
+    )
+
+
+def run_sigenergy_discovery(
+    conn: sqlite3.Connection,
+    provider: str = INTEGRATION_PROVIDER_SIGENERGY,
+    *,
+    persist: bool = True,
+) -> dict[str, Any]:
+    config = get_integration_config(conn, provider)
+    if config is None:
+        raise ValueError("Configuracao Sigenergy nao encontrada.")
+    client = sigenergy_service.SigenergyClient(
+        build_sigenergy_service_config(config),
+        session=requests.Session(),
+    )
+    systems = execute_queued_sigenergy_call(
+        conn,
+        config,
+        lambda: client.list_systems(allow_empty=True),
+        api_area=API_AREA_DISCOVERY,
+        priority=1,
+    )
+    available_system_ids = [
+        str(first_non_empty(row, ["systemId", "id", "stationId", "plantId"]))
+        for row in systems
+        if first_non_empty(row, ["systemId", "id", "stationId", "plantId"])
+    ]
+    if persist:
+        available_system_ids = upsert_provider_system_inventory(
+            conn,
+            provider=provider,
+            systems=systems,
+        )
+        reconcile_sigenergy_onboarding_requests(conn, available_system_ids)
+    return {
+        "systems": systems,
+        "station_count": len(systems),
+        "available_system_ids": available_system_ids,
+        "client": client,
+        "config": config,
+    }
+
+
+def enqueue_sigenergy_energy_backfill(
+    conn: sqlite3.Connection,
+    *,
+    external_id: str,
+    date_from: date,
+    date_to: date,
+    max_days: int = 31,
+) -> list[tuple[int, bool]]:
+    external_id = str(external_id or "").strip()
+    if not external_id:
+        raise ValueError("Seleciona uma instalacao Sigenergy descoberta.")
+    if date_from > date_to:
+        raise ValueError("O inicio do backfill nao pode ser posterior ao fim.")
+    if date_to >= current_lisbon_date():
+        raise ValueError("O historico Sigenergy so pode pedir dias ja terminados.")
+    day_count = (date_to - date_from).days + 1
+    if day_count > max_days:
+        raise ValueError(f"O backfill Sigenergy esta limitado a {max_days} dias por pedido.")
+    mapping = conn.execute(
+        """
+        SELECT ai.asset_id
+        FROM provider_system_inventory inventory
+        JOIN asset_integrations ai
+          ON ai.provider = inventory.provider
+         AND ai.external_id = inventory.external_id
+         AND ai.enabled = 1
+        WHERE inventory.provider = 'Sigenergy'
+          AND inventory.external_id = ?
+          AND inventory.access_status = 'accessible'
+        LIMIT 1
+        """,
+        (external_id,),
+    ).fetchone()
+    if mapping is None:
+        raise ValueError(
+            "A instalacao Sigenergy tem de estar descoberta, acessivel e associada antes do backfill."
+        )
+    jobs: list[tuple[int, bool]] = []
+    for offset in range(day_count):
+        target_date = date_from + timedelta(days=offset)
+        jobs.append(
+            create_background_job(
+                conn,
+                "sigenergy_energy_sync",
+                {
+                    "provider": INTEGRATION_PROVIDER_SIGENERGY,
+                    "external_id": external_id,
+                    "target_date": target_date.isoformat(),
+                },
+            )
+        )
+    return jobs
+
+
+def run_sigenergy_daily_energy_sync(
+    conn: sqlite3.Connection,
+    *,
+    external_id: str,
+    target_date: date,
+) -> dict[str, Any]:
+    if target_date >= current_lisbon_date():
+        raise ValueError("A energia Sigenergy diaria exige um dia ja terminado.")
+    config = get_integration_config(conn, INTEGRATION_PROVIDER_SIGENERGY)
+    if config is None:
+        raise ValueError("Configuracao Sigenergy nao encontrada.")
+    if not config["enabled"]:
+        raise ValueError("A integracao Sigenergy esta desativada.")
+    mapping = conn.execute(
+        """
+        SELECT ai.asset_id
+        FROM asset_integrations ai
+        WHERE ai.provider = 'Sigenergy' AND ai.external_id = ? AND ai.enabled = 1
+        LIMIT 1
+        """,
+        (external_id,),
+    ).fetchone()
+    asset_id = int(mapping["asset_id"]) if mapping else None
+    client = sigenergy_service.SigenergyClient(
+        build_sigenergy_service_config(config),
+        session=requests.Session(),
+    )
+    try:
+        history = execute_queued_sigenergy_call(
+            conn,
+            config,
+            lambda: client.get_system_history(
+                external_id,
+                level="Day",
+                target_date=target_date.isoformat(),
+            ),
+            api_area=API_AREA_PRODUCTION,
+            priority=3,
+        )
+    except sigenergy_service.SigenergyAPIError as exc:
+        if getattr(exc, "status_code", None) != 403:
+            raise
+        safe_error = (
+            "Historico energetico sem autorizacao para esta instalacao (HTTP 403)."
+        )
+        conn.execute(
+            """
+            UPDATE provider_system_inventory
+            SET data_quality = 'missing', last_error = ?, updated_at = ?
+            WHERE provider = 'Sigenergy' AND external_id = ?
+            """,
+            (
+                safe_error,
+                datetime.now().isoformat(timespec="seconds"),
+                external_id,
+            ),
+        )
+        conn.commit()
+        return {
+            "status": "forbidden",
+            "external_id": external_id,
+            "target_date": target_date.isoformat(),
+            "message": safe_error,
+        }
+
+    fact = parse_sigenergy_daily_history(
+        sigenergy_service.sanitize_payload(history),
+        system_id=external_id,
+        period_date=target_date,
+        confirmed_unit=os.environ.get(
+            "SIGENERGY_HISTORY_ENERGY_UNIT",
+            "",
+        ),
+    )
+    fact_id = persist_sigenergy_daily_history(
+        conn,
+        asset_id=asset_id,
+        fact=fact,
+    )
+    now = datetime.now().isoformat(timespec="seconds")
+    conn.execute(
+        """
+        UPDATE provider_system_inventory
+        SET last_telemetry_at = ?, data_quality = ?, last_error = '',
+            updated_at = ?
+        WHERE provider = 'Sigenergy' AND external_id = ?
+        """,
+        (now, fact.data_quality, now, external_id),
+    )
+    conn.commit()
+    return {
+        "status": "success",
+        "external_id": external_id,
+        "asset_id": asset_id,
+        "target_date": target_date.isoformat(),
+        "fact_id": fact_id,
+        "data_quality": fact.data_quality,
+    }
+
+
 def run_sigenergy_check(
     conn: sqlite3.Connection,
     provider: str,
@@ -18051,50 +18954,59 @@ def run_sigenergy_check(
     *,
     target_external_ids: list[str] | None = None,
     discover_all: bool = False,
+    include_energy_flow: bool = True,
+    persist_discovery: bool = False,
 ) -> dict[str, Any]:
-    config = get_integration_config(conn, provider)
-    if config is None:
-        raise ValueError("Configuracao Sigenergy nao encontrada.")
+    discovery = run_sigenergy_discovery(
+        conn,
+        provider,
+        persist=persist_discovery,
+    )
+    config = discovery["config"]
     endpoints = get_sigenergy_endpoint_config(config)
-    service_config = build_sigenergy_service_config(config)
-    if discover_all:
-        selected_external_ids: list[str] = []
-        service_config["system_ids"] = ""
-    else:
-        selected_external_ids = normalize_target_external_ids(
-            target_external_ids
-            if target_external_ids is not None
-            else active_provider_external_ids(conn, provider)
+    client = discovery["client"]
+    systems = list(discovery["systems"])
+    available_system_ids = list(discovery["available_system_ids"])
+    if persist_discovery and systems:
+        inventory_order = {
+            str(row["external_id"]): index
+            for index, row in enumerate(
+                conn.execute(
+                    """
+                    SELECT external_id
+                    FROM provider_system_inventory
+                    WHERE provider = ? AND access_status = 'accessible'
+                    ORDER BY
+                        CASE WHEN last_state_at IS NULL THEN 0 ELSE 1 END,
+                        last_state_at,
+                        external_id
+                    """,
+                    (provider,),
+                ).fetchall()
+            )
+        }
+        systems.sort(
+            key=lambda row: inventory_order.get(
+                str(
+                    first_non_empty(
+                        row,
+                        ["systemId", "id", "stationId", "plantId"],
+                    )
+                ),
+                len(inventory_order),
+            )
         )
-        if not selected_external_ids and target_external_ids is None:
-            # Compatibility for legacy deployments that configured an explicit
-            # allowlist before mappings existed. Active mappings take priority
-            # as soon as at least one is available.
-            selected_external_ids = sigenergy_configured_system_ids(config)
-        service_config["system_ids"] = selected_external_ids
-    session = requests.Session()
-    client = sigenergy_service.SigenergyClient(service_config, session=session)
-    if discover_all:
-        systems = retry_api_call(
-            lambda: client.list_systems(allow_empty=True),
-            allow_sleep=not has_request_context(),
-            sleeper=time.sleep,
-        )
-    elif selected_external_ids:
-        systems = retry_api_call(
-            client.list_systems,
-            allow_sleep=not has_request_context(),
-            sleeper=time.sleep,
-        )
-    elif target_external_ids is None:
-        systems = retry_api_call(
-            client.list_systems,
-            allow_sleep=not has_request_context(),
-            sleeper=time.sleep,
-        )
-    else:
-        systems = []
-    available_system_ids = [first_non_empty(row, ["systemId", "id", "stationId", "plantId"]) for row in systems if first_non_empty(row, ["systemId", "id", "stationId", "plantId"])]
+    selected_external_ids = set(normalize_target_external_ids(target_external_ids))
+    if target_external_ids is not None:
+        systems = [
+            row
+            for row in systems
+            if first_non_empty(
+                row,
+                ["systemId", "id", "stationId", "plantId"],
+            )
+            in selected_external_ids
+        ]
     normalized_rows: list[dict[str, Any]] = []
     energy_flow_count = 0
     energy_flow_errors: list[str] = []
@@ -18104,18 +19016,35 @@ def run_sigenergy_check(
             continue
         energy_flow: dict[str, Any] = {}
         row = normalize_sigenergy_system_row(system_row, {}, energy_flow)
+        if not include_energy_flow:
+            normalized_rows.append(row)
+            continue
         try:
-            energy_flow = retry_api_call(
+            energy_flow = execute_queued_sigenergy_call(
+                conn,
+                config,
                 lambda system_id=system_id: client.get_energy_flow(system_id),
-                allow_sleep=not has_request_context(),
-                sleeper=time.sleep,
+                api_area=API_AREA_STATE,
+                priority=2,
             )
             energy_flow_count += 1
             row = normalize_sigenergy_system_row(system_row, {}, energy_flow)
+            if persist_discovery:
+                update_provider_inventory_state(
+                    conn,
+                    provider=provider,
+                    external_id=system_id,
+                    status=row["status"],
+                )
         except ApiRateLimitError:
+            raise
+        except ApiSlotUnavailableError:
             raise
         except Exception as exc:
             sanitized_error = sigenergy_service.sanitize_sigenergy_error(exc)
+            unauthorized = getattr(exc, "status_code", None) == 403
+            if unauthorized:
+                sanitized_error = "Sem autorizacao para esta instalacao"
             energy_flow_errors.append(f"{system_id}: {sanitized_error}")
             row["status"] = "Sem dados"
             row["normalized_status"] = "Sem dados"
@@ -18123,19 +19052,16 @@ def run_sigenergy_check(
             row["fetch_status"] = "error"
             row["fetch_error"] = sanitized_error
             row["payload"]["fetch_error"] = sanitized_error
+            if persist_discovery:
+                update_provider_inventory_state(
+                    conn,
+                    provider=provider,
+                    external_id=system_id,
+                    status="Sem autorizacao" if unauthorized else "Sem dados",
+                    error=sanitized_error,
+                    unauthorized=unauthorized,
+                )
         normalized_rows.append(row)
-        time.sleep(0.2)
-
-    if not dry_run:
-        conn.execute(
-            """
-            UPDATE integration_configs
-            SET last_sync_status = ?, last_error = ?, updated_at = ?
-            WHERE provider = ?
-            """,
-            ("success", "", datetime.now().isoformat(timespec="seconds"), provider),
-        )
-        conn.commit()
     return {
         "rows": normalized_rows,
         "systems": normalized_rows,
@@ -18240,11 +19166,11 @@ def insert_integration_realtime_snapshot(
             row.get("pv_capacity_kw"),
             row.get("battery_capacity_kwh"),
             json.dumps(
-                {
+                sigenergy_service.sanitize_payload({
                     **(row.get("payload") or {}),
                     "fetch_status": row.get("fetch_status", "ok"),
                     "fetch_error": row.get("fetch_error", ""),
-                },
+                }),
                 ensure_ascii=True,
             ),
         ),
@@ -18274,15 +19200,12 @@ def run_sigenergy_sync(
             source=provider,
         )
         try:
-            result = (
-                run_sigenergy_check(
-                    conn,
-                    provider,
-                    dry_run=True,
-                    target_external_ids=target_external_ids,
-                )
-                if target_external_ids is not None
-                else run_provider_check(conn, provider, dry_run=True)
+            result = run_sigenergy_check(
+                conn,
+                provider,
+                dry_run=True,
+                target_external_ids=target_external_ids,
+                persist_discovery=True,
             )
             rows = result["rows"]
             reconcile_sigenergy_onboarding_requests(conn, result.get("available_system_ids", []))
@@ -18351,7 +19274,7 @@ def run_sigenergy_sync(
                         external_id=row["external_id"],
                         external_name=row["external_name"],
                         status=row["status"],
-                        payload=row["payload"],
+                        payload=sigenergy_service.sanitize_payload(row["payload"]),
                     )
                     unresolved += 1
 
@@ -18396,15 +19319,59 @@ def run_sigenergy_sync(
             process_monitoring_alerts(conn, alert_events, batch_id, now)
             conn.commit()
             return {"matched": matched, "unresolved": unresolved, "auto_resolved": 0, "snapshots": len(rows), "status": sync_status}
+        except ApiSlotUnavailableError as exc:
+            sanitized_error = sigenergy_service.sanitize_sigenergy_error(
+                exc.message
+            )
+            conn.execute(
+                """
+                UPDATE integration_configs
+                SET last_sync_status = 'waiting_api_slot', last_error = ?, updated_at = ?
+                WHERE provider = ?
+                """,
+                (
+                    sanitized_error,
+                    datetime.now().isoformat(timespec="seconds"),
+                    provider,
+                ),
+            )
+            finalize_integration_run(
+                conn,
+                run_id,
+                status="waiting_api_slot",
+                matched_count=0,
+                unresolved_count=0,
+                auto_resolved_count=0,
+                error_message=sanitized_error,
+            )
+            conn.commit()
+            raise
         except ApiRateLimitError as exc:
+            rate_limit_area = (
+                exc.area
+                if exc.area in {
+                    API_AREA_DISCOVERY,
+                    API_AREA_STATE,
+                    API_AREA_PRODUCTION,
+                    API_AREA_TELEMETRY,
+                    API_AREA_ALARMS,
+                }
+                else API_AREA_STATE
+            )
             until = mark_api_cooldown(
                 conn,
                 provider,
-                API_AREA_STATE,
+                rate_limit_area,
                 exc.message,
                 cooldown_until=exc.cooldown_until,
             )
-            notify_api_rate_limit(conn, provider, API_AREA_STATE, until, exc.message)
+            notify_api_rate_limit(
+                conn,
+                provider,
+                rate_limit_area,
+                until,
+                exc.message,
+            )
             sanitized_error = sigenergy_service.sanitize_sigenergy_error(exc.message)
             conn.execute(
                 """
@@ -18424,7 +19391,16 @@ def run_sigenergy_sync(
                 error_message=sanitized_error,
             )
             conn.commit()
-            raise ApiRateLimitError(provider, API_AREA_STATE, until, get_provider_cooldown_reason(conn, provider, API_AREA_STATE)) from exc
+            raise ApiRateLimitError(
+                provider,
+                rate_limit_area,
+                until,
+                get_provider_cooldown_reason(
+                    conn,
+                    provider,
+                    rate_limit_area,
+                ),
+            ) from exc
         except Exception as exc:
             sanitized_error = sigenergy_service.sanitize_sigenergy_error(exc)
             conn.execute(

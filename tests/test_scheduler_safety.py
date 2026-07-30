@@ -522,13 +522,15 @@ def test_provider_sync_failures_persist_through_existing_sync_run_path(tmp_path,
     db_path = tmp_path / "sync-failure.db"
     app_module.ensure_database(str(db_path))
 
-    def fake_provider_check(_conn, _provider: str, dry_run: bool = False) -> dict[str, Any]:
+    def fake_provider_check(
+        _conn,
+        _provider: str,
+        dry_run: bool = False,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
         raise ValueError("provider unavailable")
 
-    if hasattr(app_module, "run_provider_check"):
-        monkeypatch.setattr(app_module, "run_provider_check", fake_provider_check)
-    else:
-        monkeypatch.setattr(app_module, "run_fusionsolar_check", fake_provider_check)
+    monkeypatch.setattr(app_module, "run_sigenergy_check", fake_provider_check)
     with get_db(str(db_path)) as conn:
         _insert_enabled_config(conn, app_module.INTEGRATION_PROVIDER_SIGENERGY)
 

@@ -46,8 +46,12 @@
                 <p class="muted">Ultima tentativa: {{ item.production_area.last_attempt_at or '-' }}</p>
                 <p class="muted">Ultimo sucesso: {{ item.production_area.last_success_at or '-' }}</p>
               {% else %}
-                <span class="chip muted">nao disponivel</span>
-                <p class="muted">Sigenergy nesta fase so tem estado/energyFlow atual.</p>
+                <span class="chip {{ 'success' if item.production_area.last_success_at else 'muted' }}">
+                  {{ 'com dados' if item.production_area.last_success_at else 'a aguardar autorizacao/dados' }}
+                </span>
+                <p class="muted">Historico diario protegido pela fila; nunca calculado a partir de potencia live.</p>
+                <p class="muted">Ultima tentativa: {{ item.production_area.last_attempt_at or '-' }}</p>
+                <p class="muted">Ultimo sucesso: {{ item.production_area.last_success_at or '-' }}</p>
               {% endif %}
             </td>
             <td>
@@ -58,7 +62,7 @@
                 <p class="muted">Ultimo sucesso: {{ item.diagnostics_area.last_success_at or '-' }}</p>
               {% else %}
                 <span class="chip muted">nao disponivel</span>
-                <p class="muted">Sem historico, alarmes ou diagnostics Sigenergy.</p>
+                <p class="muted">MQTT/Alarmes dependem da configuracao entregue pela Sigenergy.</p>
               {% endif %}
             </td>
             <td>
@@ -66,6 +70,8 @@
               {% if item.provider == 'FusionSolar' %}
                 <p>Producao: {{ item.production_area.latest_job.status if item.production_area.latest_job else '-' }}</p>
                 <p>Diagnostics: {{ item.diagnostics_area.latest_job.status if item.diagnostics_area.latest_job else '-' }}</p>
+              {% else %}
+                <p>Energia: {{ item.production_area.latest_job.status if item.production_area.latest_job else '-' }}</p>
               {% endif %}
             </td>
             <td>
@@ -73,6 +79,8 @@
               {% if item.provider == 'FusionSolar' %}
                 <p>Producao: {{ item.production_area.next_attempt_at or item.production_area.next_scheduled_at or '-' }}</p>
                 <p>Diagnostics: {{ item.diagnostics_area.next_attempt_at or item.diagnostics_area.next_scheduled_at or '-' }}</p>
+              {% else %}
+                <p>Energia: {{ item.production_area.next_attempt_at or '-' }}</p>
               {% endif %}
             </td>
             <td>
@@ -80,6 +88,8 @@
               {% if item.provider == 'FusionSolar' %}
                 <p><span class="chip {{ 'warning' if item.production_area.api_status == 'Em cooldown' else 'danger' if item.production_area.api_status in ['Falhou ultima tentativa', 'Sem credenciais'] else 'muted' if item.production_area.api_status == 'Disabled' else 'success' }}">Producao: {{ item.production_area.api_status }}</span></p>
                 <p><span class="chip {{ 'warning' if item.diagnostics_area.api_status == 'Em cooldown' else 'danger' if item.diagnostics_area.api_status in ['Falhou ultima tentativa', 'Sem credenciais'] else 'muted' if item.diagnostics_area.api_status == 'Disabled' else 'success' }}">Diagnostics: {{ item.diagnostics_area.api_status }}</span></p>
+              {% else %}
+                <p><span class="chip {{ 'warning' if item.production_area.api_status == 'Em cooldown' else 'danger' if item.production_area.api_status in ['Falhou ultima tentativa', 'Sem credenciais'] else 'muted' if item.production_area.api_status == 'Disabled' else 'success' }}">Energia: {{ item.production_area.api_status }}</span></p>
               {% endif %}
               {% if item.state_area.last_error %}
                 <p class="muted">Erro estado: {{ item.state_area.last_error }}</p>

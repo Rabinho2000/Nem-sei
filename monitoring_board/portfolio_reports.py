@@ -19,6 +19,8 @@ from monitoring_board.portfolio_repository import (
 from monitoring_board.reporting.availability import calculate_weighted_portfolio_availability
 from monitoring_board.reporting.billing import calculate_billing, decimal_from_value, detect_report_type_value
 from monitoring_board.reporting.data_quality import evaluate_monthly_production_quality
+from monitoring_board.reporting.degradation import calculate_degradation_factor  # noqa: F401
+from monitoring_board.reporting.energy_sources import resolve_asset_energy_source
 from monitoring_board.reporting.financial_quality import (
     apply_production_financial_gate,
     financial_quality_warnings,
@@ -69,7 +71,7 @@ PERIOD_NAMES = ("ponta", "cheia", "vazio", "super_vazio")
 FINANCIAL_SOURCE_TYPE = "financial_model"
 WARNING_LABELS = {
     "ok": "OK",
-    "missing_monthly_production": "Sem producao real FusionSolar",
+    "missing_monthly_production": "Sem producao real da fonte selecionada",
     "partial_monthly_production": "Producao mensal parcial",
     "monthly_daily_production_conflict": "Conflito entre producao mensal e diaria",
     "production_in_progress": "Mes de producao em curso",
@@ -78,7 +80,7 @@ WARNING_LABELS = {
     "invalid_monthly_production": "Valor mensal de producao invalido",
     "portfolio_production_incomplete": "Total de producao do portfolio indisponivel",
     "production_financials_not_final": "Valores financeiros em rascunho",
-    "missing_hourly_production": "Sem producao horaria FusionSolar",
+    "missing_hourly_production": "Sem producao horaria da fonte selecionada",
     "missing_hourly_self_use": "Sem autoconsumo horario",
     "missing_helioscope_expected": "Sem Helioscope",
     "missing_financial_model": "Sem modelo financeiro",
@@ -693,6 +695,10 @@ def build_portfolio_report_rows(
     rows: list[dict[str, Any]] = []
     for asset in assets:
         asset_id = int(asset["asset_id"]) if asset["asset_id"] is not None else None
+        energy_source = resolve_asset_energy_source(conn, asset_id)
+        energy_provider = (
+            str(energy_source["provider"]) if energy_source is not None else ""
+        )
         warnings: list[str] = []
         mapping_status = str(asset["mapping_status"] or "")
         if asset_id is None:
@@ -764,7 +770,12 @@ def build_portfolio_report_rows(
         )
         deviation = actual - adjusted if actual is not None and adjusted is not None else None
         deviation_pct = (deviation / adjusted * 100) if deviation is not None and adjusted else None
-        availability = get_monthly_availability(conn, asset_id, start, end) if asset_id is not None else None
+        availability = (
+            get_monthly_availability(conn, asset_id, start, end)
+            if asset_id is not None
+            and energy_provider == "FusionSolar"
+            else None
+        )
         if availability is None:
             warnings.append("missing_availability")
         tariff_validity_warnings = detect_tariff_validity_warnings(conn, asset_id=asset_id, start=start, end=end) if asset_id is not None else ()
@@ -876,6 +887,16 @@ def build_portfolio_report_rows(
                 "actual_production_kwh": round(actual, 2) if actual is not None else None,
                 "raw_daily_production_kwh": round(production_quality.raw_daily_total_kwh, 2) if production_quality.raw_daily_total_kwh is not None else None,
                 "production_quality_status": production_quality.status,
+                "energy_provider": energy_provider,
+                "data_origin": "production_records",
+                "granularity": (
+                    "month+day" if prod is not None and daily_records
+                    else "month" if prod is not None
+                    else "day" if daily_records
+                    else "missing"
+                ),
+                "covered_period": f"{start.isoformat()}/{end.isoformat()}",
+                "quality_status": production_quality.status,
                 "production_source": production_quality.source,
                 "production_expected_days": production_quality.expected_days,
                 "production_available_days": production_quality.available_days,
@@ -1084,8 +1105,9 @@ def snapshot_portfolio_report(conn: sqlite3.Connection, portfolio_id: int, repor
                 report_id, asset_id, actual_production_kwh, production_ponta_kwh, production_cheia_kwh,
                 production_vazio_kwh, production_super_vazio_kwh, helioscope_expected_kwh,
                 adjusted_expected_kwh, degradation_factor, deviation_kwh, deviation_pct,
-                availability_pct, estimated_value_eur, data_status, warnings_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                availability_pct, estimated_value_eur, data_status, warnings_json,
+                energy_provider, data_origin, granularity, covered_period, quality_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 report_id,
@@ -1104,6 +1126,11 @@ def snapshot_portfolio_report(conn: sqlite3.Connection, portfolio_id: int, repor
                 row["estimated_value_eur"],
                 row["data_status"],
                 json.dumps(row["warnings"], ensure_ascii=True),
+                row.get("energy_provider", ""),
+                row.get("data_origin", ""),
+                row.get("granularity", ""),
+                row.get("covered_period", ""),
+                row.get("quality_status", ""),
             ),
         )
     return report_id

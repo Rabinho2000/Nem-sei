@@ -10,6 +10,7 @@
           <th>External ID</th>
           <th>External name</th>
           <th>Ultimo estado</th>
+          <th>Fonte de relatorio</th>
         </tr>
       </thead>
       <tbody>
@@ -21,9 +22,21 @@
             <td>{{ row.external_id or '-' }}</td>
             <td>{{ row.external_name or '-' }}</td>
             <td>{{ row.last_status or '-' }}</td>
+            <td>
+              {% if row.is_primary_energy_source %}
+                Primaria
+              {% else %}
+                <form method="post">
+                  <input type="hidden" name="action" value="set_primary_energy_source">
+                  <input type="hidden" name="asset_id" value="{{ row.asset_id }}">
+                  <input type="hidden" name="provider" value="{{ row.provider }}">
+                  <button class="button secondary" type="submit">Definir como primaria</button>
+                </form>
+              {% endif %}
+            </td>
           </tr>
         {% else %}
-          <tr><td colspan="6" class="muted">Ainda nao existem centrais mapeadas a APIs.</td></tr>
+          <tr><td colspan="7" class="muted">Ainda nao existem centrais mapeadas a APIs.</td></tr>
         {% endfor %}
       </tbody>
     </table>

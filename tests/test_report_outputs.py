@@ -3,7 +3,10 @@ from __future__ import annotations
 import sqlite3
 import struct
 import hashlib
+import io
+import json
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -13,18 +16,27 @@ import monitoring_board.app_factory as app_factory_module
 from openpyxl import load_workbook
 from pypdf import PdfReader
 from app import ensure_database
+from monitoring_board.customer_reports import prepare_customer_report
 from monitoring_board.portfolio_report_repository import get_default_profile
 from monitoring_board.portfolio_repository import create_portfolio
 from monitoring_board.report_template_repository import (
     archive_template,
     duplicate_template,
+    ensure_report_template_schema,
     get_default_template,
+    get_template,
     latest_template_version,
     list_templates,
     save_template,
     set_default_template,
 )
-from monitoring_board.reporting.templates import default_template
+from monitoring_board.reporting.templates import (
+    RENDERER_GENERIC_INDIVIDUAL,
+    RENDERER_GENERIC_PORTFOLIO,
+    RENDERER_SOLCOR_INDIVIDUAL,
+    default_template,
+    template_to_config,
+)
 from monitoring_board.reporting.templates import validate_template_scope
 from monitoring_board.reporting_storage import reconcile_generated_reports
 from monitoring_board.services.portfolio_reporting import prepare_portfolio_report
@@ -92,6 +104,37 @@ def report_test_client(db_path: Path):
         flask_app.config["TESTING"] = previous_testing
 
 
+def install_custom_individual_template(conn: sqlite3.Connection) -> int:
+    conn.execute("DELETE FROM report_template_versions")
+    conn.execute("DELETE FROM report_templates")
+    base = default_template("Individual padrao")
+    custom = replace(
+        base,
+        name="EPC Cliente Personalizado",
+        description="Configuração individual preservada",
+        title="Relatório Solar {asset}",
+        subtitle="Desempenho energético",
+        sections=(
+            TemplateSection("cover", "Capa personalizada", True, 10),
+            TemplateSection("production", "Produção personalizada", True, 20),
+            TemplateSection("warnings", "Avisos de qualidade", True, 30),
+        ),
+        branding=replace(
+            base.branding,
+            company_name="Solcor Cliente",
+            client_name="Cliente AGA",
+            logo_path="static/solcor-logo.png",
+            primary_color="#123456",
+            secondary_color="#65A430",
+            footer="Rodapé preservado",
+            contacts="reporting@example.invalid",
+            disclaimer="Configuração de teste.",
+        ),
+        filename_pattern="EPC_Custom_{asset}_{period}",
+    )
+    return save_template(conn, custom, is_default=1)
+
+
 def test_template_crud_default_version_and_invalid_config(tmp_path: Path) -> None:
     conn = connect(tmp_path)
     templates = list_templates(conn)
@@ -112,6 +155,176 @@ def test_template_crud_default_version_and_invalid_config(tmp_path: Path) -> Non
         assert str(exc) == "template_name_required"
     else:
         raise AssertionError("expected invalid template")
+
+
+def test_custom_template_survives_schema_and_startup_byte_for_byte(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "custom-template-startup.db"
+    ensure_database(str(db_path))
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        template_id = install_custom_individual_template(conn)
+        custom_config = json.dumps(
+            template_to_config(get_default_template(conn, "individual")),
+            ensure_ascii=False,
+            indent=2,
+        )
+        conn.execute(
+            "UPDATE report_templates SET config_json = ? WHERE id = ?",
+            (custom_config, template_id),
+        )
+        conn.execute(
+            "UPDATE report_template_versions SET config_json = ? WHERE template_id = ? AND version = 1",
+            (custom_config, template_id),
+        )
+        conn.commit()
+        template_before = dict(
+            conn.execute(
+                "SELECT * FROM report_templates WHERE id = ?",
+                (template_id,),
+            ).fetchone()
+        )
+        versions_before = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM report_template_versions WHERE template_id = ? ORDER BY id",
+                (template_id,),
+            )
+        ]
+
+        ensure_report_template_schema(conn)
+        conn.commit()
+
+    ensure_database(str(db_path))
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        templates_after = [
+            dict(row)
+            for row in conn.execute("SELECT * FROM report_templates ORDER BY id")
+        ]
+        versions_after = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM report_template_versions ORDER BY id"
+            )
+        ]
+
+    assert templates_after == [template_before]
+    assert versions_after == versions_before
+
+
+def test_persisted_custom_default_is_used_without_generic_reseed(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "custom-default.db"
+    ensure_database(str(db_path))
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        template_id = install_custom_individual_template(conn)
+        conn.commit()
+
+    ensure_database(str(db_path))
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        selected = get_default_template(conn, "individual")
+        rows = conn.execute(
+            "SELECT id, name, is_default FROM report_templates ORDER BY id"
+        ).fetchall()
+
+    assert selected.id == template_id
+    assert selected.name == "EPC Cliente Personalizado"
+    assert selected.branding.primary_color == "#123456"
+    assert [(row["id"], row["name"], row["is_default"]) for row in rows] == [
+        (template_id, "EPC Cliente Personalizado", 1)
+    ]
+
+
+def test_legacy_standard_template_infers_renderer_without_rewriting_config(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "legacy-renderer-inference.db"
+    ensure_database(str(db_path))
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT id, config_json FROM report_templates WHERE name = 'Individual padrao'"
+        ).fetchone()
+        config = json.loads(row["config_json"])
+        config.pop("renderer")
+        legacy_json = json.dumps(config, ensure_ascii=False, indent=2)
+        conn.execute(
+            "UPDATE report_templates SET config_json = ? WHERE id = ?",
+            (legacy_json, row["id"]),
+        )
+        conn.execute(
+            "UPDATE report_template_versions SET config_json = ? WHERE template_id = ?",
+            (legacy_json, row["id"]),
+        )
+        conn.commit()
+
+        ensure_report_template_schema(conn)
+        inferred = get_template(conn, row["id"])
+        stored_template = conn.execute(
+            "SELECT config_json FROM report_templates WHERE id = ?",
+            (row["id"],),
+        ).fetchone()[0]
+        stored_version = conn.execute(
+            "SELECT config_json FROM report_template_versions WHERE template_id = ?",
+            (row["id"],),
+        ).fetchone()[0]
+
+    assert inferred.renderer == RENDERER_SOLCOR_INDIVIDUAL
+    assert stored_template == legacy_json
+    assert stored_version == legacy_json
+
+
+def test_existing_template_version_remains_linked_to_historical_run(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "template-history-link.db"
+    ensure_database(str(db_path))
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        template_id = install_custom_individual_template(conn)
+        version = conn.execute(
+            "SELECT id, version, config_json FROM report_template_versions WHERE template_id = ?",
+            (template_id,),
+        ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO report_generation_runs (
+                template_id, template_version, report_type, asset_id,
+                period_type, period_start, period_end, status,
+                requested_count, completed_count, failed_count, created_at
+            ) VALUES (?, ?, 'individual', 1956, 'monthly', '2026-06-01',
+                      '2026-06-30', 'completed', 1, 1, 0, '2026-07-01T10:00:00')
+            """,
+            (template_id, version["version"]),
+        )
+        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+
+    ensure_database(str(db_path))
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        linked = conn.execute(
+            """
+            SELECT r.id AS run_id, r.template_id, r.template_version,
+                   v.id AS version_id, v.config_json
+            FROM report_generation_runs r
+            JOIN report_template_versions v
+              ON v.template_id = r.template_id
+             AND v.version = r.template_version
+            WHERE r.id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+
+    assert linked["template_id"] == template_id
+    assert linked["template_version"] == version["version"]
+    assert linked["version_id"] == version["id"]
+    assert linked["config_json"] == version["config_json"]
 
 
 def test_safe_filename_blocks_traversal_and_reserved_names() -> None:
@@ -141,6 +354,17 @@ def test_portfolio_renderers_use_canonical_result(tmp_path: Path) -> None:
     assert pdf.content.startswith(b"%PDF-")
     assert excel.content.startswith(b"PK")
     assert zipped.content.startswith(b"PK")
+
+
+def test_portfolio_defaults_have_explicit_generic_renderer() -> None:
+    for name in (
+        "Portfolio executivo",
+        "Portfolio operacional",
+        "Portfolio financeiro",
+    ):
+        template = default_template(name)
+        assert template.renderer == RENDERER_GENERIC_PORTFOLIO
+        assert template_to_config(template)["renderer"] == RENDERER_GENERIC_PORTFOLIO
 
 
 def test_report_generation_routes_create_files_and_download(tmp_path: Path) -> None:
@@ -245,6 +469,233 @@ def test_exports_individual_asset_query_renders_selected_option(tmp_path: Path) 
     option_start = html.index(f'<option value="{asset_id}" data-report-type=')
     assert " selected>" in html[option_start : option_start + 180]
     assert 'name="asset_id" id="report-asset" required' in html
+
+
+def test_individual_generation_uses_persisted_custom_default(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "custom-generation-template.db"
+    ensure_database(str(db_path))
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        asset_id = add_asset(conn, "Custom Template Solar")
+        template_id = install_custom_individual_template(conn)
+        conn.commit()
+
+    selected_templates = []
+
+    def fake_report(conn, asset_id, period_job, **kwargs):
+        return {
+            "asset": {"project_name": "Custom Template Solar"},
+            "period_label": "Junho 2026",
+        }
+
+    def fake_renderer(report, template):
+        selected_templates.append(template)
+        return app_factory_module.RenderedFile(
+            filename="custom-template.pdf",
+            content=b"%PDF-1.4 custom",
+            mimetype="application/pdf",
+            fmt="pdf",
+        )
+
+    monkeypatch.setattr(app_factory_module, "UPLOAD_DIR", tmp_path / "uploads")
+    monkeypatch.setattr(
+        app_factory_module,
+        "store_runtime_relative_path",
+        lambda path: str(path),
+    )
+    monkeypatch.setattr(
+        app_factory_module,
+        "build_individual_generation_report",
+        fake_report,
+    )
+    monkeypatch.setattr(app_factory_module, "render_individual_pdf", fake_renderer)
+
+    with report_test_client(db_path) as client:
+        response = client.post(
+            "/report-generation",
+            data={
+                "csrf_token": "token",
+                "report_type": "individual",
+                "asset_id": str(asset_id),
+                "period_type": "monthly",
+                "report_month": "2026-06",
+                "formats": ["pdf"],
+            },
+        )
+
+    assert response.status_code in {302, 303}
+    assert len(selected_templates) == 1
+    assert selected_templates[0].id == template_id
+    assert selected_templates[0].name == "EPC Cliente Personalizado"
+    assert selected_templates[0].title == "Relatório Solar {asset}"
+    with sqlite3.connect(db_path) as conn:
+        run = conn.execute(
+            "SELECT template_id, template_version, status FROM report_generation_runs"
+        ).fetchone()
+    assert run == (template_id, 1, "completed")
+
+
+def test_seeded_individual_epc_uses_recovered_solcor_layout() -> None:
+    notice = "Rascunho - produção incompleta: 20/31 dias disponíveis"
+    report = prepare_customer_report(
+        {
+            "asset": {
+                "id": 1956,
+                "project_name": "AGA (EPC)",
+                "contract_type": "EPC (O&M)",
+            },
+            "period_type": "monthly",
+            "period_start": "2026-07-01",
+            "period_end": "2026-07-31",
+            "period_label": "Julho 2026",
+            "production_kwh": None,
+            "self_use_kwh": None,
+            "export_kwh": None,
+            "consumption_kwh": None,
+            "production_is_final": False,
+            "daily_rows": [],
+            "report_notes": [notice],
+            "electricity_price": 0.2,
+            "sell_price": 0.04,
+            "coverage_pct": 0,
+        }
+    )
+
+    rendered = render_individual_pdf(report, default_template("Individual padrao"))
+    reader = PdfReader(io.BytesIO(rendered.content))
+    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    page = reader.pages[0]
+    xobjects = page["/Resources"].get("/XObject", {})
+
+    assert len(reader.pages) == 1
+    assert float(page.mediabox.width) > float(page.mediabox.height)
+    assert "Relatório Mensal - Energia Solar" in text
+    assert "Modelo EPC" in text
+    assert "Produção Total" in text
+    assert notice in text
+    assert "Cover" not in text
+    assert "Identification" not in text
+    assert "Executive Summary" not in text
+    assert len(xobjects) >= 1
+
+
+def test_seeded_individual_esco_uses_recovered_solcor_layout_and_kpis() -> None:
+    report = prepare_customer_report(
+        {
+            "asset": {
+                "id": 2035,
+                "project_name": "Sicobrita",
+                "contract_type": "ESCO",
+            },
+            "period_type": "monthly",
+            "period_start": "2026-06-01",
+            "period_end": "2026-06-30",
+            "period_label": "Junho 2026",
+            "production_kwh": 1000,
+            "self_use_kwh": 800,
+            "export_kwh": 200,
+            "consumption_kwh": 1200,
+            "production_is_final": True,
+            "daily_rows": [],
+            "electricity_price": 0.2,
+            "sell_price": 0.04,
+        },
+        solcor_price_per_kwh=0.08,
+    )
+
+    rendered = render_individual_pdf(report, default_template("Individual padrao"))
+    reader = PdfReader(io.BytesIO(rendered.content))
+    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+
+    assert len(reader.pages) == 1
+    assert float(reader.pages[0].mediabox.width) > float(reader.pages[0].mediabox.height)
+    assert "Modelo ESCO" in text
+    assert "Instalação operada em modelo ESCO" in text
+    assert "Pagamento à Solcor" in text
+    assert "Benefício Líquido" in text
+    assert "Cover" not in text
+
+
+def test_customised_individual_keeps_solcor_renderer_branding_and_sections(
+    tmp_path: Path,
+) -> None:
+    conn = connect(tmp_path)
+    template_id = install_custom_individual_template(conn)
+    conn.commit()
+    reloaded = get_template(conn, template_id)
+    raw_config = json.loads(
+        conn.execute(
+            "SELECT config_json FROM report_templates WHERE id = ?",
+            (template_id,),
+        ).fetchone()[0]
+    )
+    conn.close()
+
+    report = prepare_customer_report(
+        {
+            "asset": {
+                "id": 1956,
+                "project_name": "AGA Personalizada",
+                "contract_type": "EPC",
+            },
+            "period_type": "monthly",
+            "period_start": "2026-07-01",
+            "period_end": "2026-07-31",
+            "period_label": "Julho 2026",
+            "production_kwh": 120,
+            "self_use_kwh": 100,
+            "export_kwh": 20,
+            "consumption_kwh": 180,
+            "production_is_final": True,
+            "daily_rows": [],
+            "electricity_price": 0.2,
+            "sell_price": 0.04,
+        }
+    )
+    rendered = render_individual_pdf(report, reloaded)
+    reader = PdfReader(io.BytesIO(rendered.content))
+    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    content_stream = reader.pages[0].get_contents().get_data()
+
+    assert reloaded.renderer == RENDERER_SOLCOR_INDIVIDUAL
+    assert raw_config["renderer"] == RENDERER_SOLCOR_INDIVIDUAL
+    assert "Relatório Solar AGA Personalizada" in text
+    assert "Desempenho energético" in text
+    assert "Rodapé preservado" in text
+    assert "Produção Diária de Eletricidade" in text
+    assert "Destaques do Periodo" not in text
+    assert b".070588 .203922 .337255 rg" in content_stream
+    assert b".396078 .643137 .188235 rg" in content_stream
+
+
+def test_individual_compact_remains_explicit_generic_visual_family() -> None:
+    template = default_template("Individual compacto")
+    report = {
+        "asset": {"id": 1, "project_name": "Compact Test"},
+        "report_type": "epc",
+        "period_label": "Julho 2026",
+        "period_type": "monthly",
+        "period_start": "2026-07-01",
+        "period_end": "2026-07-31",
+        "production_kwh": 100,
+        "self_use_kwh": 80,
+        "export_kwh": 20,
+        "consumption_kwh": 120,
+        "net_benefit_eur": 12,
+    }
+
+    rendered = render_individual_pdf(report, template)
+    reader = PdfReader(io.BytesIO(rendered.content))
+    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+
+    assert template.renderer == RENDERER_GENERIC_INDIVIDUAL
+    assert float(reader.pages[0].mediabox.width) < float(reader.pages[0].mediabox.height)
+    assert "Cover" in text
+    assert "Identification" in text
+    assert "Modelo EPC" not in text
 
 
 def test_individual_generation_persists_scope_and_fallback_state(
@@ -355,6 +806,12 @@ def test_individual_generation_persists_scope_and_fallback_state(
     history_html = history.get_data(as_text=True)
     option_start = history_html.index(f'<option value="{asset_id}" data-report-type=')
     assert " selected>" in history_html[option_start : option_start + 180]
+    template_option_start = history_html.index(
+        f'<option value="{template_id}" data-template-type="individual"'
+    )
+    assert " selected>" in history_html[
+        template_option_start : template_option_start + 260
+    ]
     assert "Último relatório compatível" in history_html
     assert "stateful.pdf" in history_html
     assert f"#{run['id']}" in history_html
@@ -1050,8 +1507,39 @@ def test_ensure_database_is_idempotent_for_reporting_outputs(tmp_path: Path) -> 
     db_path = tmp_path / "idempotent.db"
     ensure_database(str(db_path))
     ensure_database(str(db_path))
-    conn = sqlite3.connect(db_path)
-    assert conn.execute("SELECT COUNT(*) FROM report_templates WHERE name = 'Portfolio executivo'").fetchone()[0] == 1
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        templates = conn.execute(
+            "SELECT name, report_type, active, is_default, config_json FROM report_templates ORDER BY id"
+        ).fetchall()
+
+    assert [row["name"] for row in templates] == [
+        "Individual padrao",
+        "Individual compacto",
+        "Portfolio executivo",
+        "Portfolio operacional",
+        "Portfolio financeiro",
+    ]
+    assert all(row["active"] == 1 and json.loads(row["config_json"]) for row in templates)
+    renderers = {
+        row["name"]: json.loads(row["config_json"])["renderer"]
+        for row in templates
+    }
+    assert renderers == {
+        "Individual padrao": RENDERER_SOLCOR_INDIVIDUAL,
+        "Individual compacto": RENDERER_GENERIC_INDIVIDUAL,
+        "Portfolio executivo": RENDERER_GENERIC_PORTFOLIO,
+        "Portfolio operacional": RENDERER_GENERIC_PORTFOLIO,
+        "Portfolio financeiro": RENDERER_GENERIC_PORTFOLIO,
+    }
+    assert {
+        (row["report_type"], row["name"])
+        for row in templates
+        if row["is_default"]
+    } == {
+        ("individual", "Individual padrao"),
+        ("portfolio", "Portfolio executivo"),
+    }
 
 
 def test_reporting_health_route(tmp_path: Path) -> None:

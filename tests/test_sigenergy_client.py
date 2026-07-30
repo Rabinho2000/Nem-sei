@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -36,9 +37,16 @@ def endpoints() -> SigenergyEndpoints:
 
 
 class FakeResponse:
-    def __init__(self, payload: Any, *, status_code: int = 200) -> None:
+    def __init__(
+        self,
+        payload: Any,
+        *,
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.payload = payload
         self.status_code = status_code
+        self.headers = headers or {}
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
@@ -135,17 +143,23 @@ def test_list_systems_uses_api_rows() -> None:
     assert session.requests[0]["headers"]["sigen-region"] == "eu"
 
 
-def test_list_systems_falls_back_to_configured_system_ids_without_api_call() -> None:
-    session = QueueSession({})
+def test_list_systems_ignores_legacy_system_ids_and_uses_discovery_api() -> None:
+    session = QueueSession(
+        {
+            "https://sigenergy.example.test/openapi/auth/login/key": [
+                FakeResponse(load_fixture("auth_success_object.json"))
+            ],
+            "https://sigenergy.example.test/openapi/system": [
+                FakeResponse(load_fixture("systems_list.json"))
+            ],
+        }
+    )
 
     systems = client(session, system_ids="SIG-001, SIG-002").list_systems()
 
-    assert systems == [
-        {"systemId": "SIG-001", "systemName": "SIG-001"},
-        {"systemId": "SIG-002", "systemName": "SIG-002"},
-    ]
-    assert session.posts == []
-    assert session.requests == []
+    assert [row["systemId"] for row in systems] == ["SIG-001", "SIG-002"]
+    assert len(session.posts) == 1
+    assert session.requests[0]["url"].endswith("/openapi/system")
 
 
 def test_energy_flow_current_by_system() -> None:
@@ -165,7 +179,7 @@ def test_energy_flow_current_by_system() -> None:
     assert session.requests[0]["json"] is None
 
 
-def test_history_get_uses_query_parameters_and_maps_energy_without_double_counting() -> None:
+def test_history_get_uses_query_parameters_and_returns_raw_energy_counters() -> None:
     history_url = "https://sigenergy.example.test/openapi/systems/SIG-001/history"
     history_data = {
         "powerGenerationKwh": "42.5",
@@ -195,14 +209,7 @@ def test_history_get_uses_query_parameters_and_maps_energy_without_double_counti
     assert sent["method"] == "GET"
     assert sent["params"] == {"level": "Day", "date": "2026-07-28"}
     assert sent["json"] is None
-    assert result["production_kwh"] == 42.5
-    assert result["consumption_kwh"] == 38.2
-    assert result["export_kwh"] == 10.1
-    assert result["grid_import_kwh"] == 5.8
-    assert result["self_consumption_kwh"] == 32.4
-    assert result["battery_charging_kwh"] == 3.2
-    assert result["battery_discharging_kwh"] == 2.7
-    assert "power_oneself_kwh" not in result
+    assert result == history_data
 
 
 def test_history_regression_rejects_json_body_but_accepts_query_parameters() -> None:
@@ -261,13 +268,40 @@ def test_history_regression_rejects_json_body_but_accepts_query_parameters() -> 
         "SIG-001", level="Day", target_date="2026-07-28"
     )
 
-    assert result["production_kwh"] == 12.3
+    assert result["powerGenerationKwh"] == 12.3
     assert session.requests[0]["json"] is not None
     assert session.requests[1]["params"] == {
         "level": "Day",
         "date": "2026-07-28",
     }
     assert session.requests[1]["json"] is None
+
+
+def test_system_history_uses_documented_daily_contract() -> None:
+    session = QueueSession(
+        {
+            "https://sigenergy.example.test/openapi/auth/login/key": [
+                FakeResponse(load_fixture("auth_success_object.json"))
+            ],
+            "https://sigenergy.example.test/openapi/systems/SIG-001/history": [
+                FakeResponse(load_fixture("system_history_day.json"))
+            ],
+        }
+    )
+
+    history = client(session).get_system_history(
+        "SIG-001",
+        level="Day",
+        target_date="2024-04-02",
+    )
+
+    assert history["powerGeneration"] == 22.94
+    assert session.requests[0]["method"] == "GET"
+    assert session.requests[0]["params"] == {
+        "level": "Day",
+        "date": "2024-04-02",
+    }
+    assert session.requests[0]["json"] is None
 
 
 def test_401_invalidates_token_and_relogs_once() -> None:
@@ -302,8 +336,53 @@ def test_http_429_raises_common_rate_limit_error() -> None:
         }
     )
 
-    with pytest.raises(ApiRateLimitError, match="Sigenergy HTTP 429"):
+    with pytest.raises(ApiRateLimitError, match="Sigenergy HTTP 429") as error:
         client(session).get_energy_flow("SIG-001")
+    assert error.value.area == "state"
+
+
+def test_discovery_429_is_classified_as_discovery() -> None:
+    session = QueueSession(
+        {
+            "https://sigenergy.example.test/openapi/auth/login/key": [
+                FakeResponse(load_fixture("auth_success_object.json"))
+            ],
+            "https://sigenergy.example.test/openapi/system": [
+                FakeResponse(
+                    {"code": 429, "msg": "too many"},
+                    status_code=429,
+                )
+            ],
+        }
+    )
+
+    with pytest.raises(ApiRateLimitError) as error:
+        client(session).list_systems()
+
+    assert error.value.area == "discovery"
+
+
+def test_http_429_respects_retry_after_seconds() -> None:
+    session = QueueSession(
+        {
+            "https://sigenergy.example.test/openapi/auth/login/key": [
+                FakeResponse(load_fixture("auth_success_object.json"))
+            ],
+            "https://sigenergy.example.test/openapi/systems/SIG-001/energyFlow": [
+                FakeResponse(
+                    {"code": 429, "msg": "too many"},
+                    status_code=429,
+                    headers={"Retry-After": "120"},
+                )
+            ],
+        }
+    )
+
+    before = datetime.now()
+    with pytest.raises(ApiRateLimitError) as error:
+        client(session).get_energy_flow("SIG-001")
+
+    assert 115 <= (error.value.cooldown_until - before).total_seconds() <= 125
 
 
 def test_normalizers_tolerate_missing_or_unexpected_fields() -> None:

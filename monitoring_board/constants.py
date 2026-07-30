@@ -29,6 +29,7 @@ DEFAULT_SIGENERGY_BASE_URL = "https://api-eu.sigencloud.com"
 DEFAULT_SIGENERGY_AUTH_ENDPOINT = "/openapi/auth/login/key"
 DEFAULT_SIGENERGY_SYSTEMS_ENDPOINT = "/openapi/system"
 DEFAULT_SIGENERGY_ENERGY_FLOW_ENDPOINT = "/openapi/systems/{system_id}/energyFlow"
+DEFAULT_SIGENERGY_HISTORY_ENDPOINT = "/openapi/systems/{system_id}/history"
 DEFAULT_SIGENERGY_ONBOARD_ENDPOINT = "/openapi/board/onboard"
 DEFAULT_SIGENERGY_REGION = "eu"
 DEFAULT_SIGENERGY_SNAPSHOT_RETENTION_DAYS = 90

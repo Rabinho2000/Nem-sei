@@ -8,6 +8,7 @@ from typing import Any
 
 from monitoring_board.db import query_all
 from monitoring_board.reporting.billing import decimal_from_value
+from monitoring_board.reporting.energy_sources import resolve_asset_energy_provider
 from monitoring_board.reporting.models import (
     BillingConfig,
     BillingEnergyBase,
@@ -921,19 +922,25 @@ def get_monthly_availability(conn: sqlite3.Connection, asset_id: int, start: dat
 def get_monthly_production_record(conn: sqlite3.Connection, asset_id: int | None, period_start: date) -> sqlite3.Row | None:
     if asset_id is None:
         return None
+    provider = resolve_asset_energy_provider(conn, asset_id)
+    if provider is None:
+        return None
     return conn.execute(
         """
         SELECT *
         FROM production_records
-        WHERE asset_id = ? AND provider = 'FusionSolar' AND period_type = 'month' AND period_date = ?
+        WHERE asset_id = ? AND provider = ? AND period_type = 'month' AND period_date = ?
         LIMIT 1
         """,
-        (asset_id, period_start.isoformat()),
+        (asset_id, provider, period_start.isoformat()),
     ).fetchone()
 
 
 def get_daily_production_totals(conn: sqlite3.Connection, asset_id: int | None, start: date, end: date) -> dict[str, float] | None:
     if asset_id is None:
+        return None
+    provider = resolve_asset_energy_provider(conn, asset_id)
+    if provider is None:
         return None
     row = conn.execute(
         """
@@ -942,13 +949,13 @@ def get_daily_production_totals(conn: sqlite3.Connection, asset_id: int | None, 
             COUNT(DISTINCT period_date) AS distinct_days_with_data
         FROM production_records
         WHERE asset_id = ?
-          AND provider = 'FusionSolar'
+          AND provider = ?
           AND period_type = 'day'
           AND period_date BETWEEN ? AND ?
           AND COALESCE(data_quality, '') != 'missing_production'
           AND production_kwh IS NOT NULL
         """,
-        (asset_id, start.isoformat(), end.isoformat()),
+        (asset_id, provider, start.isoformat(), end.isoformat()),
     ).fetchone()
     if row is None or int(row["distinct_days_with_data"] or 0) == 0 or row["production_kwh"] is None:
         return None
@@ -967,18 +974,21 @@ def list_monthly_production_records(
 ) -> list[sqlite3.Row]:
     if asset_id is None:
         return []
+    provider = resolve_asset_energy_provider(conn, asset_id)
+    if provider is None:
+        return []
     return query_all(
         conn,
         """
         SELECT *
         FROM production_records
         WHERE asset_id = ?
-          AND provider = 'FusionSolar'
+          AND provider = ?
           AND period_type = 'month'
           AND period_date BETWEEN ? AND ?
         ORDER BY period_date
         """,
-        (asset_id, start.isoformat(), end.isoformat()),
+        (asset_id, provider, start.isoformat(), end.isoformat()),
     )
 
 
@@ -991,18 +1001,21 @@ def list_daily_production_records(
 ) -> list[sqlite3.Row]:
     if asset_id is None:
         return []
+    provider = resolve_asset_energy_provider(conn, asset_id)
+    if provider is None:
+        return []
     return query_all(
         conn,
         """
         SELECT *
         FROM production_records
         WHERE asset_id = ?
-          AND provider = 'FusionSolar'
+          AND provider = ?
           AND period_type = 'day'
           AND period_date BETWEEN ? AND ?
         ORDER BY period_date
         """,
-        (asset_id, start.isoformat(), end.isoformat()),
+        (asset_id, provider, start.isoformat(), end.isoformat()),
     )
 
 
@@ -1038,15 +1051,18 @@ def list_hourly_production_records(
 ) -> list[sqlite3.Row]:
     if asset_id is None:
         return []
+    provider = resolve_asset_energy_provider(conn, asset_id)
+    if provider is None:
+        return []
     return query_all(
         conn,
         """
         SELECT *
         FROM production_hourly_records
-        WHERE asset_id = ? AND provider = 'FusionSolar' AND period_start >= ? AND period_start < ?
+        WHERE asset_id = ? AND provider = ? AND period_start >= ? AND period_start < ?
         ORDER BY period_start
         """,
-        (asset_id, start_iso, end_iso),
+        (asset_id, provider, start_iso, end_iso),
     )
 
 

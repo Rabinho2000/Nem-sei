@@ -6,40 +6,100 @@
       <thead>
         <tr>
           <th>Instalacao</th>
+          <th>System ID</th>
           <th>Asset local</th>
-          <th>Estado</th>
-          <th>PV</th>
-          <th>Carga</th>
-          <th>Rede raw</th>
-          <th>Bateria</th>
-          <th>SOC</th>
-          <th>Recolhido</th>
+          <th>Acesso</th>
+          <th>Ultimo estado</th>
+          <th>Ultima telemetria</th>
+          <th>Cobertura energetica</th>
+          <th>Relatorios</th>
+          <th>Fonte de relatorio</th>
+          <th>Historico</th>
           <th>Erro</th>
         </tr>
       </thead>
       <tbody>
         {% for row in sigenergy_system_rows %}
-          {% set no_battery = row.battery_capacity_kwh is not none and row.battery_capacity_kwh|float == 0 %}
           <tr>
             <td>
-              <strong>{{ row.mapped_external_name or row.external_id }}</strong>
-              <div class="muted">{{ row.external_id }}</div>
+              <strong>{{ row.external_name or row.mapped_external_name or row.external_id }}</strong>
             </td>
+            <td>{{ row.external_id }}</td>
             <td>{{ row.project_name or 'Por associar' }}</td>
-            <td>{{ row.normalized_status or '-' }}{% if row.external_status %}<div class="muted">{{ row.external_status }}</div>{% endif %}</td>
-            <td>{{ "%.3g"|format(row.pv_power_kw) if row.pv_power_kw is not none else 'N/A' }} kW</td>
-            <td>{{ "%.3g"|format(row.load_power_kw) if row.load_power_kw is not none else 'N/A' }} kW</td>
-            <td>{{ "%.3g"|format(row.grid_power_kw_raw) if row.grid_power_kw_raw is not none else 'N/A' }} kW</td>
-            <td>{{ 'N/A' if no_battery else (("%.3g"|format(row.battery_power_kw) ~ ' kW') if row.battery_power_kw is not none else 'N/A') }}</td>
-            <td>{{ 'N/A' if no_battery else (("%.3g"|format(row.battery_soc_pct) ~ '%') if row.battery_soc_pct is not none else 'N/A') }}</td>
-            <td>{{ row.collected_at }}</td>
-            <td>{{ row.last_error or '-' }}</td>
+            <td>
+              {% if row.access_status == 'unauthorized' %}
+                Sem autorizacao
+              {% elif row.access_status == 'not_returned' %}
+                Nao devolvida
+              {% else %}
+                Acessivel
+              {% endif %}
+            </td>
+            <td>{{ row.normalized_status or row.last_state or '-' }}<div class="muted">{{ row.collected_at or row.last_state_at or '-' }}</div></td>
+            <td>{{ row.last_energy_event_at or row.last_telemetry_at or 'Ainda sem energia' }}</td>
+            <td>
+              {{ row.current_month_days }}/{{ row.current_month_expected_days }} dias
+              ({{ row.current_month_coverage_pct }}%)
+              <div class="muted">
+                {{ row.granularity or 'sem granularidade' }}
+                {% if row.first_period_start %} · desde {{ row.first_period_start[:10] }}{% endif %}
+              </div>
+            </td>
+            <td>
+              {% if row.report_ready %}
+                Pronta
+                <div class="muted">desde {{ row.report_ready_since }}</div>
+              {% else %}
+                Dados insuficientes
+                <div class="muted">{{ row.data_quality or 'missing' }}</div>
+              {% endif %}
+            </td>
+            <td>
+              {% if row.asset_id %}
+                {% if row.is_primary_energy_source %}
+                  Primaria
+                {% elif not row.report_ready %}
+                  Bloqueada ate existir um mes completo
+                {% else %}
+                  <form method="post">
+                    <input type="hidden" name="action" value="set_primary_energy_source">
+                    <input type="hidden" name="asset_id" value="{{ row.asset_id }}">
+                    <input type="hidden" name="provider" value="Sigenergy">
+                    <input type="hidden" name="confirm_source_switch" value="1">
+                    <button class="button secondary" type="submit">Confirmar Sigenergy como primaria</button>
+                  </form>
+                {% endif %}
+              {% else %}
+                -
+              {% endif %}
+            </td>
+            <td>
+              {% if row.asset_id and row.access_status == 'accessible' %}
+                <form method="post" class="stack-form">
+                  <input type="hidden" name="action" value="sync_sigenergy_energy">
+                  <input type="hidden" name="external_id" value="{{ row.external_id }}">
+                  <label>De
+                    <input type="date" name="date_from" value="{{ sigenergy_default_history_date }}">
+                  </label>
+                  <label>Ate
+                    <input type="date" name="date_to" value="{{ sigenergy_default_history_date }}">
+                  </label>
+                  <button class="button secondary" type="submit">Ler energia</button>
+                </form>
+              {% else %}
+                Associa primeiro ao asset local
+              {% endif %}
+            </td>
+            <td>{{ row.display_error or '-' }}</td>
           </tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
   {% else %}
-    <p class="muted">Ainda nao existem snapshots Sigenergy. Usa Testar ligacao para validar a API ou Sincronizar agora para guardar dados.</p>
+    <p class="muted">Ainda nao existe inventario. Usa Atualizar instalacoes para descobrir os sistemas autorizados pela App Key.</p>
+  {% endif %}
+  {% if not sigenergy_history_unit_confirmed %}
+    <p class="muted">A ingestao energetica fica bloqueada ate a unidade dos totais historicos ser confirmada como kWh e configurada pelo administrador.</p>
   {% endif %}
 </section>

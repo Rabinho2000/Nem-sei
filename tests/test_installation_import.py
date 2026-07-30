@@ -223,11 +223,78 @@ def test_sigenergy_missing_access_sends_only_one_onboarding_request(tmp_path, mo
         row = conn.execute(
             "SELECT * FROM sigenergy_onboarding_requests WHERE system_id = 'SIG-PENDING'"
         ).fetchone()
+        queue_state = conn.execute(
+            """
+            SELECT daily_call_count
+            FROM production_api_queue_state
+            WHERE provider = 'sigenergy' AND api_area = 'discovery'
+            """
+        ).fetchone()
 
         assert first["request_id"] == second["request_id"]
         assert second["reused"] is True
         assert calls == ["SIG-PENDING"]
         assert row["attempt_count"] == 1
+        assert queue_state["daily_call_count"] == 1
+
+
+def test_sigenergy_import_list_and_preview_use_the_common_queue(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "sigenergy-import-queue.db"
+    app_module.ensure_database(str(db_path))
+
+    class FakeClient:
+        def __init__(self, _config, session=None) -> None:
+            self.session = session
+
+        def list_systems(self, *, allow_empty: bool = False):
+            assert allow_empty is True
+            return [
+                {
+                    "systemId": "SIG-QUEUE",
+                    "systemName": "Queued system",
+                    "status": "Normal",
+                }
+            ]
+
+        def get_energy_flow(self, system_id: str):
+            assert system_id == "SIG-QUEUE"
+            return {"pvPower": 1.5, "loadPower": 0.8}
+
+    monkeypatch.setattr(
+        app_module.sigenergy_service,
+        "SigenergyClient",
+        FakeClient,
+    )
+    with get_db(str(db_path)) as conn:
+        configure_provider(conn, "Sigenergy")
+
+        listed = app_module.list_provider_installations_for_import(
+            conn,
+            "Sigenergy",
+        )
+        preview, _raw = app_module.fetch_provider_installation_preview(
+            conn,
+            "Sigenergy",
+            "SIG-QUEUE",
+        )
+        queue_rows = {
+            row["api_area"]: int(row["daily_call_count"])
+            for row in conn.execute(
+                """
+                SELECT api_area, daily_call_count
+                FROM production_api_queue_state
+                WHERE provider = 'sigenergy'
+                """
+            ).fetchall()
+        }
+
+    assert [row["external_id"] for row in listed] == ["SIG-QUEUE"]
+    assert preview["external_id"] == "SIG-QUEUE"
+    assert queue_rows["discovery"] == 2
+    assert queue_rows["state"] == 1
 
 
 def test_access_check_resumes_pending_import_without_duplicate_data(tmp_path, monkeypatch) -> None:
@@ -544,8 +611,11 @@ def test_import_discovery_respects_existing_provider_cooldown(tmp_path, monkeypa
             app_module.list_provider_installations_for_import(conn, "FusionSolar")
 
 
-def test_failed_sigenergy_onboarding_job_leaves_no_partial_asset_or_mapping(tmp_path, monkeypatch) -> None:
-    db_path = tmp_path / "onboarding-failure.db"
+def test_sigenergy_access_pending_requires_explicit_onboarding_and_creates_no_mapping(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "onboarding-explicit.db"
     app_module.ensure_database(str(db_path))
     with get_db(str(db_path)) as conn:
         app_module.ensure_integration_seed_data(conn)
@@ -570,20 +640,15 @@ def test_failed_sigenergy_onboarding_job_leaves_no_partial_asset_or_mapping(tmp_
                 app_module.SigenergyInstallationAccessPending("pending")
             ),
         )
-        monkeypatch.setattr(
-            app_module,
-            "create_sigenergy_onboarding_request",
-            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("provider failed")),
-        )
-
-        with pytest.raises(RuntimeError, match="provider failed"):
-            app_module.run_installation_import_preview_job(conn, import_id)
+        result = app_module.run_installation_import_preview_job(conn, import_id)
 
         row = conn.execute(
             "SELECT * FROM installation_imports WHERE id = ?", (import_id,)
         ).fetchone()
-        assert row["status"] == "error"
-        assert "provider failed" in row["last_error"]
+        assert result["status"] == "access_pending"
+        assert result["onboarding_required"] is True
+        assert row["status"] == "access_pending"
+        assert row["access_status"] == "pending_approval"
         assert conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM asset_integrations").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM sigenergy_onboarding_requests").fetchone()[0] == 0
@@ -597,7 +662,7 @@ def test_failed_sigenergy_onboarding_job_leaves_no_partial_asset_or_mapping(tmp_
     ],
     ids=["empty-list", "requested-id-absent"],
 )
-def test_sigenergy_discovery_requests_onboarding_once_when_access_is_pending(
+def test_sigenergy_discovery_never_auto_requests_onboarding_when_access_is_pending(
     tmp_path,
     monkeypatch,
     available_systems,
@@ -605,7 +670,6 @@ def test_sigenergy_discovery_requests_onboarding_once_when_access_is_pending(
     db_path = tmp_path / "sigenergy-access-pending.db"
     app_module.ensure_database(str(db_path))
     list_calls: list[bool] = []
-    onboarding_calls: list[str] = []
 
     class FakeClient:
         def __init__(self, _config, session=None) -> None:
@@ -618,25 +682,10 @@ def test_sigenergy_discovery_requests_onboarding_once_when_access_is_pending(
         def get_energy_flow(self, _system_id: str):
             raise AssertionError("Energy flow must not be requested without access")
 
-    def fake_onboard(_config, system_id, session):
-        onboarding_calls.append(system_id)
-        return {
-            "system_id": system_id,
-            "status": "requested",
-            "provider_code": "0",
-            "message": "pending",
-            "response": {"code": 0},
-        }
-
     monkeypatch.setattr(
         app_module.sigenergy_service,
         "SigenergyClient",
         FakeClient,
-    )
-    monkeypatch.setattr(
-        app_module.sigenergy_service,
-        "onboard_system",
-        fake_onboard,
     )
     with get_db(str(db_path)) as conn:
         configure_provider(conn, "Sigenergy")
@@ -670,21 +719,15 @@ def test_sigenergy_discovery_requests_onboarding_once_when_access_is_pending(
             "SELECT * FROM installation_imports WHERE id = ?",
             (import_id,),
         ).fetchone()
-        onboarding = conn.execute(
-            """
-            SELECT *
-            FROM sigenergy_onboarding_requests
-            WHERE installation_import_id = ?
-            """,
-            (import_id,),
-        ).fetchone()
+        onboarding_count = conn.execute(
+            "SELECT COUNT(*) FROM sigenergy_onboarding_requests"
+        ).fetchone()[0]
 
     assert first["status"] == second["status"] == "access_pending"
     assert list_calls == [True, True]
-    assert onboarding_calls == ["SIG-REQUESTED"]
     assert installation_import["status"] == "access_pending"
-    assert installation_import["onboarding_request_id"] == onboarding["id"]
-    assert onboarding["attempt_count"] == 1
+    assert installation_import["onboarding_request_id"] is None
+    assert onboarding_count == 0
 
 
 def test_sigenergy_accessible_import_syncs_only_new_mapping_despite_fixed_ids(
@@ -780,12 +823,12 @@ def test_sigenergy_accessible_import_syncs_only_new_mapping_despite_fixed_ids(
 
     assert json.loads(job["params_json"])["target_external_ids"] == ["SIG-NEW"]
     assert client_configs[0] == ""
-    assert client_configs[-1] == ["SIG-NEW"]
+    assert client_configs[-1] == ""
     assert result["matched"] == 1
     assert {row["external_id"] for row in snapshots} == {"SIG-NEW"}
 
 
-def test_sigenergy_normal_sync_uses_only_active_mappings(
+def test_sigenergy_normal_sync_uses_full_discovery_and_ignores_manual_ids(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -799,14 +842,10 @@ def test_sigenergy_normal_sync_uses_only_active_mappings(
             self.system_ids = config.get("system_ids")
             self.session = session
 
-        def list_systems(self):
+        def list_systems(self, *, allow_empty: bool = False):
             return [
-                {
-                    "systemId": item,
-                    "systemName": item,
-                    "status": "Normal",
-                }
-                for item in self.system_ids
+                {"systemId": "SIG-ACTIVE", "systemName": "Active", "status": "Normal"},
+                {"systemId": "SIG-UNMAPPED", "systemName": "Unmapped", "status": "Normal"},
             ]
 
         def get_energy_flow(self, _system_id: str):
@@ -852,8 +891,11 @@ def test_sigenergy_normal_sync_uses_only_active_mappings(
             dry_run=True,
         )
 
-    assert configured_ids == [["SIG-ACTIVE"]]
-    assert [row["external_id"] for row in result["rows"]] == ["SIG-ACTIVE"]
+    assert configured_ids == [""]
+    assert [row["external_id"] for row in result["rows"]] == [
+        "SIG-ACTIVE",
+        "SIG-UNMAPPED",
+    ]
 
 
 def test_fusionsolar_raw_devices_are_normalized_for_realtime_and_storage(

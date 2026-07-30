@@ -4,6 +4,7 @@ import io
 import logging
 import re
 import unicodedata
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,55 @@ LIGHT_BLUE = colors.HexColor("#EDF3F8")
 LIGHT_GRAY = colors.HexColor("#F5F6F7")
 MID_GRAY = colors.HexColor("#D8DDE2")
 TEXT_GRAY = colors.HexColor("#66717E")
+
+
+@dataclass(frozen=True)
+class CustomerReportVisualStyle:
+    title: str = ""
+    subtitle: str = ""
+    company_name: str = "SOLCOR"
+    primary_color: str = "#0B2D52"
+    secondary_color: str = "#4BA52E"
+    footer: str = ""
+    contacts: str = ""
+    disclaimer: str = ""
+    enabled_sections: frozenset[str] | None = None
+
+
+def _visual_style(pdf: canvas.Canvas) -> CustomerReportVisualStyle:
+    return getattr(pdf, "_customer_report_visual_style", CustomerReportVisualStyle())
+
+
+def _primary(pdf: canvas.Canvas):
+    return colors.HexColor(_visual_style(pdf).primary_color)
+
+
+def _secondary(pdf: canvas.Canvas):
+    return colors.HexColor(_visual_style(pdf).secondary_color)
+
+
+def _secondary_light(pdf: canvas.Canvas):
+    color = _secondary(pdf)
+    return colors.Color(
+        0.88 + color.red * 0.12,
+        0.88 + color.green * 0.12,
+        0.88 + color.blue * 0.12,
+    )
+
+
+def _themed_color(pdf: canvas.Canvas, color):
+    if color == NAVY:
+        return _primary(pdf)
+    if color == GREEN:
+        return _secondary(pdf)
+    if color == LIGHT_GREEN:
+        return _secondary_light(pdf)
+    return color
+
+
+def _section_enabled(pdf: canvas.Canvas, *keys: str) -> bool:
+    enabled = _visual_style(pdf).enabled_sections
+    return enabled is None or any(key in enabled for key in keys)
 
 
 REPORT_TYPES: dict[str, dict[str, Any]] = {
@@ -165,6 +215,11 @@ def prepare_customer_report(
         config,
         months_count=months_count,
     )
+    grid_import_decimal = (
+        decimal_from_value(report.get("grid_import_kwh"))
+        if report.get("grid_import_kwh") is not None
+        else billing.grid_import_kwh
+    )
     tariff_value = decimal_from_value(report.get("tariff_value_eur")) if report.get("tariff_value_eur") is not None else None
     savings_eur = tariff_value if tariff_value is not None else billing.savings_eur
     gross_benefit_eur = savings_eur + billing.export_revenue_eur
@@ -198,7 +253,7 @@ def prepare_customer_report(
         solcor_payment_eur=decimal_to_float(billing.solcor_payment_eur),
         net_benefit_eur=decimal_to_float(net_benefit_eur),
         billable_energy_kwh=decimal_to_float(billing.billable_energy_kwh),
-        grid_import_kwh=decimal_to_float(billing.grid_import_kwh),
+        grid_import_kwh=decimal_to_float(grid_import_decimal),
         exported_energy_kwh=decimal_to_float(billing.exported_energy_kwh),
         billing_mode=billing.billing_mode.value,
         billing_energy_base=billing.billing_energy_base.value,
@@ -275,11 +330,11 @@ def format_pct(value: Any) -> str:
     return f"{_number(value):.0f}%"
 
 
-def _scaled_text(pdf: canvas.Canvas, text: str, x: float, y: float, width: float, *, size: int, color=NAVY) -> None:
+def _scaled_text(pdf: canvas.Canvas, text: str, x: float, y: float, width: float, *, size: int, color=None) -> None:
     font = "Helvetica-Bold"
     while size > 6 and pdf.stringWidth(text, font, size) > width:
         size -= 1
-    pdf.setFillColor(color)
+    pdf.setFillColor(_themed_color(pdf, color) if color is not None else _primary(pdf))
     pdf.setFont(font, size)
     pdf.drawString(x, y, text)
 
@@ -295,9 +350,9 @@ def _draw_logo(pdf: canvas.Canvas, logo_path: Path | None, x: float, y: float, w
     if logo_path and logo_path.exists():
         pdf.drawImage(ImageReader(str(logo_path)), x, y, width=width, height=width * 0.28, preserveAspectRatio=True, mask="auto")
         return
-    pdf.setFillColor(GREEN)
+    pdf.setFillColor(_secondary(pdf))
     pdf.setFont("Helvetica-Bold", 24)
-    pdf.drawRightString(x + width, y + 10, "SOLCOR")
+    pdf.drawRightString(x + width, y + 10, _visual_style(pdf).company_name or "SOLCOR")
 
 
 def draw_report_icon(pdf: canvas.Canvas, kind: str, cx: float, cy: float, color) -> None:
@@ -364,17 +419,25 @@ def kpi_icon_kind(key: str) -> str:
 
 def draw_report_header(pdf: canvas.Canvas, report: dict[str, Any], logo_path: Path | None, page_width: float, page_height: float) -> None:
     x = 20
-    _scaled_text(pdf, str(report["asset"].get("project_name") or "Instalacao"), x, page_height - 31, 430, size=22)
+    style = _visual_style(pdf)
+    _scaled_text(
+        pdf,
+        style.title or str(report["asset"].get("project_name") or "Instalacao"),
+        x,
+        page_height - 31,
+        430,
+        size=22,
+    )
     pdf.setFont("Helvetica", 10)
-    pdf.setFillColor(NAVY)
+    pdf.setFillColor(_primary(pdf))
     months_count = int(report.get("months_count") or 1)
     title = "Relatório Mensal - Energia Solar" if months_count == 1 else f"Relatório {report.get('period_label')} - Energia Solar"
-    pdf.drawString(x, page_height - 47, title)
+    pdf.drawString(x, page_height - 47, style.subtitle or title)
     pdf.setFont("Helvetica-Bold", 9)
     pdf.drawString(x, page_height - 62, str(report.get("month_label") or ""))
     config = REPORT_TYPES[report["report_type"]]
     badge_x = 186
-    pdf.setFillColor(GREEN)
+    pdf.setFillColor(_secondary(pdf))
     pdf.roundRect(badge_x, page_height - 55, 78, 16, 8, fill=1, stroke=0)
     pdf.setFillColor(colors.white)
     pdf.setFont("Helvetica-Bold", 8)
@@ -383,7 +446,7 @@ def draw_report_header(pdf: canvas.Canvas, report: dict[str, Any], logo_path: Pa
     pdf.setFillColor(TEXT_GRAY)
     pdf.setFont("Helvetica", 7)
     pdf.drawRightString(page_width - 20, page_height - 67, config["note"])
-    pdf.setStrokeColor(GREEN)
+    pdf.setStrokeColor(_secondary(pdf))
     pdf.setLineWidth(1)
     pdf.line(20, page_height - 72, page_width - 20, page_height - 72)
 
@@ -391,7 +454,11 @@ def draw_report_header(pdf: canvas.Canvas, report: dict[str, Any], logo_path: Pa
 def draw_kpi_cards(pdf: canvas.Canvas, report: dict[str, Any], page_width: float, page_height: float) -> None:
     config = REPORT_TYPES[report["report_type"]]
     items = list(config["kpis"])
-    if report.get("include_availability_kpi") and report.get("availability_pct") is not None:
+    if (
+        _section_enabled(pdf, "availability")
+        and report.get("include_availability_kpi")
+        and report.get("availability_pct") is not None
+    ):
         items.append(("Disponibilidade (%)", "availability_pct", "pct", GREEN))
     gap = 6
     x0 = 20
@@ -400,10 +467,11 @@ def draw_kpi_cards(pdf: canvas.Canvas, report: dict[str, Any], page_width: float
     for index, (label, key, kind, accent) in enumerate(items):
         x = x0 + index * (card_w + gap)
         _card(pdf, x, y, card_w, 52)
+        accent = _themed_color(pdf, accent)
         pdf.setFillColor(accent)
         pdf.circle(x + 19, y + 26, 13, fill=0, stroke=1)
         draw_report_icon(pdf, kpi_icon_kind(key), x + 19, y + 26, accent)
-        pdf.setFillColor(NAVY)
+        pdf.setFillColor(_primary(pdf))
         pdf.setFont("Helvetica-Bold", 7)
         pdf.drawString(x + 38, y + 33, label)
         if kind == "kwh":
@@ -417,7 +485,7 @@ def draw_kpi_cards(pdf: canvas.Canvas, report: dict[str, Any], page_width: float
 
 def draw_daily_chart(pdf: canvas.Canvas, report: dict[str, Any], x: float, y: float, width: float, height: float) -> None:
     _card(pdf, x, y, width, height)
-    pdf.setFillColor(NAVY)
+    pdf.setFillColor(_primary(pdf))
     pdf.setFont("Helvetica-Bold", 9)
     pdf.drawString(x + 12, y + height - 17, "Produção Diária de Eletricidade (kWh)")
     plot_x, plot_y = x + 28, y + 28
@@ -448,18 +516,18 @@ def draw_daily_chart(pdf: canvas.Canvas, report: dict[str, Any], x: float, y: fl
         self_h = plot_h * self_use / max_value
         pdf.rect(x_bar, plot_y, bar_w, self_h, fill=1, stroke=0)
         if export:
-            pdf.setFillColor(NAVY)
+            pdf.setFillColor(_primary(pdf))
             pdf.rect(x_bar, plot_y + self_h, bar_w, plot_h * export / max_value, fill=1, stroke=0)
         if day == 1 or day == days or day % 3 == 0:
             pdf.setFillColor(TEXT_GRAY)
             pdf.setFont("Helvetica", 5)
             pdf.drawCentredString(x_bar + bar_w / 2, plot_y - 9, str(day))
-    legend = ((MID_GRAY, "Consumo da empresa"), (ORANGE, "Solar autoconsumida"), (NAVY, "Solar excedente"))
+    legend = ((MID_GRAY, "Consumo da empresa"), (ORANGE, "Solar autoconsumida"), (_primary(pdf), "Solar excedente"))
     legend_x = x + 150
     for color, label in legend:
         pdf.setFillColor(color)
         pdf.rect(legend_x, y + 8, 6, 6, fill=1, stroke=0)
-        pdf.setFillColor(NAVY)
+        pdf.setFillColor(_primary(pdf))
         pdf.setFont("Helvetica", 6)
         pdf.drawString(legend_x + 9, y + 8, label)
         legend_x += 112
@@ -467,7 +535,7 @@ def draw_daily_chart(pdf: canvas.Canvas, report: dict[str, Any], x: float, y: fl
 
 def draw_monthly_chart(pdf: canvas.Canvas, report: dict[str, Any], x: float, y: float, width: float, height: float) -> None:
     _card(pdf, x, y, width, height)
-    pdf.setFillColor(NAVY)
+    pdf.setFillColor(_primary(pdf))
     pdf.setFont("Helvetica-Bold", 9)
     pdf.drawString(x + 12, y + height - 17, "Produção Mensal de Eletricidade (kWh)")
     plot_x, plot_y = x + 36, y + 28
@@ -500,17 +568,17 @@ def draw_monthly_chart(pdf: canvas.Canvas, report: dict[str, Any], x: float, y: 
         self_h = plot_h * self_use / max_value
         pdf.rect(x_bar, plot_y, bar_w, self_h, fill=1, stroke=0)
         if export:
-            pdf.setFillColor(NAVY)
+            pdf.setFillColor(_primary(pdf))
             pdf.rect(x_bar, plot_y + self_h, bar_w, plot_h * export / max_value, fill=1, stroke=0)
         pdf.setFillColor(TEXT_GRAY)
         pdf.setFont("Helvetica", 5.5)
         pdf.drawCentredString(x_bar + bar_w / 2, plot_y - 9, str(row.get("label") or ""))
-    legend = ((MID_GRAY, "Consumo da empresa"), (ORANGE, "Solar autoconsumida"), (NAVY, "Solar excedente"))
+    legend = ((MID_GRAY, "Consumo da empresa"), (ORANGE, "Solar autoconsumida"), (_primary(pdf), "Solar excedente"))
     legend_x = x + 150
     for color, label in legend:
         pdf.setFillColor(color)
         pdf.rect(legend_x, y + 8, 6, 6, fill=1, stroke=0)
-        pdf.setFillColor(NAVY)
+        pdf.setFillColor(_primary(pdf))
         pdf.setFont("Helvetica", 6)
         pdf.drawString(legend_x + 9, y + 8, label)
         legend_x += 112
@@ -518,7 +586,7 @@ def draw_monthly_chart(pdf: canvas.Canvas, report: dict[str, Any], x: float, y: 
 
 def draw_highlights(pdf: canvas.Canvas, report: dict[str, Any], x: float, y: float, width: float, height: float) -> None:
     _card(pdf, x, y, width, height, fill=LIGHT_GRAY)
-    pdf.setFillColor(NAVY)
+    pdf.setFillColor(_primary(pdf))
     pdf.setFont("Helvetica-Bold", 9)
     pdf.drawString(x + 12, y + height - 17, "Destaques do Periodo")
     items = (
@@ -531,18 +599,18 @@ def draw_highlights(pdf: canvas.Canvas, report: dict[str, Any], x: float, y: flo
     for index, (label, value, fill, icon_kind) in enumerate(items):
         card_y = y + height - 28 - (index + 1) * card_h - index * 3
         _card(pdf, x + 7, card_y, width - 14, card_h, fill=colors.white)
-        pdf.setFillColor(fill)
+        pdf.setFillColor(_themed_color(pdf, fill))
         pdf.circle(x + 31, card_y + card_h / 2, 14, fill=1, stroke=0)
-        draw_report_icon(pdf, icon_kind, x + 31, card_y + card_h / 2, GREEN)
-        pdf.setFillColor(NAVY)
+        draw_report_icon(pdf, icon_kind, x + 31, card_y + card_h / 2, _secondary(pdf))
+        pdf.setFillColor(_primary(pdf))
         pdf.setFont("Helvetica-Bold", 7)
         pdf.drawString(x + 52, card_y + card_h - 15, label)
-        _scaled_text(pdf, value, x + 52, card_y + 9, width - 65, size=12, color=GREEN)
+        _scaled_text(pdf, value, x + 52, card_y + 9, width - 65, size=12, color=_secondary(pdf))
 
 
 def draw_monthly_summary(pdf: canvas.Canvas, report: dict[str, Any], x: float, y: float, width: float, height: float) -> None:
     _card(pdf, x, y, width, height)
-    pdf.setFillColor(NAVY)
+    pdf.setFillColor(_primary(pdf))
     pdf.setFont("Helvetica-Bold", 9)
     pdf.drawString(x + 12, y + height - 16, "Resumo do Periodo")
     rows = REPORT_TYPES[report["report_type"]]["summary"]
@@ -550,13 +618,13 @@ def draw_monthly_summary(pdf: canvas.Canvas, report: dict[str, Any], x: float, y
     for index, (label, key, kind) in enumerate(rows):
         row_y = y + height - 22 - (index + 1) * row_h
         is_total = label in {"Benefício total", "Benefício líquido"}
-        fill = GREEN if label == "Benefício total" else ORANGE if label == "Benefício líquido" else colors.white
+        fill = _secondary(pdf) if label == "Benefício total" else ORANGE if label == "Benefício líquido" else colors.white
         if is_total:
             pdf.setFillColor(fill)
             pdf.rect(x + 6, row_y, width - 12, row_h, fill=1, stroke=0)
         pdf.setStrokeColor(MID_GRAY)
         pdf.line(x + 6, row_y, x + width - 6, row_y)
-        pdf.setFillColor(colors.white if is_total else NAVY)
+        pdf.setFillColor(colors.white if is_total else _primary(pdf))
         pdf.setFont("Helvetica-Bold" if is_total else "Helvetica", 6.5)
         pdf.drawString(x + 12, row_y + row_h / 2 - 2, label)
         value = format_kwh(report[key]) if kind == "kwh" else format_eur(report[key])
@@ -564,17 +632,18 @@ def draw_monthly_summary(pdf: canvas.Canvas, report: dict[str, Any], x: float, y
         pdf.drawRightString(x + width - 12, row_y + row_h / 2 - 2, value)
 
 
-def _draw_donut(pdf: canvas.Canvas, center_x: float, center_y: float, radius: float, pct: float, color, label: str) -> None:
-    pct = min(max(pct, 0), 100)
+def _draw_donut(pdf: canvas.Canvas, center_x: float, center_y: float, radius: float, pct: float | None, color, label: str) -> None:
+    display_pct = min(max(pct, 0), 100) if pct is not None else None
     pdf.setFillColor(MID_GRAY)
     pdf.wedge(center_x - radius, center_y - radius, center_x + radius, center_y + radius, 90, 450, fill=1, stroke=0)
-    pdf.setFillColor(color)
-    pdf.wedge(center_x - radius, center_y - radius, center_x + radius, center_y + radius, 90, 90 + 360 * pct / 100, fill=1, stroke=0)
+    if display_pct is not None:
+        pdf.setFillColor(_themed_color(pdf, color))
+        pdf.wedge(center_x - radius, center_y - radius, center_x + radius, center_y + radius, 90, 90 + 360 * display_pct / 100, fill=1, stroke=0)
     pdf.setFillColor(colors.white)
     pdf.circle(center_x, center_y, radius * 0.58, fill=1, stroke=0)
-    pdf.setFillColor(NAVY)
+    pdf.setFillColor(_primary(pdf))
     pdf.setFont("Helvetica-Bold", 11)
-    pdf.drawCentredString(center_x, center_y - 4, format_pct(pct))
+    pdf.drawCentredString(center_x, center_y - 4, format_pct(display_pct) if display_pct is not None else "N/D")
     pdf.setFont("Helvetica-Bold", 7)
     pdf.drawCentredString(center_x, center_y + radius + 10, label)
 
@@ -585,7 +654,7 @@ def draw_donut_charts(pdf: canvas.Canvas, report: dict[str, Any], x: float, y: f
     for index in range(3):
         _card(pdf, x + index * (card_w + gap), y, card_w, height)
     _draw_donut(pdf, x + 54, y + 41, 29, report["autoconsumption_pct"], ORANGE, "Taxa de Autoconsumo")
-    pdf.setFillColor(NAVY)
+    pdf.setFillColor(_primary(pdf))
     pdf.setFont("Helvetica", 6.5)
     pdf.drawString(x + 95, y + 46, format_kwh(report["self_use_kwh"]))
     pdf.drawString(x + 95, y + 31, f"Excedente: {format_kwh(report['export_kwh'])}")
@@ -599,12 +668,12 @@ def draw_donut_charts(pdf: canvas.Canvas, report: dict[str, Any], x: float, y: f
             if not value:
                 continue
             extent = 360 * value / tariff_total
-            pdf.setFillColor(color)
+            pdf.setFillColor(_themed_color(pdf, color))
             pdf.wedge(center_x - radius, center_y - radius, center_x + radius, center_y + radius, angle, angle + extent, fill=1, stroke=0)
             angle += extent
         pdf.setFillColor(colors.white)
         pdf.circle(center_x, center_y, 17, fill=1, stroke=0)
-        pdf.setFillColor(NAVY)
+        pdf.setFillColor(_primary(pdf))
         pdf.setFont("Helvetica-Bold", 7)
         pdf.drawCentredString(center_x, center_y - 2, format_kwh(tariff_total))
         pdf.setFont("Helvetica-Bold", 7)
@@ -612,14 +681,14 @@ def draw_donut_charts(pdf: canvas.Canvas, report: dict[str, Any], x: float, y: f
         legend_y = y + 55
         for label, value, color in report["tariff_rows"]:
             if value:
-                pdf.setFillColor(color)
+                pdf.setFillColor(_themed_color(pdf, color))
                 pdf.circle(tariff_x + 100, legend_y, 3, fill=1, stroke=0)
-                pdf.setFillColor(NAVY)
+                pdf.setFillColor(_primary(pdf))
                 pdf.setFont("Helvetica", 5.5)
                 pdf.drawString(tariff_x + 108, legend_y - 2, f"{label}: {format_kwh(value)}")
                 legend_y -= 13
     else:
-        pdf.setFillColor(NAVY)
+        pdf.setFillColor(_primary(pdf))
         pdf.setFont("Helvetica-Bold", 7)
         pdf.drawCentredString(tariff_x + card_w / 2, y + height - 18, "Autoconsumo por Período Tarifário")
         pdf.setFillColor(TEXT_GRAY)
@@ -645,38 +714,50 @@ def draw_donut_charts(pdf: canvas.Canvas, report: dict[str, Any], x: float, y: f
 
     suff_x = x + 2 * (card_w + gap)
     _draw_donut(pdf, suff_x + 54, y + 41, 29, report["self_sufficiency_pct"], ORANGE, "Autossuficiência Energética")
-    pdf.setFillColor(NAVY)
+    pdf.setFillColor(_primary(pdf))
     pdf.setFont("Helvetica", 6.5)
     pdf.drawString(suff_x + 95, y + 46, f"Consumo: {format_kwh(report['consumption_kwh'])}")
     pdf.drawString(suff_x + 95, y + 31, f"Producao: {format_kwh(report['production_kwh'])}")
 
 
 def draw_report_footer(pdf: canvas.Canvas, report: dict[str, Any], page_width: float) -> None:
-    pdf.setStrokeColor(GREEN)
+    style = _visual_style(pdf)
+    pdf.setStrokeColor(_secondary(pdf))
     pdf.line(20, 18, page_width - 20, 18)
-    pdf.setFillColor(NAVY)
+    pdf.setFillColor(_primary(pdf))
     pdf.setFont("Helvetica-BoldOblique", 7)
-    pdf.drawString(24, 7, "Obrigado pela sua confiança!")
-    notes = report.get("report_notes") or []
+    pdf.drawString(24, 7, style.footer or "Obrigado pela sua confiança!")
+    notes = list(report.get("report_notes") or []) if _section_enabled(pdf, "warnings", "data_quality", "notes") else []
+    notes.extend(item for item in (style.contacts, style.disclaimer) if item)
     if notes:
         pdf.setFillColor(TEXT_GRAY)
         pdf.setFont("Helvetica", 5.5)
-        pdf.drawRightString(page_width - 20, 7, " ".join(notes))
+        _scaled_text(pdf, " ".join(notes), 340, 7, page_width - 360, size=5, color=TEXT_GRAY)
 
 
-def build_customer_report_pdf(report: dict[str, Any], *, logo_path: Path | None = None) -> bytes:
+def build_customer_report_pdf(
+    report: dict[str, Any],
+    *,
+    logo_path: Path | None = None,
+    visual_style: CustomerReportVisualStyle | None = None,
+) -> bytes:
     buffer = io.BytesIO()
     pdf = canvas.Canvas(buffer, pagesize=landscape(A4), pageCompression=1)
+    pdf._customer_report_visual_style = visual_style or CustomerReportVisualStyle()
     page_width, page_height = landscape(A4)
     draw_report_header(pdf, report, logo_path, page_width, page_height)
-    draw_kpi_cards(pdf, report, page_width, page_height)
-    if report.get("chart_granularity") == "monthly":
-        draw_monthly_chart(pdf, report, 20, 236, 604, 216)
-    else:
-        draw_daily_chart(pdf, report, 20, 236, 604, 216)
-    draw_highlights(pdf, report, 632, 236, page_width - 652, 216)
-    draw_monthly_summary(pdf, report, 20, 146, 604, 82)
-    draw_donut_charts(pdf, report, 20, 26, page_width - 40, 112)
+    if _section_enabled(pdf, "executive_summary", "production", "financial"):
+        draw_kpi_cards(pdf, report, page_width, page_height)
+    if _section_enabled(pdf, "production", "comparison"):
+        if report.get("chart_granularity") == "monthly":
+            draw_monthly_chart(pdf, report, 20, 236, 604, 216)
+        else:
+            draw_daily_chart(pdf, report, 20, 236, 604, 216)
+    if _section_enabled(pdf, "executive_summary", "financial"):
+        draw_highlights(pdf, report, 632, 236, page_width - 652, 216)
+        draw_monthly_summary(pdf, report, 20, 146, 604, 82)
+    if _section_enabled(pdf, "self_consumption", "tariffs"):
+        draw_donut_charts(pdf, report, 20, 26, page_width - 40, 112)
     draw_report_footer(pdf, report, page_width)
     pdf.showPage()
     pdf.save()

@@ -80,10 +80,15 @@ def evaluate_monthly_production_quality(
     expected_days = calendar.monthrange(month_start.year, month_start.month)[1]
     month_end = month_start.replace(day=expected_days)
     warnings: set[str] = set()
+    declared_non_final: set[str] = set()
 
     monthly_values: list[float] = []
     monthly_record_count = 0
     for record in monthly_records:
+        declared_quality = str(_record_get(record, "data_quality") or "").strip()
+        if declared_quality in {"partial", "missing", "conflict", "in_progress"}:
+            declared_non_final.add(declared_quality)
+            warnings.add(f"source_quality_{declared_quality}")
         record_date = _record_date(record)
         if record_date is not None and record_date.replace(day=1) != month_start:
             continue
@@ -100,6 +105,10 @@ def evaluate_monthly_production_quality(
     daily_by_date: dict[date, float] = {}
     seen_daily_dates: set[date] = set()
     for record in daily_records:
+        declared_quality = str(_record_get(record, "data_quality") or "").strip()
+        if declared_quality in {"partial", "missing", "conflict", "in_progress"}:
+            declared_non_final.add(declared_quality)
+            warnings.add(f"source_quality_{declared_quality}")
         record_date = _record_date(record)
         if record_date is None or not month_start <= record_date <= month_end:
             continue
@@ -138,6 +147,12 @@ def evaluate_monthly_production_quality(
             asset_id, month_start, "missing", None, raw_daily_total, source,
             expected_days, available_days, missing_dates, coverage_ratio, daily_coverage, warnings,
         )
+    for declared_status in ("conflict", "in_progress", "partial", "missing"):
+        if declared_status in declared_non_final:
+            return _result(
+                asset_id, month_start, declared_status, None, raw_daily_total, source,
+                expected_days, available_days, missing_dates, coverage_ratio, daily_coverage, warnings,
+            )
 
     if monthly_value is not None:
         tolerance = monthly_daily_tolerance_kwh(monthly_value)

@@ -78,3 +78,125 @@ def test_integrations_ui_does_not_force_hidden_auto_sync_and_has_daily_fields(tm
     assert 'name="diagnostics_sync_enabled"' in html
     assert 'name="production_sync_time"' in html
     assert 'name="diagnostics_sync_time"' in html
+
+
+def test_sigenergy_ui_hides_technical_endpoints_and_manual_system_allowlist(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "sigenergy-operational-ui.db"
+    app_module.ensure_database(str(db_path))
+    monkeypatch.delenv("SIGENERGY_APP_SECRET", raising=False)
+    with get_db(str(db_path)) as conn:
+        now = datetime.now().isoformat(timespec="seconds")
+        conn.execute(
+            """
+            INSERT INTO integration_configs (
+                provider, username, password, enabled, created_at, updated_at
+            ) VALUES ('Sigenergy', '', '', 0, ?, ?)
+            """,
+            (now, now),
+        )
+        conn.commit()
+
+    flask_app, original_database, client = authenticated_client(db_path)
+    try:
+        response = client.get("/integrations")
+    finally:
+        flask_app.config["DATABASE"] = original_database
+
+    html = response.get_data(as_text=True)
+    assert response.status_code == 200
+    assert 'name="system_ids"' not in html
+    assert "Energy flow endpoint" not in html
+    assert "System IDs opcionais" not in html
+    assert 'value="refresh_sigenergy_systems"' in html
+
+
+def test_sigenergy_connection_test_lists_systems_without_energy_flow(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "sigenergy-test-connection.db"
+    app_module.ensure_database(str(db_path))
+    calls = []
+
+    def fake_check(_conn, provider, **kwargs):
+        calls.append((provider, kwargs))
+        return {
+            "station_count": 2,
+            "realtime_count": 0,
+            "failed_realtime_count": 0,
+        }
+
+    monkeypatch.setattr(app_module, "run_sigenergy_check", fake_check)
+    flask_app, original_database, client = authenticated_client(db_path)
+    try:
+        response = client.post(
+            "/integrations",
+            data={
+                "csrf_token": "token",
+                "action": "test_sigenergy_connection",
+            },
+        )
+    finally:
+        flask_app.config["DATABASE"] = original_database
+
+    assert response.status_code == 302
+    assert calls == [
+        (
+            app_module.INTEGRATION_PROVIDER_SIGENERGY,
+            {"dry_run": True, "include_energy_flow": False},
+        )
+    ]
+
+
+def test_sigenergy_onboarding_requires_explicit_remote_confirmation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "sigenergy-onboarding-confirmation.db"
+    app_module.ensure_database(str(db_path))
+    with get_db(str(db_path)) as conn:
+        app_module.ensure_integration_seed_data(conn)
+        conn.commit()
+    calls: list[str] = []
+
+    def fake_onboarding(_conn, _config, system_id, **_kwargs):
+        calls.append(system_id)
+        return {
+            "system_id": system_id,
+            "status": "requested",
+            "message": "pending",
+        }
+
+    monkeypatch.setattr(
+        app_module,
+        "create_sigenergy_onboarding_request",
+        fake_onboarding,
+    )
+    flask_app, original_database, client = authenticated_client(db_path)
+    try:
+        rejected = client.post(
+            "/integrations",
+            data={
+                "csrf_token": "token",
+                "action": "onboard_sigenergy_system",
+                "system_id": "SIG-CONFIRM",
+            },
+        )
+        accepted = client.post(
+            "/integrations",
+            data={
+                "csrf_token": "token",
+                "action": "onboard_sigenergy_system",
+                "system_id": "SIG-CONFIRM",
+                "confirm_remote_access": "1",
+            },
+        )
+    finally:
+        flask_app.config["DATABASE"] = original_database
+
+    assert rejected.status_code == 302
+    assert accepted.status_code == 302
+    assert calls == ["SIG-CONFIRM"]
