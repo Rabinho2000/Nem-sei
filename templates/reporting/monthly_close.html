@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="reports-header">
+  <div>
+    <p class="eyebrow">Reporting</p>
+    <h2>Fecho mensal</h2>
+    <p class="muted">Preparar, validar e aprovar dados congelados antes da geração final.</p>
+  </div>
+</section>
+<nav class="reports-tabs" aria-label="Área de relatórios">
+  <a href="{{ url_for('exports', tab='generate') }}">Gerar</a>
+  <a class="active" aria-current="page" href="{{ url_for('reporting.monthly_close', report_month=report_month) }}">Fecho mensal</a>
+  <a href="{{ url_for('exports', tab='automations') }}">Automatizações</a>
+  <a href="{{ url_for('exports', tab='templates') }}">Templates</a>
+  <a href="{{ url_for('exports', tab='history') }}">Histórico</a>
+</nav>
+<section class="card reports-card">
+  <form method="get" class="form-grid">
+    <label>Mês <input type="month" name="report_month" value="{{ report_month }}" required></label>
+    <label>Âmbito
+      <select name="scope_type">
+        <option value="individual" {{ 'selected' if scope_type == 'individual' else '' }}>Instalação</option>
+        <option value="portfolio" {{ 'selected' if scope_type == 'portfolio' else '' }}>Portefólio</option>
+      </select>
+    </label>
+    <button class="button secondary" type="submit">Aplicar filtros</button>
+  </form>
+</section>
+<section class="card reports-card">
+  <h3>Criar snapshot de fecho</h3>
+  <form method="post" action="{{ url_for('reporting.create_monthly_close_snapshot') }}" class="form-grid">
+    <input type="hidden" name="report_month" value="{{ report_month }}">
+    <input type="hidden" name="scope_type" value="{{ scope_type }}">
+    {% if scope_type == 'portfolio' %}
+      <label>Portefólio
+        <select name="portfolio_id" required>
+          {% for portfolio in portfolios %}<option value="{{ portfolio.id }}">{{ portfolio.name }}</option>{% endfor %}
+        </select>
+      </label>
+    {% else %}
+      <label>Instalação
+        <select name="asset_id" required>
+          {% for asset in assets %}<option value="{{ asset.id }}">{{ asset.customer_name or 'Sem cliente' }} — {{ asset.project_name }}</option>{% endfor %}
+        </select>
+      </label>
+    {% endif %}
+    <button class="button" type="submit">Criar snapshot draft</button>
+  </form>
+</section>
+<section class="card reports-card">
+  <h3>Snapshots do período</h3>
+  <div class="table-wrap">
+    <table class="reports-table">
+      <thead><tr><th>ID</th><th>Âmbito</th><th>Estado</th><th>Qualidade</th><th>Período</th><th>Ação</th></tr></thead>
+      <tbody>
+        {% for snapshot in snapshots %}
+          <tr>
+            <td>#{{ snapshot.id }}</td>
+            <td>{{ 'Instalação' if snapshot.scope_type == 'individual' else 'Portefólio' }}</td>
+            <td><span class="status-chip">{{ snapshot.approval_status }}</span></td>
+            <td>{{ snapshot.quality_status }}</td>
+            <td>{{ snapshot.period_start }} — {{ snapshot.period_end }}</td>
+            <td><a class="button secondary" href="{{ url_for('reporting.snapshot_preview', snapshot_id=snapshot.id) }}">Abrir</a></td>
+          </tr>
+        {% else %}
+          <tr><td colspan="6" class="muted">Ainda não existem snapshots para este período.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 from openpyxl import Workbook
 
-from app import ensure_database
+from app import ensure_database, ensure_portfolio_seed_data
 from monitoring_board.portfolio_reports import (
     aggregate_portfolio_total,
     auto_map_portfolio_assets,
@@ -45,6 +45,15 @@ def add_asset(conn: sqlite3.Connection, name: str = "Solar One", nif: str = "123
     return asset_id
 
 
+def add_portfolio(conn: sqlite3.Connection, name: str = "Portfolio Teste") -> int:
+    return int(
+        conn.execute(
+            "INSERT INTO portfolio_groups (name, notes) VALUES (?, '')",
+            (name,),
+        ).lastrowid
+    )
+
+
 def test_degradation_factor_uses_helioscope_phase_2_rule() -> None:
     factor = calculate_degradation_factor(date(2024, 1, 1), date(2025, 7, 1))
     assert round(factor, 5) == 0.97225
@@ -69,9 +78,7 @@ def test_portfolio_reports_use_sigenergy_primary_facts_without_mixing_providers(
 ) -> None:
     conn = connect(tmp_path)
     asset_id = add_asset(conn, "Sigenergy Report Site")
-    portfolio_id = conn.execute(
-        "SELECT id FROM portfolio_groups WHERE name = 'Solcorelios I'"
-    ).fetchone()["id"]
+    portfolio_id = add_portfolio(conn, "Sigenergy Portfolio")
     conn.execute(
         "INSERT INTO portfolio_assets (portfolio_id, asset_id, active, mapping_status, mapping_confidence) VALUES (?, ?, 1, 'manual', 1)",
         (portfolio_id, asset_id),
@@ -177,7 +184,7 @@ def test_financial_model_parser_reads_upac_prod_month_format(tmp_path: Path) -> 
     workbook = Workbook()
     upac = workbook.active
     upac.title = "UPAC"
-    upac["A4"] = "Usinage"
+    upac["A4"] = "Instalacao Modelo"
     upac["D4"] = 138.6
     upac["D6"] = 84546
     upac["H12"] = "Semanal"
@@ -200,7 +207,7 @@ def test_financial_model_parser_reads_upac_prod_month_format(tmp_path: Path) -> 
 
     parsed = parse_financial_model_file(path)
 
-    assert parsed.project_name == "Usinage"
+    assert parsed.project_name == "Instalacao Modelo"
     assert parsed.installed_power_kwp == 138.6
     assert parsed.monthly_expected[1] == 100
     assert parsed.monthly_expected[12] == 1200
@@ -223,7 +230,7 @@ class UploadStub:
 def test_financial_model_import_replaces_helioscope_and_applies_tariff(tmp_path: Path) -> None:
     conn = connect(tmp_path)
     asset_id = add_asset(conn)
-    portfolio_id = conn.execute("SELECT id FROM portfolio_groups WHERE name = 'Solcorelios I'").fetchone()["id"]
+    portfolio_id = add_portfolio(conn)
     path = tmp_path / "financial.xlsx"
     build_financial_workbook(path)
 
@@ -299,7 +306,7 @@ def test_tri_hourly_calculation_uses_hourly_records() -> None:
 def test_report_flags_missing_data(tmp_path: Path) -> None:
     conn = connect(tmp_path)
     asset_id = add_asset(conn)
-    portfolio_id = conn.execute("SELECT id FROM portfolio_groups WHERE name = 'Solcorelios I'").fetchone()["id"]
+    portfolio_id = add_portfolio(conn)
     conn.execute(
         "INSERT INTO portfolio_assets (portfolio_id, asset_id, active, mapping_status, mapping_confidence) VALUES (?, ?, 1, 'manual', 1)",
         (portfolio_id, asset_id),
@@ -310,14 +317,15 @@ def test_report_flags_missing_data(tmp_path: Path) -> None:
 
     assert row["data_status"] == "missing_data"
     assert "missing_monthly_production" in row["warnings"]
-    assert "missing_helioscope_expected" in row["warnings"]
+    assert "missing_financial_model" in row["warnings"]
+    assert row["expected_production_source"] == "missing"
     assert "missing_tariff" in row["warnings"]
 
 
 def test_report_uses_daily_production_when_monthly_row_is_missing(tmp_path: Path) -> None:
     conn = connect(tmp_path)
     asset_id = add_asset(conn)
-    portfolio_id = conn.execute("SELECT id FROM portfolio_groups WHERE name = 'Solcorelios I'").fetchone()["id"]
+    portfolio_id = add_portfolio(conn)
     conn.execute(
         "INSERT INTO portfolio_assets (portfolio_id, asset_id, active, mapping_status, mapping_confidence) VALUES (?, ?, 1, 'manual', 1)",
         (portfolio_id, asset_id),
@@ -354,7 +362,7 @@ def test_report_uses_daily_production_when_monthly_row_is_missing(tmp_path: Path
 def test_portfolio_monthly_value_is_final_while_partial_daily_coverage_stays_traceable(tmp_path: Path) -> None:
     conn = connect(tmp_path)
     asset_id = add_asset(conn)
-    portfolio_id = conn.execute("SELECT id FROM portfolio_groups WHERE name = 'Solcorelios I'").fetchone()["id"]
+    portfolio_id = add_portfolio(conn)
     conn.execute(
         "INSERT INTO portfolio_assets (portfolio_id, asset_id, active, mapping_status, mapping_confidence) VALUES (?, ?, 1, 'manual', 1)",
         (portfolio_id, asset_id),
@@ -410,7 +418,7 @@ def test_non_final_installation_gates_source_financial_values(
 ) -> None:
     conn = connect(tmp_path)
     asset_id = add_asset(conn)
-    portfolio_id = conn.execute("SELECT id FROM portfolio_groups WHERE name = 'Solcorelios I'").fetchone()["id"]
+    portfolio_id = add_portfolio(conn)
     conn.execute(
         "INSERT INTO portfolio_assets (portfolio_id, asset_id, active, mapping_status, mapping_confidence) VALUES (?, ?, 1, 'manual', 1)",
         (portfolio_id, asset_id),
@@ -466,7 +474,7 @@ def test_non_final_installation_gates_source_financial_values(
 def test_complete_monthly_installation_keeps_financials_with_partial_daily_coverage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     conn = connect(tmp_path)
     asset_id = add_asset(conn)
-    portfolio_id = conn.execute("SELECT id FROM portfolio_groups WHERE name = 'Solcorelios I'").fetchone()["id"]
+    portfolio_id = add_portfolio(conn)
     conn.execute(
         "INSERT INTO portfolio_assets (portfolio_id, asset_id, active, mapping_status, mapping_confidence) VALUES (?, ?, 1, 'manual', 1)",
         (portfolio_id, asset_id),
@@ -565,27 +573,56 @@ def test_mapping_by_nif_then_name(tmp_path: Path) -> None:
     assert map_external_portfolio_entity(conn, nif="", external_name="Solar Alias")["asset_id"] == asset_id
 
 
-def test_seed_external_portfolio_rows_includes_missing_subaccounts(tmp_path: Path) -> None:
+def test_empty_database_has_no_seeded_operational_portfolios(tmp_path: Path) -> None:
     conn = connect(tmp_path)
-    solcorelios_ii = conn.execute("SELECT id FROM portfolio_groups WHERE name = 'Solcorelios II'").fetchone()["id"]
+    assert conn.execute("SELECT COUNT(*) FROM portfolio_groups").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM portfolio_assets").fetchone()[0] == 0
 
-    rows = conn.execute(
-        "SELECT sub_account, nif, mapping_status FROM portfolio_assets WHERE portfolio_id = ? AND sub_account <= '005' ORDER BY sub_account",
-        (solcorelios_ii,),
-    ).fetchall()
 
-    assert [row["sub_account"] for row in rows] == ["001", "002", "003", "004", "005"]
-    assert all(row["nif"] == "" for row in rows)
-    assert all(row["mapping_status"] == "missing_source" for row in rows)
+def test_legacy_portfolio_rows_are_preserved_without_new_seed_data(tmp_path: Path) -> None:
+    conn = connect(tmp_path)
+    portfolio_id = add_portfolio(conn, "Portfolio Existente")
+    conn.execute(
+        """
+        INSERT INTO portfolio_assets (
+            portfolio_id, external_name, nif, sub_account, active,
+            mapping_status, mapping_confidence
+        ) VALUES (?, 'Instalacao Existente', '599999991', '001', 1, 'manual', 1)
+        """,
+        (portfolio_id,),
+    )
+    conn.commit()
+
+    ensure_portfolio_seed_data(conn)
+    ensure_portfolio_seed_data(conn)
+
+    row = conn.execute(
+        "SELECT external_name, nif FROM portfolio_assets WHERE portfolio_id = ?",
+        (portfolio_id,),
+    ).fetchone()
+    assert tuple(row) == ("Instalacao Existente", "599999991")
+    assert conn.execute("SELECT COUNT(*) FROM portfolio_groups").fetchone()[0] == 1
 
 
 def test_repeated_nif_across_portfolios_is_not_false_conflict(tmp_path: Path) -> None:
     conn = connect(tmp_path)
-    asset_id = add_asset(conn, name="JETESETECAR EQUIPAMENTOS AUTO LDA", nif="503194387")
+    asset_id = add_asset(conn, name="Instalacao Sintetica", nif="599999991")
+    first = add_portfolio(conn, "Portfolio A")
+    second = add_portfolio(conn, "Portfolio B")
+    for portfolio_id in (first, second):
+        conn.execute(
+            """
+            INSERT INTO portfolio_assets (
+                portfolio_id, external_name, nif, sub_account, active,
+                mapping_status, mapping_confidence
+            ) VALUES (?, 'Instalacao Sintetica', '599999991', '001', 1, 'mapping_pending', 0)
+            """,
+            (portfolio_id,),
+        )
 
     result = auto_map_portfolio_assets(conn)
     rows = conn.execute(
-        "SELECT asset_id, mapping_status FROM portfolio_assets WHERE nif = '503194387' ORDER BY portfolio_id"
+        "SELECT asset_id, mapping_status FROM portfolio_assets WHERE nif = '599999991' ORDER BY portfolio_id"
     ).fetchall()
 
     assert result["conflicts"] == 0

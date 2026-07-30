@@ -11,6 +11,7 @@ from typing import Any
 
 from openpyxl import Workbook, load_workbook
 
+from monitoring_board.asset_capacity_repository import resolve_capacity_for_period
 from monitoring_board.portfolio_repository import (
     auto_map_portfolio_assets as repository_auto_map_portfolio_assets,
     suggest_mapping,
@@ -18,8 +19,8 @@ from monitoring_board.portfolio_repository import (
 from monitoring_board.reporting.availability import calculate_weighted_portfolio_availability
 from monitoring_board.reporting.billing import calculate_billing, decimal_from_value, detect_report_type_value
 from monitoring_board.reporting.data_quality import evaluate_monthly_production_quality
+from monitoring_board.reporting.degradation import calculate_degradation_factor  # noqa: F401
 from monitoring_board.reporting.energy_sources import resolve_asset_energy_source
-from monitoring_board.reporting.degradation import calculate_degradation_factor
 from monitoring_board.reporting.financial_quality import (
     apply_production_financial_gate,
     financial_quality_warnings,
@@ -29,7 +30,6 @@ from monitoring_board.reporting.periods import month_bounds
 from monitoring_board.reporting.repositories import (
     detect_tariff_validity_warnings,
     get_asset_billing_config,
-    get_latest_helioscope_expected,
     get_latest_tariff,
     get_monthly_availability,
     get_monthly_production_record,
@@ -44,7 +44,7 @@ from monitoring_board.reporting.repositories import (
     save_asset_tariff,
     upsert_asset_billing_config,
 )
-from monitoring_board.services.financial_models import get_active_expected_for_month
+from monitoring_board.services.financial_models import resolve_expected_production_for_month
 from monitoring_board.reporting.tariffs import (
     classify_tariff_period as tariff_classify_tariff_period,
     result_to_legacy_dict,
@@ -116,93 +116,6 @@ WARNING_LABELS = {
     "tariff_validity_gap": "Lacuna tarifaria",
     "overlapping_tariffs": "Tarifas sobrepostas",
 }
-
-PORTFOLIO_EXTERNAL_ROWS = {
-    "Solcorelios I": [
-        ("001", "500001022", "A COLMEIA DO MINHO SA"),
-        ("002", "510912974", "FLORINEVE - PRODUCAO E COMERCIO DE FLORES LDA"),
-        ("003", "510731570", "DIALOGOS DO BOSQUE UNIPESSOAL LDA"),
-        ("004", "502265906", "A PIRES LOURENCO E FILHOS SA"),
-        ("005", "505435748", "USINAGE MAQUINACAO E PORTA MOLDES LDA"),
-        ("006", "500792640", "FUNDACAO ABEL E JOAO DE LACERDA"),
-        ("007", "501754679", "MARMORES GRANJA LDA"),
-        ("008", "514968044", "AH PINHAL DO REI LDA"),
-        ("009", "503722170", "LUSOBATATA PRODUTOS IV GAMA LDA"),
-        ("010", "505030896", "SOLIDUS - SOLUCOES PARA FERRAMENTAS E MOLDES LD"),
-        ("011", "503995762", "MARMO J - EXPORTACAO, IMPORTACAO, MARMORES UNIPESSOAL LDA"),
-        ("012", "501782265", "ROUFIMAR INDUSTRIA DE MARMORES, S.A."),
-        ("013", "500751722", "VIARCO INDUSTRIA LAPIS LDA"),
-        ("014", "513203524", "GADELHO DE CASTRO S A"),
-        ("015", "502480335", "AMADOIS CALCADO LDA"),
-        ("016", "500269203", "SOC TRANSPORTES POIARENSE LDA"),
-        ("017", "501150617", "GRANETOS-MARMORES E GRANITOS,S.A."),
-        ("018", "502882514", "MULTIAVES AVICOLA INTERNACIONAL LDA"),
-        ("019", "513018590", "INTERVEDROS - SUPERMERCADOS LDA"),
-        ("020", "501258060", "SERRALHARIA VIEIRA LDA"),
-        ("021", "502786078", "COLEGIO DE NOSSA SENHORA DA APRESENTACAO"),
-        ("022", "507685733", "RAS RECYCLING, Lda."),
-        ("023", "501277676", "SICOBRITA - EXTRACCAO E BRITAGEM DE PEDRA S.A"),
-        ("024", "501416382", "COOPERATIVA AGRO-PECUARIA MIRANDESA CRL"),
-        ("025", "500876746", "FERRAZ E FERREIRA LDA"),
-        ("026", "502605545", "ARDAVI MAQUINACAO E COMERCIALIZACAO ARTEFACTOS METALICOS LDA"),
-        ("027", "502247185", "GRANITOS GALRAO NORTE LDA"),
-        ("028", "503194387", "JETESETECAR EQUIPAMENTOS AUTO LDA"),
-        ("029", "502099666", "DIAMANTINO COELHO FILHO SA"),
-        ("030", "513239731", "PH Energia, Lda (Prod)"),
-        ("031", "515346306", "SOLCORACTION, LDA"),
-        ("032", "980763703", "Simples Energia de Espana, SL-Sucursal de Portugal"),
-        ("033", "506178374", "RAP - INDUSTRIAL LDA"),
-        ("034", "509090990", "LICOFRUTOS UNIPESSOAL LDA"),
-        ("035", "510504965", "HOMEUPDATE LDA"),
-        ("036", "501137092", "ASSOC HUMANITARIA DOS BOMBEIROS VOLUNTARIOS ARRUDA VINHOS"),
-        ("037", "500280614", "TECNISATA INDUSTRIA METALOMECANICA SA"),
-        ("038", "501493603", "ITECMO INDUSTRIA FABRICACAO MOLDES LDA"),
-        ("039", "502930942", "ENCONTRUS SOC HOTELEIRA LDA"),
-        ("040", "999999990", "Consumidor Final"),
-        ("041", "501084819", "Real Sport Clube"),
-        ("042", "510352855", "MARYASA - IMPORTACAO E EXPORTACAO UNIPESSOAL LDA"),
-        ("043", "502680296", "PANCRISP-INDUSTRIA DE PANIFICACAO LDA"),
-        ("044", "500091161", "MARMORES GALRAO - EDUARDO GALRAO JORGE & FILHOS S A"),
-        ("045", "516250779", "RUMOS VIRTUOSOS, LDA"),
-        ("046", "517295890", "SOLCORELIOS II, UNIPESSOAL, LDA"),
-        ("047", "510091490", "Negocios.Doc - Produtos e Servicos de Gestao Integrada, Lda"),
-    ],
-    "Solcorelios II": [
-        ("001", "", "Subconta 001 - importar mais tarde"),
-        ("002", "", "Subconta 002 - importar mais tarde"),
-        ("003", "", "Subconta 003 - importar mais tarde"),
-        ("004", "", "Subconta 004 - importar mais tarde"),
-        ("005", "", "Subconta 005 - importar mais tarde"),
-        ("006", "502312254", "Casa da Divina Providencia e de Maria Auxiliadora"),
-        ("007", "504646788", "APPACDM DE LISBOA - ASSOCIACAO PORTUGUESA DE PAIS"),
-        ("008", "500878684", "ASESM - Associacao de Solidariedade e Educacao de Salir de ..."),
-        ("009", "600083780", "Agrupamento de Escolas da Boa Agua"),
-        ("010", "503780774", "O CASARAO HOTELARIA E TURISMO LDA"),
-        ("011", "501426892", "Fundacao Irene Rolo"),
-        ("012", "501130179", "Associacao Humanitaria de Bombeiro Voluntarios de Alcoentre"),
-        ("013", "501379550", "FUTEBOL CLUBE DE ALVERCA"),
-        ("014", "513983511", "EZU Energia, Lda"),
-        ("015", "501512071", "ALVARSOL SOC LAVANDARIAS ALGARVE LDA"),
-        ("016", "508619041", "NEUTRIPURO - LAVAGENS INDUSTRIAIS , LDA"),
-        ("017", "508776597", "Antonio Evaristo Goncalves - Sociedade Agricola, Unipessoal ..."),
-        ("018", "502962801", "LAREIRAS SOUSA LDA"),
-        ("019", "501440623", "Associacao Humanitaria de Bombeiro Voluntarios de Montela..."),
-        ("020", "501358331", "SANTOS E FERREIRA LDA"),
-        ("021", "508546192", "LUIS BAPTISTA GONCALVES - SOCIEDADE AGRICOLA UNIPE..."),
-        ("022", "501237089", "ASSOCIACAO HUMANITARIA DE BOMBEIROS DO PINHAL NO..."),
-        ("023", "502377380", "Centro de Solidariedade Social Padre Jose Filipe Rodrigues"),
-        ("024", "500827540", "MANUEL BARBOSA E FILHOS LDA"),
-        ("025", "501137092", "ASSOC HUMANITARIA DOS BOMBEIROS VOLUNTARIOS ARR..."),
-        ("026", "500877386", "Legado do Caixeiro Alentejano - Associacao Mutualista"),
-        ("027", "501241230", "ASSOCIACAO HUMANITARIA DE BOMBEIROS VOLUNTARIOS ..."),
-        ("028", "503194387", "JETESETECAR EQUIPAMENTOS AUTO LDA"),
-        ("029", "509090990", "LICOFRUTOS UNIPESSOAL LDA"),
-        ("030", "510091490", "Negocios.Doc - Produtos e Servicos de Gestao Integrada, Lda"),
-        ("031", "501131981", "ASSOCIACAO HUMANITARIA DOS BOMBEIROS VOLUNTARIO..."),
-        ("032", "500731179", "PROVINCIA PORTUGUESA INSTITUTO IRMAS SANTA DOROT..."),
-    ],
-}
-
 
 def normalize_text(value: Any) -> str:
     normalized = unicodedata.normalize("NFKD", str(value or ""))
@@ -719,48 +632,6 @@ def auto_map_portfolio_assets(conn: sqlite3.Connection, portfolio_id: int | None
     return repository_auto_map_portfolio_assets(conn, portfolio_id)
 
 
-def seed_external_portfolio_rows(conn: sqlite3.Connection) -> None:
-    for portfolio_name, rows in PORTFOLIO_EXTERNAL_ROWS.items():
-        group = conn.execute("SELECT id FROM portfolio_groups WHERE name = ?", (portfolio_name,)).fetchone()
-        if group is None:
-            continue
-        portfolio_id = int(group["id"])
-        for index, (sub_account, nif, external_name) in enumerate(rows, start=1):
-            existing = conn.execute(
-                """
-                SELECT id
-                FROM portfolio_assets
-                WHERE portfolio_id = ? AND sub_account = ?
-                LIMIT 1
-                """,
-                (portfolio_id, sub_account),
-            ).fetchone()
-            if existing:
-                conn.execute(
-                    """
-                    UPDATE portfolio_assets
-                    SET external_name = COALESCE(NULLIF(external_name, ''), ?),
-                        nif = COALESCE(NULLIF(nif, ''), ?),
-                        display_order = COALESCE(NULLIF(display_order, 0), ?),
-                        active = 1
-                    WHERE id = ?
-                    """,
-                    (external_name, nif, index * 10, existing["id"]),
-                )
-                continue
-            mapping_status = "mapping_pending" if nif else "missing_source"
-            notes = "Subconta em falta na fonte original; importar mais tarde." if not nif else ""
-            conn.execute(
-                """
-                INSERT INTO portfolio_assets (
-                    portfolio_id, asset_id, external_name, nif, sub_account, active,
-                    mapping_status, mapping_confidence, notes, display_order, mapping_method, updated_at
-                ) VALUES (?, NULL, ?, ?, ?, 1, ?, 0, ?, ?, 'unmapped', ?)
-                """,
-                (portfolio_id, external_name, nif, sub_account, mapping_status, notes, index * 10, datetime.now().isoformat(timespec="seconds")),
-            )
-
-
 def warning_label(code: str) -> str:
     return WARNING_LABELS.get(code, "Dados incompletos")
 
@@ -847,24 +718,6 @@ def build_portfolio_report_rows(
         warnings.extend(production_quality.warnings)
         if production_quality.status in {"partial", "missing", "conflict"}:
             warnings.append("missing_monthly_production")
-        financial_expected = get_active_expected_for_month(conn, asset_id=asset_id, year=start.year, month=start.month)
-        expected_source = "financial_model" if financial_expected else "none"
-        expected_kwh = float(financial_expected["expected_production_kwh"]) if financial_expected and financial_expected["expected_production_kwh"] is not None else None
-        expected_consumption_kwh = float(financial_expected["expected_consumption_kwh"]) if financial_expected and financial_expected["expected_consumption_kwh"] is not None else None
-        expected_self_use_kwh = float(financial_expected["expected_self_use_kwh"]) if financial_expected and financial_expected["expected_self_use_kwh"] is not None else None
-        expected_export_kwh = float(financial_expected["expected_export_kwh"]) if financial_expected and financial_expected["expected_export_kwh"] is not None else None
-        expected_grid_import_kwh = float(financial_expected["expected_grid_import_kwh"]) if financial_expected and financial_expected["expected_grid_import_kwh"] is not None else None
-        expected_self_consumption_rate_pct = float(financial_expected["expected_self_consumption_rate_pct"]) if financial_expected and financial_expected["expected_self_consumption_rate_pct"] is not None else None
-        expected_self_sufficiency_rate_pct = float(financial_expected["expected_self_sufficiency_rate_pct"]) if financial_expected and financial_expected["expected_self_sufficiency_rate_pct"] is not None else None
-        expected_specific_yield = None
-        if expected_kwh is not None and parse_float(asset["kwp"]):
-            expected_specific_yield = expected_kwh / parse_float(asset["kwp"])
-        if expected_kwh is None:
-            expected = get_latest_helioscope_expected(conn, asset_id, start.month)
-            expected_kwh = float(expected["expected_kwh"]) if expected else None
-            expected_source = "helioscope" if expected else "none"
-        if expected_kwh is None:
-            warnings.append("missing_helioscope_expected")
         mount_raw = asset["mounting_date"] or asset["start_contract"]
         mounting = None
         if mount_raw:
@@ -874,8 +727,47 @@ def build_portfolio_report_rows(
                 warnings.append("invalid_mounting_date")
         else:
             warnings.append("missing_mounting_date")
-        factor = calculate_degradation_factor(mounting, start)
-        adjusted = expected_kwh * factor if expected_kwh is not None else None
+        expected_resolution = resolve_expected_production_for_month(
+            conn, asset_id=asset_id, period=start, mounting_date=mounting
+        )
+        financial_expected = expected_resolution.get("model_monthly")
+        expected_source = expected_resolution["expected_production_source"]
+        expected_kwh = expected_resolution["expected_production_kwh"]
+        expected_consumption_kwh = float(financial_expected["expected_consumption_kwh"]) if financial_expected and financial_expected["expected_consumption_kwh"] is not None else None
+        expected_self_use_kwh = float(financial_expected["expected_self_use_kwh"]) if financial_expected and financial_expected["expected_self_use_kwh"] is not None else None
+        expected_export_kwh = float(financial_expected["expected_export_kwh"]) if financial_expected and financial_expected["expected_export_kwh"] is not None else None
+        expected_grid_import_kwh = float(financial_expected["expected_grid_import_kwh"]) if financial_expected and financial_expected["expected_grid_import_kwh"] is not None else None
+        expected_self_consumption_rate_pct = float(financial_expected["expected_self_consumption_rate_pct"]) if financial_expected and financial_expected["expected_self_consumption_rate_pct"] is not None else None
+        expected_self_sufficiency_rate_pct = float(financial_expected["expected_self_sufficiency_rate_pct"]) if financial_expected and financial_expected["expected_self_sufficiency_rate_pct"] is not None else None
+        capacity = (
+            resolve_capacity_for_period(
+                conn,
+                asset_id=asset_id,
+                period_start=start,
+                period_end=end,
+                fallback_kwp=asset["kwp"],
+            )
+            if asset_id is not None
+            else None
+        )
+        installed_power_kwp = (
+            float(capacity.installed_power_kwp)
+            if capacity and capacity.installed_power_kwp is not None
+            else None
+        )
+        if capacity and capacity.ambiguous:
+            warnings.append("ambiguous_installed_power")
+        elif installed_power_kwp is None:
+            warnings.append("missing_installed_power")
+        if expected_kwh is None:
+            warnings.append("missing_financial_model")
+        factor = expected_resolution["degradation_factor"]
+        adjusted = expected_resolution["adjusted_expected_production_kwh"]
+        expected_specific_yield = (
+            adjusted / installed_power_kwp
+            if adjusted is not None and installed_power_kwp
+            else None
+        )
         deviation = actual - adjusted if actual is not None and adjusted is not None else None
         deviation_pct = (deviation / adjusted * 100) if deviation is not None and adjusted else None
         availability = (
@@ -990,7 +882,8 @@ def build_portfolio_report_rows(
                 "local_installation": asset["project_name"] or "",
                 "nif": asset["nif"] or asset["asset_nif"] or "",
                 "sub_account": asset["sub_account"] or "",
-                "installed_power_kwp": parse_float(asset["kwp"]),
+                "installed_power_kwp": installed_power_kwp,
+                "installed_power_source": capacity.source if capacity else "missing",
                 "actual_production_kwh": round(actual, 2) if actual is not None else None,
                 "raw_daily_production_kwh": round(production_quality.raw_daily_total_kwh, 2) if production_quality.raw_daily_total_kwh is not None else None,
                 "production_quality_status": production_quality.status,
@@ -1029,7 +922,7 @@ def build_portfolio_report_rows(
                 "export_kwh": round(export_kwh, 2) if export_kwh is not None else None,
                 "consumption_kwh": round(consumption_kwh, 2) if consumption_kwh is not None else None,
                 "grid_import_kwh": round(grid_import_kwh, 2) if grid_import_kwh is not None else None,
-                "helioscope_expected_kwh": round(expected_kwh, 2) if expected_kwh is not None else None,
+                "helioscope_expected_kwh": None,
                 "expected_production_kwh": round(expected_kwh, 2) if expected_kwh is not None else None,
                 "expected_consumption_kwh": round(expected_consumption_kwh, 2) if expected_consumption_kwh is not None else None,
                 "expected_self_use_kwh": round(expected_self_use_kwh, 2) if expected_self_use_kwh is not None else None,
@@ -1039,10 +932,18 @@ def build_portfolio_report_rows(
                 "expected_self_sufficiency_rate_pct": round(expected_self_sufficiency_rate_pct, 2) if expected_self_sufficiency_rate_pct is not None else None,
                 "expected_specific_yield": round(expected_specific_yield, 2) if expected_specific_yield is not None else None,
                 "expected_production_source": expected_source,
+                "financial_model_id": expected_resolution["financial_model_id"],
+                "financial_model_version": expected_resolution["financial_model_version"],
+                "financial_model_effective_date": expected_resolution["financial_model_effective_date"],
                 "adjusted_expected_kwh": round(adjusted, 2) if adjusted is not None else None,
-                "degradation_factor": round(factor, 6),
+                "degradation_factor": round(factor, 6) if factor is not None else None,
                 "deviation_kwh": round(deviation, 2) if deviation is not None else None,
                 "deviation_pct": round(deviation_pct, 2) if deviation_pct is not None else None,
+                "performance_vs_expected_pct": (
+                    round(actual / adjusted * 100, 2)
+                    if actual is not None and adjusted is not None and adjusted > 0
+                    else None
+                ),
                 "availability_pct": availability,
                 "tariff_type": tariff["tariff_type"] if tariff else "",
                 "estimated_value_eur": tariff_result["estimated_value_eur"],

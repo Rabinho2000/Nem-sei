@@ -1,0 +1,21 @@
+{
+  "code": 0,
+  "msg": "success",
+  "data": {
+    "powerGenerationKwh": 22.94,
+    "powerToGridKwh": 3.93,
+    "powerSelfConsumptionKwh": 19.01,
+    "powerUseKwh": 24.83,
+    "powerFromGridKwh": 9.67,
+    "powerOneselfKwh": 15.16,
+    "esChargingKwh": 6.51,
+    "esDischargingKwh": 0.47,
+    "itemList": [
+      {
+        "dataTime": "2026-02-01 00:00",
+        "pvTotalPower": 0.0,
+        "loadPower": 1.06
+      }
+    ]
+  }
+}

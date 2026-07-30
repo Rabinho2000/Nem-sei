@@ -9,7 +9,12 @@ import pytest
 import requests
 
 from monitoring_board.services.api_rate_limit import ApiRateLimitError
-from monitoring_board.services.sigenergy_client import SigenergyClient
+from monitoring_board.services.sigenergy_client import (
+    EXPERTCOM_SIGENERGY_BASE_URL,
+    EXPERTCOM_SIGENERGY_SYSTEM_ID,
+    SigenergyClient,
+    SigenergyPreviewReadOnlyPolicy,
+)
 from monitoring_board.services.sigenergy_errors import SigenergyApiError
 from monitoring_board.services.sigenergy_models import (
     SigenergyCredentials,
@@ -75,11 +80,20 @@ class QueueSession:
         url: str,
         *,
         headers: dict[str, str],
+        params: dict[str, Any] | None,
         json: Any | None,
         timeout: int,
     ) -> FakeResponse:
         assert timeout == 30
-        self.requests.append({"method": method, "url": url, "json": json, "headers": headers})
+        self.requests.append(
+            {
+                "method": method,
+                "url": url,
+                "params": params,
+                "json": json,
+                "headers": headers,
+            }
+        )
         return self.responses_by_url[url].pop(0)
 
 
@@ -92,6 +106,95 @@ def client(session: QueueSession, *, system_ids: str = "", token_cache: dict[str
         token_cache=token_cache if token_cache is not None else {},
         sleeper=lambda _seconds: None,
     )
+
+
+def preview_client(
+    session: QueueSession,
+    *,
+    base_url: str = EXPERTCOM_SIGENERGY_BASE_URL,
+) -> SigenergyClient:
+    return SigenergyClient(
+        SigenergyEndpoints(
+            base_url=base_url,
+            login_endpoint="/openapi/auth/login/key",
+            systems_endpoint="/openapi/system",
+            energy_flow_endpoint=(
+                f"/openapi/systems/{EXPERTCOM_SIGENERGY_SYSTEM_ID}/energyFlow"
+            ),
+            history_endpoint=(
+                f"/openapi/systems/{EXPERTCOM_SIGENERGY_SYSTEM_ID}/history"
+            ),
+            region="eu",
+        ),
+        SigenergyCredentials("fixture-app-key", "fixture-app-secret"),
+        session=session,
+        token_cache={},
+        read_only_policy=SigenergyPreviewReadOnlyPolicy(),
+    )
+
+
+def test_preview_policy_allows_only_expertcom_read_endpoints(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "preview")
+    monkeypatch.setenv("EXTERNAL_ACTIONS_ENABLED", "false")
+    login_url = f"{EXPERTCOM_SIGENERGY_BASE_URL}/openapi/auth/login/key"
+    flow_url = (
+        f"{EXPERTCOM_SIGENERGY_BASE_URL}/openapi/systems/"
+        f"{EXPERTCOM_SIGENERGY_SYSTEM_ID}/energyFlow"
+    )
+    session = QueueSession(
+        {
+            login_url: [FakeResponse(load_fixture("auth_success_object.json"))],
+            flow_url: [FakeResponse(load_fixture("energy_flow.json"))],
+        }
+    )
+    read_only_client = preview_client(session)
+
+    read_only_client.get_energy_flow(EXPERTCOM_SIGENERGY_SYSTEM_ID)
+
+    with pytest.raises(SigenergyApiError, match="allowlist"):
+        read_only_client.get_energy_flow("OTHER-SYSTEM")
+    with pytest.raises(SigenergyApiError, match="allowlist"):
+        read_only_client.request_json(
+            "POST",
+            "/openapi/board/onboard",
+            json_payload={"systemId": EXPERTCOM_SIGENERGY_SYSTEM_ID},
+        )
+    assert [call["method"] for call in session.requests] == ["GET"]
+
+
+def test_preview_policy_refuses_different_base_url() -> None:
+    with pytest.raises(SigenergyApiError, match="allowlist"):
+        preview_client(QueueSession({}), base_url="https://example.invalid")
+
+
+def test_preview_policy_refuses_discovered_system_outside_allowlist() -> None:
+    login_url = f"{EXPERTCOM_SIGENERGY_BASE_URL}/openapi/auth/login/key"
+    systems_url = f"{EXPERTCOM_SIGENERGY_BASE_URL}/openapi/system"
+    session = QueueSession(
+        {
+            login_url: [FakeResponse(load_fixture("auth_success_object.json"))],
+            systems_url: [
+                FakeResponse(
+                    {
+                        "code": 0,
+                        "data": {
+                            "list": [
+                                {
+                                    "systemId": "OTHER-SYSTEM",
+                                    "systemName": "Refused",
+                                }
+                            ]
+                        },
+                    }
+                )
+            ],
+        }
+    )
+
+    with pytest.raises(SigenergyApiError, match="System ID"):
+        preview_client(session).list_systems()
 
 
 def test_login_extracts_token_and_sends_region_header() -> None:
@@ -166,6 +269,106 @@ def test_energy_flow_current_by_system() -> None:
     assert flow["systemId"] == "SIG-001"
     assert flow["pvPower"] == 4.25
     assert session.requests[0]["url"] == "https://sigenergy.example.test/openapi/systems/SIG-001/energyFlow"
+    assert session.requests[0]["params"] is None
+    assert session.requests[0]["json"] is None
+
+
+def test_history_get_uses_query_parameters_and_returns_raw_energy_counters() -> None:
+    history_url = "https://sigenergy.example.test/openapi/systems/SIG-001/history"
+    history_data = {
+        "powerGenerationKwh": "42.5",
+        "powerUseKwh": "38.2",
+        "powerToGridKwh": "10.1",
+        "powerFromGridKwh": "5.8",
+        "powerSelfConsumptionKwh": "32.4",
+        "powerOneselfKwh": "31.9",
+        "esChargingKwh": "3.2",
+        "esDischargingKwh": "2.7",
+        "itemList": [{"time": "2026-07-28", "powerGenerationKwh": "42.5"}],
+    }
+    session = QueueSession(
+        {
+            "https://sigenergy.example.test/openapi/auth/login/key": [
+                FakeResponse(load_fixture("auth_success_object.json"))
+            ],
+            history_url: [FakeResponse({"code": 0, "message": "success", "data": history_data})],
+        }
+    )
+
+    result = client(session).get_system_history(
+        "SIG-001", level="Day", target_date="2026-07-28"
+    )
+
+    sent = session.requests[0]
+    assert sent["method"] == "GET"
+    assert sent["params"] == {"level": "Day", "date": "2026-07-28"}
+    assert sent["json"] is None
+    assert result == history_data
+
+
+def test_history_regression_rejects_json_body_but_accepts_query_parameters() -> None:
+    class QueryOnlySession(QueueSession):
+        def request(self, method, url, *, headers, params, json, timeout):
+            if method == "GET" and json is not None:
+                self.requests.append(
+                    {
+                        "method": method,
+                        "url": url,
+                        "params": params,
+                        "json": json,
+                        "headers": headers,
+                    }
+                )
+                return FakeResponse("<html>CloudFront 403</html>", status_code=403)
+            assert params == {"level": "Day", "date": "2026-07-28"}
+            return super().request(
+                method,
+                url,
+                headers=headers,
+                params=params,
+                json=json,
+                timeout=timeout,
+            )
+
+    history_url = "https://sigenergy.example.test/openapi/systems/SIG-001/history"
+    session = QueryOnlySession(
+        {
+            "https://sigenergy.example.test/openapi/auth/login/key": [
+                FakeResponse(load_fixture("auth_success_object.json"))
+            ],
+            history_url: [
+                FakeResponse(
+                    {
+                        "code": 0,
+                        "message": "success",
+                        "data": {"powerGenerationKwh": 12.3, "itemList": []},
+                    }
+                )
+            ],
+        }
+    )
+
+    history_client = client(session)
+    with pytest.raises(SigenergyApiError) as rejected:
+        history_client.request_json(
+            "GET",
+            "/openapi/systems/SIG-001/history",
+            json_payload={"level": "Day", "date": "2026-07-28"},
+            api_area="production",
+        )
+    assert rejected.value.status_code == 403
+
+    result = history_client.get_system_history(
+        "SIG-001", level="Day", target_date="2026-07-28"
+    )
+
+    assert result["powerGenerationKwh"] == 12.3
+    assert session.requests[0]["json"] is not None
+    assert session.requests[1]["params"] == {
+        "level": "Day",
+        "date": "2026-07-28",
+    }
+    assert session.requests[1]["json"] is None
 
 
 def test_system_history_uses_documented_daily_contract() -> None:
@@ -188,10 +391,11 @@ def test_system_history_uses_documented_daily_contract() -> None:
 
     assert history["powerGeneration"] == 22.94
     assert session.requests[0]["method"] == "GET"
-    assert session.requests[0]["json"] == {
+    assert session.requests[0]["params"] == {
         "level": "Day",
         "date": "2024-04-02",
     }
+    assert session.requests[0]["json"] is None
 
 
 def test_401_invalidates_token_and_relogs_once() -> None:

@@ -38,6 +38,12 @@ jobs:
       - name: Compile
         run: python -m compileall monitoring_board
 
+      - name: Check patch whitespace
+        run: git diff --check
+
+      - name: Scan tracked files for obvious secrets
+        run: python scripts/check_tracked_secrets.py
+
       - name: Smoke imports
         run: |
           python -c "from monitoring_board.reporting import templates, portfolio, invoices; print('reporting imports ok')"

@@ -388,13 +388,13 @@ Linha total:
 
 Todas as instalacoes aparecem, incluindo incompletas.
 
-## Fase 9 - Mapping de portfolios e Solcorelios
+## Fase 9 - Mapping de portefólios importados
 
 Branch sugerida: `fix/portfolio-asset-mapping`
 
 Corrigir mapping para suportar:
 
-- mesmo NIF em Solcorelios I e II
+- mesmo NIF em mais do que um portefólio
 - varias instalacoes da mesma empresa
 - varias subcontas
 - aliases
@@ -416,7 +416,7 @@ Nao usar simplesmente o primeiro asset devolvido pela query.
 
 Mudancas de constraint devem preservar mappings, incluir migracao, deteccao de duplicados e rollback documentado.
 
-Manter subcontas 001 a 005 de Solcorelios II como incompletas enquanto nao existirem dados confirmados.
+Manter subcontas incompletas como tal enquanto não existirem dados confirmados.
 
 ## Fase 10 - Integracao, regressao e limpeza arquitetural
 

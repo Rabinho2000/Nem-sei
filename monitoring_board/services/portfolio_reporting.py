@@ -147,7 +147,7 @@ def base_values(monthly: dict[str, Any]) -> dict[str, Any]:
         "raw_daily_production_kwh": None,
         "_production_statuses": [],
         "_complete_production_months": 0,
-        "_source_slots": {"production": 0, "helioscope": 0, "availability": 0, "tariff": 0, "self_use": 0, "invoice": 0, "mapping": 0},
+        "_source_slots": {"production": 0, "financial_model": 0, "availability": 0, "tariff": 0, "self_use": 0, "invoice": 0, "mapping": 0},
         "_availability_weighted": Decimal("0"),
         "_availability_weight": Decimal("0"),
     }
@@ -202,6 +202,9 @@ def accumulate_month(target: dict[str, Any], monthly: dict[str, Any]) -> None:
         "expected_self_sufficiency_rate_pct",
         "expected_specific_yield",
         "expected_production_source",
+        "financial_model_id",
+        "financial_model_version",
+        "financial_model_effective_date",
     ):
         if monthly.get(key) is not None and target.get(key) is None:
             target[key] = monthly.get(key)
@@ -215,7 +218,7 @@ def accumulate_source_coverage(target: dict[str, Any], monthly: dict[str, Any]) 
     slots = target.setdefault("_source_slots", {})
     source_warnings = {
         "production": {"missing_monthly_production"},
-        "helioscope": {"missing_helioscope_expected"},
+        "financial_model": {"missing_financial_model"},
         "availability": {"missing_availability"},
         "tariff": {"missing_tariff", "expired_tariff", "tariff_validity_gap", "overlapping_tariffs"},
         "self_use": {"missing_hourly_self_use", "missing_self_use"},
@@ -258,6 +261,11 @@ def finalize_values(values: dict[str, Any]) -> None:
     consumption = _decimal_or_none(values.get("consumption_kwh"))
     values["deviation_kwh"] = actual - adjusted if actual is not None and adjusted is not None else None
     values["deviation_pct"] = ((actual - adjusted) / adjusted * Decimal("100")) if actual is not None and adjusted else None
+    values["performance_vs_expected_pct"] = (
+        actual / adjusted * Decimal("100")
+        if actual is not None and adjusted is not None and adjusted > 0
+        else None
+    )
     values["specific_yield"] = actual / installed if actual is not None and installed else None
     values["self_consumption_rate_pct"] = self_use / (self_use + export) * Decimal("100") if self_use is not None and export is not None and (self_use + export) else None
     values["self_sufficiency_rate_pct"] = self_use / consumption * Decimal("100") if self_use is not None and consumption else None
@@ -282,8 +290,8 @@ def missing_sources_for_values(values: dict[str, Any], warnings: set[str]) -> se
     missing = set()
     if values.get("production_quality_status") != "complete" or "missing_monthly_production" in warnings:
         missing.add("production")
-    if "missing_helioscope_expected" in warnings:
-        missing.add("helioscope")
+    if "missing_financial_model" in warnings:
+        missing.add("financial_model")
     if "missing_availability" in warnings:
         missing.add("availability")
     if any(warning in warnings for warning in {"missing_tariff", "expired_tariff", "tariff_validity_gap", "overlapping_tariffs"}):
@@ -448,8 +456,8 @@ def warning_severity(code: str) -> str:
 
 
 def warning_source(code: str) -> str:
-    if "helioscope" in code:
-        return "helioscope"
+    if "financial_model" in code:
+        return "financial_model"
     if "availability" in code:
         return "availability"
     if "tariff" in code or "price" in code:

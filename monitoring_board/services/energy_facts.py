@@ -10,6 +10,8 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from monitoring_board.services.sigenergy_models import sanitize_payload
+
 
 ENERGY_QUALITY_STATES = {
     "complete",
@@ -30,17 +32,16 @@ ENERGY_FIELDS = (
     "heat_pump_kwh",
 )
 SIGENERGY_HISTORY_FIELD_MAP = {
-    "powerGeneration": "production_kwh",
-    "powerUse": "consumption_kwh",
-    # The official contract calls powerOneself "Load green power consumption".
-    # This is the onsite energy that balances load against grid import and is
-    # therefore the value used by reports and billing. powerSelfConsumption is
-    # a distinct generation-side total and remains preserved in payload_json.
-    "powerOneself": "self_use_kwh",
-    "powerToGrid": "export_kwh",
-    "powerFromGrid": "grid_import_kwh",
-    "esCharging": "battery_charge_kwh",
-    "esDischarging": "battery_discharge_kwh",
+    "production_kwh": ("powerGenerationKwh", "powerGeneration"),
+    "consumption_kwh": ("powerUseKwh", "powerUse"),
+    # powerOneself is "Load green power consumption": the onsite energy
+    # supplied to load and the value that balances the reports. The distinct
+    # generation-side powerSelfConsumption counter remains only in payload_json.
+    "self_use_kwh": ("powerOneselfKwh", "powerOneself"),
+    "export_kwh": ("powerToGridKwh", "powerToGrid"),
+    "grid_import_kwh": ("powerFromGridKwh", "powerFromGrid"),
+    "battery_charge_kwh": ("esChargingKwh", "esCharging"),
+    "battery_discharge_kwh": ("esDischargingKwh", "esDischarging"),
 }
 SIGENERGY_REPORT_CORE_FIELDS = (
     "production_kwh",
@@ -85,7 +86,13 @@ def parse_sigenergy_daily_history(
             "A unidade do historico Sigenergy ainda nao foi confirmada como kWh."
         )
     values: dict[str, float | None] = {}
-    for source_field, target_field in SIGENERGY_HISTORY_FIELD_MAP.items():
+    for target_field, source_fields in SIGENERGY_HISTORY_FIELD_MAP.items():
+        preferred_field, legacy_field = source_fields
+        source_field = (
+            preferred_field
+            if payload.get(preferred_field) not in (None, "")
+            else legacy_field
+        )
         raw_value = payload.get(source_field)
         if raw_value in (None, ""):
             values[target_field] = None
@@ -113,7 +120,7 @@ def parse_sigenergy_daily_history(
         period_date=period_date,
         values=values,
         data_quality=quality,
-        payload=payload,
+        payload=sanitize_payload(payload),
     )
 
 

@@ -41,10 +41,16 @@ from monitoring_board.portfolio_reports import (
     filter_report_rows,
     import_helioscope_file,
     map_external_portfolio_entity,
-    seed_external_portfolio_rows,
+)
+from monitoring_board.preview_safety import (
+    PREVIEW_DISABLED_MESSAGE,
+    external_actions_enabled,
+    preview_enabled,
+    scheduler_enabled,
 )
 from monitoring_board.routes.auth import auth_bp
 from monitoring_board.routes.field_routes import field_routes_bp
+from monitoring_board.routes.reporting import reporting_bp
 from monitoring_board import runtime as runtime_module
 from monitoring_board.runtime import (
     BACKUP_DIR,
@@ -67,6 +73,13 @@ from monitoring_board.customer_reports import (
     build_customer_report_pdf,
     detect_report_type,
     prepare_customer_report,
+)
+from monitoring_board.customer_repository import ensure_customer_schema
+from monitoring_board.asset_capacity_repository import (
+    add_capacity_expansion,
+    ensure_asset_capacity_schema,
+    list_capacity_periods,
+    update_capacity_period,
 )
 from monitoring_board.financial_model_repository import (
     ensure_financial_model_schema,
@@ -154,7 +167,9 @@ from monitoring_board.reporting.portfolio import (
     aggregate_rows,
     profile_from_config,
     profile_to_config,
+    result_from_dict as portfolio_result_from_dict,
 )
+from monitoring_board.reporting.snapshots import approved_snapshot_for_period
 from monitoring_board.reporting.templates import default_template, template_from_config, template_to_config, validate_template_scope
 from monitoring_board.services.report_rendering import (
     MAX_BATCH_ASSETS,
@@ -186,6 +201,7 @@ from monitoring_board.reporting.data_quality import (
 from monitoring_board.reporting.energy_sources import (
     resolve_asset_energy_source,
     set_asset_primary_energy_source,
+    set_sigenergy_asset_association,
 )
 from monitoring_board.services.energy_facts import (
     parse_sigenergy_daily_history,
@@ -252,6 +268,8 @@ from monitoring_board.reporting.validation import (
     parse_billing_values_source,
     validate_report_asset_selection,
 )
+from monitoring_board.reporting.snapshots import ensure_report_snapshot_schema
+from monitoring_board.reporting.distribution import ensure_distribution_schema
 from monitoring_board.reporting.tariffs import result_to_legacy_dict, value_tariff_energy, with_billing_fallback
 from monitoring_board.services.invoice_extraction import extract_invoice_file, sha256_file, validate_invoice_file_content
 from monitoring_board.services.fusionsolar import (
@@ -741,6 +759,8 @@ def create_app() -> Flask:
     app.config["SESSION_COOKIE_HTTPONLY"] = True
     app.config["SESSION_COOKIE_SAMESITE"] = os.environ.get("SESSION_COOKIE_SAMESITE", "Lax").strip() or "Lax"
     app.config["SESSION_COOKIE_SECURE"] = env_flag("SESSION_COOKIE_SECURE", False)
+    app.config["PREVIEW_BANNER"] = preview_enabled()
+    app.config["EXTERNAL_ACTIONS_ENABLED"] = external_actions_enabled()
     app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=12)
     configure_logging(app, LOG_DIR)
     app.logger.info("Using database at %s", app.config["DATABASE"])
@@ -750,6 +770,7 @@ def create_app() -> Flask:
 
     ensure_database(app.config["DATABASE"])
     app.register_blueprint(field_routes_bp)
+    app.register_blueprint(reporting_bp)
     with closing(get_db(app.config["DATABASE"])) as bootstrap_conn:
         populate_missing_installation_groups(bootstrap_conn)
         populate_missing_group_metadata(bootstrap_conn)
@@ -798,6 +819,9 @@ def create_app() -> Flask:
             "asset_monitoring_statuses": ASSET_MONITORING_STATUSES,
             "renewal_statuses": RENEWAL_STATUSES,
             "integration_status_colors": INTEGRATION_STATUS_COLORS,
+            "installation_access_status_labels": (
+                INSTALLATION_ACCESS_STATUS_LABELS
+            ),
             "om_status_label": om_status_label,
             "format_date_pt": format_date_pt,
             "format_number": format_number,
@@ -807,6 +831,8 @@ def create_app() -> Flask:
             "reference_diagnostic": reference_diagnostic,
             "csrf_token": csrf_token,
             "current_username": session.get("username"),
+            "preview_banner": app.config["PREVIEW_BANNER"],
+            "external_actions_enabled": app.config["EXTERNAL_ACTIONS_ENABLED"],
         }
 
     @app.errorhandler(400)
@@ -1136,6 +1162,9 @@ def create_app() -> Flask:
     @app.route("/performance", methods=["GET", "POST"])
     def performance() -> str:
         if request.method == "POST":
+            if not external_actions_enabled():
+                flash(PREVIEW_DISABLED_MESSAGE, "warning")
+                return redirect(url_for("performance"))
             action = request.form.get("action", "sync_availability").strip()
             if action == "sync_availability":
                 result = run_fusionsolar_device_availability_sync(
@@ -1266,6 +1295,9 @@ def create_app() -> Flask:
 
     @app.route("/performance/backfill", methods=["GET", "POST"])
     def performance_backfill() -> str:
+        if request.method == "POST" and not external_actions_enabled():
+            flash(PREVIEW_DISABLED_MESSAGE, "warning")
+            return redirect(url_for("performance_backfill"))
         current_year = date.today().year
         period_type = request.values.get("period_type", "day").strip()
         if period_type not in {"day", "month"}:
@@ -1660,6 +1692,7 @@ def create_app() -> Flask:
             (current_installation_group,),
         )
         financial_model = build_asset_financial_model_context(g.db, asset_id=asset_id)
+        capacity_periods = list_capacity_periods(g.db, asset_id)
         requested_import_id = request.args.get("import_id", "").strip()
         installation_import_summary = (
             get_installation_import_context(g.db, int(requested_import_id))
@@ -1694,8 +1727,59 @@ def create_app() -> Flask:
             latest_device_rows=latest_device_rows,
             expected_strings_by_device=expected_strings_by_device,
             financial_model=financial_model,
+            capacity_periods=capacity_periods,
             installation_import_summary=installation_import_summary,
         )
+
+    @app.route("/asset/<int:asset_id>/capacity/expansion", methods=["POST"])
+    def add_asset_capacity_expansion(asset_id: int):
+        try:
+            add_capacity_expansion(
+                g.db,
+                asset_id=asset_id,
+                valid_from=request.form.get("valid_from", ""),
+                installed_power_kwp=request.form.get("installed_power_kwp", ""),
+                reason=request.form.get("reason", ""),
+            )
+            g.db.commit()
+        except ValueError as exc:
+            g.db.rollback()
+            messages = {
+                "capacity_invalid_date": "Indica uma data válida para a expansão.",
+                "capacity_power_must_be_positive": "A potência deve ser positiva.",
+                "capacity_period_overlap": "O novo período sobrepõe-se ao histórico existente.",
+            }
+            flash(messages.get(str(exc), "Não foi possível guardar a expansão."), "error")
+        else:
+            flash("Expansão adicionada ao histórico de potência.", "success")
+        return redirect(url_for("asset_detail", asset_id=asset_id))
+
+    @app.route("/asset/<int:asset_id>/capacity/<int:period_id>", methods=["POST"])
+    def update_asset_capacity_period(asset_id: int, period_id: int):
+        try:
+            update_capacity_period(
+                g.db,
+                period_id=period_id,
+                asset_id=asset_id,
+                valid_from=request.form.get("valid_from", ""),
+                valid_to=request.form.get("valid_to", ""),
+                installed_power_kwp=request.form.get("installed_power_kwp", ""),
+                reason=request.form.get("reason", ""),
+            )
+            g.db.commit()
+        except ValueError as exc:
+            g.db.rollback()
+            messages = {
+                "capacity_invalid_date": "Indica datas válidas.",
+                "capacity_invalid_period": "A data final não pode anteceder a data inicial.",
+                "capacity_power_must_be_positive": "A potência deve ser positiva.",
+                "capacity_period_overlap": "O período sobrepõe-se a outro período.",
+                "capacity_period_not_found": "O período já não existe.",
+            }
+            flash(messages.get(str(exc), "Não foi possível corrigir o período."), "error")
+        else:
+            flash("Período de potência atualizado.", "success")
+        return redirect(url_for("asset_detail", asset_id=asset_id))
 
     @app.route("/asset/<int:asset_id>/financial-model/upload", methods=["POST"])
     def upload_asset_financial_model(asset_id: int):
@@ -3323,6 +3407,7 @@ def create_app() -> Flask:
                 g.db,
                 external_name=member["external_name"] or "",
                 nif=member["nif"] or "",
+                sub_account=member["sub_account"] or "",
                 context=mapping_context,
             )
             for member in members
@@ -3731,11 +3816,6 @@ def create_app() -> Flask:
                         "success",
                     )
                     return redirect(url_for("portfolios", tab="config", portfolio_id=portfolio_id, report_month=report_month_redirect))
-                if action == "seed_external":
-                    seed_external_portfolio_rows(g.db)
-                    g.db.commit()
-                    flash("Lista externa do portfolio importada/atualizada.", "success")
-                    return redirect(url_for("portfolios", tab="config", portfolio_id=portfolio_id_redirect, report_month=report_month_redirect))
                 if action == "add_asset":
                     portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
                     asset_id_raw = request.form.get("asset_id", "").strip()
@@ -4745,6 +4825,9 @@ def create_app() -> Flask:
 
     @app.route("/integrations/import", methods=["GET", "POST"])
     def installation_import() -> str:
+        if request.method == "POST" and not external_actions_enabled():
+            flash(PREVIEW_DISABLED_MESSAGE, "warning")
+            return redirect(url_for("installation_import"))
         assets_for_import = query_all(
             g.db,
             "SELECT * FROM assets ORDER BY project_name COLLATE NOCASE",
@@ -4945,6 +5028,9 @@ def create_app() -> Flask:
 
     @app.post("/integrations/import/<int:import_id>/check-access")
     def check_installation_import_access(import_id: int) -> str:
+        if not external_actions_enabled():
+            flash(PREVIEW_DISABLED_MESSAGE, "warning")
+            return redirect(url_for("installation_import", import_id=import_id))
         import_context = get_installation_import_context(g.db, import_id)
         if import_context is None:
             abort(404)
@@ -5001,6 +5087,9 @@ def create_app() -> Flask:
 
     @app.post("/integrations/import/<int:import_id>/confirm")
     def confirm_installation_import(import_id: int) -> str:
+        if not external_actions_enabled():
+            flash(PREVIEW_DISABLED_MESSAGE, "warning")
+            return redirect(url_for("installation_import", import_id=import_id))
         try:
             existing_import = get_installation_import_context(g.db, import_id)
             if (
@@ -5064,6 +5153,24 @@ def create_app() -> Flask:
         provider = INTEGRATION_PROVIDER_FUSIONSOLAR
         if request.method == "POST":
             action = request.form.get("action", "").strip()
+            external_actions = {
+                "test_connection",
+                "test_fusionsolar_connection",
+                "test_sigenergy_connection",
+                "onboard_sigenergy_system",
+                "refresh_sigenergy_onboarding",
+                "refresh_sigenergy_systems",
+                "sync_sigenergy_energy",
+                "sync_sigenergy_now",
+                "sync_now",
+                "sync_provider_state_now",
+                "sync_fusionsolar_production_now",
+                "sync_fusionsolar_diagnostics_now",
+                "test_telegram",
+            }
+            if action in external_actions and not external_actions_enabled():
+                flash(PREVIEW_DISABLED_MESSAGE, "warning")
+                return redirect(url_for("integrations"))
             if action == "save_config":
                 auto_sync_enabled = 1 if request.form.get("auto_sync_enabled") == "on" else 0
                 enabled = 1 if request.form.get("enabled") == "on" else 0
@@ -5341,6 +5448,26 @@ def create_app() -> Flask:
                 except Exception as exc:
                     flash(f"Nao foi possivel definir a fonte primaria: {exc}", "error")
                 return redirect(url_for("integrations") + "#integrations-sigenergy")
+
+            if action == "set_sigenergy_asset_association":
+                try:
+                    raw_asset_id = request.form.get("asset_id", "").strip()
+                    set_sigenergy_asset_association(
+                        g.db,
+                        external_id=request.form.get("external_id", "").strip(),
+                        asset_id=int(raw_asset_id) if raw_asset_id else None,
+                    )
+                    g.db.commit()
+                    flash("Associacao local Sigenergy atualizada.", "success")
+                except Exception as exc:
+                    g.db.rollback()
+                    flash(
+                        f"Nao foi possivel atualizar a associacao local: {exc}",
+                        "error",
+                    )
+                return redirect(
+                    url_for("integrations") + "#integrations-sigenergy"
+                )
 
             if action == "sync_sigenergy_now":
                 try:
@@ -6955,6 +7082,7 @@ def ensure_database(path: str) -> None:
         ensure_column(conn, "portfolio_report_rows", "covered_period TEXT")
         ensure_column(conn, "portfolio_report_rows", "quality_status TEXT")
         ensure_column(conn, "sigenergy_onboarding_requests", "installation_import_id INTEGER")
+        migrate_sigenergy_import_access_statuses(conn)
         ensure_api_call_state_schema(conn)
         ensure_api_queue_schema(conn)
         ensure_sampled_availability_schema(conn)
@@ -7012,8 +7140,12 @@ def ensure_database(path: str) -> None:
         populate_missing_group_metadata(conn)
         ensure_predefined_export_templates(conn)
         ensure_portfolio_management_schema(conn)
+        ensure_customer_schema(conn)
+        ensure_asset_capacity_schema(conn)
+        ensure_report_snapshot_schema(conn)
         ensure_portfolio_reporting_schema(conn)
         ensure_report_template_schema(conn)
+        ensure_distribution_schema(conn)
         ensure_financial_model_schema(conn)
         ensure_portfolio_seed_data(conn)
         ensure_alert_settings_defaults(conn)
@@ -7162,12 +7294,7 @@ def ensure_database_indexes(conn: sqlite3.Connection) -> None:
 
 
 def ensure_portfolio_seed_data(conn: sqlite3.Connection) -> None:
-    for name in ("Solcorelios I", "Solcorelios II"):
-        conn.execute(
-            "INSERT OR IGNORE INTO portfolio_groups (name, notes) VALUES (?, '')",
-            (name,),
-        )
-    seed_external_portfolio_rows(conn)
+    """Compatibility hook retained without inserting operational data."""
 
 
 def encode_job_params(params: dict[str, Any]) -> str:
@@ -11792,69 +11919,226 @@ def validate_report_automation_form(conn: sqlite3.Connection, form: Any) -> dict
     }
 
 
-def run_report_automation_generation(conn: sqlite3.Connection, automation_id: int) -> dict[str, Any]:
+def run_report_automation_generation(
+    conn: sqlite3.Connection,
+    automation_id: int,
+    *,
+    reference_date: date | None = None,
+    output_dir: Path | None = None,
+) -> dict[str, Any]:
     automation = get_report_automation(conn, automation_id)
     if automation is None:
         raise ValueError("Automatização não encontrada.")
-    previous_month_end = current_lisbon_date().replace(day=1) - timedelta(days=1)
+    previous_month_end = (reference_date or current_lisbon_date()).replace(
+        day=1
+    ) - timedelta(days=1)
     report_month = previous_month_end.strftime("%Y-%m")
+    period = build_period("monthly", report_month=report_month)
     try:
-        formats = json.loads(automation["formats_json"] or '["pdf"]')
+        raw_formats = json.loads(automation["formats_json"] or '["pdf"]')
     except (TypeError, json.JSONDecodeError):
-        formats = ["pdf"]
-    form = MultiDict(
-        [
-            ("report_type", str(automation["report_type"])),
-            ("template_id", str(automation["template_id"])),
-            ("portfolio_id", str(automation["portfolio_id"] or "")),
-            ("profile_id", str(automation["profile_id"] or "")),
-            ("asset_id", str(automation["asset_id"] or "")),
-            ("period_type", "monthly"),
-            ("report_month", report_month),
-            ("include_availability", "on" if automation["include_availability"] else ""),
-            *[("formats", str(fmt)) for fmt in formats],
-        ]
+        raw_formats = ["pdf"]
+    formats = tuple(
+        item for item in validate_formats(str(automation["report_type"]), raw_formats)
+        if item != "zip"
     )
-    try:
-        return execute_persisted_report_generation(
+    snapshot = approved_snapshot_for_period(
+        conn,
+        scope_type=str(automation["report_type"]),
+        asset_id=automation["asset_id"],
+        portfolio_id=automation["portfolio_id"],
+        period_start=period.start.isoformat(),
+        template_id=automation["template_id"],
+        profile_id=automation["profile_id"],
+    )
+    if snapshot is None:
+        reason = "Não existe um snapshot aprovado compatível para o mês fechado."
+        run_id = create_generation_run(
             conn,
-            form,
-            output_dir=UPLOAD_DIR / "generated_reports",
+            template_id=automation["template_id"],
+            template_version=latest_template_version(conn, automation["template_id"]),
+            report_type=automation["report_type"],
+            portfolio_id=automation["portfolio_id"],
+            asset_id=automation["asset_id"],
             automation_id=automation_id,
+            period_type="monthly",
+            period_start=period.start.isoformat(),
+            period_end=period.end.isoformat(),
+            requested_count=len(formats),
         )
-    except Exception:
-        period = build_period("monthly", report_month=report_month)
-        existing = conn.execute(
+        finish_generation_run(
+            conn,
+            run_id,
+            status="blocked",
+            completed_count=0,
+            failed_count=0,
+            skipped_count=len(formats),
+            error_message=reason,
+        )
+        conn.execute(
             """
-            SELECT id FROM report_generation_runs
-            WHERE automation_id = ? AND period_start = ?
-            ORDER BY id DESC LIMIT 1
+            UPDATE report_automations
+            SET last_blocked_reason = ?, last_snapshot_id = NULL, updated_at = ?
+            WHERE id = ?
             """,
-            (automation_id, period.start.isoformat()),
-        ).fetchone()
-        if existing is None:
-            run_id = create_generation_run(
-                conn,
-                template_id=automation["template_id"],
-                template_version=latest_template_version(conn, automation["template_id"]),
-                report_type=automation["report_type"],
-                portfolio_id=automation["portfolio_id"],
-                asset_id=automation["asset_id"],
-                automation_id=automation_id,
-                period_type="monthly",
-                period_start=period.start.isoformat(),
-                period_end=period.end.isoformat(),
-                requested_count=max(1, len(formats)),
+            (reason, datetime.now().isoformat(timespec="seconds"), automation_id),
+        )
+        conn.commit()
+        return {
+            "run_id": run_id,
+            "status": "blocked",
+            "completed": 0,
+            "failed": 0,
+            "duplicate": False,
+            "reason": reason,
+        }
+    duplicate = conn.execute(
+        """
+        SELECT id, status FROM report_generation_runs
+        WHERE automation_id = ? AND snapshot_id = ?
+          AND status IN ('running', 'completed')
+        ORDER BY id DESC LIMIT 1
+        """,
+        (automation_id, snapshot.id),
+    ).fetchone()
+    if duplicate:
+        return {
+            "run_id": int(duplicate["id"]),
+            "status": str(duplicate["status"]),
+            "completed": 0,
+            "failed": 0,
+            "duplicate": True,
+        }
+    template = template_from_config(
+        snapshot.template_snapshot,
+        template_id=snapshot.template_id,
+        portfolio_id=snapshot.portfolio_id,
+    )
+    run_id = create_generation_run(
+        conn,
+        template_id=snapshot.template_id,
+        template_version=int(snapshot.template_version or 1),
+        report_type=snapshot.scope_type,
+        portfolio_id=snapshot.portfolio_id,
+        asset_id=snapshot.asset_id,
+        snapshot_id=snapshot.id,
+        automation_id=automation_id,
+        period_type="monthly",
+        period_start=snapshot.period_start,
+        period_end=snapshot.period_end,
+        requested_count=len(formats),
+    )
+    conn.commit()
+    completed = 0
+    failed = 0
+    warnings: list[str] = []
+    try:
+        for fmt in formats:
+            try:
+                if snapshot.scope_type == "portfolio":
+                    result = portfolio_result_from_dict(snapshot.payload)
+                    rendered = (
+                        render_portfolio_pdf(result, template)
+                        if fmt == "pdf"
+                        else render_portfolio_excel(result, template)
+                    )
+                else:
+                    report = {
+                        **snapshot.payload,
+                        "asset": {
+                            "id": snapshot.asset_id,
+                            "project_name": snapshot.payload.get("installation") or "",
+                        },
+                        "report_month": report_month,
+                        "period_start": snapshot.period_start,
+                        "period_end": snapshot.period_end,
+                        "engine_version": snapshot.engine_version,
+                    }
+                    rendered = (
+                        render_individual_pdf(report, template)
+                        if fmt == "pdf"
+                        else render_individual_excel(report, template)
+                    )
+                register_rendered_generation_file(
+                    conn,
+                    output_dir or (UPLOAD_DIR / "generated_reports"),
+                    run_id,
+                    rendered,
+                    portfolio_id=snapshot.portfolio_id,
+                    asset_id=snapshot.asset_id,
+                    snapshot_id=snapshot.id,
+                )
+                completed += 1
+                warnings.extend(rendered.warnings)
+            except Exception as exc:
+                failed += 1
+                LOGGER.warning(
+                    "report_automation_snapshot_render_failed automation_id=%s snapshot_id=%s format=%s error_code=%s",
+                    automation_id,
+                    snapshot.id,
+                    fmt,
+                    type(exc).__name__,
+                )
+                add_failed_generation_file(
+                    conn,
+                    run_id,
+                    {
+                        "format": fmt,
+                        "period": {
+                            "period_type": "monthly",
+                            "period_start": snapshot.period_start,
+                            "period_end": snapshot.period_end,
+                        },
+                    },
+                    str(exc),
+                    portfolio_id=snapshot.portfolio_id,
+                    asset_id=snapshot.asset_id,
+                    snapshot_id=snapshot.id,
+                )
+        status = "completed" if completed and not failed else (
+            "partial" if completed else "failed"
+        )
+        finish_generation_run(
+            conn,
+            run_id,
+            status=status,
+            completed_count=completed,
+            failed_count=failed,
+            warnings=sorted(set(warnings)),
+            error_message="" if completed else "Todos os outputs falharam.",
+        )
+        conn.execute(
+            """
+            UPDATE report_automations
+            SET last_blocked_reason = '', last_snapshot_id = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                snapshot.id,
+                datetime.now().isoformat(timespec="seconds"),
+                automation_id,
             )
-            finish_generation_run(
-                conn,
-                run_id,
-                status="failed",
-                completed_count=0,
-                failed_count=max(1, len(formats)),
-                error_message="Falha ao preparar a execução automática.",
-            )
-            conn.commit()
+        )
+        conn.commit()
+        return {
+            "run_id": run_id,
+            "status": status,
+            "completed": completed,
+            "failed": failed,
+            "duplicate": False,
+            "snapshot_id": snapshot.id,
+        }
+    except Exception:
+        conn.rollback()
+        finish_generation_run(
+            conn,
+            run_id,
+            status="failed",
+            completed_count=completed,
+            failed_count=max(failed, 1),
+            error_message="Falha ao gerar a partir do snapshot aprovado.",
+        )
+        conn.commit()
         raise
 
 
@@ -12997,6 +13281,10 @@ def get_integration_config(conn: sqlite3.Connection, provider: str) -> dict[str,
 
 def start_integration_scheduler(app: Flask) -> None:
     global SCHEDULER
+    if not scheduler_enabled():
+        app.logger.warning("APScheduler disabled by preview/runtime policy.")
+        SCHEDULER = None
+        return
     if SCHEDULER is not None:
         return
     SCHEDULER = BackgroundScheduler(timezone="Europe/Lisbon")
@@ -17299,10 +17587,78 @@ def build_sigenergy_monitoring_notes(row: dict[str, Any]) -> str:
 
 SIGENERGY_SYSTEM_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 SIGENERGY_ACTIVE_ONBOARDING_STATUSES = {"requested", "already_requested", "already_requested_or_onboarded"}
+SIGENERGY_NOT_RETURNED_MESSAGE = (
+    "A instalação não foi devolvida pela App Key configurada."
+)
+INSTALLATION_ACCESS_STATUS_LABELS = {
+    "not_returned": "Não devolvida pela App Key",
+    "pending_approval": "Pedido enviado — aguarda aprovação",
+    "available": "Acesso disponível",
+    "error": "Erro na verificação",
+}
 
 
 class SigenergyInstallationAccessPending(ValueError):
     pass
+
+
+def active_sigenergy_onboarding_for_import(
+    conn: sqlite3.Connection,
+    import_id: int,
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT request.*
+        FROM sigenergy_onboarding_requests request
+        JOIN installation_imports import_row ON import_row.id = ?
+        WHERE (
+                request.installation_import_id = import_row.id
+                OR request.id = import_row.onboarding_request_id
+              )
+          AND request.status IN (
+              'requested',
+              'already_requested',
+              'already_requested_or_onboarded'
+          )
+        ORDER BY request.id DESC
+        LIMIT 1
+        """,
+        (import_id,),
+    ).fetchone()
+
+
+def migrate_sigenergy_import_access_statuses(
+    conn: sqlite3.Connection,
+) -> int:
+    cursor = conn.execute(
+        """
+        UPDATE installation_imports
+        SET access_status = 'not_returned',
+            last_error = ?,
+            updated_at = ?
+        WHERE provider = 'Sigenergy'
+          AND status = 'access_pending'
+          AND access_status = 'pending_approval'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM sigenergy_onboarding_requests request
+              WHERE (
+                      request.installation_import_id = installation_imports.id
+                      OR request.id = installation_imports.onboarding_request_id
+                    )
+                AND request.status IN (
+                    'requested',
+                    'already_requested',
+                    'already_requested_or_onboarded'
+                )
+          )
+        """,
+        (
+            SIGENERGY_NOT_RETURNED_MESSAGE,
+            datetime.now().isoformat(timespec="seconds"),
+        ),
+    )
+    return int(cursor.rowcount or 0)
 
 
 def normalize_sigenergy_system_id_for_compare(system_id: str) -> str:
@@ -17846,12 +18202,38 @@ def run_installation_import_preview_job(
                 SET status = 'approved', last_checked_at = ?,
                     approved_at = COALESCE(approved_at, ?), updated_at = ?, last_error = ''
                 WHERE installation_import_id = ?
+                   OR id = (
+                       SELECT onboarding_request_id
+                       FROM installation_imports
+                       WHERE id = ?
+                   )
                 """,
-                (now, now, now, import_id),
+                (now, now, now, import_id, import_id),
             )
         conn.commit()
-        return {"import_id": import_id, "status": "preview"}
+        return {
+            "import_id": import_id,
+            "status": "preview",
+            "access_status": "available",
+        }
     except SigenergyInstallationAccessPending:
+        onboarding = active_sigenergy_onboarding_for_import(conn, import_id)
+        onboarding_request_id = (
+            int(onboarding["id"]) if onboarding is not None else None
+        )
+        access_status = (
+            "pending_approval"
+            if onboarding_request_id is not None
+            else "not_returned"
+        )
+        access_message = (
+            str(
+                onboarding["provider_message"]
+                or "O pedido de acesso está pendente de aprovação."
+            )
+            if onboarding is not None
+            else SIGENERGY_NOT_RETURNED_MESSAGE
+        )
         normalized = {
             "provider": provider,
             "source_label": f"{provider} API",
@@ -17868,18 +18250,37 @@ def run_installation_import_preview_job(
             mode=import_context["mode"],
             target_asset_id=import_context.get("target_asset_id"),
             status="access_pending",
-            access_status="pending_approval",
+            access_status=access_status,
             normalized=normalized,
             raw_payload={},
             created_by=str(import_context.get("created_by") or ""),
+        )
+        conn.execute(
+            """
+            UPDATE installation_imports
+            SET onboarding_request_id = ?, last_error = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                onboarding_request_id,
+                (
+                    access_message
+                    if onboarding_request_id is None
+                    else ""
+                ),
+                datetime.now().isoformat(timespec="seconds"),
+                import_id,
+            ),
         )
         conn.commit()
         return {
             "import_id": import_id,
             "status": "access_pending",
-            "onboarding_required": True,
-            "onboarding_request_id": None,
-            "onboarding_reused": False,
+            "access_status": access_status,
+            "message": access_message,
+            "onboarding_required": onboarding_request_id is None,
+            "onboarding_request_id": onboarding_request_id,
+            "onboarding_reused": onboarding_request_id is not None,
         }
     except ApiRateLimitError as exc:
         safe_error = sigenergy_service.sanitize_sigenergy_error(exc)
@@ -18083,6 +18484,19 @@ def get_installation_import_context(
     )
     result["background_job"] = (
         dict(background_job_row) if background_job_row is not None else None
+    )
+    result["access_status_label"] = INSTALLATION_ACCESS_STATUS_LABELS.get(
+        str(result.get("access_status") or ""),
+        str(result.get("access_status") or ""),
+    )
+    result["onboarding_required"] = (
+        result.get("status") == "access_pending"
+        and result.get("access_status") == "not_returned"
+    )
+    result["access_message"] = (
+        SIGENERGY_NOT_RETURNED_MESSAGE
+        if result.get("access_status") == "not_returned"
+        else str(result.get("last_error") or "")
     )
     return result
 

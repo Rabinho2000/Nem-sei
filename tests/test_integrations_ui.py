@@ -200,3 +200,86 @@ def test_sigenergy_onboarding_requires_explicit_remote_confirmation(
     assert rejected.status_code == 302
     assert accepted.status_code == 302
     assert calls == ["SIG-CONFIRM"]
+
+
+def test_sigenergy_local_association_can_change_and_remove_in_preview(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "sigenergy-local-association.db"
+    app_module.ensure_database(str(db_path))
+    monkeypatch.setenv("APP_ENV", "preview")
+    now = datetime.now().isoformat(timespec="seconds")
+    with get_db(str(db_path)) as conn:
+        first_asset = int(
+            conn.execute(
+                "INSERT INTO assets (project_name) VALUES ('Asset A')"
+            ).lastrowid
+        )
+        second_asset = int(
+            conn.execute(
+                "INSERT INTO assets (project_name) VALUES ('Asset B')"
+            ).lastrowid
+        )
+        conn.execute(
+            """
+            INSERT INTO provider_system_inventory (
+                provider, external_id, external_name, metadata_json,
+                access_status, first_discovered_at, last_discovered_at,
+                data_quality, created_at, updated_at
+            ) VALUES (
+                'Sigenergy', 'TZXRS1780315946', 'Expertcom', '{}',
+                'accessible', ?, ?, 'missing', ?, ?
+            )
+            """,
+            (now, now, now, now),
+        )
+        conn.commit()
+
+    flask_app, original_database, client = authenticated_client(db_path)
+    try:
+        for asset_id in (first_asset, second_asset):
+            response = client.post(
+                "/integrations",
+                data={
+                    "csrf_token": "token",
+                    "action": "set_sigenergy_asset_association",
+                    "external_id": "TZXRS1780315946",
+                    "asset_id": str(asset_id),
+                },
+            )
+            assert response.status_code == 302
+            with get_db(str(db_path)) as conn:
+                mapping = conn.execute(
+                    """
+                    SELECT * FROM asset_integrations
+                    WHERE provider = 'Sigenergy'
+                      AND external_id = 'TZXRS1780315946'
+                    """
+                ).fetchone()
+            assert mapping["asset_id"] == asset_id
+            assert mapping["external_name"] == "Expertcom"
+            assert mapping["is_primary_energy_source"] == 0
+
+        removed = client.post(
+            "/integrations",
+            data={
+                "csrf_token": "token",
+                "action": "set_sigenergy_asset_association",
+                "external_id": "TZXRS1780315946",
+                "asset_id": "",
+            },
+        )
+        assert removed.status_code == 302
+        with get_db(str(db_path)) as conn:
+            mapping_count = conn.execute(
+                """
+                SELECT COUNT(*) FROM asset_integrations
+                WHERE provider = 'Sigenergy'
+                  AND external_id = 'TZXRS1780315946'
+                """
+            ).fetchone()[0]
+    finally:
+        flask_app.config["DATABASE"] = original_database
+
+    assert mapping_count == 0

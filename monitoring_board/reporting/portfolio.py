@@ -5,7 +5,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from monitoring_board.reporting.models import ReportingPeriod
+from monitoring_board.reporting.models import ReportPeriodType, ReportingPeriod
 from monitoring_board.reporting.financial_quality import (
     apply_production_financial_gate,
     financial_quality_warnings,
@@ -143,9 +143,13 @@ METRIC_CATALOG: dict[str, PortfolioMetricDefinition] = {
     "expected_self_sufficiency_rate_pct": PortfolioMetricDefinition("expected_self_sufficiency_rate_pct", "Taxa AS prevista", "Taxa de autossuficiencia prevista", "Previsao", "%", "number", 2, "recalculate"),
     "expected_specific_yield": PortfolioMetricDefinition("expected_specific_yield", "Specific yield previsto", "Producao prevista por kWp", "Previsao", "kWh/kWp", "number", 2, "recalculate"),
     "expected_production_source": PortfolioMetricDefinition("expected_production_source", "Origem prevista", "Origem da producao prevista", "Previsao", "", "text", 0, "none", False, False),
+    "financial_model_id": PortfolioMetricDefinition("financial_model_id", "Modelo financeiro", "Identificador do modelo financeiro congelado", "Previsao", "", "number", 0, "none", False, False),
+    "financial_model_version": PortfolioMetricDefinition("financial_model_version", "Versao do modelo", "Versao do modelo financeiro congelado", "Previsao", "", "number", 0, "none", False, False),
+    "financial_model_effective_date": PortfolioMetricDefinition("financial_model_effective_date", "Data efetiva do modelo", "Data efetiva do modelo financeiro congelado", "Previsao", "", "text", 0, "none", False, False),
     "adjusted_expected_kwh": PortfolioMetricDefinition("adjusted_expected_kwh", "Esperada ajustada", "Producao esperada ajustada", "Performance", "kWh", "number", 2, "sum"),
     "deviation_kwh": PortfolioMetricDefinition("deviation_kwh", "Desvio", "Desvio de producao", "Performance", "kWh", "number", 2, "recalculate"),
     "deviation_pct": PortfolioMetricDefinition("deviation_pct", "Desvio %", "Desvio percentual", "Performance", "%", "number", 2, "recalculate"),
+    "performance_vs_expected_pct": PortfolioMetricDefinition("performance_vs_expected_pct", "Performance vs esperado", "Producao real / producao esperada ajustada; nao e PR tecnico", "Performance", "%", "number", 2, "recalculate"),
     "specific_yield": PortfolioMetricDefinition("specific_yield", "Specific yield", "Producao por kWp", "Performance", "kWh/kWp", "number", 2, "recalculate"),
     "availability_pct": PortfolioMetricDefinition("availability_pct", "Disponibilidade", "Disponibilidade ponderada", "Disponibilidade", "%", "number", 2, "weighted_avg"),
     "self_use_kwh": PortfolioMetricDefinition("self_use_kwh", "Autoconsumo", "Energia autoconsumida", "Autoconsumo", "kWh", "number", 2, "sum"),
@@ -170,7 +174,7 @@ METRIC_CATALOG: dict[str, PortfolioMetricDefinition] = {
 
 DEFAULT_PROFILE_COLUMNS = {
     "Resumo operacional": ("installation", "actual_production_kwh", "production_quality_status", "production_coverage_pct", "adjusted_expected_kwh", "deviation_pct", "availability_pct", "estimated_value_eur", "data_status"),
-    "Performance": ("installation", "installed_power_kwp", "actual_production_kwh", "specific_yield", "adjusted_expected_kwh", "deviation_kwh", "deviation_pct", "availability_pct"),
+    "Performance": ("installation", "installed_power_kwp", "actual_production_kwh", "specific_yield", "adjusted_expected_kwh", "deviation_kwh", "deviation_pct", "performance_vs_expected_pct", "availability_pct"),
     "Financeiro": ("installation", "self_use_kwh", "export_kwh", "estimated_value_eur", "export_revenue_eur", "esco_payment_eur", "net_benefit_eur"),
     "Qualidade dos dados": ("installation", "mapping_confidence", "production_quality_status", "production_coverage_pct", "raw_daily_production_kwh", "coverage_pct", "invoice_status", "tariff_type", "warning_count", "warning_labels"),
     "Completo": tuple(METRIC_CATALOG.keys()),
@@ -367,7 +371,7 @@ def comparison_values(current: PortfolioReportSummary, previous: PortfolioReport
 
 
 def data_coverage(rows: tuple[PortfolioReportRow, ...], months: tuple[date, ...]) -> PortfolioDataCoverage:
-    sources = ("production", "helioscope", "availability", "tariff", "self_use", "invoice", "mapping")
+    sources = ("production", "financial_model", "availability", "tariff", "self_use", "invoice", "mapping")
     by_source: dict[str, Decimal] = {}
     expected_months = len(months) or 1
     expected_slots = len(rows) * expected_months
@@ -415,6 +419,77 @@ def result_to_dict(result: PortfolioReportResult) -> dict[str, Any]:
         "engine_version": result.engine_version,
         "generated_at": result.generated_at.isoformat(timespec="seconds"),
     }
+
+
+def result_from_dict(payload: dict[str, Any]) -> PortfolioReportResult:
+    """Rebuild a renderable result exclusively from an immutable snapshot."""
+    period_data = dict(payload.get("period") or {})
+    profile = profile_from_config(
+        dict(payload.get("profile") or {}),
+        profile_id=None,
+        portfolio_id=int(payload.get("portfolio_id") or 0) or None,
+    )
+    period = ReportingPeriod(
+        period_type=ReportPeriodType(str(period_data.get("type") or "monthly")),
+        start=date.fromisoformat(str(period_data["start"])),
+        end=date.fromisoformat(str(period_data["end"])),
+        label=str(period_data.get("label") or ""),
+        month_count=len(period_data.get("months") or ()) or 1,
+        included_months=tuple(
+            date.fromisoformat(str(item)) for item in period_data.get("months") or ()
+        ),
+    )
+    coverage = dict(payload.get("coverage") or {})
+    comparison_data = payload.get("comparison")
+    return PortfolioReportResult(
+        portfolio_id=int(payload["portfolio_id"]),
+        portfolio_name=str(payload.get("portfolio_name") or ""),
+        profile=profile,
+        profile_version=int(payload.get("profile_version") or 1),
+        period=period,
+        columns=tuple(
+            PortfolioReportColumn(**item)
+            for item in payload.get("columns") or ()
+            if isinstance(item, dict)
+        ),
+        rows=tuple(
+            PortfolioReportRow(
+                asset_id=item.get("asset_id"),
+                values=dict(item.get("values") or {}),
+                warnings=tuple(item.get("warnings") or ()),
+                severity=str(item.get("severity") or "ok"),
+            )
+            for item in payload.get("rows") or ()
+            if isinstance(item, dict)
+        ),
+        summary=PortfolioReportSummary(
+            values=dict((payload.get("summary") or {}).get("values") or {}),
+            warnings=tuple((payload.get("summary") or {}).get("warnings") or ()),
+        ),
+        comparison=(
+            None
+            if not isinstance(comparison_data, dict)
+            else PortfolioComparisonResult(
+                mode=str(comparison_data.get("mode") or ""),
+                values=dict(comparison_data.get("values") or {}),
+                warnings=tuple(comparison_data.get("warnings") or ()),
+            )
+        ),
+        coverage=PortfolioDataCoverage(
+            global_pct=Decimal(str(coverage.get("global_pct") or 0)),
+            by_source={
+                key: Decimal(str(value))
+                for key, value in (coverage.get("by_source") or {}).items()
+            },
+            complete_installations=int(coverage.get("complete_installations") or 0),
+            incomplete_installations=int(coverage.get("incomplete_installations") or 0),
+            missing_months=tuple(coverage.get("missing_months") or ()),
+        ),
+        warnings=tuple(payload.get("warnings") or ()),
+        metadata=dict(payload.get("metadata") or {}),
+        engine_version=str(payload.get("engine_version") or ENGINE_VERSION),
+        generated_at=datetime.fromisoformat(str(payload.get("generated_at"))),
+    )
 
 
 def profile_to_config(profile: PortfolioReportProfile) -> dict[str, Any]:

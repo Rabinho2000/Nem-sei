@@ -642,7 +642,8 @@ Presentation candidates:
 - FusionSolar API session and fetch functions should stay in integration code until reporting no longer needs live API fallback.
 - `customer_reports.REPORT_TYPES` can stay as PDF display configuration.
 - `customer_reports.build_customer_report_pdf()` can stay for Phase 1-6 to preserve visual output.
-- `portfolio_reports.PORTFOLIO_EXTERNAL_ROWS` can stay until mapping is reworked in Phase 9.
+- Operational portfolio rows must be imported through the UI or Excel/CSV
+  workflows. They are not stored in source code.
 
 ## Incremental Migration Strategy
 

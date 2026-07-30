@@ -14,7 +14,7 @@
           <span>{{ row.external_id }} · {{ row.project_name or "Sem asset associado" }}</span>
         </div>
         <div>
-          <span class="status-pill">{{ row.access_status }}</span>
+          <span class="status-pill">{{ installation_access_status_labels.get(row.access_status, row.access_status) }}</span>
           <small class="muted">Última sync: {{ row.mapping_last_sync_at or "—" }}</small>
           {% if row.mapping_last_error or row.last_error %}
             <small class="error-text">{{ row.mapping_last_error or row.last_error }}</small>

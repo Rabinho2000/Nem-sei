@@ -24,6 +24,7 @@ from monitoring_board.portfolio_report_repository import (
 from monitoring_board.portfolio_repository import create_portfolio
 from monitoring_board.reporting.periods import build_period
 from monitoring_board.reporting.portfolio import (
+    DEFAULT_PROFILE_COLUMNS,
     PortfolioReportColumn,
     PortfolioReportProfile,
     PortfolioReportRow,
@@ -66,6 +67,8 @@ def add_portfolio_member(conn: sqlite3.Connection, asset_id: int) -> int:
 
 
 def test_domain_recalculates_totals_and_comparison_without_averaging_percentages() -> None:
+    assert "performance_vs_expected_pct" in DEFAULT_PROFILE_COLUMNS["Performance"]
+
     columns = (
         PortfolioReportColumn("actual_production_kwh", "Producao real"),
         PortfolioReportColumn("adjusted_expected_kwh", "Esperada"),
@@ -163,7 +166,7 @@ def test_service_periods_snapshots_and_excel_use_same_result(tmp_path: Path) -> 
     result = prepare_portfolio_report(
         conn,
         portfolio_id=portfolio_id,
-        portfolio_name="Solcorelios I",
+        portfolio_name="Portfolio Sintetico",
         profile=profile,
         period_type="quarterly",
         year=2026,

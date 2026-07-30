@@ -1,134 +1,122 @@
-# Sigenergy API — contrato implementado
+# Sigenergy API
 
-A integração executa leituras de descoberta, estado live e histórico diário. Não
-implementa controlo de bateria, alterações de modo nem outros comandos remotos.
-Existe uma única escrita remota opcional, o pedido de acesso
-`POST /openapi/board/onboard`; só é executada por uma ação explícita e confirmada
-na página de Integrações e fica auditada localmente.
+A integração Sigenergy suporta descoberta, estado atual e leitura de histórico
+diário. O acesso foi confirmado em modo read-only para a instalação Expertcom.
+Alarmes, inversores, strings, disponibilidade e controlo remoto continuam fora
+do âmbito.
 
-## Matriz de capacidades
+## Configuração suportada
 
-| Capacidade | Contrato oficial / canal | Uso local | Estado |
+As variáveis atuais continuam compatíveis:
+
+- `SIGENERGY_ENABLED`
+- `SIGENERGY_APP_KEY`
+- `SIGENERGY_APP_SECRET`
+- `SIGENERGY_BASE_URL`
+- `SIGENERGY_AUTH_ENDPOINT`
+- `SIGENERGY_SYSTEMS_ENDPOINT`
+- `SIGENERGY_ENERGY_FLOW_ENDPOINT`
+- `SIGENERGY_REGION`
+- `SIGENERGY_SYSTEM_IDS`
+
+O client normal descobre os sistemas autorizados através de `/openapi/system`.
+O worker isolado da preview usa, adicionalmente,
+`SIGENERGY_ALLOWED_SYSTEM_IDS`, que é uma allowlist obrigatória e não um
+fallback de descoberta.
+
+## Implementado
+
+| Área | Endpoint/config | Método | Notas |
 | --- | --- | --- | --- |
-| Autenticação | `POST /openapi/auth/login/key` | Token Bearer sanitizado e renovado quando necessário | Implementado |
-| Descoberta | `GET /openapi/system` | Inventário de todos os sistemas autorizados; nunca usa uma allowlist manual | Implementado |
-| Estado atual | `GET /openapi/systems/{systemId}/energyFlow` | Snapshots de potência, SOC e estado; não produz kWh | Implementado |
-| Histórico diário | `GET /openapi/systems/{systemId}/history`, corpo `{"level":"Day","date":"AAAA-MM-DD"}` | Backfill limitado, fila `production`, factos diários e materialização mensal | Implementado, mas condicionado por permissão e unidade confirmada |
-| Data Subscription | MQTT, com pedidos de subscrição num tópico próprio | Não existe webhook HTTP porque esse não é o transporte oficial documentado | A aguardar parâmetros MQTT entregues pela Sigenergy |
-| Telemetria periódica | Tópico MQTT; período normal de 5 minutos, alterável com suporte Sigenergy | Não ativa polling adicional | Não ligado |
-| Alarmes e alterações | Tópicos MQTT separados | Sem consumidor local enquanto faltarem broker e tópicos reais | Não ligado |
-| Pedido de acesso | `POST /openapi/board/onboard` | Ação explícita, confirmada e auditável; nunca automática | Implementado |
-| Comandos remotos | Fora do âmbito | Nenhum | Não suportado |
+| Login | `SIGENERGY_AUTH_ENDPOINT` | `get_access_token` / `authenticate` | Envia App Key/App Secret codificados no payload `key`. |
+| Token | Bearer | `request_json` | O token é guardado em cache até expirar. |
+| Região | `SIGENERGY_REGION` | headers | Envia `sigen-region` no login e nas chamadas autenticadas. |
+| Sistemas | `SIGENERGY_SYSTEMS_ENDPOINT` | `list_systems` | Aceita listas em `data.list`, `records`, `systems`, `items`, `systemList` ou `rows`. |
+| Estado atual | `SIGENERGY_ENERGY_FLOW_ENDPOINT` | `get_energy_flow` | Substitui `{system_id}`/`{systemId}` e lê `energyFlow` atual. |
+| Histórico diário | `/openapi/systems/{system_id}/history` | `get_system_history` | Envia `level` e `date` na query string; nunca usa JSON body no GET. |
+| Scheduler | `integration-state-sigenergy-hourly` | sync horário | Só agenda estado/energyFlow. |
 
-Documentação oficial consultada:
+## Validação e tolerância de payload
 
-- [System history](https://developer.sigencloud.com/user/api/document/32)
-- [Data Subscription](https://developer.sigencloud.com/user/api/document/45)
-- [System telemetry](https://developer.sigencloud.com/user/api/document/51)
-- [Telemetry signal list](https://developer.sigencloud.com/user/api/document/63)
-- [MQTT service alignment](https://developer.sigencloud.com/user/api/document/39)
+- Payload Sigenergy tem de ser objeto JSON.
+- `code` ausente, `0` ou `"0"` é tratado como sucesso.
+- `data` pode vir como objeto ou como string JSON; ambos continuam suportados.
+- Campos em falta no `energyFlow` resultam em `None`, não em exceção.
+- Estado desconhecido é apresentado como `Sem dados`.
+- O histórico diário com `code: 0` é autorizado. O antigo HTML 403 do
+  CloudFront era causado pelo envio incorreto de `level` e `date` num JSON body
+  de um pedido GET, não por falta da permissão `System history`.
 
-## Regras energéticas
+## Contrato energético histórico
 
-`energyFlow` contém potência instantânea. Os campos `pvPower`, `gridPower`,
-`batteryPower` e equivalentes nunca são integrados nem convertidos em energia.
+Os nomes confirmados pela API identificam energia em kWh. Cada contador é
+persistido ou usado separadamente; não são somados campos semanticamente
+sobrepostos:
 
-O histórico oficial devolve totais como `powerGeneration`, `powerUse`,
-`powerSelfConsumption`, `powerOneself`, `powerToGrid`, `powerFromGrid`,
-`esCharging` e `esDischarging`. A página distingue
-`powerSelfConsumption` (“Self-consumed green power”) de `powerOneself`
-(“Load green power consumption”). O segundo é materializado como
-`self_use_kwh`, porque representa a energia verde realmente fornecida à carga e
-mantém o balanço consumo = energia local + importação. O primeiro permanece no
-payload sanitizado, sem ser confundido com energia faturável.
+| Campo Sigenergy | Destino | Significado |
+| --- | --- | --- |
+| `powerGenerationKwh` | `production_kwh` | Produção PV principal do período. |
+| `powerUseKwh` | `consumption_kwh` | Consumo total. |
+| `powerOneselfKwh` | `self_use_kwh` | Energia verde fornecida à carga, usada no balanço dos relatórios. |
+| `powerToGridKwh` | `export_kwh` | Energia exportada para a rede. |
+| `powerFromGridKwh` | `grid_import_kwh` | Energia importada da rede. |
+| `esChargingKwh` | `battery_charge_kwh` | Energia carregada na bateria. |
+| `esDischargingKwh` | `battery_discharge_kwh` | Energia descarregada da bateria. |
 
-A página oficial descreve estes totais como energia, mas não identifica
-inequivocamente a unidade. Por isso:
+Os nomes legacy sem `Kwh` continuam aceites apenas como fallback. Quando as
+duas variantes existem, vence a variante `Kwh` e os valores nunca são somados.
+Campos ausentes permanecem `NULL`, nunca zero.
 
-1. O payload é recusado enquanto a unidade não estiver confirmada como kWh.
-2. A confirmação operacional é `SIGENERGY_HISTORY_ENERGY_UNIT=kWh`.
-3. Só os campos presentes e numéricos são persistidos.
-4. Nenhum valor ausente é substituído por zero.
-5. O payload sanitizado, período, timezone `Europe/Lisbon`, granularidade,
-   proveniência e qualidade ficam em `energy_interval_facts`.
+`powerSelfConsumptionKwh` é um contador distinto do lado da produção. É
+preservado, juntamente com `itemList` e todos os restantes campos originais, no
+`payload_json` sanitizado, mas não é convertido numa segunda métrica de
+autoconsumo nem somado a `self_use_kwh`.
 
-Cada dia é materializado de forma idempotente em `production_records`. Um mês
-anterior só é `complete` quando existem todos os dias e todos os campos
-energéticos centrais — produção, consumo, autoconsumo, exportação e importação —
-estão completos. Caso contrário fica `partial`, `missing`, `conflict` ou
-`in_progress`. Os relatórios leem exclusivamente estes registos locais e nunca
-chamam a Sigenergy durante a geração.
+## Token, 401 e rate limit
 
-Uma fonte energética primária é única por asset. A Sigenergy não pode ser
-selecionada sem pelo menos um mês completo. Se o mesmo asset também tiver
-FusionSolar, a troca exige confirmação explícita.
+- HTTP `401` invalida o token e faz relogin uma vez.
+- HTTP `429` gera `ApiRateLimitError` para a camada comum persistir cooldown e evitar novas chamadas até ao próximo attempt.
+- HTTP `5xx` e erros de rede usam backoff curto e limitado pela camada comum.
+- Secrets, tokens e Bearer headers devem ser sanitizados em mensagens de erro.
 
-## Fila, quotas e limites
+## Fora de scope atual
 
-Descoberta, estado, produção, telemetria e alarmes têm áreas distintas na fila
-persistente, mas partilham a lease da conta. Importação, preview, onboarding e
-histórico passam pela mesma fila.
+Não existem endpoints implementados para:
 
-A documentação do histórico limita uma conta a uma leitura de uma estação a
-cada cinco minutos. A área `production` usa por defeito:
+- alarmes;
+- inversores;
+- strings;
+- availability;
+- controlo remoto.
 
-```dotenv
-SIGENERGY_PRODUCTION_MIN_INTERVAL_SECONDS=300
-SIGENERGY_PRODUCTION_DAILY_BUDGET=
-```
+O onboarding existente na app fica como compatibilidade operacional da UI atual, mas não faz parte do client de estado Sigenergy documentado aqui.
 
-O orçamento diário permanece vazio até existir um limite contratual confirmado.
-A UI mostra `Por validar`. Podem ser definidos limites por área:
+## Readiness para fecho mensal
 
-```dotenv
-SIGENERGY_API_MIN_INTERVAL_SECONDS=
-SIGENERGY_API_DAILY_BUDGET=
-SIGENERGY_DISCOVERY_MIN_INTERVAL_SECONDS=
-SIGENERGY_DISCOVERY_DAILY_BUDGET=
-SIGENERGY_STATE_MIN_INTERVAL_SECONDS=
-SIGENERGY_STATE_DAILY_BUDGET=
-SIGENERGY_PRODUCTION_MIN_INTERVAL_SECONDS=300
-SIGENERGY_PRODUCTION_DAILY_BUDGET=
-SIGENERGY_TELEMETRY_MIN_INTERVAL_SECONDS=
-SIGENERGY_TELEMETRY_DAILY_BUDGET=
-SIGENERGY_ALARMS_MIN_INTERVAL_SECONDS=
-SIGENERGY_ALARMS_DAILY_BUDGET=
-```
+O fecho mensal mantém FusionSolar como fonte primária quando é a fonte mensal
+válida. `energyFlow` representa estado/potência live e nunca é integrado para
+inventar kWh.
 
-HTTP 429 mantém a área correta, respeita `Retry-After`, aplica cooldown
-persistente e reagenda jobs. HTTP 403 de histórico é isolado à instalação e não
-é repetido agressivamente.
+Um snapshot que dependa de Sigenergy fica bloqueado quando:
 
-## Estado validado da Expertcom
+- o backfill não cobre o mês completo;
+- o mês não passou a validação de qualidade.
 
-Com as credenciais locais atuais, a descoberta devolve `Expertcom` com System ID
-`TZXRS1780315946`, e `energyFlow` devolve estado live. O histórico diário para
-essa instalação devolveu HTTP 403. Consequentemente:
+Os findings mostram a remediação operacional. A aplicação não altera permissões,
+não inventa tópicos MQTT e não gera valores sintéticos. Um único dia read-only
+confirma o contrato e a permissão, mas não constitui um backfill mensal.
 
-- a monitorização live está operacional;
-- não existem kWh históricos Sigenergy ingeridos;
-- a Sigenergy não está pronta para ser fonte primária dos relatórios;
-- FusionSolar deve continuar como fonte primária caso esteja mapeada no mesmo
-  asset.
+## Persistência e backfill
 
-## Passos manuais ainda necessários
+A aplicação expõe o job `sigenergy_energy_sync` e a UI usa
+`enqueue_sigenergy_energy_backfill` para criar, de forma idempotente, um job por
+dia terminado. Cada resposta é persistida em `energy_interval_facts`,
+materializada como registo diário em `production_records` e volta a
+materializar o total mensal.
 
-No portal e com o contacto Sigenergy responsável pela aplicação:
-
-1. Abrir a aplicação associada à App Key usada pela plataforma.
-2. Pedir/ativar a permissão do endpoint **System history** para a Expertcom
-   (`TZXRS1780315946`) e confirmar que uma leitura diária deixa de devolver
-   HTTP 403.
-3. Obter confirmação escrita de que os totais do endpoint de histórico diário
-   são expressos em **kWh**. Só depois definir
-   `SIGENERGY_HISTORY_ENERGY_UNIT=kWh` e reiniciar a aplicação.
-4. Definir `SIGENERGY_PRODUCTION_DAILY_BUDGET` de acordo com a quota contratada
-   antes de lançar backfills extensos.
-5. Para Data Subscription, pedir à Sigenergy os valores específicos da
-   aplicação: broker, porta, client ID, username, password, TLS, QoS e os três
-   tópicos (telemetria periódica, alterações e alarmes). Sem estes dados não é
-   possível ligar um consumidor MQTT real e seguro.
-
-Não há URL de webhook para configurar: a documentação oficial disponível define
-MQTT. Um consumidor MQTT só deve ser implementado quando os parâmetros reais e
-payloads anonimizados da aplicação estiverem disponíveis.
+Na preview, o comando administrativo `sigenergy-backfill` executa o mesmo
+contrato de parsing e persistência diretamente num worker one-shot. O intervalo
+fica limitado a 31 dias terminados, as chamadas são sequenciais e respeitam o
+intervalo mínimo de 300 segundos já usado pela política de produção Sigenergy.
+O worker para novas tentativas quando recebe rate limit. Nenhum destes
+mecanismos foi executado durante a alteração do código.

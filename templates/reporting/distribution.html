@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="reports-header">
+  <div><p class="eyebrow">Reporting</p><h2>Distribuição</h2><p class="muted">Preparação e aprovação manual. Nenhum email é enviado por esta aplicação.</p></div>
+</section>
+<nav class="reports-tabs" aria-label="Área de relatórios">
+  <a href="{{ url_for('exports', tab='generate') }}">Gerar</a>
+  <a href="{{ url_for('reporting.monthly_close') }}">Fecho mensal</a>
+  <a href="{{ url_for('exports', tab='automations') }}">Automatizações</a>
+  <a class="active" aria-current="page" href="{{ url_for('reporting.distribution_queue') }}">Distribuição</a>
+  <a href="{{ url_for('exports', tab='templates') }}">Templates</a>
+  <a href="{{ url_for('exports', tab='history') }}">Histórico</a>
+</nav>
+<section class="card reports-card">
+  <h3>Novo destinatário</h3>
+  <form method="post" action="{{ url_for('reporting.add_distribution_recipient') }}" class="form-grid">
+    <label>Nome <input name="name" required maxlength="120"></label>
+    <label>Email <input type="email" name="email" required maxlength="254" autocomplete="email"></label>
+    <label>Âmbito
+      <select name="scope_type" required>
+        <option value="customer">Cliente</option><option value="asset">Instalação</option><option value="portfolio">Portefólio</option>
+      </select>
+    </label>
+    <label>ID do âmbito <input type="number" min="1" name="scope_id" required aria-describedby="scope-help"></label>
+    <span id="scope-help" class="muted">Use o ID apresentado na gestão do cliente, instalação ou portefólio.</span>
+    <button class="button" type="submit">Criar destinatário</button>
+  </form>
+</section>
+<section class="card reports-card">
+  <h3>Preparar ficheiro</h3>
+  <form method="post" action="{{ url_for('reporting.add_distribution_item') }}" class="form-grid">
+    <label>Ficheiro aprovado
+      <select name="generated_file_id" required>{% for file in files %}<option value="{{ file.id }}">#{{ file.id }} — {{ file.filename }}</option>{% endfor %}</select>
+    </label>
+    <label>Destinatário
+      <select name="recipient_id" required>{% for recipient in recipients if recipient.active %}<option value="{{ recipient.id }}">{{ recipient.name }} — {{ recipient.customer_name or recipient.asset_name or recipient.portfolio_name }}</option>{% endfor %}</select>
+    </label>
+    <button class="button" type="submit">Marcar ready_to_send</button>
+  </form>
+</section>
+<section class="card reports-card">
+  <h3>Fila sem envio real</h3>
+  <div class="table-wrap"><table class="reports-table">
+    <thead><tr><th>Ficheiro</th><th>Destinatário</th><th>Estado</th><th>Tentativas</th><th>Ações</th></tr></thead>
+    <tbody>
+      {% for item in distributions %}<tr>
+        <td><a href="{{ url_for('download_generated_report', file_id=item.file_id) }}">{{ item.filename }}</a></td>
+        <td>{{ item.recipient_name }}</td><td><span class="status-chip">{{ item.status }}</span></td><td>{{ item.attempt_count }}</td>
+        <td><div class="button-row">
+          {% if item.status == 'ready_to_send' %}<form method="post" action="{{ url_for('reporting.update_distribution_item', distribution_id=item.id, action='approve') }}"><button class="button" type="submit">Aprovar para envio</button></form>{% endif %}
+          {% if item.status == 'failed' %}<form method="post" action="{{ url_for('reporting.update_distribution_item', distribution_id=item.id, action='retry') }}"><button class="button secondary" type="submit">Repor como pronto</button></form>{% endif %}
+          {% if item.status in ['draft', 'ready_to_send', 'approved_to_send', 'failed'] %}<form method="post" action="{{ url_for('reporting.update_distribution_item', distribution_id=item.id, action='cancel') }}" onsubmit="return confirm('Cancelar esta distribuição?')"><button class="button danger" type="submit">Cancelar</button></form>{% endif %}
+        </div></td>
+      </tr>{% else %}<tr><td colspan="5" class="muted">Sem itens preparados.</td></tr>{% endfor %}
+    </tbody>
+  </table></div>
+</section>
+{% endblock %}

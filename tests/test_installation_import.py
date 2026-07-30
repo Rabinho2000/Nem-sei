@@ -351,7 +351,10 @@ def test_access_check_resumes_pending_import_without_duplicate_data(tmp_path, mo
             "SELECT * FROM installation_imports WHERE id = ?", (import_id,)
         ).fetchone()
         assert queued["status"] == "queued"
-        app_module.run_installation_import_preview_job(conn, import_id)
+        result = app_module.run_installation_import_preview_job(
+            conn,
+            import_id,
+        )
         imported = conn.execute(
             "SELECT * FROM installation_imports WHERE id = ?", (import_id,)
         ).fetchone()
@@ -359,7 +362,10 @@ def test_access_check_resumes_pending_import_without_duplicate_data(tmp_path, mo
             "SELECT * FROM sigenergy_onboarding_requests WHERE installation_import_id = ?",
             (import_id,),
         ).fetchone()
+        assert result["status"] == "preview"
+        assert result["access_status"] == "available"
         assert imported["status"] == "preview"
+        assert imported["access_status"] == "available"
         assert onboarding["status"] == "approved"
         assert conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 0
 
@@ -646,12 +652,95 @@ def test_sigenergy_access_pending_requires_explicit_onboarding_and_creates_no_ma
             "SELECT * FROM installation_imports WHERE id = ?", (import_id,)
         ).fetchone()
         assert result["status"] == "access_pending"
+        assert result["access_status"] == "not_returned"
+        assert result["message"] == (
+            "A instalação não foi devolvida pela App Key configurada."
+        )
         assert result["onboarding_required"] is True
         assert row["status"] == "access_pending"
-        assert row["access_status"] == "pending_approval"
+        assert row["access_status"] == "not_returned"
+        assert row["last_error"] == result["message"]
         assert conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM asset_integrations").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM sigenergy_onboarding_requests").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "request_status",
+    [
+        "requested",
+        "already_requested",
+        "already_requested_or_onboarded",
+    ],
+)
+def test_sigenergy_missing_system_with_real_onboarding_stays_pending_approval(
+    tmp_path,
+    monkeypatch,
+    request_status,
+) -> None:
+    db_path = tmp_path / f"onboarding-{request_status}.db"
+    app_module.ensure_database(str(db_path))
+    with get_db(str(db_path)) as conn:
+        import_id = app_module.upsert_installation_import_preview(
+            conn,
+            provider="Sigenergy",
+            external_id="SIG-PENDING",
+            external_name="SIG-PENDING",
+            mode="create",
+            target_asset_id=None,
+            status="queued",
+            access_status="checking",
+            normalized={
+                "external_id": "SIG-PENDING",
+                "external_name": "SIG-PENDING",
+            },
+            raw_payload={},
+            created_by="test",
+        )
+        now = datetime.now().isoformat(timespec="seconds")
+        request_id = int(
+            conn.execute(
+                """
+                INSERT INTO sigenergy_onboarding_requests (
+                    system_id, requested_at, requested_by, status,
+                    attempt_count, response_json, created_at, updated_at,
+                    installation_import_id
+                ) VALUES (?, ?, '', ?, 1, '{}', ?, ?, ?)
+                """,
+                (
+                    "SIG-PENDING",
+                    now,
+                    request_status,
+                    now,
+                    now,
+                    import_id,
+                ),
+            ).lastrowid
+        )
+        conn.commit()
+        monkeypatch.setattr(
+            app_module,
+            "fetch_provider_installation_preview",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                app_module.SigenergyInstallationAccessPending("pending")
+            ),
+        )
+
+        result = app_module.run_installation_import_preview_job(
+            conn,
+            import_id,
+        )
+        row = conn.execute(
+            "SELECT * FROM installation_imports WHERE id = ?",
+            (import_id,),
+        ).fetchone()
+
+    assert result["access_status"] == "pending_approval"
+    assert result["onboarding_required"] is False
+    assert result["onboarding_request_id"] == request_id
+    assert result["onboarding_reused"] is True
+    assert row["access_status"] == "pending_approval"
+    assert row["onboarding_request_id"] == request_id
 
 
 @pytest.mark.parametrize(
@@ -686,6 +775,13 @@ def test_sigenergy_discovery_never_auto_requests_onboarding_when_access_is_pendi
         app_module.sigenergy_service,
         "SigenergyClient",
         FakeClient,
+    )
+    monkeypatch.setattr(
+        app_module,
+        "create_sigenergy_onboarding_request",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Onboarding must never be requested automatically")
+        ),
     )
     with get_db(str(db_path)) as conn:
         configure_provider(conn, "Sigenergy")
@@ -726,8 +822,170 @@ def test_sigenergy_discovery_never_auto_requests_onboarding_when_access_is_pendi
     assert first["status"] == second["status"] == "access_pending"
     assert list_calls == [True, True]
     assert installation_import["status"] == "access_pending"
+    assert installation_import["access_status"] == "not_returned"
     assert installation_import["onboarding_request_id"] is None
     assert onboarding_count == 0
+
+
+def test_sigenergy_not_returned_ui_never_claims_request_was_sent(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "sigenergy-not-returned-ui.db"
+    app_module.ensure_database(str(db_path))
+    with get_db(str(db_path)) as conn:
+        import_id = app_module.upsert_installation_import_preview(
+            conn,
+            provider="Sigenergy",
+            external_id="SIG-NOT-RETURNED",
+            external_name="SIG-NOT-RETURNED",
+            mode="create",
+            target_asset_id=None,
+            status="queued",
+            access_status="checking",
+            normalized={
+                "external_id": "SIG-NOT-RETURNED",
+                "external_name": "SIG-NOT-RETURNED",
+            },
+            raw_payload={},
+            created_by="test",
+        )
+        monkeypatch.setattr(
+            app_module,
+            "fetch_provider_installation_preview",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                app_module.SigenergyInstallationAccessPending("pending")
+            ),
+        )
+        app_module.run_installation_import_preview_job(conn, import_id)
+
+    flask_app, original_database, client = authenticated_client(db_path)
+    try:
+        response = client.get(
+            f"/integrations/import?import_id={import_id}"
+        )
+    finally:
+        flask_app.config["DATABASE"] = original_database
+
+    html = response.get_data(as_text=True)
+    assert response.status_code == 200
+    assert "Não devolvida pela App Key" in html
+    assert "A instalação não foi devolvida pela App Key configurada." in html
+    assert "Pedido enviado — aguarda aprovação" not in html
+
+
+def test_installation_import_ui_uses_human_access_status_labels(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "installation-access-labels.db"
+    app_module.ensure_database(str(db_path))
+    with get_db(str(db_path)) as conn:
+        for index, access_status in enumerate(
+            ("not_returned", "pending_approval", "available", "error"),
+            start=1,
+        ):
+            app_module.upsert_installation_import_preview(
+                conn,
+                provider="Sigenergy",
+                external_id=f"SIG-LABEL-{index}",
+                external_name=f"Label {index}",
+                mode="create",
+                target_asset_id=None,
+                status=(
+                    "preview"
+                    if access_status == "available"
+                    else (
+                        "error"
+                        if access_status == "error"
+                        else "access_pending"
+                    )
+                ),
+                access_status=access_status,
+                normalized={"external_id": f"SIG-LABEL-{index}"},
+                raw_payload={},
+                created_by="test",
+            )
+        conn.commit()
+
+    flask_app, original_database, client = authenticated_client(db_path)
+    try:
+        response = client.get("/integrations")
+    finally:
+        flask_app.config["DATABASE"] = original_database
+
+    html = response.get_data(as_text=True)
+    assert response.status_code == 200
+    for label in (
+        "Não devolvida pela App Key",
+        "Pedido enviado — aguarda aprovação",
+        "Acesso disponível",
+        "Erro na verificação",
+    ):
+        assert label in html
+
+
+def test_sigenergy_pending_approval_migration_preserves_real_requests(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "sigenergy-access-status-migration.db"
+    app_module.ensure_database(str(db_path))
+    with get_db(str(db_path)) as conn:
+        without_request = app_module.upsert_installation_import_preview(
+            conn,
+            provider="Sigenergy",
+            external_id="SIG-WITHOUT-REQUEST",
+            external_name="SIG-WITHOUT-REQUEST",
+            mode="create",
+            target_asset_id=None,
+            status="access_pending",
+            access_status="pending_approval",
+            normalized={"external_id": "SIG-WITHOUT-REQUEST"},
+            raw_payload={},
+            created_by="test",
+        )
+        with_request = app_module.upsert_installation_import_preview(
+            conn,
+            provider="Sigenergy",
+            external_id="SIG-WITH-REQUEST",
+            external_name="SIG-WITH-REQUEST",
+            mode="create",
+            target_asset_id=None,
+            status="access_pending",
+            access_status="pending_approval",
+            normalized={"external_id": "SIG-WITH-REQUEST"},
+            raw_payload={},
+            created_by="test",
+        )
+        now = datetime.now().isoformat(timespec="seconds")
+        conn.execute(
+            """
+            INSERT INTO sigenergy_onboarding_requests (
+                system_id, requested_at, status, attempt_count,
+                response_json, created_at, updated_at, installation_import_id
+            ) VALUES ('SIG-WITH-REQUEST', ?, 'requested', 1, '{}', ?, ?, ?)
+            """,
+            (now, now, now, with_request),
+        )
+        conn.commit()
+
+    app_module.ensure_database(str(db_path))
+    app_module.ensure_database(str(db_path))
+
+    with get_db(str(db_path)) as conn:
+        migrated = conn.execute(
+            "SELECT * FROM installation_imports WHERE id = ?",
+            (without_request,),
+        ).fetchone()
+        preserved = conn.execute(
+            "SELECT * FROM installation_imports WHERE id = ?",
+            (with_request,),
+        ).fetchone()
+
+    assert migrated["access_status"] == "not_returned"
+    assert migrated["last_error"] == (
+        "A instalação não foi devolvida pela App Key configurada."
+    )
+    assert preserved["access_status"] == "pending_approval"
 
 
 def test_sigenergy_accessible_import_syncs_only_new_mapping_despite_fixed_ids(

@@ -139,3 +139,57 @@ def set_asset_primary_energy_source(
         "UPDATE asset_integrations SET is_primary_energy_source = 1 WHERE id = ?",
         (int(selected["id"]),),
     )
+
+
+def set_sigenergy_asset_association(
+    conn: sqlite3.Connection,
+    *,
+    external_id: str,
+    asset_id: int | None,
+) -> None:
+    """Create, change, or remove a Sigenergy mapping without remote calls."""
+
+    inventory = conn.execute(
+        """
+        SELECT external_name
+        FROM provider_system_inventory
+        WHERE provider = 'Sigenergy' AND external_id = ?
+        """,
+        (external_id,),
+    ).fetchone()
+    if inventory is None:
+        raise ValueError("O sistema Sigenergy nao existe no inventario local.")
+    if asset_id is None:
+        conn.execute(
+            """
+            DELETE FROM asset_integrations
+            WHERE provider = 'Sigenergy' AND external_id = ?
+            """,
+            (external_id,),
+        )
+        return
+    asset = conn.execute(
+        "SELECT id FROM assets WHERE id = ?",
+        (asset_id,),
+    ).fetchone()
+    if asset is None:
+        raise ValueError("O asset local escolhido nao existe.")
+    conn.execute(
+        """
+        INSERT INTO asset_integrations (
+            asset_id, provider, external_id, external_name, enabled,
+            is_primary_energy_source, last_sync_at, last_status, last_error
+        ) VALUES (?, 'Sigenergy', ?, ?, 1, 0, NULL, NULL, '')
+        ON CONFLICT(provider, external_id) DO UPDATE SET
+            asset_id = excluded.asset_id,
+            external_name = excluded.external_name,
+            enabled = 1,
+            is_primary_energy_source = 0,
+            last_error = ''
+        """,
+        (
+            asset_id,
+            external_id,
+            str(inventory["external_name"] or external_id),
+        ),
+    )

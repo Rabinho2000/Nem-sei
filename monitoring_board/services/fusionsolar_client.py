@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 import requests
 
+from monitoring_board.preview_safety import require_external_actions_enabled
 from monitoring_board.services.api_client_base import http_rate_limited_status, http_retryable_status, retry_api_call
 from monitoring_board.services.api_rate_limit import ApiTransientError
 from monitoring_board.services.fusionsolar import build_provider_url
@@ -94,6 +95,7 @@ class FusionSolarClient:
         return f"{self.endpoints.base_url}|{self.credentials.username}"
 
     def login(self, *, force_login: bool = False) -> tuple[requests.Session, str]:
+        require_external_actions_enabled()
         if not self.credentials.username or not self.credentials.password:
             raise ValueError("Preenche username e password do FusionSolar.")
         if not self.endpoints.base_url:
@@ -143,6 +145,7 @@ class FusionSolarClient:
         expected_message: str,
         require_data: bool = False,
     ) -> dict[str, Any]:
+        require_external_actions_enabled()
         url = endpoint_or_url if endpoint_or_url.lower().startswith("http") else build_provider_url(self.endpoints.base_url, endpoint_or_url)
 
         def call_once() -> dict[str, Any]:

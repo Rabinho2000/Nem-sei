@@ -35,7 +35,7 @@ def connect(tmp_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def add_asset(conn: sqlite3.Connection, *, name: str = "Usinage", nif: str = "505435748", kwp: str = "138.6") -> int:
+def add_asset(conn: sqlite3.Connection, *, name: str = "Instalacao Modelo", nif: str = "599999991", kwp: str = "138.6") -> int:
     cursor = conn.execute(
         "INSERT INTO assets (project_name, nif, kwp, mounting_date, start_contract) VALUES (?, ?, ?, '2024-01-01', '2024-01-01')",
         (name, nif, kwp),
@@ -55,7 +55,7 @@ def financial_workbook(path: Path, *, sheet_name: str = "Prod month", unit_label
     sheet.append(["Consumption (kWh)", *[month * 120 for month in range(1, len(months) + 1)]])
     sheet.append(["Self consumption (kWh)", *[month * 80 for month in range(1, len(months) + 1)]])
     meta = workbook.create_sheet("UPAC")
-    meta["A4"] = "Usinage"
+    meta["A4"] = "Instalacao Modelo"
     meta["D4"] = 138.6
     workbook.save(path)
 
@@ -74,7 +74,7 @@ def usinage_style_financial_workbook(path: Path) -> None:
     sheet.append(["Grand Total", 93600.0, 78000.0, 70200.0, 0.9])
 
     upac = workbook.create_sheet("UPAC")
-    upac["A4"] = "Usinage"
+    upac["A4"] = "Instalacao Modelo"
     upac["D4"] = 138.6
     upac["D6"] = 84546
     upac["H12"] = "Semanal"
@@ -292,7 +292,7 @@ def test_parse_financial_model_workbook_xlsx_and_mwh_conversion(tmp_path: Path) 
 
     parsed = parse_financial_model_workbook(path)
 
-    assert parsed.detected_name == "Usinage"
+    assert parsed.detected_name == "Instalacao Modelo"
     assert parsed.detected_kwp == 138.6
     assert len(parsed.monthly) == 12
     assert parsed.monthly[0]["expected_production_kwh"] == 100000
@@ -441,11 +441,15 @@ def test_create_preview_confirm_version_and_duplicate_hash(tmp_path: Path) -> No
         conn.close()
 
 
-def test_financial_model_precedence_over_helioscope_and_year_isolated(tmp_path: Path) -> None:
+def test_financial_model_is_used_without_helioscope_fallback_and_repeats_after_base_year(tmp_path: Path) -> None:
     conn = connect(tmp_path)
     try:
         asset_id = add_asset(conn)
-        portfolio_id = conn.execute("SELECT id FROM portfolio_groups WHERE name = 'Solcorelios I'").fetchone()["id"]
+        portfolio_id = int(
+            conn.execute(
+                "INSERT INTO portfolio_groups (name, notes) VALUES ('Portfolio Financeiro', '')"
+            ).lastrowid
+        )
         conn.execute("INSERT INTO portfolio_assets (portfolio_id, asset_id, active, mapping_status, mapping_confidence) VALUES (?, ?, 1, 'manual', 1)", (portfolio_id, asset_id))
         source_id = conn.execute(
             "INSERT INTO source_files (asset_id, file_type, original_filename, stored_path, uploaded_at) VALUES (?, 'helioscope', 'h.xlsx', 'h.xlsx', '2026-01-01')",
@@ -466,8 +470,28 @@ def test_financial_model_precedence_over_helioscope_and_year_isolated(tmp_path: 
 
         assert row_2026["expected_production_kwh"] == 100
         assert row_2026["expected_production_source"] == "financial_model"
-        assert row_2027["expected_production_source"] == "helioscope"
-        assert row_2027["expected_production_kwh"] == 50
+        assert row_2027["expected_production_source"] == "financial_model"
+        assert row_2027["expected_production_kwh"] == 100
+        assert row_2027["financial_model_id"] == model_id
+        assert row_2027["financial_model_version"] == 1
+        assert row_2027["financial_model_effective_date"]
+        assert row_2027["adjusted_expected_kwh"] < row_2027["expected_production_kwh"]
+        assert row_2027["expected_specific_yield"] == round(
+            row_2027["adjusted_expected_kwh"] / row_2027["installed_power_kwp"], 2
+        )
+        assert row_2027["helioscope_expected_kwh"] is None
+
+        conn.execute(
+            "UPDATE financial_model_monthly SET expected_production_kwh = 0 WHERE financial_model_id = ? AND month = 1",
+            (model_id,),
+        )
+        zero_row = next(
+            row
+            for row in build_portfolio_report_rows(conn, portfolio_id, "2026-01")
+            if row["asset_id"] == asset_id
+        )
+        assert zero_row["performance_vs_expected_pct"] is None
+        assert zero_row["deviation_pct"] is None
     finally:
         conn.close()
 
@@ -476,7 +500,11 @@ def test_preview_not_used_in_reports_and_real_values_stay_none(tmp_path: Path) -
     conn = connect(tmp_path)
     try:
         asset_id = add_asset(conn)
-        portfolio_id = conn.execute("SELECT id FROM portfolio_groups WHERE name = 'Solcorelios I'").fetchone()["id"]
+        portfolio_id = int(
+            conn.execute(
+                "INSERT INTO portfolio_groups (name, notes) VALUES ('Portfolio Preview', '')"
+            ).lastrowid
+        )
         conn.execute("INSERT INTO portfolio_assets (portfolio_id, asset_id, active, mapping_status, mapping_confidence) VALUES (?, ?, 1, 'manual', 1)", (portfolio_id, asset_id))
         path = tmp_path / "model.xlsx"
         financial_workbook(path)
@@ -485,7 +513,8 @@ def test_preview_not_used_in_reports_and_real_values_stay_none(tmp_path: Path) -
 
         row = next(row for row in build_portfolio_report_rows(conn, portfolio_id, "2026-01") if row["asset_id"] == asset_id)
 
-        assert row["expected_production_source"] == "none"
+        assert row["expected_production_source"] == "missing"
+        assert "missing_financial_model" in row["warnings"]
         assert row["actual_production_kwh"] is None
         assert row["self_use_kwh"] is None
         assert row["export_kwh"] is None

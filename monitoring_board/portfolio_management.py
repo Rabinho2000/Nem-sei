@@ -12,6 +12,8 @@ POSSIBLE_SUGGESTION_THRESHOLD = 0.78
 AMBIGUOUS_DELTA = 0.06
 
 MAPPING_METHOD_NIF_EXACT = "nif_exact"
+MAPPING_METHOD_EXTERNAL_ID_EXACT = "external_id_exact"
+MAPPING_METHOD_SUB_ACCOUNT_EXACT = "sub_account_exact"
 MAPPING_METHOD_ALIAS_EXACT = "alias_exact"
 MAPPING_METHOD_NAME_EXACT = "name_exact"
 MAPPING_METHOD_ALIAS_NORMALIZED = "alias_normalized"
@@ -24,6 +26,8 @@ MAPPING_METHOD_CONFLICT = "conflict"
 
 SAFE_AUTO_METHODS = {
     MAPPING_METHOD_NIF_EXACT,
+    MAPPING_METHOD_EXTERNAL_ID_EXACT,
+    MAPPING_METHOD_SUB_ACCOUNT_EXACT,
     MAPPING_METHOD_ALIAS_EXACT,
     MAPPING_METHOD_NAME_EXACT,
     MAPPING_METHOD_ALIAS_NORMALIZED,
@@ -243,21 +247,69 @@ def decide_mapping(
     nif: str,
     assets: tuple[dict[str, Any], ...],
     aliases: tuple[dict[str, Any], ...],
+    external_id: str = "",
+    sub_account: str = "",
 ) -> MappingDecision:
     normalized_nif = normalize_nif(nif)
     normalized_name = normalize_name(external_name)
+    normalized_external_id = str(external_id or "").strip().casefold()
+    normalized_sub_account = str(sub_account or "").strip().casefold()
     candidates: list[MappingCandidate] = []
     warnings: list[str] = []
+    nif_asset_ids: set[int] = set()
 
     if normalized_nif:
         nif_assets = [asset for asset in assets if normalize_nif(asset.get("nif")) == normalized_nif]
+        nif_asset_ids = {int(asset["id"]) for asset in nif_assets}
         if len(nif_assets) == 1:
             asset = nif_assets[0]
             candidates.append(_candidate(asset, None, MAPPING_METHOD_NIF_EXACT, 1.0, ("nif_exact",)))
         elif len(nif_assets) > 1:
-            warnings.append("nif_conflict")
-            for asset in nif_assets:
-                candidates.append(_candidate(asset, None, MAPPING_METHOD_CONFLICT, 1.0, ("nif_duplicate",), conflict=True))
+            warnings.append("customer_multiple_assets")
+
+    if normalized_external_id:
+        external_matches = [
+            asset
+            for asset in assets
+            if normalized_external_id
+            in {
+                str(item).strip().casefold()
+                for item in asset.get("external_ids", ())
+                if str(item).strip()
+            }
+        ]
+        for asset in external_matches:
+            candidates.append(
+                _candidate(
+                    asset,
+                    None,
+                    MAPPING_METHOD_EXTERNAL_ID_EXACT,
+                    1.0,
+                    ("external_id_exact",),
+                )
+            )
+
+    if normalized_sub_account:
+        sub_account_matches = [
+            asset
+            for asset in assets
+            if normalized_sub_account
+            in {
+                str(item).strip().casefold()
+                for item in asset.get("sub_accounts", ())
+                if str(item).strip()
+            }
+        ]
+        for asset in sub_account_matches:
+            candidates.append(
+                _candidate(
+                    asset,
+                    None,
+                    MAPPING_METHOD_SUB_ACCOUNT_EXACT,
+                    0.99,
+                    ("sub_account_exact",),
+                )
+            )
 
     if normalized_name:
         alias_matches = [alias for alias in aliases if alias.get("active", True) and alias.get("normalized_alias") == normalized_name]
@@ -283,10 +335,60 @@ def decide_mapping(
                 candidates.append(_candidate(asset, None, MAPPING_METHOD_CONFLICT, 0.95, ("name_duplicate",), conflict=True))
 
     best_by_asset = _best_candidates(candidates)
+    exact_identifiers = [
+        item
+        for item in best_by_asset
+        if item.method
+        in {
+            MAPPING_METHOD_EXTERNAL_ID_EXACT,
+            MAPPING_METHOD_SUB_ACCOUNT_EXACT,
+            MAPPING_METHOD_ALIAS_EXACT,
+            MAPPING_METHOD_NAME_EXACT,
+            MAPPING_METHOD_ALIAS_NORMALIZED,
+            MAPPING_METHOD_NAME_NORMALIZED,
+        }
+    ]
+    if normalized_nif and nif_asset_ids and any(
+        item.asset_id not in nif_asset_ids for item in exact_identifiers
+    ):
+        warnings.append("identifier_disagreement")
+        return MappingDecision(
+            None,
+            MAPPING_METHOD_CONFLICT,
+            max(item.score for item in exact_identifiers),
+            "conflict",
+            "mapping_conflict",
+            tuple(best_by_asset),
+            warnings=tuple(sorted(set(warnings))),
+            auto_mappable=False,
+        )
     if best_by_asset:
         exact = _resolve_exact(best_by_asset, warnings)
         if exact:
             return exact
+
+    if len(nif_asset_ids) > 1:
+        restricted = tuple(
+            _candidate(
+                asset,
+                None,
+                MAPPING_METHOD_UNMAPPED,
+                0.0,
+                ("customer_candidate",),
+            )
+            for asset in assets
+            if int(asset["id"]) in nif_asset_ids
+        )
+        return MappingDecision(
+            None,
+            MAPPING_METHOD_UNMAPPED,
+            0.0,
+            "low",
+            "mapping_pending",
+            restricted,
+            warnings=tuple(sorted(set(warnings))),
+            auto_mappable=False,
+        )
 
     fuzzy = _fuzzy_candidates(normalized_name, assets, aliases)
     best = _best_candidates([*best_by_asset, *fuzzy])

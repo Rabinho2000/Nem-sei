@@ -289,8 +289,11 @@ def test_availability_and_degradation_foundations_preserve_edge_cases() -> None:
 
 def test_reporting_repositories_read_existing_sqlite_schema(tmp_path: Path) -> None:
     conn = connect(tmp_path)
+    conn.execute(
+        "INSERT INTO portfolio_groups (name, notes) VALUES ('Portfolio Repository', '')"
+    )
     group_names = [row["name"] for row in repositories.list_portfolio_groups(conn)]
-    assert "Solcorelios I" in group_names
+    assert "Portfolio Repository" in group_names
 
     conn.execute("INSERT INTO assets (project_name, active_contract, kwp) VALUES ('Central Repo', 'yes', '10')")
     asset_id = int(conn.execute("SELECT id FROM assets WHERE project_name = 'Central Repo'").fetchone()["id"])
