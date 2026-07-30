@@ -22,8 +22,6 @@ services:
     volumes:
       - ./runtime:/data
       - ./runtime/tmp:/preview-tmp
-    ports:
-      - "0.0.0.0:5002:5000"
     command: gunicorn -w 1 --threads 4 -b 0.0.0.0:5000 app:app
     networks:
       - preview-internal
@@ -41,6 +39,32 @@ services:
       retries: 12
       start_period: 20s
 
+  preview-gateway:
+    build:
+      context: ./docker/preview-gateway
+    restart: unless-stopped
+    depends_on:
+      monitoring-board:
+        condition: service_healthy
+    ports:
+      - "0.0.0.0:5002:8080"
+    networks:
+      - preview-internal
+      - preview-edge
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - --quiet
+        - --spider
+        - http://127.0.0.1:8080/login
+      interval: 15s
+      timeout: 6s
+      retries: 12
+      start_period: 10s
+
 networks:
   preview-internal:
     internal: true
+  preview-edge:
+    driver: bridge

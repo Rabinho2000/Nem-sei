@@ -23,6 +23,8 @@ backups/
 logs/
 uploads/
 data/
+runtime/
+**/runtime/
 
 *.xlsx
 *.xlsm

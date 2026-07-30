@@ -71,6 +71,21 @@ compose() {
     "$@"
 }
 
+validate_build_context() {
+  local required_pattern
+  for required_pattern in \
+    'runtime/' \
+    '**/runtime/' \
+    '.env.preview' \
+    '*.db' \
+    '*.sqlite' \
+    '*.sqlite3'
+  do
+    grep -Fxq "${required_pattern}" "${PREVIEW_ROOT}/.dockerignore" ||
+      die "Exclusão obrigatória ausente de .dockerignore: ${required_pattern}"
+  done
+}
+
 check_url() {
   local url="$1"
   local label="$2"
@@ -80,11 +95,16 @@ check_url() {
 }
 
 wait_for_preview() {
-  local container_id
-  container_id="$(compose ps --quiet monitoring-board)"
-  [[ -n "${container_id}" ]] || die "Container de preview não foi criado."
+  local app_id gateway_id app_health gateway_health
+  app_id="$(compose ps --quiet monitoring-board)"
+  gateway_id="$(compose ps --quiet preview-gateway)"
+  [[ -n "${app_id}" ]] || die "Container monitoring-board não foi criado."
+  [[ -n "${gateway_id}" ]] || die "Container preview-gateway não foi criado."
   for _attempt in $(seq 1 30); do
-    if [[ "$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${container_id}")" == "healthy" ]]; then
+    app_health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${app_id}")"
+    gateway_health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${gateway_id}")"
+    if [[ "${app_health}" == "healthy" && "${gateway_health}" == "healthy" ]]; then
+      check_gateway_port
       check_url "${PREVIEW_URL}" "Preview"
       check_url "${PRODUCTION_URL}" "Produção"
       return
@@ -92,8 +112,26 @@ wait_for_preview() {
     sleep 2
   done
   compose ps
-  compose logs --tail 100 monitoring-board
-  die "Preview não ficou healthy."
+  compose logs --tail 100 monitoring-board preview-gateway
+  die "Os dois serviços de preview não ficaram healthy."
+}
+
+check_gateway_port() {
+  local gateway_id
+  gateway_id="$(compose ps --quiet preview-gateway)"
+  [[ -n "${gateway_id}" ]] || die "Container preview-gateway não existe."
+  docker inspect "${gateway_id}" | python3 -c '
+import json
+import sys
+
+bindings = json.load(sys.stdin)[0]["NetworkSettings"]["Ports"].get("8080/tcp") or []
+if not any(
+    binding.get("HostIp") == "0.0.0.0"
+    and binding.get("HostPort") == "5002"
+    for binding in bindings
+):
+    raise SystemExit("preview-gateway não publica 0.0.0.0:5002->8080")
+'
 }
 
 run_schema() {
@@ -123,6 +161,7 @@ sanitize_preview_database() {
 
 refresh_data() {
   local copy_uploads="${1:-no}"
+  validate_build_context
   compose stop monitoring-board
   mkdir -p "${PREVIEW_ROOT}/runtime"/{backups,logs,tmp,uploads/generated_reports}
   backup_production_database
@@ -134,7 +173,7 @@ refresh_data() {
   fi
   run_schema
   sanitize_preview_database
-  compose up --detach monitoring-board
+  compose up --detach monitoring-board preview-gateway
   wait_for_preview
 }
 
@@ -146,9 +185,9 @@ update_preview() {
     trap - ERR
     printf 'ERROR: atualização do preview falhou (código %s).\n' "${exit_code}" >&2
     compose ps >&2 || true
-    compose logs --tail 100 monitoring-board >&2 || true
+    compose logs --tail 100 monitoring-board preview-gateway >&2 || true
     printf 'A tentar recuperar apenas o serviço de preview...\n' >&2
-    compose up --detach monitoring-board >&2 || true
+    compose up --detach monitoring-board preview-gateway >&2 || true
     compose ps >&2 || true
     curl --fail --silent --show-error --location --max-time 15 \
       --output /dev/null "${PRODUCTION_URL}" ||
@@ -161,10 +200,11 @@ update_preview() {
   git_preview fetch origin "${PREVIEW_BRANCH}"
   git_preview merge --ff-only "origin/${PREVIEW_BRANCH}"
   validate_scope
-  compose build monitoring-board
+  validate_build_context
+  compose build monitoring-board preview-gateway
   compose stop monitoring-board
   run_schema
-  compose up --detach --remove-orphans monitoring-board
+  compose up --detach --remove-orphans monitoring-board preview-gateway
   wait_for_preview
   check_url "${PRODUCTION_URL}" "Produção"
   update_completed=true
@@ -173,6 +213,8 @@ update_preview() {
 
 show_status() {
   compose ps
+  wait_for_preview
+  check_gateway_port
   check_url "${PRODUCTION_URL}" "Produção"
   check_url "${PREVIEW_URL}" "Preview"
   printf 'Produção: http://media:5000\nPreview:  http://media:5002\n'
@@ -190,11 +232,12 @@ main() {
       ;;
     start)
       check_url "${PRODUCTION_URL}" "Produção"
-      compose up --detach monitoring-board
+      validate_build_context
+      compose up --detach monitoring-board preview-gateway
       wait_for_preview
       ;;
     stop)
-      compose stop monitoring-board
+      compose stop monitoring-board preview-gateway
       check_url "${PRODUCTION_URL}" "Produção"
       ;;
     status)

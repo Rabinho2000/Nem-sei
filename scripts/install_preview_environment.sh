@@ -12,6 +12,21 @@ die() {
   exit 1
 }
 
+validate_build_context() {
+  local required_pattern
+  for required_pattern in \
+    'runtime/' \
+    '**/runtime/' \
+    '.env.preview' \
+    '*.db' \
+    '*.sqlite' \
+    '*.sqlite3'
+  do
+    grep -Fxq "${required_pattern}" "${PREVIEW_ROOT}/.dockerignore" ||
+      die "Exclusão obrigatória ausente de .dockerignore: ${required_pattern}"
+  done
+}
+
 [[ "${EUID}" -eq 0 ]] || die "Executa este instalador com sudo."
 [[ -d "${PRODUCTION_ROOT}/.git" ]] ||
   die "Repositório de produção não encontrado; nada foi alterado."
@@ -55,21 +70,27 @@ fi
   sudo -u "${operator}" git -C "${PREVIEW_ROOT}" status --porcelain --untracked-files=no
 )" ]] ||
   die "O clone de preview contém alterações tracked."
+validate_build_context
 
-read -r -p "APP_USERNAME do preview: " app_username
-[[ "${app_username}" =~ ^[A-Za-z0-9._@+-]{1,80}$ ]] ||
-  die "APP_USERNAME contém caracteres inválidos."
-read -r -s -p "APP_PASSWORD do preview: " app_password
-printf '\n'
-[[ ${#app_password} -ge 12 ]] ||
-  die "APP_PASSWORD deve ter pelo menos 12 caracteres."
-[[ "${app_password}" != *$'\r'* && "${app_password}" != *$'\n'* ]] ||
-  die "APP_PASSWORD contém newline inválido."
-[[ ! "${app_password}" =~ [[:space:]#] ]] ||
-  die "APP_PASSWORD não pode conter espaços nem # neste instalador."
-flask_secret="$(openssl rand -hex 32)"
+if [[ -f "${PREVIEW_ROOT}/.env.preview" ]]; then
+  [[ "$(stat -c '%a' "${PREVIEW_ROOT}/.env.preview")" == "600" ]] ||
+    die ".env.preview existente deve ter permissões 600."
+  printf 'A preservar .env.preview e as credenciais existentes.\n'
+else
+  read -r -p "APP_USERNAME do preview: " app_username
+  [[ "${app_username}" =~ ^[A-Za-z0-9._@+-]{1,80}$ ]] ||
+    die "APP_USERNAME contém caracteres inválidos."
+  read -r -s -p "APP_PASSWORD do preview: " app_password
+  printf '\n'
+  [[ ${#app_password} -ge 12 ]] ||
+    die "APP_PASSWORD deve ter pelo menos 12 caracteres."
+  [[ "${app_password}" != *$'\r'* && "${app_password}" != *$'\n'* ]] ||
+    die "APP_PASSWORD contém newline inválido."
+  [[ ! "${app_password}" =~ [[:space:]#] ]] ||
+    die "APP_PASSWORD não pode conter espaços nem # neste instalador."
+  flask_secret="$(openssl rand -hex 32)"
 
-cat > "${PREVIEW_ROOT}/.env.preview" <<EOF
+  cat > "${PREVIEW_ROOT}/.env.preview" <<EOF
 FLASK_SECRET_KEY=${flask_secret}
 APP_USERNAME=${app_username}
 APP_PASSWORD=${app_password}
@@ -94,8 +115,9 @@ TELEGRAM_ALERTS_ENABLED=false
 TELEGRAM_DAILY_SUMMARY_ENABLED=false
 OPENROUTESERVICE_API_KEY=
 EOF
-chmod 600 "${PREVIEW_ROOT}/.env.preview"
-chown root:root "${PREVIEW_ROOT}/.env.preview"
+  chmod 600 "${PREVIEW_ROOT}/.env.preview"
+  chown root:root "${PREVIEW_ROOT}/.env.preview"
+fi
 
 install -d -m 0750 -o root -g root \
   "${PREVIEW_ROOT}/runtime" \
