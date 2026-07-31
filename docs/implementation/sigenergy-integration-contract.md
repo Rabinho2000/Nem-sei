@@ -121,21 +121,21 @@ A evidência sanitizada demonstra que:
 
 ### Causa raiz
 
-O fluxo de inserção foi, portanto, o fallback legacy de `system_ids`, e não
-discovery, parser de outro provider, mapping, onboarding, teste, seed ou
-migração. Sem mapping ativo, `run_sigenergy_check` selecionava os IDs
+O fluxo que inseriu os snapshots foi, portanto, o fallback legacy de
+`system_ids`, e não discovery, parser de outro provider, mapping, onboarding,
+teste ou migração. Sem mapping ativo, `run_sigenergy_check` selecionava os IDs
 configurados; `SigenergyClient.list_systems()` não chamava discovery e
 `configured_system_rows()` fabricava a linha de identidade; `energyFlow`
 falhava e `run_sigenergy_sync()` persistia essa linha antes de resolver o
 asset. Execuções agendadas e manuais em background repetiram o snapshot com
 `asset_id=NULL`.
 
-Depois de a coluna ter sido limpa, já não é possível reconstruir onde o valor
-fora originalmente guardado: o código antigo aceitava tanto a coluna/UI da
-base como o override de ambiente `SIGENERGY_SYSTEM_IDS`. Isto não deixa o
-fluxo de inserção ambíguo; impede apenas atribuir quem introduziu o valor ou
-qual dessas duas superfícies de configuração usou. O auditor regista esta
-distinção como
+Depois de a coluna ter sido limpa, já não é possível reconstruir como o valor
+entrou na configuração: o código antigo aceitava a coluna da base (preenchida
+pela UI ou pelo seed a partir do ambiente) e também o override runtime
+`SIGENERGY_SYSTEM_IDS`. Isto não deixa o fluxo que criou os snapshots
+ambíguo; impede apenas atribuir quem introduziu o valor ou qual superfície de
+configuração o forneceu. O auditor regista esta distinção como
 `configured_value_source=database_or_environment_not_recoverable`.
 
 O módulo `monitoring_board.sigenergy_legacy_audit` recolhe a evidência em modo
