@@ -350,11 +350,20 @@ def _strict_system_rows(data: Any) -> list[dict[str, Any]]:
             raise SigenergyApiError(
                 "A descoberta Sigenergy devolveu uma lista invalida."
             )
-        return list(data)
+        rows = list(data)
+        _validate_system_ids(rows)
+        return rows
     if not isinstance(data, dict):
+        if isinstance(data, str):
+            raise SigenergyApiError(
+                "A descoberta Sigenergy devolveu um payload invalido "
+                f"(tipo=str, comprimento={len(data)})."
+            )
         raise SigenergyApiError(
             "A descoberta Sigenergy devolveu um payload invalido."
         )
+    if not data:
+        return []
     for key in ("list", "records", "systems", "items", "systemList", "rows"):
         if key not in data:
             continue
@@ -365,12 +374,30 @@ def _strict_system_rows(data: Any) -> list[dict[str, Any]]:
             raise SigenergyApiError(
                 "A descoberta Sigenergy devolveu uma lista invalida."
             )
-        return list(rows)
+        result = list(rows)
+        _validate_system_ids(result)
+        return result
     if any(key in data for key in ("systemId", "id", "systemName", "name")):
-        return [data]
+        rows = [data]
+        _validate_system_ids(rows)
+        return rows
     raise SigenergyApiError(
         "A descoberta Sigenergy devolveu um payload invalido."
     )
+
+
+def _validate_system_ids(rows: list[dict[str, Any]]) -> None:
+    for row in rows:
+        system_id = (
+            row.get("systemId")
+            or row.get("id")
+            or row.get("stationId")
+            or row.get("plantId")
+        )
+        if not str(system_id or "").strip():
+            raise SigenergyApiError(
+                "A resposta Sigenergy nao trouxe systemId numa das linhas."
+            )
 
 
 def client_from_config(config: dict[str, Any], session: requests.Session | None = None) -> SigenergyClient:

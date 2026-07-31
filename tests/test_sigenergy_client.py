@@ -275,6 +275,60 @@ def test_list_systems_uses_api_rows() -> None:
     assert session.requests[0]["headers"]["sigen-region"] == "eu"
 
 
+@pytest.mark.parametrize("data", ["", "   ", "null", "[]", "{}", '{"list": []}'])
+def test_list_systems_accepts_empty_string_encoded_discovery(data: str) -> None:
+    session = QueueSession(
+        {
+            "https://sigenergy.example.test/openapi/auth/login/key": [
+                FakeResponse(load_fixture("auth_success_object.json"))
+            ],
+            "https://sigenergy.example.test/openapi/system": [
+                FakeResponse({"code": 0, "msg": "success", "data": data})
+            ],
+        }
+    )
+
+    assert client(session).list_systems(allow_empty=True) == []
+
+
+def test_list_systems_rejects_string_encoded_row_without_system_id() -> None:
+    session = QueueSession(
+        {
+            "https://sigenergy.example.test/openapi/auth/login/key": [
+                FakeResponse(load_fixture("auth_success_object.json"))
+            ],
+            "https://sigenergy.example.test/openapi/system": [
+                FakeResponse({"code": 0, "msg": "success", "data": "[{}]"})
+            ],
+        }
+    )
+
+    with pytest.raises(SigenergyApiError, match="systemId"):
+        client(session).list_systems(allow_empty=True)
+
+
+def test_list_systems_rejects_non_json_string_without_exposing_content() -> None:
+    raw_data = "opaque production response"
+    session = QueueSession(
+        {
+            "https://sigenergy.example.test/openapi/auth/login/key": [
+                FakeResponse(load_fixture("auth_success_object.json"))
+            ],
+            "https://sigenergy.example.test/openapi/system": [
+                FakeResponse({"code": 0, "msg": "success", "data": raw_data})
+            ],
+        }
+    )
+
+    with pytest.raises(SigenergyApiError) as error:
+        client(session).list_systems(allow_empty=True)
+
+    message = str(error.value)
+    assert "tipo=str" in message
+    assert f"comprimento={len(raw_data)}" in message
+    assert raw_data not in message
+
+
 def test_client_has_no_legacy_system_ids_candidate_source() -> None:
     session = QueueSession(
         {
