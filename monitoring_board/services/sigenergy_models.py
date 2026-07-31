@@ -83,6 +83,8 @@ def parse_sigenergy_response(payload: Any) -> Any:
         )
     data = payload.get("data")
     if isinstance(data, str):
+        if not data.strip():
+            return None
         try:
             return json.loads(data)
         except json.JSONDecodeError:

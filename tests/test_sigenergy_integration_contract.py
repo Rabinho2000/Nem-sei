@@ -312,6 +312,33 @@ def test_discovery_explicit_outcomes(
     assert result.status is expected
 
 
+def test_empty_discovery_does_not_invalidate_credentials(tmp_path) -> None:
+    db_path = _database(tmp_path, "empty-discovery.db")
+    with get_db(str(db_path)) as conn:
+        repository.record_operation_result(
+            conn,
+            operation=OPERATION_CREDENTIALS,
+            status=CredentialStatus.VALID.value,
+            occurred_at=NOW,
+            metadata={"outcome": CredentialOutcome.AUTHENTICATED.value},
+            succeeded=True,
+        )
+        result = SigenergyIntegrationService(
+            conn,
+            client=DiscoveryClient(response=[]),
+            now=lambda: NOW,
+        ).discover_systems()
+        credential_state = repository.get_operation_state(
+            conn,
+            operation=OPERATION_CREDENTIALS,
+        )
+
+    assert result.status is DiscoveryStatus.EMPTY
+    assert result.systems == ()
+    assert result.station_count == 0
+    assert credential_state["status"] == CredentialStatus.VALID.value
+
+
 def test_discovery_does_not_delete_absent_systems(tmp_path) -> None:
     db_path = _database(tmp_path, "discovery-absence.db")
     with get_db(str(db_path)) as conn:
