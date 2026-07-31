@@ -1,9 +1,8 @@
 # Sigenergy API
 
-A integração Sigenergy suporta descoberta, estado atual e leitura de histórico
-diário. O acesso foi confirmado em modo read-only para a instalação Expertcom.
-Alarmes, inversores, strings, disponibilidade e controlo remoto continuam fora
-do âmbito.
+A integração suporta autenticação, descoberta opcional, validação direta,
+estado atual, histórico diário e onboarding explícito. Alarmes, inversores,
+strings, disponibilidade e controlo remoto continuam fora do âmbito.
 
 ## Configuração suportada
 
@@ -16,13 +15,32 @@ As variáveis atuais continuam compatíveis:
 - `SIGENERGY_AUTH_ENDPOINT`
 - `SIGENERGY_SYSTEMS_ENDPOINT`
 - `SIGENERGY_ENERGY_FLOW_ENDPOINT`
+- `SIGENERGY_HISTORY_ENDPOINT`
+- `SIGENERGY_HISTORY_ENERGY_UNIT`
+- `SIGENERGY_ONBOARD_ENDPOINT`
 - `SIGENERGY_REGION`
-- `SIGENERGY_SYSTEM_IDS`
 
-O client normal descobre os sistemas autorizados através de `/openapi/system`.
+`SIGENERGY_SYSTEM_IDS` não é suportada. A coluna
+`integration_configs.system_ids` permanece apenas para upgrade compatível e
+não entra no client, na UI, na importação ou no scheduler.
+
 O worker isolado da preview usa, adicionalmente,
 `SIGENERGY_ALLOWED_SYSTEM_IDS`, que é uma allowlist obrigatória e não um
-fallback de descoberta.
+fallback de descoberta. Essa variável não é lida pela aplicação de produção.
+
+## Operações independentes
+
+| Operação | Chamada remota | Efeitos permitidos |
+| --- | --- | --- |
+| Teste de credenciais | login | Estado da operação `credentials`; nenhum ID ou inventário. |
+| Descoberta | `GET /openapi/system` | Enriquece inventário devolvido; não invalida ausentes. |
+| Verificação direta | `energyFlow` para um ID explícito | Auditoria e inventário desse ID; não cria asset, mapping ou onboarding. |
+| Sync dirigido/global | `energyFlow` por mapping ativo | Snapshot, estado operacional e estado de sync por ID. |
+| Histórico | `history` por mapping/data explícitos | Facto energético, registo diário e materialização mensal. |
+| Onboarding | endpoint de onboarding | Pedido formal idempotente, independente do acesso direto. |
+
+`target_external_ids` é input real da operação. Nunca filtra uma resposta de
+discovery e nunca causa uma chamada a `/openapi/system`.
 
 ## Implementado
 
@@ -34,7 +52,17 @@ fallback de descoberta.
 | Sistemas | `SIGENERGY_SYSTEMS_ENDPOINT` | `list_systems` | Aceita listas em `data.list`, `records`, `systems`, `items`, `systemList` ou `rows`. |
 | Estado atual | `SIGENERGY_ENERGY_FLOW_ENDPOINT` | `get_energy_flow` | Substitui `{system_id}`/`{systemId}` e lê `energyFlow` atual. |
 | Histórico diário | `/openapi/systems/{system_id}/history` | `get_system_history` | Envia `level` e `date` na query string; nunca usa JSON body no GET. |
-| Scheduler | `integration-state-sigenergy-hourly` | sync horário | Só agenda estado/energyFlow. |
+| Scheduler | `integration-state-sigenergy-hourly` | sync horário | Usa apenas `asset_integrations WHERE provider='Sigenergy' AND enabled=1`; não chama discovery. |
+
+## Descoberta restringida
+
+O código API `1201` só é classificado como `restricted` na operação de
+discovery. O resultado tem lista vazia, mas não significa credenciais inválidas
+nem falta de autorização para um ID específico. Não altera mappings,
+onboarding ou inventário anteriormente verificado.
+
+O mesmo código em login, `energyFlow`, histórico ou onboarding continua a ser
+erro real da respetiva operação.
 
 ## Validação e tolerância de payload
 
@@ -42,7 +70,7 @@ fallback de descoberta.
 - `code` ausente, `0` ou `"0"` é tratado como sucesso.
 - `data` pode vir como objeto ou como string JSON; ambos continuam suportados.
 - Campos em falta no `energyFlow` resultam em `None`, não em exceção.
-- Estado desconhecido é apresentado como `Sem dados`.
+- Estado operacional desconhecido é persistido como `unknown`.
 - O histórico diário com `code: 0` é autorizado. O antigo HTML 403 do
   CloudFront era causado pelo envio incorreto de `level` e `date` num JSON body
   de um pedido GET, não por falta da permissão `System history`.
@@ -79,7 +107,7 @@ autoconsumo nem somado a `self_use_kwh`.
 - HTTP `5xx` e erros de rede usam backoff curto e limitado pela camada comum.
 - Secrets, tokens e Bearer headers devem ser sanitizados em mensagens de erro.
 
-## Fora de scope atual
+## Fora do scope atual
 
 Não existem endpoints implementados para:
 
@@ -89,7 +117,8 @@ Não existem endpoints implementados para:
 - availability;
 - controlo remoto.
 
-O onboarding existente na app fica como compatibilidade operacional da UI atual, mas não faz parte do client de estado Sigenergy documentado aqui.
+O onboarding é um serviço separado. `energyFlow` com sucesso não é aprovação
+formal do provider e não muda `provider_pending` para `provider_approved`.
 
 ## Readiness para fecho mensal
 
@@ -108,9 +137,10 @@ confirma o contrato e a permissão, mas não constitui um backfill mensal.
 
 ## Persistência e backfill
 
-A aplicação expõe o job `sigenergy_energy_sync` e a UI usa
-`enqueue_sigenergy_energy_backfill` para criar, de forma idempotente, um job por
-dia terminado. Cada resposta é persistida em `energy_interval_facts`,
+A aplicação expõe o job `sigenergy_energy_sync`; o planeador de backfill cria,
+de forma idempotente, um job por provider, System ID e dia terminado. Dias já
+com facto e registo diário `complete` são ignorados. Cada resposta é persistida
+em `energy_interval_facts`,
 materializada como registo diário em `production_records` e volta a
 materializar o total mensal.
 
@@ -120,3 +150,11 @@ fica limitado a 31 dias terminados, as chamadas são sequenciais e respeitam o
 intervalo mínimo de 300 segundos já usado pela política de produção Sigenergy.
 O worker para novas tentativas quando recebe rate limit. Nenhum destes
 mecanismos foi executado durante a alteração do código.
+
+## Auditoria de IDs legados
+
+`python -m monitoring_board.sigenergy_legacy_audit` abre apenas uma cópia de
+backup SQLite com `mode=ro&immutable=1`, recusa o nome da base live e recusa
+WAL não consolidado. O JSON inclui contagens, intervalos temporais, IDs
+técnicos, estrutura/hash de payloads e classificação da origem; valores
+sensíveis são omitidos.

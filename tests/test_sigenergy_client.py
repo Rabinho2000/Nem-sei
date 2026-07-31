@@ -10,9 +10,11 @@ import requests
 
 from monitoring_board.services.api_rate_limit import ApiRateLimitError
 from monitoring_board.services.sigenergy_client import (
+    SigenergyClient,
+)
+from monitoring_board.services.sigenergy_preview_policy import (
     EXPERTCOM_SIGENERGY_BASE_URL,
     EXPERTCOM_SIGENERGY_SYSTEM_ID,
-    SigenergyClient,
     SigenergyPreviewReadOnlyPolicy,
 )
 from monitoring_board.services.sigenergy_errors import SigenergyApiError
@@ -97,11 +99,14 @@ class QueueSession:
         return self.responses_by_url[url].pop(0)
 
 
-def client(session: QueueSession, *, system_ids: str = "", token_cache: dict[str, dict[str, Any]] | None = None) -> SigenergyClient:
+def client(
+    session: QueueSession,
+    *,
+    token_cache: dict[str, dict[str, Any]] | None = None,
+) -> SigenergyClient:
     return SigenergyClient(
         endpoints(),
         SigenergyCredentials("fixture-app-key", "fixture-app-secret"),
-        system_ids=system_ids,
         session=session,
         token_cache=token_cache if token_cache is not None else {},
         sleeper=lambda _seconds: None,
@@ -270,7 +275,7 @@ def test_list_systems_uses_api_rows() -> None:
     assert session.requests[0]["headers"]["sigen-region"] == "eu"
 
 
-def test_list_systems_ignores_legacy_system_ids_and_uses_discovery_api() -> None:
+def test_client_has_no_legacy_system_ids_candidate_source() -> None:
     session = QueueSession(
         {
             "https://sigenergy.example.test/openapi/auth/login/key": [
@@ -282,8 +287,10 @@ def test_list_systems_ignores_legacy_system_ids_and_uses_discovery_api() -> None
         }
     )
 
-    systems = client(session, system_ids="SIG-001, SIG-002").list_systems()
+    sigenergy_client = client(session)
+    systems = sigenergy_client.list_systems()
 
+    assert not hasattr(sigenergy_client, "system_ids")
     assert [row["systemId"] for row in systems] == ["SIG-001", "SIG-002"]
     assert len(session.posts) == 1
     assert session.requests[0]["url"].endswith("/openapi/system")

@@ -105,7 +105,7 @@
         <button class="button small" type="submit" name="action" value="preview">Rever dados</button>
       </form>
     {% else %}
-      <p class="empty-state">Não foram encontradas instalações. Confirma as credenciais ou introduz o ID manualmente.</p>
+      <p class="empty-state">A descoberta não devolveu instalações. A listagem pode estar vazia ou restringida pela Sigenergy; introduz o System ID manualmente para o verificar por energyFlow.</p>
     {% endfor %}
   </div>
   <div class="hero-actions">
@@ -136,6 +136,12 @@
       {% if import_context.access_status == "not_returned" %}
         <p class="muted">A instalação não foi devolvida pela App Key configurada.</p>
         <p class="muted">Se for necessário pedir acesso, o onboarding tem de ser iniciado explicitamente.</p>
+      {% elif import_context.access_status == "unauthorized" %}
+        <p class="muted">O energyFlow direto recusou acesso a este System ID. Um pedido de onboarding só será enviado por ação explícita.</p>
+      {% elif import_context.access_status == "not_found" %}
+        <p class="muted">O endpoint energyFlow não encontrou este System ID.</p>
+      {% elif import_context.access_status == "auth_failed" %}
+        <p class="muted">As credenciais Sigenergy foram recusadas.</p>
       {% elif import_context.access_status == "pending_approval" %}
         <p class="muted">O pedido de onboarding está ligado a esta importação. Verificar novamente não envia pedidos duplicados.</p>
       {% elif import_context.last_error %}
@@ -157,8 +163,8 @@
           <p class="muted">Acesso: {{ import_context.access_status_label }}</p>
           {% if import_context.validation_method == "direct_energy_flow" %}
             <p class="callout">
-              Acesso validado diretamente por energyFlow. Esta instalação não
-              foi devolvida por /openapi/system.
+              Acesso validado diretamente por energyFlow, sem depender da
+              descoberta global.
             </p>
           {% endif %}
         </div>

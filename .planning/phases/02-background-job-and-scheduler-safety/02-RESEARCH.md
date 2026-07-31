@@ -221,11 +221,23 @@ SCHEDULER.add_job(
 
 ### Provider Dispatch Seam
 
+The former universal `run_provider_check` seam was removed by the Sigenergy
+contract refactor. Current background dispatch keeps provider operations
+explicit:
+
 ```python
-def run_provider_check(conn: sqlite3.Connection, provider: str, dry_run: bool = False) -> dict[str, Any]:
-    if provider == INTEGRATION_PROVIDER_SIGENERGY:
-        return run_sigenergy_check(conn, provider, dry_run=dry_run)
-    return run_fusionsolar_check(conn, provider, dry_run=dry_run)
+if job_type == "sigenergy_state_sync":
+    return run_sigenergy_sync(
+        conn,
+        provider="Sigenergy",
+        target_external_ids=target_external_ids,
+    )
+if job_type == "fusionsolar_state_sync":
+    return run_fusionsolar_sync(
+        conn,
+        provider="FusionSolar",
+        target_external_ids=target_external_ids,
+    )
 ```
 
 Recommended test shape:

@@ -3,10 +3,9 @@ from __future__ import annotations
 import base64
 import threading
 import time
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 import requests
 
@@ -20,7 +19,6 @@ from monitoring_board.services.sigenergy_models import (
     SigenergyEndpoints,
     build_sigenergy_url,
     parse_sigenergy_response,
-    rows_from_data,
     sanitize_sigenergy_error,
 )
 
@@ -28,93 +26,20 @@ from monitoring_board.services.sigenergy_models import (
 _TOKEN_CACHE: dict[str, dict[str, Any]] = {}
 _TOKEN_LOCK = threading.Lock()
 
-EXPERTCOM_SIGENERGY_BASE_URL = "https://api-eu.sigencloud.com"
-EXPERTCOM_SIGENERGY_SYSTEM_ID = "TZXRS1780315946"
 
+class SigenergyRequestPolicy(Protocol):
+    def validate_endpoints(self, endpoints: SigenergyEndpoints) -> None: ...
 
-@dataclass(frozen=True)
-class SigenergyPreviewReadOnlyPolicy:
-    """Exact outbound allowlist for the one-shot Expertcom preview worker."""
+    def authorize_login(self, endpoint: str) -> None: ...
 
-    base_url: str = EXPERTCOM_SIGENERGY_BASE_URL
-    system_id: str = EXPERTCOM_SIGENERGY_SYSTEM_ID
+    def authorize_request(self, method: str, endpoint: str) -> None: ...
 
-    def validate_endpoints(self, endpoints: SigenergyEndpoints) -> None:
-        expected = {
-            "base_url": self.base_url,
-            "login_endpoint": "/openapi/auth/login/key",
-            "systems_endpoint": "/openapi/system",
-            "energy_flow_endpoint": (
-                f"/openapi/systems/{self.system_id}/energyFlow"
-            ),
-            "history_endpoint": f"/openapi/systems/{self.system_id}/history",
-            "region": "eu",
-        }
-        actual = {
-            "base_url": endpoints.base_url.rstrip("/"),
-            "login_endpoint": self._path(endpoints.login_endpoint),
-            "systems_endpoint": self._path(endpoints.systems_endpoint),
-            "energy_flow_endpoint": self._path(
-                endpoints.energy_flow_endpoint.replace(
-                    "{systemId}", self.system_id
-                ).replace("{system_id}", self.system_id)
-            ),
-            "history_endpoint": self._path(
-                endpoints.history_endpoint.replace(
-                    "{systemId}", self.system_id
-                ).replace("{system_id}", self.system_id)
-            ),
-            "region": endpoints.region,
-        }
-        if actual != expected:
-            raise SigenergyApiError(
-                "A configuracao do worker Sigenergy preview nao corresponde "
-                "a allowlist read-only da Expertcom."
-            )
-
-    def authorize_login(self, endpoint: str) -> None:
-        if self._path(endpoint) != "/openapi/auth/login/key":
-            raise SigenergyApiError(
-                "Endpoint Sigenergy recusado pela allowlist read-only da preview."
-            )
-
-    def authorize_request(self, method: str, endpoint: str) -> None:
-        allowed = {
-            "/openapi/system",
-            f"/openapi/systems/{self.system_id}/energyFlow",
-            f"/openapi/systems/{self.system_id}/history",
-        }
-        if method.upper() != "GET" or self._path(endpoint) not in allowed:
-            raise SigenergyApiError(
-                "Endpoint Sigenergy recusado pela allowlist read-only da preview."
-            )
-
-    def authorize_system_id(self, system_id: str) -> None:
-        if str(system_id).strip() != self.system_id:
-            raise SigenergyApiError(
-                "System ID Sigenergy recusado pela allowlist read-only da preview."
-            )
+    def authorize_system_id(self, system_id: str) -> None: ...
 
     def filter_discovered_systems(
         self,
         systems: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        allowed: list[dict[str, Any]] = []
-        for row in systems:
-            returned_id = str(
-                row.get("systemId")
-                or row.get("id")
-                or row.get("stationId")
-                or row.get("plantId")
-                or ""
-            ).strip()
-            if returned_id == self.system_id:
-                allowed.append(row)
-        return allowed
-
-    @staticmethod
-    def _path(endpoint: str) -> str:
-        return "/" + str(endpoint or "").strip().lstrip("/")
+    ) -> list[dict[str, Any]]: ...
 
 
 def clear_token_cache_for_tests() -> None:
@@ -136,13 +61,12 @@ class SigenergyClient:
         endpoints: SigenergyEndpoints | dict[str, Any],
         credentials: SigenergyCredentials | None = None,
         *,
-        system_ids: str | list[str] = "",
         session: requests.Session | None = None,
         token_cache: dict[str, dict[str, Any]] | None = None,
         token_lock: threading.Lock | None = None,
         allow_sleep: bool = False,
         sleeper: Callable[[float], None] = time.sleep,
-        read_only_policy: SigenergyPreviewReadOnlyPolicy | None = None,
+        read_only_policy: SigenergyRequestPolicy | None = None,
     ) -> None:
         if isinstance(endpoints, dict):
             config = endpoints
@@ -164,9 +88,6 @@ class SigenergyClient:
         else:
             self.endpoints = endpoints
             self.credentials = credentials or SigenergyCredentials("", "")
-        # Kept as an ignored constructor argument for backwards compatibility.
-        # Authorized systems must always come from the provider discovery API.
-        self.system_ids = ""
         self.session = session or requests.Session()
         self.token_cache = token_cache if token_cache is not None else _TOKEN_CACHE
         self.token_lock = token_lock or _TOKEN_LOCK
@@ -285,7 +206,8 @@ class SigenergyClient:
             self.endpoints.systems_endpoint,
             api_area="discovery",
         )
-        rows = rows_from_data(parse_sigenergy_response(payload))
+        data = parse_sigenergy_response(payload)
+        rows = _strict_system_rows(data)
         if self.read_only_policy is not None:
             rows = self.read_only_policy.filter_discovered_systems(rows)
         if not rows and not allow_empty:
@@ -302,7 +224,11 @@ class SigenergyClient:
         endpoint = endpoint.replace("{system_id}", str(system_id))
         payload = self.request_json("GET", endpoint, api_area="state")
         data = parse_sigenergy_response(payload)
-        return data if isinstance(data, dict) else {"raw_data": data}
+        if not isinstance(data, dict):
+            raise SigenergyApiError(
+                "O energyFlow Sigenergy nao devolveu um objeto de dados."
+            )
+        return data
 
     def get_system_history(
         self,
@@ -358,6 +284,11 @@ class SigenergyClient:
                 return response
             except requests.HTTPError as exc:
                 status_code = getattr(exc.response, "status_code", None)
+                if status_code in {401, 403}:
+                    raise SigenergyAuthError(
+                        f"Sigenergy auth HTTP {status_code}.",
+                        status_code=status_code,
+                    ) from exc
                 if http_rate_limited_status(status_code):
                     raise sigenergy_rate_limit_error(
                         "Sigenergy HTTP 429 auth.",
@@ -409,6 +340,37 @@ def sigenergy_rate_limit_error(
             except (TypeError, ValueError, OverflowError):
                 pass
     return ApiRateLimitError("Sigenergy", api_area, cooldown_until, message)
+
+
+def _strict_system_rows(data: Any) -> list[dict[str, Any]]:
+    if data is None:
+        return []
+    if isinstance(data, list):
+        if any(not isinstance(row, dict) for row in data):
+            raise SigenergyApiError(
+                "A descoberta Sigenergy devolveu uma lista invalida."
+            )
+        return list(data)
+    if not isinstance(data, dict):
+        raise SigenergyApiError(
+            "A descoberta Sigenergy devolveu um payload invalido."
+        )
+    for key in ("list", "records", "systems", "items", "systemList", "rows"):
+        if key not in data:
+            continue
+        rows = data[key]
+        if not isinstance(rows, list) or any(
+            not isinstance(row, dict) for row in rows
+        ):
+            raise SigenergyApiError(
+                "A descoberta Sigenergy devolveu uma lista invalida."
+            )
+        return list(rows)
+    if any(key in data for key in ("systemId", "id", "systemName", "name")):
+        return [data]
+    raise SigenergyApiError(
+        "A descoberta Sigenergy devolveu um payload invalido."
+    )
 
 
 def client_from_config(config: dict[str, Any], session: requests.Session | None = None) -> SigenergyClient:

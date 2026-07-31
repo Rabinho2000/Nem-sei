@@ -32,14 +32,25 @@
     </div>
     <div class="hero-actions">
       <button class="button" type="submit" name="action" value="save_sigenergy_config">Guardar Sigenergy</button>
-      <button class="button secondary" type="submit" name="action" value="test_sigenergy_connection">Testar ligacao</button>
-      <button class="button secondary" type="submit" name="action" value="refresh_sigenergy_systems">Atualizar instalacoes</button>
-      <button class="button secondary" type="submit" name="action" value="sync_sigenergy_now">Sincronizar todas agora</button>
+      <button class="button secondary" type="submit" name="action" value="test_sigenergy_credentials">Testar credenciais</button>
+      <button class="button secondary" type="submit" name="action" value="refresh_sigenergy_systems">Atualizar descoberta</button>
+      <button class="button secondary" type="submit" name="action" value="sync_sigenergy_now">Sincronizar instalações associadas</button>
     </div>
     <p class="muted">A App Secret nao e mostrada nem copiada da variavel de ambiente para a base de dados. Campos definidos no ambiente têm prioridade sobre a interface.</p>
-    {% if cfg.last_error %}
-      <p class="muted">Ultimo erro: {{ cfg.last_error }}</p>
-    {% endif %}
+  </form>
+  <form method="post" class="stack-form">
+    <div class="grid two">
+      <label>Verificar System ID diretamente
+        <input type="text" name="system_id" maxlength="64" placeholder="SYSTEM_ID" required>
+      </label>
+      <label>Nome opcional
+        <input type="text" name="system_name" maxlength="200" placeholder="Nome local para o inventário">
+      </label>
+    </div>
+    <div class="hero-actions">
+      <button class="button secondary" type="submit" name="action" value="verify_sigenergy_system">Verificar System ID</button>
+    </div>
+    <p class="muted">A verificação chama apenas energyFlow para o ID indicado. Não executa descoberta, não cria assets, não associa mappings e não envia onboarding.</p>
   </form>
   {% else %}
     <p class="muted">Configuracao Sigenergy nao encontrada.</p>
@@ -48,14 +59,17 @@
 
 <section class="cards">
   <article class="card stat-card">
-    <span>Ultima sincronizacao Sigenergy</span>
-    <strong>{{ sigenergy_last_run.status if sigenergy_last_run else 'sem sync' }}</strong>
-    <p class="muted">{{ sigenergy_last_run.started_at if sigenergy_last_run else '-' }}</p>
+    <span>Credenciais</span>
+    <strong>{{ sigenergy_credential_state.status }}</strong>
+    <p class="muted">{{ sigenergy_credential_state.attempted_at or 'nunca testadas' }}</p>
   </article>
   <article class="card stat-card">
-    <span>Ultima descoberta</span>
-    <strong>{{ cfg.last_discovery_at if cfg and cfg.last_discovery_at else 'nunca' }}</strong>
-    <p class="muted">{{ sigenergy_summary.accessible }} acessiveis</p>
+    <span>Descoberta</span>
+    <strong>{{ sigenergy_discovery_state.status }}</strong>
+    <p class="muted">{{ sigenergy_discovery_state.attempted_at or 'nunca executada' }}</p>
+    {% if sigenergy_discovery_state.status == 'restricted' %}
+      <p class="muted">A listagem global está restringida; a verificação direta continua disponível.</p>
+    {% endif %}
   </article>
   <article class="card stat-card">
     <span>Instalacoes</span>
@@ -63,9 +77,9 @@
     <p class="muted">{{ sigenergy_summary.unmapped }} por associar · {{ sigenergy_summary.unauthorized }} sem autorizacao</p>
   </article>
   <article class="card stat-card">
-    <span>Resultado</span>
-    <strong>{{ cfg.last_sync_status if cfg else '-' }}</strong>
-    <p class="muted">{{ cfg.last_sync_at if cfg and cfg.last_sync_at else '-' }}</p>
+    <span>Última sincronização</span>
+    <strong>{{ sigenergy_last_run.status if sigenergy_last_run else 'never_synced' }}</strong>
+    <p class="muted">{{ sigenergy_last_run.started_at if sigenergy_last_run else '-' }}</p>
   </article>
   {% set sig_quotas = production_api_queue_states | selectattr("provider", "equalto", "sigenergy") | list %}
   <article class="card stat-card">

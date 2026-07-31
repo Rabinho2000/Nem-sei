@@ -10,19 +10,47 @@ class SigenergyApiError(Exception):
         *,
         payload: dict[str, Any] | None = None,
         status_code: int | None = None,
+        api_code: str | int | None = None,
         error_type: str = "api",
     ) -> None:
         super().__init__(message)
         self.payload = payload or {}
         self.status_code = status_code
+        self.api_code = "" if api_code is None else str(api_code)
         self.error_type = error_type
 
 
 class SigenergyRateLimitError(SigenergyApiError):
-    def __init__(self, message: str, *, payload: dict[str, Any] | None = None, status_code: int | None = None) -> None:
-        super().__init__(message, payload=payload, status_code=status_code, error_type="rate_limit")
+    def __init__(
+        self,
+        message: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        status_code: int | None = None,
+        api_code: str | int | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            payload=payload,
+            status_code=status_code,
+            api_code=api_code,
+            error_type="rate_limit",
+        )
 
 
 class SigenergyAuthError(SigenergyApiError):
-    def __init__(self, message: str, *, payload: dict[str, Any] | None = None, status_code: int | None = None) -> None:
-        super().__init__(message, payload=payload, status_code=status_code, error_type="auth")
+    def __init__(
+        self,
+        message: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        status_code: int | None = None,
+        api_code: str | int | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            payload=payload,
+            status_code=status_code,
+            api_code=api_code,
+            error_type="auth",
+        )

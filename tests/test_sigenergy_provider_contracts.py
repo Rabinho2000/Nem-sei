@@ -9,6 +9,10 @@ import pytest
 import app as app_module
 from monitoring_board.db import get_db
 from monitoring_board.services import sigenergy as sigenergy_service
+from monitoring_board.services.sigenergy_models import rows_from_data
+from monitoring_board.services.sigenergy_operations import (
+    normalize_sigenergy_live_row,
+)
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "sigenergy"
@@ -145,26 +149,26 @@ def test_get_sigenergy_token_reuses_cache(monkeypatch) -> None:
 def test_normalize_sigenergy_system_rows_accepts_list_variants_and_single_object() -> None:
     systems_data = app_module.parse_provider_payload_data(load_fixture("systems_list.json"))
 
-    assert [row["systemId"] for row in app_module.normalize_sigenergy_system_rows(systems_data)] == [
+    assert [row["systemId"] for row in rows_from_data(systems_data)] == [
         "SIG-001",
         "SIG-002",
     ]
-    assert app_module.normalize_sigenergy_system_rows([{"systemId": "SIG-003"}, "skip"]) == [
+    assert rows_from_data([{"systemId": "SIG-003"}, "skip"]) == [
         {"systemId": "SIG-003"}
     ]
-    assert app_module.normalize_sigenergy_system_rows({"records": [{"systemId": "SIG-004"}]}) == [
+    assert rows_from_data({"records": [{"systemId": "SIG-004"}]}) == [
         {"systemId": "SIG-004"}
     ]
-    assert app_module.normalize_sigenergy_system_rows({"systems": [{"systemId": "SIG-005"}]}) == [
+    assert rows_from_data({"systems": [{"systemId": "SIG-005"}]}) == [
         {"systemId": "SIG-005"}
     ]
-    assert app_module.normalize_sigenergy_system_rows({"systemList": [{"systemId": "SIG-006"}]}) == [
+    assert rows_from_data({"systemList": [{"systemId": "SIG-006"}]}) == [
         {"systemId": "SIG-006"}
     ]
-    assert app_module.normalize_sigenergy_system_rows({"rows": [{"systemId": "SIG-007"}]}) == [
+    assert rows_from_data({"rows": [{"systemId": "SIG-007"}]}) == [
         {"systemId": "SIG-007"}
     ]
-    assert app_module.normalize_sigenergy_system_rows({"systemId": "SIG-008", "systemName": "Single"}) == [
+    assert rows_from_data({"systemId": "SIG-008", "systemName": "Single"}) == [
         {"systemId": "SIG-008", "systemName": "Single"}
     ]
 
@@ -189,10 +193,9 @@ def test_sigenergy_client_allows_empty_system_list_only_when_explicit(
 
 def test_normalize_sigenergy_system_row_maps_realtime_and_energy_flow_fields() -> None:
     system = app_module.parse_provider_payload_data(load_fixture("systems_list.json"))["list"][0]
-    realtime = app_module.parse_provider_payload_data(load_fixture("realtime_data.json"))
     energy_flow = app_module.parse_provider_payload_data(load_fixture("energy_flow.json"))
 
-    row = app_module.normalize_sigenergy_system_row(system, realtime, energy_flow)
+    row = normalize_sigenergy_live_row(system, energy_flow)
 
     assert row["external_id"] == "SIG-001"
     assert row["external_name"] == "Sigenergy Test Site 1"
@@ -202,17 +205,12 @@ def test_normalize_sigenergy_system_row_maps_realtime_and_energy_flow_fields() -
     assert "pvPower=4.25" in row["notes"]
     assert "batterySoc=78" in row["notes"]
     assert row["grid_power_kw_raw"] == -0.5
-    assert row["payload"] == {
-        "system": system,
-        "realtime": realtime,
-        "energy_flow": energy_flow,
-    }
+    assert row["payload"] == {"system": system, "energy_flow": energy_flow}
 
 
 def test_sigenergy_notes_show_battery_na_when_capacity_zero() -> None:
-    row = app_module.normalize_sigenergy_system_row(
+    row = normalize_sigenergy_live_row(
         {"systemId": "SIG-001", "systemName": "No Battery", "status": "Normal", "batteryCapacity": 0},
-        {},
         {"pvPower": 2.0, "loadPower": 1.0, "gridPower": -0.25, "batteryPower": 0, "batterySoc": 0},
     )
 
@@ -220,40 +218,6 @@ def test_sigenergy_notes_show_battery_na_when_capacity_zero() -> None:
     assert "Rede: -0.25 kW" in row["notes"]
     assert "Bateria: N/A" in row["notes"]
     assert "SOC: N/A" in row["notes"]
-
-
-def test_run_sigenergy_check_continues_after_single_energy_flow_failure(tmp_path, monkeypatch) -> None:
-    db_path = tmp_path / "sigenergy-check.db"
-    app_module.ensure_database(str(db_path))
-
-    class FakeClient:
-        def __init__(self, _config, session=None) -> None:
-            self.session = session
-
-        def list_systems(self, *, allow_empty: bool = False) -> list[dict[str, Any]]:
-            return [
-                {"systemId": "SIG-001", "systemName": "A", "status": "Normal"},
-                {"systemId": "SIG-002", "systemName": "B", "status": "Offline"},
-            ]
-
-        def get_energy_flow(self, system_id: str) -> dict[str, Any]:
-            if system_id == "SIG-002":
-                raise ValueError("energy flow unavailable")
-            return {"pvPower": 1.0}
-
-    monkeypatch.setattr(sigenergy_service, "SigenergyClient", FakeClient)
-
-    with get_db(str(db_path)) as conn:
-        insert_enabled_sigenergy_config(conn)
-        result = app_module.run_sigenergy_check(conn, app_module.INTEGRATION_PROVIDER_SIGENERGY, dry_run=True)
-        snapshot_count = conn.execute("SELECT COUNT(*) AS total FROM integration_realtime_snapshots").fetchone()["total"]
-
-    assert result["station_count"] == 2
-    assert result["realtime_count"] == 1
-    assert result["failed_realtime_count"] == 1
-    assert len(result["rows"]) == 2
-    assert result["rows"][1]["status"] == "Sem dados"
-    assert snapshot_count == 0
 
 
 def test_discovery_ignores_legacy_system_ids_and_persists_inventory(
@@ -284,100 +248,38 @@ def test_discovery_ignores_legacy_system_ids_and_persists_inventory(
             "UPDATE integration_configs SET system_ids = 'SIG-MANUAL-999' WHERE provider = 'Sigenergy'"
         )
         conn.commit()
-        result = app_module.run_sigenergy_discovery(conn, persist=True)
+        result = app_module.discover_sigenergy_systems(conn, persist=True)
         row = conn.execute(
             "SELECT * FROM provider_system_inventory WHERE provider = 'Sigenergy'"
         ).fetchone()
 
-    assert result["available_system_ids"] == ["SIG-API-001"]
-    assert received_configs[0]["system_ids"] == ""
+    assert result.available_system_ids == ["SIG-API-001"]
+    assert "system_ids" not in received_configs[0]
     assert row["external_id"] == "SIG-API-001"
     assert row["access_status"] == "accessible"
-
-
-def test_sigenergy_403_isolated_and_inventory_marks_unauthorized(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    db_path = tmp_path / "sigenergy-403.db"
-    app_module.ensure_database(str(db_path))
-
-    class FakeClient:
-        def __init__(self, _config, session=None) -> None:
-            pass
-
-        def list_systems(self, *, allow_empty: bool = False):
-            return [
-                {"systemId": "SIG-403", "systemName": "Sem acesso"},
-                {"systemId": "SIG-OK", "systemName": "Com acesso"},
-            ]
-
-        def get_energy_flow(self, system_id: str):
-            if system_id == "SIG-403":
-                raise sigenergy_service.SigenergyAPIError(
-                    "forbidden",
-                    status_code=403,
-                )
-            return {"pvPower": 2.5}
-
-    monkeypatch.setattr(sigenergy_service, "SigenergyClient", FakeClient)
-    with get_db(str(db_path)) as conn:
-        insert_enabled_sigenergy_config(conn)
-        result = app_module.run_sigenergy_check(
-            conn,
-            app_module.INTEGRATION_PROVIDER_SIGENERGY,
-            dry_run=True,
-            persist_discovery=True,
-        )
-        states = {
-            row["external_id"]: row["access_status"]
-            for row in conn.execute(
-                "SELECT external_id, access_status FROM provider_system_inventory"
-            ).fetchall()
-        }
-
-    assert result["realtime_count"] == 1
-    assert result["failed_realtime_count"] == 1
-    assert states == {"SIG-403": "unauthorized", "SIG-OK": "accessible"}
-    assert result["rows"][0]["fetch_error"] == "Sem autorizacao para esta instalacao"
-
-
-def _sigenergy_sync_row(external_name: str = "Plant A") -> dict[str, Any]:
-    return {
-        "external_id": "SIG-001",
-        "external_name": external_name,
-        "status": "Operacional",
-        "raw_status": "Normal",
-        "notes": "PV: 4 kW | Carga: 1 kW | Rede: -0.5 kW | Bateria: N/A | SOC: N/A",
-        "pv_power_kw": 4.0,
-        "load_power_kw": 1.0,
-        "grid_power_kw_raw": -0.5,
-        "battery_power_kw": 0.0,
-        "battery_soc_pct": 0.0,
-        "ev_power_kw": None,
-        "ac_power_kw": None,
-        "heat_pump_power_kw": None,
-        "pv_capacity_kw": 10.0,
-        "battery_capacity_kwh": 0.0,
-        "payload": {"system": {"systemId": "SIG-001"}, "energy_flow": {"gridPower": -0.5}},
-    }
 
 
 def test_run_sigenergy_sync_writes_snapshot_and_monitoring_for_existing_mapping(tmp_path, monkeypatch) -> None:
     db_path = tmp_path / "sigenergy-sync.db"
     app_module.ensure_database(str(db_path))
 
-    monkeypatch.setattr(
-        app_module,
-        "run_sigenergy_check",
-        lambda _conn, _provider, dry_run=True, **_kwargs: {
-            "rows": [_sigenergy_sync_row()],
-            "station_count": 1,
-            "realtime_count": 1,
-            "failed_realtime_count": 0,
-            "available_system_ids": ["SIG-001"],
-        },
-    )
+    class FakeClient:
+        def __init__(self, _config, session=None) -> None:
+            self.session = session
+
+        def get_energy_flow(self, system_id: str) -> dict[str, Any]:
+            assert system_id == "SIG-001"
+            return {
+                "systemStatus": "Normal",
+                "pvPower": 4.0,
+                "loadPower": 1.0,
+                "gridPower": -0.5,
+            }
+
+        def list_systems(self, **_kwargs: Any) -> list[dict[str, Any]]:
+            raise AssertionError("sync called discovery")
+
+    monkeypatch.setattr(sigenergy_service, "SigenergyClient", FakeClient)
 
     with get_db(str(db_path)) as conn:
         insert_enabled_sigenergy_config(conn)
@@ -400,29 +302,43 @@ def test_run_sigenergy_sync_writes_snapshot_and_monitoring_for_existing_mapping(
     assert monitoring["status"] == "Operacional"
 
 
-def test_run_sigenergy_sync_creates_unresolved_when_no_exact_match(tmp_path, monkeypatch) -> None:
+def test_run_sigenergy_sync_ignores_unassociated_inventory(tmp_path, monkeypatch) -> None:
     db_path = tmp_path / "sigenergy-unresolved.db"
     app_module.ensure_database(str(db_path))
-    monkeypatch.setattr(
-        app_module,
-        "run_sigenergy_check",
-        lambda _conn, _provider, dry_run=True, **_kwargs: {
-            "rows": [_sigenergy_sync_row("Unmapped Site")],
-            "station_count": 1,
-            "realtime_count": 1,
-            "failed_realtime_count": 0,
-            "available_system_ids": ["SIG-001"],
-        },
-    )
+    class FakeClient:
+        def __init__(self, _config, session=None) -> None:
+            pass
+
+        def get_energy_flow(self, _system_id: str) -> dict[str, Any]:
+            raise AssertionError("unassociated inventory became a sync target")
+
+    monkeypatch.setattr(sigenergy_service, "SigenergyClient", FakeClient)
 
     with get_db(str(db_path)) as conn:
         insert_enabled_sigenergy_config(conn)
-        app_module.run_sigenergy_sync(conn, app_module.INTEGRATION_PROVIDER_SIGENERGY)
+        now = app_module.datetime.now().isoformat(timespec="seconds")
+        conn.execute(
+            """
+            INSERT INTO provider_system_inventory (
+                provider, external_id, external_name, metadata_json,
+                access_status, first_discovered_at, last_discovered_at,
+                data_quality, created_at, updated_at
+            ) VALUES (
+                'Sigenergy', 'SIG-001', 'Unmapped Site', '{}',
+                'accessible', ?, ?, 'missing', ?, ?
+            )
+            """,
+            (now, now, now, now),
+        )
+        result = app_module.run_sigenergy_sync(
+            conn,
+            app_module.INTEGRATION_PROVIDER_SIGENERGY,
+        )
         unresolved = conn.execute("SELECT * FROM integration_unresolved WHERE provider = 'Sigenergy'").fetchone()
         monitoring_count = conn.execute("SELECT COUNT(*) AS total FROM monitoring_records WHERE source = 'Sigenergy'").fetchone()["total"]
 
-    assert unresolved["external_id"] == "SIG-001"
-    assert unresolved["external_name"] == "Unmapped Site"
+    assert result["matched"] == 0
+    assert unresolved is None
     assert monitoring_count == 0
 
 
@@ -456,7 +372,7 @@ def test_onboard_system_posts_list_payload_and_preserves_provider_code() -> None
     assert calls[0]["method"] == "POST"
     assert calls[0]["url"] == "https://sigenergy.example.test/openapi/board/onboard"
     assert calls[0]["json"] == ["SYS-001"]
-    assert result["status"] == "already_requested_or_onboarded"
+    assert result["status"] == "provider_pending"
     assert result["provider_code"] == "1401"
 
 
@@ -508,38 +424,8 @@ def test_onboarding_duplicate_updates_existing_active_request(tmp_path) -> None:
     assert row["attempt_count"] == 2
 
 
-def test_reconcile_sigenergy_onboarding_marks_pending_as_approved(tmp_path) -> None:
-    db_path = tmp_path / "sigenergy-onboarding-reconcile.db"
-    app_module.ensure_database(str(db_path))
-
-    with get_db(str(db_path)) as conn:
-        app_module.upsert_sigenergy_onboarding_request(
-            conn,
-            system_id="SYS-001",
-            requested_by="u",
-            result={"status": "requested", "provider_code": "0", "message": "ok", "response": {}},
-        )
-        assert app_module.reconcile_sigenergy_onboarding_requests(conn, ["sys-001"]) == 1
-        assert app_module.reconcile_sigenergy_onboarding_requests(conn, ["sys-001"]) == 0
-        row = conn.execute("SELECT status, approved_at FROM sigenergy_onboarding_requests").fetchone()
-
-    assert row["status"] == "approved"
-    assert row["approved_at"]
-
-
-def test_find_sigenergy_asset_id_ignores_inactive_alias(tmp_path) -> None:
-    db_path = tmp_path / "sigenergy-inactive-alias.db"
-    app_module.ensure_database(str(db_path))
-
-    with get_db(str(db_path)) as conn:
-        asset_id = conn.execute("INSERT INTO assets (project_name, active_contract) VALUES ('Other', 'yes')").lastrowid
-        conn.execute(
-            "INSERT INTO asset_aliases (asset_id, alias_name, normalized_alias, active) VALUES (?, 'Sig Site', ?, 0)",
-            (asset_id, app_module.normalize_name("Sig Site")),
-        )
-        conn.commit()
-
-        assert app_module.find_sigenergy_asset_id(conn, "Sigenergy", "SIG-001", "Sig Site") is None
+def test_legacy_direct_access_onboarding_reconciliation_hook_is_removed() -> None:
+    assert not hasattr(app_module, "reconcile_sigenergy_onboarding_requests")
 
 
 def test_cleanup_sigenergy_snapshots_keeps_latest_per_system(tmp_path) -> None:
@@ -570,17 +456,15 @@ def test_run_integration_sync_persists_sigenergy_provider_failure(tmp_path, monk
     error_payload = load_fixture("error_code_payload.json")
     provider_error = ValueError(f"{error_payload['msg']} (code={error_payload['code']})")
 
-    def fake_provider_check(
-        _conn,
-        provider: str,
-        dry_run: bool = False,
-        **_kwargs: Any,
-    ) -> dict[str, Any]:
-        assert provider == app_module.INTEGRATION_PROVIDER_SIGENERGY
-        assert dry_run is True
-        raise provider_error
+    class FailingService:
+        def sync_all_mappings(self, **_kwargs: Any):
+            raise provider_error
 
-    monkeypatch.setattr(app_module, "run_sigenergy_check", fake_provider_check)
+    monkeypatch.setattr(
+        app_module,
+        "build_sigenergy_operation_service",
+        lambda *_args, **_kwargs: FailingService(),
+    )
 
     with get_db(str(db_path)) as conn:
         insert_enabled_sigenergy_config(conn)
@@ -615,4 +499,4 @@ def test_run_integration_sync_persists_sigenergy_provider_failure(tmp_path, monk
     assert "request limited for fake test account" in run["error_message"]
     assert "code=42901" in run["error_message"]
     assert config["last_sync_status"] == "error"
-    assert "request limited for fake test account" in config["last_error"]
+    assert config["last_error"] in (None, "")

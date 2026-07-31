@@ -9,7 +9,9 @@
           <th>System ID</th>
           <th>Asset local</th>
           <th>Acesso</th>
-          <th>Ultimo estado</th>
+          <th>Estado operacional</th>
+          <th>Sync</th>
+          <th>Qualidade</th>
           <th>Ultima telemetria</th>
           <th>Cobertura energetica</th>
           <th>Relatorios</th>
@@ -46,21 +48,30 @@
               </form>
             </td>
             <td>
-              {% if row.access_status == 'unauthorized' %}
+              {% if row.access_status == 'accessible' %}
+                Acessível
+                {% if row.validation_method == 'direct_energy_flow' %}
+                  <div class="muted">
+                    Validação direta por energyFlow.
+                  </div>
+                {% elif row.validation_method == 'discovery' %}
+                  <div class="muted">Validada por descoberta.</div>
+                {% endif %}
+              {% elif row.access_status == 'unauthorized' %}
                 Sem autorizacao
               {% elif row.access_status == 'not_returned' %}
                 Nao devolvida
+              {% elif row.access_status == 'not_found' %}
+                Não encontrada
+              {% elif row.access_status == 'error' %}
+                Erro de acesso
               {% else %}
-                Acessivel
-                {% if row.validation_method == 'direct_energy_flow' %}
-                  <div class="muted">
-                    Validacao direta por energyFlow; nao devolvida por
-                    /openapi/system.
-                  </div>
-                {% endif %}
+                Acesso desconhecido
               {% endif %}
             </td>
-            <td>{{ row.normalized_status or row.last_state or '-' }}<div class="muted">{{ row.collected_at or row.last_state_at or '-' }}</div></td>
+            <td>{{ row.operational_status or 'unknown' }}<div class="muted">{{ row.normalized_status or row.last_state or '-' }} · {{ row.collected_at or row.last_state_at or '-' }}</div></td>
+            <td>{{ row.sync_status or 'never_synced' }}<div class="muted">{{ row.last_sync_at or '-' }}</div></td>
+            <td>{{ row.data_quality or 'missing' }}<div class="muted">{{ row.mapping_status }}</div></td>
             <td>{{ row.last_energy_event_at or row.last_telemetry_at or 'Ainda sem energia' }}</td>
             <td>
               {{ row.current_month_days }}/{{ row.current_month_expected_days }} dias
@@ -80,7 +91,7 @@
               {% endif %}
             </td>
             <td>
-              {% if row.asset_id %}
+              {% if row.asset_id and row.mapping_status == 'associated' %}
                 {% if row.is_primary_energy_source %}
                   Primaria
                 {% elif not row.report_ready %}
@@ -90,6 +101,7 @@
                     <input type="hidden" name="action" value="set_primary_energy_source">
                     <input type="hidden" name="asset_id" value="{{ row.asset_id }}">
                     <input type="hidden" name="provider" value="Sigenergy">
+                    <input type="hidden" name="external_id" value="{{ row.external_id }}">
                     <input type="hidden" name="confirm_source_switch" value="1">
                     <button class="button secondary" type="submit">Confirmar Sigenergy como primaria</button>
                   </form>
@@ -99,7 +111,8 @@
               {% endif %}
             </td>
             <td>
-              {% if row.asset_id and row.access_status == 'accessible' %}
+              {% if row.asset_id
+                    and row.mapping_status == 'associated' %}
                 <form method="post" class="stack-form">
                   <input type="hidden" name="action" value="sync_sigenergy_energy">
                   <input type="hidden" name="external_id" value="{{ row.external_id }}">
@@ -109,20 +122,32 @@
                   <label>Ate
                     <input type="date" name="date_to" value="{{ sigenergy_default_history_date }}">
                   </label>
-                  <button class="button secondary" type="submit">Ler energia</button>
+                  <button class="button secondary" type="submit">Importar histórico</button>
                 </form>
               {% else %}
                 Associa primeiro ao asset local
               {% endif %}
             </td>
-            <td>{{ row.display_error or '-' }}</td>
+            <td>
+              {% if row.display_error %}
+                <strong>Último erro · {{ row.error_operation }}</strong>
+                <div>{{ row.display_error }}</div>
+                <div class="muted">
+                  System ID {{ row.external_id }} · {{ row.error_at }}
+                  {% if row.error_http_status %} · HTTP {{ row.error_http_status }}{% endif %}
+                  {% if row.error_api_code %} · code {{ row.error_api_code }}{% endif %}
+                </div>
+              {% else %}
+                -
+              {% endif %}
+            </td>
           </tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
   {% else %}
-    <p class="muted">Ainda nao existe inventario. Usa Atualizar instalacoes para descobrir os sistemas autorizados pela App Key.</p>
+    <p class="muted">Ainda não existe inventário. Atualiza a descoberta ou verifica diretamente um System ID conhecido.</p>
   {% endif %}
   {% if not sigenergy_history_unit_confirmed %}
     <p class="muted">A ingestao energetica fica bloqueada ate a unidade dos totais historicos ser confirmada como kWh e configurada pelo administrador.</p>
