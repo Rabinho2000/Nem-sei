@@ -114,6 +114,91 @@ def test_legacy_audit_is_immutable_sanitized_and_classifies_system_ids_path(
     assert "must-not-appear" not in rendered
 
 
+def test_legacy_audit_recovers_system_ids_path_after_value_was_cleared(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "before-repair-with-cleared-config.db"
+    app_module.ensure_database(str(db_path))
+    with get_db(str(db_path)) as conn:
+        now = datetime.now().isoformat(timespec="seconds")
+        conn.execute(
+            """
+            INSERT INTO integration_configs (
+                provider, system_ids, last_error, enabled, created_at,
+                updated_at
+            ) VALUES ('Sigenergy', '', ?, 1, ?, ?)
+            """,
+            (
+                f"/openapi/systems/{TARGET}/energyFlow failed",
+                now,
+                now,
+            ),
+        )
+        payload = {
+            "system": {"systemId": TARGET, "systemName": TARGET},
+            "realtime": {},
+            "energy_flow": {},
+            "fetch_error": "access denied",
+            "fetch_status": "error",
+        }
+        cases = (
+            ("scheduled_state", "2026-07-29T10:00:00"),
+            ("manual_background", "2026-07-30T10:00:00"),
+        )
+        for trigger_type, collected_at in cases:
+            conn.execute(
+                """
+                INSERT INTO integration_realtime_snapshots (
+                    asset_id, provider, external_id, collected_at,
+                    payload_json
+                ) VALUES (NULL, 'Sigenergy', ?, ?, ?)
+                """,
+                (TARGET, collected_at, json.dumps(payload)),
+            )
+            conn.execute(
+                """
+                INSERT INTO integration_sync_runs (
+                    provider, trigger_type, status, started_at, finished_at,
+                    summary_json
+                ) VALUES ('Sigenergy', ?, 'partial', ?, ?, ?)
+                """,
+                (
+                    trigger_type,
+                    collected_at,
+                    collected_at,
+                    json.dumps(
+                        {
+                            "provider_rows": 1,
+                            "energy_flow_error": f"{TARGET}: access denied",
+                        }
+                    ),
+                ),
+            )
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    result = audit_backup(db_path, TARGET)
+
+    assert result["audit_version"] == 2
+    assert len(result["integration_runs"]) == 2
+    assert result["integration_config"]["legacy_system_ids_present"] is False
+    classification = result["origin_classification"]
+    assert (
+        classification["conclusion"]
+        == "legacy_system_ids_synthetic_inventory_path"
+    )
+    assert classification["confidence"] == "high"
+    assert (
+        classification["configured_value_source"]
+        == "database_or_environment_not_recoverable"
+    )
+    assert classification["evidence"]["target_linked_runs_cover_snapshots"]
+    assert classification["evidence"]["target_linked_run_triggers"] == {
+        "manual_background": 1,
+        "scheduled_state": 1,
+    }
+
+
 def test_legacy_audit_refuses_live_database_filename(tmp_path) -> None:
     db_path = tmp_path / "monitoring_board.db"
     app_module.ensure_database(str(db_path))

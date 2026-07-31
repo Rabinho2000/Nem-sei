@@ -434,6 +434,7 @@ def _config_evidence(
 def _run_evidence(
     conn: sqlite3.Connection,
     snapshot: dict[str, Any],
+    target: str,
 ) -> list[dict[str, Any]]:
     table = "integration_sync_runs"
     required = {"id", "provider", "status", "started_at"}
@@ -454,16 +455,19 @@ def _run_evidence(
         )
         if name in available
     ]
+    has_summary = "summary_json" in available
     first_at = snapshot.get("first_collected_at")
     last_at = snapshot.get("last_collected_at")
     if first_at and last_at:
         rows = conn.execute(
             f"""
             SELECT {", ".join(_quote_identifier(name) for name in selected)}
+                   {", summary_json" if has_summary else ""}
             FROM integration_sync_runs
             WHERE provider = 'Sigenergy'
-              AND started_at <= datetime(?, '+10 minutes')
-              AND COALESCE(finished_at, started_at) >= datetime(?, '-10 minutes')
+              AND datetime(started_at) <= datetime(?, '+10 minutes')
+              AND datetime(COALESCE(finished_at, started_at))
+                    >= datetime(?, '-10 minutes')
             ORDER BY started_at, id
             """,
             (last_at, first_at),
@@ -472,12 +476,36 @@ def _run_evidence(
         rows = conn.execute(
             f"""
             SELECT {", ".join(_quote_identifier(name) for name in selected)}
+                   {", summary_json" if has_summary else ""}
             FROM integration_sync_runs
             WHERE provider = 'Sigenergy'
             ORDER BY started_at, id
             """
         ).fetchall()
-    return [dict(row) for row in rows]
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        safe = {name: row[name] for name in selected}
+        if has_summary:
+            raw_summary = str(row["summary_json"] or "")
+            try:
+                parsed_summary = json.loads(raw_summary)
+            except json.JSONDecodeError:
+                parsed_summary = None
+            safe.update(
+                {
+                    "summary_sha256": (
+                        _sha256(raw_summary) if raw_summary else ""
+                    ),
+                    "summary_keys": (
+                        sorted(str(key) for key in parsed_summary)
+                        if isinstance(parsed_summary, dict)
+                        else []
+                    ),
+                    "target_present_in_summary": target in raw_summary,
+                }
+            )
+        results.append(safe)
+    return results
 
 
 def _background_job_evidence(
@@ -608,6 +636,7 @@ def _classify_origin(
     mappings: list[dict[str, Any]],
     config: dict[str, Any],
     jobs: list[dict[str, Any]],
+    runs: list[dict[str, Any]],
 ) -> dict[str, Any]:
     boundaries = snapshot.get("boundaries") or {}
     synthetic_signature = any(
@@ -616,16 +645,42 @@ def _classify_origin(
         ))
         for edge in ("first", "last")
     )
+    first_payload = (boundaries.get("first") or {}).get("payload", {})
+    last_payload = (boundaries.get("last") or {}).get("payload", {})
+    target_linked_runs = [
+        run for run in runs if run.get("target_present_in_summary")
+    ]
+    trigger_counts: dict[str, int] = {}
+    for run in target_linked_runs:
+        trigger = str(run.get("trigger_type") or "unknown")
+        trigger_counts[trigger] = trigger_counts.get(trigger, 0) + 1
+    snapshot_count = int(snapshot.get("snapshot_count") or 0)
     evidence = {
         "legacy_system_ids_contains_target": bool(
             config.get("target_in_legacy_system_ids")
         ),
+        "legacy_system_ids_present_at_backup": bool(
+            config.get("legacy_system_ids_present")
+        ),
+        "legacy_last_error_contains_target": bool(
+            config.get("target_in_legacy_last_error")
+        ),
         "synthetic_identity_signature": synthetic_signature,
+        "boundary_payload_hashes_match": bool(
+            first_payload.get("sha256")
+            and first_payload.get("sha256") == last_payload.get("sha256")
+        ),
+        "snapshot_count": snapshot_count,
         "mapping_count": len(mappings),
         "background_job_count": len(jobs),
+        "target_linked_run_count": len(target_linked_runs),
+        "target_linked_run_triggers": trigger_counts,
+        "target_linked_runs_cover_snapshots": bool(
+            snapshot_count and len(target_linked_runs) == snapshot_count
+        ),
         "snapshots_without_asset": (
             snapshot.get("asset_ids") == [None]
-            if snapshot.get("snapshot_count")
+            if snapshot_count
             else False
         ),
     }
@@ -634,6 +689,21 @@ def _classify_origin(
         and synthetic_signature
         and not mappings
     ):
+        conclusion = "legacy_system_ids_synthetic_inventory_path"
+        confidence = "high"
+    elif (
+        synthetic_signature
+        and evidence["snapshots_without_asset"]
+        and not mappings
+        and not jobs
+        and evidence["legacy_last_error_contains_target"]
+        and evidence["target_linked_runs_cover_snapshots"]
+    ):
+        # The old configured_system_rows() fallback was the code path that
+        # manufactured systemId == systemName rows without discovery. The
+        # column may already have been cleared by the time a forensic backup
+        # was taken; identical synthetic boundary payloads plus one target-
+        # linked run per NULL-asset snapshot retain the path fingerprint.
         conclusion = "legacy_system_ids_synthetic_inventory_path"
         confidence = "high"
     elif mappings:
@@ -649,9 +719,18 @@ def _classify_origin(
         "conclusion": conclusion,
         "confidence": confidence,
         "evidence": evidence,
+        "configured_value_source": (
+            "database_column_at_backup"
+            if evidence["legacy_system_ids_contains_target"]
+            else "database_or_environment_not_recoverable"
+            if conclusion == "legacy_system_ids_synthetic_inventory_path"
+            else "not_applicable"
+        ),
         "note": (
-            "A classificacao e baseada apenas no backup. Deve ser cruzada "
-            "com a evidencia Git documentada no repositorio."
+            "A classificacao cruza a assinatura persistida no backup com o "
+            "fingerprint do fluxo historico documentado no repositorio. Se "
+            "system_ids ja estava vazio, o suporte original do valor (coluna "
+            "ou ambiente) nao pode ser reconstruido a partir do backup."
         ),
     }
 
@@ -682,8 +761,9 @@ def audit_backup(database: Path, system_id: str) -> dict[str, Any]:
         mappings = _mapping_evidence(conn, target)
         config = _config_evidence(conn, target)
         jobs = _background_job_evidence(conn, target)
+        runs = _run_evidence(conn, snapshot, target)
         result = {
-            "audit_version": 1,
+            "audit_version": 2,
             "mode": "sqlite_read_only_immutable",
             "database": {
                 "filename": resolved.name,
@@ -696,7 +776,7 @@ def audit_backup(database: Path, system_id: str) -> dict[str, Any]:
             "snapshots": snapshot,
             "asset_integrations": mappings,
             "integration_config": config,
-            "integration_runs": _run_evidence(conn, snapshot),
+            "integration_runs": runs,
             "background_jobs": jobs,
             "energy_interval_facts": _fact_evidence(
                 conn,
@@ -714,6 +794,7 @@ def audit_backup(database: Path, system_id: str) -> dict[str, Any]:
             mappings=mappings,
             config=config,
             jobs=jobs,
+            runs=runs,
         )
         return result
     finally:

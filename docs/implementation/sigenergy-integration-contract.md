@@ -96,16 +96,51 @@ commit anterior.
 4. `7b1627b` removeu o uso de `system_ids` e as linhas sintéticas, mas manteve
    o fluxo universal dependente de discovery.
 
-Este histórico identifica o caminho de código capaz de selecionar e persistir
-o ID. A atribuição factual do valor `25062000156` a configuração, mapping, job,
-teste ou outra origem depende da evidência do backup
-`before-expertcom-repair-20260730-171225.db`.
+### Evidência do backup de produção
 
-O módulo `monitoring_board.sigenergy_legacy_audit` recolhe essa evidência em
-modo imutável: todas as tabelas/colunas com o ID, contagem e intervalo dos
-snapshots, `asset_id`, runs/jobs/mappings/configuração, e shape/hash sanitizado
-dos payloads de fronteira. A causa só deve ser declarada fechada depois de
-guardar e rever esse JSON.
+O administrador executou o auditor sobre
+`before-expertcom-repair-20260730-171225.db`. O backup tinha o SHA-256
+`86de6aaf77d8a80a9a3a44eac63ca26955a21a11ea32fd4a4502a6705bcbd20b`,
+passou `PRAGMA quick_check` e manteve o mesmo hash antes e depois da auditoria
+imutável read-only.
+
+A evidência sanitizada demonstra que:
+
+- existiam exatamente 116 snapshots Sigenergy, IDs 1 a 116, entre
+  `2026-07-23T16:44:45` e `2026-07-30T15:12:09`;
+- todos tinham `asset_id=NULL` e não existia mapping, registo de produção,
+  facto energético ou background job parametrizado com este ID;
+- os payloads inicial e final eram byte a byte iguais (SHA-256
+  `ff034d0f694e91841f3c8f913b8945999fc1fa225e08c2ca7b5ee4e0b3b0a38b`)
+  e continham a identidade sintética
+  `systemId == systemName == 25062000156`, objetos realtime/energy-flow vazios
+  e um erro de fetch;
+- o ID ocorria em 116 linhas de `integration_sync_runs.summary_json` e no erro
+  global legacy, mas não num mapping ou job dirigido ao ID;
+- `integration_configs.system_ids` já estava vazio neste backup.
+
+### Causa raiz
+
+O fluxo de inserção foi, portanto, o fallback legacy de `system_ids`, e não
+discovery, parser de outro provider, mapping, onboarding, teste, seed ou
+migração. Sem mapping ativo, `run_sigenergy_check` selecionava os IDs
+configurados; `SigenergyClient.list_systems()` não chamava discovery e
+`configured_system_rows()` fabricava a linha de identidade; `energyFlow`
+falhava e `run_sigenergy_sync()` persistia essa linha antes de resolver o
+asset. Execuções agendadas e manuais em background repetiram o snapshot com
+`asset_id=NULL`.
+
+Depois de a coluna ter sido limpa, já não é possível reconstruir onde o valor
+fora originalmente guardado: o código antigo aceitava tanto a coluna/UI da
+base como o override de ambiente `SIGENERGY_SYSTEM_IDS`. Isto não deixa o
+fluxo de inserção ambíguo; impede apenas atribuir quem introduziu o valor ou
+qual dessas duas superfícies de configuração usou. O auditor regista esta
+distinção como
+`configured_value_source=database_or_environment_not_recoverable`.
+
+O módulo `monitoring_board.sigenergy_legacy_audit` recolhe a evidência em modo
+imutável e reconhece este fingerprint persistido mesmo quando o valor da
+configuração legacy já foi removido antes do backup.
 
 Não existe cleanup genérico por ID. Qualquer limpeza futura exige backup,
 dry-run, evidência de origem e alvo exato.
