@@ -93,6 +93,27 @@ def test_returned_unconfirmed_unit_is_a_visible_permanent_failure(tmp_path, monk
     assert scheduled == []
 
 
+def test_returned_missing_mapping_is_a_visible_permanent_failure(tmp_path, monkeypatch) -> None:
+    payload = {
+        "status": "failed",
+        "data_quality": "invalid",
+        "message": "O System ID Sigenergy nao tem um mapping ativo.",
+        "error": {"category": "provider_error"},
+    }
+    db_path, job_id, scheduled = _run_job_against_database(tmp_path, monkeypatch, payload)
+
+    with get_db(str(db_path)) as conn:
+        job = conn.execute(
+            "SELECT status, next_attempt_at, attempt_count FROM background_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+
+    assert job["status"] == "failed"
+    assert job["next_attempt_at"] is None
+    assert job["attempt_count"] == 1
+    assert scheduled == []
+
+
 def test_recoverable_returned_failure_stops_after_three_attempts(tmp_path, monkeypatch) -> None:
     payload = {
         "status": "failed",

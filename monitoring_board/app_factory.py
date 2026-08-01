@@ -7649,6 +7649,7 @@ def background_job_result_failure(result: Any) -> dict[str, str | bool] | None:
         "credencia",
         "unidade",
         "mapeamento",
+        "mapping",
         "associada e ativa",
         "integration",
         "invalid_result",
