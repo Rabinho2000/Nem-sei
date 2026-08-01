@@ -3,6 +3,7 @@ from __future__ import annotations
 import calendar
 import json
 import math
+import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -62,6 +63,13 @@ class SigenergyHistoryFact:
     payload: dict[str, Any]
 
 
+def sigenergy_history_unit_confirmed(value: str | None = None) -> bool:
+    """Return whether the running process explicitly confirms Sigenergy kWh."""
+
+    raw_value = os.environ.get("SIGENERGY_HISTORY_ENERGY_UNIT", "") if value is None else value
+    return str(raw_value or "").strip().casefold() == "kwh"
+
+
 def parse_sigenergy_daily_history(
     payload: dict[str, Any],
     *,
@@ -80,7 +88,8 @@ def parse_sigenergy_daily_history(
     if not isinstance(payload, dict):
         raise ValueError("O historico Sigenergy devolveu um payload invalido.")
     payload_unit = str(payload.get("unit") or "").strip()
-    normalized_unit = (payload_unit or confirmed_unit).strip().lower()
+    source_unit = payload_unit or str(confirmed_unit or "").strip()
+    normalized_unit = source_unit.casefold()
     if normalized_unit != "kwh":
         raise ValueError(
             "A unidade do historico Sigenergy ainda nao foi confirmada como kWh."
@@ -115,12 +124,15 @@ def parse_sigenergy_daily_history(
         quality = "complete"
     else:
         quality = "partial"
+    stored_payload = sanitize_payload(payload)
+    stored_payload["_source_energy_unit"] = source_unit
+    stored_payload["_normalized_energy_unit"] = "kWh"
     return SigenergyHistoryFact(
         system_id=system_id.strip(),
         period_date=period_date,
         values=values,
         data_quality=quality,
-        payload=sanitize_payload(payload),
+        payload=stored_payload,
     )
 
 

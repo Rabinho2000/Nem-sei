@@ -205,6 +205,7 @@ from monitoring_board.reporting.energy_sources import (
 )
 from monitoring_board.services.energy_facts import (
     sigenergy_energy_readiness,
+    sigenergy_history_unit_confirmed,
 )
 from monitoring_board.reporting.invoices import normalize_date, is_supported_invoice_extension, validate_invoice_values, warnings_require_override
 from monitoring_board.reporting.availability import (
@@ -6001,12 +6002,7 @@ def create_app() -> Flask:
         sigenergy_default_history_date = (
             current_lisbon_date() - timedelta(days=1)
         ).isoformat()
-        sigenergy_history_unit_confirmed = (
-            os.environ.get("SIGENERGY_HISTORY_ENERGY_UNIT", "")
-            .strip()
-            .lower()
-            == "kwh"
-        )
+        sigenergy_history_unit_is_confirmed = sigenergy_history_unit_confirmed()
         sigenergy_onboarding_rows = query_all(
             g.db,
             """
@@ -6148,7 +6144,7 @@ def create_app() -> Flask:
             sigenergy_last_run=sigenergy_last_run,
             sigenergy_summary=sigenergy_summary,
             sigenergy_default_history_date=sigenergy_default_history_date,
-            sigenergy_history_unit_confirmed=sigenergy_history_unit_confirmed,
+            sigenergy_history_unit_confirmed=sigenergy_history_unit_is_confirmed,
             link_audit_rows=link_audit_rows,
             link_audit_counts=link_audit_counts,
             assets_for_mapping=assets_for_mapping,

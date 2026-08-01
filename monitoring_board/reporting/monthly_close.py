@@ -15,6 +15,7 @@ from monitoring_board.reporting.repositories import (
     list_daily_production_records,
 )
 from monitoring_board.services.financial_models import resolve_expected_production_for_month
+from monitoring_board.services.energy_facts import sigenergy_history_unit_confirmed
 
 
 def build_asset_close_payload(
@@ -102,7 +103,7 @@ def build_asset_close_payload(
     sigenergy_history_status = ""
     sigenergy_unit_confirmed = False
     if provider.casefold() == "sigenergy":
-        sigenergy_unit_confirmed = True
+        sigenergy_unit_confirmed = sigenergy_history_unit_confirmed()
         sigenergy_history_status = (
             "available" if quality.status == "complete" else "backfill_incomplete"
         )

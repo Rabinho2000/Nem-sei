@@ -11,6 +11,7 @@ from monitoring_board.db import get_db
 from monitoring_board.services.energy_facts import (
     parse_sigenergy_daily_history,
     persist_sigenergy_daily_history,
+    sigenergy_history_unit_confirmed,
     upsert_energy_interval_fact,
 )
 
@@ -50,6 +51,15 @@ def test_sigenergy_history_prefers_kwh_fields_without_double_counting() -> None:
     assert fact.values["export_kwh"] == 5.5
     assert fact.payload["powerSelfConsumptionKwh"] == 8
     assert fact.payload["powerGeneration"] == 999
+    assert fact.payload["_source_energy_unit"] == "kWh"
+    assert fact.payload["_normalized_energy_unit"] == "kWh"
+
+
+def test_sigenergy_history_unit_confirmation_comes_from_running_process(monkeypatch) -> None:
+    monkeypatch.delenv("SIGENERGY_HISTORY_ENERGY_UNIT", raising=False)
+    assert not sigenergy_history_unit_confirmed()
+    monkeypatch.setenv("SIGENERGY_HISTORY_ENERGY_UNIT", "KWH")
+    assert sigenergy_history_unit_confirmed()
 
 
 def test_sigenergy_history_legacy_fallback_and_missing_fields_stay_null() -> None:
