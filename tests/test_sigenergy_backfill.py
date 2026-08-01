@@ -154,6 +154,45 @@ def test_background_backfill_jobs_are_deduplicated_by_system_and_day(
     ] == ["2026-06-01", "2026-06-02"]
 
 
+def test_scheduled_sigenergy_reconciliation_only_queues_recent_closed_missing_days(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    conn, _asset_id = _mapped_database(tmp_path, "scheduled-reconciliation.db")
+    db_path = conn.execute("PRAGMA database_list").fetchone()[2]
+    app_module.ensure_integration_seed_data(conn)
+    conn.execute(
+        "UPDATE integration_configs SET enabled = 1 WHERE provider = 'Sigenergy'"
+    )
+    conn.commit()
+    conn.close()
+    scheduled: list[int] = []
+    monkeypatch.setattr(app_module, "current_lisbon_date", lambda: date(2026, 7, 4))
+    monkeypatch.setattr(
+        app_module,
+        "schedule_background_job",
+        lambda _app, job_id: scheduled.append(job_id) or True,
+    )
+    previous_database = app_module.app.config["DATABASE"]
+    app_module.app.config["DATABASE"] = str(db_path)
+    try:
+        app_module.run_scheduled_sigenergy_energy_sync(app_module.app)
+    finally:
+        app_module.app.config["DATABASE"] = previous_database
+
+    with get_db(str(db_path)) as check:
+        jobs = check.execute(
+            "SELECT params_json FROM background_jobs ORDER BY id"
+        ).fetchall()
+
+    assert [json.loads(row["params_json"])["target_date"] for row in jobs] == [
+        "2026-07-01",
+        "2026-07-02",
+        "2026-07-03",
+    ]
+    assert scheduled == [1, 2, 3]
+
+
 def test_backfill_rejects_unmapped_system_and_unfinished_day(tmp_path) -> None:
     db_path = tmp_path / "invalid.db"
     app_module.ensure_database(str(db_path))

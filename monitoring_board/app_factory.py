@@ -517,6 +517,8 @@ SIGENERGY_BACKGROUND_JOB_TYPES = (
     "sigenergy_energy_sync",
 )
 BACKGROUND_JOB_STALE_RUNNING_MINUTES = 30
+BACKGROUND_JOB_MAX_RECOVERABLE_ATTEMPTS = 3
+BACKGROUND_JOB_RECOVERABLE_BACKOFF_SECONDS = (60, 300, 900)
 DEFAULT_FUSIONSOLAR_SYNC_HOURS = "08:00,14:00"
 DEFAULT_STATE_SYNC_INTERVAL_HOURS = 1
 DEFAULT_FUSIONSOLAR_PRODUCTION_SYNC_TIME = "00:10"
@@ -7139,7 +7141,10 @@ def ensure_database(path: str) -> None:
                 created_at TEXT NOT NULL,
                 started_at TEXT,
                 finished_at TEXT,
-                next_attempt_at TEXT
+                next_attempt_at TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                error_category TEXT,
+                external_error_code TEXT
             );
 
             CREATE TABLE IF NOT EXISTS alert_blacklist (
@@ -7249,6 +7254,9 @@ def ensure_database(path: str) -> None:
         ensure_column(conn, "integration_configs", "diagnostics_sync_time TEXT")
         ensure_column(conn, "background_jobs", "next_attempt_at TEXT")
         ensure_column(conn, "background_jobs", "wait_reason TEXT")
+        ensure_column(conn, "background_jobs", "attempt_count INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "background_jobs", "error_category TEXT")
+        ensure_column(conn, "background_jobs", "external_error_code TEXT")
         ensure_column(conn, "asset_integrations", "is_primary_energy_source INTEGER DEFAULT 0")
         conn.execute(
             """
@@ -7605,13 +7613,82 @@ def mark_background_job_running(conn: sqlite3.Connection, job_id: int) -> bool:
         raise
 
 
+def background_job_result_failure(result: Any) -> dict[str, str | bool] | None:
+    """Normalize an explicit failure returned by a background job payload.
+
+    Provider services historically returned structured failures instead of
+    raising. The executor must treat those values exactly like exceptions;
+    otherwise a failed supplier call is persisted as a successful job.
+    """
+
+    if not isinstance(result, dict):
+        return None
+    status = str(result.get("status") or "").strip().casefold()
+    data_quality = str(result.get("data_quality") or "").strip().casefold()
+    error = result.get("error")
+    error_data = error if isinstance(error, dict) else {}
+    has_provider_error = bool(error_data) or bool(result.get("message"))
+    if status not in {"failed", "error"} and data_quality != "invalid":
+        return None
+
+    message = str(
+        error_data.get("message")
+        or result.get("message")
+        or result.get("error_message")
+        or "O job devolveu um resultado inválido."
+    ).strip()
+    category = str(
+        error_data.get("category")
+        or result.get("error_category")
+        or ("provider_error" if has_provider_error else "invalid_result")
+    ).strip().casefold()
+    external_code = str(
+        error_data.get("api_code")
+        or result.get("external_error_code")
+        or ""
+    ).strip()
+    normalized_message = message.casefold()
+    permanent_markers = (
+        "configura",
+        "credencia",
+        "unidade",
+        "mapeamento",
+        "associada e ativa",
+        "integration",
+        "invalid_result",
+    )
+    transient_markers = (
+        "timeout",
+        "timed out",
+        "http 5",
+        "rpc fail",
+        "temporar",
+        "connection",
+        "network",
+        "indispon",
+    )
+    retryable = (
+        category in {"provider_error", "transient", "network"}
+        and not any(marker in normalized_message for marker in permanent_markers)
+    )
+    if any(marker in normalized_message for marker in transient_markers):
+        retryable = True
+    return {
+        "message": message[:2000],
+        "category": category[:120] or "invalid_result",
+        "external_code": external_code[:120],
+        "retryable": retryable,
+    }
+
+
 def mark_background_job_success(conn: sqlite3.Connection, job_id: int, result: dict[str, Any]) -> None:
     now = serialize_background_job_timestamp()
     conn.execute(
         """
         UPDATE background_jobs
         SET status = 'success', result_json = ?, error_message = NULL,
-            finished_at = ?, next_attempt_at = NULL, wait_reason = NULL
+            finished_at = ?, next_attempt_at = NULL, wait_reason = NULL,
+            error_category = NULL, external_error_code = NULL
         WHERE id = ?
         """,
         (json.dumps(result, ensure_ascii=True, sort_keys=True), now, job_id),
@@ -7619,18 +7696,113 @@ def mark_background_job_success(conn: sqlite3.Connection, job_id: int, result: d
     conn.commit()
 
 
-def mark_background_job_failed(conn: sqlite3.Connection, job_id: int, error_message: str) -> None:
+def mark_background_job_failed(
+    conn: sqlite3.Connection,
+    job_id: int,
+    error_message: str,
+    *,
+    result: dict[str, Any] | None = None,
+    error_category: str | None = None,
+    external_error_code: str | None = None,
+    attempt_count: int | None = None,
+) -> None:
     now = serialize_background_job_timestamp()
     conn.execute(
         """
         UPDATE background_jobs
         SET status = 'failed', error_message = ?, finished_at = ?,
-            next_attempt_at = NULL, wait_reason = NULL
+            next_attempt_at = NULL, wait_reason = NULL, result_json = ?,
+            error_category = ?, external_error_code = ?,
+            attempt_count = COALESCE(?, attempt_count)
         WHERE id = ?
         """,
-        (error_message[:2000], now, job_id),
+        (
+            error_message[:2000],
+            now,
+            json.dumps(result or {}, ensure_ascii=True, sort_keys=True),
+            error_category[:120] if error_category else None,
+            external_error_code[:120] if external_error_code else None,
+            attempt_count,
+            job_id,
+        ),
     )
     conn.commit()
+
+
+def mark_background_job_result_failure(
+    conn: sqlite3.Connection,
+    job_id: int,
+    result: dict[str, Any],
+    failure: dict[str, str | bool],
+) -> datetime | None:
+    """Persist a returned supplier failure and return its retry time, if any."""
+
+    row = conn.execute(
+        "SELECT attempt_count FROM background_jobs WHERE id = ?", (job_id,)
+    ).fetchone()
+    attempt_count = int(row["attempt_count"] or 0) + 1 if row else 1
+    message = str(failure["message"])
+    category = str(failure["category"])
+    external_code = str(failure["external_code"])
+    retryable = bool(failure["retryable"])
+    result = dict(result)
+    result.update(
+        {
+            "status": "failed",
+            "retry_attempt": attempt_count,
+            "error_category": category,
+            "external_error_code": external_code,
+        }
+    )
+    now = background_job_utc_now()
+    if retryable and attempt_count < BACKGROUND_JOB_MAX_RECOVERABLE_ATTEMPTS:
+        delay_seconds = BACKGROUND_JOB_RECOVERABLE_BACKOFF_SECONDS[
+            min(attempt_count - 1, len(BACKGROUND_JOB_RECOVERABLE_BACKOFF_SECONDS) - 1)
+        ]
+        next_attempt_at = now + timedelta(seconds=delay_seconds)
+        result.update(
+            {
+                "status": "retrying",
+                "next_attempt_at": serialize_background_job_timestamp(next_attempt_at),
+            }
+        )
+        conn.execute(
+            """
+            UPDATE background_jobs
+            SET status = 'waiting_api_slot', error_message = ?, result_json = ?,
+                finished_at = ?, next_attempt_at = ?, wait_reason = 'recoverable_failure',
+                attempt_count = ?, error_category = ?, external_error_code = ?
+            WHERE id = ?
+            """,
+            (
+                message,
+                json.dumps(result, ensure_ascii=True, sort_keys=True),
+                serialize_background_job_timestamp(now),
+                serialize_background_job_timestamp(next_attempt_at),
+                attempt_count,
+                category,
+                external_code or None,
+                job_id,
+            ),
+        )
+        conn.commit()
+        return next_attempt_at
+
+    if retryable:
+        message = (
+            f"{message} Limite de tentativas recuperáveis atingido "
+            f"({attempt_count}/{BACKGROUND_JOB_MAX_RECOVERABLE_ATTEMPTS})."
+        )
+    mark_background_job_failed(
+        conn,
+        job_id,
+        message,
+        result=result,
+        error_category=category,
+        external_error_code=external_code,
+        attempt_count=attempt_count,
+    )
+    return None
 
 
 def mark_background_job_waiting_rate_limit(
@@ -13497,6 +13669,7 @@ def refresh_integration_scheduler(app: Flask) -> None:
                 "integration-production-fusionsolar-month-close",
                 "integration-fusionsolar-realtime-cleanup",
                 "integration-state-sigenergy-hourly",
+                "integration-production-sigenergy-daily",
                 "background-jobs-reactivate-rate-limit",
             }
         ):
@@ -13616,6 +13789,14 @@ def register_fusionsolar_scheduler_jobs(app: Flask, config: dict[str, Any]) -> N
 
 def register_sigenergy_scheduler_jobs(app: Flask, config: dict[str, Any]) -> None:
     register_hourly_state_sync(app, config, "integration-state-sigenergy-hourly")
+    add_scheduler_job(
+        func=run_scheduled_sigenergy_energy_sync,
+        trigger="cron",
+        hour=0,
+        minute=20,
+        args=[app],
+        id="integration-production-sigenergy-daily",
+    )
 
 
 def register_background_job_reactivation_scheduler(app: Flask) -> None:
@@ -13748,6 +13929,47 @@ def run_scheduled_fusionsolar_production_sync(app: Flask) -> None:
                     job_id,
                     target_date,
                 )
+
+
+def run_scheduled_sigenergy_energy_sync(app: Flask) -> None:
+    """Queue only missing/invalid recent closed Sigenergy history days.
+
+    The three-day window collects the previous Lisbon day and reconciles a
+    small recent tail without blindly re-backfilling a whole month.
+    """
+
+    scheduler_date = current_lisbon_date()
+    target_date = scheduler_date - timedelta(days=1)
+    date_from = target_date - timedelta(days=2)
+    with app.app_context():
+        with closing(get_db(app.config["DATABASE"])) as conn:
+            config = get_integration_config(conn, INTEGRATION_PROVIDER_SIGENERGY)
+            if config is None or not config["enabled"]:
+                current_app.logger.info(
+                    "Scheduled Sigenergy energy sync skipped because integration is disabled."
+                )
+                return
+            mappings = sigenergy_repository.list_enabled_mappings(conn)
+            queued: list[int] = []
+            for mapping in mappings:
+                for job_id, created in enqueue_sigenergy_energy_backfill(
+                    conn,
+                    external_id=str(mapping["external_id"]),
+                    date_from=date_from,
+                    date_to=target_date,
+                    max_days=3,
+                ):
+                    if created:
+                        queued.append(job_id)
+            conn.commit()
+        for job_id in queued:
+            schedule_background_job(app, job_id)
+        current_app.logger.info(
+            "Scheduled Sigenergy energy reconciliation: dates=%s..%s queued=%s",
+            date_from,
+            target_date,
+            len(queued),
+        )
 
 
 def run_scheduled_fusionsolar_wat_backfill(app: Flask) -> None:
@@ -14051,6 +14273,22 @@ def run_background_job(app: Flask, job_id: int) -> None:
                     job_type=str(job["job_type"]),
                 ):
                     result = run_background_job_payload(conn, str(job["job_type"]), params)
+                returned_failure = background_job_result_failure(result)
+                if returned_failure is not None:
+                    retry_at = mark_background_job_result_failure(
+                        conn,
+                        job_id,
+                        result,
+                        returned_failure,
+                    )
+                    if retry_at is not None:
+                        schedule_background_job(app, job_id, run_date=retry_at)
+                    current_app.logger.warning(
+                        "Background job %s returned failure: %s",
+                        job_id,
+                        returned_failure["message"],
+                    )
+                    return
                 mark_background_job_success(conn, job_id, result)
                 current_app.logger.info("Background job %s completed: %s", job_id, job["job_type"])
             except ApiSlotUnavailableError as exc:

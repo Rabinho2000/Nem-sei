@@ -477,42 +477,25 @@ def history_day_is_complete(
     external_id: str,
     target_date: str,
 ) -> bool:
+    # Sigenergy history provides daily totals. A complete materialized daily
+    # record is therefore the publishable source of truth; requiring another
+    # interval representation would falsely requeue an otherwise complete day.
     row = conn.execute(
         """
-        SELECT
-            EXISTS (
-                SELECT 1
-                FROM energy_interval_facts
-                WHERE asset_id = ?
-                  AND provider = ?
-                  AND external_id = ?
-                  AND granularity = 'day'
-                  AND substr(period_start, 1, 10) = ?
-                  AND data_quality = 'complete'
-            ) AS fact_complete,
-            EXISTS (
-                SELECT 1
-                FROM production_records
-                WHERE asset_id = ?
-                  AND provider = ?
-                  AND external_id = ?
-                  AND period_type = 'day'
-                  AND period_date = ?
-                  AND data_quality = 'complete'
-            ) AS production_complete
+        SELECT 1
+        FROM production_records
+        WHERE asset_id = ?
+          AND provider = ?
+          AND external_id = ?
+          AND period_type = 'day'
+          AND period_date = ?
+          AND source_granularity = 'day'
+          AND data_quality = 'complete'
+        LIMIT 1
         """,
-        (
-            asset_id,
-            SIGENERGY_PROVIDER,
-            external_id,
-            target_date,
-            asset_id,
-            SIGENERGY_PROVIDER,
-            external_id,
-            target_date,
-        ),
+        (asset_id, SIGENERGY_PROVIDER, external_id, target_date),
     ).fetchone()
-    return bool(row["fact_complete"] and row["production_complete"])
+    return row is not None
 
 
 def upsert_accessible_system(

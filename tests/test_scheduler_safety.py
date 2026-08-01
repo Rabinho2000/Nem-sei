@@ -297,7 +297,11 @@ def test_sigenergy_registers_only_hourly_state_job(tmp_path, monkeypatch) -> Non
 
         app_module.refresh_integration_scheduler(flask_app)
 
-        assert sorted(fake_scheduler.jobs) == ["background-jobs-reactivate-rate-limit", "integration-state-sigenergy-hourly"]
+        assert sorted(fake_scheduler.jobs) == [
+            "background-jobs-reactivate-rate-limit",
+            "integration-production-sigenergy-daily",
+            "integration-state-sigenergy-hourly",
+        ]
     finally:
         flask_app.config["DATABASE"] = original_database
         app_module.SCHEDULER = original_scheduler
@@ -319,7 +323,10 @@ def test_sigenergy_auto_sync_disabled_registers_no_state_job(tmp_path, monkeypat
 
         app_module.refresh_integration_scheduler(flask_app)
 
-        assert sorted(fake_scheduler.jobs) == ["background-jobs-reactivate-rate-limit"]
+        assert sorted(fake_scheduler.jobs) == [
+            "background-jobs-reactivate-rate-limit",
+            "integration-production-sigenergy-daily",
+        ]
     finally:
         flask_app.config["DATABASE"] = original_database
         app_module.SCHEDULER = original_scheduler
