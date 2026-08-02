@@ -21,6 +21,9 @@
       {% if last_compatible_file %}
         <a class="button secondary" href="{{ url_for('download_generated_report', file_id=last_compatible_file.id) }}">Ver último PDF</a>
       {% endif %}
+      {% if last_compatible_excel %}
+        <a class="button secondary" href="{{ url_for('download_generated_report', file_id=last_compatible_excel.id) }}">Descarregar último Excel</a>
+      {% endif %}
       <a class="button secondary" href="#reports-history">Ver histórico</a>
     </div>
   </section>

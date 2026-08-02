@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import Any
 
 from openpyxl import Workbook
+from openpyxl.chart import LineChart, Reference
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import getSampleStyleSheet
@@ -365,27 +368,58 @@ def render_individual_excel(report: dict[str, Any], template: ReportTemplate) ->
     asset = report.get("asset") or {}
     summary = workbook.active
     summary.title = "Resumo"
-    summary.append(["Empresa", template.branding.company_name])
-    summary.append(["Cliente", template.branding.client_name])
-    summary.append(["Instalacao", asset.get("project_name") or asset.get("name") or ""])
-    summary.append(["Periodo", report.get("period_label") or report.get("report_month") or ""])
-    summary.append(["Motor", report.get("engine_version") or "individual-report-v1"])
+    primary = _excel_color(template.branding.primary_color, "16324D")
+    secondary = _excel_color(template.branding.secondary_color, "159A9C")
+    _excel_report_title(summary, template, report, primary, secondary)
+    summary.append([])
+    summary.append(["Indicadores principais", "Valor", "", "Indicadores financeiros", "Valor"])
+    for left, right in zip(
+        (("Produção total (kWh)", report.get("production_kwh")), ("Autoconsumo (kWh)", report.get("self_use_kwh")), ("Excedente (kWh)", report.get("export_kwh")), ("Consumo (kWh)", report.get("consumption_kwh")), ("Importação rede (kWh)", report.get("grid_import_kwh"))),
+        (("Poupança (EUR)", report.get("savings_eur")), ("Receita excedente (EUR)", report.get("export_revenue_eur")), ("Pagamento Solcor (EUR)", report.get("solcor_payment_eur")), ("Benefício líquido (EUR)", report.get("net_benefit_eur")), ("Cobertura (%)", report.get("coverage_pct"))),
+    ):
+        summary.append([left[0], left[1], "", right[0], right[1]])
+    _excel_table_style(summary, 8, 13, primary, secondary, widths={"A": 27, "B": 16, "C": 4, "D": 27, "E": 16})
+    summary.freeze_panes = "A8"
     energy = workbook.create_sheet("Energia")
+    _excel_sheet_heading(energy, "Energia e produção", primary)
     energy.append(["Metrica", "Valor"])
     for key in ("production_kwh", "self_use_kwh", "export_kwh", "consumption_kwh", "grid_import_kwh"):
         energy.append([key, report.get(key)])
+    _excel_table_style(energy, 2, 7, primary, secondary, widths={"A": 30, "B": 18})
+    daily_rows = list(report.get("daily_rows") or [])
+    if daily_rows:
+        start_row = energy.max_row + 3
+        energy.cell(start_row, 1, "Produção diária")
+        energy.cell(start_row + 1, 1, "Data")
+        energy.cell(start_row + 1, 2, "Produção kWh")
+        for row in daily_rows:
+            energy.append([str(row.get("date") or row.get("period_date") or ""), row.get("production_kwh")])
+        _excel_table_style(energy, start_row + 1, energy.max_row, primary, secondary, widths={"A": 18, "B": 18})
+        chart = LineChart()
+        chart.title = "Produção diária"
+        chart.y_axis.title = "kWh"
+        chart.x_axis.title = "Dia"
+        chart.add_data(Reference(energy, min_col=2, min_row=start_row + 1, max_row=energy.max_row), titles_from_data=True)
+        chart.set_categories(Reference(energy, min_col=1, min_row=start_row + 2, max_row=energy.max_row))
+        chart.height, chart.width = 8, 16
+        energy.add_chart(chart, "D3")
     financial = workbook.create_sheet("Financeiro")
+    _excel_sheet_heading(financial, "Resumo financeiro", primary)
     financial.append(["Metrica", "Valor"])
     for key in ("savings_eur", "export_revenue_eur", "solcor_payment_eur", "fixed_monthly_fee_eur", "net_benefit_eur"):
         financial.append([key, report.get(key)])
+    _excel_table_style(financial, 2, 7, primary, secondary, widths={"A": 32, "B": 18})
     adjustments = list(report.get("client_outage_adjustments") or [])
     if adjustments:
         outage = workbook.create_sheet("Indisponibilidade cliente")
+        _excel_sheet_heading(outage, "Indisponibilidade imputável ao cliente", primary)
         outage.append(["Data", "Produção estimada kWh", "Motivo", "Cobrança EUR"])
         for item in adjustments:
             outage.append([item.get("date"), item.get("estimated_kwh"), item.get("reason"), None])
         outage.append(["Total", report.get("client_outage_billable_kwh"), "", report.get("client_outage_charge_eur")])
+        _excel_table_style(outage, 2, outage.max_row, primary, secondary, widths={"A": 18, "B": 24, "C": 60, "D": 18})
     quality = workbook.create_sheet("Qualidade dos dados")
+    _excel_sheet_heading(quality, "Qualidade dos dados", primary)
     quality.append(["Campo", "Valor"])
     quality.append(["Estado da producao", report.get("production_quality_status") or "-"])
     quality.append(["Cobertura", report.get("coverage_pct")])
@@ -394,9 +428,17 @@ def render_individual_excel(report: dict[str, Any], template: ReportTemplate) ->
         quality.append(["Aviso", note])
     for warning in list(report.get("warnings") or []) + list(report.get("billing_warnings") or []):
         quality.append(["Codigo", warning])
+    _excel_table_style(quality, 2, quality.max_row, primary, secondary, widths={"A": 30, "B": 90})
     metadata = workbook.create_sheet("Metadados")
+    _excel_sheet_heading(metadata, "Metadados do relatório", primary)
     for key in ("period_type", "period_start", "period_end", "months_count", "tariff_type", "billing_mode", "billing_energy_base"):
         metadata.append([key, str(report.get(key) or "")])
+    _excel_table_style(metadata, 2, metadata.max_row, primary, secondary, widths={"A": 28, "B": 36})
+    for sheet in workbook.worksheets:
+        sheet.sheet_view.showGridLines = False
+        sheet.page_setup.orientation = "landscape"
+        sheet.page_setup.fitToWidth = 1
+        sheet.sheet_properties.pageSetUpPr.fitToPage = True
     buffer = io.BytesIO()
     workbook.save(buffer)
     return checked_file(
@@ -412,6 +454,56 @@ def render_individual_excel(report: dict[str, Any], template: ReportTemplate) ->
             warnings=tuple(report.get("warnings") or report.get("billing_warnings") or ()),
         )
     )
+
+
+def _excel_color(value: str, fallback: str) -> str:
+    text = str(value or "").strip().lstrip("#")
+    return text.upper() if re.fullmatch(r"[0-9A-Fa-f]{6}", text) else fallback
+
+
+def _excel_sheet_heading(sheet, title: str, primary: str) -> None:
+    sheet.merge_cells("A1:F1")
+    cell = sheet["A1"]
+    cell.value = title
+    cell.font = Font(bold=True, color="FFFFFF", size=14)
+    cell.fill = PatternFill("solid", fgColor=primary)
+    cell.alignment = Alignment(horizontal="left")
+    sheet.row_dimensions[1].height = 26
+
+
+def _excel_report_title(sheet, template: ReportTemplate, report: dict[str, Any], primary: str, secondary: str) -> None:
+    asset = report.get("asset") or {}
+    sheet.merge_cells("A1:E1")
+    sheet["A1"] = expand_individual_text(template.title, report) or asset.get("project_name") or "Relatório de energia solar"
+    sheet["A1"].font = Font(bold=True, color="FFFFFF", size=18)
+    sheet["A1"].fill = PatternFill("solid", fgColor=primary)
+    sheet["A1"].alignment = Alignment(horizontal="left")
+    sheet.merge_cells("A2:E2")
+    sheet["A2"] = template.subtitle or "Relatório de energia solar"
+    sheet["A2"].font = Font(italic=True, color="FFFFFF", size=11)
+    sheet["A2"].fill = PatternFill("solid", fgColor=secondary)
+    sheet.merge_cells("A4:E4")
+    sheet["A4"] = f"Instalação: {asset.get('project_name') or asset.get('name') or '-'}  |  Período: {report.get('period_label') or report.get('report_month') or '-'}"
+    sheet["A4"].font = Font(bold=True, color=primary)
+    sheet.row_dimensions[1].height = 30
+
+
+def _excel_table_style(sheet, header_row: int, last_row: int, primary: str, secondary: str, *, widths: dict[str, int]) -> None:
+    thin = Side(style="thin", color="D9E2F3")
+    for cell in sheet[header_row]:
+        if cell.column <= max((ord(column) - 64 for column in widths), default=1):
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor=secondary)
+            cell.alignment = Alignment(horizontal="left")
+    for row in sheet.iter_rows(min_row=header_row, max_row=last_row):
+        for cell in row:
+            if cell.value is not None:
+                cell.border = Border(bottom=thin)
+                cell.alignment = Alignment(vertical="center", wrap_text=True)
+                if isinstance(cell.value, (int, float)):
+                    cell.number_format = '#,##0.00'
+    for column, width in widths.items():
+        sheet.column_dimensions[column].width = width
 
 
 def individual_rows(report: dict[str, Any]) -> list[list[str]]:

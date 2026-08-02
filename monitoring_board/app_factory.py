@@ -3314,6 +3314,9 @@ def create_app() -> Flask:
                 else None
             ),
         )
+        files_by_run: dict[int, list[Any]] = {}
+        for file in files:
+            files_by_run.setdefault(int(file["run_id"]), []).append(file)
         automations = []
         for row in list_report_automations(g.db):
             item = dict(row)
@@ -3325,6 +3328,7 @@ def create_app() -> Flask:
             automations.append(item)
         selected_automation = get_report_automation(g.db, selected_automation_id) if selected_automation_id else None
         last_compatible_file = None
+        last_compatible_excel = None
         if selected_asset_id.isdigit():
             last_compatible_file = g.db.execute(
                 """
@@ -3332,6 +3336,16 @@ def create_app() -> Flask:
                 FROM report_generated_files f
                 JOIN report_generation_runs r ON r.id = f.run_id
                 WHERE f.asset_id = ? AND f.format = 'pdf' AND f.status = 'completed'
+                ORDER BY f.created_at DESC, f.id DESC LIMIT 1
+                """,
+                (int(selected_asset_id),),
+            ).fetchone()
+            last_compatible_excel = g.db.execute(
+                """
+                SELECT f.*, r.status AS run_status, r.created_at AS run_created_at
+                FROM report_generated_files f
+                JOIN report_generation_runs r ON r.id = f.run_id
+                WHERE f.asset_id = ? AND f.format = 'xlsx' AND f.status = 'completed'
                 ORDER BY f.created_at DESC, f.id DESC LIMIT 1
                 """,
                 (int(selected_asset_id),),
@@ -3348,9 +3362,11 @@ def create_app() -> Flask:
             profiles=profiles,
             runs=runs,
             files=files,
+            files_by_run=files_by_run,
             automations=automations,
             selected_automation=selected_automation,
             last_compatible_file=last_compatible_file,
+            last_compatible_excel=last_compatible_excel,
             generation_report_type=generation_report_type,
             selected_asset_id=selected_asset_id,
             selected_portfolio_id=selected_portfolio_id,

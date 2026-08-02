@@ -4,7 +4,7 @@
   </div>
   <div class="table-wrap">
     <table class="reports-table">
-      <thead><tr><th>Run</th><th>Template</th><th>Tipo</th><th>Período</th><th>Estado</th><th>Concluídos</th><th>Falhados</th><th>Criado</th></tr></thead>
+      <thead><tr><th>Run</th><th>Template</th><th>Tipo</th><th>Período</th><th>Estado</th><th>Concluídos</th><th>Falhados</th><th>Criado</th><th>Downloads</th></tr></thead>
       <tbody>
         {% for run in runs %}
           <tr>
@@ -13,16 +13,12 @@
             <td>{{ run.period_start or '-' }}</td>
             <td><span class="reports-status {{ run.status }}">{{ report_status_labels.get(run.status, run.status) }}</span></td>
             <td>{{ run.completed_count }}</td><td>{{ run.failed_count }}</td><td>{{ run.created_at }}</td>
+            <td>{% for file in files_by_run.get(run.id, []) if file.status == 'completed' %}<a class="button secondary small" href="{{ url_for('download_generated_report', file_id=file.id) }}">{{ 'Excel' if file.format == 'xlsx' else file.format|upper }} · {{ file.filename }}</a>{% else %}<span class="muted">-</span>{% endfor %}</td>
           </tr>
         {% else %}
-          <tr><td colspan="8" class="muted">Ainda não existem gerações.</td></tr>
+          <tr><td colspan="9" class="muted">Ainda não existem gerações.</td></tr>
         {% endfor %}
       </tbody>
     </table>
-  </div>
-  <div class="reports-files">
-    {% for file in files if file.status == 'completed' %}
-      <a href="{{ url_for('download_generated_report', file_id=file.id) }}">{{ file.filename }} · {{ file.format|upper }}</a>
-    {% endfor %}
   </div>
 </section>
