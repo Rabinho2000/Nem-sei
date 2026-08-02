@@ -28,6 +28,9 @@ data/
 *.xls
 *.pdf
 uploads/
+diagnostics/
+resultado_*.json
+*_raw_export.py
 
 # Python cache and local runtime files
 __pycache__/

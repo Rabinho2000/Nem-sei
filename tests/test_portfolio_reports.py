@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 from openpyxl import Workbook
 
-from app import ensure_database, ensure_portfolio_seed_data
+from app import ensure_database
 from monitoring_board.portfolio_reports import (
     aggregate_portfolio_total,
     auto_map_portfolio_assets,
@@ -579,7 +579,7 @@ def test_empty_database_has_no_seeded_operational_portfolios(tmp_path: Path) -> 
     assert conn.execute("SELECT COUNT(*) FROM portfolio_assets").fetchone()[0] == 0
 
 
-def test_legacy_portfolio_rows_are_preserved_without_new_seed_data(tmp_path: Path) -> None:
+def test_existing_portfolio_rows_are_preserved_by_schema_initialization(tmp_path: Path) -> None:
     conn = connect(tmp_path)
     portfolio_id = add_portfolio(conn, "Portfolio Existente")
     conn.execute(
@@ -593,8 +593,10 @@ def test_legacy_portfolio_rows_are_preserved_without_new_seed_data(tmp_path: Pat
     )
     conn.commit()
 
-    ensure_portfolio_seed_data(conn)
-    ensure_portfolio_seed_data(conn)
+    conn.close()
+    ensure_database(str(tmp_path / "test.db"))
+    conn = sqlite3.connect(tmp_path / "test.db")
+    conn.row_factory = sqlite3.Row
 
     row = conn.execute(
         "SELECT external_name, nif FROM portfolio_assets WHERE portfolio_id = ?",

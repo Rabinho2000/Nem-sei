@@ -137,6 +137,56 @@ def test_official_history_fixture_flows_from_fact_to_complete_report(tmp_path) -
     assert report["production_is_final"] is True
 
 
+def test_sigenergy_history_item_list_materializes_hourly_energy(tmp_path) -> None:
+    db_path = tmp_path / "sigenergy-hourly-history.db"
+    ensure_database(str(db_path))
+    payload = {
+        "powerGenerationKwh": 24.0,
+        "powerUseKwh": 48.0,
+        "powerOneselfKwh": 18.0,
+        "powerToGridKwh": 6.0,
+        "powerFromGridKwh": 30.0,
+        "itemList": [
+            {
+                "dataTime": f"20260701 {hour:02d}:00",
+                "powerGeneration": float(hour),
+                "powerUse": float(hour * 2),
+                "powerOneself": float(hour * 0.75),
+                "powerToGrid": float(hour * 0.25),
+                "powerFromGrid": float(hour * 1.25),
+            }
+            for hour in range(24)
+        ],
+    }
+    with get_db(str(db_path)) as conn:
+        asset_id = _sigenergy_asset(conn, "Sigenergy Horaria")
+        fact = parse_sigenergy_daily_history(
+            payload,
+            system_id=f"SIG-{asset_id}",
+            period_date=date(2026, 7, 1),
+            confirmed_unit="kWh",
+        )
+        persist_sigenergy_daily_history(conn, asset_id=asset_id, fact=fact)
+        hourly_rows = conn.execute(
+            """
+            SELECT period_start, production_kwh, self_use_kwh, export_kwh,
+                   consumption_kwh, grid_import_kwh, data_quality
+            FROM production_hourly_records
+            WHERE asset_id = ? AND provider = 'Sigenergy'
+            ORDER BY period_start
+            """,
+            (asset_id,),
+        ).fetchall()
+
+    assert len(hourly_rows) == 24
+    assert hourly_rows[0]["period_start"] == "2026-07-01T00:00:00+01:00"
+    assert hourly_rows[-1]["production_kwh"] == pytest.approx(1.0)
+    assert sum(row["production_kwh"] for row in hourly_rows) == pytest.approx(24.0)
+    assert sum(row["self_use_kwh"] for row in hourly_rows) == pytest.approx(18.0)
+    assert sum(row["export_kwh"] for row in hourly_rows) == pytest.approx(6.0)
+    assert all(row["data_quality"] == "complete" for row in hourly_rows)
+
+
 def test_real_kwh_response_flows_client_to_complete_month_and_report(
     tmp_path,
 ) -> None:

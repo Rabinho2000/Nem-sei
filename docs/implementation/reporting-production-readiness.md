@@ -103,8 +103,8 @@ limpeza do histórico Git.
 - Removida a constante operacional `PORTFOLIO_EXTERNAL_ROWS`.
 - Removida a seed automática de portefólios, membros, nomes, NIFs e subcontas.
 - Removida a ação UI que voltava a aplicar a seed.
-- Mantido `ensure_portfolio_seed_data()` como hook de compatibilidade sem writes,
-  evitando quebra de imports externos.
+- A seed automática de portefólios foi removida; o bootstrap não cria nem altera
+  dados operacionais de portefólio.
 - Bases existentes não sofrem deletes nem updates sobre portefólios existentes.
 - Novos ambientes começam sem portefólios e usam importação Excel/CSV ou UI.
 - Testes com entidades operacionais foram substituídos por dados sintéticos.

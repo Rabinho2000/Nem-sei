@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from monitoring_board.reporting.repositories import upsert_hourly_energy_record
 from monitoring_board.services.sigenergy_models import sanitize_payload
 
 
@@ -51,6 +52,13 @@ SIGENERGY_REPORT_CORE_FIELDS = (
     "export_kwh",
     "grid_import_kwh",
 )
+SIGENERGY_HOURLY_COUNTER_FIELDS = {
+    "production_kwh": "powerGeneration",
+    "consumption_kwh": "powerUse",
+    "self_use_kwh": "powerOneself",
+    "export_kwh": "powerToGrid",
+    "grid_import_kwh": "powerFromGrid",
+}
 LISBON = ZoneInfo("Europe/Lisbon")
 
 
@@ -274,6 +282,11 @@ def persist_sigenergy_daily_history(
             fact_id=fact_id,
             asset_id=asset_id,
         )
+        persist_sigenergy_hourly_history(
+            conn,
+            asset_id=asset_id,
+            fact=fact,
+        )
         materialize_energy_month(
             conn,
             asset_id=asset_id,
@@ -281,6 +294,141 @@ def persist_sigenergy_daily_history(
             month_start=fact.period_date.replace(day=1),
         )
     return fact_id
+
+
+def persist_sigenergy_hourly_history(
+    conn: sqlite3.Connection,
+    *,
+    asset_id: int,
+    fact: SigenergyHistoryFact,
+) -> int:
+    """Materialize one-day Sigenergy cumulative counters into hourly energy.
+
+    The documented ``itemList`` contains five-minute samples whose energy
+    fields are cumulative since local midnight.  The daily API totals provide
+    the missing 24:00 boundary, so an hourly value is the difference between
+    the counters at the beginning and end of each local hour.  Power fields
+    are deliberately not used for energy billing.
+    """
+
+    item_list = fact.payload.get("itemList")
+    if not isinstance(item_list, list):
+        return 0
+
+    counters = _sigenergy_history_counters(item_list, fact.period_date)
+    if not counters:
+        return 0
+
+    daily_totals = {
+        field: fact.values.get(field)
+        for field in SIGENERGY_HOURLY_COUNTER_FIELDS
+    }
+    persisted = 0
+    for hour in range(24):
+        period_start = datetime.combine(
+            fact.period_date,
+            datetime.min.time(),
+            tzinfo=LISBON,
+        ) + timedelta(hours=hour)
+        period_end = period_start + timedelta(hours=1)
+        start_values = counters.get(period_start)
+        end_values = (
+            daily_totals
+            if hour == 23
+            else counters.get(period_end)
+        )
+        values = _sigenergy_counter_delta(start_values, end_values)
+        if not any(value is not None for value in values.values()):
+            continue
+        complete = all(
+            values[field] is not None
+            for field in SIGENERGY_HOURLY_COUNTER_FIELDS
+        )
+        upsert_hourly_energy_record(
+            conn,
+            asset_id=asset_id,
+            provider="Sigenergy",
+            period_start=period_start,
+            period_end=period_end,
+            data_quality="complete" if complete else "partial",
+            payload_json={
+                "source": "sigenergy_system_history_item_list",
+                "history_date": fact.period_date.isoformat(),
+                "interval_start": period_start.isoformat(),
+                "interval_end": period_end.isoformat(),
+            },
+            source_fields={
+                field: source_field
+                for field, source_field in SIGENERGY_HOURLY_COUNTER_FIELDS.items()
+                if values[field] is not None
+            },
+            **values,
+        )
+        persisted += 1
+    return persisted
+
+
+def _sigenergy_history_counters(
+    item_list: list[Any],
+    period_date: date,
+) -> dict[datetime, dict[str, float | None]]:
+    counters: dict[datetime, dict[str, float | None]] = {}
+    for item in item_list:
+        if not isinstance(item, dict):
+            continue
+        timestamp = _parse_sigenergy_history_timestamp(
+            item.get("dataTime"),
+            period_date,
+        )
+        if timestamp is None:
+            continue
+        values: dict[str, float | None] = {}
+        for field, source_field in SIGENERGY_HOURLY_COUNTER_FIELDS.items():
+            values[field] = _non_negative_float(item.get(source_field))
+        counters[timestamp] = values
+    return counters
+
+
+def _parse_sigenergy_history_timestamp(
+    value: Any,
+    period_date: date,
+) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    for pattern in ("%Y%m%d %H:%M", "%Y-%m-%d %H:%M"):
+        try:
+            parsed = datetime.strptime(value.strip(), pattern)
+        except ValueError:
+            continue
+        if parsed.date() != period_date:
+            return None
+        return parsed.replace(tzinfo=LISBON)
+    return None
+
+
+def _non_negative_float(value: Any) -> float | None:
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed >= 0 else None
+
+
+def _sigenergy_counter_delta(
+    start_values: dict[str, float | None] | None,
+    end_values: dict[str, float | None] | None,
+) -> dict[str, float | None]:
+    result: dict[str, float | None] = {}
+    for field in SIGENERGY_HOURLY_COUNTER_FIELDS:
+        start = start_values.get(field) if start_values else None
+        end = end_values.get(field) if end_values else None
+        if start is None or end is None or end < start:
+            result[field] = None
+        else:
+            result[field] = end - start
+    return result
 
 
 def materialize_daily_energy_fact(

@@ -44,6 +44,9 @@ jobs:
       - name: Scan tracked files for obvious secrets
         run: python scripts/check_tracked_secrets.py
 
+      - name: Check repository structure
+        run: python scripts/check_repository_structure.py
+
       - name: Smoke imports
         run: |
           python -c "from monitoring_board.reporting import templates, portfolio, invoices; print('reporting imports ok')"

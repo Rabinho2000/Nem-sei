@@ -10,7 +10,6 @@ import math
 import mimetypes
 import os
 import re
-import secrets
 import sqlite3
 import threading
 import time
@@ -31,7 +30,6 @@ from flask import Flask, abort, flash, g, has_app_context, has_request_context, 
 from werkzeug.datastructures import MultiDict
 from werkzeug.utils import secure_filename
 from monitoring_board.db import configure_database_for_runtime, create_database_backup, ensure_column, get_db, query_all, query_scalar
-from monitoring_board.logging_config import configure_logging
 from monitoring_board.portfolio_reports import (
     aggregate_portfolio_total,
     auto_map_portfolio_assets,
@@ -51,6 +49,7 @@ from monitoring_board.preview_safety import (
 from monitoring_board.routes.auth import auth_bp
 from monitoring_board.routes.field_routes import field_routes_bp
 from monitoring_board.routes.reporting import reporting_bp
+from monitoring_board.routes.settings import register_settings_routes
 from monitoring_board import runtime as runtime_module
 from monitoring_board.runtime import (
     BACKUP_DIR,
@@ -62,13 +61,20 @@ from monitoring_board.runtime import (
     RUNTIME_PATHS,
     UPLOAD_DIR,
     ensure_runtime_directories,
-    env_flag,
     max_upload_bytes,
     path_is_within,
     resolve_runtime_file_path_within,
     store_runtime_relative_path,
 )
-from monitoring_board.security import app_password_configured, csrf_token, flask_secret_key
+from monitoring_board.security import app_password_configured
+from monitoring_board import schema as schema_module
+from monitoring_board.schema import register_schema_initializer
+from monitoring_board.scheduler_runtime import (
+    attach_scheduler,
+    attached_scheduler,
+    detach_scheduler,
+)
+from monitoring_board.web import configure_web_application
 from monitoring_board.customer_reports import (
     build_customer_report_pdf,
     detect_report_type,
@@ -782,65 +788,8 @@ def create_app() -> Flask:
         template_folder=str(BASE_DIR / "templates"),
         static_folder=str(BASE_DIR / "static"),
     )
-    app.config["SECRET_KEY"] = flask_secret_key()
-    app.config["DATA_DIR"] = str(RUNTIME_PATHS.data_dir)
-    app.config["DATABASE"] = str(DB_PATH)
-    app.config["EXCEL_PATH"] = str(DEFAULT_EXCEL_PATH) if DEFAULT_EXCEL_PATH else ""
-    app.config["MAX_CONTENT_LENGTH"] = max_upload_bytes()
-    app.config["SESSION_COOKIE_HTTPONLY"] = True
-    app.config["SESSION_COOKIE_SAMESITE"] = os.environ.get("SESSION_COOKIE_SAMESITE", "Lax").strip() or "Lax"
-    app.config["SESSION_COOKIE_SECURE"] = env_flag("SESSION_COOKIE_SECURE", False)
-    app.config["PREVIEW_BANNER"] = preview_enabled()
-    app.config["EXTERNAL_ACTIONS_ENABLED"] = external_actions_enabled()
-    app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=12)
-    configure_logging(app, LOG_DIR)
-    app.logger.info("Using database at %s", app.config["DATABASE"])
-    app.register_blueprint(auth_bp)
-    if not app_password_configured():
-        app.logger.warning("APP_PASSWORD_HASH/APP_PASSWORD is not configured; login is locked until .env is updated.")
-
-    ensure_database(app.config["DATABASE"])
-    app.register_blueprint(field_routes_bp)
-    app.register_blueprint(reporting_bp)
-    with closing(get_db(app.config["DATABASE"])) as bootstrap_conn:
-        populate_missing_installation_groups(bootstrap_conn)
-        populate_missing_group_metadata(bootstrap_conn)
-        sync_all_contract_statuses(bootstrap_conn)
-        ensure_integration_seed_data(bootstrap_conn)
-        bootstrap_conn.commit()
-    start_integration_scheduler(app)
-
-    @app.before_request
-    def before_request() -> None:
-        g.db = get_db(app.config["DATABASE"])
-        g.request_started_at = datetime.now()
-        if request.method == "POST":
-            sent_token = request.form.get("csrf_token") or request.headers.get("X-CSRF-Token", "")
-            if not sent_token or not secrets.compare_digest(sent_token, csrf_token()):
-                app.logger.warning("CSRF validation failed for %s %s", request.method, request.path)
-                abort(400)
-        if request.endpoint not in {"auth.login", "static"} and not session.get("authenticated"):
-            return redirect(url_for("auth.login", next=request.full_path if request.query_string else request.path))
-
-    @app.teardown_request
-    def teardown_request(exception: BaseException | None) -> None:
-        started_at = getattr(g, "request_started_at", None)
-        elapsed_ms = ""
-        if started_at:
-            elapsed_ms = f" {(datetime.now() - started_at).total_seconds() * 1000:.0f}ms"
-        if request.endpoint != "static":
-            if exception:
-                app.logger.exception("%s %s failed%s", request.method, request.path, elapsed_ms)
-            else:
-                app.logger.info("%s %s%s", request.method, request.path, elapsed_ms)
-        db = g.pop("db", None)
-        if db is not None:
-            db.close()
-
-    @app.context_processor
-    def inject_globals() -> dict[str, Any]:
+    def template_globals() -> dict[str, Any]:
         return {
-            "today_iso": date.today().isoformat(),
             "ticket_statuses": TICKET_STATUSES,
             "ticket_urgencies": TICKET_URGENCIES,
             "ticket_material_statuses": TICKET_MATERIAL_STATUSES,
@@ -860,48 +809,33 @@ def create_app() -> Flask:
             "performance_bar_width": performance_bar_width,
             "performance_status_class": performance_status_class,
             "reference_diagnostic": reference_diagnostic,
-            "csrf_token": csrf_token,
-            "current_username": session.get("username"),
-            "preview_banner": app.config["PREVIEW_BANNER"],
-            "external_actions_enabled": app.config["EXTERNAL_ACTIONS_ENABLED"],
         }
 
-    @app.errorhandler(400)
-    def bad_request_error(error: Exception) -> tuple[str, int]:
-        return render_template(
-            "error.html",
-            title="Pedido invalido",
-            heading="Pedido invalido",
-            message="A acao nao foi aceite. Atualiza a pagina e tenta novamente.",
-        ), 400
+    configure_web_application(
+        app,
+        data_dir=RUNTIME_PATHS.data_dir,
+        database=DB_PATH,
+        excel_path=DEFAULT_EXCEL_PATH,
+        log_dir=LOG_DIR,
+        max_content_length=max_upload_bytes(),
+        preview_banner=preview_enabled(),
+        external_actions_enabled=external_actions_enabled(),
+        template_globals=template_globals,
+    )
+    app.register_blueprint(auth_bp)
+    if not app_password_configured():
+        app.logger.warning("APP_PASSWORD_HASH/APP_PASSWORD is not configured; login is locked until .env is updated.")
 
-    @app.errorhandler(404)
-    def not_found_error(error: Exception) -> tuple[str, int]:
-        return render_template(
-            "error.html",
-            title="Pagina nao encontrada",
-            heading="Pagina nao encontrada",
-            message="Nao encontrei esta pagina ou registo.",
-        ), 404
-
-    @app.errorhandler(500)
-    def internal_error(error: Exception) -> tuple[str, int]:
-        current_app.logger.exception("Unhandled application error")
-        return render_template(
-            "error.html",
-            title="Erro interno",
-            heading="Erro interno",
-            message="Aconteceu um erro inesperado. Consulta os logs para o detalhe tecnico.",
-        ), 500
-
-    @app.errorhandler(413)
-    def request_too_large_error(error: Exception) -> tuple[str, int]:
-        return render_template(
-            "error.html",
-            title="Ficheiro demasiado grande",
-            heading="Ficheiro demasiado grande",
-            message="O ficheiro enviado excede o limite configurado para uploads.",
-        ), 413
+    schema_module.ensure_database(app.config["DATABASE"])
+    app.register_blueprint(field_routes_bp)
+    app.register_blueprint(reporting_bp)
+    with closing(get_db(app.config["DATABASE"])) as bootstrap_conn:
+        populate_missing_installation_groups(bootstrap_conn)
+        populate_missing_group_metadata(bootstrap_conn)
+        sync_all_contract_statuses(bootstrap_conn)
+        ensure_integration_seed_data(bootstrap_conn)
+        bootstrap_conn.commit()
+    start_integration_scheduler(app)
 
     @app.route("/operation")
     def operation() -> str:
@@ -6295,205 +6229,17 @@ def create_app() -> Flask:
             assets_for_mapping=assets_for_mapping,
         )
 
-    @app.route("/renewals", methods=["GET", "POST"])
-    def renewals() -> str:
-        focus = request.args.get("focus", "").strip()
-        if request.method == "POST":
-            asset_id = int(request.form["asset_id"])
-            renewal_status = request.form.get("renewal_status", "Por contactar").strip() or "Por contactar"
-            last_contact_date = request.form.get("last_contact_date", "").strip()
-            renewal_notes = request.form.get("renewal_notes", "").strip()
-            annual_value_raw = request.form.get("annual_value", "").strip()
-            contract_end_date = normalize_date_value(request.form.get("contract_end_date", "").strip())
-            contract_start_date = normalize_date_value(request.form.get("contract_start_date", "").strip())
-
-            annual_value = None
-            if annual_value_raw:
-                normalized_value = annual_value_raw.replace(" ", "").replace(",", ".")
-                try:
-                    annual_value = float(normalized_value)
-                except ValueError:
-                    flash("O valor anual nao e valido.", "error")
-                    return redirect(url_for("renewals"))
-
-            existing_contract = query_one("SELECT id FROM om_contracts WHERE asset_id = ?", (asset_id,))
-            if existing_contract:
-                g.db.execute(
-                    """
-                    UPDATE om_contracts
-                    SET renewal_status = ?, last_contact_date = ?, renewal_notes = ?,
-                        annual_value = COALESCE(?, annual_value),
-                        contract_start_date = CASE WHEN ? != '' THEN ? ELSE contract_start_date END,
-                        contract_end_date = CASE WHEN ? != '' THEN ? ELSE contract_end_date END,
-                        updated_at = ?
-                    WHERE asset_id = ?
-                    """,
-                    (
-                        renewal_status,
-                        last_contact_date,
-                        renewal_notes,
-                        annual_value,
-                        contract_start_date,
-                        contract_start_date,
-                        contract_end_date,
-                        contract_end_date,
-                        datetime.now().isoformat(timespec="seconds"),
-                        asset_id,
-                    ),
-                )
-            else:
-                g.db.execute(
-                    """
-                    INSERT INTO om_contracts (
-                        asset_id, contract_start_date, contract_end_date, annual_value, renewal_status, last_contact_date,
-                        renewal_notes, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        asset_id,
-                        contract_start_date,
-                        contract_end_date,
-                        annual_value,
-                        renewal_status,
-                        last_contact_date,
-                        renewal_notes,
-                        datetime.now().isoformat(timespec="seconds"),
-                        datetime.now().isoformat(timespec="seconds"),
-                    ),
-                )
-
-            if renewal_status == "Renovado":
-                g.db.execute(
-                    """
-                    UPDATE assets
-                    SET maintenance = 'yes',
-                        active_contract = 'yes',
-                        start_contract = CASE WHEN ? != '' THEN ? ELSE start_contract END,
-                        end_contract = CASE WHEN ? != '' THEN ? ELSE end_contract END
-                    WHERE id = ?
-                    """,
-                    (
-                        contract_start_date,
-                        contract_start_date,
-                        contract_end_date,
-                        contract_end_date,
-                        asset_id,
-                    ),
-                )
-                sync_asset_contract_status(g.db, asset_id, contract_start_date, contract_end_date)
-            g.db.commit()
-            flash("Follow-up de renovacao atualizado.", "success")
-            return redirect(url_for("renewals"))
-
-        today_iso = date.today().isoformat()
-        year_end = f"{date.today().year}-12-31"
-        renewal_rows = query_all(
-            g.db,
-            """
-            SELECT
-                a.id AS asset_id,
-                a.project_name,
-                a.installation_group,
-                a.company_name,
-                a.location,
-                a.address,
-                a.contact_name,
-                a.contact_email,
-                a.contact_phone,
-                a.active_contract,
-                COALESCE(NULLIF(oc.contract_end_date, ''), NULLIF(a.end_contract, '')) AS contract_end_date,
-                COALESCE(NULLIF(oc.contract_start_date, ''), NULLIF(a.start_contract, '')) AS contract_start_date,
-                oc.annual_value,
-                oc.pdf_path,
-                oc.renewal_status,
-                oc.last_contact_date,
-                oc.renewal_notes,
-                CASE
-                    WHEN COALESCE(NULLIF(oc.contract_end_date, ''), NULLIF(a.end_contract, '')) < ? THEN 'Expirado'
-                    WHEN julianday(COALESCE(NULLIF(oc.contract_end_date, ''), NULLIF(a.end_contract, ''))) - julianday(?) <= 30 THEN '0-30 dias'
-                    WHEN julianday(COALESCE(NULLIF(oc.contract_end_date, ''), NULLIF(a.end_contract, ''))) - julianday(?) <= 90 THEN '31-90 dias'
-                    ELSE 'Este ano'
-                END AS renewal_bucket
-            FROM assets a
-            LEFT JOIN om_contracts oc ON oc.asset_id = a.id
-            WHERE (a.maintenance = 'yes' OR oc.id IS NOT NULL)
-              AND COALESCE(NULLIF(oc.contract_end_date, ''), NULLIF(a.end_contract, '')) NOT IN ('', '-')
-            ORDER BY COALESCE(NULLIF(oc.contract_end_date, ''), NULLIF(a.end_contract, '')) ASC, a.project_name COLLATE NOCASE
-            """,
-            (today_iso, today_iso, today_iso),
-        )
-        expired_contracts = [
-            row for row in renewal_rows
-            if row["contract_end_date"] < today_iso
-        ]
-        ending_this_year = [
-            row for row in renewal_rows
-            if today_iso <= row["contract_end_date"] <= year_end
-        ]
-        if focus == "expired":
-            ending_this_year = []
-        elif focus == "year":
-            expired_contracts = []
-        elif focus == "90":
-            expired_contracts = []
-            ending_this_year = [row for row in ending_this_year if row["renewal_bucket"] in {"0-30 dias", "31-90 dias"}]
-        renewal_metrics = {
-            "expired": len(expired_contracts),
-            "next_30_days": sum(1 for row in renewal_rows if row["renewal_bucket"] == "0-30 dias"),
-            "next_90_days": sum(1 for row in renewal_rows if row["renewal_bucket"] == "31-90 dias"),
-            "this_year": len(ending_this_year),
-        }
-        return render_template(
-            "renewals.html",
-            expired_contracts=expired_contracts,
-            ending_this_year=ending_this_year,
-            renewal_metrics=renewal_metrics,
-            focus=focus,
-            today_iso=today_iso,
-        )
-
-    @app.route("/settings", methods=["GET", "POST"])
-    def settings() -> str:
-        if request.method == "POST":
-            excel_path = request.form.get("excel_path", "").strip()
-            if not excel_path:
-                flash("Indica o caminho do Excel.", "error")
-                return redirect(url_for("settings"))
-            excel_file = Path(excel_path)
-            if not excel_file.exists() or not excel_file.is_file():
-                flash("O ficheiro Excel indicado nao existe ou nao esta acessivel.", "error")
-                return redirect(url_for("settings"))
-            if excel_file.suffix.lower() not in {".xlsx", ".xlsm"}:
-                flash("Indica um ficheiro Excel valido (.xlsx ou .xlsm).", "error")
-                return redirect(url_for("settings"))
-
-            app.config["EXCEL_PATH"] = excel_path
-            backup_path = create_database_backup(Path(app.config["DATABASE"]), BACKUP_DIR)
-            try:
-                imported = import_excel_data(g.db, excel_file)
-            except Exception as exc:
-                flash(f"Falha ao importar o Excel: {exc}", "error")
-                flash(f"A base de dados ficou salvaguardada no backup {backup_path.name}.", "warning")
-                return redirect(url_for("settings"))
-            flash(
-                f"Importacao concluida. {imported['assets']} assets, {imported['monitoring']} linhas de monitorizacao e {imported['tickets']} tickets importados.",
-                "success",
-            )
-            flash(
-                f"Backup automatico criado antes da reimportacao: {backup_path.name}",
-                "warning",
-            )
-            return redirect(url_for("settings"))
-
-        db_info = {
-            "assets": query_scalar(g.db, "SELECT COUNT(*) FROM assets"),
-            "monitoring": query_scalar(g.db, "SELECT COUNT(*) FROM monitoring_records"),
-            "tickets": query_scalar(g.db, "SELECT COUNT(*) FROM tickets"),
-            "aliases": query_scalar(g.db, "SELECT COUNT(*) FROM asset_aliases"),
-        }
-        excel_path = app.config["EXCEL_PATH"]
-        return render_template("settings.html", db_info=db_info, excel_path=excel_path)
-
+    register_settings_routes(
+        app,
+        backup_dir=BACKUP_DIR,
+        create_database_backup=create_database_backup,
+        import_excel_data=import_excel_data,
+        normalize_date_value=normalize_date_value,
+        query_all=query_all,
+        query_one=query_one,
+        query_scalar=query_scalar,
+        sync_asset_contract_status=sync_asset_contract_status,
+    )
     return app
 
 
@@ -7413,7 +7159,6 @@ def ensure_database(path: str) -> None:
         ensure_report_template_schema(conn)
         ensure_distribution_schema(conn)
         ensure_financial_model_schema(conn)
-        ensure_portfolio_seed_data(conn)
         ensure_alert_settings_defaults(conn)
         ensure_billing_config_schema(conn)
         conn.execute(
@@ -7557,10 +7302,6 @@ def ensure_database_indexes(conn: sqlite3.Connection) -> None:
             ON portfolio_report_runs(portfolio_id, report_month, created_at);
         """
     )
-
-
-def ensure_portfolio_seed_data(conn: sqlite3.Connection) -> None:
-    """Compatibility hook retained without inserting operational data."""
 
 
 def encode_job_params(params: dict[str, Any]) -> str:
@@ -13726,12 +13467,22 @@ def start_integration_scheduler(app: Flask) -> None:
     global SCHEDULER
     if not scheduler_enabled():
         app.logger.warning("APScheduler disabled by preview/runtime policy.")
+        detach_scheduler(app)
         SCHEDULER = None
         return
-    if SCHEDULER is not None:
+    scheduler = attached_scheduler(app)
+    if scheduler is not None:
+        # Keep the module attribute during the transition: it is used by the
+        # existing CLI/tests and does not own the scheduler lifecycle anymore.
+        SCHEDULER = scheduler
         return
-    SCHEDULER = BackgroundScheduler(timezone="Europe/Lisbon")
-    SCHEDULER.start()
+    if SCHEDULER is not None:
+        attach_scheduler(app, SCHEDULER)
+        return
+    scheduler = BackgroundScheduler(timezone="Europe/Lisbon")
+    scheduler.start()
+    attach_scheduler(app, scheduler)
+    SCHEDULER = scheduler
     refresh_integration_scheduler(app)
     register_background_job_reactivation_scheduler(app)
     schedule_pending_background_jobs(app)
@@ -13739,9 +13490,14 @@ def start_integration_scheduler(app: Flask) -> None:
 
 def refresh_integration_scheduler(app: Flask) -> None:
     global SCHEDULER
-    if SCHEDULER is None:
+    # Prefer the compatibility attribute while route/job code is still being
+    # extracted; tests and the CLI may intentionally replace it with a fake.
+    scheduler = SCHEDULER or attached_scheduler(app)
+    if scheduler is None:
         return
-    for job in list(SCHEDULER.get_jobs()):
+    if attached_scheduler(app) is None:
+        attach_scheduler(app, scheduler)
+    for job in list(scheduler.get_jobs()):
         if (
             job.id.startswith("integration-sync-")
             or job.id.startswith("fusionsolar-sync-")
@@ -13761,13 +13517,13 @@ def refresh_integration_scheduler(app: Flask) -> None:
                 "background-jobs-reactivate-rate-limit",
             }
         ):
-            SCHEDULER.remove_job(job.id)
+            scheduler.remove_job(job.id)
 
     with closing(get_db(app.config["DATABASE"])) as conn:
         configs = [get_integration_config(conn, provider) for provider in INTEGRATION_PROVIDER_OPTIONS]
         report_automations = list_enabled_report_automations(conn)
     if telegram_daily_summary_enabled():
-        SCHEDULER.add_job(
+        scheduler.add_job(
             func=run_scheduled_telegram_daily_summary,
             trigger="cron",
             hour=9,
@@ -14178,13 +13934,16 @@ def run_scheduled_fusionsolar_month_close(app: Flask) -> None:
 
 
 def schedule_background_job(app: Flask, job_id: int, run_date: datetime | None = None) -> bool:
-    if SCHEDULER is None:
+    scheduler = SCHEDULER or attached_scheduler(app)
+    if scheduler is None:
         app.logger.error("Background job %s was queued but APScheduler is not running", job_id)
         return False
+    if attached_scheduler(app) is None:
+        attach_scheduler(app, scheduler)
     scheduled_at = as_background_job_utc(
         run_date or background_job_utc_now()
     )
-    SCHEDULER.add_job(
+    scheduler.add_job(
         func=run_background_job,
         trigger="date",
         run_date=scheduled_at,
@@ -23330,6 +23089,9 @@ def ignore_fusionsolar_unresolved(conn: sqlite3.Connection, unresolved_id: int) 
         (datetime.now().isoformat(timespec="seconds"), unresolved_id),
     )
     conn.commit()
+
+
+register_schema_initializer(ensure_database, ensure_database_indexes)
 
 
 app = create_app()
