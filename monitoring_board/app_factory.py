@@ -285,9 +285,14 @@ from monitoring_board.services.financial_models import (
     compare_financial_models,
     confirm_financial_model_import,
     create_financial_model_preview,
+    financial_billing_review_defaults,
     parse_model_details_json,
     resolve_financial_model_path,
     sha256_file as financial_model_sha256_file,
+)
+from monitoring_board.reporting.client_outages import (
+    apply_client_outage_adjustments,
+    parse_client_outage_adjustments,
 )
 from monitoring_board.services import fusionsolar_client as fusionsolar_client_module
 from monitoring_board.services.fusionsolar_client import FusionSolarClient
@@ -1718,6 +1723,7 @@ def create_app() -> Flask:
             (current_installation_group,),
         )
         financial_model = build_asset_financial_model_context(g.db, asset_id=asset_id)
+        operational_status = get_asset_operational_status(g.db, asset_id)
         capacity_periods = list_capacity_periods(g.db, asset_id)
         requested_import_id = request.args.get("import_id", "").strip()
         installation_import_summary = (
@@ -1753,6 +1759,7 @@ def create_app() -> Flask:
             latest_device_rows=latest_device_rows,
             expected_strings_by_device=expected_strings_by_device,
             financial_model=financial_model,
+            operational_status=operational_status,
             capacity_periods=capacity_periods,
             installation_import_summary=installation_import_summary,
         )
@@ -1865,6 +1872,49 @@ def create_app() -> Flask:
             flash(f"Falha ao confirmar modelo financeiro: {exc}", "error")
             return redirect(url_for("financial_model_preview", asset_id=asset_id, model_id=model_id))
         return redirect(url_for("asset_detail", asset_id=asset_id))
+
+    @app.route("/asset/<int:asset_id>/financial-model/billing-review", methods=["GET", "POST"])
+    def financial_model_billing_review(asset_id: int):
+        asset = query_one("SELECT * FROM assets WHERE id = ?", (asset_id,))
+        context = build_asset_financial_model_context(g.db, asset_id=asset_id)
+        model = context["active"]
+        if asset is None or model is None or model["status"] != "confirmed":
+            abort(404)
+        defaults = financial_billing_review_defaults(model)
+        if request.method == "POST":
+            try:
+                if request.form.get("confirmed") != "on":
+                    raise BillingValidationError("Confirma a revisão dos valores antes de aplicar.")
+                report_type = ReportType(detect_report_type(asset))
+                config = parse_billing_config_form(dict(request.form), report_type)
+                upsert_asset_billing_config(g.db, asset_id=asset_id, config=config)
+                if request.form.get("apply_simple_tariff") == "on":
+                    valid_from = request.form.get("valid_from", "").strip()
+                    if not valid_from:
+                        raise BillingValidationError("Indica a data inicial da tarifa.")
+                    save_asset_tariff(
+                        g.db,
+                        asset_id=asset_id,
+                        tariff_type="simple",
+                        simple_price_eur_kwh=request.form.get("electricity_price", ""),
+                        valid_from=valid_from,
+                        valid_to=request.form.get("valid_to", "").strip(),
+                        notes=f"Revisto a partir do modelo financeiro v{model['version']}",
+                    )
+                g.db.commit()
+                flash("Configuração de faturação aplicada. A tarifa horária continua a exigir regras revistas manualmente.", "success")
+                return redirect(url_for("asset_detail", asset_id=asset_id))
+            except (BillingValidationError, ValueError) as exc:
+                g.db.rollback()
+                flash(str(exc), "error")
+        return render_template(
+            "financial_model_billing_review.html",
+            title="Rever faturação",
+            asset=asset,
+            model=model,
+            defaults=defaults,
+            existing=billing_config_to_form_values(get_asset_billing_config(g.db, asset_id, ReportType(detect_report_type(asset))) or BillingConfig(report_type=ReportType(detect_report_type(asset)))),
+        )
 
     @app.route("/asset/<int:asset_id>/financial-model/<int:model_id>/cancel", methods=["POST"])
     def cancel_asset_financial_model(asset_id: int, model_id: int):
@@ -3132,6 +3182,18 @@ def create_app() -> Flask:
                     force_api=force_api,
                     period=report_period,
                 )
+                adjustments = parse_client_outage_adjustments(
+                    request.form,
+                    start=report_period.start,
+                    end=report_period.end,
+                    billing_config=billing_config,
+                )
+                if adjustments:
+                    report = apply_client_outage_adjustments(
+                        report,
+                        adjustments=adjustments,
+                        billing_config=billing_config,
+                    )
                 if include_availability:
                     add_customer_report_availability(g.db, report, asset_id=asset_id, period=report_period)
                 return export_customer_production_pdf(report)
@@ -12154,6 +12216,12 @@ def execute_persisted_report_generation(
                         include_wat=include_availability,
                         billing_config=billing_override,
                         force_api=force_api,
+                        client_outage_adjustments=parse_client_outage_adjustments(
+                            form,
+                            start=date.fromisoformat(job["period"]["period_start"]),
+                            end=date.fromisoformat(job["period"]["period_end"]),
+                            billing_config=billing_override,
+                        ),
                     )
                     rendered = render_individual_pdf(report, template) if job["format"] == "pdf" else render_individual_excel(report, template)
                     completed_files.append(
@@ -12621,6 +12689,7 @@ def build_individual_generation_report(
     include_wat: bool = False,
     billing_config: BillingConfig | None = None,
     force_api: bool = False,
+    client_outage_adjustments=(),
 ) -> dict[str, Any]:
     period = build_period(
         period_job["period_type"],
@@ -12649,6 +12718,12 @@ def build_individual_generation_report(
         raise ValueError(f"Sem dados para a instalacao {asset_id}.")
     report["asset_id"] = asset_id
     report["engine_version"] = "individual-report-v1"
+    if client_outage_adjustments:
+        report = apply_client_outage_adjustments(
+            report,
+            adjustments=tuple(client_outage_adjustments),
+            billing_config=billing_config,
+        )
     requests = ensure_report_data_requests(
         conn,
         asset_ids=[asset_id],
@@ -21543,6 +21618,31 @@ def upsert_integration_unresolved(
             datetime.now().isoformat(timespec="seconds"),
         ),
     )
+
+
+def get_asset_operational_status(conn: sqlite3.Connection, asset_id: int) -> dict[str, str]:
+    integration = conn.execute(
+        "SELECT provider, external_id, last_status, last_sync_at FROM asset_integrations WHERE asset_id = ? AND enabled = 1 ORDER BY id LIMIT 1",
+        (asset_id,),
+    ).fetchone()
+    if integration is None:
+        return {"status": "Sem dados", "observed_at": "", "provider": ""}
+    status = str(integration["last_status"] or "").strip()
+    observed_at = str(integration["last_sync_at"] or "")
+    if str(integration["provider"]) == "Sigenergy":
+        row = conn.execute(
+            "SELECT operational_status, last_state_at, last_snapshot_at, updated_at FROM provider_system_inventory WHERE provider = 'Sigenergy' AND external_id = ?",
+            (integration["external_id"],),
+        ).fetchone()
+        if row is not None:
+            status = str(row["operational_status"] or status)
+            observed_at = str(row["last_state_at"] or row["last_snapshot_at"] or row["updated_at"] or observed_at)
+    labels = {
+        "operational": "Operacional", "online": "Operacional", "running": "Operacional",
+        "disconnected": "Desconectada", "offline": "Desconectada",
+        "error": "Erro", "fault": "Erro", "abnormal": "Erro",
+    }
+    return {"status": labels.get(status.casefold(), "Sem dados"), "observed_at": observed_at, "provider": str(integration["provider"])}
 
 
 def get_latest_availability_by_asset(conn: sqlite3.Connection, asset_id: int) -> dict[str, Any] | None:

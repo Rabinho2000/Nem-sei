@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-header">
+  <div><p class="eyebrow">Modelo financeiro</p><h2>Rever e aplicar à faturação</h2><p class="muted">{{ asset.project_name }} · modelo v{{ model.version }} ({{ model.base_year }})</p></div>
+  <a class="button secondary" href="{{ url_for('asset_detail', asset_id=asset.id) }}">Voltar</a>
+</section>
+<section class="card narrow-card">
+  <p class="muted">Os valores abaixo foram pré-preenchidos a partir do modelo. Revê-os antes de os usar nos relatórios. Tarifas horárias não são criadas automaticamente porque o ficheiro não prova o calendário semanal.</p>
+  <form class="stack-form" method="post">
+    <div class="grid three">
+      <label>Preço eletricidade EUR/kWh<input required type="number" min="0" step="0.00001" name="electricity_price" value="{{ request.form.get('electricity_price', defaults.electricity_price or existing.electricity_price) }}"></label>
+      <label>Venda excedente EUR/kWh<input required type="number" min="0" step="0.00001" name="sell_price" value="{{ request.form.get('sell_price', defaults.sell_price or existing.sell_price) }}"></label>
+      <label>Preço Solcor EUR/kWh<input required type="number" min="0" step="0.00001" name="solcor_price_per_kwh" value="{{ request.form.get('solcor_price_per_kwh', defaults.solcor_price_per_kwh or existing.solcor_price_per_kwh) }}"></label>
+    </div>
+    <input type="hidden" name="billing_mode" value="energy"><input type="hidden" name="billing_energy_base" value="self_consumption">
+    {% if defaults.tariff_prices %}<p class="muted">Preços horários detetados: {% for name, value in defaults.tariff_prices.items() %}{{ name }} {{ value }} EUR/kWh{% if not loop.last %} · {% endif %}{% endfor %}</p>{% endif %}
+    <fieldset><legend>Tarifa simples opcional</legend>
+      <label class="check-row"><input type="checkbox" name="apply_simple_tariff" {{ 'checked' if request.form.get('apply_simple_tariff') }}><span>Criar tarifa simples com o preço de eletricidade revisto</span></label>
+      <div class="grid two"><label>Válida desde<input type="date" name="valid_from" value="{{ request.form.get('valid_from', model.base_year ~ '-01-01') }}"></label><label>Válida até (opcional)<input type="date" name="valid_to" value="{{ request.form.get('valid_to', '') }}"></label></div>
+    </fieldset>
+    <label class="check-row"><input required type="checkbox" name="confirmed"><span>Confirmo que revi os preços e a validade antes de aplicar.</span></label>
+    <button class="button" type="submit">Aplicar configuração de faturação</button>
+  </form>
+</section>
+{% endblock %}

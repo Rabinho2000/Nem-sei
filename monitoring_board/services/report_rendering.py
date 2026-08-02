@@ -378,6 +378,13 @@ def render_individual_excel(report: dict[str, Any], template: ReportTemplate) ->
     financial.append(["Metrica", "Valor"])
     for key in ("savings_eur", "export_revenue_eur", "solcor_payment_eur", "fixed_monthly_fee_eur", "net_benefit_eur"):
         financial.append([key, report.get(key)])
+    adjustments = list(report.get("client_outage_adjustments") or [])
+    if adjustments:
+        outage = workbook.create_sheet("Indisponibilidade cliente")
+        outage.append(["Data", "Produção estimada kWh", "Motivo", "Cobrança EUR"])
+        for item in adjustments:
+            outage.append([item.get("date"), item.get("estimated_kwh"), item.get("reason"), None])
+        outage.append(["Total", report.get("client_outage_billable_kwh"), "", report.get("client_outage_charge_eur")])
     quality = workbook.create_sheet("Qualidade dos dados")
     quality.append(["Campo", "Valor"])
     quality.append(["Estado da producao", report.get("production_quality_status") or "-"])
@@ -432,7 +439,13 @@ def individual_section_rows(report: dict[str, Any], key: str) -> list[list[str]]
         "executive_summary": individual_rows(report),
         "production": [["Metrica", "Valor"], ["Producao", report.get("production_kwh") if report.get("production_kwh") is not None else "Dados indisponiveis"]],
         "self_consumption": [["Metrica", "Valor"], ["Autoconsumo", report.get("self_use_kwh") or "Dados indisponiveis"], ["Taxa", report.get("autoconsumption_pct") or "Dados indisponiveis"]],
-        "financial": [["Metrica", "Valor"], ["Poupanca", report.get("savings_eur") or "Dados indisponiveis"], ["Beneficio liquido", report.get("net_benefit_eur") or "Dados indisponiveis"]],
+        "financial": [
+            ["Metrica", "Valor"], ["Poupanca", report.get("savings_eur") or "Dados indisponiveis"],
+            ["Pagamento medido à Solcor", report.get("measured_solcor_payment_eur", report.get("solcor_payment_eur"))],
+            ["Ajuste por indisponibilidade", report.get("client_outage_charge_eur") or 0],
+            ["Beneficio liquido", report.get("net_benefit_eur") or "Dados indisponiveis"],
+            *([["Dia imputado", f"{item.get('date')} · {item.get('estimated_kwh')} kWh · {item.get('reason') or '-'}"] for item in report.get("client_outage_adjustments") or []]),
+        ],
         "tariffs": [["Campo", "Valor"], ["Tarifa", report.get("tariff_type") or "Dados indisponiveis"], ["Fonte", report.get("tariff_source") or "Dados indisponiveis"]],
         "data_quality": [
             ["Campo", "Valor"],

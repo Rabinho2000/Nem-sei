@@ -735,6 +735,42 @@ def draw_report_footer(pdf: canvas.Canvas, report: dict[str, Any], page_width: f
         _scaled_text(pdf, " ".join(notes), 340, 7, page_width - 360, size=5, color=TEXT_GRAY)
 
 
+def draw_client_outage_adjustments(pdf: canvas.Canvas, report: dict[str, Any], page_width: float, page_height: float) -> None:
+    adjustments = list(report.get("client_outage_adjustments") or [])
+    if not adjustments:
+        return
+    pdf.setFillColor(_primary(pdf))
+    pdf.setFont("Helvetica-Bold", 16)
+    pdf.drawString(28, page_height - 45, "Cobrança por indisponibilidade imputável ao cliente")
+    pdf.setFont("Helvetica", 8)
+    pdf.setFillColor(TEXT_GRAY)
+    pdf.drawString(28, page_height - 60, "A produção real mantém-se inalterada; estes valores aplicam-se apenas ao pagamento à Solcor deste relatório.")
+    y = page_height - 95
+    headers = (("Data", 28), ("Produção estimada", 160), ("Motivo", 300))
+    pdf.setFillColor(_secondary(pdf))
+    pdf.rect(24, y - 5, page_width - 48, 20, fill=1, stroke=0)
+    pdf.setFillColor(colors.white)
+    pdf.setFont("Helvetica-Bold", 8)
+    for label, x in headers:
+        pdf.drawString(x, y + 2, label)
+    y -= 25
+    pdf.setFont("Helvetica", 8)
+    for item in adjustments:
+        pdf.setFillColor(_primary(pdf))
+        pdf.drawString(28, y, str(item.get("date") or "-"))
+        pdf.drawString(160, y, format_kwh(item.get("estimated_kwh")))
+        _scaled_text(pdf, str(item.get("reason") or "-"), 300, y, page_width - 328, size=8, color=_primary(pdf))
+        pdf.setStrokeColor(MID_GRAY)
+        pdf.line(24, y - 6, page_width - 24, y - 6)
+        y -= 22
+    y -= 8
+    pdf.setFont("Helvetica-Bold", 9)
+    pdf.setFillColor(_primary(pdf))
+    pdf.drawString(28, y, f"Total estimado: {format_kwh(report.get('client_outage_billable_kwh'))}")
+    pdf.drawRightString(page_width - 28, y, f"Ajuste à Solcor: {format_eur(report.get('client_outage_charge_eur'))}")
+    draw_report_footer(pdf, report, page_width)
+
+
 def build_customer_report_pdf(
     report: dict[str, Any],
     *,
@@ -760,5 +796,8 @@ def build_customer_report_pdf(
         draw_donut_charts(pdf, report, 20, 26, page_width - 40, 112)
     draw_report_footer(pdf, report, page_width)
     pdf.showPage()
+    if report.get("client_outage_adjustments"):
+        draw_client_outage_adjustments(pdf, report, page_width, page_height)
+        pdf.showPage()
     pdf.save()
     return buffer.getvalue()

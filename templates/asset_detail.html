@@ -291,6 +291,7 @@
       <div><dt>Acesso</dt><dd>{{ asset.access_type or "-" }}</dd></div>
       <div><dt>Cobertura</dt><dd>{{ asset.coverage_type or "-" }}</dd></div>
       <div><dt>Monitorizacao</dt><dd>{{ 'ativa' if asset.monitoring_enabled is none or asset.monitoring_enabled else 'desativada' }}</dd></div>
+      <div><dt>Estado operacional</dt><dd><span class="chip {{ 'success' if operational_status.status == 'Operacional' else 'danger' if operational_status.status in ['Desconectada', 'Erro'] else 'muted' }}">{{ operational_status.status }}</span>{% if operational_status.provider %}<div class="muted">{{ operational_status.provider }}{% if operational_status.observed_at %} · {{ operational_status.observed_at }}{% endif %}</div>{% endif %}</dd></div>
       <div><dt>Alertas</dt><dd>{{ 'ativos' if asset.alerts_enabled is none or asset.alerts_enabled else 'desativados' }}</dd></div>
       <div><dt>Selecionada para alertas</dt><dd>{{ 'sim' if asset.selected_for_alerts else 'nao' }}</dd></div>
       <div><dt>Estado alertas</dt><dd>{{ asset.monitoring_status or "active" }}</dd></div>
@@ -333,6 +334,9 @@
       {% with details=financial_model.details %}
         {% include "_financial_model_details.html" %}
       {% endwith %}
+      <div class="hero-actions compact-top-space">
+        <a class="button secondary" href="{{ url_for('financial_model_billing_review', asset_id=asset.id) }}">Rever e aplicar à faturação</a>
+      </div>
       <div class="financial-chart" data-financial-chart='{{ financial_model.chart_series|tojson }}'></div>
       <div class="table-wrap compact-top-space">
         <table>

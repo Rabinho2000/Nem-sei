@@ -92,6 +92,11 @@
       const field = form.querySelector(selector);
       if (field) field.hidden = !visible;
     });
+    const outage = form.querySelector("#client-outage-adjustments");
+    if (outage) {
+      outage.hidden = !isEsco || isFixed;
+      outage.querySelectorAll("input, textarea, button").forEach((control) => { control.disabled = !isEsco || isFixed; });
+    }
     const base = form.querySelector("#billing-energy-base");
     const charge = form.querySelector("input[name='charge_total_production']");
     if (base && charge) base.value = charge.checked ? "total_production" : "self_consumption";
@@ -135,6 +140,17 @@
   }
 
   forms.forEach((form) => {
+    const outageRows = form.querySelector("[data-client-outage-rows]");
+    const addOutage = form.querySelector("[data-add-client-outage]");
+    function addOutageRow() {
+      if (!outageRows) return;
+      const row = document.createElement("div");
+      row.className = "grid three compact-top-space";
+      row.innerHTML = '<label>Dia<input required type="date" name="client_outage_date"></label><label>Produção estimada kWh<input required min="0" step="0.01" type="number" name="client_outage_kwh"></label><label>Motivo (opcional)<input maxlength="240" type="text" name="client_outage_reason"><button class="button secondary small" type="button" data-remove-client-outage>Remover</button></label>';
+      row.querySelector("[data-remove-client-outage]").addEventListener("click", () => row.remove());
+      outageRows.appendChild(row);
+    }
+    if (addOutage) addOutage.addEventListener("click", addOutageRow);
     form.querySelectorAll("input[name='report_type']").forEach((radio) => {
       radio.addEventListener("change", () => {
         syncReportScope(form);

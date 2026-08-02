@@ -475,3 +475,26 @@ def parse_model_details_json(model: sqlite3.Row | None) -> dict[str, Any]:
         return json.loads(model["details_json"] or "{}")
     except (TypeError, json.JSONDecodeError):
         return {}
+
+
+def financial_billing_review_defaults(model: sqlite3.Row | None) -> dict[str, Any]:
+    """Return editable billing values from a confirmed financial model only."""
+    details = parse_model_details_json(model)
+    summary = {
+        str(item.get("key") or ""): item.get("value")
+        for item in details.get("upac_summary") or []
+        if isinstance(item, dict)
+    }
+    periods = {
+        str(item.get("key") or ""): item.get("value")
+        for item in details.get("tariff_periods") or []
+        if isinstance(item, dict)
+    }
+    return {
+        "electricity_price": summary.get("avoided_tariff_eur_kwh") or periods.get("cheia") or periods.get("vazio") or "",
+        "sell_price": summary.get("surplus_sale_eur_kwh") or "",
+        "solcor_price_per_kwh": summary.get("ppa_tariff_eur_kwh") or "",
+        "tariff_prices": periods,
+        "model_id": int(model["id"]) if model is not None else None,
+        "base_year": int(model["base_year"]) if model is not None else None,
+    }

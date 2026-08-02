@@ -122,6 +122,12 @@
         <label class="check-row"><input type="checkbox" name="formats" value="excel"><span>Gerar também Excel</span></label>
         <input type="hidden" name="formats" value="pdf">
       </div>
+      <fieldset class="client-outage-adjustments" data-report-scope="individual" id="client-outage-adjustments">
+        <legend>Cobrança por indisponibilidade imputável ao cliente</legend>
+        <p class="muted">Temporário neste relatório: não altera a produção real nem fica guardado.</p>
+        <div data-client-outage-rows></div>
+        <button class="button secondary small" type="button" data-add-client-outage>Adicionar dia</button>
+      </fieldset>
     </details>
 
     <div class="reports-actions">
