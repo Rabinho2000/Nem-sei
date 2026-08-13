@@ -1,6 +1,9 @@
 """SQLite engine construction and connection-local safety settings."""
 from __future__ import annotations
 
+import sqlite3
+import time
+
 from sqlalchemy import Engine, event
 from sqlalchemy.engine import create_engine
 from sqlalchemy.pool import NullPool
@@ -22,7 +25,18 @@ def build_engine(settings: Settings) -> Engine:
         try:
             cursor.execute("PRAGMA foreign_keys = ON")
             cursor.execute("PRAGMA busy_timeout = 15000")
-            cursor.execute("PRAGMA journal_mode = WAL")
+            # Changing journal mode takes a database-level lock. Concurrent
+            # process startup is expected, so retry only this connection setup
+            # step within the same bounded SQLite timeout.
+            deadline = time.monotonic() + 15
+            while True:
+                try:
+                    cursor.execute("PRAGMA journal_mode = WAL")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.05)
             cursor.execute("PRAGMA synchronous = NORMAL")
             cursor.execute("PRAGMA temp_store = MEMORY")
         finally:
