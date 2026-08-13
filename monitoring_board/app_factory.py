@@ -50,6 +50,41 @@ from monitoring_board.routes.auth import auth_bp
 from monitoring_board.routes.field_routes import field_routes_bp
 from monitoring_board.routes.reporting import reporting_bp
 from monitoring_board.routes.settings import register_settings_routes
+from monitoring_board.domains.tickets.routes import register_ticket_routes
+from monitoring_board.domains.portfolios.manager_routes import register_portfolio_manager_routes
+from monitoring_board.domains.monitoring.alert_routes import register_alert_routes
+from monitoring_board.domains.assets.service import (
+    apply_group_defaults,
+    apply_group_defaults_to_asset,
+    derive_active_contract,
+    infer_installation_group,
+    list_installation_group_options,
+    normalize_date_value,
+    normalize_name,
+    parse_date_value,
+    populate_missing_group_metadata,
+    populate_missing_installation_groups,
+    sync_all_contract_statuses,
+    sync_asset_contract_status,
+)
+# Temporary compatibility exports for callers that still import pure ticket helpers
+# from ``app`` / ``app_factory`` during the incremental migration.
+from monitoring_board.domains.tickets.service import build_visits_by_ticket
+from monitoring_board.shared.calendar import (
+    build_asset_error_calendar,
+    build_intervention_calendar,
+    calendar_month_bounds,
+    intervention_ready_for_route,
+    normalize_calendar_month,
+)
+# Temporary compatibility export; existing tests import this helper through ``app``.
+from monitoring_board.shared.calendar import build_error_calendar  # noqa: F401
+from monitoring_board.constants import (
+    TICKET_MATERIAL_STATUSES,
+    TICKET_STATUSES,
+    TICKET_URGENCIES,
+    TICKET_WORK_TYPES,
+)
 from monitoring_board import runtime as runtime_module
 from monitoring_board.runtime import (
     BACKUP_DIR,
@@ -93,42 +128,7 @@ from monitoring_board.financial_model_repository import (
     get_model_source as get_financial_model_source,
     list_model_monthly as list_financial_model_monthly,
 )
-from monitoring_board.portfolio_repository import (
-    add_member as portfolio_add_member,
-    apply_import_run,
-    archive_portfolio,
-    confirm_mapping,
-    copy_members,
-    create_import_preview,
-    create_portfolio,
-    delete_alias as portfolio_delete_alias,
-    delete_portfolio,
-    detect_portfolio_conflicts,
-    duplicate_portfolio,
-    ensure_portfolio_management_schema,
-    export_configuration_workbook,
-    get_import_run,
-    import_preview_from_json,
-    get_portfolio,
-    list_aliases as portfolio_list_aliases,
-    list_available_assets as portfolio_list_available_assets,
-    list_portfolio_members,
-    list_portfolios,
-    mapping_context as portfolio_mapping_context,
-    move_member_up_down,
-    reactivate_portfolio,
-    rebuild_asset_alias_blob as portfolio_rebuild_asset_alias_blob,
-    remove_members,
-    reorder_members,
-    suggest_mapping as portfolio_suggest_mapping,
-    sync_portfolio_asset_members,
-    toggle_alias,
-    unmap_member,
-    update_alias as portfolio_update_alias,
-    update_member as portfolio_update_member,
-    update_portfolio,
-    upsert_alias,
-)
+from monitoring_board.portfolio_repository import ensure_portfolio_management_schema
 
 from monitoring_board.portfolio_report_repository import (
     archive_profile as archive_portfolio_report_profile,
@@ -397,21 +397,6 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 
-PORTFOLIO_MANAGER_ERROR_MESSAGES = {
-    "member_already_exists": "Esta instalacao ja pertence a este portfolio.",
-    "member_not_found": "A entrada selecionada ja nao existe neste portfolio.",
-    "no_members_copied": "Nenhuma instalacao pode ser copiada.",
-    "no_members_moved": "Nenhuma instalacao pode ser movida.",
-    "portfolio_not_found": "O portfolio selecionado nao existe.",
-    "alias_conflict": "Este alias ja esta associado a outra instalacao.",
-    "portfolio_has_report_history": "Este portfolio nao pode ser apagado porque tem historico de relatorios.",
-    "delete_confirmation_mismatch": "Escreve o nome exato do portfolio para confirmar.",
-    "asset_not_found": "A instalacao selecionada ja nao existe.",
-    "duplicate_ids": "A selecao contem entradas repetidas.",
-    "invalid_member_order": "A ordem enviada ja nao corresponde a este portfolio.",
-    "no_ids": "Seleciona pelo menos uma instalacao.",
-}
-
 TARIFF_WARNING_MESSAGES = {
     "overlapping_tariffs": "Existem tarifas com datas de validade sobrepostas.",
     "missing_tariff_rules": "A tarifa ainda nao tem horarios configurados.",
@@ -424,26 +409,6 @@ TARIFF_WARNING_MESSAGES = {
     "tariff_validity_gap": "Existem dias sem tarifa valida neste periodo.",
     "tariff_change_within_month": "Existem varias tarifas aplicaveis dentro do mes.",
 }
-
-
-def _portfolio_error_message(exc: Exception) -> str:
-    code = str(exc)
-    return PORTFOLIO_MANAGER_ERROR_MESSAGES.get(code, code or "Nao foi possivel concluir a operacao.")
-
-
-def _portfolio_manager_redirect(portfolio_id: int | None = None, **overrides: Any):
-    values: dict[str, Any] = {}
-    selected_id = portfolio_id if portfolio_id is not None else int(request.form.get("portfolio_id", request.args.get("portfolio_id", "0")) or 0)
-    if selected_id:
-        values["portfolio_id"] = selected_id
-    for key in ("tab", "search", "asset_filter", "alias_search", "alias_filter"):
-        value = overrides.pop(key, None)
-        if value is None:
-            value = request.form.get(key, request.args.get(key, ""))
-        if value:
-            values[key] = value
-    values.update({key: value for key, value in overrides.items() if value not in (None, "")})
-    return redirect(url_for("portfolio_manager", **values))
 
 
 def report_state_query_params(values: Any, *, run_id: int | None = None) -> dict[str, str]:
@@ -595,25 +560,6 @@ STATUS_COLORS = {
     "Fechado": "muted",
 }
 
-TICKET_STATUSES = ["Aberto", "Em analise", "Agendado", "Em visita", "Resolvido", "Fechado"]
-TICKET_URGENCIES = ["Baixa", "Media", "Alta", "Critica"]
-TICKET_MATERIAL_STATUSES = ["Nao definido", "Sem material", "Necessario", "Pronto", "Bloqueado"]
-TICKET_WORK_TYPES = ["Diagnostico", "Comunicacao", "Inversor", "String", "Estrutura", "Limpeza", "Preventiva", "Outro"]
-MONTH_NAMES_PT = [
-    "",
-    "Janeiro",
-    "Fevereiro",
-    "Março",
-    "Abril",
-    "Maio",
-    "Junho",
-    "Julho",
-    "Agosto",
-    "Setembro",
-    "Outubro",
-    "Novembro",
-    "Dezembro",
-]
 MONITORING_SOURCES = ["FusionSolar", "Sigenergy", "Manual / Outro"]
 ASSET_MONITORING_STATUSES = ["active", "silenced", "maintenance", "out_of_scope", "disabled"]
 OK_MONITORING_STATUSES = {"Operacional", "Resolvido", "OK"}
@@ -751,19 +697,6 @@ EXPORT_DATASETS = {
     },
 }
 
-GROUP_INHERITED_FIELDS = [
-    "company_name",
-    "location",
-    "address",
-    "contract_type",
-    "contact_name",
-    "contact_role",
-    "contact_email",
-    "contact_phone",
-    "access_type",
-    "coverage_type",
-]
-
 SCHEDULER: BackgroundScheduler | None = None
 FUSIONSOLAR_SESSION_CACHE: dict[str, Any] = {}
 FUSIONSOLAR_SESSION_LOCK = threading.Lock()
@@ -830,6 +763,9 @@ def create_app() -> Flask:
     schema_module.ensure_database(app.config["DATABASE"])
     app.register_blueprint(field_routes_bp)
     app.register_blueprint(reporting_bp)
+    register_ticket_routes(app)
+    register_portfolio_manager_routes(app)
+    register_alert_routes(app)
     with closing(get_db(app.config["DATABASE"])) as bootstrap_conn:
         populate_missing_installation_groups(bootstrap_conn)
         populate_missing_group_metadata(bootstrap_conn)
@@ -2706,334 +2642,6 @@ def create_app() -> Flask:
         flash("Linha associada e importada com sucesso.", "success")
         return redirect(url_for("monitoring", asset_id=asset_id))
 
-    @app.route("/tickets", methods=["GET", "POST"])
-    def tickets() -> str:
-        if request.method == "POST":
-            asset_id = int(request.form["asset_id"])
-            title = request.form.get("title", "").strip()
-            urgency = request.form.get("urgency", "Media")
-            status = request.form.get("status", "Aberto")
-            installation_ref = request.form.get("installation_ref", "").strip()
-            notes = request.form.get("notes", "").strip()
-            next_action = request.form.get("next_action", "").strip()
-            planned_date = normalize_optional_date(request.form.get("planned_date"))
-            due_date = normalize_optional_date(request.form.get("due_date"))
-            estimated_minutes = parse_positive_int(request.form.get("estimated_minutes"), default=60)
-            assigned_to = request.form.get("assigned_to", "").strip()
-            material_status = normalize_choice(
-                request.form.get("material_status", "Nao definido"),
-                TICKET_MATERIAL_STATUSES,
-                "Nao definido",
-            )
-            work_type = normalize_choice(request.form.get("work_type", "Diagnostico"), TICKET_WORK_TYPES, "Diagnostico")
-            planning_notes = request.form.get("planning_notes", "").strip()
-            if not title:
-                flash("A intervencao precisa de um titulo.", "error")
-                return redirect(url_for("tickets"))
-
-            g.db.execute(
-                """
-                INSERT INTO tickets (
-                    asset_id, title, urgency, status, installation_ref, notes, next_action,
-                    planned_date, due_date, estimated_minutes, assigned_to, material_status,
-                    work_type, planning_notes, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    asset_id,
-                    title,
-                    urgency,
-                    status,
-                    installation_ref,
-                    notes,
-                    next_action,
-                    planned_date,
-                    due_date,
-                    estimated_minutes,
-                    assigned_to,
-                    material_status,
-                    work_type,
-                    planning_notes,
-                    datetime.now().isoformat(timespec="seconds"),
-                    datetime.now().isoformat(timespec="seconds"),
-                ),
-            )
-            g.db.commit()
-            flash("Intervencao criada.", "success")
-            return redirect(url_for("tickets", asset_id=asset_id))
-
-        search = request.args.get("search", "").strip()
-        asset_filter = request.args.get("asset_id", "").strip()
-        status_filter = request.args.get("status", "").strip()
-        urgency_filter = request.args.get("urgency", "").strip()
-        scope = request.args.get("scope", "").strip()
-        om_only = request.args.get("om_only", "yes").strip()
-        calendar_month = normalize_calendar_month(request.args.get("calendar_month", ""))
-
-        conditions = []
-        params: list[Any] = []
-        if search:
-            wildcard = f"%{search}%"
-            conditions.append(
-                "(a.project_name LIKE ? OR a.alias_blob LIKE ? OR t.title LIKE ? OR COALESCE(t.notes, '') LIKE ?)"
-            )
-            params.extend([wildcard, wildcard, wildcard, wildcard])
-        if asset_filter:
-            conditions.append("a.id = ?")
-            params.append(asset_filter)
-        if status_filter:
-            conditions.append("t.status = ?")
-            params.append(status_filter)
-        if urgency_filter:
-            conditions.append("t.urgency = ?")
-            params.append(urgency_filter)
-        if scope == "open":
-            conditions.append("t.status != 'Fechado'")
-        if om_only == "yes":
-            conditions.append("a.active_contract = 'yes'")
-
-        where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        ticket_rows = query_all(
-            g.db,
-            f"""
-            SELECT
-                t.*,
-                a.project_name,
-                a.location,
-                a.active_contract,
-                a.contract_type
-            FROM tickets t
-            JOIN assets a ON a.id = t.asset_id
-            {where_sql}
-            ORDER BY
-                CASE a.active_contract WHEN 'yes' THEN 1 ELSE 2 END,
-                a.project_name COLLATE NOCASE,
-                CASE t.status
-                    WHEN 'Aberto' THEN 1
-                    WHEN 'Em analise' THEN 2
-                    WHEN 'Agendado' THEN 3
-                    WHEN 'Em visita' THEN 4
-                    WHEN 'Resolvido' THEN 5
-                    ELSE 6
-                END,
-                CASE t.urgency
-                    WHEN 'Critica' THEN 1
-                    WHEN 'Alta' THEN 2
-                    WHEN 'Media' THEN 3
-                    ELSE 4
-                END,
-                t.updated_at DESC,
-                t.id DESC
-            """,
-            params,
-        )
-
-        assets_rows = query_all(
-            g.db,
-            "SELECT id, project_name FROM assets ORDER BY project_name COLLATE NOCASE",
-        )
-        visits_by_ticket = build_visits_by_ticket(
-            query_all(
-                g.db,
-                """
-                SELECT *
-                FROM ticket_visits
-                ORDER BY visit_date DESC, id DESC
-                """,
-            )
-        )
-        grouped_tickets = group_tickets_by_asset(ticket_rows)
-        calendar_start, calendar_end, previous_month, next_month = calendar_month_bounds(calendar_month)
-        calendar_conditions = [
-            "mr.status IN ('Erro', 'Desconectada')",
-            "mr.record_date BETWEEN ? AND ?",
-        ]
-        calendar_params: list[Any] = [calendar_start.isoformat(), calendar_end.isoformat()]
-        if search:
-            wildcard = f"%{search}%"
-            calendar_conditions.append(
-                "(a.project_name LIKE ? OR a.alias_blob LIKE ? OR COALESCE(mr.notes, '') LIKE ? OR COALESCE(mr.source, '') LIKE ?)"
-            )
-            calendar_params.extend([wildcard, wildcard, wildcard, wildcard])
-        if asset_filter:
-            calendar_conditions.append("a.id = ?")
-            calendar_params.append(asset_filter)
-        if om_only == "yes":
-            calendar_conditions.append("a.active_contract = 'yes'")
-        calendar_where_sql = f"WHERE {' AND '.join(calendar_conditions)}"
-
-        calendar_rows = query_all(
-            g.db,
-            f"""
-            SELECT
-                mr.id,
-                mr.asset_id,
-                mr.status,
-                mr.record_date,
-                mr.notes,
-                mr.source,
-                a.project_name
-            FROM monitoring_records mr
-            JOIN assets a ON a.id = mr.asset_id
-            {calendar_where_sql}
-            ORDER BY
-                mr.record_date,
-                CASE mr.status
-                    WHEN 'Erro' THEN 1
-                    WHEN 'Desconectada' THEN 2
-                    ELSE 3
-                END,
-                a.project_name COLLATE NOCASE,
-                mr.id DESC
-            """,
-            calendar_params,
-        )
-        error_calendar = build_error_calendar(calendar_month, calendar_rows)
-
-        selected_asset = None
-        central_history = []
-        central_summary = None
-        if asset_filter:
-            selected_asset = query_one("SELECT * FROM assets WHERE id = ?", (asset_filter,))
-            central_history = query_all(
-                g.db,
-                """
-                SELECT
-                    t.*,
-                    (
-                        SELECT COUNT(*)
-                        FROM ticket_visits tv
-                        WHERE tv.ticket_id = t.id
-                    ) AS visit_count
-                FROM tickets t
-                WHERE t.asset_id = ?
-                ORDER BY t.updated_at DESC, t.id DESC
-                """,
-                (asset_filter,),
-            )
-            central_summary = {
-                "total": len(central_history),
-                "open": sum(1 for ticket in central_history if ticket["status"] != "Fechado"),
-                "critical": sum(1 for ticket in central_history if ticket["urgency"] == "Critica" and ticket["status"] != "Fechado"),
-                "visits": sum(ticket["visit_count"] for ticket in central_history),
-            }
-
-        ticket_stats = {
-            "centrals": len(grouped_tickets),
-            "tickets": len(ticket_rows),
-            "open": sum(1 for ticket in ticket_rows if ticket["status"] != "Fechado"),
-            "critical": sum(1 for ticket in ticket_rows if ticket["urgency"] == "Critica" and ticket["status"] != "Fechado"),
-        }
-
-        return render_template(
-            "tickets.html",
-            tickets=ticket_rows,
-            grouped_tickets=grouped_tickets,
-            assets=assets_rows,
-            visits_by_ticket=visits_by_ticket,
-            selected_asset=selected_asset,
-            central_history=central_history,
-            central_summary=central_summary,
-            ticket_stats=ticket_stats,
-            error_calendar=error_calendar,
-            calendar_month=calendar_month,
-            previous_month=previous_month,
-            next_month=next_month,
-            search=search,
-            asset_filter=asset_filter,
-            status_filter=status_filter,
-            urgency_filter=urgency_filter,
-            scope=scope,
-            om_only=om_only,
-        )
-
-    @app.route("/tickets/<int:ticket_id>/update", methods=["POST"])
-    def update_ticket(ticket_id: int):
-        ticket = query_one("SELECT asset_id FROM tickets WHERE id = ?", (ticket_id,))
-        status = request.form.get("status", "Aberto")
-        urgency = request.form.get("urgency", "Media")
-        next_action = request.form.get("next_action", "").strip()
-        notes = request.form.get("notes", "").strip()
-        planned_date = normalize_optional_date(request.form.get("planned_date"))
-        due_date = normalize_optional_date(request.form.get("due_date"))
-        estimated_minutes = parse_positive_int(request.form.get("estimated_minutes"), default=60)
-        assigned_to = request.form.get("assigned_to", "").strip()
-        material_status = normalize_choice(
-            request.form.get("material_status", "Nao definido"),
-            TICKET_MATERIAL_STATUSES,
-            "Nao definido",
-        )
-        work_type = normalize_choice(request.form.get("work_type", "Diagnostico"), TICKET_WORK_TYPES, "Diagnostico")
-        planning_notes = request.form.get("planning_notes", "").strip()
-        g.db.execute(
-            """
-            UPDATE tickets
-            SET status = ?, urgency = ?, next_action = ?, notes = ?,
-                planned_date = ?, due_date = ?, estimated_minutes = ?, assigned_to = ?,
-                material_status = ?, work_type = ?, planning_notes = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                status,
-                urgency,
-                next_action,
-                notes,
-                planned_date,
-                due_date,
-                estimated_minutes,
-                assigned_to,
-                material_status,
-                work_type,
-                planning_notes,
-                datetime.now().isoformat(timespec="seconds"),
-                ticket_id,
-            ),
-        )
-        g.db.commit()
-        flash("Intervencao atualizada.", "success")
-        if ticket:
-            return redirect(url_for("tickets", asset_id=ticket["asset_id"]))
-        return redirect(url_for("tickets"))
-
-    @app.route("/tickets/<int:ticket_id>/visit", methods=["POST"])
-    def add_visit(ticket_id: int):
-        ticket = query_one("SELECT asset_id FROM tickets WHERE id = ?", (ticket_id,))
-        visit_date = request.form.get("visit_date", date.today().isoformat())
-        technician = request.form.get("technician", "").strip()
-        result = request.form.get("result", "").strip()
-        notes = request.form.get("notes", "").strip()
-        next_action = request.form.get("next_action", "").strip()
-
-        g.db.execute(
-            """
-            INSERT INTO ticket_visits (ticket_id, visit_date, technician, result, notes, next_action)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (ticket_id, visit_date, technician, result, notes, next_action),
-        )
-        if next_action:
-            g.db.execute(
-                "UPDATE tickets SET next_action = ?, updated_at = ? WHERE id = ?",
-                (next_action, datetime.now().isoformat(timespec="seconds"), ticket_id),
-            )
-        g.db.commit()
-        flash("Visita registada.", "success")
-        if ticket:
-            return redirect(url_for("tickets", asset_id=ticket["asset_id"]))
-        return redirect(url_for("tickets"))
-
-    @app.route("/tickets/<int:ticket_id>/delete", methods=["POST"])
-    def delete_ticket(ticket_id: int):
-        ticket = query_one("SELECT asset_id FROM tickets WHERE id = ?", (ticket_id,))
-        if ticket is None:
-            flash("Intervencao nao encontrada.", "error")
-            return redirect(url_for("tickets"))
-
-        g.db.execute("DELETE FROM tickets WHERE id = ?", (ticket_id,))
-        g.db.commit()
-        flash("Intervencao apagada.", "success")
-        return redirect(url_for("tickets", asset_id=ticket["asset_id"]))
-
     @app.route("/exports", methods=["GET", "POST"])
     def exports() -> str:
         def period_redirect_params(period: ReportingPeriod) -> dict[str, str]:
@@ -3406,460 +3014,6 @@ def create_app() -> Flask:
             SCHEDULER.remove_job(f"report-automation-{automation_id}")
         flash("Automatização apagada. O histórico de relatórios foi preservado.", "success")
         return redirect(url_for("exports", tab="automations"))
-
-    @app.route("/portfolio-manager")
-    def portfolio_manager() -> str:
-        groups = list_portfolios(g.db, include_archived=True)
-        selected_portfolio_id = int(request.args.get("portfolio_id", groups[0]["id"] if groups else 0) or 0)
-        selected = get_portfolio(g.db, selected_portfolio_id) if selected_portfolio_id else None
-        active_tab = request.args.get("tab", "installations").strip()
-        if active_tab not in {"installations", "mappings", "aliases", "import", "settings"}:
-            active_tab = "installations"
-        search = request.args.get("search", "").strip()
-        asset_filter = request.args.get("asset_filter", "available").strip()
-        alias_search = request.args.get("alias_search", "").strip()
-        alias_filter = request.args.get("alias_filter", "all").strip()
-        import_id = int(request.args.get("import_id", "0") or 0)
-        if import_id and request.args.get("tab") is None:
-            active_tab = "import"
-        members = list_portfolio_members(g.db, selected_portfolio_id) if selected else []
-        assets = portfolio_list_available_assets(
-            g.db,
-            portfolio_id=selected_portfolio_id or None,
-            search=search,
-            asset_filter=asset_filter,
-        )
-        all_assets = portfolio_list_available_assets(g.db, portfolio_id=selected_portfolio_id or None, asset_filter="all")
-        portfolio_counts = {
-            int(row["portfolio_id"]): int(row["count"] or 0)
-            for row in query_all(
-                g.db,
-                "SELECT portfolio_id, COUNT(*) AS count FROM portfolio_assets WHERE active = 1 GROUP BY portfolio_id",
-            )
-        }
-        available_total = query_scalar(
-            g.db,
-            """
-            SELECT COUNT(*)
-            FROM assets a
-            WHERE NOT EXISTS (
-                SELECT 1 FROM portfolio_assets pa
-                WHERE pa.portfolio_id = ? AND pa.asset_id = a.id AND pa.active = 1
-            )
-            """,
-            (selected_portfolio_id,),
-        ) if selected else 0
-        pending_count = sum(1 for member in members if not member["asset_id"] or member["mapping_status"] == "mapping_pending")
-        conflict_count = sum(1 for member in members if member["mapping_status"] == "mapping_conflict")
-        aliases = []
-        if active_tab == "aliases":
-            aliases = portfolio_list_aliases(g.db, include_inactive=alias_filter != "active")
-            if alias_search:
-                alias_search_lower = alias_search.lower()
-                aliases = [alias for alias in aliases if alias_search_lower in str(alias["alias_name"] or "").lower() or alias_search_lower in str(alias["project_name"] or "").lower()]
-            if alias_filter == "inactive":
-                aliases = [alias for alias in aliases if not alias["active"]]
-        conflicts = detect_portfolio_conflicts(g.db, selected_portfolio_id or None)
-        import_run = get_import_run(g.db, import_id) if import_id else None
-        import_preview = import_preview_from_json(import_run["preview_json"] or "{}") if import_run else None
-        mapping_context = portfolio_mapping_context(g.db)
-        mapping_decisions = {
-            int(member["id"]): portfolio_suggest_mapping(
-                g.db,
-                external_name=member["external_name"] or "",
-                nif=member["nif"] or "",
-                sub_account=member["sub_account"] or "",
-                context=mapping_context,
-            )
-            for member in members
-            if not member["asset_id"] or member["mapping_status"] in {"mapping_pending", "mapping_conflict", "mapping_suggested"}
-        }
-        return render_template(
-            "portfolio_manager.html",
-            title="Gestor de portfolios",
-            groups=groups,
-            selected=selected,
-            active_tab=active_tab,
-            selected_portfolio_id=selected_portfolio_id,
-            portfolio_counts=portfolio_counts,
-            available_total=available_total,
-            pending_count=pending_count,
-            conflict_count=conflict_count,
-            members=members,
-            assets=assets,
-            all_assets=all_assets,
-            aliases=aliases,
-            conflicts=conflicts,
-            search=search,
-            asset_filter=asset_filter,
-            alias_search=alias_search,
-            alias_filter=alias_filter,
-            import_run=import_run,
-            import_preview=import_preview,
-            mapping_decisions=mapping_decisions,
-        )
-
-    @app.route("/portfolio-manager/create", methods=["POST"])
-    def portfolio_manager_create():
-        try:
-            portfolio_id = create_portfolio(g.db, name=request.form.get("name", ""), description=request.form.get("description", ""), notes=request.form.get("notes", ""))
-            g.db.commit()
-            flash("Portfolio criado.", "success")
-            return _portfolio_manager_redirect(portfolio_id, tab="installations")
-        except Exception as exc:
-            g.db.rollback()
-            flash(f"Falha ao criar portfolio: {_portfolio_error_message(exc)}", "error")
-            return _portfolio_manager_redirect(0)
-
-    @app.route("/portfolio-manager/update", methods=["POST"])
-    def portfolio_manager_update():
-        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
-        try:
-            update_portfolio(
-                g.db,
-                portfolio_id=portfolio_id,
-                name=request.form.get("name", ""),
-                description=request.form.get("description", ""),
-                notes=request.form.get("notes", ""),
-                display_order=int(request.form.get("display_order", "0") or 0) or None,
-            )
-            g.db.commit()
-            flash("Portfolio atualizado.", "success")
-        except Exception as exc:
-            g.db.rollback()
-            flash(f"Falha ao atualizar portfolio: {_portfolio_error_message(exc)}", "error")
-        return _portfolio_manager_redirect(portfolio_id, tab="settings")
-
-    @app.route("/portfolio-manager/duplicate", methods=["POST"])
-    def portfolio_manager_duplicate():
-        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
-        try:
-            new_id = duplicate_portfolio(g.db, portfolio_id=portfolio_id, new_name=request.form.get("new_name", ""))
-            g.db.commit()
-            flash("Portfolio duplicado.", "success")
-            return _portfolio_manager_redirect(new_id, tab="installations")
-        except Exception as exc:
-            g.db.rollback()
-            flash(f"Falha ao duplicar portfolio: {_portfolio_error_message(exc)}", "error")
-            return _portfolio_manager_redirect(portfolio_id, tab="settings")
-
-    @app.route("/portfolio-manager/archive", methods=["POST"])
-    def portfolio_manager_archive():
-        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
-        try:
-            archive_portfolio(g.db, portfolio_id)
-            g.db.commit()
-            flash("Portfolio arquivado.", "success")
-        except Exception as exc:
-            g.db.rollback()
-            flash(f"Falha ao arquivar portfolio: {_portfolio_error_message(exc)}", "error")
-        return _portfolio_manager_redirect(portfolio_id, tab="settings")
-
-    @app.route("/portfolio-manager/reactivate", methods=["POST"])
-    def portfolio_manager_reactivate():
-        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
-        try:
-            reactivate_portfolio(g.db, portfolio_id)
-            g.db.commit()
-            flash("Portfolio reativado.", "success")
-        except Exception as exc:
-            g.db.rollback()
-            flash(f"Falha ao reativar portfolio: {_portfolio_error_message(exc)}", "error")
-        return _portfolio_manager_redirect(portfolio_id, tab="settings")
-
-    @app.route("/portfolio-manager/delete", methods=["POST"])
-    def portfolio_manager_delete():
-        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
-        try:
-            delete_portfolio(g.db, portfolio_id, confirm_name=request.form.get("confirm_name", ""))
-            g.db.commit()
-            flash("Portfolio apagado.", "success")
-            return _portfolio_manager_redirect(0)
-        except Exception as exc:
-            g.db.rollback()
-            flash(f"Falha ao apagar portfolio: {_portfolio_error_message(exc)}", "error")
-            return _portfolio_manager_redirect(portfolio_id, tab="settings")
-
-    @app.route("/portfolio-manager/members/add", methods=["POST"])
-    def portfolio_manager_members_add():
-        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
-        try:
-            asset_ids = _form_int_list("asset_ids")
-            reactivated = 0
-            if asset_ids:
-                for asset_id in asset_ids:
-                    inactive = g.db.execute(
-                        "SELECT 1 FROM portfolio_assets WHERE portfolio_id = ? AND asset_id = ? AND active = 0",
-                        (portfolio_id, asset_id),
-                    ).fetchone()
-                    portfolio_add_member(g.db, portfolio_id=portfolio_id, asset_id=asset_id)
-                    if inactive:
-                        reactivated += 1
-            else:
-                asset_raw = request.form.get("asset_id", "").strip()
-                asset_id = int(asset_raw) if asset_raw.isdigit() else None
-                inactive = (
-                    g.db.execute(
-                        "SELECT 1 FROM portfolio_assets WHERE portfolio_id = ? AND asset_id = ? AND active = 0",
-                        (portfolio_id, asset_id),
-                    ).fetchone()
-                    if asset_id
-                    else None
-                )
-                portfolio_add_member(
-                    g.db,
-                    portfolio_id=portfolio_id,
-                    asset_id=asset_id,
-                    external_name=request.form.get("external_name", ""),
-                    nif=request.form.get("nif", ""),
-                    sub_account=request.form.get("sub_account", ""),
-                    notes=request.form.get("notes", ""),
-                )
-                if inactive:
-                    reactivated += 1
-            g.db.commit()
-            flash("Instalacao reativada no portfolio." if reactivated else "Instalacao adicionada ao portfolio.", "success")
-        except Exception as exc:
-            g.db.rollback()
-            flash(f"Falha ao adicionar instalacao: {_portfolio_error_message(exc)}", "error")
-        return _portfolio_manager_redirect(portfolio_id, tab="installations")
-
-    @app.route("/portfolio-manager/members/apply", methods=["POST"])
-    def portfolio_manager_members_apply():
-        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
-        try:
-            asset_ids = _form_int_list("asset_ids")
-            asset_names = {
-                asset_id: request.form.get(f"asset_name_{asset_id}", "")
-                for asset_id in asset_ids
-            }
-            result = sync_portfolio_asset_members(g.db, portfolio_id=portfolio_id, asset_ids=asset_ids, asset_names=asset_names)
-            g.db.commit()
-            flash(f"Alteracoes aplicadas: {result['selected']} instalacoes selecionadas.", "success")
-        except Exception as exc:
-            g.db.rollback()
-            flash(f"Falha ao aplicar alteracoes: {_portfolio_error_message(exc)}", "error")
-        return _portfolio_manager_redirect(portfolio_id, tab="installations")
-
-    @app.route("/portfolio-manager/members/remove", methods=["POST"])
-    def portfolio_manager_members_remove():
-        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
-        try:
-            remove_members(g.db, portfolio_id=portfolio_id, member_ids=_form_int_list("member_ids"))
-            g.db.commit()
-            flash("Instalacoes removidas do portfolio.", "success")
-        except Exception as exc:
-            g.db.rollback()
-            flash(f"Falha ao remover instalacoes: {_portfolio_error_message(exc)}", "error")
-        return _portfolio_manager_redirect(portfolio_id, tab="installations")
-
-    @app.route("/portfolio-manager/members/copy", methods=["POST"])
-    def portfolio_manager_members_copy():
-        source_id = int(request.form.get("portfolio_id", "0") or 0)
-        target_id = int(request.form.get("target_portfolio_id", "0") or 0)
-        try:
-            copy_members(g.db, source_portfolio_id=source_id, target_portfolio_id=target_id, member_ids=_form_int_list("member_ids"), move=False)
-            g.db.commit()
-            flash("Instalacoes copiadas.", "success")
-        except Exception as exc:
-            g.db.rollback()
-            flash(f"Falha ao copiar instalacoes: {_portfolio_error_message(exc)}", "error")
-        return _portfolio_manager_redirect(source_id, tab="installations")
-
-    @app.route("/portfolio-manager/members/move", methods=["POST"])
-    def portfolio_manager_members_move():
-        source_id = int(request.form.get("portfolio_id", "0") or 0)
-        target_id = int(request.form.get("target_portfolio_id", "0") or 0)
-        try:
-            copy_members(g.db, source_portfolio_id=source_id, target_portfolio_id=target_id, member_ids=_form_int_list("member_ids"), move=True)
-            g.db.commit()
-            flash("Instalacoes movidas.", "success")
-            return _portfolio_manager_redirect(target_id, tab="installations")
-        except Exception as exc:
-            g.db.rollback()
-            flash(f"Falha ao mover instalacoes: {_portfolio_error_message(exc)}", "error")
-            return _portfolio_manager_redirect(source_id, tab="installations")
-
-    @app.route("/portfolio-manager/members/reorder", methods=["POST"])
-    def portfolio_manager_members_reorder():
-        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
-        try:
-            ordered = _form_int_list("ordered_ids")
-            if not ordered:
-                member_id = int(request.form.get("member_id", "0") or 0)
-                move_member_up_down(g.db, portfolio_id=portfolio_id, member_id=member_id, direction=request.form.get("direction", "down"))
-            else:
-                reorder_members(g.db, portfolio_id=portfolio_id, ordered_ids=ordered)
-            g.db.commit()
-            flash("Ordem guardada.", "success")
-        except Exception as exc:
-            g.db.rollback()
-            flash(f"Falha ao reordenar: {_portfolio_error_message(exc)}", "error")
-        return _portfolio_manager_redirect(portfolio_id, tab="installations")
-
-    @app.route("/portfolio-manager/members/update", methods=["POST"])
-    def portfolio_manager_members_update():
-        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
-        member_id = int(request.form.get("member_id", "0") or 0)
-        asset_raw = request.form.get("asset_id", "").strip()
-        try:
-            portfolio_update_member(
-                g.db,
-                member_id=member_id,
-                portfolio_id=portfolio_id,
-                asset_id=int(asset_raw) if asset_raw.isdigit() else None,
-                external_name=request.form.get("external_name", ""),
-                nif=request.form.get("nif", ""),
-                sub_account=request.form.get("sub_account", ""),
-                notes=request.form.get("notes", ""),
-                active=request.form.get("active", "on") == "on",
-                create_alias=request.form.get("create_alias") == "on",
-            )
-            g.db.commit()
-            flash("Entrada atualizada.", "success")
-        except Exception as exc:
-            g.db.rollback()
-            flash(f"Falha ao atualizar entrada: {_portfolio_error_message(exc)}", "error")
-        return _portfolio_manager_redirect(portfolio_id, tab=request.form.get("tab") or "installations", focus=f"member-{member_id}")
-
-    @app.route("/portfolio-manager/mappings/suggest", methods=["POST"])
-    def portfolio_manager_mappings_suggest():
-        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
-        try:
-            result = auto_map_portfolio_assets(g.db, portfolio_id=portfolio_id or None)
-            g.db.commit()
-            flash(f"Sugestoes calculadas: {result['mapped']} auto, {result['pending']} pendentes, {result['conflicts']} conflitos.", "success")
-        except Exception as exc:
-            g.db.rollback()
-            flash(f"Falha ao sugerir mappings: {_portfolio_error_message(exc)}", "error")
-        return _portfolio_manager_redirect(portfolio_id, tab="mappings")
-
-    @app.route("/portfolio-manager/mappings/confirm", methods=["POST"])
-    def portfolio_manager_mappings_confirm():
-        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
-        try:
-            confirm_mapping(
-                g.db,
-                member_id=int(request.form.get("member_id", "0") or 0),
-                portfolio_id=portfolio_id,
-                asset_id=int(request.form.get("asset_id", "0") or 0),
-                create_alias=request.form.get("create_alias", "on") == "on",
-            )
-            g.db.commit()
-            flash("Mapping confirmado.", "success")
-        except Exception as exc:
-            g.db.rollback()
-            flash(f"Falha ao confirmar mapping: {_portfolio_error_message(exc)}", "error")
-        return _portfolio_manager_redirect(portfolio_id, tab=request.form.get("tab") or "mappings", focus=f"member-{request.form.get('member_id', '0')}")
-
-    @app.route("/portfolio-manager/mappings/unmap", methods=["POST"])
-    def portfolio_manager_mappings_unmap():
-        portfolio_id = int(request.form.get("portfolio_id", "0") or 0)
-        try:
-            unmap_member(g.db, member_id=int(request.form.get("member_id", "0") or 0), portfolio_id=portfolio_id)
-            g.db.commit()
-            flash("Mapping removido.", "success")
-        except Exception as exc:
-            g.db.rollback()
-            flash(f"Falha ao remover mapping: {_portfolio_error_message(exc)}", "error")
-        return _portfolio_manager_redirect(portfolio_id, tab=request.form.get("tab") or "installations", focus=f"member-{request.form.get('member_id', '0')}")
-
-    @app.route("/assets/<int:asset_id>/aliases/add", methods=["POST"])
-    def portfolio_alias_add(asset_id: int):
-        try:
-            upsert_alias(g.db, asset_id=asset_id, alias_name=request.form.get("alias_name", ""), source="manual", notes=request.form.get("notes", ""))
-            portfolio_rebuild_asset_alias_blob(g.db, asset_id)
-            g.db.commit()
-            flash("Alias guardado.", "success")
-        except Exception as exc:
-            g.db.rollback()
-            flash(f"Falha ao guardar alias: {_portfolio_error_message(exc)}", "error")
-        return _alias_return(asset_id)
-
-    @app.route("/assets/<int:asset_id>/aliases/update", methods=["POST"])
-    def portfolio_alias_update(asset_id: int):
-        try:
-            portfolio_update_alias(g.db, asset_id=asset_id, alias_id=int(request.form.get("alias_id", "0") or 0), alias_name=request.form.get("alias_name", ""), notes=request.form.get("notes", ""))
-            portfolio_rebuild_asset_alias_blob(g.db, asset_id)
-            g.db.commit()
-            flash("Alias atualizado.", "success")
-        except Exception as exc:
-            g.db.rollback()
-            flash(f"Falha ao atualizar alias: {_portfolio_error_message(exc)}", "error")
-        return _alias_return(asset_id)
-
-    @app.route("/assets/<int:asset_id>/aliases/toggle", methods=["POST"])
-    def portfolio_alias_toggle(asset_id: int):
-        try:
-            toggle_alias(g.db, asset_id=asset_id, alias_id=int(request.form.get("alias_id", "0") or 0), active=request.form.get("active") == "1")
-            portfolio_rebuild_asset_alias_blob(g.db, asset_id)
-            g.db.commit()
-            flash("Alias atualizado.", "success")
-        except Exception as exc:
-            g.db.rollback()
-            flash(f"Falha ao alterar alias: {_portfolio_error_message(exc)}", "error")
-        return _alias_return(asset_id)
-
-    @app.route("/assets/<int:asset_id>/aliases/delete", methods=["POST"])
-    def portfolio_alias_delete(asset_id: int):
-        try:
-            portfolio_delete_alias(g.db, asset_id=asset_id, alias_id=int(request.form.get("alias_id", "0") or 0))
-            portfolio_rebuild_asset_alias_blob(g.db, asset_id)
-            g.db.commit()
-            flash("Alias apagado.", "success")
-        except Exception as exc:
-            g.db.rollback()
-            flash(f"Falha ao apagar alias: {_portfolio_error_message(exc)}", "error")
-        return _alias_return(asset_id)
-
-    @app.route("/portfolio-manager/import", methods=["POST"])
-    def portfolio_manager_import():
-        portfolio_id = int(request.form.get("portfolio_id", "0") or 0) or None
-        upload = request.files.get("file")
-        if upload is None or not upload.filename:
-            flash("Escolhe um ficheiro CSV ou XLSX.", "error")
-            return redirect(url_for("portfolio_manager", portfolio_id=portfolio_id or 0))
-        try:
-            import_id = create_import_preview(g.db, portfolio_id=portfolio_id, original_filename=Path(upload.filename).name, data=upload.read())
-            g.db.commit()
-            flash("Preview de importacao criado.", "success")
-            return _portfolio_manager_redirect(portfolio_id or 0, tab="import", import_id=import_id)
-        except Exception as exc:
-            g.db.rollback()
-            flash(f"Falha ao importar configuracao: {_portfolio_error_message(exc)}", "error")
-            return _portfolio_manager_redirect(portfolio_id or 0, tab="import")
-
-    @app.route("/portfolio-manager/import/<int:import_id>/apply", methods=["POST"])
-    def portfolio_manager_import_apply(import_id: int):
-        try:
-            run = get_import_run(g.db, import_id)
-            selected_rows = _form_int_list("row_numbers")
-            overrides = {
-                int(key.removeprefix("asset_override_")): int(value)
-                for key, value in request.form.items()
-                if key.startswith("asset_override_") and str(value).isdigit()
-            }
-            apply_import_run(g.db, import_id, selected_rows=selected_rows or None, asset_overrides=overrides)
-            g.db.commit()
-            flash("Importacao aplicada.", "success")
-            return _portfolio_manager_redirect(run["portfolio_id"] if run else 0, tab="import")
-        except Exception as exc:
-            g.db.rollback()
-            flash(f"Falha ao aplicar importacao: {_portfolio_error_message(exc)}", "error")
-            return _portfolio_manager_redirect(None, tab="import", import_id=import_id)
-
-    @app.route("/portfolio-manager/export")
-    def portfolio_manager_export():
-        workbook = export_configuration_workbook(g.db)
-        output = io.BytesIO()
-        workbook.save(output)
-        output.seek(0)
-        return send_file(
-            output,
-            as_attachment=True,
-            download_name="portfolio_configuration.xlsx",
-            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
 
     @app.route("/portfolios", methods=["GET", "POST"])
     def portfolios() -> str:
@@ -6196,62 +5350,6 @@ def create_app() -> Flask:
             fusionsolar_api_warning=get_fusionsolar_performance_cooldown_reason(g.db),
         )
 
-    @app.route("/telegram-alerts")
-    def telegram_alerts() -> str:
-        status_filter = request.args.get("status", "").strip()
-        asset_filter = request.args.get("asset_id", "").strip()
-        alert_type_filter = request.args.get("alert_type", "").strip()
-        blocked_reason_filter = request.args.get("blocked_reason", "").strip()
-        conditions = []
-        params: list[Any] = []
-        if status_filter:
-            conditions.append("ta.status = ?")
-            params.append(status_filter)
-        if asset_filter:
-            conditions.append("ta.asset_id = ?")
-            params.append(asset_filter)
-        if alert_type_filter:
-            conditions.append("ta.alert_type = ?")
-            params.append(alert_type_filter)
-        if blocked_reason_filter:
-            conditions.append("ta.blocked_reason = ?")
-            params.append(blocked_reason_filter)
-        where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        rows = query_all(
-            g.db,
-            f"""
-            SELECT ta.*, a.project_name
-            FROM telegram_alerts ta
-            LEFT JOIN assets a ON a.id = ta.asset_id
-            {where_sql}
-            ORDER BY ta.sent_at DESC, ta.id DESC
-            LIMIT 250
-            """,
-            params,
-        )
-        alert_types = [row["alert_type"] for row in query_all(g.db, "SELECT DISTINCT alert_type FROM telegram_alerts ORDER BY alert_type")]
-        blocked_reasons = [row["blocked_reason"] for row in query_all(g.db, "SELECT DISTINCT blocked_reason FROM telegram_alerts WHERE blocked_reason IS NOT NULL AND blocked_reason != '' ORDER BY blocked_reason")]
-        assets_for_mapping = query_all(
-            g.db,
-            """
-            SELECT DISTINCT a.id, a.project_name
-            FROM assets a
-            JOIN telegram_alerts ta ON ta.asset_id = a.id
-            ORDER BY a.project_name COLLATE NOCASE
-            """,
-        )
-        return render_template(
-            "telegram_alerts.html",
-            alerts=rows,
-            status_filter=status_filter,
-            asset_filter=asset_filter,
-            alert_type_filter=alert_type_filter,
-            blocked_reason_filter=blocked_reason_filter,
-            alert_types=alert_types,
-            blocked_reasons=blocked_reasons,
-            assets_for_mapping=assets_for_mapping,
-        )
-
     register_settings_routes(
         app,
         backup_dir=BACKUP_DIR,
@@ -8206,18 +7304,8 @@ def build_integration_summary(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return summary
 
 
-def normalize_name(value: str) -> str:
-    lowered = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii").lower()
-    cleaned = "".join(char if char.isalnum() else " " for char in lowered)
-    return " ".join(cleaned.split())
 
 
-def infer_installation_group(project_name: str) -> str:
-    name = (project_name or "").strip()
-    if not name:
-        return ""
-    stripped = re.sub(r"\s*\([^)]*\)\s*$", "", name).strip()
-    return stripped or name
 
 
 def classify_fusionsolar_link(external_name: str, project_name: str, installation_group: str | None = "") -> tuple[str, str]:
@@ -8380,28 +7468,10 @@ def get_fusionsolar_link_audit_rows(conn: sqlite3.Connection, provider: str) -> 
     return sorted(rows, key=lambda item: (priority.get(item["verdict"], 9), (item["external_name"] or item["project_name"]).lower()))
 
 
-def parse_date_value(value: str | None) -> date | None:
-    if value in (None, "", "-"):
-        return None
-    raw_value = str(value).strip()
-    for date_format in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"):
-        try:
-            return datetime.strptime(raw_value, date_format).date()
-        except ValueError:
-            continue
-    return None
 
 
-def normalize_date_value(value: str | None) -> str:
-    parsed = parse_date_value(value)
-    return parsed.isoformat() if parsed else (str(value).strip() if value else "")
 
 
-def derive_active_contract(end_date: str | None, current_value: str = "") -> str:
-    parsed_end_date = parse_date_value(end_date)
-    if parsed_end_date is None:
-        return current_value
-    return "yes" if parsed_end_date >= date.today() else "no"
 
 
 def om_status_label(value: str | None) -> str:
@@ -8507,150 +7577,20 @@ def auto_priority(status: str | None, problem_days: int, recurrence_count: int, 
     return "Baixa"
 
 
-def contract_end_sql() -> str:
-    return "COALESCE(NULLIF(oc.contract_end_date, ''), NULLIF(a.end_contract, ''))"
 
 
-def apply_group_defaults(
-    conn: sqlite3.Connection,
-    payload: dict[str, str],
-    installation_group: str,
-    exclude_asset_id: int | None = None,
-) -> dict[str, str]:
-    if not installation_group:
-        return payload
-    available_fields = [field for field in GROUP_INHERITED_FIELDS if field in payload]
-    if not available_fields:
-        return payload
-
-    conditions = ["installation_group = ?"]
-    params: list[Any] = [installation_group]
-    if exclude_asset_id is not None:
-        conditions.append("id != ?")
-        params.append(exclude_asset_id)
-
-    sources = conn.execute(
-        f"""
-        SELECT {", ".join(available_fields)}
-        FROM assets
-        WHERE {" AND ".join(conditions)}
-          AND ({ " OR ".join(f"NULLIF({field}, '') IS NOT NULL" for field in available_fields) })
-        ORDER BY id ASC
-        """,
-        params,
-    ).fetchall()
-
-    for source in sources:
-        for field in available_fields:
-            if not payload.get(field) and source[field]:
-                payload[field] = source[field]
-        if all(payload.get(field) for field in available_fields):
-            break
-    return payload
 
 
-def list_installation_group_options(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    return query_all(
-        conn,
-        """
-        SELECT
-            COALESCE(NULLIF(TRIM(installation_group), ''), project_name) AS name,
-            COUNT(*) AS member_count
-        FROM assets
-        WHERE COALESCE(NULLIF(TRIM(installation_group), ''), project_name) != ''
-        GROUP BY name
-        ORDER BY name COLLATE NOCASE
-        """,
-    )
 
 
-def apply_group_defaults_to_asset(conn: sqlite3.Connection, asset_id: int, installation_group: str) -> None:
-    asset = conn.execute("SELECT * FROM assets WHERE id = ?", (asset_id,)).fetchone()
-    if asset is None:
-        return
-    payload = {field: asset[field] or "" for field in GROUP_INHERITED_FIELDS}
-    updated_payload = apply_group_defaults(conn, payload, installation_group, exclude_asset_id=asset_id)
-    changed_fields = [field for field in GROUP_INHERITED_FIELDS if (asset[field] or "") != updated_payload.get(field, "")]
-    if not changed_fields:
-        return
-    assignments = ", ".join(f"{field} = ?" for field in changed_fields)
-    values = [updated_payload[field] for field in changed_fields]
-    conn.execute(f"UPDATE assets SET {assignments} WHERE id = ?", values + [asset_id])
 
 
-def populate_missing_group_metadata(conn: sqlite3.Connection) -> None:
-    rows = conn.execute(
-        """
-        SELECT id, installation_group
-        FROM assets
-        WHERE installation_group IS NOT NULL AND TRIM(installation_group) != ''
-        ORDER BY installation_group COLLATE NOCASE, id
-        """
-    ).fetchall()
-    for row in rows:
-        apply_group_defaults_to_asset(conn, row["id"], row["installation_group"])
 
 
-def sync_asset_contract_status(
-    conn: sqlite3.Connection,
-    asset_id: int,
-    start_date: str | None = None,
-    end_date: str | None = None,
-) -> None:
-    asset = conn.execute("SELECT active_contract, start_contract, end_contract FROM assets WHERE id = ?", (asset_id,)).fetchone()
-    if asset is None:
-        return
-    contract = conn.execute(
-        "SELECT contract_start_date, contract_end_date FROM om_contracts WHERE asset_id = ?",
-        (asset_id,),
-    ).fetchone()
-    final_start = normalize_date_value(start_date or (contract["contract_start_date"] if contract else "") or asset["start_contract"])
-    final_end = normalize_date_value(end_date or (contract["contract_end_date"] if contract else "") or asset["end_contract"])
-    active_contract = derive_active_contract(final_end, asset["active_contract"] or "")
-    conn.execute(
-        """
-        UPDATE assets
-        SET maintenance = CASE WHEN ? = 'yes' THEN 'yes' ELSE maintenance END,
-            active_contract = ?,
-            start_contract = CASE WHEN ? != '' THEN ? ELSE start_contract END,
-            end_contract = CASE WHEN ? != '' THEN ? ELSE end_contract END
-        WHERE id = ?
-        """,
-        (active_contract, active_contract, final_start, final_start, final_end, final_end, asset_id),
-    )
 
 
-def sync_all_contract_statuses(conn: sqlite3.Connection) -> None:
-    rows = conn.execute(
-        """
-        SELECT a.id, a.start_contract, a.end_contract, oc.contract_start_date, oc.contract_end_date
-        FROM assets a
-        LEFT JOIN om_contracts oc ON oc.asset_id = a.id
-        WHERE COALESCE(NULLIF(oc.contract_end_date, ''), NULLIF(a.end_contract, '')) IS NOT NULL
-        """
-    ).fetchall()
-    for row in rows:
-        sync_asset_contract_status(
-            conn,
-            row["id"],
-            row["contract_start_date"] or row["start_contract"],
-            row["contract_end_date"] or row["end_contract"],
-        )
 
 
-def populate_missing_installation_groups(conn: sqlite3.Connection) -> None:
-    rows = conn.execute(
-        """
-        SELECT id, project_name
-        FROM assets
-        WHERE installation_group IS NULL OR TRIM(installation_group) = ''
-        """
-    ).fetchall()
-    for row in rows:
-        conn.execute(
-            "UPDATE assets SET installation_group = ? WHERE id = ?",
-            (infer_installation_group(row["project_name"]), row["id"]),
-        )
 
 
 def status_rank(status: str) -> int:
@@ -12850,231 +11790,6 @@ def apply_invoice_to_tariff(conn: sqlite3.Connection, invoice_document_id: int) 
         valid_to=normalize_date(invoice["billing_period_end"]).isoformat() if invoice["billing_period_end"] else "",
         notes=f"Criada a partir da fatura {invoice['invoice_number'] or invoice_document_id}",
     )
-
-
-def build_visits_by_ticket(visits: list[sqlite3.Row]) -> dict[int, list[sqlite3.Row]]:
-    visits_by_ticket: dict[int, list[sqlite3.Row]] = {}
-    for visit in visits:
-        visits_by_ticket.setdefault(visit["ticket_id"], []).append(visit)
-    return visits_by_ticket
-
-
-def normalize_calendar_month(value: str | None) -> str:
-    if value:
-        try:
-            return datetime.strptime(value.strip(), "%Y-%m").strftime("%Y-%m")
-        except ValueError:
-            pass
-    return date.today().strftime("%Y-%m")
-
-
-def normalize_optional_date(value: str | None) -> str:
-    if not value:
-        return ""
-    try:
-        return datetime.strptime(value.strip(), "%Y-%m-%d").date().isoformat()
-    except ValueError:
-        return ""
-
-
-def parse_positive_int(value: str | None, default: int = 0) -> int:
-    try:
-        parsed = int(float(value or ""))
-    except (TypeError, ValueError):
-        return default
-    return max(parsed, 0)
-
-
-def normalize_choice(value: str | None, choices: list[str], default: str) -> str:
-    value = (value or "").strip()
-    return value if value in choices else default
-
-
-def calendar_month_bounds(month_value: str) -> tuple[date, date, str, str]:
-    month_start = datetime.strptime(month_value, "%Y-%m").date().replace(day=1)
-    _, last_day = calendar.monthrange(month_start.year, month_start.month)
-    month_end = month_start.replace(day=last_day)
-    previous_month_date = (month_start - timedelta(days=1)).replace(day=1)
-    next_month_date = (month_end + timedelta(days=1)).replace(day=1)
-    return month_start, month_end, previous_month_date.strftime("%Y-%m"), next_month_date.strftime("%Y-%m")
-
-
-def build_error_calendar(month_value: str, records: list[sqlite3.Row]) -> dict[str, Any]:
-    month_start, month_end, _, _ = calendar_month_bounds(month_value)
-    records_by_day: dict[str, list[sqlite3.Row]] = {}
-    for record in records:
-        records_by_day.setdefault(record["record_date"], []).append(record)
-
-    weeks = []
-    week = []
-    for _ in range(month_start.weekday()):
-        week.append({"date": None, "records": []})
-
-    current_day = month_start
-    while current_day <= month_end:
-        iso_day = current_day.isoformat()
-        week.append({"date": current_day, "records": records_by_day.get(iso_day, [])})
-        if len(week) == 7:
-            weeks.append(week)
-            week = []
-        current_day += timedelta(days=1)
-
-    if week:
-        while len(week) < 7:
-            week.append({"date": None, "records": []})
-        weeks.append(week)
-
-    return {
-        "label": f"{MONTH_NAMES_PT[month_start.month]} {month_start.year}",
-        "weeks": weeks,
-        "record_count": sum(len(rows) for rows in records_by_day.values()),
-    }
-
-
-def build_intervention_calendar(month_value: str, records: list[sqlite3.Row]) -> dict[str, Any]:
-    month_start, month_end, _, _ = calendar_month_bounds(month_value)
-    records_by_day: dict[str, list[sqlite3.Row]] = {}
-    for record in records:
-        planned_date = record["planned_date"]
-        if planned_date:
-            records_by_day.setdefault(planned_date, []).append(record)
-
-    weeks = []
-    week = []
-    for _ in range(month_start.weekday()):
-        week.append({"date": None, "records": []})
-
-    current_day = month_start
-    while current_day <= month_end:
-        iso_day = current_day.isoformat()
-        week.append({"date": current_day, "records": records_by_day.get(iso_day, [])})
-        if len(week) == 7:
-            weeks.append(week)
-            week = []
-        current_day += timedelta(days=1)
-
-    if week:
-        while len(week) < 7:
-            week.append({"date": None, "records": []})
-        weeks.append(week)
-
-    return {
-        "label": f"{MONTH_NAMES_PT[month_start.month]} {month_start.year}",
-        "weeks": weeks,
-        "record_count": sum(len(rows) for rows in records_by_day.values()),
-    }
-
-
-def intervention_ready_for_route(row: sqlite3.Row | dict[str, Any]) -> bool:
-    if row["status"] == "Fechado":
-        return False
-    if row["material_status"] == "Bloqueado":
-        return False
-    if row["latitude"] is None or row["longitude"] is None:
-        return False
-    if row["coordinates_confidence"] in {"suspect", "review"}:
-        return False
-    return True
-
-
-def build_asset_error_calendar(month_value: str, records: list[sqlite3.Row]) -> dict[str, Any]:
-    month_start, month_end, _, _ = calendar_month_bounds(month_value)
-    events_by_day: dict[str, list[dict[str, Any]]] = {}
-    previous_problem = False
-
-    for record in records:
-        record_date = record["record_date"]
-        status = record["status"]
-        is_problem = status in PROBLEM_MONITORING_STATUSES
-        event_type = ""
-        event_label = ""
-
-        if is_problem and not previous_problem:
-            event_type = "start"
-            event_label = "Apareceu"
-        elif is_problem:
-            event_type = "active"
-            event_label = "Mantem-se"
-        elif previous_problem:
-            event_type = "end"
-            event_label = "Desapareceu"
-
-        if month_start.isoformat() <= record_date <= month_end.isoformat() and event_type:
-            events_by_day.setdefault(record_date, []).append(
-                {
-                    "status": status,
-                    "label": event_label,
-                    "type": event_type,
-                    "notes": record["notes"],
-                    "source": record["source"],
-                    "record_id": record["id"],
-                }
-            )
-
-        previous_problem = is_problem
-
-    weeks = []
-    week = []
-    for _ in range(month_start.weekday()):
-        week.append({"date": None, "events": []})
-
-    current_day = month_start
-    while current_day <= month_end:
-        iso_day = current_day.isoformat()
-        week.append({"date": current_day, "events": events_by_day.get(iso_day, [])})
-        if len(week) == 7:
-            weeks.append(week)
-            week = []
-        current_day += timedelta(days=1)
-
-    if week:
-        while len(week) < 7:
-            week.append({"date": None, "events": []})
-        weeks.append(week)
-
-    return {
-        "label": f"{MONTH_NAMES_PT[month_start.month]} {month_start.year}",
-        "weeks": weeks,
-        "event_count": sum(len(rows) for rows in events_by_day.values()),
-    }
-
-
-def group_tickets_by_asset(tickets: list[sqlite3.Row]) -> list[dict[str, Any]]:
-    grouped: dict[int, dict[str, Any]] = {}
-    for ticket in tickets:
-        asset_id = int(ticket["asset_id"])
-        bucket = grouped.setdefault(
-            asset_id,
-            {
-                "asset_id": asset_id,
-                "project_name": ticket["project_name"],
-                "location": ticket["location"],
-                "active_contract": ticket["active_contract"],
-                "contract_type": ticket["contract_type"],
-                "tickets": [],
-            },
-        )
-        bucket["tickets"].append(ticket)
-
-    ordered = []
-    for asset_id, bucket in grouped.items():
-        tickets_list = bucket["tickets"]
-        bucket["open_count"] = sum(1 for ticket in tickets_list if ticket["status"] != "Fechado")
-        bucket["critical_count"] = sum(
-            1 for ticket in tickets_list if ticket["urgency"] == "Critica" and ticket["status"] != "Fechado"
-        )
-        bucket["last_update"] = max(ticket["updated_at"] for ticket in tickets_list)
-        ordered.append(bucket)
-
-    ordered.sort(
-        key=lambda item: (
-            0 if item["active_contract"] == "yes" else 1,
-            -item["critical_count"],
-            -item["open_count"],
-            item["project_name"].lower(),
-        )
-    )
-    return ordered
 
 
 def ensure_predefined_export_templates(conn: sqlite3.Connection) -> None:

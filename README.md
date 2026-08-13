@@ -49,13 +49,18 @@ explicitamente `python app.py --host 0.0.0.0`.
 ## Estrutura
 
 - `app.py`: entrypoint WSGI/CLI compatível para Docker e execução local.
-- `monitoring_board/app_factory.py`: composição da aplicação e fluxos ainda em extração.
+- `monitoring_board/app_factory.py`: composition root da aplicação; concentra bootstrap e liga temporariamente os fluxos legacy ainda em extração.
 - `monitoring_board/web.py`: configuração Flask, lifecycle HTTP, segurança CSRF e respostas de erro.
 - `monitoring_board/schema.py`: interface pública para criação/upgrade idempotente da base SQLite.
 - `monitoring_board/routes/`: blueprints e grupos de rotas separados, com autenticação em `auth.py`.
+- `monitoring_board/domains/`: slices verticais por domínio. `tickets/` separa HTTP, workflows e SQL; `portfolios/` concentra a gestão de configurações, aliases e import/export; `assets/service.py` concentra grupos de instalação e estado contratual.
 - `monitoring_board/services/`: regras de dominio reutilizaveis, como helpers FusionSolar.
 - `monitoring_board/db.py`: helpers SQLite, backups e queries pequenas.
 - `tests/`: testes basicos de seguranca, DB e services.
+
+As dependências novas seguem `app_factory → routes → services → repositories → db`.
+Os módulos de domínio, services e repositories não importam o composition root;
+um teste AST protege esta boundary durante a migração incremental. O mesmo teste mantém um limite com margem para impedir que o composition root volte a crescer ou receba novas routes legacy.
 
 ## Testes
 

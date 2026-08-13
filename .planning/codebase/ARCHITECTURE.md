@@ -1,12 +1,20 @@
 # Architecture Map
 
+> Historical note (2026-08): this map predates the `app.py` compatibility shim.
+> `app.py` is now only the WSGI/CLI compatibility entrypoint; the legacy
+> monolith is `monitoring_board/app_factory.py`. Treat details below that name
+> `app.py` as historical unless verified against current code. New work follows
+> `app_factory → routes → services → repositories → db`; the first extracted
+> vertical slices are `monitoring_board/domains/tickets/`,
+> `monitoring_board/domains/portfolios/`, and `monitoring_board/domains/assets/`.
+
 ## System Shape
 
-This repository is a server-rendered Flask monitoring board for PV O&M operations. It is organized as a mostly monolithic Flask application in `app.py`, with a small extracted package under `monitoring_board/` for runtime paths, SQLite helpers, security, logging, blueprints, and reusable service helpers.
+This repository is a server-rendered Flask monitoring board for PV O&M operations. It is organized as a mostly monolithic Flask application in `monitoring_board/app_factory.py`, with extracted modules under `monitoring_board/` for runtime paths, SQLite helpers, security, logging, blueprints, reporting, providers, and reusable service helpers.
 
 The dominant pattern is:
 
-- Flask app factory and most route handlers in `app.py`.
+- Flask app factory and most legacy route handlers in `monitoring_board/app_factory.py`.
 - SQLite as the application database, initialized and migrated in application code.
 - Jinja templates in `templates/` render all primary screens.
 - Static CSS and image assets live in `static/`.
@@ -17,8 +25,8 @@ The deployment architecture is intentionally simple: `docker-compose.yml` runs o
 
 ## Entry Points
 
-- `app.py` is the main application module and WSGI entry point. It creates the global `app = create_app()` near the end of the file.
-- `create_app()` in `app.py` builds the Flask app, configures runtime paths, registers blueprints, initializes SQLite, seeds defaults, and starts APScheduler.
+- `app.py` is the WSGI/CLI compatibility entry point and re-exports legacy public symbols for tests and scripts.
+- `create_app()` in `monitoring_board/app_factory.py` builds the Flask app, configures runtime paths, registers routes, initializes SQLite, seeds defaults, and starts APScheduler.
 - Running `python app.py` uses `parse_cli_args()` and `app.run(...)` for local development.
 - Docker/Gunicorn uses `app:app` through the command in `docker-compose.yml`.
 - `monitoring_board/routes/auth.py` registers `/login` and `/logout`.
