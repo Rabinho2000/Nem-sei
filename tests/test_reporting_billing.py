@@ -32,6 +32,7 @@ def config(
     fixed_fee: str = "50",
     electricity_price: str = "0.20",
     export_price: str = "0.05",
+    export_revenue_enabled: bool = True,
 ) -> BillingConfig:
     return BillingConfig(
         report_type=report_type,
@@ -41,6 +42,7 @@ def config(
         fixed_monthly_fee_eur=Decimal(fixed_fee),
         electricity_price_eur_kwh=Decimal(electricity_price),
         export_price_eur_kwh=Decimal(export_price),
+        export_revenue_enabled=export_revenue_enabled,
     )
 
 
@@ -77,6 +79,17 @@ def test_epc_solcor_payment_is_zero() -> None:
 
     assert result.solcor_payment_eur == Decimal("0")
     assert result.net_benefit_eur == result.gross_benefit_eur
+
+
+def test_export_revenue_can_be_disabled_without_hiding_exported_energy() -> None:
+    result = calculate_billing(
+        energy(export="20"),
+        config(export_price="0.05", export_revenue_enabled=False),
+    )
+
+    assert result.exported_energy_kwh == Decimal("20")
+    assert result.export_revenue_eur == Decimal("0")
+    assert "missing_export_price" not in result.warnings
 
 
 def test_grid_import_is_consumption_minus_self_consumption() -> None:

@@ -222,7 +222,7 @@ from monitoring_board.reporting.availability import (
     inverter_availability_slot as reporting_inverter_availability_slot,
     is_inverter_available as reporting_is_inverter_available,
 )
-from monitoring_board.reporting.models import BillingConfig, InvoiceCandidate, InvoiceStatus, ReportPeriodType, ReportType, ReportingPeriod, TariffType
+from monitoring_board.reporting.models import BillingConfig, BillingEnergyBase, InvoiceCandidate, InvoiceStatus, ReportPeriodType, ReportType, ReportingPeriod, TariffType
 from monitoring_board.reporting.periods import (
     ReportingPeriodError,
     build_period,
@@ -417,6 +417,7 @@ TARIFF_WARNING_MESSAGES = {
     "missing_tariff_rules": "A tarifa ainda nao tem horarios configurados.",
     "incomplete_tariff_coverage": "Os horarios nao cobrem todas as horas.",
     "missing_hourly_self_use": "Nao existem dados horarios suficientes para calcular o autoconsumo.",
+    "incomplete_hourly_coverage": "Faltam horas medidas no periodo; a poupanca nao foi estimada.",
     "unclassified_hourly_energy": "Existem registos horarios que nao correspondem a nenhuma regra.",
     "missing_tariff": "Nao existe uma tarifa valida para este periodo.",
     "expired_tariff": "A ultima tarifa terminou antes deste periodo.",
@@ -3193,7 +3194,7 @@ def create_app() -> Flask:
         except ReportingPeriodError as exc:
             flash(str(exc), "error")
             report_period = monthly_period(report_month) if period_type == ReportPeriodType.MONTHLY.value and raw_report_month else monthly_period(date.today().strftime("%Y-%m"))
-        report_assets = get_fusionsolar_report_assets(g.db)
+        report_assets = get_fusionsolar_report_assets(g.db, tariff_moment=report_period.start)
         if selected_asset_id:
             try:
                 validate_report_asset_selection(report_assets, selected_asset_id)
@@ -3208,6 +3209,14 @@ def create_app() -> Flask:
             ),
             "",
         )
+        selected_uses_hourly_tariff = next(
+            (
+                bool(asset.get("uses_hourly_tariff"))
+                for asset in report_assets
+                if selected_asset_id.isdigit() and int(asset["asset_id"]) == int(selected_asset_id)
+            ),
+            False,
+        )
         selected_billing_config = (
             get_asset_billing_config(g.db, int(selected_asset_id), ReportType(selected_report_type))
             if selected_asset_id.isdigit() and selected_report_type
@@ -3217,6 +3226,17 @@ def create_app() -> Flask:
             get_asset_billing_config_row(g.db, int(selected_asset_id)) is not None
             if selected_asset_id.isdigit()
             else False
+        )
+        financial_billing_review_available = bool(
+            selected_asset_id.isdigit()
+            and g.db.execute(
+                """
+                SELECT 1 FROM financial_models
+                WHERE asset_id = ? AND status = 'confirmed' AND active = 1
+                LIMIT 1
+                """,
+                (int(selected_asset_id),),
+            ).fetchone()
         )
         billing_form = billing_config_to_form_values(selected_billing_config)
         active_tab = request.args.get("tab", "generate")
@@ -3314,12 +3334,15 @@ def create_app() -> Flask:
             report_semester="1" if report_period.start.month == 1 else "2",
             electricity_price=request.args.get("electricity_price", billing_form["electricity_price"]),
             sell_price=request.args.get("sell_price", billing_form["sell_price"]),
+            export_revenue_enabled=request.args.get("export_revenue_enabled", billing_form["export_revenue_enabled"]) in {"on", "true", "1"},
             solcor_price_per_kwh=request.args.get("solcor_price_per_kwh", billing_form["solcor_price_per_kwh"]),
             fixed_monthly_fee_eur=billing_form["fixed_monthly_fee_eur"],
             billing_mode=billing_form["billing_mode"],
             billing_energy_base=billing_form["billing_energy_base"],
             include_availability=request.args.get("include_availability") == "on",
             selected_billing_config_exists=selected_billing_config_exists,
+            selected_uses_hourly_tariff=selected_uses_hourly_tariff,
+            financial_billing_review_available=financial_billing_review_available,
             fusionsolar_api_warning=get_fusionsolar_performance_cooldown_reason(g.db),
         )
 
@@ -6867,6 +6890,15 @@ def ensure_database(path: str) -> None:
                 start_time TEXT NOT NULL,
                 end_time TEXT NOT NULL,
                 period_name TEXT NOT NULL,
+                FOREIGN KEY (tariff_id) REFERENCES asset_tariffs(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS tariff_calendar_slots (
+                tariff_id INTEGER NOT NULL,
+                period_start TEXT NOT NULL,
+                period_name TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'financial_model',
+                PRIMARY KEY (tariff_id, period_start),
                 FOREIGN KEY (tariff_id) REFERENCES asset_tariffs(id) ON DELETE CASCADE
             );
 
@@ -10629,7 +10661,12 @@ def build_export_dataset(
     return normalized_rows, headers
 
 
-def get_fusionsolar_report_assets(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+def get_fusionsolar_report_assets(
+    conn: sqlite3.Connection,
+    *,
+    tariff_moment: date | None = None,
+) -> list[dict[str, Any]]:
+    tariff_moment = tariff_moment or date.today()
     rows = query_all(
         conn,
         """
@@ -10658,12 +10695,21 @@ def get_fusionsolar_report_assets(conn: sqlite3.Connection) -> list[dict[str, An
             a.sell_to,
             ai.external_id,
             ai.external_name,
-            ai.provider AS energy_provider
+            ai.provider AS energy_provider,
+            EXISTS (
+                SELECT 1
+                FROM asset_tariffs t
+                WHERE t.asset_id = a.id
+                  AND t.tariff_type != 'simple'
+                  AND (t.valid_from IS NULL OR t.valid_from = '' OR t.valid_from <= ?)
+                  AND (t.valid_to IS NULL OR t.valid_to = '' OR t.valid_to >= ?)
+            ) AS uses_hourly_tariff
         FROM ranked_sources ai
         JOIN assets a ON a.id = ai.asset_id
         WHERE ai.source_rank = 1
         ORDER BY a.project_name COLLATE NOCASE
         """,
+        (tariff_moment.isoformat(), tariff_moment.isoformat()),
     )
     assets = [dict(row) for row in rows]
     for asset in assets:
@@ -11859,6 +11905,22 @@ def execute_persisted_report_generation(
     )
     raw_formats = form.getlist("formats") or ["pdf"]
     run_id: int | None = None
+
+    def with_billing_form_selections(config: BillingConfig) -> BillingConfig:
+        export_revenue_enabled = config.export_revenue_enabled
+        if form.get("export_revenue_configured") == "1":
+            export_revenue_enabled = form.get("export_revenue_enabled") in {"on", "1", 1, True}
+        billing_energy_base = config.billing_energy_base
+        if form.get("charge_total_production") in {"on", "1", 1, True}:
+            billing_energy_base = BillingEnergyBase.TOTAL_PRODUCTION
+        elif form.get("billing_energy_base") in {item.value for item in BillingEnergyBase}:
+            billing_energy_base = BillingEnergyBase(form.get("billing_energy_base"))
+        return replace(
+            config,
+            export_revenue_enabled=export_revenue_enabled,
+            billing_energy_base=billing_energy_base,
+        )
+
     try:
         formats = validate_formats(report_type, raw_formats)
         main_formats = tuple(item for item in formats if item != "zip")
@@ -11881,6 +11943,31 @@ def execute_persisted_report_generation(
             raise ValueError("Pedido sem outputs principais.")
         if len(jobs) > MAX_TOTAL_OUTPUTS:
             raise ValueError("Demasiados outputs no mesmo run.")
+        if report_type == "individual" and any(
+            str(value).strip()
+            for field in ("client_outage_date", "client_outage_kwh", "client_outage_reason")
+            for value in form.getlist(field)
+        ):
+            source = parse_billing_values_source(form.get("billing_values_source", "saved"))
+            for job in jobs:
+                selection = validate_report_asset_selection(
+                    get_fusionsolar_report_assets(conn),
+                    str(job["asset_id"]),
+                )
+                billing_config = (
+                    parse_billing_config_form(dict(form), selection.report_type)
+                    if source == "manual"
+                    else get_asset_billing_config(conn, job["asset_id"], selection.report_type)
+                )
+                if billing_config is None:
+                    raise BillingValidationError("Configuracao de cobranca invalida.")
+                billing_config = with_billing_form_selections(billing_config)
+                parse_client_outage_adjustments(
+                    form,
+                    start=date.fromisoformat(job["period"]["period_start"]),
+                    end=date.fromisoformat(job["period"]["period_end"]),
+                    billing_config=billing_config,
+                )
         first_period = jobs[0]["period"]
         if automation_id:
             duplicate = conn.execute(
@@ -11966,6 +12053,8 @@ def execute_persisted_report_generation(
                             if source == "manual"
                             else get_asset_billing_config(conn, job["asset_id"], selection.report_type)
                         )
+                        if billing_override is not None:
+                            billing_override = with_billing_form_selections(billing_override)
                     report = build_individual_generation_report(
                         conn,
                         job["asset_id"],

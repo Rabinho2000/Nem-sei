@@ -127,3 +127,29 @@ def test_energy_rules_use_self_consumption_and_keep_export_separate() -> None:
     assert missing.total_value_eur is None
     assert "missing_hourly_self_use" in missing.warnings
     assert clamped.total_energy_kwh == Decimal("0")
+
+
+def test_exact_calendar_slots_value_each_hour_and_reject_incomplete_period() -> None:
+    tariff = TariffConfig(
+        tariff_id=1,
+        asset_id=1,
+        tariff_type=TariffType.BI_HOURLY,
+        prices={PERIOD_CHEIA: Decimal("0.20"), PERIOD_VAZIO: Decimal("0.10")},
+        calendar_slots={
+            "2026-01-05T10:00:00": PERIOD_CHEIA,
+            "2026-01-05T11:00:00": PERIOD_VAZIO,
+        },
+    )
+    result = value_tariff_energy(
+        tariff,
+        hourly_records=[
+            hourly(datetime(2026, 1, 5, 10), self_use="2"),
+            hourly(datetime(2026, 1, 5, 11), self_use="3"),
+        ],
+        period_start=datetime(2026, 1, 5).date(),
+        period_end=datetime(2026, 1, 5).date(),
+    )
+
+    assert result.total_value_eur is None
+    assert result.coverage_pct == Decimal("8.333333333333333333333333333")
+    assert "incomplete_hourly_coverage" in result.warnings

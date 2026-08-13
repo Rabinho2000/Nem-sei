@@ -20,7 +20,12 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-from monitoring_board.customer_reports import CustomerReportVisualStyle, build_customer_report_pdf
+from monitoring_board.customer_reports import (
+    CustomerReportVisualStyle,
+    build_customer_report_pdf,
+    client_outage_charge_basis_text,
+    solcor_charge_basis_text,
+)
 from monitoring_board.runtime import BASE_DIR, resolve_runtime_file_path
 from monitoring_board.reporting.financial_quality import PRODUCTION_FINANCIALS_NOT_FINAL_WARNING
 from monitoring_board.reporting.portfolio import METRIC_CATALOG, PortfolioReportResult
@@ -372,9 +377,17 @@ def render_individual_excel(report: dict[str, Any], template: ReportTemplate) ->
     _excel_report_title(summary, template, report, primary, secondary)
     summary.append([])
     summary.append(["Indicadores principais", "Valor", "", "Indicadores financeiros", "Valor"])
+    financial_summary = [("Poupança (EUR)", report.get("savings_eur"))]
+    if report.get("export_revenue_enabled", True):
+        financial_summary.append(("Receita excedente (EUR)", report.get("export_revenue_eur")))
+    financial_summary.extend((
+        ("Pagamento Solcor (EUR)", report.get("solcor_payment_eur")),
+        ("Benefício líquido (EUR)", report.get("net_benefit_eur")),
+        ("Cobertura (%)", report.get("coverage_pct")),
+    ))
     for left, right in zip(
         (("Produção total (kWh)", report.get("production_kwh")), ("Autoconsumo (kWh)", report.get("self_use_kwh")), ("Excedente (kWh)", report.get("export_kwh")), ("Consumo (kWh)", report.get("consumption_kwh")), ("Importação rede (kWh)", report.get("grid_import_kwh"))),
-        (("Poupança (EUR)", report.get("savings_eur")), ("Receita excedente (EUR)", report.get("export_revenue_eur")), ("Pagamento Solcor (EUR)", report.get("solcor_payment_eur")), ("Benefício líquido (EUR)", report.get("net_benefit_eur")), ("Cobertura (%)", report.get("coverage_pct"))),
+        financial_summary,
     ):
         summary.append([left[0], left[1], "", right[0], right[1]])
     _excel_table_style(summary, 8, 13, primary, secondary, widths={"A": 27, "B": 16, "C": 4, "D": 27, "E": 16})
@@ -405,17 +418,31 @@ def render_individual_excel(report: dict[str, Any], template: ReportTemplate) ->
     financial = workbook.create_sheet("Financeiro")
     _excel_sheet_heading(financial, "Resumo financeiro", primary)
     financial.append(["Metrica", "Valor"])
-    for key in ("savings_eur", "export_revenue_eur", "solcor_payment_eur", "fixed_monthly_fee_eur", "net_benefit_eur"):
+    financial_keys = ["savings_eur"]
+    if report.get("export_revenue_enabled", True):
+        financial_keys.append("export_revenue_eur")
+    financial_keys.extend(("solcor_payment_eur", "fixed_monthly_fee_eur", "net_benefit_eur"))
+    for key in financial_keys:
         financial.append([key, report.get(key)])
-    _excel_table_style(financial, 2, 7, primary, secondary, widths={"A": 32, "B": 18})
+    if str(report.get("report_type") or "").casefold() == "esco":
+        financial.append(["Base de cobrança Solcor", solcor_charge_basis_text(report)])
+        financial.append(["Taxa Solcor EUR/kWh", report.get("solcor_price_per_kwh")])
+        financial.append(["Energia faturada à Solcor kWh", report.get("billable_energy_kwh")])
+    _excel_table_style(financial, 2, financial.max_row, primary, secondary, widths={"A": 36, "B": 44})
     adjustments = list(report.get("client_outage_adjustments") or [])
     if adjustments:
         outage = workbook.create_sheet("Indisponibilidade cliente")
         _excel_sheet_heading(outage, "Indisponibilidade imputável ao cliente", primary)
         outage.append(["Data", "Produção estimada kWh", "Motivo", "Cobrança EUR"])
         for item in adjustments:
-            outage.append([item.get("date"), item.get("estimated_kwh"), item.get("reason"), None])
+            outage.append([
+                item.get("date"),
+                item.get("estimated_kwh"),
+                item.get("reason"),
+                float(item.get("estimated_kwh") or 0) * float(report.get("solcor_price_per_kwh") or 0),
+            ])
         outage.append(["Total", report.get("client_outage_billable_kwh"), "", report.get("client_outage_charge_eur")])
+        outage.append(["Cálculo", client_outage_charge_basis_text(report), "", ""])
         _excel_table_style(outage, 2, outage.max_row, primary, secondary, widths={"A": 18, "B": 24, "C": 60, "D": 18})
     quality = workbook.create_sheet("Qualidade dos dados")
     _excel_sheet_heading(quality, "Qualidade dos dados", primary)
@@ -519,6 +546,8 @@ def individual_rows(report: dict[str, Any]) -> list[list[str]]:
         ("Beneficio liquido", "net_benefit_eur"),
     ):
         rows.append([label, str(report.get(key, "dados indisponiveis"))])
+    if str(report.get("report_type") or "").casefold() == "esco":
+        rows.append(["Base de cobrança Solcor", solcor_charge_basis_text(report) or "Dados indisponiveis"])
     return rows
 
 
@@ -532,8 +561,14 @@ def individual_section_rows(report: dict[str, Any], key: str) -> list[list[str]]
         "self_consumption": [["Metrica", "Valor"], ["Autoconsumo", report.get("self_use_kwh") or "Dados indisponiveis"], ["Taxa", report.get("autoconsumption_pct") or "Dados indisponiveis"]],
         "financial": [
             ["Metrica", "Valor"], ["Poupanca", report.get("savings_eur") or "Dados indisponiveis"],
+            *(
+                [["Base de cobrança Solcor", solcor_charge_basis_text(report) or "Dados indisponiveis"]]
+                if str(report.get("report_type") or "").casefold() == "esco"
+                else []
+            ),
             ["Pagamento medido à Solcor", report.get("measured_solcor_payment_eur", report.get("solcor_payment_eur"))],
             ["Ajuste por indisponibilidade", report.get("client_outage_charge_eur") or 0],
+            ["Pagamento total à Solcor", report.get("solcor_payment_eur") or 0],
             ["Beneficio liquido", report.get("net_benefit_eur") or "Dados indisponiveis"],
             *([["Dia imputado", f"{item.get('date')} · {item.get('estimated_kwh')} kWh · {item.get('reason') or '-'}"] for item in report.get("client_outage_adjustments") or []]),
         ],

@@ -9,6 +9,9 @@
   {% if fusionsolar_api_warning %}
     <div class="reports-notice warning"><strong>FusionSolar:</strong> {{ fusionsolar_api_warning }}</div>
   {% endif %}
+  {% if generation_report_type == 'individual' and selected_asset_id and not selected_billing_config_exists %}
+    <div class="reports-notice warning"><strong>Cálculo financeiro por configurar.</strong> Sem uma configuração de faturação guardada, os valores de poupança, excedente e pagamento podem ficar a 0,00 €.{% if financial_billing_review_available %} <a href="{{ url_for('financial_model_billing_review', asset_id=selected_asset_id) }}">Rever e aplicar valores do modelo financeiro</a>.{% endif %}</div>
+  {% endif %}
 
   <form id="reports-generate-form" class="stack-form" method="post" action="{{ url_for('report_generation') }}">
     <fieldset class="reports-segmented">
@@ -22,7 +25,7 @@
         <select name="asset_id" id="report-asset" required>
           <option value="">Escolher instalação</option>
           {% for asset in report_assets %}
-            <option value="{{ asset.asset_id }}" data-report-type="{{ asset.report_type }}" {{ 'selected' if selected_asset_id|string == asset.asset_id|string else '' }}>
+            <option value="{{ asset.asset_id }}" data-report-type="{{ asset.report_type }}" data-hourly-tariff="{{ 'true' if asset.uses_hourly_tariff else 'false' }}" {{ 'selected' if selected_asset_id|string == asset.asset_id|string else '' }}>
               {{ asset.project_name }}{% if asset.external_name and asset.external_name != asset.project_name %} · {{ asset.external_name }}{% endif %}
             </option>
           {% endfor %}
@@ -98,7 +101,7 @@
             <option value="fixed_monthly_fee" {{ 'selected' if billing_mode == 'fixed_monthly_fee' }}>Mensalidade fixa</option>
           </select>
         </label>
-        <label for="electricity-price">Preço eletricidade EUR/kWh
+        <label id="electricity-price-field" for="electricity-price" {{ 'hidden' if selected_uses_hourly_tariff else '' }}>Preço médio de fallback EUR/kWh
           <input id="electricity-price" type="number" step="0.00001" min="0" name="electricity_price" value="{{ electricity_price }}">
         </label>
         <label for="sell-price">Venda de excedente EUR/kWh
@@ -112,19 +115,25 @@
         </label>
       </div>
       <div class="reports-checks">
+        <input type="hidden" name="export_revenue_configured" value="1">
+        <label class="check-row"><input type="checkbox" name="export_revenue_enabled" {{ 'checked' if export_revenue_enabled }}><span>Incluir venda de excedente à rede</span></label>
         <label class="check-row" id="charge-total-production-field">
           <input type="checkbox" name="charge_total_production" {{ 'checked' if billing_energy_base == 'total_production' }}>
           <input type="hidden" name="billing_energy_base" id="billing-energy-base" value="{{ billing_energy_base }}">
-          <span>Cobrar também o excedente</span>
+          <span>Cobrar à Solcor sobre a produção total (inclui excedente)</span>
         </label>
         <label class="check-row"><input type="checkbox" name="force_api"><span>Atualizar diretamente da FusionSolar</span></label>
         <label class="check-row"><input type="checkbox" name="include_availability" {{ 'checked' if include_availability }}><span>Incluir disponibilidade</span></label>
         <label class="check-row"><input type="checkbox" name="formats" value="excel"><span>Gerar também Excel</span></label>
         <input type="hidden" name="formats" value="pdf">
       </div>
+      <p class="reports-notice info" id="hourly-tariff-notice" {{ 'hidden' if not selected_uses_hourly_tariff else '' }}>
+        A poupança é calculada pelos preços de ponta, cheia, vazio e super vazio da tarifa guardada. O preço médio de eletricidade não é usado neste relatório.
+      </p>
       <fieldset class="client-outage-adjustments" data-report-scope="individual" id="client-outage-adjustments">
         <legend>Cobrança por indisponibilidade imputável ao cliente</legend>
         <p class="muted">Temporário neste relatório: não altera a produção real nem fica guardado.</p>
+        <p class="reports-notice warning" data-client-outage-period-error hidden></p>
         <div data-client-outage-rows></div>
         <button class="button secondary small" type="button" data-add-client-outage>Adicionar dia</button>
       </fieldset>

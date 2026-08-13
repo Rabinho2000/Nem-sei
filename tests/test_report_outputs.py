@@ -851,6 +851,52 @@ def test_missing_individual_asset_is_rejected_without_persistence(tmp_path: Path
         assert conn.execute("SELECT COUNT(*) FROM report_generated_files").fetchone()[0] == 0
 
 
+def test_outage_outside_report_period_is_rejected_before_creating_run(tmp_path: Path) -> None:
+    db_path = tmp_path / "outage-period-validation.db"
+    ensure_database(str(db_path))
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        asset_id = add_asset(conn, "ESCO outage validation")
+        conn.execute("UPDATE assets SET contract_type = 'ESCO' WHERE id = ?", (asset_id,))
+        add_fusionsolar_integration(conn, asset_id, "ESCO outage validation")
+        template_id = next(
+            row["id"]
+            for row in list_templates(conn, "individual")
+            if row["name"] == "Individual padrao"
+        )
+        conn.commit()
+
+    with report_test_client(db_path) as client:
+        response = client.post(
+            "/report-generation",
+            data={
+                "csrf_token": "token",
+                "report_type": "individual",
+                "asset_id": str(asset_id),
+                "template_id": str(template_id),
+                "period_type": "monthly",
+                "report_month": "2026-08",
+                "formats": ["pdf"],
+                "billing_values_source": "manual",
+                "billing_mode": "energy",
+                "billing_energy_base": "self_consumption",
+                "solcor_price_per_kwh": "0.086",
+                "electricity_price": "0.18",
+                "sell_price": "0.045",
+                "client_outage_date": "2026-07-24",
+                "client_outage_kwh": "632.39",
+                "client_outage_reason": "Instalação desligada pelo cliente",
+            },
+            follow_redirects=True,
+        )
+
+    assert response.status_code == 200
+    assert "A data de indisponibilidade tem de pertencer ao período do relatório." in response.get_data(as_text=True)
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM report_generation_runs").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM report_generated_files").fetchone()[0] == 0
+
+
 def test_portfolio_generation_preserves_portfolio_scope_without_asset_leak(
     tmp_path: Path,
     monkeypatch,
@@ -944,7 +990,15 @@ def test_report_scope_changes_only_replace_browser_url(tmp_path: Path) -> None:
     assert "window.history.replaceState" in script
     assert "select[name='asset_id']" in script
     assert "select[name='portfolio_id']" in script
-    assert "fetch(" not in script
+    assert "window.fetch" in script
+    assert 'form.getAttribute("action")' in script
+    assert "form.noValidate = true" in script
+    assert "URL.createObjectURL" in script
+    assert "#hourly-tariff-notice" in script
+    assert "validateClientOutagePeriod" in script
+    assert "export_revenue_enabled" in script
+    assert "data-client-outage-period-error" in page
+    assert 'name="export_revenue_enabled"' in page
     assert 'name="action" value="save_billing_config"' in page
 
 

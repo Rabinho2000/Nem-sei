@@ -157,7 +157,7 @@ def validate_tariff_config(config: TariffConfig) -> tuple[str, ...]:
     }[config.tariff_type]
     if any(prices.get(period) is not None for period in incompatible):
         raise TariffValidationError("Precos incompativeis com o tipo de tarifa.")
-    if config.tariff_type != TariffType.SIMPLE and not config.rules:
+    if config.tariff_type != TariffType.SIMPLE and not config.rules and not config.calendar_slots:
         return ("missing_tariff_rules",)
     return validate_rules(config.rules, config.tariff_type)
 
@@ -256,7 +256,10 @@ def value_tariff_energy(
     unclassified = 0
     missing_self_use = False
     for record in records:
-        period = classify_tariff_period(record.period_start, config.rules)
+        period = (
+            (config.calendar_slots or {}).get(record.period_start.isoformat(timespec="seconds"))
+            or classify_tariff_period(record.period_start, config.rules)
+        )
         if record.production_kwh is not None and period:
             production_by_period[period] += record.production_kwh
         if not period:
@@ -285,7 +288,19 @@ def value_tariff_energy(
         breakdown.append(TariffPeriodBreakdown(period, energy_by_period[period], production_by_period[period], price, value))
     expected = _expected_slot_count(records, period_start, period_end)
     coverage = (Decimal(classified) / Decimal(expected) * HUNDRED) if expected else ZERO
-    total_value = None if missing_self_use or missing_price or not records else total
+    # An exact calendar imported from a financial model must cover the whole
+    # report period; otherwise its exact pricing claim would be misleading.
+    # Generic rule-based tariffs retain their existing partial-preview use.
+    incomplete_coverage = bool(
+        config.calendar_slots
+        and period_start is not None
+        and period_end is not None
+        and expected
+        and coverage < HUNDRED
+    )
+    if incomplete_coverage:
+        warnings.append("incomplete_hourly_coverage")
+    total_value = None if missing_self_use or missing_price or not records or incomplete_coverage else total
     return TariffValuationResult(
         tariff_type=config.tariff_type,
         total_energy_kwh=sum(energy_by_period.values(), ZERO),
@@ -328,6 +343,10 @@ def with_billing_fallback(
     default_price: Decimal,
 ) -> TariffValuationResult:
     if result.total_value_eur is not None:
+        return result
+    # A tarifa horaria exige medicao por hora. Usar um preco medio nestes casos
+    # apresentaria uma poupanca aparentemente exata, mas sem base nos dados.
+    if result.tariff_type not in (None, TariffType.SIMPLE):
         return result
     value = self_use_kwh * default_price
     warnings = tuple(sorted({*result.warnings, "missing_tariff"}))

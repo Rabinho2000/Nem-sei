@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -71,12 +72,18 @@ def ensure_billing_config_schema(conn: sqlite3.Connection) -> None:
             fixed_monthly_fee_eur TEXT NOT NULL DEFAULT '0',
             default_electricity_price TEXT NOT NULL DEFAULT '0',
             default_export_price TEXT NOT NULL DEFAULT '0',
+            export_revenue_enabled INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE
         )
         """
     )
+    columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(asset_billing_configs)")}
+    if "export_revenue_enabled" not in columns:
+        conn.execute(
+            "ALTER TABLE asset_billing_configs ADD COLUMN export_revenue_enabled INTEGER NOT NULL DEFAULT 1"
+        )
 
 
 def default_billing_config(report_type: ReportType) -> BillingConfig:
@@ -94,6 +101,9 @@ def row_to_billing_config(row: sqlite3.Row | dict[str, Any] | None, report_type:
         billing_energy_base = BillingEnergyBase(str(row["billing_energy_base"] or BillingEnergyBase.SELF_CONSUMPTION.value))
     except ValueError:
         billing_energy_base = BillingEnergyBase.SELF_CONSUMPTION
+    export_revenue_enabled = True
+    if "export_revenue_enabled" in row.keys():
+        export_revenue_enabled = str(row["export_revenue_enabled"] or "0").strip().casefold() not in {"0", "false", "off", "no"}
     return BillingConfig(
         report_type=report_type,
         billing_mode=billing_mode,
@@ -102,6 +112,7 @@ def row_to_billing_config(row: sqlite3.Row | dict[str, Any] | None, report_type:
         fixed_monthly_fee_eur=decimal_from_value(row["fixed_monthly_fee_eur"]),
         electricity_price_eur_kwh=decimal_from_value(row["default_electricity_price"]),
         export_price_eur_kwh=decimal_from_value(row["default_export_price"]),
+        export_revenue_enabled=export_revenue_enabled,
     )
 
 
@@ -128,8 +139,8 @@ def upsert_asset_billing_config(
         INSERT INTO asset_billing_configs (
             asset_id, billing_mode, billing_energy_base, solcor_price_per_kwh,
             fixed_monthly_fee_eur, default_electricity_price, default_export_price,
-            created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            export_revenue_enabled, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(asset_id) DO UPDATE SET
             billing_mode = excluded.billing_mode,
             billing_energy_base = excluded.billing_energy_base,
@@ -137,6 +148,7 @@ def upsert_asset_billing_config(
             fixed_monthly_fee_eur = excluded.fixed_monthly_fee_eur,
             default_electricity_price = excluded.default_electricity_price,
             default_export_price = excluded.default_export_price,
+            export_revenue_enabled = excluded.export_revenue_enabled,
             updated_at = excluded.updated_at
         """,
         (
@@ -147,6 +159,7 @@ def upsert_asset_billing_config(
             str(config.fixed_monthly_fee_eur),
             str(config.electricity_price_eur_kwh),
             str(config.export_price_eur_kwh),
+            1 if config.export_revenue_enabled else 0,
             now,
             now,
         ),
@@ -161,6 +174,7 @@ def billing_config_to_form_values(config: BillingConfig) -> dict[str, str]:
         "fixed_monthly_fee_eur": str(config.fixed_monthly_fee_eur),
         "electricity_price": str(config.electricity_price_eur_kwh),
         "sell_price": str(config.export_price_eur_kwh),
+        "export_revenue_enabled": "on" if config.export_revenue_enabled else "off",
     }
 
 
@@ -585,6 +599,7 @@ def row_to_tariff_config(row: sqlite3.Row | dict[str, Any] | None, rules: list[s
         valid_to=parse_date_optional(_row_get(row, "valid_to")),
         prices=prices,
         rules=parsed_rules,
+        calendar_slots=None,
         invoice_file_id=int(_row_get(row, "invoice_file_id")) if _row_get(row, "invoice_file_id") is not None else None,
         notes=str(_row_get(row, "notes") or ""),
     )
@@ -604,7 +619,21 @@ def get_tariff_config_for_date(conn: sqlite3.Connection, *, asset_id: int, momen
     if row is None:
         return None
     rules = list_tariff_period_rules(conn, int(row["id"]))
-    return row_to_tariff_config(row, rules)
+    config = row_to_tariff_config(row, rules)
+    if config is None or config.tariff_id is None:
+        return config
+    return replace(config, calendar_slots=get_tariff_calendar_slots(conn, config.tariff_id) or None)
+
+
+def get_tariff_calendar_slots(conn: sqlite3.Connection, tariff_id: int) -> dict[str, str]:
+    return {
+        str(item["period_start"]): str(item["period_name"])
+        for item in query_all(
+            conn,
+            "SELECT period_start, period_name FROM tariff_calendar_slots WHERE tariff_id = ?",
+            (tariff_id,),
+        )
+    }
 
 
 def get_tariff_resolution_warnings(conn: sqlite3.Connection, *, asset_id: int, moment: date | datetime) -> tuple[str, ...]:

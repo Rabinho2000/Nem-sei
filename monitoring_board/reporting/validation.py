@@ -57,6 +57,12 @@ def parse_billing_values_source(value: Any) -> str:
 def parse_billing_config_form(data: dict[str, Any], report_type: ReportType) -> BillingConfig:
     billing_mode = parse_billing_mode(data.get("billing_mode"))
     billing_energy_base = parse_billing_energy_base(data.get("billing_energy_base"))
+    export_revenue_enabled = (
+        str(data.get("export_revenue_enabled", "") or "").strip().casefold()
+        not in {"0", "false", "off", "no", ""}
+        if str(data.get("export_revenue_configured", "") or "") == "1"
+        else True
+    )
     return BillingConfig(
         report_type=report_type,
         billing_mode=billing_mode,
@@ -65,6 +71,7 @@ def parse_billing_config_form(data: dict[str, Any], report_type: ReportType) -> 
         fixed_monthly_fee_eur=parse_nonnegative_decimal_field(data, "fixed_monthly_fee_eur"),
         electricity_price_eur_kwh=parse_nonnegative_decimal_field(data, "electricity_price"),
         export_price_eur_kwh=parse_nonnegative_decimal_field(data, "sell_price"),
+        export_revenue_enabled=export_revenue_enabled,
     )
 
 

@@ -187,6 +187,137 @@ def test_sigenergy_history_item_list_materializes_hourly_energy(tmp_path) -> Non
     assert all(row["data_quality"] == "complete" for row in hourly_rows)
 
 
+def test_sigenergy_hourly_history_rejects_conflicting_daily_total(tmp_path) -> None:
+    db_path = tmp_path / "sigenergy-hourly-conflict.db"
+    ensure_database(str(db_path))
+    payload = {
+        "powerGenerationKwh": 0.0,
+        "powerUseKwh": 0.0,
+        "powerOneselfKwh": 0.0,
+        "powerToGridKwh": 0.0,
+        "powerFromGridKwh": 0.0,
+        "itemList": [
+            {
+                "dataTime": "20260724 00:00",
+                "powerGeneration": 0.0,
+                "powerUse": 0.0,
+                "powerOneself": 0.0,
+                "powerToGrid": 0.0,
+                "powerFromGrid": 0.0,
+            },
+            {
+                "dataTime": "20260724 01:00",
+                "powerGeneration": 1.0,
+                "powerUse": 1.0,
+                "powerOneself": 1.0,
+                "powerToGrid": 0.0,
+                "powerFromGrid": 0.0,
+            },
+        ],
+    }
+    with get_db(str(db_path)) as conn:
+        asset_id = _sigenergy_asset(conn, "Sigenergy Conflito")
+        fact = parse_sigenergy_daily_history(
+            payload,
+            system_id=f"SIG-{asset_id}",
+            period_date=date(2026, 7, 24),
+            confirmed_unit="kWh",
+        )
+        persist_sigenergy_daily_history(conn, asset_id=asset_id, fact=fact)
+        hourly_count = conn.execute(
+            "SELECT COUNT(*) FROM production_hourly_records WHERE asset_id = ?",
+            (asset_id,),
+        ).fetchone()[0]
+
+    assert hourly_count == 0
+
+
+def test_sigenergy_hourly_history_reconciles_full_day_counter_correction(tmp_path) -> None:
+    db_path = tmp_path / "sigenergy-hourly-reconciled.db"
+    ensure_database(str(db_path))
+    payload = {
+        "powerGenerationKwh": 10.0,
+        "powerUseKwh": 10.0,
+        "powerOneselfKwh": 10.0,
+        "powerToGridKwh": 0.0,
+        "powerFromGridKwh": 0.0,
+        "itemList": [
+            {
+                "dataTime": f"20260724 {hour:02d}:00",
+                "powerGeneration": 12.0 if hour == 1 else 10.0 if hour > 1 else 0.0,
+                "powerUse": 12.0 if hour == 1 else 10.0 if hour > 1 else 0.0,
+                "powerOneself": 12.0 if hour == 1 else 10.0 if hour > 1 else 0.0,
+                "powerToGrid": 0.0,
+                "powerFromGrid": 0.0,
+            }
+            for hour in range(24)
+        ],
+    }
+    with get_db(str(db_path)) as conn:
+        asset_id = _sigenergy_asset(conn, "Sigenergy Reconciliada")
+        fact = parse_sigenergy_daily_history(
+            payload,
+            system_id=f"SIG-{asset_id}",
+            period_date=date(2026, 7, 24),
+            confirmed_unit="kWh",
+        )
+        persist_sigenergy_daily_history(conn, asset_id=asset_id, fact=fact)
+        hourly_rows = conn.execute(
+            "SELECT production_kwh, self_use_kwh, data_quality FROM production_hourly_records WHERE asset_id = ?",
+            (asset_id,),
+        ).fetchall()
+
+    assert len(hourly_rows) == 24
+    assert sum(row["production_kwh"] for row in hourly_rows) == pytest.approx(10.0)
+    assert sum(row["self_use_kwh"] for row in hourly_rows) == pytest.approx(10.0)
+    assert {row["data_quality"] for row in hourly_rows} == {"reconciled"}
+
+
+def test_sigenergy_completed_item_list_overrides_contradictory_zero_daily_total(tmp_path) -> None:
+    db_path = tmp_path / "sigenergy-daily-zero-contradiction.db"
+    ensure_database(str(db_path))
+    payload = {
+        "powerGenerationKwh": 0.0,
+        "powerUseKwh": 0.0,
+        "powerOneselfKwh": 0.0,
+        "powerToGridKwh": 0.0,
+        "powerFromGridKwh": 0.0,
+        "itemList": [
+            {
+                "dataTime": f"20260724 {hour:02d}:00",
+                "powerGeneration": 12.0 if hour >= 12 else 0.0,
+                "powerUse": 20.0 if hour >= 12 else 0.0,
+                "powerOneself": 10.0 if hour >= 12 else 0.0,
+                "powerToGrid": 2.0 if hour >= 12 else 0.0,
+                "powerFromGrid": 10.0 if hour >= 12 else 0.0,
+            }
+            for hour in range(24)
+        ],
+    }
+    with get_db(str(db_path)) as conn:
+        asset_id = _sigenergy_asset(conn, "Sigenergy Daily Zero")
+        fact = parse_sigenergy_daily_history(
+            payload,
+            system_id=f"SIG-{asset_id}",
+            period_date=date(2026, 7, 24),
+            confirmed_unit="kWh",
+        )
+        persist_sigenergy_daily_history(conn, asset_id=asset_id, fact=fact)
+        daily = conn.execute(
+            "SELECT production_kwh, self_use_kwh, export_kwh FROM production_records WHERE asset_id = ? AND period_type = 'day'",
+            (asset_id,),
+        ).fetchone()
+        hourly_total = conn.execute(
+            "SELECT SUM(production_kwh) FROM production_hourly_records WHERE asset_id = ?",
+            (asset_id,),
+        ).fetchone()[0]
+
+    assert daily["production_kwh"] == pytest.approx(12.0)
+    assert daily["self_use_kwh"] == pytest.approx(10.0)
+    assert daily["export_kwh"] == pytest.approx(2.0)
+    assert hourly_total == pytest.approx(12.0)
+
+
 def test_real_kwh_response_flows_client_to_complete_month_and_report(
     tmp_path,
 ) -> None:

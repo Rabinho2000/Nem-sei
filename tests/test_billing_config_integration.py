@@ -115,6 +115,7 @@ def billing_config(
     fixed_fee: str = "25",
     electricity_price: str = "0.20",
     export_price: str = "0.05",
+    export_revenue_enabled: bool = True,
 ) -> BillingConfig:
     return BillingConfig(
         report_type=report_type,
@@ -124,6 +125,7 @@ def billing_config(
         fixed_monthly_fee_eur=Decimal(fixed_fee),
         electricity_price_eur_kwh=Decimal(electricity_price),
         export_price_eur_kwh=Decimal(export_price),
+        export_revenue_enabled=export_revenue_enabled,
     )
 
 
@@ -151,7 +153,7 @@ def test_save_update_and_read_billing_config(tmp_path: Path) -> None:
     asset_id = add_report_asset(conn)
 
     upsert_asset_billing_config(conn, asset_id=asset_id, config=billing_config(solcor_price="0.10"))
-    upsert_asset_billing_config(conn, asset_id=asset_id, config=billing_config(solcor_price="0.12", base=BillingEnergyBase.TOTAL_PRODUCTION))
+    upsert_asset_billing_config(conn, asset_id=asset_id, config=billing_config(solcor_price="0.12", base=BillingEnergyBase.TOTAL_PRODUCTION, export_revenue_enabled=False))
     conn.commit()
 
     row = get_asset_billing_config_row(conn, asset_id)
@@ -161,6 +163,7 @@ def test_save_update_and_read_billing_config(tmp_path: Path) -> None:
     assert conn.execute("SELECT COUNT(*) FROM asset_billing_configs WHERE asset_id = ?", (asset_id,)).fetchone()[0] == 1
     assert config.solcor_price_per_kwh == Decimal("0.12")
     assert config.billing_energy_base is BillingEnergyBase.TOTAL_PRODUCTION
+    assert config.export_revenue_enabled is False
 
 
 def test_missing_billing_config_returns_safe_defaults(tmp_path: Path) -> None:

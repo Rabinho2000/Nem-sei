@@ -82,7 +82,7 @@ def calculate_billing(energy: EnergyBreakdown, config: BillingConfig, *, months_
     )
     grid_import = max(energy.consumption_kwh - energy.self_use_kwh, ZERO)
     savings = energy.self_use_kwh * config.electricity_price_eur_kwh
-    export_revenue = energy.export_kwh * config.export_price_eur_kwh
+    export_revenue = energy.export_kwh * config.export_price_eur_kwh if config.export_revenue_enabled else ZERO
     gross_benefit = savings + export_revenue
     if config.report_type != ReportType.ESCO:
         solcor_payment = ZERO
@@ -99,7 +99,7 @@ def calculate_billing(energy: EnergyBreakdown, config: BillingConfig, *, months_
             warnings.append("missing_fixed_monthly_fee")
     if config.electricity_price_eur_kwh == ZERO:
         warnings.append("missing_electricity_price")
-    if energy.export_kwh > ZERO and config.export_price_eur_kwh == ZERO:
+    if config.export_revenue_enabled and energy.export_kwh > ZERO and config.export_price_eur_kwh == ZERO:
         warnings.append("missing_export_price")
 
     return BillingResult(
@@ -125,4 +125,3 @@ def calculate_billing(energy: EnergyBreakdown, config: BillingConfig, *, months_
         months_count=months,
         warnings=tuple(warnings),
     )
-

@@ -78,6 +78,7 @@ class BillingConfig:
     fixed_monthly_fee_eur: Decimal = Decimal("0")
     electricity_price_eur_kwh: Decimal = Decimal("0")
     export_price_eur_kwh: Decimal = Decimal("0")
+    export_revenue_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -140,6 +141,7 @@ class TariffConfig:
     valid_to: date | None = None
     prices: dict[str, Decimal] | None = None
     rules: tuple[TariffPeriodRule, ...] = ()
+    calendar_slots: dict[str, str] | None = None
     source: str = "stored_tariff"
     invoice_file_id: int | None = None
     notes: str = ""
@@ -216,4 +218,3 @@ class AvailabilityResult:
     available_slots: int
     unavailable_slots: int
     availability_pct: float | None
-

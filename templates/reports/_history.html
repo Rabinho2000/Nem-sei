@@ -13,7 +13,10 @@
             <td>{{ run.period_start or '-' }}</td>
             <td><span class="reports-status {{ run.status }}">{{ report_status_labels.get(run.status, run.status) }}</span></td>
             <td>{{ run.completed_count }}</td><td>{{ run.failed_count }}</td><td>{{ run.created_at }}</td>
-            <td>{% for file in files_by_run.get(run.id, []) if file.status == 'completed' %}<a class="button secondary small" href="{{ url_for('download_generated_report', file_id=file.id) }}">{{ 'Excel' if file.format == 'xlsx' else file.format|upper }} · {{ file.filename }}</a>{% else %}<span class="muted">-</span>{% endfor %}</td>
+            <td>
+              {% for file in files_by_run.get(run.id, []) if file.status == 'completed' %}<a class="button secondary small" href="{{ url_for('download_generated_report', file_id=file.id) }}">{{ 'Excel' if file.format == 'xlsx' else file.format|upper }} · {{ file.filename }}</a>{% else %}<span class="muted">-</span>{% endfor %}
+              {% for file in files_by_run.get(run.id, []) if file.status == 'failed' %}<small class="reports-error">{{ file.error_message or run.error_message or 'Falha sem detalhe.' }}</small>{% endfor %}
+            </td>
           </tr>
         {% else %}
           <tr><td colspan="9" class="muted">Ainda não existem gerações.</td></tr>

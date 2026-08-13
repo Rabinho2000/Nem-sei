@@ -11,7 +11,15 @@ from monitoring_board.customer_reports import (
     REPORT_TYPES,
     build_customer_report_pdf,
     detect_report_type,
+    draw_donut_charts,
     prepare_customer_report,
+    client_outage_charge_basis_text,
+    solcor_charge_basis_text,
+    summary_rows,
+)
+from monitoring_board.reporting.client_outages import (
+    ClientOutageAdjustment,
+    apply_client_outage_adjustments,
 )
 from monitoring_board.reporting.models import BillingConfig, BillingEnergyBase, BillingMode, ReportType
 from monitoring_board.reporting.periods import ReportingPeriodError, build_period, period_from_form
@@ -72,6 +80,19 @@ def test_prepare_esco_report_calculates_payment_and_net_benefit() -> None:
     assert any(label == "Pagamento à Solcor" for label, *_ in REPORT_TYPES["esco"]["summary"])
 
 
+def test_esco_reports_show_the_charge_rate_next_to_solcor_payment() -> None:
+    report = prepare_customer_report(sample_report("ESCO"), solcor_price_per_kwh=0.09)
+
+    assert solcor_charge_basis_text(report) == "Autoconsumo de 80 kWh x 0.09000 €/kWh"
+    text = "\n".join(
+        page.extract_text() or ""
+        for page in PdfReader(BytesIO(build_customer_report_pdf(report))).pages
+    )
+    assert "Autoconsumo de 80 kWh x 0.09000 €/kWh" in text
+    assert "Tarifa Solcor" in text
+    assert "Benefício Total" not in text
+
+
 def test_prepare_epc_report_ignores_solcor_price_and_internal_rows() -> None:
     report = prepare_customer_report(sample_report("EPC"), solcor_price_per_kwh=0.09)
 
@@ -80,6 +101,28 @@ def test_prepare_epc_report_ignores_solcor_price_and_internal_rows() -> None:
     assert report["net_benefit_eur"] == report["total_benefit_eur"]
     assert all("Solcor" not in label for label, *_ in REPORT_TYPES["epc"]["summary"])
     assert all("Líquido" not in label for label, *_ in REPORT_TYPES["epc"]["summary"])
+
+
+def test_report_hides_export_revenue_when_the_client_does_not_sell_to_grid() -> None:
+    report = prepare_customer_report(
+        sample_report("ESCO"),
+        billing_config=BillingConfig(
+            report_type=ReportType.ESCO,
+            solcor_price_per_kwh=Decimal("0.09"),
+            electricity_price_eur_kwh=Decimal("0.20"),
+            export_price_eur_kwh=Decimal("0.05"),
+            export_revenue_enabled=False,
+        ),
+    )
+
+    assert report["export_kwh"] == 20
+    assert report["export_revenue_eur"] == 0
+    assert all(key != "export_revenue_eur" for _, key, _ in summary_rows(report))
+    text = "\n".join(
+        page.extract_text() or ""
+        for page in PdfReader(BytesIO(build_customer_report_pdf(report))).pages
+    )
+    assert "Receita da venda de excedente" not in text
 
 
 def test_prepare_esco_report_can_charge_total_production() -> None:
@@ -98,6 +141,27 @@ def test_prepare_esco_report_can_charge_total_production() -> None:
     assert report["solcor_payment_eur"] == 9
 
 
+def test_esco_summary_separates_client_outage_adjustment() -> None:
+    billing = BillingConfig(
+        report_type=ReportType.ESCO,
+        solcor_price_per_kwh=Decimal("0.09"),
+        electricity_price_eur_kwh=Decimal("0.20"),
+        export_price_eur_kwh=Decimal("0.05"),
+    )
+    report = apply_client_outage_adjustments(
+        prepare_customer_report(sample_report("ESCO"), billing_config=billing),
+        adjustments=(ClientOutageAdjustment(date(2026, 5, 2), Decimal("10")),),
+        billing_config=billing,
+    )
+
+    rows = summary_rows(report)
+
+    assert ("Pagamento à Solcor — produção medida", "measured_solcor_payment_eur", "eur") in rows
+    assert ("Ajuste por indisponibilidade imputável ao cliente", "client_outage_charge_eur", "eur") in rows
+    assert ("Pagamento total à Solcor", "solcor_payment_eur", "eur") in rows
+    assert client_outage_charge_basis_text(report) == "10 kWh x 0.09000 €/kWh"
+
+
 def test_prepare_report_infers_self_use_and_handles_missing_secondary_metrics() -> None:
     raw = sample_report(None)
     raw["self_use_kwh"] = None
@@ -110,6 +174,78 @@ def test_prepare_report_infers_self_use_and_handles_missing_secondary_metrics() 
     assert report["self_use_kwh"] == 75
     assert report["self_sufficiency_pct"] == 0
     assert sum(value for _, value, _ in report["tariff_rows"]) == 0
+
+
+def test_prepare_report_uses_hourly_tariff_breakdown_for_the_visual_chart() -> None:
+    raw = sample_report("ESCO")
+    raw["tariff_period_breakdown"] = [
+        {"period_name": "ponta", "energy_kwh": 12},
+        {"period_name": "cheia", "energy_kwh": 34},
+        {"period_name": "vazio", "energy_kwh": 56},
+        {"period_name": "super_vazio", "energy_kwh": 7},
+    ]
+
+    report = prepare_customer_report(raw)
+
+    assert [(label, value) for label, value, _ in report["tariff_rows"]] == [
+        ("Cheia", 34.0),
+        ("Ponta", 12.0),
+        ("Vazio", 56.0),
+        ("Super vazio", 7.0),
+    ]
+
+
+def test_tariff_donut_does_not_render_overlapping_technical_rows() -> None:
+    raw = sample_report("ESCO")
+    raw["tariff_period_breakdown"] = [
+        {"period_name": "ponta", "energy_kwh": 12, "price_eur_kwh": 0.3, "value_eur": 3.6},
+        {"period_name": "cheia", "energy_kwh": 34, "price_eur_kwh": 0.2, "value_eur": 6.8},
+        {"period_name": "vazio", "energy_kwh": 56, "price_eur_kwh": 0.1, "value_eur": 5.6},
+    ]
+    report = prepare_customer_report(raw)
+    pdf = build_customer_report_pdf(report)
+    text = "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(pdf)).pages)
+
+    assert "Autoconsumo por Período Tarifário" in text
+    assert "simple:" not in text
+
+
+def test_tariff_donut_uses_arc_extents_and_hides_sigenergy_availability_footer_note() -> None:
+    class RecordingCanvas:
+        def __init__(self) -> None:
+            self.wedges = []
+
+        def setFillColor(self, *args, **kwargs): pass
+        def setStrokeColor(self, *args, **kwargs): pass
+        def setLineWidth(self, *args, **kwargs): pass
+        def roundRect(self, *args, **kwargs): pass
+        def circle(self, *args, **kwargs): pass
+        def setFont(self, *args, **kwargs): pass
+        def drawCentredString(self, *args, **kwargs): pass
+        def drawString(self, *args, **kwargs): pass
+        def wedge(self, *args, **kwargs): self.wedges.append(args[-2:])
+
+    raw = sample_report("ESCO")
+    raw["tariff_period_breakdown"] = [
+        {"period_name": "cheia", "energy_kwh": 50},
+        {"period_name": "ponta", "energy_kwh": 20},
+        {"period_name": "vazio", "energy_kwh": 10},
+    ]
+    report = prepare_customer_report(raw)
+    canvas = RecordingCanvas()
+    draw_donut_charts(canvas, report, 20, 26, 802, 112)
+
+    # ReportLab wedges receive (start_angle, angular_extent), not end_angle.
+    assert canvas.wedges[0] == pytest.approx((90, 360))
+    assert canvas.wedges[1] == pytest.approx((90, 288))
+    assert canvas.wedges[2] == pytest.approx((90, 225))
+    assert canvas.wedges[3] == pytest.approx((315, 90))
+    assert canvas.wedges[4] == pytest.approx((45, 45))
+
+    report["availability_error"] = "availability_not_supported_by_provider"
+    report["report_notes"] = ["Disponibilidade nao suportada para a fonte de energia selecionada."]
+    text = "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(build_customer_report_pdf(report))).pages)
+    assert "Disponibilidade nao suportada" not in text
 
 
 def test_both_report_types_render_as_single_page_pdf() -> None:

@@ -94,7 +94,7 @@ REPORT_TYPES: dict[str, dict[str, Any]] = {
             ("Produção Total", "production_kwh", "kwh", NAVY),
             ("Autoconsumo", "self_use_kwh", "kwh", GREEN),
             ("Excedente", "export_kwh", "kwh", NAVY),
-            ("Benefício Total", "total_benefit_eur", "eur", GREEN),
+            ("Poupança na Fatura", "savings_eur", "eur", GREEN),
             ("Pagamento à Solcor", "solcor_payment_eur", "eur", NAVY),
             ("Benefício Líquido", "net_benefit_eur", "eur", ORANGE),
         ),
@@ -125,6 +125,27 @@ REPORT_TYPES: dict[str, dict[str, Any]] = {
         ),
     },
 }
+
+
+def summary_rows(report: dict[str, Any]) -> tuple[tuple[str, str, str], ...]:
+    """Return the financial summary, separating temporary client outages."""
+
+    rows = tuple(
+        row
+        for row in REPORT_TYPES[report["report_type"]]["summary"]
+        if report.get("export_revenue_enabled", True) or row[1] != "export_revenue_eur"
+    )
+    if report["report_type"] != "esco" or not report.get("client_outage_adjustments"):
+        return rows
+    return tuple(row for row in (
+        ("Redução da fatura de eletricidade", "savings_eur", "eur"),
+        ("Receita da venda de excedente", "export_revenue_eur", "eur"),
+        ("Benefício total", "total_benefit_eur", "eur"),
+        ("Pagamento à Solcor — produção medida", "measured_solcor_payment_eur", "eur"),
+        ("Ajuste por indisponibilidade imputável ao cliente", "client_outage_charge_eur", "eur"),
+        ("Pagamento total à Solcor", "solcor_payment_eur", "eur"),
+        ("Benefício líquido", "net_benefit_eur", "eur"),
+    ) if report.get("export_revenue_enabled", True) or row[1] != "export_revenue_eur")
 
 
 def _asset_value(asset: Any, key: str) -> Any:
@@ -194,6 +215,7 @@ def prepare_customer_report(
         fixed_monthly_fee_eur=decimal_from_value(report.get("fixed_monthly_fee_eur")),
         electricity_price_eur_kwh=decimal_from_value(report.get("electricity_price")),
         export_price_eur_kwh=decimal_from_value(report.get("sell_price")),
+        export_revenue_enabled=str(report.get("export_revenue_enabled", True)).strip().casefold() not in {"0", "false", "off", "no"},
     )
     if config.report_type != ReportType(prepared["report_type"]):
         config = BillingConfig(
@@ -204,6 +226,7 @@ def prepare_customer_report(
             fixed_monthly_fee_eur=config.fixed_monthly_fee_eur,
             electricity_price_eur_kwh=config.electricity_price_eur_kwh,
             export_price_eur_kwh=config.export_price_eur_kwh,
+            export_revenue_enabled=config.export_revenue_enabled,
         )
     billing = calculate_customer_billing(
         EnergyBreakdown(
@@ -246,6 +269,7 @@ def prepare_customer_report(
         consumption_kwh=decimal_to_float(consumption_decimal) if report.get("consumption_kwh") is not None else None,
         savings_eur=decimal_to_float(savings_eur),
         export_revenue_eur=decimal_to_float(billing.export_revenue_eur),
+        export_revenue_enabled=config.export_revenue_enabled,
         total_benefit_eur=decimal_to_float(gross_benefit_eur),
         gross_benefit_eur=decimal_to_float(gross_benefit_eur),
         solcor_price_per_kwh=decimal_to_float(billing.solcor_price_per_kwh),
@@ -300,11 +324,18 @@ def prepare_customer_report(
         message = warning_messages.get(warning)
         if message:
             prepared["report_notes"].append(message)
+    # Current reports carry the real hourly valuation as a period breakdown.
+    # Keep the older flat fields as a fallback for historical report payloads.
+    breakdown_by_period = {
+        str(item.get("period_name") or "").strip().casefold(): _number(item.get("energy_kwh"))
+        for item in prepared["tariff_period_breakdown"]
+        if isinstance(item, dict)
+    }
     prepared["tariff_rows"] = [
-        ("Cheia", _number(report.get("self_use_cheia_kwh")), NAVY),
-        ("Ponta", _number(report.get("self_use_ponta_kwh")), ORANGE),
-        ("Vazio", _number(report.get("self_use_vazio_kwh")), MID_GRAY),
-        ("Super vazio", _number(report.get("self_use_super_vazio_kwh")), GREEN),
+        ("Cheia", breakdown_by_period.get("cheia", _number(report.get("self_use_cheia_kwh"))), NAVY),
+        ("Ponta", breakdown_by_period.get("ponta", _number(report.get("self_use_ponta_kwh"))), ORANGE),
+        ("Vazio", breakdown_by_period.get("vazio", _number(report.get("self_use_vazio_kwh"))), MID_GRAY),
+        ("Super vazio", breakdown_by_period.get("super_vazio", _number(report.get("self_use_super_vazio_kwh"))), GREEN),
     ]
     prepared["month_label"] = prepared["period_label"]
     prepared["month_start"] = prepared["period_start"]
@@ -316,6 +347,36 @@ def format_kwh(value: Any) -> str:
     if value is None:
         return "Dados indisponíveis"
     return f"{_number(value):,.0f}".replace(",", " ") + " kWh"
+
+
+def solcor_charge_basis_text(report: dict[str, Any]) -> str:
+    """Describe the contractual rate behind an ESCO payment."""
+
+    if str(report.get("report_type") or "").casefold() != "esco":
+        return ""
+    if str(report.get("billing_mode") or "energy") == "fixed_monthly_fee":
+        fee = report.get("fixed_monthly_fee_eur")
+        return f"Mensalidade fixa de {format_eur(fee)} / mês" if fee is not None else "Mensalidade fixa"
+    rate = report.get("solcor_price_per_kwh")
+    billable_energy = report.get("billable_energy_kwh")
+    if rate is None or billable_energy is None:
+        return ""
+    base = (
+        "Produção"
+        if str(report.get("billing_energy_base") or "self_consumption") == "total_production"
+        else "Autoconsumo"
+    )
+    return f"{base} de {format_kwh(billable_energy)} x {_number(rate):.5f} €/kWh"
+
+
+def client_outage_charge_basis_text(report: dict[str, Any]) -> str:
+    if not report.get("client_outage_adjustments"):
+        return ""
+    estimated_energy = report.get("client_outage_billable_kwh")
+    rate = report.get("solcor_price_per_kwh")
+    if estimated_energy is None or rate is None:
+        return ""
+    return f"{format_kwh(estimated_energy)} x {_number(rate):.5f} €/kWh"
 
 
 def format_eur(value: Any) -> str:
@@ -454,6 +515,8 @@ def draw_report_header(pdf: canvas.Canvas, report: dict[str, Any], logo_path: Pa
 def draw_kpi_cards(pdf: canvas.Canvas, report: dict[str, Any], page_width: float, page_height: float) -> None:
     config = REPORT_TYPES[report["report_type"]]
     items = list(config["kpis"])
+    if not report.get("export_revenue_enabled", True):
+        items = [item for item in items if item[1] != "export_revenue_eur"]
     if (
         _section_enabled(pdf, "availability")
         and report.get("include_availability_kpi")
@@ -589,8 +652,18 @@ def draw_highlights(pdf: canvas.Canvas, report: dict[str, Any], x: float, y: flo
     pdf.setFillColor(_primary(pdf))
     pdf.setFont("Helvetica-Bold", 9)
     pdf.drawString(x + 12, y + height - 17, "Destaques do Periodo")
+    solcor_rate = (
+        f"{_number(report.get('solcor_price_per_kwh')):.5f} €/kWh"
+        if str(report.get("billing_mode") or "energy") == "energy"
+        else f"{format_eur(report.get('fixed_monthly_fee_eur'))} / mês"
+    )
+    first_highlight = (
+        ("Tarifa Solcor", solcor_rate, LIGHT_GREEN, "solcor")
+        if report.get("report_type") == "esco"
+        else ("Poupança na Fatura", format_eur(report["savings_eur"]), LIGHT_GREEN, "money")
+    )
     items = (
-        ("Poupança na Fatura", format_eur(report["savings_eur"]), LIGHT_GREEN, "money"),
+        first_highlight,
         ("Receita de Excedente", format_eur(report["export_revenue_eur"]), LIGHT_GREEN, "wallet"),
         ("Taxa de Autoconsumo", format_pct(report["autoconsumption_pct"]), LIGHT_GREEN, "target"),
         ("Autossuficiência", format_pct(report["self_sufficiency_pct"]), LIGHT_GREEN, "bars"),
@@ -613,7 +686,7 @@ def draw_monthly_summary(pdf: canvas.Canvas, report: dict[str, Any], x: float, y
     pdf.setFillColor(_primary(pdf))
     pdf.setFont("Helvetica-Bold", 9)
     pdf.drawString(x + 12, y + height - 16, "Resumo do Periodo")
-    rows = REPORT_TYPES[report["report_type"]]["summary"]
+    rows = summary_rows(report)
     row_h = (height - 22) / len(rows)
     for index, (label, key, kind) in enumerate(rows):
         row_y = y + height - 22 - (index + 1) * row_h
@@ -630,15 +703,36 @@ def draw_monthly_summary(pdf: canvas.Canvas, report: dict[str, Any], x: float, y
         value = format_kwh(report[key]) if kind == "kwh" else format_eur(report[key])
         pdf.setFont("Helvetica-Bold", 7.5)
         pdf.drawRightString(x + width - 12, row_y + row_h / 2 - 2, value)
+        if key in {"solcor_payment_eur", "measured_solcor_payment_eur", "client_outage_charge_eur"} and label != "Pagamento total à Solcor":
+            basis = (
+                client_outage_charge_basis_text(report)
+                if key == "client_outage_charge_eur"
+                else solcor_charge_basis_text(report)
+            )
+            if basis:
+                value_width = pdf.stringWidth(value, "Helvetica-Bold", 7.5)
+                detail_right = x + width - 20 - value_width
+                _scaled_text(
+                    pdf,
+                    basis,
+                    x + width * 0.42,
+                    row_y + row_h / 2 - 2,
+                    max(detail_right - (x + width * 0.42), 1),
+                    size=5.5,
+                    color=TEXT_GRAY,
+                )
 
 
 def _draw_donut(pdf: canvas.Canvas, center_x: float, center_y: float, radius: float, pct: float | None, color, label: str) -> None:
     display_pct = min(max(pct, 0), 100) if pct is not None else None
     pdf.setFillColor(MID_GRAY)
-    pdf.wedge(center_x - radius, center_y - radius, center_x + radius, center_y + radius, 90, 450, fill=1, stroke=0)
+    pdf.wedge(center_x - radius, center_y - radius, center_x + radius, center_y + radius, 90, 360, fill=1, stroke=0)
     if display_pct is not None:
         pdf.setFillColor(_themed_color(pdf, color))
-        pdf.wedge(center_x - radius, center_y - radius, center_x + radius, center_y + radius, 90, 90 + 360 * display_pct / 100, fill=1, stroke=0)
+        # ReportLab's sixth wedge argument is an angular *extent*, not the
+        # finishing angle. Passing 90 + extent made the arc overflow and
+        # could cover the previous tariff periods in the compact chart.
+        pdf.wedge(center_x - radius, center_y - radius, center_x + radius, center_y + radius, 90, 360 * display_pct / 100, fill=1, stroke=0)
     pdf.setFillColor(colors.white)
     pdf.circle(center_x, center_y, radius * 0.58, fill=1, stroke=0)
     pdf.setFillColor(_primary(pdf))
@@ -663,29 +757,37 @@ def draw_donut_charts(pdf: canvas.Canvas, report: dict[str, Any], x: float, y: f
     tariff_total = sum(value for _, value, _ in report["tariff_rows"])
     if tariff_total:
         angle = 90.0
-        center_x, center_y, radius = tariff_x + 55, y + 41, 29
+        # Keep the heading centred in the card, while the donut and legend
+        # share a balanced horizontal group underneath it.
+        center_x, center_y, radius = tariff_x + 62, y + 50, 29
         for label, value, color in report["tariff_rows"]:
             if not value:
                 continue
             extent = 360 * value / tariff_total
             pdf.setFillColor(_themed_color(pdf, color))
-            pdf.wedge(center_x - radius, center_y - radius, center_x + radius, center_y + radius, angle, angle + extent, fill=1, stroke=0)
+            # Keep the start angle normalized. This prevents a later slice
+            # from receiving an angle above 360º and painting over Cheia.
+            pdf.wedge(center_x - radius, center_y - radius, center_x + radius, center_y + radius, angle % 360, extent, fill=1, stroke=0)
             angle += extent
         pdf.setFillColor(colors.white)
         pdf.circle(center_x, center_y, 17, fill=1, stroke=0)
         pdf.setFillColor(_primary(pdf))
+        # The full “17 500 kWh” label did not fit in the donut hole. Keep the
+        # number prominent and place the unit on its own line.
+        pdf.setFont("Helvetica-Bold", 8)
+        pdf.drawCentredString(center_x, center_y, f"{_number(tariff_total):,.0f}".replace(",", " "))
+        pdf.setFont("Helvetica", 5)
+        pdf.drawCentredString(center_x, center_y - 7, "kWh")
         pdf.setFont("Helvetica-Bold", 7)
-        pdf.drawCentredString(center_x, center_y - 2, format_kwh(tariff_total))
-        pdf.setFont("Helvetica-Bold", 7)
-        pdf.drawCentredString(center_x, center_y + radius + 10, "Autoconsumo por Período Tarifário")
-        legend_y = y + 55
+        pdf.drawCentredString(tariff_x + card_w / 2, y + height - 18, "Autoconsumo por Período Tarifário")
+        legend_y = center_y + 16
         for label, value, color in report["tariff_rows"]:
             if value:
                 pdf.setFillColor(_themed_color(pdf, color))
-                pdf.circle(tariff_x + 100, legend_y, 3, fill=1, stroke=0)
+                pdf.circle(tariff_x + 108, legend_y, 3, fill=1, stroke=0)
                 pdf.setFillColor(_primary(pdf))
                 pdf.setFont("Helvetica", 5.5)
-                pdf.drawString(tariff_x + 108, legend_y - 2, f"{label}: {format_kwh(value)}")
+                pdf.drawString(tariff_x + 116, legend_y - 2, f"{label}: {format_kwh(value)}")
                 legend_y -= 13
     else:
         pdf.setFillColor(_primary(pdf))
@@ -694,23 +796,16 @@ def draw_donut_charts(pdf: canvas.Canvas, report: dict[str, Any], x: float, y: f
         pdf.setFillColor(TEXT_GRAY)
         pdf.setFont("Helvetica", 7)
         pdf.drawCentredString(tariff_x + card_w / 2, y + 35, "Sem dados suficientes")
-    tariff_breakdown = report.get("tariff_period_breakdown") or []
-    if tariff_breakdown:
-        row_y = y + 24
+    # The legend already contains the useful visual breakdown. Rendering the
+    # technical rows here made them collide with the footer in this compact
+    # card; prices and values remain available in the financial report/Excel.
+    if report.get("tariff_coverage_pct") is not None and (
+        report.get("tariff_coverage_pct") < 100 or report.get("tariff_warnings")
+    ):
         pdf.setFillColor(TEXT_GRAY)
-        pdf.setFont("Helvetica", 5.2)
-        for item in tariff_breakdown[:4]:
-            energy = format_kwh(item.get("energy_kwh"))
-            price = item.get("price_eur_kwh")
-            value = format_eur(item.get("value_eur"))
-            price_label = f"{float(price):.4f} EUR/kWh" if price is not None else "sem preco"
-            pdf.drawString(tariff_x + 10, row_y, f"{item.get('period_name')}: {energy} | {price_label} | {value}")
-            row_y -= 8
-    if report.get("tariff_coverage_pct") is not None:
-        pdf.setFillColor(TEXT_GRAY)
-        pdf.setFont("Helvetica", 5.2)
+        pdf.setFont("Helvetica", 5.5)
         warnings = ", ".join((report.get("tariff_warnings") or [])[:3])
-        pdf.drawString(tariff_x + 10, y + 5, f"Cobertura: {format_pct(report.get('tariff_coverage_pct'))}" + (f" | {warnings}" if warnings else ""))
+        pdf.drawString(tariff_x + 10, y + 13, f"Cobertura: {format_pct(report.get('tariff_coverage_pct'))}" + (f" | {warnings}" if warnings else ""))
 
     suff_x = x + 2 * (card_w + gap)
     _draw_donut(pdf, suff_x + 54, y + 41, 29, report["self_sufficiency_pct"], ORANGE, "Autossuficiência Energética")
@@ -728,6 +823,15 @@ def draw_report_footer(pdf: canvas.Canvas, report: dict[str, Any], page_width: f
     pdf.setFont("Helvetica-BoldOblique", 7)
     pdf.drawString(24, 7, style.footer or "Obrigado pela sua confiança!")
     notes = list(report.get("report_notes") or []) if _section_enabled(pdf, "warnings", "data_quality", "notes") else []
+    # The operational state of Sigenergy installations belongs in monitoring,
+    # not in the PDF footer. Besides not being actionable in the report, this
+    # long provider-capability note was rendered below the visual cards.
+    if report.get("availability_error") == "availability_not_supported_by_provider":
+        notes = [
+            note
+            for note in notes
+            if note != "Disponibilidade nao suportada para a fonte de energia selecionada."
+        ]
     notes.extend(item for item in (style.contacts, style.disclaimer) if item)
     if notes:
         pdf.setFillColor(TEXT_GRAY)

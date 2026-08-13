@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import calendar
+from bisect import bisect_right
 import json
 import math
 import os
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from datetime import datetime
 from typing import Any
@@ -59,6 +60,10 @@ SIGENERGY_HOURLY_COUNTER_FIELDS = {
     "export_kwh": "powerToGrid",
     "grid_import_kwh": "powerFromGrid",
 }
+SIGENERGY_HOURLY_TARIFF_FIELDS = (
+    "production_kwh",
+    "self_use_kwh",
+)
 LISBON = ZoneInfo("Europe/Lisbon")
 
 
@@ -255,6 +260,7 @@ def persist_sigenergy_daily_history(
     asset_id: int | None,
     fact: SigenergyHistoryFact,
 ) -> int:
+    fact = _reconcile_sigenergy_daily_totals_from_item_list(fact)
     period_start = datetime.combine(
         fact.period_date,
         datetime.min.time(),
@@ -296,6 +302,51 @@ def persist_sigenergy_daily_history(
     return fact_id
 
 
+def _reconcile_sigenergy_daily_totals_from_item_list(
+    fact: SigenergyHistoryFact,
+) -> SigenergyHistoryFact:
+    """Use detailed counters when a completed daily total is impossibly zero.
+
+    Some Sigenergy history responses return zero in their daily summary while
+    their own five-minute cumulative counters show a completed non-zero day.
+    The detailed data is used only for that direct contradiction, never to
+    replace a non-zero daily total or to fill a short source window.
+    """
+
+    item_list = fact.payload.get("itemList")
+    if not isinstance(item_list, list):
+        return fact
+    counters = _sigenergy_history_counters(item_list, fact.period_date)
+    if not counters:
+        return fact
+    period_start = datetime.combine(fact.period_date, datetime.min.time(), tzinfo=LISBON)
+    if max(counters) < period_start + timedelta(hours=21):
+        return fact
+
+    corrected_values = dict(fact.values)
+    corrections: dict[str, float] = {}
+    for field in SIGENERGY_REPORT_CORE_FIELDS:
+        daily_total = corrected_values.get(field)
+        observed_total = max(
+            (values.get(field) for values in counters.values() if values.get(field) is not None),
+            default=None,
+        )
+        if daily_total is not None and abs(float(daily_total)) <= 0.01 and observed_total is not None and observed_total > 0.01:
+            corrected_values[field] = float(observed_total)
+            corrections[field] = float(observed_total)
+    if not corrections:
+        return fact
+    payload = {
+        **fact.payload,
+        "daily_total_reconciliation": {
+            "source": "sigenergy_system_history_item_list",
+            "reason": "daily_zero_contradicted_by_completed_cumulative_counter",
+            "values": corrections,
+        },
+    }
+    return replace(fact, values=corrected_values, payload=payload)
+
+
 def persist_sigenergy_hourly_history(
     conn: sqlite3.Connection,
     *,
@@ -311,51 +362,95 @@ def persist_sigenergy_hourly_history(
     are deliberately not used for energy billing.
     """
 
-    item_list = fact.payload.get("itemList")
-    if not isinstance(item_list, list):
-        return 0
-
-    counters = _sigenergy_history_counters(item_list, fact.period_date)
-    if not counters:
-        return 0
-
     daily_totals = {
         field: fact.values.get(field)
         for field in SIGENERGY_HOURLY_COUNTER_FIELDS
     }
-    persisted = 0
+    period_start = datetime.combine(
+        fact.period_date,
+        datetime.min.time(),
+        tzinfo=LISBON,
+    )
+    period_end = period_start + timedelta(days=1)
+    conn.execute(
+        """
+        DELETE FROM production_hourly_records
+        WHERE asset_id = ? AND provider = 'Sigenergy'
+          AND period_start >= ? AND period_start < ?
+          AND payload_json LIKE '%sigenergy_system_history_item_list%'
+        """,
+        (
+            asset_id,
+            period_start.isoformat(timespec="seconds"),
+            period_end.isoformat(timespec="seconds"),
+        ),
+    )
+    item_list = fact.payload.get("itemList")
+    if not isinstance(item_list, list):
+        return 0
+    counters = _sigenergy_history_counters(item_list, fact.period_date)
+    if not counters:
+        return 0
+
+    hourly_intervals: list[
+        tuple[datetime, datetime, dict[str, float | None]]
+    ] = []
+    missing_tariff_values = False
     for hour in range(24):
-        period_start = datetime.combine(
+        hour_start = datetime.combine(
             fact.period_date,
             datetime.min.time(),
             tzinfo=LISBON,
         ) + timedelta(hours=hour)
-        period_end = period_start + timedelta(hours=1)
-        start_values = counters.get(period_start)
+        hour_end = hour_start + timedelta(hours=1)
+        start_values = counters.get(hour_start)
         end_values = (
             daily_totals
             if hour == 23
-            else counters.get(period_end)
+            else counters.get(hour_end)
         )
         values = _sigenergy_counter_delta(start_values, end_values)
-        if not any(value is not None for value in values.values()):
-            continue
-        complete = all(
-            values[field] is not None
-            for field in SIGENERGY_HOURLY_COUNTER_FIELDS
+        if not all(values[field] is not None for field in SIGENERGY_HOURLY_TARIFF_FIELDS):
+            missing_tariff_values = True
+        hourly_intervals.append((hour_start, hour_end, values))
+
+    reconciled = False
+    if (
+        missing_tariff_values
+        or _sigenergy_counters_conflict_with_daily_total(counters, daily_totals)
+        or not _sigenergy_hourly_intervals_match_daily_total(hourly_intervals, daily_totals)
+    ):
+        reconciled_intervals = _reconcile_sigenergy_hourly_intervals(
+            counters,
+            daily_totals,
+            fact.period_date,
         )
+        if reconciled_intervals is None:
+            return 0
+        hourly_intervals = reconciled_intervals
+        reconciled = True
+
+    persisted = 0
+    for hour_start, hour_end, values in hourly_intervals:
         upsert_hourly_energy_record(
             conn,
             asset_id=asset_id,
             provider="Sigenergy",
-            period_start=period_start,
-            period_end=period_end,
-            data_quality="complete" if complete else "partial",
+            period_start=hour_start,
+            period_end=hour_end,
+            data_quality=(
+                "reconciled"
+                if reconciled
+                else "complete"
+                if all(values[field] is not None for field in SIGENERGY_HOURLY_COUNTER_FIELDS)
+                else "partial"
+            ),
             payload_json={
                 "source": "sigenergy_system_history_item_list",
                 "history_date": fact.period_date.isoformat(),
-                "interval_start": period_start.isoformat(),
-                "interval_end": period_end.isoformat(),
+                "interval_start": hour_start.isoformat(),
+                "interval_end": hour_end.isoformat(),
+                "reconciled_to_daily_total": reconciled,
             },
             source_fields={
                 field: source_field
@@ -373,6 +468,7 @@ def _sigenergy_history_counters(
     period_date: date,
 ) -> dict[datetime, dict[str, float | None]]:
     counters: dict[datetime, dict[str, float | None]] = {}
+    maximums: dict[str, float] = {}
     for item in item_list:
         if not isinstance(item, dict):
             continue
@@ -384,9 +480,137 @@ def _sigenergy_history_counters(
             continue
         values: dict[str, float | None] = {}
         for field, source_field in SIGENERGY_HOURLY_COUNTER_FIELDS.items():
-            values[field] = _non_negative_float(item.get(source_field))
+            raw_value = _non_negative_float(item.get(source_field))
+            if raw_value is None:
+                values[field] = None
+                continue
+            maximums[field] = max(maximums.get(field, raw_value), raw_value)
+            values[field] = maximums[field]
         counters[timestamp] = values
     return counters
+
+
+def _sigenergy_counters_conflict_with_daily_total(
+    counters: dict[datetime, dict[str, float | None]],
+    daily_totals: dict[str, float | None],
+) -> bool:
+    """Reject a day when a five-minute counter exceeds its daily total.
+
+    This is a source conflict, not production.  Accepting it would duplicate
+    energy in tariff billing, so the caller leaves the day without hourly data
+    and retains the independently persisted daily fact as the source of truth.
+    """
+
+    for field in SIGENERGY_HOURLY_TARIFF_FIELDS:
+        daily_total = daily_totals.get(field)
+        if daily_total is None:
+            continue
+        observed = max(
+            (
+                values[field]
+                for values in counters.values()
+                if values.get(field) is not None
+            ),
+            default=None,
+        )
+        if observed is not None and observed > float(daily_total) + 0.01:
+            return True
+    return False
+
+
+def _sigenergy_hourly_intervals_match_daily_total(
+    intervals: list[tuple[datetime, datetime, dict[str, float | None]]],
+    daily_totals: dict[str, float | None],
+) -> bool:
+    """Require a complete, reconciling day before tariff data is persisted."""
+
+    if len(intervals) != 24:
+        return False
+    for field in SIGENERGY_HOURLY_TARIFF_FIELDS:
+        daily_total = daily_totals.get(field)
+        if daily_total is None:
+            return False
+        hourly_total = sum(
+            float(values[field])
+            for _, _, values in intervals
+            if values[field] is not None
+        )
+        if abs(hourly_total - float(daily_total)) > 0.01:
+            return False
+    return True
+
+
+def _reconcile_sigenergy_hourly_intervals(
+    counters: dict[datetime, dict[str, float | None]],
+    daily_totals: dict[str, float | None],
+    period_date: date,
+) -> list[tuple[datetime, datetime, dict[str, float | None]]] | None:
+    """Recover a complete hourly shape from a complete Sigenergy daily fact.
+
+    Sigenergy sometimes corrects a cumulative counter downwards during the day
+    or omits a few five-minute snapshots while still returning a complete daily
+    total. The daily total remains authoritative. We preserve the observed
+    hourly shape, clamp counter reversals, and scale it to that authoritative
+    total. A short/incomplete source window is deliberately not recovered.
+    """
+
+    timestamps = sorted(counters)
+    if not timestamps:
+        return None
+    period_start = datetime.combine(period_date, datetime.min.time(), tzinfo=LISBON)
+    # A source ending earlier cannot establish the end-of-day distribution.
+    if timestamps[-1] < period_start + timedelta(hours=21):
+        return None
+
+    first_values = counters[timestamps[0]]
+    if any(first_values.get(field) not in (0, 0.0) for field in SIGENERGY_HOURLY_TARIFF_FIELDS):
+        return None
+
+    zero_values = {field: 0.0 for field in SIGENERGY_HOURLY_COUNTER_FIELDS}
+
+    def counter_at_or_before(moment: datetime) -> dict[str, float | None] | None:
+        position = bisect_right(timestamps, moment) - 1
+        if position < 0:
+            return zero_values
+        return counters[timestamps[position]]
+
+    intervals: list[tuple[datetime, datetime, dict[str, float | None]]] = []
+    for hour in range(24):
+        hour_start = period_start + timedelta(hours=hour)
+        hour_end = hour_start + timedelta(hours=1)
+        start_values = counter_at_or_before(hour_start)
+        end_values = daily_totals if hour == 23 else counter_at_or_before(hour_end)
+        values = _sigenergy_counter_delta(start_values, end_values)
+        # The daily total can be lower than a transient cumulative reading.
+        # It is a correction, not negative hourly energy; retain a zero final
+        # interval and apply the authoritative-total scaling below.
+        for field in SIGENERGY_HOURLY_COUNTER_FIELDS:
+            start = start_values.get(field) if start_values else None
+            end = end_values.get(field) if end_values else None
+            if start is not None and end is not None and end < start:
+                values[field] = 0.0
+        if any(values[field] is None for field in SIGENERGY_HOURLY_TARIFF_FIELDS):
+            return None
+        intervals.append((hour_start, hour_end, values))
+
+    for field in SIGENERGY_HOURLY_COUNTER_FIELDS:
+        total = daily_totals.get(field)
+        if total is None:
+            return None
+        observed = sum(float(values[field] or 0) for _, _, values in intervals)
+        if observed <= 0:
+            if float(total) != 0:
+                return None
+            for _, _, values in intervals:
+                values[field] = 0.0
+            continue
+        factor = float(total) / observed
+        for _, _, values in intervals:
+            values[field] = float(values[field] or 0) * factor
+
+    if not _sigenergy_hourly_intervals_match_daily_total(intervals, daily_totals):
+        return None
+    return intervals
 
 
 def _parse_sigenergy_history_timestamp(

@@ -585,6 +585,7 @@ def _parse_financial_automatic_details(
         ("self_sufficiency_rate_pct", "Self-sufficiency rate", "P10", "%"),
         ("specific_yield_kwh_kwp", "Specific yield", "H14", "kWh/kWp"),
         ("avoided_tariff_eur_kwh", "Avoided tariff", "L32", "EUR/kWh"),
+        ("ppa_tariff_eur_kwh", "Solcor tariff", "L33", "EUR/kWh"),
         ("surplus_sale_eur_kwh", "Surplus sale", "F46", "EUR/kWh"),
     )
     upac_summary = [

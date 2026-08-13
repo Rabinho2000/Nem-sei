@@ -155,6 +155,7 @@ def financial_automatic_as_sold_workbook(path: Path, *, battery_charge: bool = F
     project["P9"] = 0.6
     project["P10"] = 0.4
     project["L32"] = 0.15
+    project["L33"] = 0.086
     project["G39"] = "2026/1"
     project["C44"] = "Tetra-horário"
     project["C45"] = "Semanal"
@@ -349,6 +350,8 @@ def test_parse_financial_automatic_as_sold_layout(tmp_path: Path) -> None:
     assert parsed.monthly[0]["source_fields"]["expected_consumption_kwh"]["cell"] == "Savings Yr1!C4"
     assert "financial_model_calculated_grid_import" in parsed.warnings
     assert parsed.details["format"] == "financial_automatic_as_sold"
+    summary = {item["key"]: item["value"] for item in parsed.details["upac_summary"]}
+    assert summary["ppa_tariff_eur_kwh"] == pytest.approx(0.086)
     assert any(item["key"] == "installation_cost_total_eur" and item["value"] == 8750 for item in parsed.details["upac_summary"])
     assert any(item["key"] == "annual_grid_import_kwh" and item["value"] == 7020 for item in parsed.details["upac_summary"])
     assert parsed.details["tariff_periods"][0]["label"] == "SV"
