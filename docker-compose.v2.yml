@@ -1,0 +1,48 @@
+name: nemsei-v2
+
+x-v2-environment: &v2-environment
+  NEMSEI_V2_DATA_ROOT: /data
+  NEMSEI_V2_DATABASE_URL: sqlite:////data/nemsei_v2.db
+
+x-v2-volume: &v2-volume
+  - ${NEMSEI_V2_HOST_DATA_ROOT:?Set NEMSEI_V2_HOST_DATA_ROOT to the dedicated V2 host data path}:/data
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.v2
+    env_file: .env.v2
+    environment: *v2-environment
+    volumes: *v2-volume
+    ports:
+      - "127.0.0.1:5002:5000"
+    command: gunicorn -w 1 --threads 2 -b 0.0.0.0:5000 nemsei.wsgi:app
+
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.v2
+    env_file: .env.v2
+    environment: *v2-environment
+    volumes: *v2-volume
+    command: python -m nemsei.jobs.scheduler
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.v2
+    env_file: .env.v2
+    environment: *v2-environment
+    volumes: *v2-volume
+    command: python -m nemsei.jobs.worker
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile.v2
+    profiles: ["manual"]
+    env_file: .env.v2
+    environment: *v2-environment
+    volumes: *v2-volume
+    command: alembic upgrade head

@@ -1,0 +1,6 @@
+services:
+  worker:
+    environment:
+      NEMSEI_V2_ENV: test
+      NEMSEI_V2_TESTING: "true"
+      NEMSEI_V2_WORKER_LEASE_SECONDS: "3"
