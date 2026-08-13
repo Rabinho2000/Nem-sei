@@ -1,0 +1,18 @@
+from __future__ import annotations
+
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import create_engine, inspect
+
+
+def upgrade(settings, monkeypatch) -> None:
+    monkeypatch.setenv("NEMSEI_V2_ENV", "test")
+    monkeypatch.setenv("NEMSEI_V2_DATA_ROOT", str(settings.data_root))
+    monkeypatch.setenv("NEMSEI_V2_DATABASE_URL", settings.database_url)
+    command.upgrade(Config("alembic.ini"), "head")
+
+
+def test_initial_migration_creates_foundation_tables(settings, monkeypatch) -> None:
+    upgrade(settings, monkeypatch)
+    engine = create_engine(settings.database_url)
+    assert {"jobs", "job_events", "scheduler_leases", "schedule_state", "alembic_version"} <= set(inspect(engine).get_table_names())
