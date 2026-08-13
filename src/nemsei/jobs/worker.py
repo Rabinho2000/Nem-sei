@@ -22,6 +22,7 @@ class Worker:
 
     def run_once(self) -> bool:
         self.repository.recover_expired()
+        self.repository.activate_due_waiting()
         claimed = self.repository.claim_next(worker_id=self.worker_id, lease_seconds=self.settings.worker_lease_seconds)
         if claimed is None:
             return False

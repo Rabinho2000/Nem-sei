@@ -18,3 +18,8 @@ RUN mkdir -p /data
 EXPOSE 5000
 
 CMD ["gunicorn", "-b", "0.0.0.0:5000", "nemsei.wsgi:app"]
+
+FROM runtime AS acceptance
+
+COPY requirements-v2-dev.lock .
+RUN pip install --no-cache-dir -r requirements-v2-dev.lock

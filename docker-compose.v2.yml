@@ -12,7 +12,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.v2
-    env_file: .env.v2
+    env_file: ${NEMSEI_V2_ENV_FILE:-.env.v2}
     environment: *v2-environment
     volumes: *v2-volume
     ports:
@@ -23,7 +23,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.v2
-    env_file: .env.v2
+    env_file: ${NEMSEI_V2_ENV_FILE:-.env.v2}
     environment: *v2-environment
     volumes: *v2-volume
     command: python -m nemsei.jobs.scheduler
@@ -32,7 +32,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.v2
-    env_file: .env.v2
+    env_file: ${NEMSEI_V2_ENV_FILE:-.env.v2}
     environment: *v2-environment
     volumes: *v2-volume
     command: python -m nemsei.jobs.worker
@@ -42,7 +42,7 @@ services:
       context: .
       dockerfile: Dockerfile.v2
     profiles: ["manual"]
-    env_file: .env.v2
+    env_file: ${NEMSEI_V2_ENV_FILE:-.env.v2}
     environment: *v2-environment
     volumes: *v2-volume
     command: alembic upgrade head

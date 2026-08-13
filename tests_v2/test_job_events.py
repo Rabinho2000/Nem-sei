@@ -15,3 +15,5 @@ def test_expired_running_job_is_recovered_with_sanitized_audit_event(settings, m
     event = repo.events_for(job.id)[-1]
     assert (event.actor_source, event.from_status, event.to_status) == ("recovery", "running", "waiting")
     assert "password" not in event.metadata_json
+    assert repo.activate_due_waiting(now=utc_now() + timedelta(seconds=2)) == 1
+    assert repo.events_for(job.id)[-1].to_status == "queued"

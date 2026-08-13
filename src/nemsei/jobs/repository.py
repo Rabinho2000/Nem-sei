@@ -306,6 +306,29 @@ class JobRepository:
                 recovered += 1
         return recovered
 
+    def activate_due_waiting(self, *, now: datetime | None = None) -> int:
+        now_value = now or utc_now()
+        activated = 0
+        with self.session_factory.begin() as session:
+            waiting_jobs = session.scalars(
+                select(Job).where(Job.status == "waiting", Job.available_at <= now_value)
+            ).all()
+            for job in waiting_jobs:
+                job.status = "queued"
+                job.updated_at = now_value
+                self._event(
+                    session,
+                    job_id=job.id,
+                    event_type="waiting_activated",
+                    attempt=job.attempt_count,
+                    from_status="waiting",
+                    to_status="queued",
+                    actor_source="recovery",
+                    occurred_at=now_value,
+                )
+                activated += 1
+        return activated
+
     def acquire_scheduler_lease(self, *, owner_token: str, lease_seconds: int, now: datetime | None = None) -> bool:
         now_value = now or utc_now()
         lease_until = now_value + timedelta(seconds=lease_seconds)

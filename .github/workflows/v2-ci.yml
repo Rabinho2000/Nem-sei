@@ -1,0 +1,25 @@
+name: V2 CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - rewrite/v2
+
+jobs:
+  v2:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: src
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -r requirements-v2-dev.lock
+      - run: python -m pip check
+      - run: python -m ruff check src/nemsei tests_v2 migrations
+      - run: python -m compileall src/nemsei
+      - run: python -m pytest -q tests_v2
+      - run: bash scripts/run_docker_recovery_acceptance.sh
