@@ -15,6 +15,7 @@ CAPABILITIES = (
     "notifications",
     "report_distribution",
 )
+INSECURE_SECRET_KEYS = {"changeme", "change-me", "secret", "development", "default"}
 
 
 class ConfigurationError(ValueError):
@@ -57,6 +58,15 @@ class Settings:
     scheduler_lease_seconds: int = 30
     testing: bool = False
 
+    @property
+    def resolved_database_path(self) -> Path:
+        """The sole authoritative database target used by validation and SQLAlchemy."""
+        return self.database_path.expanduser().resolve()
+
+    @property
+    def sqlalchemy_database_url(self) -> str:
+        return f"sqlite:///{self.resolved_database_path.as_posix()}"
+
     @classmethod
     def from_environment(cls) -> "Settings":
         environment = os.environ.get("NEMSEI_V2_ENV", "development").strip().lower()
@@ -93,17 +103,25 @@ class Settings:
         if self.environment not in VALID_ENVIRONMENTS:
             raise ConfigurationError("NEMSEI_V2_ENV must be development, test, preview, or production.")
         resolved_root = self.data_root.resolve()
-        resolved_database = self.database_path.resolve()
+        resolved_database = self.resolved_database_path
+        configured_url_path = sqlite_path_from_url(self.database_url)
+        if configured_url_path != resolved_database:
+            raise ConfigurationError("NEMSEI_V2_DATABASE_URL must match the resolved V2 database path.")
         if resolved_database.name != V2_DATABASE_FILENAME:
             raise ConfigurationError(f"V2 database filename must be {V2_DATABASE_FILENAME}.")
         try:
             resolved_database.relative_to(resolved_root)
         except ValueError as exc:
             raise ConfigurationError("V2 database must be inside NEMSEI_V2_DATA_ROOT.") from exc
-        if self.environment in {"preview", "production"} and not self.secret_key:
-            raise ConfigurationError("NEMSEI_V2_SECRET_KEY is required outside development/test.")
+        if self.environment in {"preview", "production"}:
+            if not self.secret_key or self.secret_key.strip().lower() in INSECURE_SECRET_KEYS:
+                raise ConfigurationError("NEMSEI_V2_SECRET_KEY must be non-default outside development/test.")
+            if self.testing:
+                raise ConfigurationError("NEMSEI_V2_TESTING is not allowed in preview or production.")
         if require_auth and (not self.admin_username or not self.admin_password_hash):
             raise ConfigurationError("V2 administrator username and password hash are required.")
+        if require_auth and self.admin_password_hash.count("$") < 2:
+            raise ConfigurationError("V2 administrator password must be a Werkzeug password hash.")
         if self.worker_poll_seconds <= 0 or self.worker_lease_seconds <= 0 or self.scheduler_lease_seconds <= 0:
             raise ConfigurationError("Worker and scheduler timings must be positive.")
         return self

@@ -9,4 +9,5 @@ def test_sqlite_engine_applies_required_pragmas(settings) -> None:
     with engine.connect() as connection:
         assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
         assert connection.exec_driver_sql("PRAGMA busy_timeout").scalar() == 15000
+        assert connection.exec_driver_sql("PRAGMA journal_mode").scalar() == "wal"
     assert build_session_factory(engine)

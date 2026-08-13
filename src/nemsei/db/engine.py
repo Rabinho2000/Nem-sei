@@ -14,7 +14,7 @@ from nemsei.config import Settings
 def build_engine(settings: Settings) -> Engine:
     settings.validate()
     engine = create_engine(
-        settings.database_url,
+        settings.sqlalchemy_database_url,
         connect_args={"timeout": 15},
         poolclass=NullPool,
     )
