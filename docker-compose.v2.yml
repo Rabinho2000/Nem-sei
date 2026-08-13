@@ -5,7 +5,7 @@ x-v2-environment: &v2-environment
   NEMSEI_V2_DATABASE_URL: sqlite:////data/nemsei_v2.db
 
 x-v2-volume: &v2-volume
-  - ${NEMSEI_V2_HOST_DATA_ROOT:?Set NEMSEI_V2_HOST_DATA_ROOT to the dedicated V2 host data path}:/data
+  - ${NEMSEI_V2_HOST_DATA_ROOT:-/opt/server/apps/Nem-sei-v2-data}:/data
 
 services:
   web:
