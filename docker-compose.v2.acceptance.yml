@@ -1,6 +1,13 @@
 services:
   worker:
+    build:
+      target: acceptance
+    profiles: ["acceptance"]
     environment:
       NEMSEI_V2_ENV: test
       NEMSEI_V2_TESTING: "true"
       NEMSEI_V2_WORKER_LEASE_SECONDS: "3"
+  migrate:
+    build:
+      target: acceptance
+    profiles: ["acceptance"]

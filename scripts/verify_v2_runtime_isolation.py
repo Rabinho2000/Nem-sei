@@ -43,7 +43,7 @@ def main() -> int:
         print("Compose data mount source must be the validated V2 root.", file=sys.stderr)
         return 1
     compose_text = args.compose_file.read_text(encoding="utf-8")
-    if "${NEMSEI_V2_HOST_DATA_ROOT:?" not in compose_text:
+    if "${NEMSEI_V2_HOST_DATA_ROOT" not in compose_text:
         print("Compose must mount NEMSEI_V2_HOST_DATA_ROOT explicitly.", file=sys.stderr)
         return 1
     print(f"V2 runtime isolation verified: {v2_root}")

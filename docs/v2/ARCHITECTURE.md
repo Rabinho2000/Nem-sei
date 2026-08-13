@@ -24,3 +24,9 @@ running the one-shot `migrate` role, then starts web, scheduler, and exactly one
 worker. SQLite is the production backend for this foundation: multiple workers,
 worker scaling, and worker concurrency are unsupported and rejected by the
 deployment wrapper.
+
+`docker build -f Dockerfile.v2 .` produces the minimal runtime image. The
+crash-recovery harness is acceptance-only: it explicitly builds the
+`acceptance` target through `docker-compose.v2.acceptance.yml` with the
+`acceptance` profile. That Compose file must never be included in a normal
+deployment command.

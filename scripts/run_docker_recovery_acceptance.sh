@@ -7,7 +7,7 @@ project="nemsei-v2-acceptance-$RANDOM"
 env_file="$temp_root/.env"
 
 cleanup() {
-  docker compose --project-name "$project" --env-file "$env_file" -f "$root/docker-compose.v2.yml" -f "$root/docker-compose.v2.acceptance.yml" down --volumes --remove-orphans >/dev/null 2>&1 || true
+  docker compose --project-name "$project" --profile acceptance --env-file "$env_file" -f "$root/docker-compose.v2.yml" -f "$root/docker-compose.v2.acceptance.yml" down --volumes --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$temp_root"
 }
 trap cleanup EXIT
@@ -36,7 +36,7 @@ PYTHONPATH="$root/src" python3 "$root/scripts/verify_v2_runtime_isolation.py" \
   --database "$temp_root/v2-data/nemsei_v2.db" \
   --compose-file "$root/docker-compose.v2.yml"
 
-compose=(docker compose --project-name "$project" --env-file "$env_file" -f "$root/docker-compose.v2.yml" -f "$root/docker-compose.v2.acceptance.yml")
+compose=(docker compose --project-name "$project" --profile acceptance --env-file "$env_file" -f "$root/docker-compose.v2.yml" -f "$root/docker-compose.v2.acceptance.yml")
 "${compose[@]}" build worker migrate
 "${compose[@]}" run --rm migrate
 "${compose[@]}" up -d worker

@@ -23,3 +23,8 @@ FROM runtime AS acceptance
 
 COPY requirements-v2-dev.lock .
 RUN pip install --no-cache-dir -r requirements-v2-dev.lock
+COPY acceptance_src/ ./src/
+
+# Keep the final/default image free of test dependencies and acceptance-only
+# worker behavior. CI must opt in with `--target acceptance`.
+FROM runtime AS production
