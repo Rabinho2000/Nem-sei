@@ -30,3 +30,11 @@ crash-recovery harness is acceptance-only: it explicitly builds the
 `acceptance` target through `docker-compose.v2.acceptance.yml` with the
 `acceptance` profile. That Compose file must never be included in a normal
 deployment command.
+
+## Job operation rules
+
+`queued` and `waiting` jobs can be cancelled immediately. Cancelling `running`
+work records a cooperative cancellation request; a handler must define where it
+checks that request and how it safely stops. A lease does not make side effects
+exactly once. `job_events` are append-only at both repository and SQLite levels
+and must contain only allowlisted, non-sensitive metadata.

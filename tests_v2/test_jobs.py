@@ -95,3 +95,15 @@ def test_concurrent_waiting_activation_records_one_transition(settings, monkeypa
     with repo.session_factory() as session:
         assert session.scalar(select(Job.status).where(Job.id == job.id)) == "queued"
     assert [event.event_type for event in repo.events_for(job.id)].count("waiting_activated") == 1
+
+
+def test_cancellation_is_immediate_for_queued_and_cooperative_for_running(settings, monkeypatch) -> None:
+    repo = repository(settings, monkeypatch)
+    queued, _ = repo.enqueue(job_type="system.noop", payload={}, actor_source="web")
+    assert repo.cancel(job_id=queued.id, actor_source="web") == "cancelled"
+    assert repo.events_for(queued.id)[-1].to_status == "cancelled"
+
+    running, _ = repo.enqueue(job_type="system.noop", payload={}, actor_source="web")
+    assert repo.claim_next(worker_id="worker", lease_seconds=30)
+    assert repo.cancel(job_id=running.id, actor_source="web") == "requested"
+    assert repo.events_for(running.id)[-1].event_type == "cancellation_requested"

@@ -319,6 +319,55 @@ class JobRepository:
             )
             return True
 
+    def cancel(self, *, job_id: int, actor_source: str, reason: str = "requested") -> str | None:
+        """Cancel queued/waiting work or record cooperative cancellation for running work."""
+        now = utc_now()
+        with self._immediate_session() as session:
+            job = session.get(Job, job_id)
+            if job is None or job.status in TERMINAL_STATUSES:
+                return None
+            if job.status in {"queued", "waiting"}:
+                updated = session.execute(
+                    update(Job)
+                    .where(Job.id == job_id, Job.status == job.status)
+                    .values(status="cancelled", finished_at=now, updated_at=now)
+                )
+                if updated.rowcount != 1:
+                    return None
+                self._event(
+                    session,
+                    job_id=job_id,
+                    event_type="cancelled",
+                    attempt=job.attempt_count,
+                    from_status=job.status,
+                    to_status="cancelled",
+                    actor_source=actor_source,
+                    metadata={"reason": reason},
+                    occurred_at=now,
+                )
+                return "cancelled"
+            if job.status == "running":
+                updated = session.execute(
+                    update(Job)
+                    .where(Job.id == job_id, Job.status == "running", Job.lease_token == job.lease_token)
+                    .values(cancellation_requested_at=now, updated_at=now)
+                )
+                if updated.rowcount != 1:
+                    return None
+                self._event(
+                    session,
+                    job_id=job_id,
+                    event_type="cancellation_requested",
+                    attempt=job.attempt_count,
+                    from_status="running",
+                    to_status="running",
+                    actor_source=actor_source,
+                    metadata={"reason": reason},
+                    occurred_at=now,
+                )
+                return "requested"
+            return None
+
     def recover_expired(self, *, now: datetime | None = None) -> int:
         now_value = now or utc_now()
         recovered = 0
