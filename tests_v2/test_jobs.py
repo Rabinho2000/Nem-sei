@@ -6,7 +6,6 @@ from datetime import timedelta
 from sqlalchemy import select
 
 from nemsei.db import build_engine, build_session_factory
-from nemsei.jobs.repository import JobRepository
 from nemsei.jobs.models import Job
 from nemsei.shared.clock import utc_now
 from nemsei.jobs.repository import JobRepository
