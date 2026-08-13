@@ -8,6 +8,10 @@ v1_root=${NEMSEI_V1_DATA_ROOT:-/opt/server/apps/Nem-sei/data}
 v2_root=${NEMSEI_V2_HOST_DATA_ROOT:-/opt/server/apps/Nem-sei-v2-data}
 env_file=${NEMSEI_V2_ENV_FILE:-$root/.env.v2}
 
+if (( $# != 0 )); then
+  echo "This wrapper starts exactly one worker and accepts no Compose scale arguments." >&2
+  exit 2
+fi
 if [[ $mode != production && $mode != preview && $mode != development ]]; then
   echo "NEMSEI_V2_DEPLOYMENT_MODE must be production, preview, or development." >&2
   exit 2

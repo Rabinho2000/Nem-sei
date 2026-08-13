@@ -20,3 +20,4 @@ def test_canonical_deployment_validates_before_starting_roles() -> None:
     assert preflight < migrate < startup
     assert "config --format json" in script
     assert "NEMSEI_V2_WORKER_SCALE" in script
+    assert "accepts no Compose scale arguments" in script
