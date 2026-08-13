@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="pt-PT">
+  <head><meta charset="utf-8"><title>Entrar · Nem-sei V2</title></head>
+  <body>
+    <main>
+      <h1>Entrar</h1>
+      {% for category, message in get_flashed_messages(with_categories=true) %}<p>{{ message }}</p>{% endfor %}
+      <form method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="next" value="{{ next }}">
+        <label>Utilizador <input name="username" required></label>
+        <label>Palavra-passe <input name="password" type="password" required></label>
+        <button type="submit">Entrar</button>
+      </form>
+    </main>
+  </body>
+</html>
