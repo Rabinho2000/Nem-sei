@@ -11,7 +11,7 @@ from nemsei.db.base import Base
 PROVIDER_CODES = ("fusionsolar", "sigenergy", "sma")
 CONNECTION_STATUSES = ("not_configured", "configured", "disabled")
 MAPPING_STATUSES = ("active", "superseded", "invalid", "pending_review")
-IMPORT_OUTCOMES = ("created", "reused", "quarantined", "changed_source", "conflict", "excluded")
+IMPORT_OUTCOMES = ("created", "reused", "quarantined", "changed_source", "conflict", "excluded", "unresolved")
 
 
 class ProviderConnection(Base):
@@ -83,6 +83,8 @@ class LegacyImportRun(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     source_database_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_locator_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    importer_version: Mapped[str] = mapped_column(String(64), nullable=False)
     dry_run: Mapped[bool] = mapped_column(Boolean, nullable=False)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -100,6 +102,7 @@ class LegacyImportRecord(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     import_run_id: Mapped[int] = mapped_column(ForeignKey("legacy_import_runs.id", ondelete="RESTRICT"), nullable=False)
     source_database_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_locator_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     legacy_table: Mapped[str] = mapped_column(String(120), nullable=False)
     legacy_id: Mapped[str] = mapped_column(String(120), nullable=False)
     source_hash: Mapped[str] = mapped_column(String(64), nullable=False)

@@ -44,11 +44,13 @@ write V1. It reads only V1 customers, assets, aliases, and asset integrations.
 It excludes credentials, endpoints, payloads, contracts, portfolio rows,
 monitoring data, and provider snapshots.
 
-Each real run stores a source checksum and per-row hash in `legacy_import_runs`
+Each real run stores a source checksum, source-locator hash, importer version,
+and per-row hash in `legacy_import_runs`
 and `legacy_import_records`. A dry run writes no V2 rows and prints a JSON
 manifest. Replays reuse the recorded target. If V1 source evidence changes, the
 importer creates a review/audit outcome and preserves the V2 record, including
-manual edits. Duplicate normalized V1 asset names are quarantined rather than
+manual edits. Real imports commit deterministic batches of at most 100 audited
+writes, so an interrupted run can safely be rerun. Duplicate normalized V1 asset names are quarantined rather than
 created or merged. Legacy FusionSolar and Sigenergy mappings are connected only
 to disabled, credential-free V2 legacy connections.
 

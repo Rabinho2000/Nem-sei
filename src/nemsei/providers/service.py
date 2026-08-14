@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import date
 
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from nemsei.assets.repository import AssetRepository
 from nemsei.providers.models import (
@@ -61,6 +62,7 @@ def create_mapping(
     external_id: str,
     external_name: str | None = None,
     valid_from: date | None = None,
+    valid_to: date | None = None,
     monitoring_priority: int | None = None,
     production_priority: int | None = None,
     mapping_status: str = "active",
@@ -79,6 +81,8 @@ def create_mapping(
     if not external_id:
         raise ValueError("Provider external ID is required.")
     if mapping_status == "active":
+        if not connection.enabled or connection.configuration_status != "configured":
+            raise ValueError("An active mapping requires an enabled, configured provider connection.")
         claimed = providers.active_external_claim(
             connection_id=connection.id,
             normalized_external_id=normalize_external_id(connection.provider_code, external_id),
@@ -88,6 +92,9 @@ def create_mapping(
     if any(priority is not None and priority <= 0 for priority in (monitoring_priority, production_priority)):
         raise ValueError("Source priorities must be positive.")
     now = utc_now()
+    starts = valid_from or now.date()
+    if valid_to is not None and valid_to < starts:
+        raise ValueError("Mapping valid_to cannot precede valid_from.")
     mapping = AssetProviderMapping(
         asset_id=asset_id,
         provider_connection_id=connection.id,
@@ -96,7 +103,8 @@ def create_mapping(
         normalized_external_id=normalize_external_id(connection.provider_code, external_id),
         external_name=external_name.strip() if external_name else None,
         mapping_status=mapping_status,
-        valid_from=valid_from or now.date(),
+        valid_from=starts,
+        valid_to=valid_to,
         monitoring_priority=monitoring_priority,
         production_priority=production_priority,
         notes=notes.strip() if notes else None,
@@ -104,7 +112,11 @@ def create_mapping(
         updated_at=now,
     )
     providers.add(mapping)
-    session.flush()
+    try:
+        session.flush()
+    except IntegrityError as exc:
+        session.rollback()
+        raise ValueError("Provider mapping conflict.") from exc
     return mapping
 
 

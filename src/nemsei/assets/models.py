@@ -60,7 +60,7 @@ class Asset(Base):
     review_note: Mapped[str | None] = mapped_column(Text)
     owner_id: Mapped[int | None] = mapped_column(ForeignKey("organizations.id", ondelete="SET NULL"))
     country_code: Mapped[str | None] = mapped_column(String(2))
-    timezone: Mapped[str] = mapped_column(String(64), nullable=False, default="Europe/Lisbon")
+    timezone: Mapped[str | None] = mapped_column(String(64))
     timezone_source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
     installed_dc_power_kw: Mapped[Decimal | None] = mapped_column(Numeric(12, 3))
     commissioned_on: Mapped[date | None] = mapped_column(Date)

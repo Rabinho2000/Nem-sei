@@ -59,7 +59,7 @@ def create_asset(
     owner_id: int | None = None,
     lifecycle_status: str = "unknown",
     country_code: str | None = None,
-    timezone: str = "Europe/Lisbon",
+    timezone: str | None = "Europe/Lisbon",
     timezone_source: str = "manual",
     installed_dc_power_kw: Decimal | None = None,
     commissioned_on: date | None = None,
@@ -84,7 +84,7 @@ def create_asset(
         lifecycle_status=lifecycle_status,
         owner_id=owner_id,
         country_code=country_code.strip().upper() if country_code else None,
-        timezone=required_text(timezone, "Timezone"),
+        timezone=required_text(timezone, "Timezone") if timezone else None,
         timezone_source=required_text(timezone_source, "Timezone source"),
         installed_dc_power_kw=installed_dc_power_kw,
         commissioned_on=commissioned_on,
@@ -116,6 +116,7 @@ def update_asset(session: Session, *, asset_id: int, canonical_name: str, owner_
     asset.canonical_name, asset.normalized_name = name, normalize_name(name)
     asset.owner_id, asset.lifecycle_status = owner_id, lifecycle_status
     asset.country_code, asset.timezone = (country_code.strip().upper() if country_code else None), required_text(timezone, "Timezone")
+    asset.timezone_source = "manual"
     asset.installed_dc_power_kw, asset.locality = installed_dc_power_kw, (locality.strip() if locality else None)
     asset.address, asset.technical_notes, asset.updated_at = (address.strip() if address else None), (technical_notes.strip() if technical_notes else None), utc_now()
     session.flush()

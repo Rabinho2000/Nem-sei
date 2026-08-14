@@ -25,6 +25,7 @@ from nemsei.config import Settings
 from nemsei.db.engine import build_engine
 from nemsei.db.session import build_session_factory
 from nemsei.providers.models import AssetProviderMapping, LegacyImportRecord, LegacyImportRun, ProviderConnection
+from nemsei.providers.registry import normalize_external_id
 from nemsei.providers.service import create_connection, create_mapping
 from nemsei.shared.clock import utc_now
 
@@ -34,6 +35,8 @@ LEGACY_CONNECTIONS = {
     "fusionsolar": ("v1-fusionsolar-legacy", "V1 FusionSolar legacy mappings"),
     "sigenergy": ("v1-sigenergy-legacy", "V1 Sigenergy legacy mappings"),
 }
+IMPORTER_VERSION = "assets-v1-importer/2.0"
+IMPORT_BATCH_SIZE = 100
 
 
 class LegacyImportError(ValueError):
@@ -44,6 +47,7 @@ class LegacyImportError(ValueError):
 class ImportManifest:
     source_database_sha256: str
     dry_run: bool
+    source_locator_sha256: str = ""
     counts: Counter[str] = field(default_factory=Counter)
     issues: list[dict[str, str]] = field(default_factory=list)
 
@@ -112,10 +116,22 @@ def optional_date(value: Any) -> date | None:
         return None
 
 
-def prior_record(session: Session, table: str, legacy_id: int | str) -> LegacyImportRecord | None:
+def prior_record(session: Session, source: str, table: str, legacy_id: int | str) -> LegacyImportRecord | None:
+    exact = session.scalar(
+        select(LegacyImportRecord)
+        .where(
+            LegacyImportRecord.source_database_sha256 == source,
+            LegacyImportRecord.legacy_table == table,
+            LegacyImportRecord.legacy_id == str(legacy_id),
+        )
+        .order_by(LegacyImportRecord.id.desc())
+    )
+    if exact is not None:
+        return exact
     return session.scalar(
         select(LegacyImportRecord)
         .where(
+            LegacyImportRecord.source_locator_sha256 == session.info.get("legacy_import_locator", ""),
             LegacyImportRecord.legacy_table == table,
             LegacyImportRecord.legacy_id == str(legacy_id),
         )
@@ -131,6 +147,7 @@ def add_record(
     table: str,
     legacy_id: int | str,
     source_hash: str,
+    source_locator_sha256: str | None = None,
     outcome: str,
     reason: str | None = None,
     organization: Organization | None = None,
@@ -145,6 +162,7 @@ def add_record(
         LegacyImportRecord(
             import_run_id=run.id,
             source_database_sha256=manifest.source_database_sha256,
+            source_locator_sha256=source_locator_sha256 or manifest.source_locator_sha256,
             legacy_table=table,
             legacy_id=str(legacy_id),
             source_hash=source_hash,
@@ -156,6 +174,13 @@ def add_record(
             created_at=utc_now(),
         )
     )
+    batch_size = session.info.get("legacy_import_batch_size")
+    if batch_size:
+        writes = session.info.get("legacy_import_writes", 0) + 1
+        session.info["legacy_import_writes"] = writes
+        if writes >= batch_size:
+            session.commit()
+            session.info["legacy_import_writes"] = 0
 
 
 def legacy_connection(session: Session, provider_code: str) -> ProviderConnection:
@@ -178,7 +203,7 @@ def legacy_connection(session: Session, provider_code: str) -> ProviderConnectio
     )
 
 
-def import_v1_assets(session: Session | None, source_path: Path, *, dry_run: bool = False) -> dict[str, Any]:
+def import_v1_assets(session: Session | None, source_path: Path, *, dry_run: bool = False, batch_size: int | None = None) -> dict[str, Any]:
     """Import only V1 identity/mapping evidence and return a JSON-safe manifest.
 
     A dry run deliberately does not need, use, or modify a V2 SQLAlchemy session.
@@ -191,13 +216,23 @@ def import_v1_assets(session: Session | None, source_path: Path, *, dry_run: boo
         if source_path == bound_database:
             raise LegacyImportError("The V1 source database cannot be the V2 database.")
     source = source_sha256(source_path)
-    manifest = ImportManifest(source_database_sha256=source, dry_run=dry_run)
+    locator = hashlib.sha256(str(source_path).encode()).hexdigest()
+    if session is not None:
+        session.info["legacy_import_locator"] = locator
+        if batch_size is not None:
+            if batch_size <= 0:
+                raise LegacyImportError("Import batch size must be positive.")
+            session.info["legacy_import_batch_size"] = batch_size
+            session.info["legacy_import_writes"] = 0
+    manifest = ImportManifest(source_database_sha256=source, dry_run=dry_run, source_locator_sha256=locator)
     source_db = open_v1_readonly(source_path)
     run: LegacyImportRun | None = None
     try:
         if not dry_run:
             run = LegacyImportRun(
                 source_database_sha256=source,
+                source_locator_sha256=locator,
+                importer_version=IMPORTER_VERSION,
                 dry_run=False,
                 started_at=utc_now(),
                 manifest_json={},
@@ -209,7 +244,7 @@ def import_v1_assets(session: Session | None, source_path: Path, *, dry_run: boo
         organizations: dict[int, Organization] = {}
         for row in customers:
             fingerprint = row_hash(row, row.keys())
-            existing = prior_record(session, "customers", row["id"]) if session else None
+            existing = prior_record(session, source, "customers", row["id"]) if session else None
             if existing and existing.source_hash == fingerprint:
                 organization = session.get(Organization, existing.target_organization_id) if existing.target_organization_id else None
                 if organization:
@@ -243,7 +278,7 @@ def import_v1_assets(session: Session | None, source_path: Path, *, dry_run: boo
         for row in assets:
             fingerprint = row_hash(row, row.keys())
             normalized = normalize_name(row["project_name"])
-            existing = prior_record(session, "assets", row["id"]) if session else None
+            existing = prior_record(session, source, "assets", row["id"]) if session else None
             if existing and existing.source_hash == fingerprint:
                 asset = session.get(Asset, existing.target_asset_id) if existing.target_asset_id else None
                 if asset:
@@ -266,8 +301,10 @@ def import_v1_assets(session: Session | None, source_path: Path, *, dry_run: boo
                 review_reasons.append("installed power missing or invalid")
             if not row["location"]:
                 review_reasons.append("location missing")
-            timezone = row["timezone"] or "Europe/Lisbon"
-            timezone_source = "legacy_source" if row["timezone"] else "migration_default"
+            if not row["timezone"]:
+                review_reasons.append("timezone missing")
+            timezone = row["timezone"] or None
+            timezone_source = "legacy_source" if row["timezone"] else "unknown"
             asset = create_asset(
                 session,
                 canonical_name=row["project_name"],
@@ -290,7 +327,7 @@ def import_v1_assets(session: Session | None, source_path: Path, *, dry_run: boo
         aliases = list(source_db.execute("SELECT id, asset_id, alias_name, normalized_alias, source, active FROM asset_aliases ORDER BY id"))
         for row in aliases:
             fingerprint = row_hash(row, row.keys())
-            existing = prior_record(session, "asset_aliases", row["id"]) if session else None
+            existing = prior_record(session, source, "asset_aliases", row["id"]) if session else None
             asset = imported_assets.get(row["asset_id"])
             if existing and existing.source_hash == fingerprint:
                 add_record(session, run, manifest, table="asset_aliases", legacy_id=row["id"], source_hash=fingerprint, outcome="reused", asset=session.get(Asset, existing.target_asset_id) if session and existing.target_asset_id else None, persist=False)
@@ -317,7 +354,7 @@ def import_v1_assets(session: Session | None, source_path: Path, *, dry_run: boo
         connections: dict[str, ProviderConnection] = {}
         for row in mappings:
             fingerprint = row_hash(row, row.keys())
-            existing = prior_record(session, "asset_integrations", row["id"]) if session else None
+            existing = prior_record(session, source, "asset_integrations", row["id"]) if session else None
             asset = imported_assets.get(row["asset_id"])
             provider = (row["provider"] or "").strip().lower()
             if existing and existing.source_hash == fingerprint:
@@ -333,17 +370,42 @@ def import_v1_assets(session: Session | None, source_path: Path, *, dry_run: boo
                 add_record(None, None, manifest, table="asset_integrations", legacy_id=row["id"], source_hash=fingerprint, outcome="created")
                 continue
             connection = connections.setdefault(provider, legacy_connection(session, provider))
+            collision = session.scalar(
+                select(AssetProviderMapping).where(
+                    AssetProviderMapping.provider_connection_id == connection.id,
+                    AssetProviderMapping.resource_kind == "plant",
+                    AssetProviderMapping.normalized_external_id == normalize_external_id(provider, row["external_id"]),
+                )
+            )
+            if collision is not None:
+                add_record(session, run, manifest, table="asset_integrations", legacy_id=row["id"], source_hash=fingerprint, outcome="conflict", reason="Provider plant is already represented by a legacy mapping.", asset=asset)
+                continue
             try:
-                mapping = create_mapping(session, asset_id=asset.id, provider_connection_id=connection.id, external_id=row["external_id"], external_name=row["external_name"], mapping_status="active", notes="Imported from V1; disabled legacy connection.")
+                mapping = create_mapping(session, asset_id=asset.id, provider_connection_id=connection.id, external_id=row["external_id"], external_name=row["external_name"], mapping_status="pending_review", notes="Imported from V1; disabled legacy connection.")
             except ValueError as exc:
                 add_record(session, run, manifest, table="asset_integrations", legacy_id=row["id"], source_hash=fingerprint, outcome="conflict", reason=str(exc), asset=asset)
                 continue
             add_record(session, run, manifest, table="asset_integrations", legacy_id=row["id"], source_hash=fingerprint, outcome="created", asset=asset, mapping=mapping)
 
+        source_tables = {row[0] for row in source_db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        unresolved = list(source_db.execute("SELECT id, provider, external_id, external_name, normalized_name, external_status, resolution_status FROM integration_unresolved ORDER BY id")) if "integration_unresolved" in source_tables else []
+        for row in unresolved:
+            fingerprint = row_hash(row, row.keys())
+            existing = prior_record(session, source, "integration_unresolved", row["id"]) if session else None
+            if existing and existing.source_hash == fingerprint:
+                add_record(session, run, manifest, table="integration_unresolved", legacy_id=row["id"], source_hash=fingerprint, outcome="reused", persist=False)
+                continue
+            if existing:
+                add_record(session, run, manifest, table="integration_unresolved", legacy_id=row["id"], source_hash=fingerprint, outcome="changed_source", reason="V1 unresolved integration changed; no automatic mapping was created.")
+                continue
+            add_record(session if not dry_run else None, run if not dry_run else None, manifest, table="integration_unresolved", legacy_id=row["id"], source_hash=fingerprint, outcome="unresolved", reason=f"{row['provider']} unresolved integration ({row['resolution_status'] or 'unknown'}); no automatic asset or mapping match.")
+
         if run is not None:
             run.finished_at = utc_now()
             run.manifest_json = manifest.as_dict()
             session.flush()
+        if session is not None and batch_size is not None:
+            session.commit()
         return manifest.as_dict()
     finally:
         source_db.close()
@@ -361,8 +423,7 @@ def main() -> None:
         if args.dry_run:
             manifest = import_v1_assets(None, args.v1_db, dry_run=True)
         else:
-            with session.begin():
-                manifest = import_v1_assets(session, args.v1_db)
+            manifest = import_v1_assets(session, args.v1_db, batch_size=IMPORT_BATCH_SIZE)
         print(json.dumps(manifest, sort_keys=True))
 
 
