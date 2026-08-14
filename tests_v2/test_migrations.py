@@ -15,4 +15,9 @@ def upgrade(settings, monkeypatch) -> None:
 def test_initial_migration_creates_foundation_tables(settings, monkeypatch) -> None:
     upgrade(settings, monkeypatch)
     engine = create_engine(settings.database_url)
-    assert {"jobs", "job_events", "scheduler_leases", "schedule_state", "alembic_version"} <= set(inspect(engine).get_table_names())
+    assert {
+        "jobs", "job_events", "scheduler_leases", "schedule_state",
+        "organizations", "assets", "asset_aliases", "provider_connections",
+        "asset_provider_mappings", "legacy_import_runs", "legacy_import_records",
+        "alembic_version",
+    } <= set(inspect(engine).get_table_names())

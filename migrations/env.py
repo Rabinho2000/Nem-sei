@@ -6,6 +6,8 @@ from sqlalchemy import engine_from_config, pool
 from nemsei.config import Settings
 from nemsei.db.base import Base
 import nemsei.jobs.models  # noqa: F401 - register foundation metadata
+import nemsei.assets.models  # noqa: F401 - register asset metadata
+import nemsei.providers.models  # noqa: F401 - register provider metadata
 
 
 config = context.config
