@@ -105,3 +105,24 @@ def test_rerun_without_source_change_does_not_duplicate_rows(settings, monkeypat
     with factory() as session:
         assert session.scalar(select(func.count()).select_from(Asset)) == 1
         assert session.scalar(select(func.count()).select_from(AssetProviderMapping)) == 1
+
+
+def test_import_reports_connection_scoped_mapping_collision(settings, monkeypatch, tmp_path: Path) -> None:
+    upgrade(settings, monkeypatch)
+    v1_db = tmp_path / "v1.db"
+    build_v1_fixture(v1_db)
+    source = sqlite3.connect(v1_db)
+    source.executescript(
+        """
+        INSERT INTO assets VALUES (4, 'Bravo Solar', NULL, 'Porto', '5', NULL, 'PT', NULL, NULL, NULL);
+        INSERT INTO asset_integrations VALUES (2, 4, 'FusionSolar', 'Plant-A', 'Collision', 1);
+        """
+    )
+    source.commit()
+    source.close()
+    factory = build_session_factory(create_engine(settings.database_url))
+    with factory() as session, session.begin():
+        manifest = import_v1_assets(session, v1_db)
+    assert manifest["counts"]["asset_integrations.conflict"] == 1
+    with factory() as session:
+        assert session.scalar(select(func.count()).select_from(AssetProviderMapping)) == 1

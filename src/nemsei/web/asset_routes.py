@@ -7,7 +7,7 @@ from flask import Blueprint, abort, flash, redirect, render_template, request, u
 from nemsei.assets.repository import AssetRepository
 from nemsei.assets.service import add_alias, create_asset, create_organization, update_asset
 from nemsei.providers.repository import ProviderRepository
-from nemsei.providers.service import create_connection, create_mapping
+from nemsei.providers.service import cross_connection_conflicts, create_connection, create_mapping
 from nemsei.web.csrf import require_valid_token, token
 from nemsei.web.db_session import get_request_session
 from nemsei.web.home_routes import require_authenticated
@@ -69,7 +69,12 @@ def asset_detail(asset_id: int) -> str:
             session.rollback()
             flash(str(exc), "error")
     providers = ProviderRepository(session)
-    return render_template("assets/detail.html", asset=asset, organizations=repository.list_organizations(), aliases=list(asset.aliases), mappings=providers.mappings_for_asset(asset.id), connections=providers.list_connections(), csrf_token=token())
+    mappings = providers.mappings_for_asset(asset.id)
+    conflicts = {
+        mapping.id: cross_connection_conflicts(session, mapping_id=mapping.id)
+        for mapping in mappings
+    }
+    return render_template("assets/detail.html", asset=asset, organizations=repository.list_organizations(), aliases=list(asset.aliases), mappings=mappings, mapping_conflicts=conflicts, connections=providers.list_connections(), csrf_token=token())
 
 
 @assets_bp.post("/assets/<int:asset_id>/aliases")

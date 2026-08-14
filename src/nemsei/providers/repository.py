@@ -39,6 +39,23 @@ class ProviderRepository:
             )
         )
 
+    def cross_connection_claims(self, mapping: AssetProviderMapping) -> list[AssetProviderMapping]:
+        return list(
+            self.session.scalars(
+                select(AssetProviderMapping)
+                .join(ProviderConnection)
+                .where(
+                    ProviderConnection.provider_code
+                    == self.session.get(ProviderConnection, mapping.provider_connection_id).provider_code,
+                    AssetProviderMapping.provider_connection_id != mapping.provider_connection_id,
+                    AssetProviderMapping.resource_kind == mapping.resource_kind,
+                    AssetProviderMapping.normalized_external_id == mapping.normalized_external_id,
+                    AssetProviderMapping.mapping_status == "active",
+                    AssetProviderMapping.valid_to.is_(None),
+                )
+            )
+        )
+
     def list_connections(self) -> list[ProviderConnection]:
         return list(self.session.scalars(select(ProviderConnection).order_by(ProviderConnection.provider_code, ProviderConnection.display_name)))
 

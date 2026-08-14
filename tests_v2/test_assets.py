@@ -8,7 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from nemsei.assets.repository import AssetRepository
 from nemsei.assets.service import add_alias, create_asset, create_organization
 from nemsei.db import build_engine, build_session_factory
-from nemsei.providers.service import create_connection, create_mapping, replace_mapping
+from nemsei.providers.service import cross_connection_conflicts, create_connection, create_mapping, replace_mapping
 from tests_v2.test_migrations import upgrade
 
 
@@ -50,6 +50,18 @@ def test_provider_external_id_has_one_active_connection_scoped_claim(settings, m
         create_mapping(session, asset_id=first.id, provider_connection_id=connection.id, external_id="SIG-1")
         with pytest.raises(ValueError, match="already actively mapped"):
             create_mapping(session, asset_id=second.id, provider_connection_id=connection.id, external_id="sig-1")
+
+
+def test_same_provider_id_can_remain_distinct_across_connections(settings, monkeypatch) -> None:
+    with session_for(settings, monkeypatch) as session:
+        first = create_asset(session, canonical_name="Central A")
+        second = create_asset(session, canonical_name="Central B")
+        account_a = create_connection(session, provider_code="sigenergy", connection_key="account-a", display_name="Account A")
+        account_b = create_connection(session, provider_code="sigenergy", connection_key="account-b", display_name="Account B")
+        mapping = create_mapping(session, asset_id=first.id, provider_connection_id=account_a.id, external_id="SIG-1")
+        other = create_mapping(session, asset_id=second.id, provider_connection_id=account_b.id, external_id="SIG-1")
+        assert [conflict.id for conflict in cross_connection_conflicts(session, mapping_id=mapping.id)] == [other.id]
+        session.commit()
 
 
 def test_mapping_replacement_preserves_history(settings, monkeypatch) -> None:

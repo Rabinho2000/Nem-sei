@@ -139,3 +139,12 @@ def replace_mapping(
     previous.updated_at = utc_now()
     session.flush()
     return replacement
+
+
+def cross_connection_conflicts(session: Session, *, mapping_id: int) -> list[AssetProviderMapping]:
+    """Surface, but never merge, provider IDs that collide across accounts."""
+    repository = ProviderRepository(session)
+    mapping = repository.mapping(mapping_id)
+    if mapping is None:
+        raise ValueError("Unknown provider mapping.")
+    return repository.cross_connection_claims(mapping)
