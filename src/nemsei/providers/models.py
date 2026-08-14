@@ -93,7 +93,7 @@ class LegacyImportRecord(Base):
     __tablename__ = "legacy_import_records"
     __table_args__ = (
         CheckConstraint(f"outcome IN {IMPORT_OUTCOMES!r}", name="ck_legacy_import_records_outcome"),
-        UniqueConstraint("source_database_sha256", "legacy_table", "legacy_id", name="uq_legacy_import_records_source"),
+        UniqueConstraint("source_database_sha256", "legacy_table", "legacy_id", "source_hash", name="uq_legacy_import_records_source_version"),
         Index("ix_legacy_import_records_outcome", "outcome"),
     )
 

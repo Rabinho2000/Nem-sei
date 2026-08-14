@@ -19,6 +19,9 @@ def imports(path: Path) -> set[str]:
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "import_module":
             if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
                 found.add(node.args[0].value)
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "__import__":
+            if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                found.add(node.args[0].value)
     return found
 
 
@@ -42,3 +45,14 @@ def test_app_composition_root_has_no_direct_sql_execution() -> None:
     source = (SOURCE / "app.py").read_text(encoding="utf-8")
     assert "exec_driver_sql" not in source
     assert ".execute(" not in source
+
+
+def test_assets_and_provider_contracts_have_no_network_client_dependency() -> None:
+    prohibited = {"requests", "httpx", "aiohttp", "urllib", "urllib3"}
+    violations = []
+    for package in (SOURCE / "assets", SOURCE / "providers"):
+        for path in package.rglob("*.py"):
+            names = imports(path)
+            if any(name.split(".", 1)[0] in prohibited for name in names):
+                violations.append(str(path.relative_to(ROOT)))
+    assert not violations

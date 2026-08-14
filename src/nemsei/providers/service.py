@@ -6,7 +6,12 @@ from datetime import date
 from sqlalchemy.orm import Session
 
 from nemsei.assets.repository import AssetRepository
-from nemsei.providers.models import AssetProviderMapping, ProviderConnection
+from nemsei.providers.models import (
+    CONNECTION_STATUSES,
+    MAPPING_STATUSES,
+    AssetProviderMapping,
+    ProviderConnection,
+)
 from nemsei.providers.registry import ProviderCode, normalize_external_id
 from nemsei.providers.repository import ProviderRepository
 from nemsei.shared.clock import utc_now
@@ -24,10 +29,12 @@ def create_connection(
     enabled: bool = False,
     configuration_status: str = "not_configured",
 ) -> ProviderConnection:
-    provider = ProviderCode(str(provider_code).lower()).value
+    provider = ProviderCode(provider_code).value if isinstance(provider_code, ProviderCode) else ProviderCode(provider_code.lower()).value
     key = connection_key.strip()
     if not key or not display_name.strip():
         raise ValueError("Provider connection key and name are required.")
+    if configuration_status not in CONNECTION_STATUSES:
+        raise ValueError("Invalid provider connection configuration status.")
     now = utc_now()
     connection = ProviderConnection(
         provider_code=provider,
@@ -66,6 +73,11 @@ def create_mapping(
     connection = providers.connection(provider_connection_id)
     if connection is None:
         raise ValueError("Unknown provider connection.")
+    if mapping_status not in MAPPING_STATUSES:
+        raise ValueError("Invalid provider mapping status.")
+    external_id = external_id.strip()
+    if not external_id:
+        raise ValueError("Provider external ID is required.")
     if mapping_status == "active":
         claimed = providers.active_external_claim(
             connection_id=connection.id,
@@ -80,7 +92,7 @@ def create_mapping(
         asset_id=asset_id,
         provider_connection_id=connection.id,
         resource_kind="plant",
-        external_id=external_id.strip(),
+        external_id=external_id,
         normalized_external_id=normalize_external_id(connection.provider_code, external_id),
         external_name=external_name.strip() if external_name else None,
         mapping_status=mapping_status,
