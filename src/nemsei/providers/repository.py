@@ -39,5 +39,8 @@ class ProviderRepository:
             )
         )
 
+    def list_connections(self) -> list[ProviderConnection]:
+        return list(self.session.scalars(select(ProviderConnection).order_by(ProviderConnection.provider_code, ProviderConnection.display_name)))
+
     def add(self, entity: object) -> None:
         self.session.add(entity)

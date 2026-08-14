@@ -20,6 +20,9 @@ class AssetRepository:
     def list_assets(self) -> list[Asset]:
         return list(self.session.scalars(select(Asset).order_by(Asset.canonical_name, Asset.id)))
 
+    def list_organizations(self) -> list[Organization]:
+        return list(self.session.scalars(select(Organization).order_by(Organization.display_name, Organization.id)))
+
     def alias(self, alias_id: int) -> AssetAlias | None:
         return self.session.get(AssetAlias, alias_id)
 

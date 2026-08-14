@@ -101,6 +101,27 @@ def create_asset(
     return asset
 
 
+def update_asset(session: Session, *, asset_id: int, canonical_name: str, owner_id: int | None, lifecycle_status: str, country_code: str | None, timezone: str, installed_dc_power_kw: Decimal | None, locality: str | None, address: str | None, technical_notes: str | None) -> Asset:
+    repository = AssetRepository(session)
+    asset = repository.asset(asset_id)
+    if asset is None:
+        raise ValueError("Unknown asset.")
+    if lifecycle_status not in ASSET_LIFECYCLE_STATUSES:
+        raise ValueError("Invalid asset lifecycle status.")
+    if owner_id is not None and repository.organization(owner_id) is None:
+        raise ValueError("Unknown asset owner.")
+    if installed_dc_power_kw is not None and installed_dc_power_kw < 0:
+        raise ValueError("Installed power cannot be negative.")
+    name = required_text(canonical_name, "Asset name")
+    asset.canonical_name, asset.normalized_name = name, normalize_name(name)
+    asset.owner_id, asset.lifecycle_status = owner_id, lifecycle_status
+    asset.country_code, asset.timezone = (country_code.strip().upper() if country_code else None), required_text(timezone, "Timezone")
+    asset.installed_dc_power_kw, asset.locality = installed_dc_power_kw, (locality.strip() if locality else None)
+    asset.address, asset.technical_notes, asset.updated_at = (address.strip() if address else None), (technical_notes.strip() if technical_notes else None), utc_now()
+    session.flush()
+    return asset
+
+
 def add_alias(
     session: Session,
     *,
