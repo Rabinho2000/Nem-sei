@@ -23,6 +23,7 @@ def upgrade() -> None:
         batch.add_column(sa.Column("source_locator_sha256", sa.String(64), nullable=False, server_default="unknown"))
     with op.batch_alter_table("legacy_import_records", recreate="always") as batch:
         batch.add_column(sa.Column("source_locator_sha256", sa.String(64), nullable=False, server_default="unknown"))
+        batch.add_column(sa.Column("evidence_json", sa.JSON(), nullable=False, server_default="{}"))
         batch.drop_constraint("ck_legacy_import_records_outcome", type_="check")
         batch.create_check_constraint("ck_legacy_import_records_outcome", "outcome IN ('created', 'reused', 'quarantined', 'changed_source', 'conflict', 'excluded', 'unresolved')")
 
@@ -31,6 +32,7 @@ def downgrade() -> None:
     with op.batch_alter_table("legacy_import_records", recreate="always") as batch:
         batch.drop_constraint("ck_legacy_import_records_outcome", type_="check")
         batch.create_check_constraint("ck_legacy_import_records_outcome", "outcome IN ('created', 'reused', 'quarantined', 'changed_source', 'conflict', 'excluded')")
+        batch.drop_column("evidence_json")
         batch.drop_column("source_locator_sha256")
     with op.batch_alter_table("legacy_import_runs", recreate="always") as batch:
         batch.drop_column("source_locator_sha256")

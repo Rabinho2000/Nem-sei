@@ -153,6 +153,7 @@ def add_record(
     organization: Organization | None = None,
     asset: Asset | None = None,
     mapping: AssetProviderMapping | None = None,
+    evidence: dict[str, str] | None = None,
     persist: bool = True,
 ) -> None:
     manifest.record(table, outcome, legacy_id=legacy_id, reason=reason)
@@ -168,6 +169,7 @@ def add_record(
             source_hash=source_hash,
             outcome=outcome,
             reason=reason,
+            evidence_json=evidence or {},
             target_organization_id=organization.id if organization else None,
             target_asset_id=asset.id if asset else None,
             target_mapping_id=mapping.id if mapping else None,
@@ -398,7 +400,7 @@ def import_v1_assets(session: Session | None, source_path: Path, *, dry_run: boo
             if existing:
                 add_record(session, run, manifest, table="integration_unresolved", legacy_id=row["id"], source_hash=fingerprint, outcome="changed_source", reason="V1 unresolved integration changed; no automatic mapping was created.")
                 continue
-            add_record(session if not dry_run else None, run if not dry_run else None, manifest, table="integration_unresolved", legacy_id=row["id"], source_hash=fingerprint, outcome="unresolved", reason=f"{row['provider']} unresolved integration ({row['resolution_status'] or 'unknown'}); no automatic asset or mapping match.")
+            add_record(session if not dry_run else None, run if not dry_run else None, manifest, table="integration_unresolved", legacy_id=row["id"], source_hash=fingerprint, outcome="unresolved", reason=f"{row['provider']} unresolved integration ({row['resolution_status'] or 'unknown'}); no automatic asset or mapping match.", evidence={"provider": row["provider"], "external_id": row["external_id"] or "", "external_name": row["external_name"], "resolution_status": row["resolution_status"] or "unknown"})
 
         if run is not None:
             run.finished_at = utc_now()

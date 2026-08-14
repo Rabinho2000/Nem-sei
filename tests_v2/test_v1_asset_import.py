@@ -149,6 +149,8 @@ def test_source_fingerprint_prevents_cross_database_id_reuse_and_records_unresol
         assert session.scalar(select(func.count()).select_from(Asset)) == 2
         assert session.scalar(select(func.count()).select_from(LegacyImportRun)) == 2
         assert session.scalar(select(LegacyImportRun.importer_version).limit(1)) == "assets-v1-importer/2.0"
+        unresolved = session.scalar(select(LegacyImportRecord).where(LegacyImportRecord.legacy_table == "integration_unresolved"))
+        assert unresolved.evidence_json["external_id"] == "unknown-1"
 
 
 def test_batched_import_commits_deterministic_small_units_and_reruns_safely(settings, monkeypatch, tmp_path: Path) -> None:

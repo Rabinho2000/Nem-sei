@@ -108,6 +108,7 @@ class LegacyImportRecord(Base):
     source_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     outcome: Mapped[str] = mapped_column(String(32), nullable=False)
     reason: Mapped[str | None] = mapped_column(Text)
+    evidence_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     target_organization_id: Mapped[int | None] = mapped_column(ForeignKey("organizations.id", ondelete="SET NULL"))
     target_asset_id: Mapped[int | None] = mapped_column(ForeignKey("assets.id", ondelete="SET NULL"))
     target_mapping_id: Mapped[int | None] = mapped_column(ForeignKey("asset_provider_mappings.id", ondelete="SET NULL"))
