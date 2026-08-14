@@ -2,6 +2,8 @@
 <html lang="pt-PT">
   <head><meta charset="utf-8"><title>{{ title or "Nem-sei V2" }}</title></head>
   <body>
-    <main><h1>{{ title or "Nem-sei V2" }}</h1><p>V2 foundation is ready.</p></main>
+    <nav><a href="{{ url_for('assets.list_assets') }}">Assets</a> · <a href="{{ url_for('assets.organizations') }}">Organizations</a> · <a href="{{ url_for('assets.provider_connections') }}">Provider connections</a></nav>
+    {% with messages = get_flashed_messages(with_categories=true) %}{% for category, message in messages %}<p class="{{ category }}">{{ message }}</p>{% endfor %}{% endwith %}
+    <main>{% block content %}<h1>{{ title or "Nem-sei V2" }}</h1><p>V2 foundation is ready.</p>{% endblock %}</main>
   </body>
 </html>
