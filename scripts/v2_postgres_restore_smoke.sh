@@ -27,10 +27,30 @@ trap cleanup EXIT
 "${compose[@]}" exec -T postgres psql -U nemsei -d postgres -v ON_ERROR_STOP=1 \
   -c "CREATE DATABASE $restore_db"
 "${compose[@]}" exec -T postgres pg_restore -U nemsei -d "$restore_db" --exit-on-error < "$archive"
-revision=$("${compose[@]}" exec -T postgres psql -U nemsei -d "$restore_db" -At \
+revision_output=$("${compose[@]}" exec -T postgres psql -U nemsei -d "$restore_db" -At \
   -c 'SELECT version_num FROM alembic_version')
-if [[ $revision != 0004_asset_import_hardening ]]; then
-  echo "Unexpected restored Alembic revision: $revision" >&2
+mapfile -t revisions < <(printf '%s\n' "$revision_output" | sed '/^[[:space:]]*$/d')
+if (( ${#revisions[@]} != 1 )); then
+  echo "Restored database must contain exactly one Alembic revision; found ${#revisions[@]}." >&2
+  exit 1
+fi
+revision=${revisions[0]}
+
+if ! head_output=$("${compose[@]}" run --rm --no-deps -T \
+  -v "$root/scripts/v2_resolve_alembic_head.py:/app/v2_resolve_alembic_head.py:ro" \
+  -v "$root/alembic.ini:/app/alembic.ini:ro" \
+  -v "$root/migrations:/app/migrations:ro" \
+  migrate python /app/v2_resolve_alembic_head.py --config /app/alembic.ini); then
+  echo "Unable to resolve the current repository Alembic head." >&2
+  exit 1
+fi
+expected_head=$(printf '%s\n' "$head_output" | awk -F= '/^__NEMSEI_ALEMBIC_HEAD__=/{print $2}' | tail -n 1)
+if [[ -z $expected_head ]]; then
+  echo "Unable to resolve the current repository Alembic head." >&2
+  exit 1
+fi
+if [[ $revision != "$expected_head" ]]; then
+  echo "Restored Alembic revision '$revision' does not match repository head '$expected_head'." >&2
   exit 1
 fi
 "${compose[@]}" exec -T postgres psql -U nemsei -d "$restore_db" -v ON_ERROR_STOP=1 \
