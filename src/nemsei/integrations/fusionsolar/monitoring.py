@@ -19,7 +19,7 @@ from nemsei.config import Settings
 from nemsei.integrations.fusionsolar.client import FusionSolarClient, FusionSolarClientError, FusionSolarCredentials
 from nemsei.integrations.fusionsolar.request_control import FusionSolarRequestController
 from nemsei.integrations.fusionsolar.service import credentials_for
-from nemsei.monitoring.service import record_observation
+from nemsei.monitoring.service import confirm_current_monitoring, record_current_monitoring_attempt
 from nemsei.providers.errors import ProviderError, ProviderErrorCode
 from nemsei.providers.models import AssetProviderMapping, ProviderConnection
 from nemsei.providers.registry import ProviderCapability, ProviderCode, normalize_external_id
@@ -126,6 +126,7 @@ class FusionSolarMonitoringService:
         evaluated: set[str] = set()
         for batch in _batches(selected, 100):
             codes = [mapping.external_id for mapping in batch]
+            self._record_attempts(batch)
             rows, error = self._calls.call(
                 connection_id=connection_id,
                 sync_run_id=run.id,
@@ -205,7 +206,7 @@ class FusionSolarMonitoringService:
         with self._sessions() as session:
             for normalized, sample in samples.items():
                 mapping = mappings[normalized]
-                record_observation(
+                confirm_current_monitoring(
                     session,
                     asset_id=mapping.asset_id,
                     provider_mapping_id=mapping.id,
@@ -223,6 +224,14 @@ class FusionSolarMonitoringService:
                 )
             session.commit()
         return len(samples)
+
+    def _record_attempts(self, mappings: list[AssetProviderMapping]) -> None:
+        with self._sessions() as session:
+            record_current_monitoring_attempt(
+                session,
+                provider_mapping_ids=[mapping.id for mapping in mappings],
+            )
+            session.commit()
 
     def _finish(
         self,

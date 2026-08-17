@@ -5,6 +5,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from nemsei.monitoring.models import (
@@ -12,6 +13,7 @@ from nemsei.monitoring.models import (
     OBSERVATION_CONDITIONS,
     PRODUCTION_METRICS,
     QUALITY_STATES,
+    MonitoringCurrentState,
     MonitoringObservation,
     ProductionFact,
 )
@@ -95,6 +97,91 @@ def record_observation(
     )
     session.add(observation)
     return observation, True
+
+
+def record_current_monitoring_attempt(
+    session: Session,
+    *,
+    provider_mapping_ids: list[int],
+    attempted_at: datetime | None = None,
+) -> None:
+    """Record that a current-state request included these mappings.
+
+    This projection is intentionally independent of observation condition and
+    confirmation: a failed or partial provider request must not imply offline.
+    """
+    now = as_utc(attempted_at or utc_now())
+    for mapping_id in provider_mapping_ids:
+        session.execute(
+            insert(MonitoringCurrentState)
+            .values(provider_mapping_id=mapping_id, last_attempt_at=now, updated_at=now)
+            .on_conflict_do_update(
+                index_elements=("provider_mapping_id",),
+                set_={"last_attempt_at": now, "updated_at": now},
+            )
+        )
+
+
+def confirm_current_monitoring(
+    session: Session,
+    *,
+    asset_id: int,
+    provider_mapping_id: int,
+    source_observation_key: str,
+    observed_at: datetime,
+    condition: str,
+    freshness: str,
+    quality: str,
+    completeness: str,
+    sync_run_id: int,
+    raw_status_code: str | None = None,
+    raw_status_text: str | None = None,
+    safe_detail: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    deduplicate_observed_at: bool = False,
+    confirmed_at: datetime | None = None,
+) -> tuple[MonitoringObservation, bool]:
+    """Persist canonical evidence and refresh its provider-neutral projection."""
+    observation, created = record_observation(
+        session,
+        asset_id=asset_id,
+        provider_mapping_id=provider_mapping_id,
+        source_observation_key=source_observation_key,
+        observed_at=observed_at,
+        condition=condition,
+        freshness=freshness,
+        quality=quality,
+        completeness=completeness,
+        sync_run_id=sync_run_id,
+        raw_status_code=raw_status_code,
+        raw_status_text=raw_status_text,
+        safe_detail=safe_detail,
+        metadata=metadata,
+        deduplicate_observed_at=deduplicate_observed_at,
+    )
+    session.flush()
+    assert observation.id is not None
+    now = as_utc(confirmed_at or utc_now())
+    session.execute(
+        insert(MonitoringCurrentState)
+        .values(
+            provider_mapping_id=provider_mapping_id,
+            latest_observation_id=observation.id,
+            last_confirmed_at=now,
+            last_successful_sync_run_id=sync_run_id,
+            updated_at=now,
+        )
+        .on_conflict_do_update(
+            index_elements=("provider_mapping_id",),
+            set_={
+                "latest_observation_id": observation.id,
+                "last_confirmed_at": now,
+                "last_successful_sync_run_id": sync_run_id,
+                "updated_at": now,
+            },
+        )
+    )
+    return observation, created
 
 
 def record_production_fact(

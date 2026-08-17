@@ -54,16 +54,36 @@ class FusionSolarRequestController:
                 error = None
             except FusionSolarClientError as exc:
                 value, error = None, exc.error
-            with self._sessions() as session:
-                state = session.scalar(
-                    select(ProviderRequestState)
-                    .where(ProviderRequestState.id == state_id)
-                    .with_for_update()
-                )
-                attempt = session.get(ProviderRequestAttempt, attempt_id)
-                assert state is not None and attempt is not None
-                record_request_result(session, state=state, attempt=attempt, error=error)
-                session.commit()
+            except Exception:
+                # Preserve a truthful, sanitized terminal audit record even for
+                # programming/transport surprises, then propagate the original.
+                try:
+                    self._finalize(
+                        state_id,
+                        attempt_id,
+                        ProviderError(
+                            ProviderErrorCode.UNKNOWN,
+                            "Unexpected internal failure while invoking FusionSolar.",
+                        ),
+                    )
+                except Exception:
+                    # The original operation failure remains more actionable;
+                    # never retry the provider call to repair local evidence.
+                    pass
+                raise
+            self._finalize(state_id, attempt_id, error)
             if error is None or not error.transient or error.code is ProviderErrorCode.RATE_LIMITED:
                 return value, error
         return None, error
+
+    def _finalize(self, state_id: int, attempt_id: int, error: ProviderError | None) -> None:
+        with self._sessions() as session:
+            state = session.scalar(
+                select(ProviderRequestState)
+                .where(ProviderRequestState.id == state_id)
+                .with_for_update()
+            )
+            attempt = session.get(ProviderRequestAttempt, attempt_id)
+            assert state is not None and attempt is not None
+            record_request_result(session, state=state, attempt=attempt, error=error)
+            session.commit()

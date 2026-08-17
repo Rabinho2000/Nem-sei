@@ -19,6 +19,6 @@ def test_initial_migration_creates_foundation_tables(settings, monkeypatch) -> N
         "organizations", "assets", "asset_aliases", "provider_connections",
         "asset_provider_mappings", "legacy_import_runs", "legacy_import_records",
         "integration_health", "sync_runs", "sync_cursors", "provider_request_states",
-        "provider_request_attempts", "asset_source_policies", "monitoring_observations", "production_facts",
+        "provider_request_attempts", "asset_source_policies", "monitoring_observations", "monitoring_current_states", "production_facts",
         "alembic_version",
     } <= set(inspect(engine).get_table_names())

@@ -46,6 +46,25 @@ class MonitoringObservation(Base):
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
 
 
+class MonitoringCurrentState(Base):
+    """Mutable per-mapping confirmation evidence, separate from fact history."""
+
+    __tablename__ = "monitoring_current_states"
+
+    provider_mapping_id: Mapped[int] = mapped_column(
+        ForeignKey("asset_provider_mappings.id", ondelete="CASCADE"), primary_key=True
+    )
+    latest_observation_id: Mapped[int | None] = mapped_column(
+        ForeignKey("monitoring_observations.id", ondelete="RESTRICT")
+    )
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_successful_sync_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("sync_runs.id", ondelete="SET NULL")
+    )
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class ProductionFact(Base):
     __tablename__ = "production_facts"
     __table_args__ = (

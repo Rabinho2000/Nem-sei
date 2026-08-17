@@ -3,20 +3,23 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import date
 
+import pytest
 from sqlalchemy import delete, func, select
 
 from nemsei.assets.service import create_asset
 from nemsei.db import build_engine, build_session_factory
 from nemsei.integrations.fusionsolar.client import FusionSolarClient, FusionSolarClientError, HttpResponse
 from nemsei.integrations.fusionsolar.monitoring import FusionSolarMonitoringService, normalize_current_monitoring_row
-from nemsei.monitoring.models import MonitoringObservation
+from nemsei.integrations.fusionsolar.request_control import FusionSolarRequestController
+from nemsei.monitoring.models import MonitoringCurrentState, MonitoringObservation
 from nemsei.monitoring.service import record_observation
 from nemsei.providers.errors import ProviderError, ProviderErrorCode
 from nemsei.providers.service import create_connection, create_mapping
 from nemsei.shared.clock import utc_now
 from nemsei.sources.service import create_source_policy
 from nemsei.sources.models import AssetSourcePolicy
-from nemsei.sync.models import IntegrationHealth, ProviderRequestState, SyncRun
+from nemsei.sync.models import IntegrationHealth, ProviderRequestAttempt, ProviderRequestState, SyncRun
+from nemsei.sync.service import start_sync_run
 from tests_v2.test_migrations import upgrade
 
 
@@ -156,10 +159,37 @@ def test_repeat_is_idempotent_and_changed_provider_evidence_creates_a_revision(s
         assert values[1].supersedes_observation_id == values[0].id
 
 
+def test_current_state_projection_advances_confirmation_without_duplicate_observations(settings, monkeypatch):
+    configured_environment(monkeypatch)
+    factory = factory_for(settings, monkeypatch)
+    connection_id, mappings = selected_connection(factory)
+    first = service(factory, settings, FakeTransport([response(LOGIN_OK, headers={"XSRF-TOKEN": "t"}), realtime([row("FS-001", "3")])])).sync_current_monitoring(connection_id)
+    with factory() as session:
+        before = session.get(MonitoringCurrentState, mappings[0].id)
+        assert before is not None
+        first_observation_id = before.latest_observation_id
+        first_confirmed_at = before.last_confirmed_at
+        assert before.last_successful_sync_run_id == first.sync_run_id
+    second = service(factory, settings, FakeTransport([response(LOGIN_OK, headers={"XSRF-TOKEN": "t"}), realtime([row("FS-001", "3")])])).sync_current_monitoring(connection_id)
+    with factory() as session:
+        current = session.get(MonitoringCurrentState, mappings[0].id)
+        assert current is not None
+        assert current.latest_observation_id == first_observation_id
+        assert current.last_confirmed_at is not None and current.last_confirmed_at >= first_confirmed_at
+        assert current.last_successful_sync_run_id == second.sync_run_id
+        assert session.scalar(select(func.count()).select_from(MonitoringObservation)) == 1
+
+
 def test_partial_response_and_provider_failure_preserve_successful_or_stale_observations(settings, monkeypatch):
     configured_environment(monkeypatch)
     factory = factory_for(settings, monkeypatch)
     connection_id, mappings = selected_connection(factory, count=2)
+    service(factory, settings, FakeTransport([response(LOGIN_OK, headers={"XSRF-TOKEN": "t"}), realtime([row("FS-001", "3"), row("FS-002", "3")])])).sync_current_monitoring(connection_id)
+    with factory() as session:
+        second_before = session.get(MonitoringCurrentState, mappings[1].id)
+        assert second_before is not None
+        second_confirmed = second_before.last_confirmed_at
+        second_success_run = second_before.last_successful_sync_run_id
     partial = service(factory, settings, FakeTransport([response(LOGIN_OK, headers={"XSRF-TOKEN": "t"}), realtime([row("FS-001", "3")])])).sync_current_monitoring(connection_id)
     assert partial.status == "partial" and partial.accepted == 1
     with factory() as session:
@@ -181,6 +211,34 @@ def test_partial_response_and_provider_failure_preserve_successful_or_stale_obse
         stale = session.scalar(select(MonitoringObservation).where(MonitoringObservation.source_observation_key == "previous-stale"))
         assert stale is not None and stale.condition == "operational" and stale.freshness == "stale"
         assert session.scalar(select(func.count()).select_from(MonitoringObservation).where(MonitoringObservation.condition == "offline")) == 0
+        second_after = session.get(MonitoringCurrentState, mappings[1].id)
+        assert second_after is not None
+        assert second_after.last_confirmed_at == second_confirmed
+        assert second_after.last_successful_sync_run_id == second_success_run
+        assert second_after.last_attempt_at is not None
+
+
+def test_unexpected_provider_operation_failure_finalizes_attempt_without_exposing_details(settings, monkeypatch):
+    factory = factory_for(settings, monkeypatch)
+    connection_id, _mappings = selected_connection(factory)
+    with factory() as session:
+        run = start_sync_run(session, provider_connection_id=connection_id, capability="current_monitoring")
+        session.commit()
+        run_id = run.id
+    controller = FusionSolarRequestController(factory, max_transient_retries=1)
+    with pytest.raises(RuntimeError, match="unexpected test failure"):
+        controller.call(
+            connection_id=connection_id,
+            sync_run_id=run_id,
+            endpoint_family="current_monitoring",
+            purpose="unexpected-test",
+            operation=lambda: (_ for _ in ()).throw(RuntimeError("unexpected test failure: fixture-secret")),
+        )
+    with factory() as session:
+        attempts = list(session.scalars(select(ProviderRequestAttempt).where(ProviderRequestAttempt.sync_run_id == run_id)))
+        assert len(attempts) == 1 and attempts[0].status == "failed"
+        assert attempts[0].safe_detail == "Unexpected internal failure while invoking FusionSolar."
+        assert "fixture-secret" not in (attempts[0].safe_detail or "")
 
 
 def test_rate_limit_deferral_and_source_policy_failure_make_no_monitoring_call(settings, monkeypatch):

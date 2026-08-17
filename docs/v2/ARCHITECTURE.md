@@ -75,3 +75,16 @@ Repeated identical current-state evidence is idempotent; a status correction
 creates an append-only revision. A timeout, authentication failure, missing row,
 or rate limit updates IntegrationHealth and SyncRun evidence but never writes an
 offline observation or erases the last valid observation.
+
+Canonical observations stay append-only. `monitoring_current_states` is the
+separate provider-neutral, per-mapping confirmation projection: it records the
+latest canonical observation, last batch attempt, last confirmed provider
+evidence, and the SyncRun that last confirmed that mapping. An identical poll
+does not add another observation revision, but does advance its confirmation.
+A mapping absent from a partial response, or any provider failure, cannot
+advance `last_confirmed_at`.
+
+FusionSolar request attempts are finalized even when an unexpected operation
+exception occurs. The audit contains only a fixed internal-failure message and
+the original exception is re-raised; local evidence handling never triggers an
+additional provider HTTP request.
