@@ -232,8 +232,11 @@ def test_source_policy_conflict_blocks_call_and_untrusted_contract_blocks_persis
     result = service(factory, settings, transport).sync_daily_production(connection_id, start_date=date(2026, 1, 15), end_date=date(2026, 1, 15))
     assert result.status == "failed" and not transport.calls
     monkeypatch.delenv("NEMSEI_V2_FUSIONSOLAR_PRODUCTION_PRODUCTION_UNIT")
-    with pytest.raises(FusionSolarClientError, match="timezone and verified kWh"):
-        service(factory, settings, FakeTransport([])).sync_daily_production(connection_id, start_date=date(2026, 1, 15), end_date=date(2026, 1, 15))
+    contract_failure = service(factory, settings, FakeTransport([])).sync_daily_production(connection_id, start_date=date(2026, 1, 15), end_date=date(2026, 1, 15))
+    assert contract_failure.status == "failed" and contract_failure.error_code == "configuration"
+    with factory() as session:
+        assert session.get(SyncRun, contract_failure.sync_run_id) is not None
+        assert session.scalar(select(func.count()).select_from(ProductionFact)) == 0
 
 
 def test_normalizer_rejects_unverified_fallback_fields_and_no_discovery_occurs(settings, monkeypatch):
@@ -250,3 +253,104 @@ def test_normalizer_rejects_unverified_fallback_fields_and_no_discovery_occurs(s
     with factory() as session:
         attempts = list(session.scalars(select(ProviderRequestAttempt).where(ProviderRequestAttempt.sync_run_id == result.sync_run_id)))
         assert [attempt.status for attempt in attempts] == ["succeeded", "succeeded"]
+
+
+def test_cursor_advances_only_for_contiguous_selected_coverage(settings, monkeypatch):
+    configured_environment(monkeypatch)
+    factory = factory_for(settings, monkeypatch)
+    connection_id, _mappings = selected_connection(factory)
+    baseline = service(factory, settings, FakeTransport([
+        response(LOGIN_OK, headers={"XSRF-TOKEN": "t"}), daily([row("FS-001", "10")]),
+    ])).sync_daily_production(connection_id, start_date=date(2026, 8, 10), end_date=date(2026, 8, 10))
+    assert baseline.cursor_advanced
+    gap = service(factory, settings, FakeTransport([
+        response(LOGIN_OK, headers={"XSRF-TOKEN": "t"}),
+        daily([row("FS-001", "15")]), daily([row("FS-001", "16")]),
+    ])).sync_daily_production(connection_id, start_date=date(2026, 8, 15), end_date=date(2026, 8, 16))
+    assert gap.status == "success" and not gap.cursor_advanced
+    next_day = service(factory, settings, FakeTransport([
+        response(LOGIN_OK, headers={"XSRF-TOKEN": "t"}), daily([row("FS-001", "11")]),
+    ])).sync_daily_production(connection_id, start_date=date(2026, 8, 11), end_date=date(2026, 8, 11))
+    assert next_day.cursor_advanced
+    overlap = service(factory, settings, FakeTransport([
+        response(LOGIN_OK, headers={"XSRF-TOKEN": "t"}),
+        daily([row("FS-001", "11")]), daily([row("FS-001", "12")]),
+    ])).sync_daily_production(connection_id, start_date=date(2026, 8, 11), end_date=date(2026, 8, 12))
+    assert overlap.cursor_advanced
+    with factory() as session:
+        cursor = session.scalar(select(SyncCursor))
+        assert cursor is not None and cursor.checkpoint_json["last_completed_day"] == "2026-08-12"
+
+
+def test_historical_correction_partial_and_failure_never_move_existing_cursor(settings, monkeypatch):
+    configured_environment(monkeypatch)
+    factory = factory_for(settings, monkeypatch)
+    connection_id, _mappings = selected_connection(factory)
+    service(factory, settings, FakeTransport([
+        response(LOGIN_OK, headers={"XSRF-TOKEN": "t"}), daily([row("FS-001", "10")]),
+    ])).sync_daily_production(connection_id, start_date=date(2026, 8, 10), end_date=date(2026, 8, 10))
+    correction = service(factory, settings, FakeTransport([
+        response(LOGIN_OK, headers={"XSRF-TOKEN": "t"}), daily([row("FS-001", "9.5")]),
+    ])).sync_daily_production(connection_id, start_date=date(2026, 8, 9), end_date=date(2026, 8, 9))
+    partial = service(factory, settings, FakeTransport([
+        response(LOGIN_OK, headers={"XSRF-TOKEN": "t"}), daily([]),
+    ])).sync_daily_production(connection_id, start_date=date(2026, 8, 11), end_date=date(2026, 8, 11))
+    failed = service(factory, settings, FakeTransport([
+        FusionSolarClientError(ProviderError(ProviderErrorCode.TIMEOUT, "timeout", transient=True)),
+    ])).sync_daily_production(connection_id, start_date=date(2026, 8, 11), end_date=date(2026, 8, 11))
+    assert correction.status == "success" and not correction.cursor_advanced
+    assert partial.status == "partial" and not partial.cursor_advanced
+    assert failed.status == "failed" and not failed.cursor_advanced
+    with factory() as session:
+        cursor = session.scalar(select(SyncCursor))
+        assert cursor is not None and cursor.checkpoint_json["last_completed_day"] == "2026-08-10"
+
+
+@pytest.mark.parametrize("name, value", [
+    ("NEMSEI_V2_FUSIONSOLAR_PRODUCTION_PRODUCTION_TIMEZONE", None),
+    ("NEMSEI_V2_FUSIONSOLAR_PRODUCTION_PRODUCTION_UNIT", "MWh"),
+])
+def test_contract_configuration_and_disabled_reads_are_controlled_without_http(settings, monkeypatch, name, value):
+    configured_environment(monkeypatch)
+    factory = factory_for(settings, monkeypatch)
+    connection_id, _mappings = selected_connection(factory)
+    if value is None:
+        monkeypatch.delenv(name)
+    else:
+        monkeypatch.setenv(name, value)
+    transport = FakeTransport([])
+    result = service(factory, settings, transport).sync_daily_production(connection_id, start_date=date(2026, 8, 10), end_date=date(2026, 8, 10))
+    assert result.status == "failed" and result.error_code == "configuration" and not transport.calls
+    disabled_transport = FakeTransport([])
+    disabled = FusionSolarProductionService(
+        factory,
+        settings,
+        client_factory=lambda credentials: FusionSolarClient(credentials, transport=disabled_transport),
+    ).sync_daily_production(connection_id, start_date=date(2026, 8, 10), end_date=date(2026, 8, 10))
+    assert disabled.status == "deferred" and disabled.error_code == "not_supported" and not disabled_transport.calls
+    with factory() as session:
+        runs = list(session.scalars(select(SyncRun).order_by(SyncRun.id)))
+        assert [run.status for run in runs] == ["failed", "deferred"]
+        assert session.scalar(select(func.count()).select_from(ProductionFact)) == 0
+
+
+def test_cursor_timezone_change_and_normal_window_limit_fail_safely(settings, monkeypatch):
+    configured_environment(monkeypatch)
+    factory = factory_for(settings, monkeypatch)
+    connection_id, _mappings = selected_connection(factory)
+    service(factory, settings, FakeTransport([
+        response(LOGIN_OK, headers={"XSRF-TOKEN": "t"}), daily([row("FS-001", "10")]),
+    ])).sync_daily_production(connection_id, start_date=date(2026, 8, 10), end_date=date(2026, 8, 10))
+    monkeypatch.setenv("NEMSEI_V2_FUSIONSOLAR_PRODUCTION_PRODUCTION_TIMEZONE", "Europe/Lisbon")
+    timezone_changed = service(factory, settings, FakeTransport([])).sync_daily_production(connection_id, end_date=date(2026, 8, 11), reconciliation_days=0)
+    assert timezone_changed.status == "failed" and timezone_changed.error_code == "configuration"
+    monkeypatch.setenv("NEMSEI_V2_FUSIONSOLAR_PRODUCTION_PRODUCTION_TIMEZONE", "UTC")
+    bounded = FusionSolarProductionService(
+        factory,
+        replace(settings, capabilities={**settings.capabilities, "provider_reads": True}, production_max_source_days=1),
+        client_factory=lambda credentials: FusionSolarClient(credentials, transport=FakeTransport([])),
+    ).sync_daily_production(connection_id, start_date=date(2026, 8, 11), end_date=date(2026, 8, 12))
+    assert bounded.status == "failed" and bounded.error_code == "configuration"
+    with factory() as session:
+        cursor = session.scalar(select(SyncCursor))
+        assert cursor is not None and cursor.checkpoint_json == {"last_completed_day": "2026-08-10", "source_timezone": "UTC"}

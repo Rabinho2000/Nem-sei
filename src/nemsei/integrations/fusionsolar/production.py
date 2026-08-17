@@ -57,8 +57,8 @@ class ProductionSyncResult:
     sync_run_id: int
     status: str
     completeness: str
-    requested_from: date
-    requested_until: date
+    requested_from: date | None
+    requested_until: date | None
     expected: int
     received: int
     accepted: int
@@ -145,31 +145,39 @@ class FusionSolarProductionService:
         if reconciliation_days < 0:
             raise ValueError("Reconciliation overlap cannot be negative.")
         connection = self._connection(connection_id)
-        contract = production_contract_for(connection)
-        requested_from, requested_until = self._window(
-            connection_id,
-            start_date=start_date,
-            end_date=end_date,
-            reconciliation_days=reconciliation_days,
-            contract=contract,
-        )
-        run = self._start_run(connection_id, requested_from, requested_until, contract)
         if connection.provider_code != ProviderCode.FUSIONSOLAR.value:
-            return self._finish(run.id, connection_id, requested_from, requested_until, 0, 0, 0, 0, False, ProviderError(ProviderErrorCode.CONFIGURATION, "Connection is not FusionSolar."))
+            run = self._start_run(connection_id)
+            return self._finish(run.id, connection_id, start_date, end_date, 0, 0, 0, 0, ProviderError(ProviderErrorCode.CONFIGURATION, "Connection is not FusionSolar."))
         if not connection.enabled or connection.configuration_status != "configured":
-            return self._finish(run.id, connection_id, requested_from, requested_until, 0, 0, 0, 0, False, ProviderError(ProviderErrorCode.CONFIGURATION, "FusionSolar connection is not enabled and configured."))
+            run = self._start_run(connection_id)
+            return self._finish(run.id, connection_id, start_date, end_date, 0, 0, 0, 0, ProviderError(ProviderErrorCode.CONFIGURATION, "FusionSolar connection is not enabled and configured."))
         if not self._settings.capabilities.get("provider_reads", False):
-            return self._finish(run.id, connection_id, requested_from, requested_until, 0, 0, 0, 0, False, ProviderError(ProviderErrorCode.NOT_SUPPORTED, "Provider reads are disabled by policy."), deferred=True)
+            run = self._start_run(connection_id)
+            return self._finish(run.id, connection_id, start_date, end_date, 0, 0, 0, 0, ProviderError(ProviderErrorCode.NOT_SUPPORTED, "Provider reads are disabled by policy."), deferred=True)
+        try:
+            contract = production_contract_for(connection)
+            requested_from, requested_until = self._window(
+                connection_id,
+                start_date=start_date,
+                end_date=end_date,
+                reconciliation_days=reconciliation_days,
+                contract=contract,
+            )
+        except (FusionSolarClientError, ValueError) as exc:
+            error = exc.error if isinstance(exc, FusionSolarClientError) else ProviderError(ProviderErrorCode.CONFIGURATION, str(exc))
+            run = self._start_run(connection_id)
+            return self._finish(run.id, connection_id, start_date, end_date, 0, 0, 0, 0, error)
+        run = self._start_run(connection_id, requested_from, requested_until, contract)
         try:
             credentials = credentials_for(connection)
         except FusionSolarClientError as exc:
-            return self._finish(run.id, connection_id, requested_from, requested_until, 0, 0, 0, 0, False, exc.error)
+            return self._finish(run.id, connection_id, requested_from, requested_until, 0, 0, 0, 0, exc.error)
 
         selected_by_day, selection_findings = self._selected_mappings(connection_id, requested_from, requested_until)
         expected = sum(len(values) for values in selected_by_day.values())
         if expected == 0:
             error = ProviderError(ProviderErrorCode.CONFIGURATION, "No FusionSolar mapping is selected for production.")
-            return self._finish(run.id, connection_id, requested_from, requested_until, 0, 0, 0, selection_findings, False, error)
+            return self._finish(run.id, connection_id, requested_from, requested_until, 0, 0, 0, selection_findings, error)
 
         client = self._client_factory(credentials)
         _value, error = self._calls.call(
@@ -180,7 +188,7 @@ class FusionSolarProductionService:
             operation=client.authenticate,
         )
         if error:
-            return self._finish(run.id, connection_id, requested_from, requested_until, expected, 0, 0, selection_findings, False, error)
+            return self._finish(run.id, connection_id, requested_from, requested_until, expected, 0, 0, selection_findings, error)
 
         received = accepted = rejected = 0
         first_error: ProviderError | None = None
@@ -208,7 +216,6 @@ class FusionSolarProductionService:
             received,
             accepted,
             rejected + selection_findings,
-            complete,
             first_error,
             advance=complete,
             contract=contract,
@@ -345,6 +352,11 @@ class FusionSolarProductionService:
         end_date = end_date or default_end
         if end_date < start_date:
             raise ValueError("Production sync window is invalid.")
+        if (end_date - start_date).days + 1 > self._settings.production_max_source_days:
+            raise ValueError("Production sync window exceeds the configured normal-sync safety limit.")
+        source_timezone = checkpoint.get("source_timezone")
+        if cursor is not None and source_timezone != contract.source_timezone_name:
+            raise ValueError("Production cursor timezone differs from the configured verified timezone; operator reconciliation or reset is required.")
         return start_date, end_date
 
     def _connection(self, connection_id: int) -> ProviderConnection:
@@ -355,14 +367,20 @@ class FusionSolarProductionService:
             session.expunge(connection)
             return connection
 
-    def _start_run(self, connection_id: int, start: date, end: date, contract: FusionSolarProductionContract) -> SyncRun:
+    def _start_run(
+        self,
+        connection_id: int,
+        start: date | None = None,
+        end: date | None = None,
+        contract: FusionSolarProductionContract | None = None,
+    ) -> SyncRun:
         with self._sessions() as session:
             run = start_sync_run(
                 session,
                 provider_connection_id=connection_id,
                 capability=ProviderCapability.PRODUCTION_HISTORY.value,
-                requested_from=datetime.combine(start, time.min, tzinfo=contract.source_timezone),
-                requested_until=datetime.combine(end + timedelta(days=1), time.min, tzinfo=contract.source_timezone),
+                requested_from=datetime.combine(start, time.min, tzinfo=contract.source_timezone) if start and contract else None,
+                requested_until=datetime.combine(end + timedelta(days=1), time.min, tzinfo=contract.source_timezone) if end and contract else None,
             )
             session.commit()
             session.expunge(run)
@@ -372,13 +390,12 @@ class FusionSolarProductionService:
         self,
         run_id: int,
         connection_id: int,
-        start: date,
-        end: date,
+        start: date | None,
+        end: date | None,
         expected: int,
         received: int,
         accepted: int,
         rejected: int,
-        cursor_advanced: bool,
         error: ProviderError | None,
         *,
         advance: bool = False,
@@ -407,8 +424,8 @@ class FusionSolarProductionService:
                 "items_received": received,
                 "items_accepted": accepted,
                 "items_rejected": rejected,
-                "source_period_start": start.isoformat(),
-                "source_period_end": end.isoformat(),
+                "source_period_start": start.isoformat() if start else None,
+                "source_period_end": end.isoformat() if end else None,
                 "source_period_timezone": contract.source_timezone_name if contract else None,
             }
             record_health(session, provider_connection_id=connection_id, partial=status == "partial", error=error, **_health_values(error))
@@ -416,13 +433,14 @@ class FusionSolarProductionService:
             cursor_updated = False
             if advance:
                 assert status == "success" and contract is not None
+                assert start is not None and end is not None
                 covered_through = datetime.combine(end + timedelta(days=1), time.min, tzinfo=contract.source_timezone)
                 existing_cursor = session.scalar(select(SyncCursor).where(
                     SyncCursor.provider_connection_id == connection_id,
                     SyncCursor.capability == ProviderCapability.PRODUCTION_HISTORY.value,
                     SyncCursor.cursor_key == _CURSOR_KEY,
                 ).with_for_update())
-                if existing_cursor is None or existing_cursor.covered_through is None or covered_through > existing_cursor.covered_through:
+                if _can_extend_cursor(existing_cursor, start=start, end=end, timezone_name=contract.source_timezone_name):
                     advance_cursor(
                         session,
                         run=run,
@@ -442,6 +460,36 @@ class _DayOutcome:
     rejected: int
     partial: bool
     error: ProviderError | None
+
+
+def _can_extend_cursor(
+    cursor: SyncCursor | None,
+    *,
+    start: date,
+    end: date,
+    timezone_name: str,
+) -> bool:
+    """Allow only first coverage or a window contiguous with the safe day.
+
+    A successful historical correction is intentionally not an advancement. A
+    successful gap window may persist its immutable facts, but it cannot turn an
+    uncovered interval into implied coverage.
+    """
+    if cursor is None:
+        return True
+    checkpoint = dict(cursor.checkpoint_json)
+    if checkpoint.get("source_timezone") != timezone_name:
+        return False
+    last_completed = checkpoint.get("last_completed_day")
+    if not isinstance(last_completed, str):
+        return False
+    try:
+        last_day = date.fromisoformat(last_completed)
+    except ValueError:
+        return False
+    if end <= last_day:
+        return False
+    return start <= last_day + timedelta(days=1)
 
 
 def _days(start: date, end: date):
@@ -475,4 +523,6 @@ def _health_values(error: ProviderError | None) -> dict[str, str]:
         return {"auth_state": "healthy", "access_state": "degraded", "provider_state": "healthy"}
     if error.code is ProviderErrorCode.RATE_LIMITED:
         return {"provider_state": "healthy", "quota_state": "degraded"}
+    if error.code is ProviderErrorCode.CONFIGURATION:
+        return {"provider_state": "not_configured"}
     return {"provider_state": "unavailable"}

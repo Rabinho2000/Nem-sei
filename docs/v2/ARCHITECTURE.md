@@ -103,7 +103,11 @@ as daily production energy.
 
 The canonical fact retains UTC period boundaries and sanitized source-period
 metadata. Its per-connection daily cursor advances only after complete,
-contiguous selected-mapping coverage; partial, failed, deferred, rate-limited,
-and historical-correction runs cannot regress or skip the cursor. Re-fetching
-recent days is intentional reconciliation: unchanged records are idempotent and
-changed evidence creates append-only fact revisions.
+contiguous selected-mapping coverage: a successful gap window can persist facts
+but cannot skip coverage. Partial, failed, deferred, rate-limited, and
+historical-correction runs cannot regress it. A changed configured source
+timezone stops incremental continuation until an operator reconciles/resets the
+cursor. Normal sync is capped at a configurable 31 source days by default;
+larger history work is deliberately deferred to explicit bounded backfill.
+Re-fetching recent days is intentional reconciliation: unchanged records are
+idempotent and changed evidence creates append-only fact revisions.

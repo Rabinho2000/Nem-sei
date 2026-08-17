@@ -69,6 +69,7 @@ class Settings:
     db_lock_timeout_ms: int = 3000
     db_idle_transaction_timeout_ms: int = 30000
     db_pool_recycle_seconds: int = 1800
+    production_max_source_days: int = 31
     testing: bool = False
 
     @property
@@ -100,6 +101,7 @@ class Settings:
             db_lock_timeout_ms=int(os.environ.get("NEMSEI_V2_DB_LOCK_TIMEOUT_MS", str(defaults["lock_timeout_ms"]))),
             db_idle_transaction_timeout_ms=int(os.environ.get("NEMSEI_V2_DB_IDLE_TRANSACTION_TIMEOUT_MS", str(defaults["idle_transaction_timeout_ms"]))),
             db_pool_recycle_seconds=int(os.environ.get("NEMSEI_V2_DB_POOL_RECYCLE_SECONDS", "1800")),
+            production_max_source_days=int(os.environ.get("NEMSEI_V2_PRODUCTION_MAX_SOURCE_DAYS", "31")),
             testing=parse_bool(os.environ.get("NEMSEI_V2_TESTING"), default=False),
         )
 
@@ -118,6 +120,6 @@ class Settings:
             raise ConfigurationError("NEMSEI_V2_SECRET_KEY must be non-default outside development/test.")
         if require_auth and (not self.admin_username or self.admin_password_hash.count("$") < 2):
             raise ConfigurationError("V2 administrator credentials are required.")
-        if min(self.worker_poll_seconds, self.worker_lease_seconds, self.scheduler_lease_seconds, self.db_pool_size, self.db_statement_timeout_ms, self.db_lock_timeout_ms, self.db_idle_transaction_timeout_ms, self.db_pool_recycle_seconds) <= 0 or self.db_max_overflow < 0:
+        if min(self.worker_poll_seconds, self.worker_lease_seconds, self.scheduler_lease_seconds, self.db_pool_size, self.db_statement_timeout_ms, self.db_lock_timeout_ms, self.db_idle_transaction_timeout_ms, self.db_pool_recycle_seconds, self.production_max_source_days) <= 0 or self.db_max_overflow < 0:
             raise ConfigurationError("V2 timing and pool settings must be positive.")
         return self

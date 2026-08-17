@@ -63,8 +63,13 @@ plant row is partial coverage and does not create a synthetic zero.
 
 `ProductionFact` stores UTC boundaries plus the source period date, configured
 source timezone, and source field. The cursor stores the last fully completed
-source day. It advances only after all requested days have been persisted with
-complete selected-mapping coverage; partial, failed, deferred, and rate-limited
-runs leave it unchanged. A later caller may request a small overlap (including
-D-1) for correction reconciliation; unchanged facts are idempotent and changed
-facts create immutable revisions.
+source day and only advances if a successful window extends existing coverage
+contiguously. A successful gap window may preserve facts but cannot imply
+coverage for skipped days. Partial, failed, deferred, rate-limited, and
+historical-correction runs leave it unchanged. A stored cursor timezone must
+match the currently verified connection timezone or the run stops as a
+configuration/data-contract finding. Normal syncs have a configurable
+application safety cap (default 31 source days); larger history loading needs a
+future explicit bounded backfill path. A later caller may request a small
+overlap (including D-1) for correction reconciliation; unchanged facts are
+idempotent and changed facts create immutable revisions.
