@@ -29,7 +29,7 @@ def test_unconfigured_connections_never_claim_a_live_capability() -> None:
     ).runtime_availability is CapabilityAvailability.NOT_CONFIGURED
 
 
-def test_fusionsolar_discovery_is_the_only_live_read_capability_at_this_checkpoint() -> None:
+def test_fusionsolar_and_sigenergy_discovery_are_runtime_available_when_configured() -> None:
     assert evaluate_capability(
         ProviderCode.FUSIONSOLAR,
         ProviderCapability.DISCOVERY,
@@ -39,7 +39,7 @@ def test_fusionsolar_discovery_is_the_only_live_read_capability_at_this_checkpoi
         ProviderCode.SIGENERGY,
         ProviderCapability.DISCOVERY,
         connection_configured=True,
-    ).runtime_availability is CapabilityAvailability.UNKNOWN
+    ).runtime_availability is CapabilityAvailability.AVAILABLE
 
 
 def test_unknown_provider_is_rejected() -> None:

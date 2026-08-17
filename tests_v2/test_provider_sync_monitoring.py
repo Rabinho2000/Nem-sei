@@ -50,7 +50,7 @@ def asset_mapping(session):
 @pytest.mark.parametrize("provider", list(ProviderCode))
 def test_capability_support_and_runtime_availability_are_separate(provider: ProviderCode) -> None:
     unconfigured = evaluate_capability(provider, ProviderCapability.DISCOVERY, connection_configured=False)
-    expected = ImplementationSupport.SUPPORTED if provider is ProviderCode.FUSIONSOLAR else ImplementationSupport.UNSUPPORTED
+    expected = ImplementationSupport.UNSUPPORTED if provider is ProviderCode.SMA else ImplementationSupport.SUPPORTED
     assert unconfigured.implementation_support is expected
     assert unconfigured.runtime_availability is RuntimeAvailability.NOT_CONFIGURED
     configured = evaluate_capability(provider, ProviderCapability.DISCOVERY, connection_configured=True)

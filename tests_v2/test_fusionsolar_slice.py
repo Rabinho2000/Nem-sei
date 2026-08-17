@@ -82,7 +82,9 @@ def test_live_implemented_capabilities_are_narrow_and_runtime_availability_is_se
             assert status.runtime_availability is RuntimeAvailability.AVAILABLE
         else:
             assert status.implementation_support is ImplementationSupport.UNSUPPORTED
-    assert evaluate_capability(ProviderCode.SIGENERGY, ProviderCapability.DISCOVERY, connection_configured=True).implementation_support is ImplementationSupport.UNSUPPORTED
+    for capability in {ProviderCapability.CONNECTION_VALIDATION, ProviderCapability.DISCOVERY, ProviderCapability.CURRENT_MONITORING}:
+        assert evaluate_capability(ProviderCode.SIGENERGY, capability, connection_configured=True).implementation_support is ImplementationSupport.SUPPORTED
+    assert evaluate_capability(ProviderCode.SIGENERGY, ProviderCapability.PRODUCTION_HISTORY, connection_configured=True).implementation_support is ImplementationSupport.UNSUPPORTED
 
 
 def test_discovery_paginates_deduplicates_and_reconciles_without_creating_assets(settings, monkeypatch):

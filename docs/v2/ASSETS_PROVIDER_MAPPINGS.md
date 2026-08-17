@@ -19,7 +19,9 @@ portfolios, reports, schedules, or external calls.
 ## Provider mapping rules
 
 The code-owned registry currently knows `fusionsolar`, `sigenergy`, and `sma`.
-It is declarative, network-free, and declares no live capability as supported.
+It is declarative and network-free. FusionSolar supports its guarded read
+slice; Sigenergy supports only its guarded connection-validation, discovery,
+and current-monitoring read slice; SMA has no supported capability yet.
 
 `provider_connections` contains only a non-secret credential reference name,
 not a password, token, endpoint, or payload. External plant identifiers are

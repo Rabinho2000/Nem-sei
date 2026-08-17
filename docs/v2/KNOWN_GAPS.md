@@ -8,7 +8,10 @@ realtime production/performance calculations, financial models, reports, and
 automation/distribution.
 
 FusionSolar daily production remains gated on an operator-verified source
-timezone and `PVYield=kWh` contract per connection. Sigenergy and SMA have no
-live adapter. No live provider call is made by tests or by default policy.
+timezone and `PVYield=kWh` contract per connection. Sigenergy has guarded
+read-only connection validation, discovery, and current monitoring; its daily
+production remains blocked until source-day/timezone and bounded-history
+semantics are independently verified. SMA has no live adapter. No live
+provider call is made by tests or by default policy.
 It has no persisted users or RBAC; the administrator is configured with a
 password hash.

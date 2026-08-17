@@ -47,15 +47,18 @@ def test_app_composition_root_has_no_direct_sql_execution() -> None:
     assert ".execute(" not in source
 
 
-def test_network_dependency_is_confined_to_the_fusionsolar_http_client() -> None:
+def test_network_dependency_is_confined_to_provider_http_clients() -> None:
     prohibited = {"requests", "httpx", "aiohttp", "urllib", "urllib3", "socket"}
     violations = []
     packages = (SOURCE / "assets", SOURCE / "providers", SOURCE / "sync", SOURCE / "monitoring", SOURCE / "sources", SOURCE / "integrations")
-    allowed = SOURCE / "integrations" / "fusionsolar" / "client.py"
+    allowed = {
+        SOURCE / "integrations" / "fusionsolar" / "client.py",
+        SOURCE / "integrations" / "sigenergy" / "client.py",
+    }
     for package in packages:
         for path in package.rglob("*.py"):
             names = imports(path)
-            if path != allowed and any(name.split(".", 1)[0] in prohibited for name in names):
+            if path not in allowed and any(name.split(".", 1)[0] in prohibited for name in names):
                 violations.append(str(path.relative_to(ROOT)))
     assert not violations
 
@@ -69,10 +72,29 @@ def test_fusionsolar_adapter_has_no_web_or_business_domain_dependencies() -> Non
     assert not violations
 
 
+def test_sigenergy_adapter_has_no_web_or_business_domain_dependencies() -> None:
+    prohibited = ("flask", "nemsei.web", "nemsei.assets", "monitoring_board")
+    violations = []
+    for path in (SOURCE / "integrations" / "sigenergy").rglob("*.py"):
+        if any(name == item or name.startswith(f"{item}.") for item in prohibited for name in imports(path)):
+            violations.append(str(path.relative_to(ROOT)))
+    assert not violations
+
+
 def test_monitoring_domain_never_imports_provider_specific_adapter_code() -> None:
     violations = [
         str(path.relative_to(ROOT))
         for path in (SOURCE / "monitoring").rglob("*.py")
         if any(name == "nemsei.integrations" or name.startswith("nemsei.integrations.") for name in imports(path))
     ]
+    assert not violations
+
+
+def test_sigenergy_is_not_leaked_into_canonical_domains() -> None:
+    violations = []
+    for package in (SOURCE / "assets", SOURCE / "providers", SOURCE / "sync", SOURCE / "monitoring", SOURCE / "sources"):
+        for path in package.rglob("*.py"):
+            text = path.read_text(encoding="utf-8").casefold()
+            if any(field in text for field in ("sigencloud", "energyflow", "systemstatus", "pvpower", "battery soc")):
+                violations.append(str(path.relative_to(ROOT)))
     assert not violations

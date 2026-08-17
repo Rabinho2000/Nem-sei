@@ -48,6 +48,17 @@ connection keeps a non-secret credential reference; username and password are
 read from the corresponding environment variable or mounted secret file. They
 are never stored in V2 tables or SyncRun metadata.
 
+## Sigenergy read slice
+
+Sigenergy connection validation, system discovery, and current energy-flow
+monitoring live under `src/nemsei/integrations/sigenergy/`. The adapter uses
+the same provider-neutral SyncRun, request-attempt, IntegrationHealth,
+AssetProviderMapping, AssetSourcePolicy, MonitoringObservation, and
+MonitoringCurrentState services as FusionSolar. It does not add a provider
+table, queue, scheduler, or canonical Sigenergy fields. Production history is
+not enabled until its source-day/timezone and bounded-request contract is
+verified.
+
 Each network request follows: reserve persisted request state and attempt,
 commit, perform the HTTP request, then persist the normalized result in a new
 short transaction. The discovery flow authenticates once, reads each requested

@@ -81,7 +81,11 @@ _DESCRIPTORS = {
         ProviderCode.SIGENERGY,
         "Sigenergy",
         _casefold,
-        frozenset(),
+        frozenset({
+            ProviderCapability.CONNECTION_VALIDATION,
+            ProviderCapability.DISCOVERY,
+            ProviderCapability.CURRENT_MONITORING,
+        }),
     ),
     ProviderCode.SMA: ProviderDescriptor(
         ProviderCode.SMA,

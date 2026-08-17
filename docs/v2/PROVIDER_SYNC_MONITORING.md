@@ -2,9 +2,11 @@
 
 This milestone adds only provider-neutral contracts and persisted control/data
 models. FusionSolar has narrow, guarded discovery, current-monitoring, and
-daily production-history slices. Sigenergy and SMA remain registry descriptors
-with every operational capability unsupported. Provider response structures are
-confined to the FusionSolar adapter and never enter canonical-domain code.
+daily production-history slices. Sigenergy has narrow, guarded connection
+validation, system discovery, and current energy-flow monitoring. SMA remains
+a registry descriptor with every operational capability unsupported. Provider
+response structures are confined to their adapter packages and never enter
+canonical-domain code.
 
 Capability implementation support (`supported` or `unsupported`) is distinct
 from runtime availability (`available`, `not_configured`,
@@ -73,6 +75,30 @@ application safety cap (default 31 source days); larger history loading needs a
 future explicit bounded backfill path. A later caller may request a small
 overlap (including D-1) for correction reconciliation; unchanged facts are
 idempotent and changed facts create immutable revisions.
+
+## Sigenergy read-only slice
+
+The verified V1 evidence and deterministic adapter fixtures establish the
+Sigenergy AppKey/AppSecret login envelope, bearer token use, `sigen-region`
+header, a read-only system-list request, and a read-only
+`/openapi/systems/{system_id}/energyFlow` request. V2 keeps these calls behind
+the durable request controller and a non-secret credential reference. System
+identifiers use the existing connection-scoped provider rule; discovery only
+reports mapped, unmapped, or conflict candidates and never creates assets or
+mappings.
+
+Current monitoring reads only source-policy-selected mappings and does not run
+discovery. The V1-evidenced `normal`, `online`, `running`, `fault`, `error`,
+`abnormal`, `offline`, and `disconnected` words are normalized conservatively;
+an unrecognized or absent status remains `unknown`. The endpoint has no verified
+provider observation timestamp, so freshness remains `unknown` and receipt
+time is recorded as ingestion evidence. Provider/API failure updates SyncRun,
+request-attempt, and IntegrationHealth records but never writes an offline
+observation.
+
+Sigenergy daily production is deliberately not implemented. Although legacy
+fixtures contain kWh-named fields, source-day/timezone semantics, correction
+behavior, and safe historical request bounds are not independently verified.
 
 ## Production recovery modes
 
