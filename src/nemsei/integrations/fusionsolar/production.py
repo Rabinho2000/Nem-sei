@@ -23,7 +23,6 @@ from nemsei.integrations.fusionsolar.client import FusionSolarClient, FusionSola
 from nemsei.integrations.fusionsolar.request_control import FusionSolarRequestController
 from nemsei.integrations.fusionsolar.service import credentials_for
 from nemsei.monitoring.service import record_production_fact
-from nemsei.monitoring.repository import CanonicalFactRepository
 from nemsei.providers.errors import ProviderError, ProviderErrorCode
 from nemsei.providers.models import AssetProviderMapping, ProviderConnection
 from nemsei.providers.registry import ProviderCapability, ProviderCode, normalize_external_id
@@ -424,14 +423,6 @@ class FusionSolarProductionService:
             for normalized, sample in samples.items():
                 mapping = mappings[normalized]
                 source_key = f"fusionsolar-daily-pvyield:{normalized}:{source_day.isoformat()}"
-                existing = CanonicalFactRepository(session).latest_production_fact(
-                    provider_mapping_id=mapping.id,
-                    source_key=source_key,
-                )
-                # A partial reconciliation response is not a domain correction.
-                # Keep a previously complete canonical fact selected as latest.
-                if sample.value is None and existing and existing.value is not None and existing.quality == "complete" and existing.completeness == "complete":
-                    continue
                 record_production_fact(
                     session,
                     asset_id=mapping.asset_id,

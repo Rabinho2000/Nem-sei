@@ -16,3 +16,13 @@ class CanonicalFactRepository:
 
     def latest_production_fact(self, *, provider_mapping_id: int, source_key: str) -> ProductionFact | None:
         return self.session.scalar(select(ProductionFact).where(ProductionFact.provider_mapping_id == provider_mapping_id, ProductionFact.source_fact_key == source_key).order_by(ProductionFact.source_revision.desc()))
+
+    def latest_complete_production_fact(self, *, provider_mapping_id: int, source_key: str) -> ProductionFact | None:
+        """Latest usable numeric fact, distinct from the latest provider evidence."""
+        return self.session.scalar(select(ProductionFact).where(
+            ProductionFact.provider_mapping_id == provider_mapping_id,
+            ProductionFact.source_fact_key == source_key,
+            ProductionFact.value.is_not(None),
+            ProductionFact.quality == "complete",
+            ProductionFact.completeness == "complete",
+        ).order_by(ProductionFact.source_revision.desc()))

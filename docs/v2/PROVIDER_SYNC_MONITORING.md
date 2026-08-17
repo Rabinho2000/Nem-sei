@@ -91,3 +91,11 @@ It classifies each explicit source-timezone day from latest `ProductionFact`
 evidence as `complete`, `partial`, or `missing`; a numeric complete zero is
 complete. Backfill may extend the cursor only through a complete contiguous
 window, never through a policy conflict, missing day, or partial day.
+
+Latest provider evidence and an effective complete numeric value are separate
+canonical queries. For example, a complete `120 kWh` revision followed by a
+missing/partial revision retains both immutable records: coverage/cursor safety
+uses the latest missing evidence, while a future quality-aware consumer can
+retrieve the prior complete `120 kWh` fact explicitly. A later complete
+correction becomes both latest evidence and effective complete value. No raw
+provider payload or secret is retained.

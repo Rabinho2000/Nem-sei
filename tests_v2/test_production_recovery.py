@@ -58,7 +58,12 @@ def test_reconciliation_is_idempotent_corrects_and_missing_does_not_replace_vali
     assert missing.status == "partial"
     with factory() as session:
         facts = list(session.scalars(select(ProductionFact).where(ProductionFact.provider_mapping_id == mappings[0].id).order_by(ProductionFact.source_revision)))
-        assert [(fact.source_revision, fact.value) for fact in facts] == [(1, Decimal("120")), (2, Decimal("121"))]
+        assert [(fact.source_revision, fact.value, fact.quality, fact.completeness) for fact in facts] == [
+            (1, Decimal("120"), "complete", "complete"),
+            (2, Decimal("121"), "complete", "complete"),
+            (3, None, "missing", "partial"),
+        ]
+        assert facts[-1].sync_run_id == missing.sync_run_id
 
 
 def test_canonical_gap_detection_keeps_zero_complete_and_never_calls_provider(settings, monkeypatch):
@@ -78,7 +83,7 @@ def test_canonical_gap_detection_keeps_zero_complete_and_never_calls_provider(se
             )
         session.commit()
         coverage = production_coverage(session, provider_mapping_id=mappings[0].id, source_timezone="UTC", start_date=date(2026, 1, 1), end_date=date(2026, 1, 3))
-    assert [(item.source_day, item.status) for item in coverage] == [(date(2026, 1, 1), "complete"), (date(2026, 1, 2), "partial"), (date(2026, 1, 3), "missing")]
+    assert [(item.source_day, item.status) for item in coverage] == [(date(2026, 1, 1), "complete"), (date(2026, 1, 2), "missing"), (date(2026, 1, 3), "missing")]
     assert connection_id > 0
 
 

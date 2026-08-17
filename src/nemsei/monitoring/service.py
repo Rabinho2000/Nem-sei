@@ -236,4 +236,7 @@ def record_production_fact(
         metadata_json=dict(metadata or {}),
     )
     session.add(fact)
+    # Later evidence in the same short unit of work must see this immutable
+    # revision so its successor receives the correct chain and revision number.
+    session.flush()
     return fact, True
