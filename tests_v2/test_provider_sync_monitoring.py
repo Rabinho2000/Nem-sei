@@ -50,11 +50,12 @@ def asset_mapping(session):
 @pytest.mark.parametrize("provider", list(ProviderCode))
 def test_capability_support_and_runtime_availability_are_separate(provider: ProviderCode) -> None:
     unconfigured = evaluate_capability(provider, ProviderCapability.DISCOVERY, connection_configured=False)
-    assert unconfigured.implementation_support is ImplementationSupport.UNSUPPORTED
+    expected = ImplementationSupport.SUPPORTED if provider is ProviderCode.FUSIONSOLAR else ImplementationSupport.UNSUPPORTED
+    assert unconfigured.implementation_support is expected
     assert unconfigured.runtime_availability is RuntimeAvailability.NOT_CONFIGURED
     configured = evaluate_capability(provider, ProviderCapability.DISCOVERY, connection_configured=True)
-    assert configured.implementation_support is ImplementationSupport.UNSUPPORTED
-    assert configured.runtime_availability is RuntimeAvailability.UNKNOWN
+    assert configured.implementation_support is expected
+    assert configured.runtime_availability is (RuntimeAvailability.AVAILABLE if expected is ImplementationSupport.SUPPORTED else RuntimeAvailability.UNKNOWN)
 
 
 def test_integration_health_never_creates_a_fake_asset_offline_observation(settings, monkeypatch) -> None:

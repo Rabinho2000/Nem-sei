@@ -47,12 +47,23 @@ def test_app_composition_root_has_no_direct_sql_execution() -> None:
     assert ".execute(" not in source
 
 
-def test_provider_sync_and_canonical_contracts_have_no_network_client_dependency() -> None:
+def test_network_dependency_is_confined_to_the_fusionsolar_http_client() -> None:
     prohibited = {"requests", "httpx", "aiohttp", "urllib", "urllib3", "socket"}
     violations = []
-    for package in (SOURCE / "assets", SOURCE / "providers", SOURCE / "sync", SOURCE / "monitoring", SOURCE / "sources"):
+    packages = (SOURCE / "assets", SOURCE / "providers", SOURCE / "sync", SOURCE / "monitoring", SOURCE / "sources", SOURCE / "integrations")
+    allowed = SOURCE / "integrations" / "fusionsolar" / "client.py"
+    for package in packages:
         for path in package.rglob("*.py"):
             names = imports(path)
-            if any(name.split(".", 1)[0] in prohibited for name in names):
+            if path != allowed and any(name.split(".", 1)[0] in prohibited for name in names):
                 violations.append(str(path.relative_to(ROOT)))
+    assert not violations
+
+
+def test_fusionsolar_adapter_has_no_web_or_business_domain_dependencies() -> None:
+    prohibited = ("flask", "nemsei.web", "nemsei.monitoring", "nemsei.sources", "nemsei.assets", "monitoring_board")
+    violations = []
+    for path in (SOURCE / "integrations" / "fusionsolar").rglob("*.py"):
+        if any(name == item or name.startswith(f"{item}.") for item in prohibited for name in imports(path)):
+            violations.append(str(path.relative_to(ROOT)))
     assert not violations

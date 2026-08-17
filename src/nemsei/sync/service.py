@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from nemsei.providers.errors import ProviderError, ProviderErrorCode
@@ -176,17 +178,29 @@ def reserve_request(
     now: datetime | None = None,
 ) -> tuple[ProviderRequestState, ProviderRequestAttempt, bool]:
     now_value = as_utc(now or utc_now())
-    state = SyncRepository(session).request_state(provider_connection_id=provider_connection_id, endpoint_family=endpoint_family)
-    if state is None:
-        state = ProviderRequestState(
+    # PostgreSQL is the sole V2 runtime. Create-or-lock prevents concurrent
+    # workers from both reserving an initial request-state row or losing its
+    # actual-call counter/cooldown update.
+    session.execute(
+        insert(ProviderRequestState)
+        .values(
             provider_connection_id=provider_connection_id,
             endpoint_family=endpoint_family,
             quota_known=False,
             actual_call_count=0,
             updated_at=now_value,
         )
-        session.add(state)
-        session.flush()
+        .on_conflict_do_nothing(index_elements=("provider_connection_id", "endpoint_family"))
+    )
+    state = session.scalar(
+        select(ProviderRequestState)
+        .where(
+            ProviderRequestState.provider_connection_id == provider_connection_id,
+            ProviderRequestState.endpoint_family == endpoint_family,
+        )
+        .with_for_update()
+    )
+    assert state is not None
     deferred_until = max((value for value in (state.next_allowed_at, state.cooldown_until, state.provider_retry_at) if value is not None), default=None)
     allowed = deferred_until is None or as_utc(deferred_until) <= now_value
     attempt = ProviderRequestAttempt(

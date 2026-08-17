@@ -39,6 +39,18 @@ class ProviderRepository:
             )
         )
 
+    def mappings_for_connection(self, connection_id: int) -> list[AssetProviderMapping]:
+        return list(
+            self.session.scalars(
+                select(AssetProviderMapping)
+                .where(
+                    AssetProviderMapping.provider_connection_id == connection_id,
+                    AssetProviderMapping.resource_kind == "plant",
+                )
+                .order_by(AssetProviderMapping.id)
+            )
+        )
+
     def cross_connection_claims(self, mapping: AssetProviderMapping) -> list[AssetProviderMapping]:
         return list(
             self.session.scalars(

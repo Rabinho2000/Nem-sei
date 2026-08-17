@@ -13,6 +13,7 @@ class ProviderCode(StrEnum):
 
 
 class ProviderCapability(StrEnum):
+    CONNECTION_VALIDATION = "connection_validation"
     DISCOVERY = "discovery"
     PLANT_METADATA = "plant_metadata"
     CURRENT_MONITORING = "current_monitoring"
@@ -69,7 +70,7 @@ _DESCRIPTORS = {
         ProviderCode.FUSIONSOLAR,
         "FusionSolar",
         _trim,
-        frozenset(),
+        frozenset({ProviderCapability.CONNECTION_VALIDATION, ProviderCapability.DISCOVERY}),
     ),
     ProviderCode.SIGENERGY: ProviderDescriptor(
         ProviderCode.SIGENERGY,

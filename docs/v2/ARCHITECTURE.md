@@ -38,3 +38,20 @@ work records a cooperative cancellation request; a handler must define where it
 checks that request and how it safely stops. A lease does not make side effects
 exactly once. `job_events` are append-only at both repository and PostgreSQL levels
 and must contain only allowlisted, non-sensitive metadata.
+
+## FusionSolar read slice
+
+FusionSolar currently implements only `connection_validation` and `discovery`.
+Both are read-only and are unavailable unless `provider_reads=true`. A provider
+connection keeps a non-secret credential reference; username and password are
+read from the corresponding environment variable or mounted secret file. They
+are never stored in V2 tables or SyncRun metadata.
+
+Each network request follows: reserve persisted request state and attempt,
+commit, perform the HTTP request, then persist the normalized result in a new
+short transaction. The discovery flow authenticates once, reads each requested
+plant-list page once, and reuses that result for mapping validation. A bounded
+transient retry creates a separate request attempt; rate limits and Retry-After
+defer later calls without a network request. Discovery is connection-scoped,
+deduplicates stable plant identifiers, and only reports mapped/unmapped/conflict
+results. It never creates assets or changes mappings.
