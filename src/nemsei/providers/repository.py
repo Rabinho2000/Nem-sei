@@ -39,13 +39,16 @@ class ProviderRepository:
             )
         )
 
-    def mappings_for_connection(self, connection_id: int) -> list[AssetProviderMapping]:
+    def current_mappings_for_connection(self, connection_id: int) -> list[AssetProviderMapping]:
+        """Return only unresolved/current plant mappings for live reconciliation."""
         return list(
             self.session.scalars(
                 select(AssetProviderMapping)
                 .where(
                     AssetProviderMapping.provider_connection_id == connection_id,
                     AssetProviderMapping.resource_kind == "plant",
+                    AssetProviderMapping.valid_to.is_(None),
+                    AssetProviderMapping.mapping_status.in_(("active", "invalid", "pending_review")),
                 )
                 .order_by(AssetProviderMapping.id)
             )

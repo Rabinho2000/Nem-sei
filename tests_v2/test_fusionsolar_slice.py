@@ -194,6 +194,28 @@ def test_mapping_not_found_and_duplicate_provider_id_remain_non_mutating(setting
         assert session.get(AssetProviderMapping, mapping_id).mapping_status == "active"
 
 
+def test_reconciliation_ignores_superseded_mapping_history(settings, monkeypatch):
+    configured_environment(monkeypatch)
+    factory = session_factory(settings, monkeypatch)
+    connection_id, mapping_id = connection_and_mapping(factory)
+    with factory() as session:
+        previous_asset = create_asset(session, canonical_name="Former FusionSolar target")
+        create_mapping(
+            session,
+            asset_id=previous_asset.id,
+            provider_connection_id=connection_id,
+            external_id="FS-001",
+            mapping_status="superseded",
+        )
+        session.commit()
+    transport = FakeTransport([response(LOGIN_OK, headers={"XSRF-TOKEN": "t"}), page([{"plantCode": "FS-001"}])])
+    result = service(factory, settings, transport).discover(connection_id)
+    reconciliation = service(factory, settings, transport).reconcile(result)
+    assert len(reconciliation) == 1
+    assert reconciliation[0].status is ReconciliationStatus.MAPPED
+    assert reconciliation[0].mapping_ids == (mapping_id,)
+
+
 def test_transient_retry_is_bounded_and_each_network_call_is_accounted(settings, monkeypatch):
     configured_environment(monkeypatch)
     factory = session_factory(settings, monkeypatch)

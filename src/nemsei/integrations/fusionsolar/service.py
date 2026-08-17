@@ -127,7 +127,7 @@ class FusionSolarDiscoveryService:
 
     def reconcile(self, result: DiscoveryResult) -> list[ReconciliationItem]:
         with self._sessions() as session:
-            mappings = ProviderRepository(session).mappings_for_connection(result.connection_id)
+            mappings = ProviderRepository(session).current_mappings_for_connection(result.connection_id)
         by_identifier: dict[str, list[AssetProviderMapping]] = {}
         for mapping in mappings:
             by_identifier.setdefault(mapping.normalized_external_id, []).append(mapping)
