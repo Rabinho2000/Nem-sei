@@ -1,8 +1,9 @@
 # Nem-sei V2 known gaps
 
-V2 includes the foundation plus assets, organizations, aliases, disabled legacy
-provider connections/mappings, and the V1 read-only importer. It intentionally
-excludes provider contracts/adapters, monitoring, canonical facts, portfolios,
-production/performance, financial models, reports, and automation/distribution.
+V2 includes the foundation plus assets, provider-neutral contracts, sync control,
+integration health, canonical monitoring/production persistence, and temporal
+source policy. It intentionally excludes live provider adapters, portfolio
+membership, production/performance calculations, financial models, reports, and
+automation/distribution.
 It has no persisted users or RBAC; the administrator is configured with a
 password hash.

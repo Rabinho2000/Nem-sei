@@ -26,7 +26,7 @@ def test_unconfigured_connections_never_claim_a_live_capability() -> None:
         ProviderCode.SMA,
         ProviderCapability.PRODUCTION_HISTORY,
         connection_configured=False,
-    ) is CapabilityAvailability.NOT_CONFIGURED
+    ).runtime_availability is CapabilityAvailability.NOT_CONFIGURED
 
 
 def test_configured_provider_without_an_adapter_is_explicitly_unsupported() -> None:
@@ -34,7 +34,7 @@ def test_configured_provider_without_an_adapter_is_explicitly_unsupported() -> N
         ProviderCode.FUSIONSOLAR,
         ProviderCapability.DISCOVERY,
         connection_configured=True,
-    ) is CapabilityAvailability.UNSUPPORTED
+    ).runtime_availability is CapabilityAvailability.UNKNOWN
 
 
 def test_unknown_provider_is_rejected() -> None:

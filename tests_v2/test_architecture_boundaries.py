@@ -47,10 +47,10 @@ def test_app_composition_root_has_no_direct_sql_execution() -> None:
     assert ".execute(" not in source
 
 
-def test_assets_and_provider_contracts_have_no_network_client_dependency() -> None:
-    prohibited = {"requests", "httpx", "aiohttp", "urllib", "urllib3"}
+def test_provider_sync_and_canonical_contracts_have_no_network_client_dependency() -> None:
+    prohibited = {"requests", "httpx", "aiohttp", "urllib", "urllib3", "socket"}
     violations = []
-    for package in (SOURCE / "assets", SOURCE / "providers"):
+    for package in (SOURCE / "assets", SOURCE / "providers", SOURCE / "sync", SOURCE / "monitoring", SOURCE / "sources"):
         for path in package.rglob("*.py"):
             names = imports(path)
             if any(name.split(".", 1)[0] in prohibited for name in names):
