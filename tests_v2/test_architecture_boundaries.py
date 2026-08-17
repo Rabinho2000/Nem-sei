@@ -61,9 +61,18 @@ def test_network_dependency_is_confined_to_the_fusionsolar_http_client() -> None
 
 
 def test_fusionsolar_adapter_has_no_web_or_business_domain_dependencies() -> None:
-    prohibited = ("flask", "nemsei.web", "nemsei.monitoring", "nemsei.sources", "nemsei.assets", "monitoring_board")
+    prohibited = ("flask", "nemsei.web", "nemsei.assets", "monitoring_board")
     violations = []
     for path in (SOURCE / "integrations" / "fusionsolar").rglob("*.py"):
         if any(name == item or name.startswith(f"{item}.") for item in prohibited for name in imports(path)):
             violations.append(str(path.relative_to(ROOT)))
+    assert not violations
+
+
+def test_monitoring_domain_never_imports_provider_specific_adapter_code() -> None:
+    violations = [
+        str(path.relative_to(ROOT))
+        for path in (SOURCE / "monitoring").rglob("*.py")
+        if any(name == "nemsei.integrations" or name.startswith("nemsei.integrations.") for name in imports(path))
+    ]
     assert not violations

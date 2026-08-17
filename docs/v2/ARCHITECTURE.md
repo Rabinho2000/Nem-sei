@@ -55,3 +55,23 @@ transient retry creates a separate request attempt; rate limits and Retry-After
 defer later calls without a network request. Discovery is connection-scoped,
 deduplicates stable plant identifiers, and only reports mapped/unmapped/conflict
 results. It never creates assets or changes mappings.
+
+## FusionSolar current monitoring
+
+The current-monitoring slice calls `/thirdData/getStationRealKpi` only after a
+single controlled login, with selected plant IDs in batches of at most 100. It
+does not run discovery, alarms, device monitoring, or production requests.
+Only source-policy-selected mappings are eligible. The verified plant health
+codes are `3` (operational), `2` (fault), and `1` (offline); an absent or
+unverified value is persisted as `unknown`, never inferred from a provider or
+transport error. No verified warning code is currently known for this endpoint,
+so warning remains unavailable until a documented provider capability supplies
+that evidence.
+
+The response fixtures contain no reliable provider observation timestamp. V2
+therefore records the receipt time with metadata
+`observed_at_source=ingested_at_no_provider_timestamp` and `freshness=unknown`.
+Repeated identical current-state evidence is idempotent; a status correction
+creates an append-only revision. A timeout, authentication failure, missing row,
+or rate limit updates IntegrationHealth and SyncRun evidence but never writes an
+offline observation or erases the last valid observation.

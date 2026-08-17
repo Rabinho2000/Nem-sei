@@ -10,8 +10,6 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Callable
-from typing import TypeVar
-
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -26,16 +24,16 @@ from nemsei.integrations.fusionsolar.discovery import (
     ReconciliationStatus,
     plant_from_payload,
 )
+from nemsei.integrations.fusionsolar.request_control import FusionSolarRequestController
 from nemsei.providers.errors import ProviderError, ProviderErrorCode
 from nemsei.providers.models import AssetProviderMapping, ProviderConnection
 from nemsei.providers.registry import ProviderCapability, ProviderCode
 from nemsei.providers.repository import ProviderRepository
 from nemsei.shared.clock import utc_now
-from nemsei.sync.models import ProviderRequestAttempt, ProviderRequestState, SyncRun
-from nemsei.sync.service import finish_sync_run, record_health, record_request_result, reserve_request, start_sync_run
+from nemsei.sync.models import ProviderRequestAttempt, SyncRun
+from nemsei.sync.service import finish_sync_run, record_health, start_sync_run
 
 
-T = TypeVar("T")
 _REFERENCE = re.compile(r"^[A-Za-z0-9_]{1,80}$")
 
 
@@ -53,7 +51,7 @@ class FusionSolarDiscoveryService:
         self._sessions = session_factory
         self._settings = settings
         self._client_factory = client_factory
-        self._max_transient_retries = max(0, max_transient_retries)
+        self._calls = FusionSolarRequestController(session_factory, max_transient_retries=max_transient_retries)
 
     def validate_connection(self, connection_id: int) -> DiscoveryResult:
         """Authenticate then read only page one, proving account access without a full scan."""
@@ -75,7 +73,7 @@ class FusionSolarDiscoveryService:
             return self._finish_without_call(run.id, connection_id, capability, exc.error, "failed")
 
         client = self._client_factory(credentials)
-        _value, error = self._controlled_call(connection_id, run.id, "authentication", "fusionsolar_authentication", client.authenticate)
+        _value, error = self._calls.call(connection_id=connection_id, sync_run_id=run.id, endpoint_family="authentication", purpose="fusionsolar_authentication", operation=client.authenticate)
         if error:
             return self._finish_discovery(run.id, connection_id, (), frozenset(), error, received=0, rejected=0, pages=0)
 
@@ -86,12 +84,12 @@ class FusionSolarDiscoveryService:
         page = 1
         expected_pages = 1
         while page <= expected_pages and (page_limit is None or page <= page_limit):
-            rows, error = self._controlled_call(
-                connection_id,
-                run.id,
-                "discovery",
-                f"fusionsolar_discovery_page_{page}",
-                lambda page=page: client.discover_page(page),
+            rows, error = self._calls.call(
+                connection_id=connection_id,
+                sync_run_id=run.id,
+                endpoint_family="discovery",
+                purpose=f"fusionsolar_discovery_page_{page}",
+                operation=lambda page=page: client.discover_page(page),
             )
             if error:
                 return self._finish_discovery(run.id, connection_id, tuple(plants), frozenset(duplicate_ids), error, received=len(plants), rejected=rejected, pages=page - 1)
@@ -236,30 +234,6 @@ class FusionSolarDiscoveryService:
         with self._sessions() as session:
             record_health(session, provider_connection_id=connection_id, auth_state="not_configured", access_state="not_configured", provider_state="not_configured", discovery_state="not_configured", error=error)
             session.commit()
-
-    def _controlled_call(self, connection_id: int, run_id: int, endpoint_family: str, purpose: str, operation: Callable[[], T]) -> tuple[T | None, ProviderError | None]:
-        for retry in range(self._max_transient_retries + 1):
-            with self._sessions() as session:
-                state, attempt, allowed = reserve_request(session, provider_connection_id=connection_id, endpoint_family=endpoint_family, purpose=purpose, sync_run_id=run_id)
-                session.commit()
-                state_id, attempt_id = state.id, attempt.id
-            if not allowed:
-                return None, ProviderError(ProviderErrorCode.RATE_LIMITED, "FusionSolar request is deferred by persisted provider state.", transient=True)
-            try:
-                value = operation()
-                error = None
-            except FusionSolarClientError as exc:
-                value, error = None, exc.error
-            with self._sessions() as session:
-                state = session.scalar(select(ProviderRequestState).where(ProviderRequestState.id == state_id).with_for_update())
-                attempt = session.get(ProviderRequestAttempt, attempt_id)
-                assert state is not None and attempt is not None
-                record_request_result(session, state=state, attempt=attempt, error=error)
-                session.commit()
-            if error is None or not error.transient or error.code is ProviderErrorCode.RATE_LIMITED:
-                return value, error
-        return None, error
-
 
 def credentials_for(connection: ProviderConnection) -> FusionSolarCredentials:
     reference = connection.credential_reference or ""

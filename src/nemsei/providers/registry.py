@@ -70,7 +70,11 @@ _DESCRIPTORS = {
         ProviderCode.FUSIONSOLAR,
         "FusionSolar",
         _trim,
-        frozenset({ProviderCapability.CONNECTION_VALIDATION, ProviderCapability.DISCOVERY}),
+        frozenset({
+            ProviderCapability.CONNECTION_VALIDATION,
+            ProviderCapability.DISCOVERY,
+            ProviderCapability.CURRENT_MONITORING,
+        }),
     ),
     ProviderCode.SIGENERGY: ProviderDescriptor(
         ProviderCode.SIGENERGY,

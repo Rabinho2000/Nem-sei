@@ -1,7 +1,8 @@
-"""Small FusionSolar HTTP boundary for authentication and plant-list pages only.
+"""Small FusionSolar HTTP boundary for implemented read capabilities only.
 
 The endpoint shapes below are limited to behavior observed in frozen V1 fixtures.
-No monitoring, production, device, alarm, or mutation endpoint belongs here.
+Only plant discovery and current plant monitoring are implemented. Production,
+devices, alarms, and mutations remain deliberately absent.
 """
 from __future__ import annotations
 
@@ -89,6 +90,7 @@ class FusionSolarClient:
 
     login_endpoint: str = "/thirdData/login"
     plants_endpoint: str = "/thirdData/stations"
+    current_monitoring_endpoint: str = "/thirdData/getStationRealKpi"
 
     def authenticate(self) -> None:
         response = self._post(
@@ -115,6 +117,24 @@ class FusionSolarClient:
         if pages < page_number or pages < 1:
             raise FusionSolarClientError(ProviderError(ProviderErrorCode.INVALID_RESPONSE, "FusionSolar discovery page range is invalid."))
         return [row for row in data["list"] if isinstance(row, dict)], pages
+
+    def current_monitoring_batch(self, station_codes: list[str]) -> list[dict[str, Any]]:
+        """Read one verified account-level plant-state batch (at most 100 IDs)."""
+        if self._token is None:
+            raise FusionSolarClientError(ProviderError(ProviderErrorCode.AUTHENTICATION, "FusionSolar authentication is required."))
+        codes = [code.strip() for code in station_codes if code and code.strip()]
+        if not codes or len(codes) > 100:
+            raise FusionSolarClientError(ProviderError(ProviderErrorCode.CONFIGURATION, "FusionSolar monitoring batch must contain one to 100 station codes."))
+        response = self._post(
+            self.current_monitoring_endpoint,
+            {"stationCodes": ",".join(codes)},
+            include_token=True,
+        )
+        self._validate(response, phase="current_monitoring")
+        rows = response.payload.get("data")
+        if not isinstance(rows, list):
+            raise FusionSolarClientError(ProviderError(ProviderErrorCode.INVALID_RESPONSE, "FusionSolar monitoring response has no plant list."))
+        return [row for row in rows if isinstance(row, dict)]
 
     def _post(self, endpoint: str, payload: dict[str, Any], *, include_token: bool) -> HttpResponse:
         headers = {"Content-Type": "application/json", "Accept": "application/json, */*"}

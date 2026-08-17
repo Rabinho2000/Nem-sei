@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -41,6 +42,8 @@ def record_observation(
     raw_status_code: str | None = None,
     raw_status_text: str | None = None,
     safe_detail: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    deduplicate_observed_at: bool = False,
 ) -> tuple[MonitoringObservation, bool]:
     if condition not in OBSERVATION_CONDITIONS or freshness not in FRESHNESS_STATES or quality not in QUALITY_STATES or completeness not in QUALITY_STATES:
         raise ValueError("Invalid canonical observation state")
@@ -49,8 +52,27 @@ def record_observation(
     if not key:
         raise ValueError("Source observation key is required")
     existing = CanonicalFactRepository(session).latest_observation(provider_mapping_id=provider_mapping_id, source_key=key)
-    normalized = (as_utc(observed_at), condition, freshness, quality, completeness, raw_status_code, raw_status_text)
-    if existing and normalized == (as_utc(existing.observed_at), existing.condition, existing.freshness, existing.quality, existing.completeness, existing.raw_status_code, existing.raw_status_text):
+    normalized = (
+        None if deduplicate_observed_at else as_utc(observed_at),
+        condition,
+        freshness,
+        quality,
+        completeness,
+        raw_status_code,
+        raw_status_text,
+        metadata or {},
+    )
+    existing_normalized = (
+        None if deduplicate_observed_at else as_utc(existing.observed_at),
+        existing.condition,
+        existing.freshness,
+        existing.quality,
+        existing.completeness,
+        existing.raw_status_code,
+        existing.raw_status_text,
+        existing.metadata_json,
+    ) if existing else None
+    if existing and normalized == existing_normalized:
         return existing, False
     revision = (existing.source_revision + 1) if existing else 1
     observation = MonitoringObservation(
@@ -69,7 +91,7 @@ def record_observation(
         raw_status_code=raw_status_code[:120] if raw_status_code else None,
         raw_status_text=raw_status_text[:500] if raw_status_text else None,
         safe_detail=safe_detail[:500] if safe_detail else None,
-        metadata_json={},
+        metadata_json=dict(metadata or {}),
     )
     session.add(observation)
     return observation, True

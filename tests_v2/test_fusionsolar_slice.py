@@ -72,7 +72,11 @@ def configured_environment(monkeypatch):
 def test_live_implemented_capabilities_are_narrow_and_runtime_availability_is_separate():
     for capability in ProviderCapability:
         status = evaluate_capability(ProviderCode.FUSIONSOLAR, capability, connection_configured=True)
-        if capability in {ProviderCapability.CONNECTION_VALIDATION, ProviderCapability.DISCOVERY}:
+        if capability in {
+            ProviderCapability.CONNECTION_VALIDATION,
+            ProviderCapability.DISCOVERY,
+            ProviderCapability.CURRENT_MONITORING,
+        }:
             assert status.implementation_support is ImplementationSupport.SUPPORTED
             assert status.runtime_availability is RuntimeAvailability.AVAILABLE
         else:
