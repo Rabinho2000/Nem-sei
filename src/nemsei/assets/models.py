@@ -26,7 +26,7 @@ class Organization(Base):
             "uq_organizations_normalized_tax_id",
             "normalized_tax_id",
             unique=True,
-            sqlite_where=text("normalized_tax_id IS NOT NULL AND normalized_tax_id != ''"),
+            postgresql_where=text("normalized_tax_id IS NOT NULL AND normalized_tax_id != ''"),
         ),
     )
 

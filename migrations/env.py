@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool
 
 from nemsei.config import Settings
 from nemsei.db.base import Base
+from nemsei.db.engine import build_engine
 import nemsei.jobs.models  # noqa: F401 - register foundation metadata
 import nemsei.assets.models  # noqa: F401 - register asset metadata
 import nemsei.providers.models  # noqa: F401 - register provider metadata
@@ -23,12 +23,14 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    settings.data_root.mkdir(parents=True, exist_ok=True)
-    connectable = engine_from_config(config.get_section(config.config_ini_section, {}), prefix="sqlalchemy.", poolclass=pool.NullPool)
-    with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata)
-        with context.begin_transaction():
-            context.run_migrations()
+    connectable = build_engine(settings)
+    try:
+        with connectable.connect() as connection:
+            context.configure(connection=connection, target_metadata=target_metadata)
+            with context.begin_transaction():
+                context.run_migrations()
+    finally:
+        connectable.dispose()
 
 
 if context.is_offline_mode():

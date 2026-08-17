@@ -15,20 +15,14 @@ depends_on = None
 
 def upgrade() -> None:
     op.add_column("jobs", sa.Column("cancellation_requested_at", sa.DateTime(timezone=True)))
-    op.execute("""
-        CREATE TRIGGER job_events_no_update
-        BEFORE UPDATE ON job_events
-        BEGIN SELECT RAISE(ABORT, 'job_events are append-only'); END;
-    """)
-    op.execute("""
-        CREATE TRIGGER job_events_no_delete
-        BEFORE DELETE ON job_events
-        BEGIN SELECT RAISE(ABORT, 'job_events are append-only'); END;
-    """)
+    op.execute("""CREATE FUNCTION job_events_immutable() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'job_events are append-only'; END; $$""")
+    op.execute("CREATE TRIGGER job_events_no_update BEFORE UPDATE ON job_events FOR EACH ROW EXECUTE FUNCTION job_events_immutable()")
+    op.execute("CREATE TRIGGER job_events_no_delete BEFORE DELETE ON job_events FOR EACH ROW EXECUTE FUNCTION job_events_immutable()")
 
 
 def downgrade() -> None:
-    op.execute("DROP TRIGGER job_events_no_delete")
-    op.execute("DROP TRIGGER job_events_no_update")
+    op.execute("DROP TRIGGER job_events_no_delete ON job_events")
+    op.execute("DROP TRIGGER job_events_no_update ON job_events")
+    op.execute("DROP FUNCTION job_events_immutable()")
     with op.batch_alter_table("jobs") as batch_op:
         batch_op.drop_column("cancellation_requested_at")

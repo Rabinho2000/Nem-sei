@@ -23,7 +23,7 @@ class Job(Base):
             "job_type",
             "dedupe_key",
             unique=True,
-            sqlite_where=text("dedupe_key IS NOT NULL AND status IN ('queued', 'running', 'waiting')"),
+            postgresql_where=text("dedupe_key IS NOT NULL AND status IN ('queued', 'running', 'waiting')"),
         ),
     )
 

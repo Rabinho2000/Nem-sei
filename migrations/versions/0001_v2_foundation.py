@@ -39,7 +39,7 @@ def upgrade() -> None:
         sa.CheckConstraint("status IN ('queued', 'running', 'waiting', 'success', 'partial', 'failed', 'cancelled')", name="ck_jobs_status"),
     )
     op.create_index("ix_jobs_due", "jobs", ["status", "available_at", "priority", "id"])
-    op.create_index("uq_jobs_active_dedupe", "jobs", ["job_type", "dedupe_key"], unique=True, sqlite_where=sa.text("dedupe_key IS NOT NULL AND status IN ('queued', 'running', 'waiting')"))
+    op.create_index("uq_jobs_active_dedupe", "jobs", ["job_type", "dedupe_key"], unique=True, postgresql_where=sa.text("dedupe_key IS NOT NULL AND status IN ('queued', 'running', 'waiting')"))
     op.create_table(
         "job_events",
         sa.Column("id", sa.Integer(), primary_key=True),

@@ -1,4 +1,4 @@
-"""SQLite-backed persisted queue operations; no handler or web dependencies."""
+"""PostgreSQL-backed persisted queue operations; no handler or web dependencies."""
 from __future__ import annotations
 
 import secrets
@@ -7,7 +7,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import Engine, insert, select, update
+from sqlalchemy import Engine, insert, or_, select, update
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -46,19 +47,15 @@ class JobRepository:
 
     @contextmanager
     def _immediate_session(self):
-        """Serialize a short SQLite state transition without running handlers."""
-        with self.engine.connect() as connection:
-            connection.exec_driver_sql("BEGIN IMMEDIATE")
-            session = Session(bind=connection, autoflush=False, expire_on_commit=False)
+        """Short PostgreSQL transaction; handlers never run inside it."""
+        with self.session_factory() as session:
             try:
                 yield session
                 session.flush()
-                connection.commit()
+                session.commit()
             except Exception:
-                connection.rollback()
+                session.rollback()
                 raise
-            finally:
-                session.close()
 
     def _event(
         self,
@@ -180,8 +177,7 @@ class JobRepository:
         now_value = now or utc_now()
         lease_token = secrets.token_urlsafe(24)
         lease_until = now_value + timedelta(seconds=lease_seconds)
-        with self.engine.connect() as connection:
-            connection.exec_driver_sql("BEGIN IMMEDIATE")
+        with self.engine.begin() as connection:
             try:
                 row = connection.execute(
                     select(
@@ -194,9 +190,9 @@ class JobRepository:
                     .where(Job.status == "queued", Job.available_at <= now_value)
                     .order_by(Job.priority.asc(), Job.available_at.asc(), Job.id.asc())
                     .limit(1)
+                    .with_for_update(skip_locked=True)
                 ).mappings().first()
                 if row is None:
-                    connection.commit()
                     return None
                 attempt = int(row["attempt_count"]) + 1
                 result = connection.execute(
@@ -214,7 +210,6 @@ class JobRepository:
                     )
                 )
                 if result.rowcount != 1:
-                    connection.rollback()
                     return None
                 connection.execute(
                     insert(JobEvent).values(
@@ -228,7 +223,6 @@ class JobRepository:
                         metadata_json={},
                     )
                 )
-                connection.commit()
                 return ClaimedJob(
                     id=int(row["id"]),
                     job_type=str(row["job_type"]),
@@ -238,7 +232,6 @@ class JobRepository:
                     lease_token=lease_token,
                 )
             except Exception:
-                connection.rollback()
                 raise
 
     def finish(
@@ -448,17 +441,27 @@ class JobRepository:
     def acquire_scheduler_lease(self, *, owner_token: str, lease_seconds: int, now: datetime | None = None) -> bool:
         now_value = now or utc_now()
         lease_until = now_value + timedelta(seconds=lease_seconds)
-        with self._immediate_session() as session:
-            lease = session.get(SchedulerLease, "v2-scheduler")
-            if lease is not None and lease.lease_expires_at and as_utc(lease.lease_expires_at) > now_value and lease.owner_token != owner_token:
-                return False
-            if lease is None:
-                lease = SchedulerLease(name="v2-scheduler", updated_at=now_value)
-                session.add(lease)
-            lease.owner_token = owner_token
-            lease.lease_expires_at = lease_until
-            lease.updated_at = now_value
-            return True
+        statement = postgresql_insert(SchedulerLease).values(
+            name="v2-scheduler",
+            owner_token=owner_token,
+            lease_expires_at=lease_until,
+            updated_at=now_value,
+        )
+        statement = statement.on_conflict_do_update(
+            index_elements=[SchedulerLease.name],
+            set_={
+                "owner_token": owner_token,
+                "lease_expires_at": lease_until,
+                "updated_at": now_value,
+            },
+            where=or_(
+                SchedulerLease.lease_expires_at.is_(None),
+                SchedulerLease.lease_expires_at <= now_value,
+                SchedulerLease.owner_token == owner_token,
+            ),
+        ).returning(SchedulerLease.name)
+        with self.engine.begin() as connection:
+            return connection.scalar(statement) is not None
 
     def enqueue_due_noop(self, *, now: datetime | None = None) -> tuple[Job | None, bool]:
         now_value = now or utc_now()

@@ -55,7 +55,7 @@ class AssetProviderMapping(Base):
             "resource_kind",
             "normalized_external_id",
             unique=True,
-            sqlite_where=text("mapping_status = 'active' AND valid_to IS NULL"),
+            postgresql_where=text("mapping_status = 'active' AND valid_to IS NULL"),
         ),
         Index("ix_asset_provider_mappings_asset", "asset_id", "mapping_status"),
     )

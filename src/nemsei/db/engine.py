@@ -1,45 +1,23 @@
-"""SQLite engine construction and connection-local safety settings."""
+"""PostgreSQL engine construction; V1 SQLite is importer-only."""
 from __future__ import annotations
-
-import sqlite3
-import time
 
 from sqlalchemy import Engine, event
 from sqlalchemy.engine import create_engine
-from sqlalchemy.pool import NullPool
 
 from nemsei.config import Settings
 
 
 def build_engine(settings: Settings) -> Engine:
     settings.validate()
-    engine = create_engine(
-        settings.sqlalchemy_database_url,
-        connect_args={"timeout": 15},
-        poolclass=NullPool,
-    )
+    engine = create_engine(settings.sqlalchemy_database_url, pool_size=settings.db_pool_size, max_overflow=settings.db_max_overflow, pool_pre_ping=True, pool_recycle=settings.db_pool_recycle_seconds)
 
     @event.listens_for(engine, "connect")
-    def configure_sqlite_connection(dbapi_connection, _connection_record) -> None:
-        cursor = dbapi_connection.cursor()
+    def configure_postgres_connection(connection, _record) -> None:
+        cursor = connection.cursor()
         try:
-            cursor.execute("PRAGMA foreign_keys = ON")
-            cursor.execute("PRAGMA busy_timeout = 15000")
-            # Changing journal mode takes a database-level lock. Concurrent
-            # process startup is expected, so retry only this connection setup
-            # step within the same bounded SQLite timeout.
-            deadline = time.monotonic() + 15
-            while True:
-                try:
-                    cursor.execute("PRAGMA journal_mode = WAL")
-                    break
-                except sqlite3.OperationalError as exc:
-                    if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
-                        raise
-                    time.sleep(0.05)
-            cursor.execute("PRAGMA synchronous = NORMAL")
-            cursor.execute("PRAGMA temp_store = MEMORY")
+            cursor.execute(f"SET statement_timeout = {settings.db_statement_timeout_ms}")
+            cursor.execute(f"SET lock_timeout = {settings.db_lock_timeout_ms}")
+            cursor.execute(f"SET idle_in_transaction_session_timeout = {settings.db_idle_transaction_timeout_ms}")
         finally:
             cursor.close()
-
     return engine

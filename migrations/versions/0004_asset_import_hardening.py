@@ -14,30 +14,53 @@ depends_on = None
 
 
 def upgrade() -> None:
-    with op.batch_alter_table("assets", recreate="always") as batch:
-        batch.alter_column("timezone", existing_type=sa.String(64), nullable=True)
-    with op.batch_alter_table("asset_provider_mappings", recreate="always") as batch:
-        batch.create_check_constraint("ck_asset_provider_mappings_valid_range", "valid_to IS NULL OR valid_to >= valid_from")
-    with op.batch_alter_table("legacy_import_runs", recreate="always") as batch:
-        batch.add_column(sa.Column("importer_version", sa.String(64), nullable=False, server_default="assets-v1-importer/2.0"))
-        batch.add_column(sa.Column("source_locator_sha256", sa.String(64), nullable=False, server_default="unknown"))
-    with op.batch_alter_table("legacy_import_records", recreate="always") as batch:
-        batch.add_column(sa.Column("source_locator_sha256", sa.String(64), nullable=False, server_default="unknown"))
-        batch.add_column(sa.Column("evidence_json", sa.JSON(), nullable=False, server_default="{}"))
-        batch.drop_constraint("ck_legacy_import_records_outcome", type_="check")
-        batch.create_check_constraint("ck_legacy_import_records_outcome", "outcome IN ('created', 'reused', 'quarantined', 'changed_source', 'conflict', 'excluded', 'unresolved')")
+    op.alter_column("assets", "timezone", existing_type=sa.String(64), nullable=True)
+    op.create_check_constraint(
+        "ck_asset_provider_mappings_valid_range",
+        "asset_provider_mappings",
+        "valid_to IS NULL OR valid_to >= valid_from",
+    )
+    op.add_column(
+        "legacy_import_runs",
+        sa.Column("importer_version", sa.String(64), nullable=False, server_default="assets-v1-importer/2.0"),
+    )
+    op.add_column(
+        "legacy_import_runs",
+        sa.Column("source_locator_sha256", sa.String(64), nullable=False, server_default="unknown"),
+    )
+    op.add_column(
+        "legacy_import_records",
+        sa.Column("source_locator_sha256", sa.String(64), nullable=False, server_default="unknown"),
+    )
+    op.add_column(
+        "legacy_import_records",
+        sa.Column("evidence_json", sa.JSON(), nullable=False, server_default="{}"),
+    )
+    op.drop_constraint("ck_legacy_import_records_outcome", "legacy_import_records", type_="check")
+    op.create_check_constraint(
+        "ck_legacy_import_records_outcome",
+        "legacy_import_records",
+        "outcome IN ('created', 'reused', 'quarantined', 'changed_source', 'conflict', 'excluded', 'unresolved')",
+    )
+    for table_name, column_name in (
+        ("legacy_import_runs", "importer_version"),
+        ("legacy_import_runs", "source_locator_sha256"),
+        ("legacy_import_records", "source_locator_sha256"),
+        ("legacy_import_records", "evidence_json"),
+    ):
+        op.alter_column(table_name, column_name, server_default=None)
 
 
 def downgrade() -> None:
-    with op.batch_alter_table("legacy_import_records", recreate="always") as batch:
-        batch.drop_constraint("ck_legacy_import_records_outcome", type_="check")
-        batch.create_check_constraint("ck_legacy_import_records_outcome", "outcome IN ('created', 'reused', 'quarantined', 'changed_source', 'conflict', 'excluded')")
-        batch.drop_column("evidence_json")
-        batch.drop_column("source_locator_sha256")
-    with op.batch_alter_table("legacy_import_runs", recreate="always") as batch:
-        batch.drop_column("source_locator_sha256")
-        batch.drop_column("importer_version")
-    with op.batch_alter_table("asset_provider_mappings", recreate="always") as batch:
-        batch.drop_constraint("ck_asset_provider_mappings_valid_range", type_="check")
-    with op.batch_alter_table("assets", recreate="always") as batch:
-        batch.alter_column("timezone", existing_type=sa.String(64), nullable=False)
+    op.drop_constraint("ck_legacy_import_records_outcome", "legacy_import_records", type_="check")
+    op.create_check_constraint(
+        "ck_legacy_import_records_outcome",
+        "legacy_import_records",
+        "outcome IN ('created', 'reused', 'quarantined', 'changed_source', 'conflict', 'excluded')",
+    )
+    op.drop_column("legacy_import_records", "evidence_json")
+    op.drop_column("legacy_import_records", "source_locator_sha256")
+    op.drop_column("legacy_import_runs", "source_locator_sha256")
+    op.drop_column("legacy_import_runs", "importer_version")
+    op.drop_constraint("ck_asset_provider_mappings_valid_range", "asset_provider_mappings", type_="check")
+    op.alter_column("assets", "timezone", existing_type=sa.String(64), nullable=False)

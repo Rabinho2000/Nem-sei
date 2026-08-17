@@ -1,127 +1,123 @@
-"""Validated V2 runtime settings with strict data-root isolation."""
+"""Validated V2 PostgreSQL runtime settings."""
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import unquote
+
+from sqlalchemy.engine import make_url
 
 
 VALID_ENVIRONMENTS = {"development", "test", "preview", "production"}
-V2_DATABASE_FILENAME = "nemsei_v2.db"
-CAPABILITIES = (
-    "provider_reads",
-    "provider_mutations",
-    "notifications",
-    "report_distribution",
-)
+PROCESS_ROLES = {"web", "scheduler", "worker", "migrate", "admin"}
+CAPABILITIES = ("provider_reads", "provider_mutations", "notifications", "report_distribution")
 INSECURE_SECRET_KEYS = {"changeme", "change-me", "secret", "development", "default"}
+ROLE_DATABASE_DEFAULTS = {
+    "web": {"pool_size": 2, "max_overflow": 1, "statement_timeout_ms": 15000, "lock_timeout_ms": 3000, "idle_transaction_timeout_ms": 30000},
+    "scheduler": {"pool_size": 1, "max_overflow": 1, "statement_timeout_ms": 10000, "lock_timeout_ms": 3000, "idle_transaction_timeout_ms": 20000},
+    "worker": {"pool_size": 2, "max_overflow": 1, "statement_timeout_ms": 30000, "lock_timeout_ms": 5000, "idle_transaction_timeout_ms": 60000},
+    "migrate": {"pool_size": 1, "max_overflow": 0, "statement_timeout_ms": 120000, "lock_timeout_ms": 10000, "idle_transaction_timeout_ms": 120000},
+    "admin": {"pool_size": 1, "max_overflow": 0, "statement_timeout_ms": 60000, "lock_timeout_ms": 10000, "idle_transaction_timeout_ms": 60000},
+}
 
 
 class ConfigurationError(ValueError):
-    """Raised before a V2 process can use an unsafe configuration."""
+    pass
 
 
 def parse_bool(value: str | None, *, default: bool = False) -> bool:
     if value is None:
         return default
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
+    if value.strip().lower() in {"1", "true", "yes", "on"}:
         return True
-    if normalized in {"0", "false", "no", "off"}:
+    if value.strip().lower() in {"0", "false", "no", "off"}:
         return False
-    raise ConfigurationError(f"Expected a boolean value, got {value!r}.")
+    raise ConfigurationError(f"Expected boolean, got {value!r}.")
 
 
-def sqlite_path_from_url(database_url: str) -> Path:
-    prefix = "sqlite:///"
-    if not database_url.startswith(prefix):
-        raise ConfigurationError("NEMSEI_V2_DATABASE_URL must be a SQLite file URL.")
-    raw_path = unquote(database_url[len(prefix) :])
-    if not raw_path or raw_path == ":memory:" or "?" in raw_path:
-        raise ConfigurationError("V2 requires a SQLite database file, not memory or query URLs.")
-    return Path(raw_path).expanduser().resolve()
+def read_secret_value(*, value_name: str, file_name: str) -> str:
+    """Read one configuration secret from an env value or a mounted secret file."""
+    value = os.environ.get(value_name, "").strip()
+    file_value = os.environ.get(file_name, "").strip()
+    if value and file_value:
+        raise ConfigurationError(f"Set only one of {value_name} or {file_name}.")
+    if value:
+        return value
+    if not file_value:
+        return ""
+    try:
+        return Path(file_value).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ConfigurationError(f"Unable to read {file_name}.") from exc
 
 
 @dataclass(frozen=True)
 class Settings:
     environment: str
-    data_root: Path
     database_url: str
-    database_path: Path
     secret_key: str
     admin_username: str
     admin_password_hash: str
     capabilities: dict[str, bool]
+    process_role: str = "web"
     worker_poll_seconds: float = 2.0
     worker_lease_seconds: int = 30
     scheduler_lease_seconds: int = 30
+    db_pool_size: int = 2
+    db_max_overflow: int = 1
+    db_statement_timeout_ms: int = 15000
+    db_lock_timeout_ms: int = 3000
+    db_idle_transaction_timeout_ms: int = 30000
+    db_pool_recycle_seconds: int = 1800
     testing: bool = False
 
     @property
-    def resolved_database_path(self) -> Path:
-        """The sole authoritative database target used by validation and SQLAlchemy."""
-        return self.database_path.expanduser().resolve()
-
-    @property
     def sqlalchemy_database_url(self) -> str:
-        return f"sqlite:///{self.resolved_database_path.as_posix()}"
+        return self.database_url
 
     @classmethod
     def from_environment(cls) -> "Settings":
         environment = os.environ.get("NEMSEI_V2_ENV", "development").strip().lower()
-        data_root = Path(
-            os.environ.get("NEMSEI_V2_DATA_ROOT", "./data-v2")
-        ).expanduser().resolve()
-        database_url = os.environ.get(
-            "NEMSEI_V2_DATABASE_URL",
-            f"sqlite:///{data_root / V2_DATABASE_FILENAME}",
-        )
-        database_path = sqlite_path_from_url(database_url)
-        capabilities = {
-            capability: parse_bool(
-                os.environ.get(f"NEMSEI_V2_{capability.upper()}"), default=False
-            )
-            for capability in CAPABILITIES
-        }
+        process_role = os.environ.get("NEMSEI_V2_PROCESS_ROLE", "web").strip().lower()
+        defaults = ROLE_DATABASE_DEFAULTS.get(process_role, ROLE_DATABASE_DEFAULTS["web"])
         return cls(
             environment=environment,
-            data_root=data_root,
-            database_url=database_url,
-            database_path=database_path,
+            database_url=read_secret_value(
+                value_name="NEMSEI_V2_DATABASE_URL",
+                file_name="NEMSEI_V2_DATABASE_URL_FILE",
+            ),
             secret_key=os.environ.get("NEMSEI_V2_SECRET_KEY", ""),
             admin_username=os.environ.get("NEMSEI_V2_ADMIN_USERNAME", "admin").strip(),
             admin_password_hash=os.environ.get("NEMSEI_V2_ADMIN_PASSWORD_HASH", "").strip(),
-            capabilities=capabilities,
+            capabilities={name: parse_bool(os.environ.get(f"NEMSEI_V2_{name.upper()}"), default=False) for name in CAPABILITIES},
+            process_role=process_role,
             worker_poll_seconds=float(os.environ.get("NEMSEI_V2_WORKER_POLL_SECONDS", "2")),
             worker_lease_seconds=int(os.environ.get("NEMSEI_V2_WORKER_LEASE_SECONDS", "30")),
             scheduler_lease_seconds=int(os.environ.get("NEMSEI_V2_SCHEDULER_LEASE_SECONDS", "30")),
+            db_pool_size=int(os.environ.get("NEMSEI_V2_DB_POOL_SIZE", str(defaults["pool_size"]))),
+            db_max_overflow=int(os.environ.get("NEMSEI_V2_DB_MAX_OVERFLOW", str(defaults["max_overflow"]))),
+            db_statement_timeout_ms=int(os.environ.get("NEMSEI_V2_DB_STATEMENT_TIMEOUT_MS", str(defaults["statement_timeout_ms"]))),
+            db_lock_timeout_ms=int(os.environ.get("NEMSEI_V2_DB_LOCK_TIMEOUT_MS", str(defaults["lock_timeout_ms"]))),
+            db_idle_transaction_timeout_ms=int(os.environ.get("NEMSEI_V2_DB_IDLE_TRANSACTION_TIMEOUT_MS", str(defaults["idle_transaction_timeout_ms"]))),
+            db_pool_recycle_seconds=int(os.environ.get("NEMSEI_V2_DB_POOL_RECYCLE_SECONDS", "1800")),
             testing=parse_bool(os.environ.get("NEMSEI_V2_TESTING"), default=False),
         )
 
     def validate(self, *, require_auth: bool = False) -> "Settings":
         if self.environment not in VALID_ENVIRONMENTS:
-            raise ConfigurationError("NEMSEI_V2_ENV must be development, test, preview, or production.")
-        resolved_root = self.data_root.resolve()
-        resolved_database = self.resolved_database_path
-        configured_url_path = sqlite_path_from_url(self.database_url)
-        if configured_url_path != resolved_database:
-            raise ConfigurationError("NEMSEI_V2_DATABASE_URL must match the resolved V2 database path.")
-        if resolved_database.name != V2_DATABASE_FILENAME:
-            raise ConfigurationError(f"V2 database filename must be {V2_DATABASE_FILENAME}.")
+            raise ConfigurationError("Invalid V2 environment.")
+        if self.process_role not in PROCESS_ROLES:
+            raise ConfigurationError("Invalid V2 process role.")
         try:
-            resolved_database.relative_to(resolved_root)
-        except ValueError as exc:
-            raise ConfigurationError("V2 database must be inside NEMSEI_V2_DATA_ROOT.") from exc
-        if self.environment in {"preview", "production"}:
-            if not self.secret_key or self.secret_key.strip().lower() in INSECURE_SECRET_KEYS:
-                raise ConfigurationError("NEMSEI_V2_SECRET_KEY must be non-default outside development/test.")
-            if self.testing:
-                raise ConfigurationError("NEMSEI_V2_TESTING is not allowed in preview or production.")
-        if require_auth and (not self.admin_username or not self.admin_password_hash):
-            raise ConfigurationError("V2 administrator username and password hash are required.")
-        if require_auth and self.admin_password_hash.count("$") < 2:
-            raise ConfigurationError("V2 administrator password must be a Werkzeug password hash.")
-        if self.worker_poll_seconds <= 0 or self.worker_lease_seconds <= 0 or self.scheduler_lease_seconds <= 0:
-            raise ConfigurationError("Worker and scheduler timings must be positive.")
+            url = make_url(self.database_url)
+        except Exception as exc:
+            raise ConfigurationError("NEMSEI_V2_DATABASE_URL must be a PostgreSQL URL.") from exc
+        if url.drivername not in {"postgresql", "postgresql+psycopg"} or not url.host or not url.database or not url.username:
+            raise ConfigurationError("NEMSEI_V2_DATABASE_URL must be a complete PostgreSQL URL.")
+        if self.environment in {"preview", "production"} and (not self.secret_key or self.secret_key.lower() in INSECURE_SECRET_KEYS):
+            raise ConfigurationError("NEMSEI_V2_SECRET_KEY must be non-default outside development/test.")
+        if require_auth and (not self.admin_username or self.admin_password_hash.count("$") < 2):
+            raise ConfigurationError("V2 administrator credentials are required.")
+        if min(self.worker_poll_seconds, self.worker_lease_seconds, self.scheduler_lease_seconds, self.db_pool_size, self.db_statement_timeout_ms, self.db_lock_timeout_ms, self.db_idle_transaction_timeout_ms, self.db_pool_recycle_seconds) <= 0 or self.db_max_overflow < 0:
+            raise ConfigurationError("V2 timing and pool settings must be positive.")
         return self

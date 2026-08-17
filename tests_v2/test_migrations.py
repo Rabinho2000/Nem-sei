@@ -7,7 +7,6 @@ from sqlalchemy import create_engine, inspect
 
 def upgrade(settings, monkeypatch) -> None:
     monkeypatch.setenv("NEMSEI_V2_ENV", "test")
-    monkeypatch.setenv("NEMSEI_V2_DATA_ROOT", str(settings.data_root))
     monkeypatch.setenv("NEMSEI_V2_DATABASE_URL", settings.database_url)
     command.upgrade(Config("alembic.ini"), "head")
 

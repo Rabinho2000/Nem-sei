@@ -38,6 +38,22 @@ def test_claim_is_atomic_and_records_worker_actor(settings, monkeypatch) -> None
     assert repo.events_for(job.id)[-1].actor_source == "worker"
 
 
+def test_independent_workers_claim_distinct_jobs_with_skip_locked(settings, monkeypatch) -> None:
+    repo = repository(settings, monkeypatch)
+    first, _ = repo.enqueue(job_type="system.noop", payload={"number": 1}, actor_source="web")
+    second, _ = repo.enqueue(job_type="system.noop", payload={"number": 2}, actor_source="web")
+
+    def claim(worker_id: str):
+        engine = build_engine(settings)
+        return JobRepository(engine, build_session_factory(engine)).claim_next(worker_id=worker_id, lease_seconds=30)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        claims = list(pool.map(claim, ("worker-a", "worker-b")))
+
+    assert {claim.id for claim in claims if claim is not None} == {first.id, second.id}
+    assert len({claim.lease_token for claim in claims if claim is not None}) == 2
+
+
 def test_concurrent_enqueue_returns_one_active_job(settings, monkeypatch) -> None:
     repo = repository(settings, monkeypatch)
 
