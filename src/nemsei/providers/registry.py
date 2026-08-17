@@ -74,6 +74,7 @@ _DESCRIPTORS = {
             ProviderCapability.CONNECTION_VALIDATION,
             ProviderCapability.DISCOVERY,
             ProviderCapability.CURRENT_MONITORING,
+            ProviderCapability.PRODUCTION_HISTORY,
         }),
     ),
     ProviderCode.SIGENERGY: ProviderDescriptor(

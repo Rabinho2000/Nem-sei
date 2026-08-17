@@ -199,6 +199,7 @@ def record_production_fact(
     completeness: str,
     metric_kind: str = "production_energy",
     sync_run_id: int | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> tuple[ProductionFact, bool]:
     if metric_kind not in PRODUCTION_METRICS or quality not in QUALITY_STATES or completeness not in QUALITY_STATES:
         raise ValueError("Invalid production fact state")
@@ -213,8 +214,8 @@ def record_production_fact(
     if not key or not unit.strip() or not granularity.strip():
         raise ValueError("Production fact key, unit, and granularity are required")
     existing = CanonicalFactRepository(session).latest_production_fact(provider_mapping_id=provider_mapping_id, source_key=key)
-    normalized = (as_utc(period_start), as_utc(period_end), granularity, value, unit, quality, completeness, metric_kind)
-    if existing and normalized == (as_utc(existing.period_start), as_utc(existing.period_end), existing.granularity, existing.value, existing.unit, existing.quality, existing.completeness, existing.metric_kind):
+    normalized = (as_utc(period_start), as_utc(period_end), granularity, value, unit, quality, completeness, metric_kind, metadata or {})
+    if existing and normalized == (as_utc(existing.period_start), as_utc(existing.period_end), existing.granularity, existing.value, existing.unit, existing.quality, existing.completeness, existing.metric_kind, existing.metadata_json):
         return existing, False
     fact = ProductionFact(
         asset_id=asset_id,
@@ -232,7 +233,7 @@ def record_production_fact(
         quality=quality,
         completeness=completeness,
         ingested_at=utc_now(),
-        metadata_json={},
+        metadata_json=dict(metadata or {}),
     )
     session.add(fact)
     return fact, True

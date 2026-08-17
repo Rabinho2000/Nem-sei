@@ -1,7 +1,9 @@
 """Persistence operations for provider connections and plant mappings."""
 from __future__ import annotations
 
-from sqlalchemy import select
+from datetime import date
+
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from nemsei.providers.models import AssetProviderMapping, ProviderConnection
@@ -49,6 +51,21 @@ class ProviderRepository:
                     AssetProviderMapping.resource_kind == "plant",
                     AssetProviderMapping.valid_to.is_(None),
                     AssetProviderMapping.mapping_status.in_(("active", "invalid", "pending_review")),
+                )
+                .order_by(AssetProviderMapping.id)
+            )
+        )
+
+    def mappings_for_connection_on_date(self, connection_id: int, on_date: date) -> list[AssetProviderMapping]:
+        """Plant mappings effective for a historical source period."""
+        return list(
+            self.session.scalars(
+                select(AssetProviderMapping)
+                .where(
+                    AssetProviderMapping.provider_connection_id == connection_id,
+                    AssetProviderMapping.resource_kind == "plant",
+                    AssetProviderMapping.valid_from <= on_date,
+                    or_(AssetProviderMapping.valid_to.is_(None), AssetProviderMapping.valid_to >= on_date),
                 )
                 .order_by(AssetProviderMapping.id)
             )

@@ -76,6 +76,7 @@ def test_live_implemented_capabilities_are_narrow_and_runtime_availability_is_se
             ProviderCapability.CONNECTION_VALIDATION,
             ProviderCapability.DISCOVERY,
             ProviderCapability.CURRENT_MONITORING,
+            ProviderCapability.PRODUCTION_HISTORY,
         }:
             assert status.implementation_support is ImplementationSupport.SUPPORTED
             assert status.runtime_availability is RuntimeAvailability.AVAILABLE

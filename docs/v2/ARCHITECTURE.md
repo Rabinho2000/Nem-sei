@@ -41,8 +41,9 @@ and must contain only allowlisted, non-sensitive metadata.
 
 ## FusionSolar read slice
 
-FusionSolar currently implements only `connection_validation` and `discovery`.
-Both are read-only and are unavailable unless `provider_reads=true`. A provider
+FusionSolar currently implements `connection_validation`, `discovery`, guarded
+current monitoring, and guarded daily production history. All are read-only and
+are unavailable unless `provider_reads=true`. A provider
 connection keeps a non-secret credential reference; username and password are
 read from the corresponding environment variable or mounted secret file. They
 are never stored in V2 tables or SyncRun metadata.
@@ -88,3 +89,21 @@ FusionSolar request attempts are finalized even when an unexpected operation
 exception occurs. The audit contains only a fixed internal-failure message and
 the original exception is re-raised; local evidence handling never triggers an
 additional provider HTTP request.
+
+## FusionSolar daily production history
+
+Production history is limited to `/thirdData/getKpiStationDay`: one guarded
+request per explicit provider day and up to 100 source-policy-selected plants,
+after one guarded login per sync. No range/pagination behavior is claimed or
+used. The adapter requires an explicit per-connection IANA source timezone and
+an operator-verified `kWh` declaration for `PVYield`; without both it makes no
+provider request and writes no canonical fact. It treats numeric zero as zero,
+but null/absent `PVYield` as missing/partial, and never treats another V1 field
+as daily production energy.
+
+The canonical fact retains UTC period boundaries and sanitized source-period
+metadata. Its per-connection daily cursor advances only after complete,
+contiguous selected-mapping coverage; partial, failed, deferred, rate-limited,
+and historical-correction runs cannot regress or skip the cursor. Re-fetching
+recent days is intentional reconciliation: unchanged records are idempotent and
+changed evidence creates append-only fact revisions.

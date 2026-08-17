@@ -1,17 +1,20 @@
 """Small FusionSolar HTTP boundary for implemented read capabilities only.
 
 The endpoint shapes below are limited to behavior observed in frozen V1 fixtures.
-Only plant discovery and current plant monitoring are implemented. Production,
-devices, alarms, and mutations remain deliberately absent.
+Only plant discovery, current plant monitoring, and one daily production
+endpoint evidenced by frozen V1 fixtures are implemented.  The caller owns
+production-period and unit contracts; this HTTP boundary never guesses them.
 """
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import date, datetime, time
 from http.cookiejar import CookieJar
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPCookieProcessor, Request, build_opener
+from zoneinfo import ZoneInfo
 
 from nemsei.providers.errors import ProviderError, ProviderErrorCode
 
@@ -91,6 +94,7 @@ class FusionSolarClient:
     login_endpoint: str = "/thirdData/login"
     plants_endpoint: str = "/thirdData/stations"
     current_monitoring_endpoint: str = "/thirdData/getStationRealKpi"
+    daily_production_endpoint: str = "/thirdData/getKpiStationDay"
 
     def authenticate(self) -> None:
         response = self._post(
@@ -134,6 +138,40 @@ class FusionSolarClient:
         rows = response.payload.get("data")
         if not isinstance(rows, list):
             raise FusionSolarClientError(ProviderError(ProviderErrorCode.INVALID_RESPONSE, "FusionSolar monitoring response has no plant list."))
+        return [row for row in rows if isinstance(row, dict)]
+
+    def daily_production_batch(
+        self,
+        station_codes: list[str],
+        *,
+        source_day: date,
+        source_timezone: ZoneInfo,
+    ) -> list[dict[str, Any]]:
+        """Read one daily-KPI batch for one explicitly contracted source day.
+
+        Frozen V1 fixtures establish the endpoint, ``stationCodes`` payload,
+        and a maximum batch size of 100.  They do *not* establish which time
+        zone defines a provider day, so callers must supply an explicit IANA
+        time zone verified for this connection before this method is used.
+        """
+        if self._token is None:
+            raise FusionSolarClientError(ProviderError(ProviderErrorCode.AUTHENTICATION, "FusionSolar authentication is required."))
+        codes = [code.strip() for code in station_codes if code and code.strip()]
+        if not codes or len(codes) > 100:
+            raise FusionSolarClientError(ProviderError(ProviderErrorCode.CONFIGURATION, "FusionSolar production batch must contain one to 100 station codes."))
+        collect_time = datetime.combine(source_day, time.min, tzinfo=source_timezone)
+        response = self._post(
+            self.daily_production_endpoint,
+            {
+                "stationCodes": ",".join(codes),
+                "collectTime": int(collect_time.timestamp() * 1000),
+            },
+            include_token=True,
+        )
+        self._validate(response, phase="production_history")
+        rows = response.payload.get("data")
+        if not isinstance(rows, list):
+            raise FusionSolarClientError(ProviderError(ProviderErrorCode.INVALID_RESPONSE, "FusionSolar daily production response has no plant list."))
         return [row for row in rows if isinstance(row, dict)]
 
     def _post(self, endpoint: str, payload: dict[str, Any], *, include_token: bool) -> HttpResponse:
