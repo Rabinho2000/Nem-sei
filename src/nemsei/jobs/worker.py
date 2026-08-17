@@ -27,8 +27,17 @@ class Worker:
         if claimed is None:
             return False
         try:
-            outcome = execute(claimed, testing=self.settings.testing)
-            self.repository.finish(claimed, status=outcome.status, result=outcome.result)
+            outcome = execute(
+                claimed,
+                testing=self.settings.testing,
+                settings=self.settings,
+                session_factory=self.repository.session_factory,
+            )
+            resume_payload = getattr(outcome, "resume_payload", None)
+            if resume_payload is not None:
+                self.repository.reschedule(claimed, payload=resume_payload)
+            else:
+                self.repository.finish(claimed, status=outcome.status, result=outcome.result)
         except RetryableJobError as exc:
             delay = 60 if claimed.attempt == 1 else 300
             self.repository.retry_or_fail(claimed, error_type=type(exc).__name__, message=str(exc), delay_seconds=delay)

@@ -122,3 +122,20 @@ def test_cancellation_is_immediate_for_queued_and_cooperative_for_running(settin
     assert repo.claim_next(worker_id="worker", lease_seconds=30)
     assert repo.cancel(job_id=running.id, actor_source="web") == "requested"
     assert repo.events_for(running.id)[-1].event_type == "cancellation_requested"
+
+
+def test_production_backfill_progress_is_persisted_before_reschedule(settings, monkeypatch) -> None:
+    repo = repository(settings, monkeypatch)
+    job, _ = repo.enqueue(
+        job_type="production.bounded_backfill",
+        payload={"mode": "bounded_backfill", "connection_id": 1, "start_date": "2026-01-01", "end_date": "2026-01-31"},
+        actor_source="web",
+    )
+    claimed = repo.claim_next(worker_id="worker-a", lease_seconds=30)
+    assert claimed is not None
+    assert repo.reschedule(claimed, payload={**claimed.payload, "next_source_day": "2026-01-11"})
+    with repo.session_factory() as session:
+        persisted = session.get(Job, job.id)
+        assert persisted is not None and persisted.status == "waiting"
+        assert persisted.payload_json["next_source_day"] == "2026-01-11"
+    assert repo.events_for(job.id)[-1].event_type == "progress_saved"

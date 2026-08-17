@@ -32,7 +32,7 @@ class ClaimedJob:
 
 def safe_metadata(values: dict[str, Any] | None = None) -> dict[str, Any]:
     """Keep only small, non-sensitive audit metadata values."""
-    allowed = {"reason", "delay_seconds", "schedule_key", "dedupe_key", "result_status"}
+    allowed = {"reason", "delay_seconds", "schedule_key", "dedupe_key", "result_status", "mode", "next_source_day"}
     return {
         key: str(value)[:200]
         for key, value in (values or {}).items()
@@ -308,6 +308,38 @@ class JobRepository:
                 to_status=target_status,
                 actor_source="worker",
                 metadata={"delay_seconds": delay_seconds, "reason": error_type},
+                occurred_at=now,
+            )
+            return True
+
+    def reschedule(self, claimed: ClaimedJob, *, payload: dict[str, Any], delay_seconds: int = 0) -> bool:
+        """Persist backfill progress before releasing the lease for the next chunk."""
+        now = utc_now()
+        with self._immediate_session() as session:
+            updated = session.execute(
+                update(Job)
+                .where(Job.id == claimed.id, Job.status == "running", Job.lease_token == claimed.lease_token)
+                .values(
+                    status="waiting",
+                    payload_json=dict(payload),
+                    available_at=now + timedelta(seconds=max(0, delay_seconds)),
+                    lease_owner=None,
+                    lease_token=None,
+                    lease_expires_at=None,
+                    updated_at=now,
+                )
+            )
+            if updated.rowcount != 1:
+                return False
+            self._event(
+                session,
+                job_id=claimed.id,
+                event_type="progress_saved",
+                attempt=claimed.attempt,
+                from_status="running",
+                to_status="waiting",
+                actor_source="worker",
+                metadata={"next_source_day": payload.get("next_source_day"), "mode": payload.get("mode")},
                 occurred_at=now,
             )
             return True

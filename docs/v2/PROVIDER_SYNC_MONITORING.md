@@ -73,3 +73,21 @@ application safety cap (default 31 source days); larger history loading needs a
 future explicit bounded backfill path. A later caller may request a small
 overlap (including D-1) for correction reconciliation; unchanged facts are
 idempotent and changed facts create immutable revisions.
+
+## Production recovery modes
+
+`incremental` remains cursor-driven and capped at 31 days by default.
+`reconciliation` is an explicit provider-local D-1 refresh (or a separately
+bounded small recent window): it never moves the incremental cursor. Its
+missing/partial evidence never replaces an existing complete fact, while a
+changed complete value produces an immutable revision. `bounded_backfill`
+requires both dates, has a separate bounded overall window and chronological
+chunk cap, and records the next source day in its persisted job payload before
+the worker releases its lease. Rate limits and failures retain that progress for
+retry; there is no autonomous backfill scheduler.
+
+Canonical `production_coverage` is provider-neutral and makes no network call.
+It classifies each explicit source-timezone day from latest `ProductionFact`
+evidence as `complete`, `partial`, or `missing`; a numeric complete zero is
+complete. Backfill may extend the cursor only through a complete contiguous
+window, never through a policy conflict, missing day, or partial day.

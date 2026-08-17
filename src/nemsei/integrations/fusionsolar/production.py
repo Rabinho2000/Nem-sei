@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from itertools import islice
@@ -23,6 +23,7 @@ from nemsei.integrations.fusionsolar.client import FusionSolarClient, FusionSola
 from nemsei.integrations.fusionsolar.request_control import FusionSolarRequestController
 from nemsei.integrations.fusionsolar.service import credentials_for
 from nemsei.monitoring.service import record_production_fact
+from nemsei.monitoring.repository import CanonicalFactRepository
 from nemsei.providers.errors import ProviderError, ProviderErrorCode
 from nemsei.providers.models import AssetProviderMapping, ProviderConnection
 from nemsei.providers.registry import ProviderCapability, ProviderCode, normalize_external_id
@@ -65,6 +66,8 @@ class ProductionSyncResult:
     rejected: int
     cursor_advanced: bool
     error_code: str | None = None
+    mode: str = "incremental"
+    next_source_day: date | None = None
 
 
 def production_contract_for(connection: ProviderConnection) -> FusionSolarProductionContract:
@@ -135,6 +138,136 @@ class FusionSolarProductionService:
         end_date: date | None = None,
         reconciliation_days: int = 1,
     ) -> ProductionSyncResult:
+        """Compatibility name for the explicit incremental mode."""
+        return self.sync_incremental(
+            connection_id,
+            start_date=start_date,
+            end_date=end_date,
+            reconciliation_days=reconciliation_days,
+        )
+
+    def sync_incremental(
+        self,
+        connection_id: int,
+        *,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        reconciliation_days: int = 1,
+    ) -> ProductionSyncResult:
+        return self._sync_window(
+            connection_id,
+            start_date=start_date,
+            end_date=end_date,
+            reconciliation_days=reconciliation_days,
+            mode="incremental",
+            allow_cursor_advance=True,
+            max_source_days=self._settings.production_max_source_days,
+        )
+
+    def sync_reconciliation(
+        self,
+        connection_id: int,
+        *,
+        source_days: int = 1,
+        as_of: datetime | None = None,
+    ) -> ProductionSyncResult:
+        """Explicit provider-local D-1 (or small recent-window) refresh."""
+        return self._sync_window(
+            connection_id,
+            start_date=None,
+            end_date=None,
+            reconciliation_days=source_days,
+            mode="reconciliation",
+            allow_cursor_advance=False,
+            max_source_days=self._settings.production_reconciliation_max_source_days,
+            as_of=as_of,
+        )
+
+    def sync_bounded_backfill(
+        self,
+        connection_id: int,
+        *,
+        start_date: date | None,
+        end_date: date | None,
+        resume_from: date | None = None,
+    ) -> ProductionSyncResult:
+        """Process one chronological, resumable bounded-backfill chunk."""
+        if start_date is None or end_date is None:
+            return self._sync_window(
+                connection_id,
+                start_date=start_date,
+                end_date=end_date,
+                reconciliation_days=0,
+                mode="bounded_backfill",
+                allow_cursor_advance=True,
+                max_source_days=self._settings.production_backfill_chunk_days,
+                require_explicit_bounds=True,
+            )
+        if end_date < start_date:
+            return self._sync_window(
+                connection_id,
+                start_date=start_date,
+                end_date=end_date,
+                reconciliation_days=0,
+                mode="bounded_backfill",
+                allow_cursor_advance=True,
+                max_source_days=self._settings.production_backfill_chunk_days,
+                require_explicit_bounds=True,
+            )
+        if (end_date - start_date).days + 1 > self._settings.production_backfill_max_source_days:
+            return self._sync_window(
+                connection_id,
+                start_date=start_date,
+                end_date=end_date,
+                reconciliation_days=0,
+                mode="bounded_backfill",
+                allow_cursor_advance=True,
+                max_source_days=self._settings.production_backfill_chunk_days,
+                require_explicit_bounds=True,
+                force_window_error="Production backfill window exceeds the configured safety limit.",
+            )
+        chunk_start = resume_from or start_date
+        if chunk_start < start_date or chunk_start > end_date:
+            return self._sync_window(
+                connection_id,
+                start_date=start_date,
+                end_date=end_date,
+                reconciliation_days=0,
+                mode="bounded_backfill",
+                allow_cursor_advance=True,
+                max_source_days=self._settings.production_backfill_chunk_days,
+                require_explicit_bounds=True,
+                force_window_error="Production backfill resume point is outside its requested bounds.",
+            )
+        chunk_end = min(end_date, chunk_start + timedelta(days=self._settings.production_backfill_chunk_days - 1))
+        result = self._sync_window(
+            connection_id,
+            start_date=chunk_start,
+            end_date=chunk_end,
+            reconciliation_days=0,
+            mode="bounded_backfill",
+            allow_cursor_advance=True,
+            max_source_days=self._settings.production_backfill_chunk_days,
+            require_explicit_bounds=True,
+        )
+        if result.status == "success" and chunk_end < end_date:
+            return replace(result, next_source_day=chunk_end + timedelta(days=1))
+        return result
+
+    def _sync_window(
+        self,
+        connection_id: int,
+        *,
+        start_date: date | None,
+        end_date: date | None,
+        reconciliation_days: int,
+        mode: str,
+        allow_cursor_advance: bool,
+        max_source_days: int,
+        as_of: datetime | None = None,
+        require_explicit_bounds: bool = False,
+        force_window_error: str | None = None,
+    ) -> ProductionSyncResult:
         """Fetch a bounded daily window and advance only complete coverage.
 
         The cursor deliberately advances only when every requested source day
@@ -147,13 +280,13 @@ class FusionSolarProductionService:
         connection = self._connection(connection_id)
         if connection.provider_code != ProviderCode.FUSIONSOLAR.value:
             run = self._start_run(connection_id)
-            return self._finish(run.id, connection_id, start_date, end_date, 0, 0, 0, 0, ProviderError(ProviderErrorCode.CONFIGURATION, "Connection is not FusionSolar."))
+            return self._finish(run.id, connection_id, start_date, end_date, 0, 0, 0, 0, ProviderError(ProviderErrorCode.CONFIGURATION, "Connection is not FusionSolar."), mode=mode)
         if not connection.enabled or connection.configuration_status != "configured":
             run = self._start_run(connection_id)
-            return self._finish(run.id, connection_id, start_date, end_date, 0, 0, 0, 0, ProviderError(ProviderErrorCode.CONFIGURATION, "FusionSolar connection is not enabled and configured."))
+            return self._finish(run.id, connection_id, start_date, end_date, 0, 0, 0, 0, ProviderError(ProviderErrorCode.CONFIGURATION, "FusionSolar connection is not enabled and configured."), mode=mode)
         if not self._settings.capabilities.get("provider_reads", False):
             run = self._start_run(connection_id)
-            return self._finish(run.id, connection_id, start_date, end_date, 0, 0, 0, 0, ProviderError(ProviderErrorCode.NOT_SUPPORTED, "Provider reads are disabled by policy."), deferred=True)
+            return self._finish(run.id, connection_id, start_date, end_date, 0, 0, 0, 0, ProviderError(ProviderErrorCode.NOT_SUPPORTED, "Provider reads are disabled by policy."), deferred=True, mode=mode)
         try:
             contract = production_contract_for(connection)
             requested_from, requested_until = self._window(
@@ -162,22 +295,27 @@ class FusionSolarProductionService:
                 end_date=end_date,
                 reconciliation_days=reconciliation_days,
                 contract=contract,
+                mode=mode,
+                max_source_days=max_source_days,
+                as_of=as_of,
+                require_explicit_bounds=require_explicit_bounds,
+                force_window_error=force_window_error,
             )
         except (FusionSolarClientError, ValueError) as exc:
             error = exc.error if isinstance(exc, FusionSolarClientError) else ProviderError(ProviderErrorCode.CONFIGURATION, str(exc))
             run = self._start_run(connection_id)
-            return self._finish(run.id, connection_id, start_date, end_date, 0, 0, 0, 0, error)
+            return self._finish(run.id, connection_id, start_date, end_date, 0, 0, 0, 0, error, mode=mode)
         run = self._start_run(connection_id, requested_from, requested_until, contract)
         try:
             credentials = credentials_for(connection)
         except FusionSolarClientError as exc:
-            return self._finish(run.id, connection_id, requested_from, requested_until, 0, 0, 0, 0, exc.error)
+            return self._finish(run.id, connection_id, requested_from, requested_until, 0, 0, 0, 0, exc.error, mode=mode)
 
         selected_by_day, selection_findings = self._selected_mappings(connection_id, requested_from, requested_until)
         expected = sum(len(values) for values in selected_by_day.values())
         if expected == 0:
             error = ProviderError(ProviderErrorCode.CONFIGURATION, "No FusionSolar mapping is selected for production.")
-            return self._finish(run.id, connection_id, requested_from, requested_until, 0, 0, 0, selection_findings, error)
+            return self._finish(run.id, connection_id, requested_from, requested_until, 0, 0, 0, selection_findings, error, mode=mode)
 
         client = self._client_factory(credentials)
         _value, error = self._calls.call(
@@ -188,7 +326,7 @@ class FusionSolarProductionService:
             operation=client.authenticate,
         )
         if error:
-            return self._finish(run.id, connection_id, requested_from, requested_until, expected, 0, 0, selection_findings, error)
+            return self._finish(run.id, connection_id, requested_from, requested_until, expected, 0, 0, selection_findings, error, mode=mode)
 
         received = accepted = rejected = 0
         first_error: ProviderError | None = None
@@ -217,9 +355,10 @@ class FusionSolarProductionService:
             accepted,
             rejected + selection_findings,
             first_error,
-            advance=complete,
+            advance=complete and allow_cursor_advance,
             contract=contract,
             partial=incomplete,
+            mode=mode,
         )
 
     def _sync_day(
@@ -284,11 +423,20 @@ class FusionSolarProductionService:
         with self._sessions() as session:
             for normalized, sample in samples.items():
                 mapping = mappings[normalized]
+                source_key = f"fusionsolar-daily-pvyield:{normalized}:{source_day.isoformat()}"
+                existing = CanonicalFactRepository(session).latest_production_fact(
+                    provider_mapping_id=mapping.id,
+                    source_key=source_key,
+                )
+                # A partial reconciliation response is not a domain correction.
+                # Keep a previously complete canonical fact selected as latest.
+                if sample.value is None and existing and existing.value is not None and existing.quality == "complete" and existing.completeness == "complete":
+                    continue
                 record_production_fact(
                     session,
                     asset_id=mapping.asset_id,
                     provider_mapping_id=mapping.id,
-                    source_fact_key=f"fusionsolar-daily-pvyield:{normalized}:{source_day.isoformat()}",
+                    source_fact_key=source_key,
                     period_start=start,
                     period_end=end,
                     granularity="day",
@@ -332,8 +480,14 @@ class FusionSolarProductionService:
         end_date: date | None,
         reconciliation_days: int,
         contract: FusionSolarProductionContract,
+        mode: str,
+        max_source_days: int,
+        as_of: datetime | None,
+        require_explicit_bounds: bool,
+        force_window_error: str | None,
     ) -> tuple[date, date]:
-        default_end = datetime.now(contract.source_timezone).date() - timedelta(days=1)
+        if force_window_error:
+            raise ValueError(force_window_error)
         with self._sessions() as session:
             cursor = session.scalar(select(SyncCursor).where(
                 SyncCursor.provider_connection_id == connection_id,
@@ -341,6 +495,18 @@ class FusionSolarProductionService:
                 SyncCursor.cursor_key == _CURSOR_KEY,
             ))
             checkpoint = dict(cursor.checkpoint_json) if cursor else {}
+        if cursor is not None and checkpoint.get("source_timezone") != contract.source_timezone_name:
+            raise ValueError("Production cursor timezone differs from the configured verified timezone; operator reconciliation or reset is required.")
+        if mode == "reconciliation":
+            if not 1 <= reconciliation_days <= max_source_days:
+                raise ValueError("Production reconciliation window exceeds its configured safety limit.")
+            local_now = (as_of or datetime.now(contract.source_timezone)).astimezone(contract.source_timezone)
+            end_date = local_now.date() - timedelta(days=1)
+            start_date = end_date - timedelta(days=reconciliation_days - 1)
+            return start_date, end_date
+        if require_explicit_bounds and (start_date is None or end_date is None):
+            raise ValueError("Production bounded backfill requires explicit start and end dates.")
+        default_end = datetime.now(contract.source_timezone).date() - timedelta(days=1)
         if start_date is None:
             last_day = checkpoint.get("last_completed_day")
             if not isinstance(last_day, str):
@@ -352,11 +518,10 @@ class FusionSolarProductionService:
         end_date = end_date or default_end
         if end_date < start_date:
             raise ValueError("Production sync window is invalid.")
-        if (end_date - start_date).days + 1 > self._settings.production_max_source_days:
+        if mode == "bounded_backfill" and end_date > default_end:
+            raise ValueError("Production backfill cannot request an incomplete or future provider-local day.")
+        if (end_date - start_date).days + 1 > max_source_days:
             raise ValueError("Production sync window exceeds the configured normal-sync safety limit.")
-        source_timezone = checkpoint.get("source_timezone")
-        if cursor is not None and source_timezone != contract.source_timezone_name:
-            raise ValueError("Production cursor timezone differs from the configured verified timezone; operator reconciliation or reset is required.")
         return start_date, end_date
 
     def _connection(self, connection_id: int) -> ProviderConnection:
@@ -402,6 +567,7 @@ class FusionSolarProductionService:
         deferred: bool = False,
         contract: FusionSolarProductionContract | None = None,
         partial: bool = False,
+        mode: str = "incremental",
     ) -> ProductionSyncResult:
         if deferred:
             status, completeness = "deferred", "none"
@@ -427,6 +593,7 @@ class FusionSolarProductionService:
                 "source_period_start": start.isoformat() if start else None,
                 "source_period_end": end.isoformat() if end else None,
                 "source_period_timezone": contract.source_timezone_name if contract else None,
+                "production_mode": mode,
             }
             record_health(session, provider_connection_id=connection_id, partial=status == "partial", error=error, **_health_values(error))
             finish_sync_run(session, run=run, status=status, completeness=completeness, error=error)
@@ -450,7 +617,7 @@ class FusionSolarProductionService:
                     )
                     cursor_updated = True
             session.commit()
-        return ProductionSyncResult(connection_id, run_id, status, completeness, start, end, expected, received, accepted, rejected, cursor_updated, error.code.value if error else None)
+        return ProductionSyncResult(connection_id, run_id, status, completeness, start, end, expected, received, accepted, rejected, cursor_updated, error.code.value if error else None, mode)
 
 
 @dataclass(frozen=True)
