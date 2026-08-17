@@ -8,7 +8,8 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, func, select
 
-from nemsei.assets.models import Asset
+from nemsei.assets import v1_import as v1_import_module
+from nemsei.assets.models import Asset, AssetAlias
 from nemsei.assets.v1_import import import_v1_assets, open_v1_readonly
 from nemsei.db.session import build_session_factory
 from nemsei.providers.models import AssetProviderMapping, LegacyImportRecord, LegacyImportRun, ProviderConnection
@@ -20,7 +21,7 @@ def upgrade(settings, monkeypatch) -> None:
     command.upgrade(Config("alembic.ini"), "head")
 
 
-def build_v1_fixture(path: Path) -> None:
+def build_v1_fixture(path: Path, *, first_asset_country: str = "PT") -> None:
     connection = sqlite3.connect(path)
     try:
         connection.executescript(
@@ -39,6 +40,7 @@ def build_v1_fixture(path: Path) -> None:
             INSERT INTO integration_unresolved VALUES (1, 'FusionSolar', 'unknown-1', 'Unknown plant', 'unknown plant', NULL, 'pending');
             """
         )
+        connection.execute("UPDATE assets SET country = ? WHERE id = 1", (first_asset_country,))
         connection.commit()
     finally:
         connection.close()
@@ -74,6 +76,7 @@ def test_import_is_idempotent_and_preserves_changed_source(settings, monkeypatch
         assert asset is not None
         assert asset.timezone is None
         assert asset.timezone_source == "unknown"
+        assert asset.country_code == "PT"
         assert asset.review_status == "needs_review"
         assert session.scalar(select(func.count()).select_from(ProviderConnection)) == 1
         assert session.scalar(select(func.count()).select_from(AssetProviderMapping)) == 1
@@ -147,7 +150,7 @@ def test_source_fingerprint_prevents_cross_database_id_reuse_and_records_unresol
     with factory() as session:
         assert session.scalar(select(func.count()).select_from(Asset)) == 2
         assert session.scalar(select(func.count()).select_from(LegacyImportRun)) == 2
-        assert session.scalar(select(LegacyImportRun.importer_version).limit(1)) == "assets-v1-importer/2.0"
+        assert session.scalar(select(LegacyImportRun.importer_version).limit(1)) == "assets-v1-importer/2.1"
         unresolved = session.scalar(select(LegacyImportRecord).where(LegacyImportRecord.legacy_table == "integration_unresolved"))
         assert unresolved.evidence_json["external_id"] == "unknown-1"
 
@@ -164,3 +167,74 @@ def test_batched_import_commits_deterministic_small_units_and_reruns_safely(sett
         assert session.scalar(select(func.count()).select_from(Asset)) == 1
     assert first["counts"]["assets.created"] == 1
     assert second["counts"]["assets.reused"] == 3
+
+
+def test_invalid_legacy_country_is_reviewable_in_real_import(settings, monkeypatch, tmp_path: Path) -> None:
+    upgrade(settings, monkeypatch)
+    v1_db = tmp_path / "v1.db"
+    build_v1_fixture(v1_db, first_asset_country="Portugal")
+    factory = build_session_factory(create_engine(settings.database_url))
+    with factory() as session, session.begin():
+        manifest = import_v1_assets(session, v1_db)
+    assert manifest["counts"]["assets.created"] == 1
+    assert any(issue["legacy_id"] == "1" and "country value requires review" in issue["reason"] for issue in manifest["issues"])
+    with factory() as session:
+        asset = session.scalar(select(Asset).where(Asset.canonical_name == "Alpha Solar"))
+        assert asset is not None
+        assert asset.country_code is None
+        assert asset.review_status == "needs_review"
+        assert "country value requires review" in asset.review_note
+
+
+def test_invalid_legacy_country_dry_run_matches_review_classification(tmp_path: Path) -> None:
+    v1_db = tmp_path / "v1.db"
+    build_v1_fixture(v1_db, first_asset_country="Portugal")
+    manifest = import_v1_assets(None, v1_db, dry_run=True)
+    assert manifest["dry_run"] is True
+    assert manifest["counts"]["assets.created"] == 1
+    assert any(issue["legacy_id"] == "1" and "country value requires review" in issue["reason"] for issue in manifest["issues"])
+    connection = open_v1_readonly(v1_db)
+    assert connection.execute("SELECT country FROM assets WHERE id = 1").fetchone()[0] == "Portugal"
+    connection.close()
+
+
+def test_interrupted_batched_import_resumes_without_duplicates(settings, monkeypatch, tmp_path: Path) -> None:
+    upgrade(settings, monkeypatch)
+    v1_db = tmp_path / "v1.db"
+    build_v1_fixture(v1_db)
+    source = sqlite3.connect(v1_db)
+    source.execute("INSERT INTO assets VALUES (4, 'Bravo Solar', NULL, 'Porto', '5', NULL, 'PT', NULL, NULL, NULL)")
+    source.commit()
+    source.close()
+    factory = build_session_factory(create_engine(settings.database_url))
+    original_create_asset = v1_import_module.create_asset
+
+    def fail_on_remaining_asset(*args, **kwargs):
+        if kwargs.get("canonical_name") == "Bravo Solar":
+            raise RuntimeError("simulated interrupted import")
+        return original_create_asset(*args, **kwargs)
+
+    monkeypatch.setattr(v1_import_module, "create_asset", fail_on_remaining_asset)
+    with factory() as session:
+        with pytest.raises(RuntimeError, match="simulated interrupted import"):
+            import_v1_assets(session, v1_db, batch_size=1)
+
+    with factory() as session:
+        interrupted = session.scalar(select(LegacyImportRun).order_by(LegacyImportRun.id))
+        assert interrupted is not None
+        assert interrupted.finished_at is None
+        assert session.scalar(select(func.count()).select_from(Asset)) == 1
+
+    monkeypatch.setattr(v1_import_module, "create_asset", original_create_asset)
+    with factory() as session:
+        resumed = import_v1_assets(session, v1_db, batch_size=1)
+    assert resumed["counts"]["assets.created"] == 1
+    with factory() as session:
+        runs = session.scalars(select(LegacyImportRun).order_by(LegacyImportRun.id)).all()
+        assert len(runs) == 2
+        assert runs[0].finished_at is None
+        assert runs[1].finished_at is not None
+        assert session.scalar(select(func.count()).select_from(Asset)) == 2
+        assert session.scalar(select(func.count()).select_from(AssetAlias)) == 1
+        assert session.scalar(select(func.count()).select_from(AssetProviderMapping)) == 1
+        assert session.scalar(select(func.count()).select_from(LegacyImportRecord)) > 0

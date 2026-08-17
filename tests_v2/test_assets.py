@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 
 from nemsei.assets.repository import AssetRepository
-from nemsei.assets.service import add_alias, create_asset, create_organization, update_asset
+from nemsei.assets.service import add_alias, create_asset, create_organization, normalize_country_code, update_asset
 from nemsei.db import build_engine, build_session_factory
 from nemsei.providers.service import cross_connection_conflicts, create_connection, create_mapping, replace_mapping
 from tests_v2.test_migrations import upgrade
@@ -81,6 +81,37 @@ def test_manual_timezone_is_explicit_and_edit_marks_manual_source(settings, monk
     with session_for(settings, monkeypatch) as session:
         asset = create_asset(session, canonical_name="Central A", timezone="Europe/Lisbon")
         assert asset.timezone_source == "manual"
+
+
+def test_country_code_normalization_rejects_non_iso_values(settings, monkeypatch) -> None:
+    assert normalize_country_code("pt") == "PT"
+    assert normalize_country_code(" ES ") == "ES"
+    assert normalize_country_code(None) is None
+    assert normalize_country_code("   ") is None
+    for invalid in ("Portugal", "PRT", "P1"):
+        with pytest.raises(ValueError, match="two ASCII letters"):
+            normalize_country_code(invalid)
+
+    with session_for(settings, monkeypatch) as session:
+        asset = create_asset(session, canonical_name="Country Test", country_code="pt")
+        assert asset.country_code == "PT"
+        session.commit()
+        with pytest.raises(ValueError, match="two ASCII letters"):
+            create_asset(session, canonical_name="Invalid Country", country_code="Portugal")
+        with pytest.raises(ValueError, match="two ASCII letters"):
+            update_asset(
+                session,
+                asset_id=asset.id,
+                canonical_name=asset.canonical_name,
+                owner_id=None,
+                lifecycle_status="unknown",
+                country_code="PRT",
+                timezone="Europe/Lisbon",
+                installed_dc_power_kw=None,
+                locality=None,
+                address=None,
+                technical_notes=None,
+            )
         asset.timezone, asset.timezone_source = None, "unknown"
         update_asset(session, asset_id=asset.id, canonical_name=asset.canonical_name, owner_id=None, lifecycle_status="unknown", country_code=None, timezone="Europe/Lisbon", installed_dc_power_kw=None, locality=None, address=None, technical_notes=None)
         assert asset.timezone_source == "manual"

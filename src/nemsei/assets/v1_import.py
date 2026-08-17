@@ -20,7 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from nemsei.assets.models import Asset, AssetAlias, Organization
-from nemsei.assets.service import create_asset, create_organization, normalize_name, normalize_tax_id
+from nemsei.assets.service import create_asset, create_organization, normalize_country_code, normalize_name, normalize_tax_id
 from nemsei.config import Settings
 from nemsei.db.engine import build_engine
 from nemsei.db.session import build_session_factory
@@ -35,7 +35,7 @@ LEGACY_CONNECTIONS = {
     "fusionsolar": ("v1-fusionsolar-legacy", "V1 FusionSolar legacy mappings"),
     "sigenergy": ("v1-sigenergy-legacy", "V1 Sigenergy legacy mappings"),
 }
-IMPORTER_VERSION = "assets-v1-importer/2.0"
+IMPORTER_VERSION = "assets-v1-importer/2.1"
 IMPORT_BATCH_SIZE = 100
 
 
@@ -114,6 +114,14 @@ def optional_date(value: Any) -> date | None:
         return date.fromisoformat(str(value).strip()[:10])
     except ValueError:
         return None
+
+
+def legacy_country_code(value: Any) -> tuple[str | None, str | None]:
+    """Keep invalid legacy country evidence reviewable without aborting import."""
+    try:
+        return normalize_country_code(value), None
+    except ValueError:
+        return None, "legacy country value requires review"
 
 
 def prior_record(session: Session, source: str, table: str, legacy_id: int | str) -> LegacyImportRecord | None:
@@ -294,9 +302,6 @@ def import_v1_assets(session: Session | None, source_path: Path, *, dry_run: boo
                 add_record(session, run, manifest, table="assets", legacy_id=row["id"], source_hash=fingerprint, outcome="quarantined", reason="Duplicate normalized V1 asset name requires identity review.")
                 continue
             eligible_asset_ids.add(row["id"])
-            if dry_run:
-                add_record(None, None, manifest, table="assets", legacy_id=row["id"], source_hash=fingerprint, outcome="created")
-                continue
             power = optional_decimal(row["kwp"])
             review_reasons = []
             if power is None:
@@ -305,6 +310,13 @@ def import_v1_assets(session: Session | None, source_path: Path, *, dry_run: boo
                 review_reasons.append("location missing")
             if not row["timezone"]:
                 review_reasons.append("timezone missing")
+            country_code, country_reason = legacy_country_code(row["country"])
+            if country_reason:
+                review_reasons.append(country_reason)
+            review_note = "; ".join(review_reasons) or None
+            if dry_run:
+                add_record(None, None, manifest, table="assets", legacy_id=row["id"], source_hash=fingerprint, outcome="created", reason=review_note)
+                continue
             timezone = row["timezone"] or None
             timezone_source = "legacy_source" if row["timezone"] else "unknown"
             asset = create_asset(
@@ -312,7 +324,7 @@ def import_v1_assets(session: Session | None, source_path: Path, *, dry_run: boo
                 canonical_name=row["project_name"],
                 owner_id=organizations.get(row["customer_id"]).id if row["customer_id"] in organizations else None,
                 lifecycle_status="unknown",
-                country_code=row["country"],
+                country_code=country_code,
                 timezone=timezone,
                 timezone_source=timezone_source,
                 installed_dc_power_kw=power,
@@ -321,10 +333,10 @@ def import_v1_assets(session: Session | None, source_path: Path, *, dry_run: boo
                 locality=row["location"],
                 technical_notes=row["notes"],
                 review_status="needs_review" if review_reasons else "clear",
-                review_note="; ".join(review_reasons) or None,
+                review_note=review_note,
             )
             imported_assets[row["id"]] = asset
-            add_record(session, run, manifest, table="assets", legacy_id=row["id"], source_hash=fingerprint, outcome="created", asset=asset)
+            add_record(session, run, manifest, table="assets", legacy_id=row["id"], source_hash=fingerprint, outcome="created", reason=review_note, asset=asset)
 
         aliases = list(source_db.execute("SELECT id, asset_id, alias_name, normalized_alias, source, active FROM asset_aliases ORDER BY id"))
         for row in aliases:

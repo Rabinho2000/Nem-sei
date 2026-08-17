@@ -23,6 +23,18 @@ def normalize_tax_id(value: str | None) -> str | None:
     return normalized or None
 
 
+def normalize_country_code(value: str | None) -> str | None:
+    """Normalize a country code without guessing arbitrary legacy values."""
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if len(normalized) != 2 or not normalized.isascii() or not normalized.isalpha():
+        raise ValueError("Country code must be exactly two ASCII letters.")
+    return normalized.upper()
+
+
 def required_text(value: str, label: str) -> str:
     normalized = value.strip()
     if not normalized:
@@ -83,7 +95,7 @@ def create_asset(
         normalized_name=normalize_name(name),
         lifecycle_status=lifecycle_status,
         owner_id=owner_id,
-        country_code=country_code.strip().upper() if country_code else None,
+        country_code=normalize_country_code(country_code),
         timezone=required_text(timezone, "Timezone") if timezone else None,
         timezone_source=required_text(timezone_source, "Timezone source"),
         installed_dc_power_kw=installed_dc_power_kw,
@@ -113,9 +125,10 @@ def update_asset(session: Session, *, asset_id: int, canonical_name: str, owner_
     if installed_dc_power_kw is not None and installed_dc_power_kw < 0:
         raise ValueError("Installed power cannot be negative.")
     name = required_text(canonical_name, "Asset name")
+    normalized_country = normalize_country_code(country_code)
     asset.canonical_name, asset.normalized_name = name, normalize_name(name)
     asset.owner_id, asset.lifecycle_status = owner_id, lifecycle_status
-    asset.country_code, asset.timezone = (country_code.strip().upper() if country_code else None), required_text(timezone, "Timezone")
+    asset.country_code, asset.timezone = normalized_country, required_text(timezone, "Timezone")
     asset.timezone_source = "manual"
     asset.installed_dc_power_kw, asset.locality = installed_dc_power_kw, (locality.strip() if locality else None)
     asset.address, asset.technical_notes, asset.updated_at = (address.strip() if address else None), (technical_notes.strip() if technical_notes else None), utc_now()
