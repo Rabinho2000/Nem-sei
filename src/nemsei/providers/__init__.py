@@ -2,8 +2,11 @@
 
 from nemsei.providers.registry import (
     CapabilityAvailability,
+    CapabilityStatus,
+    ImplementationSupport,
     ProviderCapability,
     ProviderCode,
+    RuntimeAvailability,
     descriptor_for,
     evaluate_capability,
     normalize_external_id,
@@ -11,8 +14,11 @@ from nemsei.providers.registry import (
 
 __all__ = [
     "CapabilityAvailability",
+    "CapabilityStatus",
+    "ImplementationSupport",
     "ProviderCapability",
     "ProviderCode",
+    "RuntimeAvailability",
     "descriptor_for",
     "evaluate_capability",
     "normalize_external_id",

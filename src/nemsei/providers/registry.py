@@ -25,11 +25,27 @@ class ProviderCapability(StrEnum):
     PROVIDER_MUTATIONS = "provider_mutations"
 
 
-class CapabilityAvailability(StrEnum):
+class ImplementationSupport(StrEnum):
     SUPPORTED = "supported"
     UNSUPPORTED = "unsupported"
+
+
+class RuntimeAvailability(StrEnum):
+    AVAILABLE = "available"
     TEMPORARILY_UNAVAILABLE = "temporarily_unavailable"
     NOT_CONFIGURED = "not_configured"
+    UNKNOWN = "unknown"
+
+
+# Backward-compatible import name for the old foundation vocabulary. New code
+# uses the two separate enums above.
+CapabilityAvailability = RuntimeAvailability
+
+
+@dataclass(frozen=True)
+class CapabilityStatus:
+    implementation_support: ImplementationSupport
+    runtime_availability: RuntimeAvailability
 
 
 @dataclass(frozen=True)
@@ -37,7 +53,7 @@ class ProviderDescriptor:
     code: ProviderCode
     display_name: str
     identifier_normalizer: Callable[[str], str]
-    documented_capabilities: frozenset[ProviderCapability]
+    implemented_capabilities: frozenset[ProviderCapability]
 
 
 def _trim(value: str) -> str:
@@ -90,13 +106,23 @@ def evaluate_capability(
     *,
     connection_configured: bool,
     integration_temporarily_unavailable: bool = False,
-) -> CapabilityAvailability:
+    runtime_known: bool = True,
+) -> CapabilityStatus:
     descriptor = descriptor_for(provider)
     requested = ProviderCapability(capability)
+    support = (
+        ImplementationSupport.SUPPORTED
+        if requested in descriptor.implemented_capabilities
+        else ImplementationSupport.UNSUPPORTED
+    )
     if not connection_configured:
-        return CapabilityAvailability.NOT_CONFIGURED
-    if requested not in descriptor.documented_capabilities:
-        return CapabilityAvailability.UNSUPPORTED
-    if integration_temporarily_unavailable:
-        return CapabilityAvailability.TEMPORARILY_UNAVAILABLE
-    return CapabilityAvailability.SUPPORTED
+        availability = RuntimeAvailability.NOT_CONFIGURED
+    elif integration_temporarily_unavailable:
+        availability = RuntimeAvailability.TEMPORARILY_UNAVAILABLE
+    elif not runtime_known:
+        availability = RuntimeAvailability.UNKNOWN
+    elif support is ImplementationSupport.SUPPORTED:
+        availability = RuntimeAvailability.AVAILABLE
+    else:
+        availability = RuntimeAvailability.UNKNOWN
+    return CapabilityStatus(support, availability)

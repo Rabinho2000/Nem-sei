@@ -70,6 +70,8 @@ class AssetProviderMapping(Base):
     mapping_status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
     valid_from: Mapped[date] = mapped_column(Date, nullable=False)
     valid_to: Mapped[date | None] = mapped_column(Date)
+    # Read only for migration compatibility. New source selection belongs in
+    # temporal AssetSourcePolicy rows, not on the provider mapping itself.
     monitoring_priority: Mapped[int | None] = mapped_column(Integer)
     production_priority: Mapped[int | None] = mapped_column(Integer)
     replaced_by_mapping_id: Mapped[int | None] = mapped_column(ForeignKey("asset_provider_mappings.id", ondelete="SET NULL"))
