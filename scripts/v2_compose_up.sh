@@ -21,20 +21,13 @@ if [[ $mode != development && $v2_root != /opt/server/apps/Nem-sei-v2-data ]]; t
   exit 2
 fi
 if [[ ${NEMSEI_V2_WORKER_SCALE:-1} != 1 || ${NEMSEI_V2_WORKER_CONCURRENCY:-1} != 1 ]]; then
-  echo "SQLite V2 supports exactly one worker; scaling/concurrency must remain 1." >&2
+  echo "V2 deploys exactly one worker at this checkpoint; scaling is not yet enabled." >&2
   exit 2
 fi
 
 mkdir -p "$v2_root"
-v1_real=$(realpath -m "$v1_root")
+python3 "$root/scripts/verify_v2_runtime_isolation.py" --v1-data-root "$v1_root" --v2-data-root "$v2_root" --compose-file "$root/docker-compose.v2.yml"
 v2_real=$(realpath -m "$v2_root")
-database="$v2_real/nemsei_v2.db"
-
-PYTHONPATH="$root/src" python3 "$root/scripts/verify_v2_runtime_isolation.py" \
-  --v1-data-root "$v1_real" \
-  --v2-data-root "$v2_real" \
-  --database "$database" \
-  --compose-file "$root/docker-compose.v2.yml"
 
 compose=(docker compose --project-name nemsei-v2 --env-file "$env_file" -f "$root/docker-compose.v2.yml")
 rendered=$("${compose[@]}" config --format json)
@@ -45,12 +38,10 @@ import sys
 
 expected = os.path.realpath(sys.argv[1])
 config = json.loads(os.environ["RENDERED_COMPOSE"])
-for role in ("web", "scheduler", "worker", "migrate"):
-    mounts = config["services"][role].get("volumes", [])
-    matches = [mount for mount in mounts if mount.get("target") == "/data" and mount.get("type") == "bind"]
-    if len(matches) != 1 or os.path.realpath(matches[0]["source"]) != expected:
-        raise SystemExit(f"{role} does not bind the validated V2 root at /data")
+if config["services"]["postgres"].get("ports"):
+    raise SystemExit("PostgreSQL must not publish a host port")
 PY
 
+"${compose[@]}" up -d postgres
 "${compose[@]}" run --rm migrate
 "${compose[@]}" up -d web scheduler worker

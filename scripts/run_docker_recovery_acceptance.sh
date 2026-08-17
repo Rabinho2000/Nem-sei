@@ -12,28 +12,28 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$temp_root/v1-data" "$temp_root/v2-data"
-cat > "$env_file" <<EOF
-NEMSEI_V2_ENV=test
-NEMSEI_V2_ENV_FILE=$env_file
-NEMSEI_V2_HOST_DATA_ROOT=$temp_root/v2-data
-NEMSEI_V2_DATA_ROOT=/data
-NEMSEI_V2_DATABASE_URL=sqlite:////data/nemsei_v2.db
-NEMSEI_V2_SECRET_KEY=acceptance-secret
-NEMSEI_V2_ADMIN_USERNAME=admin
-NEMSEI_V2_ADMIN_PASSWORD_HASH=
-NEMSEI_V2_PROVIDER_READS=false
-NEMSEI_V2_PROVIDER_MUTATIONS=false
-NEMSEI_V2_NOTIFICATIONS=false
-NEMSEI_V2_REPORT_DISTRIBUTION=false
-NEMSEI_V2_TESTING=true
-NEMSEI_V2_WORKER_LEASE_SECONDS=3
-EOF
+mkdir -p "$temp_root/v1-data" "$temp_root/v2-data" "$temp_root/secrets"
+printf '%s' 'nemsei-acceptance' > "$temp_root/secrets/postgres_password"
+printf '%s' 'postgresql+psycopg://nemsei:nemsei-acceptance@postgres:5432/nemsei_v2' > "$temp_root/secrets/database_url"
+printf '%s\n' \
+  NEMSEI_V2_ENV=test \
+  NEMSEI_V2_ENV_FILE=$env_file \
+  NEMSEI_V2_HOST_DATA_ROOT=$temp_root/v2-data \
+  NEMSEI_V2_DATABASE_URL_SECRET_FILE=$temp_root/secrets/database_url \
+  NEMSEI_V2_POSTGRES_PASSWORD_SECRET_FILE=$temp_root/secrets/postgres_password \
+  NEMSEI_V2_SECRET_KEY=acceptance-secret \
+  NEMSEI_V2_ADMIN_USERNAME=admin \
+  NEMSEI_V2_ADMIN_PASSWORD_HASH= \
+  NEMSEI_V2_PROVIDER_READS=false \
+  NEMSEI_V2_PROVIDER_MUTATIONS=false \
+  NEMSEI_V2_NOTIFICATIONS=false \
+  NEMSEI_V2_REPORT_DISTRIBUTION=false \
+  NEMSEI_V2_TESTING=true \
+NEMSEI_V2_WORKER_LEASE_SECONDS=3 > "$env_file"
 
 PYTHONPATH="$root/src" python3 "$root/scripts/verify_v2_runtime_isolation.py" \
   --v1-data-root "$temp_root/v1-data" \
   --v2-data-root "$temp_root/v2-data" \
-  --database "$temp_root/v2-data/nemsei_v2.db" \
   --compose-file "$root/docker-compose.v2.yml"
 
 compose=(docker compose --project-name "$project" --profile acceptance --env-file "$env_file" -f "$root/docker-compose.v2.yml" -f "$root/docker-compose.v2.acceptance.yml")

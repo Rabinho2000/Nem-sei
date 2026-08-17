@@ -2,6 +2,7 @@
 .env
 .env.preview
 .env.*
+secrets/
 *.env
 SolarFusionAPI.txt
 

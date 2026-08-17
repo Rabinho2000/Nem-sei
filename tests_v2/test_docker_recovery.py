@@ -11,6 +11,8 @@ def test_docker_recovery_acceptance_uses_actual_worker_stop_restart() -> None:
     assert "('recovery', 'running', 'waiting')" in script
     assert "up -d worker" in script
     assert "--profile acceptance" in script
+    assert "sqlite:" not in script
+    assert "postgresql+psycopg://" in script
     dockerfile = (root / "Dockerfile.v2").read_text(encoding="utf-8")
     assert dockerfile.rfind("FROM runtime AS production") > dockerfile.index("FROM runtime AS acceptance")
     acceptance = (root / "docker-compose.v2.acceptance.yml").read_text(encoding="utf-8")

@@ -13,8 +13,6 @@ COPY src ./src
 COPY migrations ./migrations
 COPY alembic.ini ./alembic.ini
 
-RUN mkdir -p /data
-
 EXPOSE 5000
 
 CMD ["gunicorn", "-b", "0.0.0.0:5000", "nemsei.wsgi:app"]

@@ -1,48 +1,76 @@
 name: nemsei-v2
 
 x-v2-environment: &v2-environment
-  NEMSEI_V2_DATA_ROOT: /data
-  NEMSEI_V2_DATABASE_URL: sqlite:////data/nemsei_v2.db
-
-x-v2-volume: &v2-volume
-  - ${NEMSEI_V2_HOST_DATA_ROOT:-/opt/server/apps/Nem-sei-v2-data}:/data
+  NEMSEI_V2_DATABASE_URL_FILE: /run/secrets/v2_database_url
 
 services:
-  web:
-    build:
-      context: .
-      dockerfile: Dockerfile.v2
+  postgres:
+    image: postgres:16.11-bookworm@sha256:a2420e9555e2224583fe84d0bb3f0b967e69354ae3a0be55a9c14e251388c4eb
+    environment:
+      POSTGRES_DB: nemsei_v2
+      POSTGRES_USER: nemsei
+      POSTGRES_PASSWORD_FILE: /run/secrets/v2_postgres_password
+    volumes:
+      - nemsei-v2-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nemsei -d nemsei_v2"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    secrets:
+      - v2_postgres_password
+
+  migrate:
+    build: {context: ., dockerfile: Dockerfile.v2}
+    profiles: ["manual"]
     env_file: ${NEMSEI_V2_ENV_FILE:-.env.v2}
-    environment: *v2-environment
-    volumes: *v2-volume
-    ports:
-      - "127.0.0.1:5002:5000"
+    environment:
+      <<: *v2-environment
+      NEMSEI_V2_PROCESS_ROLE: migrate
+    secrets:
+      - v2_database_url
+    depends_on: {postgres: {condition: service_healthy}}
+    command: alembic upgrade head
+
+  web:
+    build: {context: ., dockerfile: Dockerfile.v2}
+    env_file: ${NEMSEI_V2_ENV_FILE:-.env.v2}
+    environment:
+      <<: *v2-environment
+      NEMSEI_V2_PROCESS_ROLE: web
+    secrets:
+      - v2_database_url
+    depends_on: {postgres: {condition: service_healthy}}
+    ports: ["127.0.0.1:${NEMSEI_V2_WEB_PORT:-5002}:5000"]
     command: gunicorn -w 1 --threads 2 -b 0.0.0.0:5000 nemsei.wsgi:app
 
   scheduler:
-    build:
-      context: .
-      dockerfile: Dockerfile.v2
+    build: {context: ., dockerfile: Dockerfile.v2}
     env_file: ${NEMSEI_V2_ENV_FILE:-.env.v2}
-    environment: *v2-environment
-    volumes: *v2-volume
+    environment:
+      <<: *v2-environment
+      NEMSEI_V2_PROCESS_ROLE: scheduler
+    secrets:
+      - v2_database_url
+    depends_on: {postgres: {condition: service_healthy}}
     command: python -m nemsei.jobs.scheduler
 
   worker:
-    build:
-      context: .
-      dockerfile: Dockerfile.v2
+    build: {context: ., dockerfile: Dockerfile.v2}
     env_file: ${NEMSEI_V2_ENV_FILE:-.env.v2}
-    environment: *v2-environment
-    volumes: *v2-volume
+    environment:
+      <<: *v2-environment
+      NEMSEI_V2_PROCESS_ROLE: worker
+    secrets:
+      - v2_database_url
+    depends_on: {postgres: {condition: service_healthy}}
     command: python -m nemsei.jobs.worker
 
-  migrate:
-    build:
-      context: .
-      dockerfile: Dockerfile.v2
-    profiles: ["manual"]
-    env_file: ${NEMSEI_V2_ENV_FILE:-.env.v2}
-    environment: *v2-environment
-    volumes: *v2-volume
-    command: alembic upgrade head
+volumes:
+  nemsei-v2-postgres-data:
+
+secrets:
+  v2_database_url:
+    file: ${NEMSEI_V2_DATABASE_URL_SECRET_FILE:?set NEMSEI_V2_DATABASE_URL_SECRET_FILE}
+  v2_postgres_password:
+    file: ${NEMSEI_V2_POSTGRES_PASSWORD_SECRET_FILE:?set NEMSEI_V2_POSTGRES_PASSWORD_SECRET_FILE}

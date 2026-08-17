@@ -11,6 +11,21 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PYTHONPATH: src
+      NEMSEI_V2_TEST_DATABASE_URL: postgresql+psycopg://nemsei:nemsei-test@127.0.0.1:5432/nemsei_v2_test
+    services:
+      postgres:
+        image: postgres:16.11-bookworm@sha256:a2420e9555e2224583fe84d0bb3f0b967e69354ae3a0be55a9c14e251388c4eb
+        env:
+          POSTGRES_DB: nemsei_v2_test
+          POSTGRES_USER: nemsei
+          POSTGRES_PASSWORD: nemsei-test
+        options: >-
+          --health-cmd "pg_isready -U nemsei -d nemsei_v2_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+        ports:
+          - 5432:5432
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -23,3 +38,4 @@ jobs:
       - run: python -m compileall src/nemsei
       - run: python -m pytest -q tests_v2
       - run: bash scripts/run_docker_recovery_acceptance.sh
+      - run: bash scripts/run_postgres_operations_acceptance.sh
