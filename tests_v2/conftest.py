@@ -15,6 +15,8 @@ from nemsei.config import Settings
 def settings() -> Settings:
     base = os.environ.get("NEMSEI_V2_TEST_DATABASE_URL", "postgresql+psycopg://nemsei:nemsei-test@127.0.0.1:55432/nemsei_v2_test")
     url = make_url(base)
+    if url.database != "nemsei_v2_test":
+        raise RuntimeError("NEMSEI_V2_TEST_DATABASE_URL must name the isolated nemsei_v2_test database.")
     name = f"nemsei_v2_test_{uuid.uuid4().hex}"
     admin = create_engine(url.set(database="postgres"), isolation_level="AUTOCOMMIT")
     with admin.connect() as connection:
