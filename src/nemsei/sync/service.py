@@ -25,6 +25,31 @@ def _detail(value: str | None) -> str | None:
     return value[:500] if value else None
 
 
+def health_values_for_error(error: ProviderError | None, *, operation: str) -> dict[str, str]:
+    """Map provider outcomes to neutral integration-health dimensions."""
+    operation_field = f"{operation}_state"
+    if error is None:
+        values = {"auth_state": "healthy", "access_state": "healthy", "provider_state": "healthy", "quota_state": "unknown"}
+        values[operation_field] = "healthy"
+        return values
+    if error.code is ProviderErrorCode.CONFIGURATION:
+        values = {"auth_state": "not_configured", "access_state": "not_configured", "provider_state": "not_configured", "quota_state": "unknown"}
+        values[operation_field] = "not_configured"
+        return values
+    values = {"auth_state": "unknown", "access_state": "unknown", "provider_state": "unknown", "quota_state": "unknown"}
+    if error.code is ProviderErrorCode.AUTHENTICATION:
+        values["auth_state"] = "degraded"
+    elif error.code is ProviderErrorCode.AUTHORIZATION:
+        values["access_state"] = "degraded"
+    elif error.code is ProviderErrorCode.RATE_LIMITED:
+        values["provider_state"] = "healthy"
+        values["quota_state"] = "degraded"
+    elif error.code in {ProviderErrorCode.UNAVAILABLE, ProviderErrorCode.TIMEOUT, ProviderErrorCode.TRANSPORT}:
+        values["provider_state"] = "unavailable"
+    values[operation_field] = "degraded"
+    return values
+
+
 def health_for(session: Session, provider_connection_id: int) -> IntegrationHealth:
     health = SyncRepository(session).health(provider_connection_id)
     if health is None:

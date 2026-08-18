@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date
+from datetime import UTC, date, datetime
 
 import pytest
 from sqlalchemy import func, select
@@ -13,12 +13,13 @@ from nemsei.integrations.sigenergy.discovery import SigenergyDiscoveryService, p
 from nemsei.integrations.sigenergy.monitoring import SigenergyMonitoringService, normalize_status
 from nemsei.integrations.sigenergy.request_control import SigenergyRequestController
 from nemsei.monitoring.models import MonitoringCurrentState, MonitoringObservation
+from nemsei.providers.errors import ProviderError, ProviderErrorCode
 from nemsei.providers.models import AssetProviderMapping
 from nemsei.providers.registry import ImplementationSupport, ProviderCapability, ProviderCode, RuntimeAvailability, evaluate_capability
 from nemsei.providers.service import create_connection, create_mapping
-from nemsei.sources.service import create_source_policy
+from nemsei.sources.service import create_source_policy, source_policy_date_for_asset
 from nemsei.sync.models import IntegrationHealth, ProviderRequestAttempt, ProviderRequestState, SyncRun
-from nemsei.sync.service import start_sync_run
+from nemsei.sync.service import health_values_for_error, start_sync_run
 from tests_v2.test_migrations import upgrade
 
 
@@ -176,6 +177,107 @@ def test_unknown_or_missing_status_never_fabricates_offline(settings, monkeypatc
         assert session.scalar(select(func.count()).select_from(MonitoringObservation).where(MonitoringObservation.condition == "offline")) == 0
 
 
+def test_monitoring_continues_after_one_mapping_failure_and_records_partial_metadata(settings, monkeypatch):
+    configured_environment(monkeypatch)
+    factory = factory_for(settings, monkeypatch)
+    connection_id, mappings = selected_connection(factory, count=3)
+    transport = FakeTransport([
+        auth_ok(),
+        response({"code": 0, "data": {"systemId": "SIG-001", "systemStatus": "running"}}),
+        response({}, status=503),
+        response({"code": 0, "data": {"systemId": "SIG-003", "systemStatus": "fault"}}),
+    ])
+    result = monitoring_service(factory, settings, transport).sync_current_monitoring(connection_id)
+    assert result.status == "partial" and result.accepted == 2 and result.error_code == "unavailable"
+    assert len(transport.calls) == 4
+    with factory() as session:
+        observations = list(session.scalars(select(MonitoringObservation).order_by(MonitoringObservation.provider_mapping_id)))
+        assert [item.provider_mapping_id for item in observations] == [mappings[0].id, mappings[2].id]
+        run = session.get(SyncRun, result.sync_run_id)
+        assert run is not None and run.metadata_json == {
+            "actual_provider_calls": 4,
+            "expected_items": 3,
+            "attempted_items": 3,
+            "items_received": 2,
+            "items_accepted": 2,
+            "items_rejected": 0,
+            "items_failed": 1,
+            "items_skipped": 0,
+            "source_policy_findings": 0,
+        }
+
+
+def test_rate_limited_mapping_stops_remaining_mapping_attempts(settings, monkeypatch):
+    configured_environment(monkeypatch)
+    factory = factory_for(settings, monkeypatch)
+    connection_id, mappings = selected_connection(factory, count=3)
+    transport = FakeTransport([
+        auth_ok(),
+        response({"code": 0, "data": {"systemId": "SIG-001", "systemStatus": "running"}}),
+        response({}, status=429, headers={"Retry-After": "60"}),
+    ])
+    result = monitoring_service(factory, settings, transport).sync_current_monitoring(connection_id)
+    assert result.status == "partial" and result.accepted == 1 and result.error_code == "rate_limited"
+    with factory() as session:
+        states = [session.get(MonitoringCurrentState, mapping.id) for mapping in mappings]
+        assert states[0] is not None and states[0].last_attempt_at is not None
+        assert states[1] is not None and states[1].last_attempt_at is not None
+        assert states[2] is None
+        run = session.get(SyncRun, result.sync_run_id)
+        assert run is not None
+        assert run.metadata_json["attempted_items"] == 2
+        assert run.metadata_json["items_failed"] == 1
+        assert run.metadata_json["items_skipped"] == 1
+
+
+def test_all_mapping_failures_finish_failed_without_observations(settings, monkeypatch):
+    configured_environment(monkeypatch)
+    factory = factory_for(settings, monkeypatch)
+    connection_id, _mappings = selected_connection(factory, count=3)
+    transport = FakeTransport([auth_ok(), response({}, status=503), response({}, status=503), response({}, status=503)])
+    result = monitoring_service(factory, settings, transport).sync_current_monitoring(connection_id)
+    assert result.status == "failed" and result.accepted == 0
+    with factory() as session:
+        assert session.scalar(select(func.count()).select_from(MonitoringObservation)) == 0
+        run = session.get(SyncRun, result.sync_run_id)
+        assert run is not None and run.status == "failed" and run.metadata_json["items_failed"] == 3
+
+
+def test_invalid_response_is_unknown_health_and_never_offline(settings, monkeypatch):
+    configured_environment(monkeypatch)
+    factory = factory_for(settings, monkeypatch)
+    connection_id, _mappings = selected_connection(factory)
+    result = monitoring_service(factory, settings, FakeTransport([auth_ok(), response({"code": 0, "data": []})])).sync_current_monitoring(connection_id)
+    assert result.status == "failed" and result.error_code == "invalid_response"
+    with factory() as session:
+        assert session.scalar(select(func.count()).select_from(MonitoringObservation)) == 0
+        health = session.get(IntegrationHealth, connection_id)
+        assert health is not None and health.provider_state == "unknown" and health.sync_state == "degraded"
+
+
+def test_sigenergy_discovery_accepts_only_verified_system_identity_fields():
+    with pytest.raises(ValueError):
+        plant_from_payload(1, {"id": "alternate-1", "name": "Unverified"})
+    with pytest.raises(ValueError):
+        plant_from_payload(1, {"stationId": "alternate-2", "stationName": "Unverified"})
+    plant = plant_from_payload(1, {"systemId": "verified-1", "systemName": "Verified"})
+    assert plant.external_id == "verified-1" and plant.external_name == "Verified"
+
+
+def test_source_policy_date_uses_each_asset_timezone_and_rejects_unknown_timezone(settings, monkeypatch):
+    factory = factory_for(settings, monkeypatch)
+    with factory() as session:
+        portugal = create_asset(session, canonical_name="Portugal calendar", timezone="Europe/Lisbon")
+        tokyo = create_asset(session, canonical_name="Tokyo calendar", timezone="Asia/Tokyo")
+        unknown = create_asset(session, canonical_name="Unknown calendar", timezone=None)
+        session.commit()
+        instant = datetime(2026, 1, 1, 23, 30, tzinfo=UTC)
+        assert source_policy_date_for_asset(session, asset_id=portugal.id, at=instant) == date(2026, 1, 1)
+        assert source_policy_date_for_asset(session, asset_id=tokyo.id, at=instant) == date(2026, 1, 2)
+        with pytest.raises(ValueError, match="timezone"):
+            source_policy_date_for_asset(session, asset_id=unknown.id, at=instant)
+
+
 def test_provider_failure_updates_audit_without_creating_observation(settings, monkeypatch):
     configured_environment(monkeypatch)
     factory = factory_for(settings, monkeypatch)
@@ -244,6 +346,22 @@ def test_unexpected_operation_failure_finalizes_sigenergy_attempt_without_secret
 )
 def test_sigenergy_status_normalization_is_explicit(raw, expected):
     assert normalize_status(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        (ProviderErrorCode.AUTHENTICATION, {"auth_state": "degraded", "provider_state": "unknown"}),
+        (ProviderErrorCode.AUTHORIZATION, {"access_state": "degraded", "provider_state": "unknown"}),
+        (ProviderErrorCode.RATE_LIMITED, {"provider_state": "healthy", "quota_state": "degraded"}),
+        (ProviderErrorCode.INVALID_RESPONSE, {"provider_state": "unknown", "sync_state": "degraded"}),
+        (ProviderErrorCode.UNAVAILABLE, {"provider_state": "unavailable", "sync_state": "degraded"}),
+        (ProviderErrorCode.CONFIGURATION, {"auth_state": "not_configured", "provider_state": "not_configured", "sync_state": "not_configured"}),
+    ],
+)
+def test_provider_health_semantics_do_not_turn_provider_errors_into_offline(code, expected):
+    values = health_values_for_error(ProviderError(code, "fixture"), operation="sync")
+    assert all(values[key] == value for key, value in expected.items())
 
 
 def test_discovery_identifier_requires_stable_system_id():

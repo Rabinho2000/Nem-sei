@@ -31,7 +31,7 @@ from nemsei.providers.registry import ProviderCapability, ProviderCode
 from nemsei.providers.repository import ProviderRepository
 from nemsei.shared.clock import utc_now
 from nemsei.sync.models import ProviderRequestAttempt, SyncRun
-from nemsei.sync.service import finish_sync_run, record_health, start_sync_run
+from nemsei.sync.service import finish_sync_run, health_values_for_error, record_health, start_sync_run
 
 
 _REFERENCE = re.compile(r"^[A-Za-z0-9_]{1,80}$")
@@ -224,7 +224,7 @@ class FusionSolarDiscoveryService:
             run = session.get(SyncRun, run_id)
             assert run is not None
             run.metadata_json = {"actual_provider_calls": _calls(session, run_id), "items_received": received, "items_accepted": len(plants), "items_rejected": rejected, "duplicate_ids": len(duplicates), "pages_completed": pages}
-            health_values = _health_values(error, status)
+            health_values = health_values_for_error(error, operation="discovery")
             record_health(session, provider_connection_id=connection_id, partial=status == "partial", error=error, **health_values)
             finish_sync_run(session, run=run, status=status, completeness=effective_completeness, error=error)
             session.commit()
@@ -252,18 +252,6 @@ def credentials_for(connection: ProviderConnection) -> FusionSolarCredentials:
 
 def _calls(session: Session, run_id: int) -> int:
     return int(session.scalar(select(func.count()).select_from(ProviderRequestAttempt).where(ProviderRequestAttempt.sync_run_id == run_id, ProviderRequestAttempt.status.in_(("succeeded", "failed", "rate_limited")))) or 0)
-
-
-def _health_values(error: ProviderError | None, status: str) -> dict[str, str]:
-    if error is None:
-        return {"auth_state": "healthy", "access_state": "healthy", "provider_state": "healthy", "discovery_state": "healthy", "quota_state": "unknown"}
-    if error.code is ProviderErrorCode.AUTHENTICATION:
-        return {"auth_state": "degraded", "access_state": "unknown", "provider_state": "healthy", "discovery_state": "degraded"}
-    if error.code is ProviderErrorCode.AUTHORIZATION:
-        return {"auth_state": "healthy", "access_state": "degraded", "provider_state": "healthy", "discovery_state": "degraded"}
-    if error.code is ProviderErrorCode.RATE_LIMITED:
-        return {"provider_state": "healthy", "discovery_state": "degraded", "quota_state": "degraded"}
-    return {"provider_state": "unavailable", "discovery_state": "degraded"}
 
 
 def _validation_error(error_code: str | None, status: str) -> MappingValidationStatus:

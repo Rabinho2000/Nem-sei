@@ -29,7 +29,7 @@ from nemsei.providers.registry import ProviderCapability, ProviderCode, normaliz
 from nemsei.providers.repository import ProviderRepository
 from nemsei.sources.service import resolve_source_policy
 from nemsei.sync.models import ProviderRequestAttempt, SyncCursor, SyncRun
-from nemsei.sync.service import advance_cursor, finish_sync_run, record_health, start_sync_run
+from nemsei.sync.service import advance_cursor, finish_sync_run, health_values_for_error, record_health, start_sync_run
 
 
 _CURSOR_KEY = "fusionsolar-daily-production"
@@ -586,7 +586,7 @@ class FusionSolarProductionService:
                 "source_period_timezone": contract.source_timezone_name if contract else None,
                 "production_mode": mode,
             }
-            record_health(session, provider_connection_id=connection_id, partial=status == "partial", error=error, **_health_values(error))
+            record_health(session, provider_connection_id=connection_id, partial=status == "partial", error=error, **health_values_for_error(error, operation="sync"))
             finish_sync_run(session, run=run, status=status, completeness=completeness, error=error)
             cursor_updated = False
             if advance:
@@ -670,17 +670,3 @@ def _calls(session: Session, run_id: int) -> int:
             ProviderRequestAttempt.status.in_(("succeeded", "failed", "rate_limited")),
         )
     ) or 0)
-
-
-def _health_values(error: ProviderError | None) -> dict[str, str]:
-    if error is None:
-        return {"auth_state": "healthy", "access_state": "healthy", "provider_state": "healthy", "quota_state": "unknown"}
-    if error.code is ProviderErrorCode.AUTHENTICATION:
-        return {"auth_state": "degraded", "access_state": "unknown", "provider_state": "healthy"}
-    if error.code is ProviderErrorCode.AUTHORIZATION:
-        return {"auth_state": "healthy", "access_state": "degraded", "provider_state": "healthy"}
-    if error.code is ProviderErrorCode.RATE_LIMITED:
-        return {"provider_state": "healthy", "quota_state": "degraded"}
-    if error.code is ProviderErrorCode.CONFIGURATION:
-        return {"provider_state": "not_configured"}
-    return {"provider_state": "unavailable"}

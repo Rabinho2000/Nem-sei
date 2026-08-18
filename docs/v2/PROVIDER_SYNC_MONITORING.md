@@ -92,9 +92,25 @@ discovery. The V1-evidenced `normal`, `online`, `running`, `fault`, `error`,
 `abnormal`, `offline`, and `disconnected` words are normalized conservatively;
 an unrecognized or absent status remains `unknown`. The endpoint has no verified
 provider observation timestamp, so freshness remains `unknown` and receipt
-time is recorded as ingestion evidence. Provider/API failure updates SyncRun,
-request-attempt, and IntegrationHealth records but never writes an offline
-observation.
+time is recorded as ingestion evidence. Each mapping is reserved and marked as
+attempted immediately before its provider call. A failed mapping does not abort
+the remaining mappings; a rate-limit deferral may stop the remainder and marks
+those mappings skipped. Sync metadata records `expected_items`,
+`attempted_items`, `items_received`, `items_accepted`, `items_rejected`,
+`items_failed`, `items_skipped`, and `actual_provider_calls`.
+
+Sigenergy discovery establishes identity only from the verified `systemId` and
+`systemName` fields. Alternate fields such as `id`, `stationId`, or `plantId`
+are not silently promoted to canonical identity. Provider/API failure updates
+SyncRun, request-attempt, and IntegrationHealth records but never writes an
+offline observation. Authentication, authorization, rate limiting, invalid
+responses, and transport failures affect their corresponding health dimensions;
+none of them means that a plant is offline.
+
+Date-only source policies are resolved in each asset's explicit IANA timezone
+from the current UTC instant. An asset with no valid timezone is a source-policy
+finding and is not queried; the provider adapter does not assume Lisbon or
+another global timezone.
 
 Sigenergy daily production is deliberately not implemented. Although legacy
 fixtures contain kWh-named fields, source-day/timezone semantics, correction

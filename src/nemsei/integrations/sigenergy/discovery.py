@@ -18,7 +18,7 @@ from nemsei.providers.registry import ProviderCapability, ProviderCode, normaliz
 from nemsei.providers.repository import ProviderRepository
 from nemsei.shared.clock import utc_now
 from nemsei.sync.models import ProviderRequestAttempt, SyncRun
-from nemsei.sync.service import finish_sync_run, record_health, start_sync_run
+from nemsei.sync.service import finish_sync_run, health_values_for_error, record_health, start_sync_run
 
 
 @dataclass(frozen=True)
@@ -168,10 +168,7 @@ class SigenergyDiscoveryService:
             run = session.get(SyncRun, run_id)
             assert run is not None
             run.metadata_json = {"actual_provider_calls": int(session.scalar(select(func.count()).select_from(ProviderRequestAttempt).where(ProviderRequestAttempt.sync_run_id == run_id, ProviderRequestAttempt.status.in_(("succeeded", "failed", "rate_limited")))) or 0), **(metadata or {})}
-            if error and error.code is ProviderErrorCode.CONFIGURATION:
-                health_values = {"auth_state": "not_configured", "access_state": "not_configured", "provider_state": "not_configured", "discovery_state": "not_configured", "quota_state": "unknown"}
-            else:
-                health_values = {"auth_state": "healthy" if error is None else ("degraded" if error.code in {ProviderErrorCode.AUTHENTICATION, ProviderErrorCode.AUTHORIZATION} else "unknown"), "access_state": "healthy" if error is None else "unknown", "provider_state": "healthy" if error is None or error.code is ProviderErrorCode.RATE_LIMITED else "unavailable", "discovery_state": "healthy" if error is None else "degraded", "quota_state": "degraded" if error and error.code is ProviderErrorCode.RATE_LIMITED else "unknown"}
+            health_values = health_values_for_error(error, operation="discovery")
             record_health(session, provider_connection_id=connection_id, error=error, partial=status == "partial", **health_values)
             finish_sync_run(session, run=run, status=status, completeness=completeness, error=error)
             session.commit()
@@ -179,10 +176,10 @@ class SigenergyDiscoveryService:
 
 
 def plant_from_payload(connection_id: int, row: dict[str, Any]) -> SigenergyPlant:
-    external_id = str(row.get("systemId") or row.get("id") or row.get("stationId") or row.get("plantId") or "").strip()
+    external_id = str(row.get("systemId") or "").strip()
     if not external_id or len(external_id) > 255:
         raise ValueError("Sigenergy discovery row has no stable system identifier.")
-    external_name = str(row.get("systemName") or row.get("name") or row.get("stationName") or row.get("plantName") or "").strip() or None
+    external_name = str(row.get("systemName") or "").strip() or None
     raw_status = row.get("status") or row.get("systemStatus") or row.get("runningStatus") or row.get("state")
     metadata = {}
     for key in ("pvCapacity", "batteryCapacity"):

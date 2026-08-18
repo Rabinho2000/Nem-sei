@@ -1,12 +1,14 @@
 """Validation and deterministic resolution of temporal source policies."""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy.orm import Session
 
+from nemsei.assets.models import Asset
 from nemsei.providers.models import AssetProviderMapping
-from nemsei.shared.clock import utc_now
+from nemsei.shared.clock import as_utc, utc_now
 from nemsei.sources.models import SOURCE_USES, AssetSourcePolicy
 from nemsei.sources.repository import SourcePolicyRepository
 
@@ -55,3 +57,15 @@ def resolve_source_policy(session: Session, *, asset_id: int, source_use: str, o
     if len(competing) != 1:
         raise ValueError("Competing primary source policies require reconciliation")
     return competing[0]
+
+
+def source_policy_date_for_asset(session: Session, *, asset_id: int, at: datetime | None = None) -> date:
+    """Resolve a date-only source policy in the asset's explicit local calendar."""
+    asset = session.get(Asset, asset_id)
+    if asset is None or not asset.timezone:
+        raise ValueError("Asset timezone is required to resolve a source policy.")
+    try:
+        timezone = ZoneInfo(asset.timezone)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError("Asset timezone is invalid.") from exc
+    return as_utc(at or utc_now()).astimezone(timezone).date()

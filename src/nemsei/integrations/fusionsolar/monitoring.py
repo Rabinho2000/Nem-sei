@@ -8,9 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
 from itertools import islice
-from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -25,12 +23,9 @@ from nemsei.providers.models import AssetProviderMapping, ProviderConnection
 from nemsei.providers.registry import ProviderCapability, ProviderCode, normalize_external_id
 from nemsei.providers.repository import ProviderRepository
 from nemsei.shared.clock import utc_now
-from nemsei.sources.service import resolve_source_policy
+from nemsei.sources.service import resolve_source_policy, source_policy_date_for_asset
 from nemsei.sync.models import ProviderRequestAttempt, SyncRun
-from nemsei.sync.service import finish_sync_run, record_health, start_sync_run
-
-
-LISBON = ZoneInfo("Europe/Lisbon")
+from nemsei.sync.service import finish_sync_run, health_values_for_error, record_health, start_sync_run
 
 
 @dataclass(frozen=True)
@@ -122,10 +117,12 @@ class FusionSolarMonitoringService:
 
         by_external_id = {mapping.normalized_external_id: mapping for mapping in selected}
         received = accepted = rejected = 0
+        attempted = failed = skipped = 0
         first_error: ProviderError | None = None
         evaluated: set[str] = set()
         for batch in _batches(selected, 100):
             codes = [mapping.external_id for mapping in batch]
+            attempted += len(batch)
             self._record_attempts(batch)
             rows, error = self._calls.call(
                 connection_id=connection_id,
@@ -136,6 +133,8 @@ class FusionSolarMonitoringService:
             )
             if error:
                 first_error = error
+                failed += len(batch)
+                skipped += len(selected) - attempted
                 break
             assert rows is not None
             batch_samples: dict[str, CurrentMonitoringSample] = {}
@@ -165,6 +164,9 @@ class FusionSolarMonitoringService:
             selection_findings=selection_findings,
             error=first_error,
             evaluated=len(evaluated),
+            attempted=attempted,
+            failed=failed,
+            skipped=skipped,
         )
 
     def _selected_mappings(self, connection_id: int) -> tuple[ProviderConnection, list[AssetProviderMapping], int]:
@@ -176,9 +178,10 @@ class FusionSolarMonitoringService:
             candidates = [mapping for mapping in repository.current_mappings_for_connection(connection_id) if mapping.mapping_status == "active"]
             selected: list[AssetProviderMapping] = []
             findings = 0
-            on_date = datetime.now(LISBON).date()
+            selection_at = utc_now()
             for mapping in candidates:
                 try:
+                    on_date = source_policy_date_for_asset(session, asset_id=mapping.asset_id, at=selection_at)
                     policy = resolve_source_policy(session, asset_id=mapping.asset_id, source_use="monitoring", on_date=on_date)
                 except ValueError:
                     findings += 1
@@ -246,7 +249,12 @@ class FusionSolarMonitoringService:
         error: ProviderError | None,
         evaluated: int = 0,
         deferred: bool = False,
+        attempted: int = 0,
+        failed: int = 0,
+        skipped: int = 0,
     ) -> MonitoringSyncResult:
+        if deferred or (error is not None and attempted == 0 and expected > 0):
+            skipped = expected
         if deferred:
             status, completeness = "deferred", "none"
         elif error and accepted:
@@ -265,12 +273,15 @@ class FusionSolarMonitoringService:
             run.metadata_json = {
                 "actual_provider_calls": _calls(session, run_id),
                 "expected_items": expected,
+                "attempted_items": attempted,
                 "items_received": received,
                 "items_accepted": accepted,
                 "items_rejected": rejected,
+                "items_failed": failed,
+                "items_skipped": skipped,
                 "source_policy_findings": selection_findings,
             }
-            health = _health_values(error)
+            health = health_values_for_error(error, operation="sync")
             record_health(
                 session,
                 provider_connection_id=connection_id,
@@ -301,20 +312,3 @@ def _calls(session: Session, run_id: int) -> int:
         )
         or 0
     )
-
-
-def _health_values(error: ProviderError | None) -> dict[str, str]:
-    if error is None:
-        return {
-            "auth_state": "healthy",
-            "access_state": "healthy",
-            "provider_state": "healthy",
-            "quota_state": "unknown",
-        }
-    if error.code is ProviderErrorCode.AUTHENTICATION:
-        return {"auth_state": "degraded", "access_state": "unknown", "provider_state": "healthy"}
-    if error.code is ProviderErrorCode.AUTHORIZATION:
-        return {"auth_state": "healthy", "access_state": "degraded", "provider_state": "healthy"}
-    if error.code is ProviderErrorCode.RATE_LIMITED:
-        return {"provider_state": "healthy", "quota_state": "degraded"}
-    return {"provider_state": "unavailable"}
