@@ -13,7 +13,9 @@ from nemsei.web.asset_routes import assets_bp
 from nemsei.web.db_session import close_request_session
 from nemsei.web.health_routes import health_bp
 from nemsei.web.home_routes import home_bp
+from nemsei.web.mapping_routes import mapping_bp
 from nemsei.web.reconciliation_routes import reconciliation_bp
+from nemsei.web.source_routes import source_bp
 
 
 def create_app(
@@ -41,4 +43,6 @@ def create_app(
     app.register_blueprint(health_bp)
     app.register_blueprint(home_bp)
     app.register_blueprint(reconciliation_bp)
+    app.register_blueprint(mapping_bp)
+    app.register_blueprint(source_bp)
     return app

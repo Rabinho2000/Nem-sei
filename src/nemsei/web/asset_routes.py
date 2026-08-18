@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
 
-from flask import Blueprint, abort, flash, redirect, render_template, request, url_for
+from flask import Blueprint, abort, flash, redirect, render_template, request, session as browser_session, url_for, current_app
 
 from nemsei.assets.repository import AssetRepository
 from nemsei.assets.service import add_alias, create_asset, create_organization, update_asset
 from nemsei.providers.repository import ProviderRepository
-from nemsei.providers.service import create_connection, create_mapping
+from nemsei.providers.service import configure_connection, create_connection, create_mapping, set_connection_enabled
 from nemsei.web.csrf import require_valid_token, token
 from nemsei.web.db_session import get_request_session
 from nemsei.web.home_routes import require_authenticated
@@ -157,7 +157,60 @@ def provider_connections() -> str:
         return redirect(url_for("assets.provider_connections"))
     return render_template(
         "assets/connections.html",
-        connections=provider_connections_data(session),
+        connections=provider_connections_data(session, settings=current_app.extensions["nemsei.settings"]),
         csrf_token=token(),
         title="Ligações",
     )
+
+
+@assets_bp.post("/provider-connections/<int:connection_id>/configure")
+@require_authenticated
+def configure_provider_connection(connection_id: int):
+    require_valid_token()
+    session = get_request_session()
+    try:
+        configure_connection(
+            session,
+            connection_id=connection_id,
+            display_name=request.form.get("display_name"),
+            account_reference=request.form.get("account_reference"),
+            region=request.form.get("region"),
+            credential_reference=request.form.get("credential_reference") or None,
+            actor_username=browser_session.get("username", "web"),
+        )
+        session.commit()
+        flash("Configuração guardada. A ligação continua desativada até ativação explícita.", "success")
+    except ValueError as exc:
+        session.rollback()
+        flash(str(exc), "error")
+    return redirect(url_for("assets.provider_connections"))
+
+
+@assets_bp.post("/provider-connections/<int:connection_id>/enable")
+@require_authenticated
+def enable_provider_connection(connection_id: int):
+    require_valid_token()
+    session = get_request_session()
+    try:
+        set_connection_enabled(session, connection_id=connection_id, enabled=True, actor_username=browser_session.get("username", "web"))
+        session.commit()
+        flash("Ligação ativada explicitamente; provider_reads global continua a ser obrigatório.", "success")
+    except ValueError as exc:
+        session.rollback()
+        flash(str(exc), "error")
+    return redirect(url_for("assets.provider_connections"))
+
+
+@assets_bp.post("/provider-connections/<int:connection_id>/disable")
+@require_authenticated
+def disable_provider_connection(connection_id: int):
+    require_valid_token()
+    session = get_request_session()
+    try:
+        set_connection_enabled(session, connection_id=connection_id, enabled=False, actor_username=browser_session.get("username", "web"))
+        session.commit()
+        flash("Ligação desativada.", "success")
+    except ValueError as exc:
+        session.rollback()
+        flash(str(exc), "error")
+    return redirect(url_for("assets.provider_connections"))

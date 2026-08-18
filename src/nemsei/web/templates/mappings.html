@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block content %}
+<header class="page-header"><div><p class="eyebrow">Integrações</p><h1>Revisão de mappings</h1><p class="page-intro">Aprovação explícita, com evidência de identidade e sem ativação automática.</p></div></header>
+<section class="panel">
+  <form class="filter-bar" method="get">
+    <input name="asset" value="{{ filters.asset_search }}" placeholder="Central">
+    <input name="organization" value="{{ filters.organization_search }}" placeholder="Organização">
+    <select name="provider"><option value="">Todos os providers</option>{% for code,label in provider_options %}<option value="{{ code }}" {% if filters.provider == code %}selected{% endif %}>{{ label }}</option>{% endfor %}</select>
+    <select name="status"><option value="">Todos os estados</option>{% for value,label in [('pending_review','Pendente'),('active','Ativo'),('invalid','Inválido'),('superseded','Substituído')] %}<option value="{{ value }}" {% if filters.status == value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select>
+    <select name="needs_review"><option value="">Qualidade</option><option value="yes" {% if filters.needs_review == 'yes' %}selected{% endif %}>Com findings de identidade</option></select>
+    <button class="button secondary" type="submit">Filtrar</button>
+  </form>
+</section>
+<section class="panel table-panel"><div class="table-scroll"><table class="data-table compact-table"><thead><tr><th>Central / organização</th><th>Provider / ligação</th><th>ID externo</th><th>Estado</th><th>Evidência</th><th>Ações</th></tr></thead><tbody>
+{% for mapping in mappings %}<tr>
+  <th scope="row"><a href="{{ url_for('assets.asset_detail', asset_id=mapping.asset_id) }}">{{ mapping.asset_name }}</a><small>{{ mapping.organization_name or 'Sem organização' }}</small></th>
+  <td>{{ mapping.provider }}<small>{{ mapping.connection_name }}</small></td>
+  <td><code>{{ mapping.external_id }}</code>{% if mapping.external_name %}<small>{{ mapping.external_name }}</small>{% endif %}</td>
+  <td><span class="status-badge {{ 'success' if mapping.mapping_status == 'active' else 'warning' if mapping.mapping_status == 'pending_review' else 'muted' }}">{{ mapping.mapping_status }}</span></td>
+  <td><small>{{ mapping.aliases|length }} aliases · {{ mapping.evidence|length }} registos importados</small>{% if mapping.asset_review_status == 'needs_review' %}<small class="text-warning">Identidade requer revisão</small>{% endif %}</td>
+  <td class="action-stack"><a class="button secondary" href="{{ url_for('mappings.preflight', mapping_id=mapping.id, capability='current_monitoring') }}">Preflight</a>{% if mapping.mapping_status == 'pending_review' %}<form method="post" action="{{ url_for('mappings.approve', mapping_id=mapping.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button" type="submit">Aprovar</button></form><form method="post" action="{{ url_for('mappings.reject', mapping_id=mapping.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button danger" type="submit">Rejeitar</button></form>{% endif %}</td>
+</tr>{% else %}<tr><td class="table-empty" colspan="6">Não existem mappings para os filtros escolhidos.</td></tr>{% endfor %}
+</tbody></table></div></section>
+{% endblock %}

@@ -23,6 +23,8 @@
           <div class="nav-group">
             <span class="nav-heading">Integrações</span>
             <a class="nav-link {{ 'active' if request.endpoint == 'assets.provider_connections' else '' }}" href="{{ url_for('assets.provider_connections') }}"><span aria-hidden="true">⇄</span> Ligações</a>
+            <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('mappings.') else '' }}" href="{{ url_for('mappings.index') }}"><span aria-hidden="true">✓</span> Mappings</a>
+            <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('sources.') else '' }}" href="{{ url_for('sources.index') }}"><span aria-hidden="true">◷</span> Políticas de fonte</a>
             <a class="nav-link {{ 'active' if request.endpoint == 'reconciliation.index' else '' }}" href="{{ url_for('reconciliation.index') }}"><span aria-hidden="true">⌁</span> Reconciliação</a>
           </div>
           <div class="nav-group">

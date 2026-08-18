@@ -4,9 +4,11 @@ from __future__ import annotations
 from datetime import date, datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from nemsei.assets.models import Asset
+from nemsei.providers.audit import record_operator_action
 from nemsei.providers.models import AssetProviderMapping
 from nemsei.shared.clock import as_utc, utc_now
 from nemsei.sources.models import SOURCE_USES, AssetSourcePolicy
@@ -23,14 +25,19 @@ def create_source_policy(
     valid_from: date,
     valid_to: date | None = None,
     is_fallback: bool = False,
+    actor_username: str | None = None,
 ) -> AssetSourcePolicy:
     if source_use not in SOURCE_USES or priority <= 0:
         raise ValueError("Invalid source policy use or priority")
     if valid_to is not None and valid_to < valid_from:
         raise ValueError("Policy valid_to cannot precede valid_from")
-    mapping = session.get(AssetProviderMapping, provider_mapping_id)
+    mapping = session.execute(
+        select(AssetProviderMapping).where(AssetProviderMapping.id == provider_mapping_id).with_for_update()
+    ).scalar_one_or_none()
     if mapping is None or mapping.asset_id != asset_id:
         raise ValueError("Source policy mapping must belong to the asset")
+    if mapping.mapping_status != "active":
+        raise ValueError("Source policy requires an approved active mapping.")
     now = utc_now()
     policy = AssetSourcePolicy(
         asset_id=asset_id,
@@ -44,6 +51,23 @@ def create_source_policy(
         updated_at=now,
     )
     session.add(policy)
+    if actor_username:
+        record_operator_action(
+            session,
+            actor_username=actor_username,
+            action="source_policy_created",
+            entity_type="asset_source_policy",
+            entity_id=None,
+            metadata={
+                "asset_id": asset_id,
+                "mapping_id": provider_mapping_id,
+                "source_use": source_use,
+                "valid_from": valid_from.isoformat(),
+                "valid_to": valid_to.isoformat() if valid_to else None,
+                "priority": priority,
+                "is_fallback": is_fallback,
+            },
+        )
     return policy
 
 

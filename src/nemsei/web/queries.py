@@ -12,7 +12,9 @@ from nemsei.assets.models import Asset, AssetAlias, Organization
 from nemsei.assets.service import normalize_name
 from nemsei.monitoring.models import MonitoringObservation, ProductionFact
 from nemsei.providers.models import AssetProviderMapping, LegacyImportRecord, ProviderConnection
-from nemsei.sync.models import SyncRun
+from nemsei.providers.registry import descriptor_for
+from nemsei.sources.models import AssetSourcePolicy
+from nemsei.sync.models import IntegrationHealth, SyncRun
 
 
 PROVIDER_LABELS = {
@@ -246,6 +248,7 @@ def dashboard_data(session: Session) -> dict[str, Any]:
     )
     provider_rows = session.execute(
         select(
+            ProviderConnection.id.label("connection_id"),
             ProviderConnection.provider_code,
             ProviderConnection.display_name,
             ProviderConnection.enabled,
@@ -265,6 +268,7 @@ def dashboard_data(session: Session) -> dict[str, Any]:
             state_label, state_tone = "Configurada", "success"
         connections.append(
             {
+                "id": row["connection_id"],
                 "provider": provider_label(row["provider_code"]),
                 "display_name": row["display_name"],
                 "state_label": state_label,
@@ -321,7 +325,7 @@ def organization_list_data(session: Session, *, search: str = "", page_value: st
     return {"organizations": organizations, "pagination": pagination, "search": search}
 
 
-def provider_connections_data(session: Session) -> list[dict[str, Any]]:
+def provider_connections_data(session: Session, *, settings: Any | None = None) -> list[dict[str, Any]]:
     mapping_counts = (
         select(AssetProviderMapping.provider_connection_id, func.count(AssetProviderMapping.id).label("mapping_count"))
         .where(AssetProviderMapping.valid_to.is_(None))
@@ -330,6 +334,7 @@ def provider_connections_data(session: Session) -> list[dict[str, Any]]:
     )
     rows = session.execute(
         select(
+            ProviderConnection.id.label("connection_id"),
             ProviderConnection.provider_code,
             ProviderConnection.display_name,
             ProviderConnection.enabled,
@@ -339,6 +344,18 @@ def provider_connections_data(session: Session) -> list[dict[str, Any]]:
         .outerjoin(mapping_counts, mapping_counts.c.provider_connection_id == ProviderConnection.id)
         .order_by(ProviderConnection.provider_code, ProviderConnection.display_name)
     ).mappings()
+    status_rows = session.execute(
+        select(
+            AssetProviderMapping.provider_connection_id,
+            AssetProviderMapping.mapping_status,
+            func.count(AssetProviderMapping.id),
+        )
+        .where(AssetProviderMapping.valid_to.is_(None))
+        .group_by(AssetProviderMapping.provider_connection_id, AssetProviderMapping.mapping_status)
+    ).all()
+    status_counts: dict[int, dict[str, int]] = defaultdict(dict)
+    for connection_id, mapping_status, count in status_rows:
+        status_counts[connection_id][mapping_status] = count
     result = []
     for row in rows:
         if not row["enabled"] or row["configuration_status"] == "disabled":
@@ -347,18 +364,147 @@ def provider_connections_data(session: Session) -> list[dict[str, Any]]:
             state_label, state_tone = "Por configurar", "warning"
         else:
             state_label, state_tone = "Configurada", "success"
+        health = session.get(IntegrationHealth, row["connection_id"])
+        descriptor = descriptor_for(row["provider_code"])
+        supported = sorted(capability.value for capability in descriptor.implemented_capabilities)
+        runtime_enabled = []
+        if settings is not None and row["enabled"] and row["configuration_status"] == "configured" and settings.capabilities.get("provider_reads", False):
+            runtime_enabled = supported
         result.append(
             {
+                "id": row["connection_id"],
                 "provider": provider_label(row["provider_code"]),
                 "display_name": row["display_name"],
                 "state_label": state_label,
                 "state_tone": state_tone,
                 "active_label": "Sim" if row["enabled"] else "Não",
                 "mapping_count": row["mapping_count"],
+                "pending_count": status_counts[row["connection_id"]].get("pending_review", 0),
+                "active_count": status_counts[row["connection_id"]].get("active", 0),
                 "credential_label": "Configuradas" if row["configuration_status"] == "configured" else "Não configuradas",
+                "supported_capabilities": supported,
+                "runtime_capabilities": runtime_enabled,
+                "health": {
+                    "auth_state": health.auth_state if health else "unknown",
+                    "provider_state": health.provider_state if health else "unknown",
+                    "discovery_state": health.discovery_state if health else "unknown",
+                    "quota_state": health.quota_state if health else "unknown",
+                    "last_success_at": health.last_success_at if health else None,
+                    "last_failure_at": health.last_failure_at if health else None,
+                },
             }
         )
     return result
+
+
+def mapping_review_data(
+    session: Session,
+    *,
+    provider: str = "",
+    connection_id: str = "",
+    status: str = "",
+    asset_search: str = "",
+    organization_search: str = "",
+    needs_review: str = "",
+) -> dict[str, Any]:
+    statement = (
+        select(
+            AssetProviderMapping,
+            Asset,
+            Organization.display_name.label("organization_name"),
+            ProviderConnection,
+        )
+        .join(Asset, Asset.id == AssetProviderMapping.asset_id)
+        .outerjoin(Organization, Organization.id == Asset.owner_id)
+        .join(ProviderConnection, ProviderConnection.id == AssetProviderMapping.provider_connection_id)
+        .order_by(ProviderConnection.provider_code, ProviderConnection.display_name, Asset.canonical_name, AssetProviderMapping.id)
+    )
+    filters = []
+    if provider in PROVIDER_LABELS:
+        filters.append(ProviderConnection.provider_code == provider)
+    if connection_id.isdigit():
+        filters.append(ProviderConnection.id == int(connection_id))
+    if status in {"active", "superseded", "invalid", "pending_review"}:
+        filters.append(AssetProviderMapping.mapping_status == status)
+    if asset_search.strip():
+        pattern = f"%{normalize_name(asset_search)}%"
+        filters.append(Asset.normalized_name.ilike(pattern))
+    if organization_search.strip():
+        filters.append(Organization.display_name.ilike(f"%{organization_search.strip()}%"))
+    if needs_review == "yes":
+        filters.append(Asset.review_status == "needs_review")
+    rows = session.execute(statement.where(*filters) if filters else statement).all()
+    mappings = []
+    for mapping, asset, organization_name, connection in rows:
+        evidence = list(
+            session.scalars(
+                select(LegacyImportRecord)
+                .where(LegacyImportRecord.target_mapping_id == mapping.id)
+                .order_by(LegacyImportRecord.id.desc())
+                .limit(5)
+            )
+        )
+        aliases = list(
+            session.scalars(
+                select(AssetAlias.alias)
+                .where(AssetAlias.asset_id == asset.id, AssetAlias.active.is_(True))
+                .order_by(AssetAlias.alias)
+            )
+        )
+        mappings.append(
+            {
+                "id": mapping.id,
+                "asset_id": asset.id,
+                "asset_name": asset.canonical_name,
+                "organization_name": organization_name,
+                "provider": provider_label(connection.provider_code),
+                "provider_code": connection.provider_code,
+                "connection_id": connection.id,
+                "connection_name": connection.display_name,
+                "external_id": mapping.external_id,
+                "external_name": mapping.external_name,
+                "mapping_status": mapping.mapping_status,
+                "valid_from": mapping.valid_from,
+                "valid_to": mapping.valid_to,
+                "asset_review_status": asset.review_status,
+                "aliases": aliases,
+                "evidence": [{"table": item.legacy_table, "legacy_id": item.legacy_id, "outcome": item.outcome, "reason": item.reason} for item in evidence],
+            }
+        )
+    connections = list(session.scalars(select(ProviderConnection).order_by(ProviderConnection.display_name)))
+    return {
+        "mappings": mappings,
+        "connections": connections,
+        "provider_options": [(code, provider_label(code)) for code in PROVIDER_LABELS],
+        "filters": {"provider": provider, "connection_id": connection_id, "status": status, "asset_search": asset_search, "organization_search": organization_search, "needs_review": needs_review},
+    }
+
+
+def source_policy_data(session: Session, *, asset_id: int | None = None) -> list[dict[str, Any]]:
+    statement = (
+        select(AssetSourcePolicy, Asset, AssetProviderMapping, ProviderConnection)
+        .join(Asset, Asset.id == AssetSourcePolicy.asset_id)
+        .join(AssetProviderMapping, AssetProviderMapping.id == AssetSourcePolicy.provider_mapping_id)
+        .join(ProviderConnection, ProviderConnection.id == AssetProviderMapping.provider_connection_id)
+        .order_by(AssetSourcePolicy.valid_from.desc(), AssetSourcePolicy.id.desc())
+    )
+    if asset_id is not None:
+        statement = statement.where(AssetSourcePolicy.asset_id == asset_id)
+    return [
+        {
+            "id": policy.id,
+            "asset_id": asset.id,
+            "asset_name": asset.canonical_name,
+            "mapping_id": mapping.id,
+            "provider": provider_label(connection.provider_code),
+            "source_use": policy.source_use,
+            "priority": policy.priority,
+            "is_fallback": policy.is_fallback,
+            "valid_from": policy.valid_from,
+            "valid_to": policy.valid_to,
+        }
+        for policy, asset, mapping, connection in session.execute(statement).all()
+    ]
 
 
 def asset_detail_data(session: Session, asset_id: int) -> dict[str, Any] | None:

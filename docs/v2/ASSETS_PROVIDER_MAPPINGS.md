@@ -1,8 +1,9 @@
 # Assets and provider mappings
 
-This milestone defines the V2 physical-installation boundary. It does not add
-provider clients, credentials, discovery, monitoring, production facts,
-portfolios, reports, schedules, or external calls.
+This milestone defines the V2 physical-installation boundary and the
+operator-controlled review layer. Provider calls remain behind the existing
+capability gates; this layer adds no provider-specific schema or automatic
+activation.
 
 ## Identity rules
 

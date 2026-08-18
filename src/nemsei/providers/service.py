@@ -3,15 +3,19 @@ from __future__ import annotations
 
 from datetime import date
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
+from nemsei.assets.models import Asset
 from nemsei.assets.repository import AssetRepository
+from nemsei.providers.audit import record_operator_action
 from nemsei.providers.models import (
     CONNECTION_STATUSES,
     MAPPING_STATUSES,
     AssetProviderMapping,
     ProviderConnection,
+    LegacyImportRecord,
 )
 from nemsei.providers.registry import ProviderCode, normalize_external_id
 from nemsei.providers.repository import ProviderRepository
@@ -50,6 +54,77 @@ def create_connection(
         updated_at=now,
     )
     ProviderRepository(session).add(connection)
+    session.flush()
+    return connection
+
+
+def configure_connection(
+    session: Session,
+    *,
+    connection_id: int,
+    display_name: str | None = None,
+    account_reference: str | None = None,
+    region: str | None = None,
+    credential_reference: str | None = None,
+    actor_username: str | None = None,
+) -> ProviderConnection:
+    connection = session.execute(
+        select(ProviderConnection).where(ProviderConnection.id == connection_id).with_for_update()
+    ).scalar_one_or_none()
+    if connection is None:
+        raise ValueError("Unknown provider connection.")
+    if credential_reference is not None:
+        reference = credential_reference.strip()
+        if not reference or len(reference) > 255 or any(char.isspace() for char in reference):
+            raise ValueError("Credential reference must be a non-empty secret reference name.")
+        connection.credential_reference = reference
+    if display_name is not None:
+        if not display_name.strip():
+            raise ValueError("Connection name is required.")
+        connection.display_name = display_name.strip()
+    connection.account_reference = account_reference.strip() if account_reference and account_reference.strip() else None
+    connection.region = region.strip() if region and region.strip() else None
+    if connection.credential_reference:
+        connection.configuration_status = "configured"
+    connection.updated_at = utc_now()
+    if actor_username:
+        record_operator_action(
+            session,
+            actor_username=actor_username,
+            action="connection_configured",
+            entity_type="provider_connection",
+            entity_id=connection.id,
+            metadata={"provider_code": connection.provider_code, "connection_id": connection.id},
+        )
+    session.flush()
+    return connection
+
+
+def set_connection_enabled(
+    session: Session,
+    *,
+    connection_id: int,
+    enabled: bool,
+    actor_username: str,
+) -> ProviderConnection:
+    connection = session.execute(
+        select(ProviderConnection).where(ProviderConnection.id == connection_id).with_for_update()
+    ).scalar_one_or_none()
+    if connection is None:
+        raise ValueError("Unknown provider connection.")
+    if enabled and (connection.configuration_status == "not_configured" or not connection.credential_reference):
+        raise ValueError("Configure a credential reference before enabling the connection.")
+    connection.enabled = enabled
+    connection.configuration_status = "configured" if enabled else "disabled"
+    connection.updated_at = utc_now()
+    record_operator_action(
+        session,
+        actor_username=actor_username,
+        action="connection_enabled" if enabled else "connection_disabled",
+        entity_type="provider_connection",
+        entity_id=connection.id,
+        metadata={"provider_code": connection.provider_code, "connection_id": connection.id},
+    )
     session.flush()
     return connection
 
@@ -117,6 +192,95 @@ def create_mapping(
     except IntegrityError as exc:
         session.rollback()
         raise ValueError("Provider mapping conflict.") from exc
+    return mapping
+
+
+def approve_mapping(session: Session, *, mapping_id: int, actor_username: str) -> AssetProviderMapping:
+    mapping = session.execute(
+        select(AssetProviderMapping).where(AssetProviderMapping.id == mapping_id).with_for_update()
+    ).scalar_one_or_none()
+    if mapping is None:
+        raise ValueError("Unknown provider mapping.")
+    if mapping.mapping_status == "active":
+        return mapping
+    if mapping.mapping_status != "pending_review":
+        raise ValueError("Only pending mappings can be approved.")
+    asset = session.execute(select(Asset).where(Asset.id == mapping.asset_id).with_for_update()).scalar_one_or_none()
+    connection = session.execute(
+        select(ProviderConnection).where(ProviderConnection.id == mapping.provider_connection_id).with_for_update()
+    ).scalar_one_or_none()
+    if asset is None or connection is None:
+        raise ValueError("Mapping asset and provider connection are required.")
+    if asset.review_status == "needs_review":
+        raise ValueError("Asset identity review must be completed before mapping approval.")
+    if connection.configuration_status != "configured" or not connection.enabled or not connection.credential_reference:
+        raise ValueError("Provider connection must be configured and enabled before mapping approval.")
+    if not mapping.external_id.strip():
+        raise ValueError("Provider external ID is required.")
+    claimed = session.scalar(
+        select(AssetProviderMapping)
+        .where(
+            AssetProviderMapping.provider_connection_id == mapping.provider_connection_id,
+            AssetProviderMapping.resource_kind == mapping.resource_kind,
+            AssetProviderMapping.normalized_external_id == mapping.normalized_external_id,
+            AssetProviderMapping.mapping_status == "active",
+            AssetProviderMapping.valid_to.is_(None),
+            AssetProviderMapping.id != mapping.id,
+        )
+        .with_for_update()
+    )
+    if claimed is not None:
+        raise ValueError("Provider plant is already actively mapped to another asset.")
+    quarantined = session.scalar(
+        select(LegacyImportRecord.id).where(
+            LegacyImportRecord.target_asset_id == asset.id,
+            LegacyImportRecord.outcome == "quarantined",
+        )
+    )
+    if quarantined is not None:
+        raise ValueError("Asset is associated with quarantined legacy identity evidence.")
+    mapping.mapping_status = "active"
+    mapping.updated_at = utc_now()
+    record_operator_action(
+        session,
+        actor_username=actor_username,
+        action="mapping_approved",
+        entity_type="asset_provider_mapping",
+        entity_id=mapping.id,
+        metadata={
+            "mapping_id": mapping.id,
+            "asset_id": mapping.asset_id,
+            "connection_id": mapping.provider_connection_id,
+            "provider_code": connection.provider_code,
+        },
+    )
+    session.flush()
+    return mapping
+
+
+def reject_mapping(session: Session, *, mapping_id: int, actor_username: str) -> AssetProviderMapping:
+    mapping = session.execute(
+        select(AssetProviderMapping).where(AssetProviderMapping.id == mapping_id).with_for_update()
+    ).scalar_one_or_none()
+    if mapping is None:
+        raise ValueError("Unknown provider mapping.")
+    if mapping.mapping_status == "active":
+        raise ValueError("Active mappings require an explicit replacement workflow.")
+    if mapping.mapping_status == "invalid":
+        return mapping
+    if mapping.mapping_status != "pending_review":
+        raise ValueError("Only pending mappings can be rejected.")
+    mapping.mapping_status = "invalid"
+    mapping.updated_at = utc_now()
+    record_operator_action(
+        session,
+        actor_username=actor_username,
+        action="mapping_rejected",
+        entity_type="asset_provider_mapping",
+        entity_id=mapping.id,
+        metadata={"mapping_id": mapping.id, "asset_id": mapping.asset_id, "connection_id": mapping.provider_connection_id},
+    )
+    session.flush()
     return mapping
 
 

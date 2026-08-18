@@ -12,6 +12,16 @@ PROVIDER_CODES = ("fusionsolar", "sigenergy", "sma")
 CONNECTION_STATUSES = ("not_configured", "configured", "disabled")
 MAPPING_STATUSES = ("active", "superseded", "invalid", "pending_review")
 IMPORT_OUTCOMES = ("created", "reused", "quarantined", "changed_source", "conflict", "excluded", "unresolved")
+OPERATOR_AUDIT_ACTIONS = (
+    "mapping_approved",
+    "mapping_rejected",
+    "source_policy_created",
+    "source_policy_changed",
+    "connection_configured",
+    "connection_enabled",
+    "connection_disabled",
+    "validation_requested",
+)
 
 
 class ProviderConnection(Base):
@@ -115,3 +125,21 @@ class LegacyImportRecord(Base):
     target_asset_id: Mapped[int | None] = mapped_column(ForeignKey("assets.id", ondelete="SET NULL"))
     target_mapping_id: Mapped[int | None] = mapped_column(ForeignKey("asset_provider_mappings.id", ondelete="SET NULL"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class OperatorAuditEvent(Base):
+    """Append-only, sanitized record of consequential operator actions."""
+
+    __tablename__ = "operator_audit_events"
+    __table_args__ = (
+        CheckConstraint(f"action IN {OPERATOR_AUDIT_ACTIONS!r}", name="ck_operator_audit_events_action"),
+        Index("ix_operator_audit_events_entity", "entity_type", "entity_id", "occurred_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    actor_username: Mapped[str] = mapped_column(String(120), nullable=False)
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    entity_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    entity_id: Mapped[int | None] = mapped_column(Integer)
+    metadata_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
