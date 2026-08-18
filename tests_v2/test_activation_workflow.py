@@ -11,10 +11,15 @@ from sqlalchemy import text
 from nemsei.app import create_app
 from nemsei.assets.service import create_asset
 from nemsei.db import build_engine, build_session_factory
+from nemsei.integrations.fusionsolar.discovery import DiscoveryResult, DiscoveredPlant, MappingValidation, MappingValidationStatus
+from nemsei.integrations.fusionsolar.monitoring import MonitoringSyncResult
+from nemsei.integrations.fusionsolar.production import ProductionSyncResult
+from nemsei.integrations.fusionsolar.validation import FusionSolarSingleAssetValidation
 from nemsei.providers.models import OperatorAuditEvent
 from nemsei.providers.preflight import activation_preflight
-from nemsei.providers.registry import ProviderCapability
+from nemsei.providers.registry import ProviderCapability, ProviderCode
 from nemsei.providers.service import approve_mapping, configure_connection, create_connection, create_mapping, reject_mapping, set_connection_enabled
+from nemsei.shared.clock import utc_now
 from nemsei.sources.service import create_source_policy
 from tests_v2.test_migrations import upgrade
 
@@ -84,6 +89,8 @@ def test_preflight_blocks_global_provider_reads_and_missing_policy(settings, mon
         codes = {finding.code for finding in result.blocking_findings}
         assert not result.ready
         assert "provider_reads_disabled" in codes
+        assert result.implementation_support == "supported"
+        assert result.runtime_availability == "unknown"
 
 
 def test_preflight_ready_is_provider_neutral_and_network_free(settings, monkeypatch):
@@ -154,3 +161,76 @@ def test_production_preflight_requires_verified_contract_and_timezone(settings, 
         asset.timezone = "Not/AZone"
         invalid = activation_preflight(session, settings=enabled, mapping_id=mapping.id, capability=ProviderCapability.PRODUCTION_HISTORY)
         assert "timezone_invalid" in {finding.code for finding in invalid.blocking_findings}
+
+
+def test_single_asset_validation_blocks_before_network_and_audits(settings, monkeypatch):
+    def should_not_construct(*_args, **_kwargs):
+        raise AssertionError("provider service must not be constructed when preflight is blocked")
+
+    upgrade(settings, monkeypatch)
+    factory = build_session_factory(build_engine(settings))
+    with factory() as session:
+        _asset, _connection, mapping = activate_fixture(session)
+        session.commit()
+        result = FusionSolarSingleAssetValidation(
+            factory,
+            settings,
+            discovery_factory=should_not_construct,
+            monitoring_factory=should_not_construct,
+            production_factory=should_not_construct,
+        ).run(mapping.id, actor_username="operator")
+        assert result.status == "blocked"
+        assert result.provider_calls == 0
+        assert "provider_reads_disabled" in result.findings
+        assert session.scalar(select(OperatorAuditEvent).where(OperatorAuditEvent.action == "validation_requested")) is not None
+
+
+def test_single_asset_validation_is_explicit_and_scoped(settings, monkeypatch):
+    enabled = replace(settings, capabilities={**settings.capabilities, "provider_reads": True})
+    monkeypatch.setenv("NEMSEI_V2_FUSIONSOLAR_PRIMARY_PRODUCTION_TIMEZONE", "Europe/Lisbon")
+    monkeypatch.setenv("NEMSEI_V2_FUSIONSOLAR_PRIMARY_PRODUCTION_UNIT", "kWh")
+
+    class FakeDiscovery:
+        def validate_connection(self, connection_id):
+            return DiscoveryResult(connection_id, (DiscoveredPlant(ProviderCode.FUSIONSOLAR, connection_id, "FS-PRIMARY", "Primary", {}, utc_now()),), frozenset(), "success", "partial", 101)
+
+        def validate_mapping(self, mapping_id, *, discovery):
+            return MappingValidation(mapping_id, MappingValidationStatus.VALID, discovery.sync_run_id)
+
+    class FakeMonitoring:
+        def sync_current_monitoring(self, connection_id):
+            return MonitoringSyncResult(connection_id, 102, "success", "complete", 1, 1, 1, 0)
+
+    class FakeProduction:
+        def sync_incremental(self, connection_id, *, start_date, end_date):
+            assert start_date == end_date
+            return ProductionSyncResult(connection_id, 103, "success", "complete", start_date, end_date, 1, 1, 1, 0, True)
+
+    upgrade(enabled, monkeypatch)
+    factory = build_session_factory(build_engine(enabled))
+    with factory() as session:
+        asset, connection, mapping = activate_fixture(session)
+        create_source_policy(
+            session,
+            asset_id=asset.id,
+            provider_mapping_id=mapping.id,
+            source_use="production",
+            priority=1,
+            valid_from=date(2026, 1, 1),
+        )
+        session.commit()
+        result = FusionSolarSingleAssetValidation(
+            factory,
+            enabled,
+            discovery_factory=lambda *_args: FakeDiscovery(),
+            monitoring_factory=lambda *_args: FakeMonitoring(),
+            production_factory=lambda *_args: FakeProduction(),
+        ).run(mapping.id, actor_username="operator", on_date=date(2026, 8, 18))
+        assert result.status == "success"
+        assert result.discovery_status == "success"
+        assert result.mapping_status == "valid"
+        assert result.monitoring_status == "success"
+        assert result.production_status == "success"
+        assert result.provider_calls == 0  # fakes perform no network calls
+        actions = list(session.scalars(select(OperatorAuditEvent.action).where(OperatorAuditEvent.action == "validation_requested")))
+        assert len(actions) == 2

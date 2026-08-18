@@ -115,11 +115,15 @@ def activation_preflight(
 
     checks["connection_exists"] = True
     configured = connection.configuration_status == "configured" and bool(connection.credential_reference)
+    health = session.get(IntegrationHealth, connection.id)
+    provider_temporarily_unavailable = bool(health and health.provider_state == "unavailable")
+    runtime_known = bool(connection.enabled and getattr(settings, "capabilities", {}).get("provider_reads", False))
     status = evaluate_capability(
         connection.provider_code,
         requested,
         connection_configured=configured,
-        integration_temporarily_unavailable=False,
+        integration_temporarily_unavailable=provider_temporarily_unavailable,
+        runtime_known=runtime_known,
     )
     if status.implementation_support is ImplementationSupport.UNSUPPORTED:
         findings.append(_finding("capability_unsupported", "Este provider não suporta esta capacidade no V2."))
@@ -187,8 +191,7 @@ def activation_preflight(
             except FusionSolarClientError as exc:
                 findings.append(_finding("production_contract_missing", exc.error.safe_message))
 
-    health = session.get(IntegrationHealth, connection.id)
-    if health and health.provider_state == "unavailable":
+    if provider_temporarily_unavailable:
         findings.append(_finding("provider_temporarily_unavailable", "O último estado provider indica indisponibilidade temporária."))
 
     checks.update(

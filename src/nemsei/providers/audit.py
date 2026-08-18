@@ -21,6 +21,8 @@ _ALLOWED_METADATA = {
     "is_fallback",
     "finding_codes",
     "capability",
+    "provider_call_count",
+    "result_status",
 }
 
 

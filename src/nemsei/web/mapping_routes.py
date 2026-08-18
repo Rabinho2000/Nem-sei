@@ -5,6 +5,7 @@ from flask import Blueprint, current_app, flash, redirect, render_template, requ
 from nemsei.providers.preflight import activation_preflight
 from nemsei.providers.service import approve_mapping, reject_mapping
 from nemsei.providers.registry import ProviderCapability
+from nemsei.integrations.fusionsolar.validation import FusionSolarSingleAssetValidation
 from nemsei.web.csrf import require_valid_token, token
 from nemsei.web.db_session import get_request_session
 from nemsei.web.home_routes import require_authenticated
@@ -87,3 +88,26 @@ def preflight(mapping_id: int) -> str:
         preflight=result,
         csrf_token=token(),
     )
+
+
+@mapping_bp.post("/mappings/<int:mapping_id>/validate")
+@require_authenticated
+def validate_single_asset(mapping_id: int):
+    """Run only the explicitly requested, one-mapping read-only validation."""
+    require_valid_token()
+    settings = current_app.extensions["nemsei.settings"]
+    factory = current_app.extensions["nemsei.session_factory"]
+    try:
+        result = FusionSolarSingleAssetValidation(factory, settings).run(
+            mapping_id,
+            actor_username=browser_session.get("username", "web"),
+        )
+        if result.status == "blocked":
+            flash("Validação bloqueada: " + ", ".join(result.findings), "error")
+        elif result.status == "success":
+            flash(f"Validação read-only concluída ({result.provider_calls} chamadas provider).", "success")
+        else:
+            flash(f"Validação terminou com estado {result.status} ({result.provider_calls} chamadas provider).", "error")
+    except ValueError as exc:
+        flash(str(exc), "error")
+    return redirect(url_for("mappings.preflight", mapping_id=mapping_id, capability=ProviderCapability.CURRENT_MONITORING.value))

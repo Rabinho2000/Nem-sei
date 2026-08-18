@@ -51,3 +51,12 @@ requirements, global safety gates, and integration-health findings.
 Provider validation is operator-initiated only. The current deployment keeps
 provider_reads=false, so preflight blocks before any HTTP call. Mutations,
 notifications, and report distribution remain denied.
+
+When all gates are ready, the preflight page exposes one explicit
+``/mappings/<id>/validate`` action. It requires exactly one active FusionSolar
+mapping on the connection, validates authentication and the mapping against a
+small discovery page, then runs current monitoring and one provider-local
+production day. The action never approves mappings, creates source policies, or
+starts scheduler-wide work. Each request and outcome is sanitized in the
+operator audit log; provider request and SyncRun evidence remains in the
+existing integration tables.
