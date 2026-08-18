@@ -1,9 +1,57 @@
 <!doctype html>
 <html lang="pt-PT">
-  <head><meta charset="utf-8"><title>{{ title or "Nem-sei V2" }}</title></head>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Nem-sei — operações O&M">
+    <title>{{ title or "Nem-sei" }} · Nem-sei</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  </head>
   <body>
-    <nav><a href="{{ url_for('assets.list_assets') }}">Assets</a> · <a href="{{ url_for('assets.organizations') }}">Organizations</a> · <a href="{{ url_for('assets.provider_connections') }}">Provider connections</a></nav>
-    {% with messages = get_flashed_messages(with_categories=true) %}{% for category, message in messages %}<p class="{{ category }}">{{ message }}</p>{% endfor %}{% endwith %}
-    <main>{% block content %}<h1>{{ title or "Nem-sei V2" }}</h1><p>V2 foundation is ready.</p>{% endblock %}</main>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <a class="brand" href="{{ url_for('home.index') }}">
+          <span class="brand-mark" aria-hidden="true">N</span>
+          <span><strong>Nem-sei</strong><small>Operações O&amp;M</small></span>
+        </a>
+        <nav class="primary-nav" aria-label="Navegação principal">
+          <div class="nav-group">
+            <span class="nav-heading">Operação</span>
+            <a class="nav-link {{ 'active' if request.endpoint == 'home.index' else '' }}" href="{{ url_for('home.index') }}"><span aria-hidden="true">⌂</span> Visão geral</a>
+            <a class="nav-link {{ 'active' if request.endpoint in ['assets.list_assets', 'assets.new_asset', 'assets.asset_detail'] else '' }}" href="{{ url_for('assets.list_assets') }}"><span aria-hidden="true">▦</span> Centrais</a>
+          </div>
+          <div class="nav-group">
+            <span class="nav-heading">Integrações</span>
+            <a class="nav-link {{ 'active' if request.endpoint == 'assets.provider_connections' else '' }}" href="{{ url_for('assets.provider_connections') }}"><span aria-hidden="true">⇄</span> Ligações</a>
+            <a class="nav-link {{ 'active' if request.endpoint == 'reconciliation.index' else '' }}" href="{{ url_for('reconciliation.index') }}"><span aria-hidden="true">⌁</span> Reconciliação</a>
+          </div>
+          <div class="nav-group">
+            <span class="nav-heading">Gestão</span>
+            <a class="nav-link {{ 'active' if request.endpoint == 'assets.organizations' else '' }}" href="{{ url_for('assets.organizations') }}"><span aria-hidden="true">◎</span> Organizações</a>
+          </div>
+        </nav>
+        <div class="sidebar-footer">
+          <div class="user-summary"><span class="user-dot" aria-hidden="true"></span><span><small>Sessão ativa</small><strong>{{ session.get('username', 'Operador') }}</strong></span></div>
+          <form method="post" action="{{ url_for('auth.logout') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button class="logout-button" type="submit">Sair</button>
+          </form>
+        </div>
+      </aside>
+      <main class="main-content">
+        <header class="mobile-header">
+          <a class="brand" href="{{ url_for('home.index') }}"><span class="brand-mark" aria-hidden="true">N</span><strong>Nem-sei</strong></a>
+          <span class="mobile-user">{{ session.get('username', 'Operador') }}</span>
+        </header>
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}
+            <div class="flash-stack" role="status">
+              {% for category, message in messages %}<p class="flash {{ category }}">{{ message }}</p>{% endfor %}
+            </div>
+          {% endif %}
+        {% endwith %}
+        {% block content %}{% endblock %}
+      </main>
+    </div>
   </body>
 </html>

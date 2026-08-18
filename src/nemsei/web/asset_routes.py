@@ -7,10 +7,11 @@ from flask import Blueprint, abort, flash, redirect, render_template, request, u
 from nemsei.assets.repository import AssetRepository
 from nemsei.assets.service import add_alias, create_asset, create_organization, update_asset
 from nemsei.providers.repository import ProviderRepository
-from nemsei.providers.service import cross_connection_conflicts, create_connection, create_mapping
+from nemsei.providers.service import create_connection, create_mapping
 from nemsei.web.csrf import require_valid_token, token
 from nemsei.web.db_session import get_request_session
 from nemsei.web.home_routes import require_authenticated
+from nemsei.web.queries import asset_detail_data, list_assets_data, organization_list_data, provider_connections_data
 
 
 assets_bp = Blueprint("assets", __name__)
@@ -32,7 +33,19 @@ def optional_int(value: str | None) -> int | None:
 @assets_bp.get("/assets")
 @require_authenticated
 def list_assets() -> str:
-    return render_template("assets/list.html", assets=AssetRepository(get_request_session()).list_assets(), csrf_token=token())
+    filters = {
+        "search": request.args.get("q", "").strip(),
+        "needs_review": request.args.get("needs_review", "").strip(),
+        "provider": request.args.get("provider", "").strip(),
+        "mapping": request.args.get("mapping", "").strip(),
+        "page_value": request.args.get("page"),
+    }
+    return render_template(
+        "assets/list.html",
+        **list_assets_data(get_request_session(), **filters),
+        csrf_token=token(),
+        title="Centrais",
+    )
 
 
 @assets_bp.route("/assets/new", methods=["GET", "POST"])
@@ -69,12 +82,15 @@ def asset_detail(asset_id: int) -> str:
             session.rollback()
             flash(str(exc), "error")
     providers = ProviderRepository(session)
-    mappings = providers.mappings_for_asset(asset.id)
-    conflicts = {
-        mapping.id: cross_connection_conflicts(session, mapping_id=mapping.id)
-        for mapping in mappings
-    }
-    return render_template("assets/detail.html", asset=asset, organizations=repository.list_organizations(), aliases=list(asset.aliases), mappings=mappings, mapping_conflicts=conflicts, connections=providers.list_connections(), csrf_token=token())
+    detail = asset_detail_data(session, asset.id)
+    return render_template(
+        "assets/detail.html",
+        **detail,
+        organizations=repository.list_organizations(),
+        connections=providers.list_connections(),
+        csrf_token=token(),
+        title=asset.canonical_name,
+    )
 
 
 @assets_bp.post("/assets/<int:asset_id>/aliases")
@@ -108,7 +124,7 @@ def create_asset_mapping(asset_id: int):
 @assets_bp.route("/organizations", methods=["GET", "POST"])
 @require_authenticated
 def organizations() -> str:
-    session, repository = get_request_session(), AssetRepository(get_request_session())
+    session = get_request_session()
     if request.method == "POST":
         require_valid_token()
         try:
@@ -118,13 +134,18 @@ def organizations() -> str:
             session.rollback()
             flash(str(exc), "error")
         return redirect(url_for("assets.organizations"))
-    return render_template("assets/organizations.html", organizations=repository.list_organizations(), csrf_token=token())
+    return render_template(
+        "assets/organizations.html",
+        **organization_list_data(session, search=request.args.get("q", "").strip(), page_value=request.args.get("page")),
+        csrf_token=token(),
+        title="Organizações",
+    )
 
 
 @assets_bp.route("/provider-connections", methods=["GET", "POST"])
 @require_authenticated
 def provider_connections() -> str:
-    session, repository = get_request_session(), ProviderRepository(get_request_session())
+    session = get_request_session()
     if request.method == "POST":
         require_valid_token()
         try:
@@ -134,4 +155,9 @@ def provider_connections() -> str:
             session.rollback()
             flash(str(exc), "error")
         return redirect(url_for("assets.provider_connections"))
-    return render_template("assets/connections.html", connections=repository.list_connections(), csrf_token=token())
+    return render_template(
+        "assets/connections.html",
+        connections=provider_connections_data(session),
+        csrf_token=token(),
+        title="Ligações",
+    )

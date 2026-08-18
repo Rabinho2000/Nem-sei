@@ -13,6 +13,7 @@ from nemsei.web.asset_routes import assets_bp
 from nemsei.web.db_session import close_request_session
 from nemsei.web.health_routes import health_bp
 from nemsei.web.home_routes import home_bp
+from nemsei.web.reconciliation_routes import reconciliation_bp
 
 
 def create_app(
@@ -22,7 +23,7 @@ def create_app(
 ) -> Flask:
     configured = (settings or Settings.from_environment()).validate(require_auth=True)
     engine = build_engine(configured)
-    app = Flask(__name__, template_folder="web/templates")
+    app = Flask(__name__, template_folder="web/templates", static_folder="web/static", static_url_path="/static")
     app.config.update(
         SECRET_KEY=configured.secret_key,
         SESSION_COOKIE_HTTPONLY=True,
@@ -39,4 +40,5 @@ def create_app(
     app.register_blueprint(assets_bp)
     app.register_blueprint(health_bp)
     app.register_blueprint(home_bp)
+    app.register_blueprint(reconciliation_bp)
     return app

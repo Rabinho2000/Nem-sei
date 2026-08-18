@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 
 from nemsei.app import create_app
+from tests_v2.test_migrations import upgrade
 
 
 def csrf_token(response) -> str:
@@ -11,7 +12,8 @@ def csrf_token(response) -> str:
     return match.group(1)
 
 
-def test_login_and_csrf_protect_authenticated_routes(settings) -> None:
+def test_login_and_csrf_protect_authenticated_routes(settings, monkeypatch) -> None:
+    upgrade(settings, monkeypatch)
     client = create_app(settings).test_client()
     assert client.get("/").status_code == 302
     login = client.get("/login")

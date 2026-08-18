@@ -5,6 +5,9 @@ from functools import wraps
 
 from flask import Blueprint, redirect, render_template, request, session, url_for
 
+from nemsei.web.csrf import token
+from nemsei.web.db_session import get_request_session
+from nemsei.web.queries import dashboard_data
 
 home_bp = Blueprint("home", __name__)
 
@@ -22,4 +25,9 @@ def require_authenticated(view: Callable):
 @home_bp.get("/")
 @require_authenticated
 def index() -> str:
-    return render_template("base.html", title="Nem-sei V2")
+    return render_template(
+        "dashboard.html",
+        title="Visão geral",
+        dashboard=dashboard_data(get_request_session()),
+        csrf_token=token(),
+    )

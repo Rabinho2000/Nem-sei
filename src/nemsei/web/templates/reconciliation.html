@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+<header class="page-header"><div><p class="eyebrow">Integrações</p><h1>Revisão de dados</h1><p class="page-intro">Evidência de importação para análise. Esta página é somente de leitura.</p></div></header>
+<section class="panel"><div class="panel-header"><div><p class="eyebrow">Importação V1 → V2</p><h2>Itens a rever</h2></div><span class="status-badge muted">Sem mutações</span></div>
+  <div class="review-grid">
+    <div><strong>{{ review.assets_needs_review }}</strong><span>centrais precisam de revisão</span></div>
+    <div><strong>{{ review.organizations_needs_review }}</strong><span>organizações precisam de revisão</span></div>
+    <div><strong>{{ review.mappings_pending_review }}</strong><span>mappings pendentes</span></div>
+    <div><strong>{{ review.quarantined }}</strong><span>registos em quarentena</span></div>
+    <div><strong>{{ review.unresolved }}</strong><span>integrações não resolvidas</span></div>
+    <div><strong>{{ review.conflicts }}</strong><span>conflitos</span></div>
+    <div><strong>{{ review.excluded }}</strong><span>registos excluídos</span></div>
+  </div>
+</section>
+{% endblock %}
