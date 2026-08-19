@@ -19,6 +19,32 @@ Only this installation was activated: one enabled connection, one active
 mapping, two source policies. Every other mapping stayed `pending_review` on the
 disabled legacy connections.
 
+## Why a live call was unavoidable
+
+Current monitoring could not be validated by replaying V1 evidence, and this was
+established exhaustively rather than assumed. Every V1 table carrying a payload
+or JSON column was searched for `real_health_state`, the field that identifies a
+`getStationRealKpi` response and that V2 maps to its verified plant health codes.
+The result is zero rows, in `assets.source_payload`,
+`device_realtime_snapshots.payload_json`, `provider_devices.payload_json`,
+`integration_sync_runs.summary_json`, `production_records.payload_json` and
+`availability_daily.payload_json` alike. `monitoring_records` has no payload
+column at all, `integration_realtime_snapshots` holds Sigenergy rows only, and
+`assets.source_payload` is an Excel import row rather than provider data.
+
+V1 therefore never persisted a station status response. There was no genuine
+payload to replay, and fabricating one would have proved nothing about the
+provider contract while looking like evidence.
+
+Authentication was in the same position. A replay exercises V2's login path,
+header token extraction and session reuse, but against a replayed response; only
+a real account proves the credential exchange itself.
+
+Daily production was the one leg with replayable V1 evidence, and replaying it
+is precisely what hid the defect this milestone found: V1 stored a single row
+per record, so no fixture ever described the month-long response the provider
+actually sends.
+
 ## What the live run established
 
 **Authentication.** `/thirdData/login` succeeded against
