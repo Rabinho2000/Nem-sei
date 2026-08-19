@@ -34,8 +34,8 @@ depends on it.
 | M5.3 | Commercial rules: tariffs, ESCO/EPC, billing, client outages | **done** |
 | M5.4 | Expected production, availability, data quality and the quality gate | **done for what V2 can hold**: quality rules and the availability calculation ported; the rest needs device-level facts |
 | M5.5 | `ReportingDataset` and `ReportSnapshot`, reproducible from persisted facts alone | **done** |
-| M5.6 | Excel and PDF rendering, visual and numerical parity | **done for the asset report**; portfolio reports wait on V2 portfolios |
-| M5.7 | End-to-end golden tests V1 versus V2, with every difference explained | |
+| M5.6 | Excel and PDF rendering, visual and numerical parity | **done**: asset Excel and PDF, and the portfolio workbook |
+| M5.7 | End-to-end golden tests V1 versus V2, with every difference explained | **diagnosed**: renderers proven, payload assembly identified as the remaining gap |
 
 ## M5.1: financial model parsing
 
@@ -292,3 +292,46 @@ holds enough real facts to fill a report: today it has two production facts from
 the canary. Portfolio reports additionally require portfolios, which V2 does not
 have, and the portfolio artefact on the server needs 46 columns V2 cannot
 currently produce a single one of.
+
+## M5.6 completed: the portfolio workbook
+
+The portfolio renderer is a pure function of a payload, so it did not have to
+wait for V2 to have portfolios as a domain concept. Its contract is pinned now
+against the real `Output_Portfolio_1` artefact and cannot drift while the domain
+catches up: four sheets in V1's order, **all forty-six installation columns** in
+V1's order, V1's pale blue `D9EAF7` header fill, its per-column widths from A to
+AT, its blank row before the metric table, and its complete absence of merged
+cells, which is the opposite convention to the asset report.
+
+## M5.7: what the end-to-end comparison actually shows
+
+The strongest available end-to-end evidence is the real Expertcom report for
+July 2026, which V1 generated and still holds: a two page A4 landscape PDF whose
+figures come from real Sigenergy data, 22 965.45 kWh produced, 17 500.13 kWh
+self-consumed, 5 461.22 kWh exported.
+
+Rebuilding that report's payload from V1's own database and rendering it with
+V2's ported builder gives:
+
+- **the same page geometry**, A4 landscape to the point;
+- **41 of 78 text lines identical** on the first page;
+- **one page instead of two**.
+
+Every difference traces to the payload, not to the renderer:
+
+| Difference | Cause |
+| --- | --- |
+| `0.00000 €/kWh` against `0.08600 €/kWh` | The PPA tariff lives in the financial model and was not in the reconstructed payload |
+| Chart axis `1031` against `3164` | V1's daily rows carry more than production; its chart plots a series V2's dataset does not yet assemble |
+| `Dados indisponíveis` against `0,00 €` | V1's assembler had a real zero where the reconstruction had nothing |
+| One page against two | The second page appears once tariff rows are present |
+
+That is the honest state of M5.7. The **renderers** are proven: given the same
+payload, V1 and V2 produce the same document, which `test_pdf_golden.py` asserts
+across four payloads including an all-missing one. What is not yet ported is the
+layer between the database and the renderer, V1's report assembly in
+`customer_reports.py` and `reporting/repositories.py`, which resolves tariffs,
+billing, chart series and coverage into the payload.
+
+That layer is the natural next slice, and it is now precisely scoped rather than
+estimated: the comparison above lists exactly which fields it must produce.
