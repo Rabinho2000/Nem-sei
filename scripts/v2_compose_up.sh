@@ -42,6 +42,25 @@ if config["services"]["postgres"].get("ports"):
     raise SystemExit("PostgreSQL must not publish a host port")
 PY
 
+# The migrate service sits behind the `manual` profile, so a plain
+# `docker compose build` silently skips it. Without this explicit build a stale
+# migrate image runs `alembic upgrade head` against its own older migration
+# graph, exits 0, and leaves the database behind the checked-out code.
+"${compose[@]}" --profile manual build migrate
 "${compose[@]}" up -d postgres
 "${compose[@]}" run --rm migrate
+
+# Prove the migration actually reached the checked-out head. The head is always
+# resolved from the freshly built image's migration graph; no revision name is
+# ever hardcoded here.
+live_revision=$("${compose[@]}" exec -T postgres psql -U nemsei -d nemsei_v2 -At \
+  -c 'SELECT version_num FROM alembic_version' | tr -d '\r' | sed '/^[[:space:]]*$/d' | tail -n 1)
+if ! "${compose[@]}" run --rm --no-deps -T \
+  -v "$root/scripts/v2_resolve_alembic_head.py:/app/v2_resolve_alembic_head.py:ro" \
+  migrate python /app/v2_resolve_alembic_head.py --config /app/alembic.ini \
+  --live-revision "$live_revision"; then
+  echo "Refusing to start application roles: the database is not at the repository Alembic head." >&2
+  exit 1
+fi
+
 "${compose[@]}" up -d web scheduler worker

@@ -16,10 +16,28 @@ Set their paths in `.env.v2` through
 `NEMSEI_V2_DATABASE_URL_SECRET_FILE`. Compose mounts them as Docker secrets;
 the application only receives `/run/secrets/v2_database_url`.
 
+Compose interpolates `.env.v2`, so every literal `$` in a value must be written
+`$$`. This matters most for `NEMSEI_V2_ADMIN_PASSWORD_HASH`: a Werkzeug hash
+such as `scrypt:32768:8:1$salt$hash` is silently truncated to
+`scrypt:32768:8:1` when unescaped, because Compose expands `$salt` and `$hash`
+as undefined variables, and web then refuses to start. The hash stays an
+environment value rather than a mounted secret: moving it to a secret file
+would add a third secret and a config path for no security gain, since it is a
+hash rather than a credential, so the escaping rule is the contract.
+
 Start with `scripts/v2_compose_up.sh`. It verifies V1/V2 host-artifact roots
-are disjoint, starts PostgreSQL, waits for its health check, runs the explicit
-one-shot Alembic migration, and only then starts web, scheduler, and the single
-worker. Normal roles never migrate on startup. `/healthz` is liveness-only;
+are disjoint, rebuilds the `migrate` image, starts PostgreSQL, waits for its
+health check, runs the explicit one-shot Alembic migration, verifies that the
+database revision now equals the head resolved from that image's migration
+graph, and only then starts web, scheduler, and the single worker. Normal roles
+never migrate on startup.
+
+The explicit `migrate` rebuild is required, not cosmetic. That service sits
+behind the `manual` Compose profile, so a plain `docker compose build` skips
+it; a stale migrate image would run `alembic upgrade head` against its own
+older graph, exit 0, and leave the database behind the checked-out code while
+`/readyz` fails. The post-migration revision check fails the deployment loudly
+if that ever happens again, and no revision name is hardcoded anywhere. `/healthz` is liveness-only;
 `/readyz` performs a PostgreSQL read/connectivity check plus Alembic revision
 comparison and does not write application data.
 
@@ -34,7 +52,9 @@ database transactions.
 Set `NEMSEI_V2_HOST_DATA_ROOT` to the dedicated V2 host artifact root. Run
 `scripts/v2_postgres_backup.sh` daily. It creates a PostgreSQL custom-format
 backup under `<v2-root>/backups` and removes V2 backup archives older than
-seven days. It never accesses V1 data.
+seven days. It never accesses V1 data. Archives are created mode 600 through
+the script's umask rather than tightened afterwards, and the script fails if an
+archive ends up with any other mode.
 
 Test a backup before relying on it:
 

@@ -125,7 +125,11 @@ class Settings:
         if self.environment in {"preview", "production"} and (not self.secret_key or self.secret_key.lower() in INSECURE_SECRET_KEYS):
             raise ConfigurationError("NEMSEI_V2_SECRET_KEY must be non-default outside development/test.")
         if require_auth and (not self.admin_username or self.admin_password_hash.count("$") < 2):
-            raise ConfigurationError("V2 administrator credentials are required.")
+            raise ConfigurationError(
+                "V2 administrator credentials are required. A password hash missing its "
+                "`$` sections usually means Compose interpolated the env file: every "
+                "literal `$` in .env.v2 must be written `$$`."
+            )
         if min(self.worker_poll_seconds, self.worker_lease_seconds, self.scheduler_lease_seconds, self.db_pool_size, self.db_statement_timeout_ms, self.db_lock_timeout_ms, self.db_idle_transaction_timeout_ms, self.db_pool_recycle_seconds, self.production_max_source_days, self.production_reconciliation_max_source_days, self.production_backfill_max_source_days, self.production_backfill_chunk_days) <= 0 or self.db_max_overflow < 0:
             raise ConfigurationError("V2 timing and pool settings must be positive.")
         if self.production_backfill_chunk_days > self.production_backfill_max_source_days:
