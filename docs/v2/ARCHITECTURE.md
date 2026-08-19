@@ -31,6 +31,28 @@ crash-recovery harness is acceptance-only: it explicitly builds the
 `acceptance` profile. That Compose file must never be included in a normal
 deployment command.
 
+## Canonical device level
+
+`assets` is the physical installation and `devices` is its child. Device kind is
+an open vocabulary (`inverter`, `meter`, `datalogger`, `string_box`) with an
+optional `parent_device_id`, so a datalogger owning inverters is a new row
+rather than a new migration. Only `inverter` is populated by the V1 import,
+because every device in V1 is an inverter. No plant tier exists between
+organizations and assets; `DEVICE_MODEL.md` records that decision and the V1
+evidence behind it.
+
+Canonical device identity is the hardware: serial number, model and rated power.
+Serials are unique per asset and never globally, so an identical transcription
+across installations is a review condition rather than an import failure.
+Provider identifiers stay in `asset_provider_mappings`, which now accepts
+`resource_kind='device'` with a `device_id` and records the plant mapping a
+device claim was discovered under. A database constraint keeps the two in step:
+a device claim always carries its device and a plant claim never does.
+
+Plant-scoped provider selection is unchanged. The repository queries that drive
+sync, monitoring and production still filter `resource_kind='plant'`, so adding
+device claims cannot alter existing provider behavior.
+
 ## Job operation rules
 
 `queued` and `waiting` jobs can be cancelled immediately. Cancelling `running`

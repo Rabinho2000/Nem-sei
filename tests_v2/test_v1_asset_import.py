@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,7 @@ from alembic.config import Config
 from sqlalchemy import create_engine, func, select
 
 from nemsei.assets import v1_import as v1_import_module
-from nemsei.assets.models import Asset, AssetAlias
+from nemsei.assets.models import Asset, AssetAlias, Device
 from nemsei.assets.v1_import import import_v1_assets, open_v1_readonly
 from nemsei.db.session import build_session_factory
 from nemsei.providers.models import AssetProviderMapping, LegacyImportRecord, LegacyImportRun, ProviderConnection
@@ -21,7 +22,7 @@ def upgrade(settings, monkeypatch) -> None:
     command.upgrade(Config("alembic.ini"), "head")
 
 
-def build_v1_fixture(path: Path, *, first_asset_country: str = "PT") -> None:
+def build_v1_fixture(path: Path, *, first_asset_country: str = "PT", with_devices: bool = False) -> None:
     connection = sqlite3.connect(path)
     try:
         connection.executescript(
@@ -41,6 +42,17 @@ def build_v1_fixture(path: Path, *, first_asset_country: str = "PT") -> None:
             """
         )
         connection.execute("UPDATE assets SET country = ? WHERE id = 1", (first_asset_country,))
+        if with_devices:
+            # Device 1 is importable, device 2 has an unmapped V1 type, and
+            # device 3 hangs off an asset the identity import quarantines.
+            connection.executescript(
+                """
+                CREATE TABLE provider_devices (id INTEGER PRIMARY KEY, asset_id INTEGER NOT NULL, provider TEXT NOT NULL, station_code TEXT, external_device_id TEXT, dev_dn TEXT, sn TEXT, device_name TEXT, model TEXT, rated_power_kw REAL, dev_type_id INTEGER, enabled INTEGER);
+                INSERT INTO provider_devices VALUES (1, 1, 'FusionSolar', 'Plant-A', '1000000139150452', 'NE=139150452', '6T2159042269', 'Inverter 1', 'SUN2000-30KTL-M3', 30.0, 1, 1);
+                INSERT INTO provider_devices VALUES (2, 1, 'FusionSolar', 'Plant-A', '1000000139150454', 'NE=139150454', '6T2159040909', 'Inverter 2', 'SUN2000-30KTL-M3', 30.0, 99, 1);
+                INSERT INTO provider_devices VALUES (3, 2, 'FusionSolar', 'Plant-B', '1000000139150456', 'NE=139150456', 'ES2330055991', 'Inverter 3', 'SUN2000-50KTL-M3', 50.0, 1, 0);
+                """
+            )
         connection.commit()
     finally:
         connection.close()
@@ -150,7 +162,7 @@ def test_source_fingerprint_prevents_cross_database_id_reuse_and_records_unresol
     with factory() as session:
         assert session.scalar(select(func.count()).select_from(Asset)) == 2
         assert session.scalar(select(func.count()).select_from(LegacyImportRun)) == 2
-        assert session.scalar(select(LegacyImportRun.importer_version).limit(1)) == "assets-v1-importer/2.1"
+        assert session.scalar(select(LegacyImportRun.importer_version).limit(1)) == "assets-v1-importer/3.0"
         unresolved = session.scalar(select(LegacyImportRecord).where(LegacyImportRecord.legacy_table == "integration_unresolved"))
         assert unresolved.evidence_json["external_id"] == "unknown-1"
 
@@ -196,6 +208,74 @@ def test_invalid_legacy_country_dry_run_matches_review_classification(tmp_path: 
     connection = open_v1_readonly(v1_db)
     assert connection.execute("SELECT country FROM assets WHERE id = 1").fetchone()[0] == "Portugal"
     connection.close()
+
+
+def test_v1_devices_import_with_provenance_and_reviewable_outcomes(settings, monkeypatch, tmp_path: Path) -> None:
+    upgrade(settings, monkeypatch)
+    v1_db = tmp_path / "v1.db"
+    build_v1_fixture(v1_db, with_devices=True)
+    factory = build_session_factory(create_engine(settings.database_url))
+    with factory() as session, session.begin():
+        manifest = import_v1_assets(session, v1_db)
+
+    # Every source row is accounted for: one imported, one unknown type held for
+    # review, one whose parent asset was quarantined by the identity import.
+    assert manifest["counts"]["provider_devices.created"] == 1
+    assert manifest["counts"]["provider_devices.quarantined"] == 1
+    assert manifest["counts"]["provider_devices.excluded"] == 1
+
+    with factory() as session:
+        device = session.scalar(select(Device))
+        assert device is not None
+        assert device.device_kind == "inverter"
+        assert device.serial_number == "6T2159042269"
+        assert device.normalized_serial_number == "6T2159042269"
+        assert device.model == "SUN2000-30KTL-M3"
+        assert device.rated_power_kw == Decimal("30.000")
+        assert device.lifecycle_status == "active"
+        assert device.label == "Inverter 1"
+
+        plant = session.scalar(select(AssetProviderMapping).where(AssetProviderMapping.resource_kind == "plant"))
+        claim = session.scalar(select(AssetProviderMapping).where(AssetProviderMapping.resource_kind == "device"))
+        assert claim.device_id == device.id
+        assert claim.asset_id == device.asset_id
+        assert claim.external_id == "1000000139150452"
+        assert claim.mapping_status == "pending_review"
+        assert claim.parent_mapping_id == plant.id
+
+        record = session.scalar(
+            select(LegacyImportRecord).where(
+                LegacyImportRecord.legacy_table == "provider_devices",
+                LegacyImportRecord.outcome == "created",
+            )
+        )
+        assert record.target_device_id == device.id
+        assert record.evidence_json["dev_dn"] == "NE=139150452"
+        assert record.evidence_json["station_code"] == "Plant-A"
+
+    # A rerun neither duplicates devices nor re-creates their claims. Every
+    # source row replays as reused, including the ones held for review, so the
+    # rerun still accounts for all three.
+    with factory() as session, session.begin():
+        rerun = import_v1_assets(session, v1_db)
+    assert rerun["counts"]["provider_devices.reused"] == 3
+    assert "provider_devices.created" not in rerun["counts"]
+    with factory() as session:
+        assert session.scalar(select(func.count()).select_from(Device)) == 1
+        assert session.scalar(select(func.count()).select_from(AssetProviderMapping)) == 2
+
+
+def test_import_without_provider_devices_table_still_runs(settings, monkeypatch, tmp_path: Path) -> None:
+    upgrade(settings, monkeypatch)
+    v1_db = tmp_path / "v1.db"
+    build_v1_fixture(v1_db)
+    factory = build_session_factory(create_engine(settings.database_url))
+    with factory() as session, session.begin():
+        manifest = import_v1_assets(session, v1_db)
+    assert manifest["counts"]["assets.created"] == 1
+    assert not any(key.startswith("provider_devices.") for key in manifest["counts"])
+    with factory() as session:
+        assert session.scalar(select(func.count()).select_from(Device)) == 0
 
 
 def test_interrupted_batched_import_resumes_without_duplicates(settings, monkeypatch, tmp_path: Path) -> None:

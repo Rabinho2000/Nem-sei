@@ -12,6 +12,9 @@ from nemsei.db.base import Base
 
 ASSET_LIFECYCLE_STATUSES = ("unknown", "active", "inactive", "decommissioned")
 IMPORT_REVIEW_STATUSES = ("clear", "needs_review")
+# Open vocabulary: only `inverter` is populated by the V1 migration. The other
+# kinds exist so that a meter or a datalogger is a new row, not a new table.
+DEVICE_KINDS = ("inverter", "meter", "datalogger", "string_box")
 
 
 def public_id() -> str:
@@ -73,6 +76,7 @@ class Asset(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     owner: Mapped[Organization | None] = relationship(back_populates="assets")
     aliases: Mapped[list["AssetAlias"]] = relationship(back_populates="asset", cascade="all, delete-orphan")
+    devices: Mapped[list["Device"]] = relationship(back_populates="asset")
 
 
 class AssetAlias(Base):
@@ -93,3 +97,52 @@ class AssetAlias(Base):
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     asset: Mapped[Asset] = relationship(back_populates="aliases")
+
+
+class Device(Base):
+    """A physical device belonging to one installation.
+
+    Canonical identity is the hardware itself: serial number, model and rated
+    power. Provider identifiers live in `asset_provider_mappings` so that a
+    provider account change supersedes evidence without touching the device.
+    """
+
+    __tablename__ = "devices"
+    __table_args__ = (
+        CheckConstraint(f"device_kind IN {DEVICE_KINDS!r}", name="ck_devices_device_kind"),
+        CheckConstraint(f"lifecycle_status IN {ASSET_LIFECYCLE_STATUSES!r}", name="ck_devices_lifecycle_status"),
+        CheckConstraint(f"review_status IN {IMPORT_REVIEW_STATUSES!r}", name="ck_devices_review_status"),
+        CheckConstraint("rated_power_kw IS NULL OR rated_power_kw >= 0", name="ck_devices_rated_power"),
+        CheckConstraint("valid_to IS NULL OR valid_to >= valid_from", name="ck_devices_validity"),
+        # Serials are unique per installation, never globally: identical
+        # transcriptions across installations are plausible and must stay a
+        # review condition rather than an import failure.
+        Index(
+            "uq_devices_asset_serial",
+            "asset_id",
+            "normalized_serial_number",
+            unique=True,
+            postgresql_where=text("normalized_serial_number IS NOT NULL AND valid_to IS NULL"),
+        ),
+        Index("ix_devices_asset", "asset_id", "device_kind"),
+        Index("ix_devices_normalized_serial", "normalized_serial_number"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    public_id: Mapped[str] = mapped_column(String(36), unique=True, nullable=False, default=public_id)
+    asset_id: Mapped[int] = mapped_column(ForeignKey("assets.id", ondelete="RESTRICT"), nullable=False)
+    parent_device_id: Mapped[int | None] = mapped_column(ForeignKey("devices.id", ondelete="SET NULL"))
+    device_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    serial_number: Mapped[str | None] = mapped_column(String(120))
+    normalized_serial_number: Mapped[str | None] = mapped_column(String(120))
+    label: Mapped[str | None] = mapped_column(String(255))
+    model: Mapped[str | None] = mapped_column(String(120))
+    rated_power_kw: Mapped[Decimal | None] = mapped_column(Numeric(12, 3))
+    lifecycle_status: Mapped[str] = mapped_column(String(24), nullable=False, default="unknown")
+    review_status: Mapped[str] = mapped_column(String(24), nullable=False, default="clear")
+    review_note: Mapped[str | None] = mapped_column(Text)
+    valid_from: Mapped[date] = mapped_column(Date, nullable=False)
+    valid_to: Mapped[date | None] = mapped_column(Date)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    asset: Mapped[Asset] = relationship(back_populates="devices")

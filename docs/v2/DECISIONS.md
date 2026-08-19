@@ -9,6 +9,32 @@
 - Jobs are at-least-once and all future side effects require explicit
   idempotency strategies.
 
+## Canonical device level (M1)
+
+Justification and V1 evidence: `DEVICE_MODEL.md`.
+
+- `assets` remains the physical installation. No `Plant` tier is introduced
+  between `organizations` and `assets`, because V1 has exactly one device tier
+  below the installation and every one of its 325 devices is an inverter.
+- `devices` is a child of `assets` with an open `device_kind` vocabulary
+  (`inverter`, `meter`, `datalogger`, `string_box`) and an optional
+  `parent_device_id`. Only `inverter` is populated by migration; the remaining
+  kinds are enabled by adding rows, not by adding tables.
+- Canonical device identity is the hardware serial number, model and rated
+  power. Provider identifiers (`external_device_id`, `dev_dn`, station codes)
+  are provider evidence and live in the mapping layer only.
+- Serial numbers are unique per asset, not globally. A duplicate within an asset
+  is a review condition, never an import failure or an automatic merge.
+- `asset_provider_mappings` is extended with a nullable `device_id` and accepts
+  `resource_kind='device'`; there is no separate device mapping table. Existing
+  plant claim, supersede and conflict rules are unchanged. A device mapping
+  records the plant mapping it was discovered under.
+- Every device-level fact references `devices.id`. No V2 fact table keys a
+  device on a provider identifier string, which is V1's pattern in
+  `inverter_power_samples` and `inverter_availability_daily`.
+- `provider_device_configuration_history` is not imported: its 325 rows are all
+  single-version and open, so there is no device history to migrate.
+
 ## Future side-effect idempotency contracts
 
 Every side-effecting handler must persist an idempotency key before invoking an

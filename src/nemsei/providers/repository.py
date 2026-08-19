@@ -20,12 +20,12 @@ class ProviderRepository:
         return self.session.get(AssetProviderMapping, mapping_id)
 
     def active_external_claim(
-        self, *, connection_id: int, normalized_external_id: str
+        self, *, connection_id: int, normalized_external_id: str, resource_kind: str = "plant"
     ) -> AssetProviderMapping | None:
         return self.session.scalar(
             select(AssetProviderMapping).where(
                 AssetProviderMapping.provider_connection_id == connection_id,
-                AssetProviderMapping.resource_kind == "plant",
+                AssetProviderMapping.resource_kind == resource_kind,
                 AssetProviderMapping.normalized_external_id == normalized_external_id,
                 AssetProviderMapping.mapping_status == "active",
                 AssetProviderMapping.valid_to.is_(None),

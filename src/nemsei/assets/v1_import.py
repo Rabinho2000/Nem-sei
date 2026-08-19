@@ -19,8 +19,8 @@ from typing import Any, Iterable
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from nemsei.assets.models import Asset, AssetAlias, Organization
-from nemsei.assets.service import create_asset, create_organization, normalize_country_code, normalize_name, normalize_tax_id
+from nemsei.assets.models import Asset, AssetAlias, Device, Organization
+from nemsei.assets.service import create_asset, create_device, create_organization, normalize_country_code, normalize_name, normalize_tax_id
 from nemsei.config import Settings
 from nemsei.db.engine import build_engine
 from nemsei.db.session import build_session_factory
@@ -35,8 +35,11 @@ LEGACY_CONNECTIONS = {
     "fusionsolar": ("v1-fusionsolar-legacy", "V1 FusionSolar legacy mappings"),
     "sigenergy": ("v1-sigenergy-legacy", "V1 Sigenergy legacy mappings"),
 }
-IMPORTER_VERSION = "assets-v1-importer/2.1"
+IMPORTER_VERSION = "assets-v1-importer/3.0"
 IMPORT_BATCH_SIZE = 100
+# V1 device types observed in the frozen database: 324 string inverters and one
+# residential inverter. Any other type is quarantined rather than guessed.
+DEVICE_KIND_BY_V1_TYPE = {1: "inverter", 38: "inverter"}
 
 
 class LegacyImportError(ValueError):
@@ -160,6 +163,7 @@ def add_record(
     reason: str | None = None,
     organization: Organization | None = None,
     asset: Asset | None = None,
+    device: Device | None = None,
     mapping: AssetProviderMapping | None = None,
     evidence: dict[str, str] | None = None,
     persist: bool = True,
@@ -180,6 +184,7 @@ def add_record(
             evidence_json=evidence or {},
             target_organization_id=organization.id if organization else None,
             target_asset_id=asset.id if asset else None,
+            target_device_id=device.id if device else None,
             target_mapping_id=mapping.id if mapping else None,
             created_at=utc_now(),
         )
@@ -402,6 +407,79 @@ def import_v1_assets(session: Session | None, source_path: Path, *, dry_run: boo
             add_record(session, run, manifest, table="asset_integrations", legacy_id=row["id"], source_hash=fingerprint, outcome="created", asset=asset, mapping=mapping)
 
         source_tables = {row[0] for row in source_db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        devices = list(source_db.execute("SELECT id, asset_id, provider, station_code, external_device_id, dev_dn, sn, device_name, model, rated_power_kw, dev_type_id, enabled FROM provider_devices ORDER BY id")) if "provider_devices" in source_tables else []
+        for row in devices:
+            fingerprint = row_hash(row, row.keys())
+            existing = prior_record(session, source, "provider_devices", row["id"]) if session else None
+            asset = imported_assets.get(row["asset_id"])
+            provider = (row["provider"] or "").strip().lower()
+            if existing and existing.source_hash == fingerprint:
+                add_record(session, run, manifest, table="provider_devices", legacy_id=row["id"], source_hash=fingerprint, outcome="reused", asset=session.get(Asset, existing.target_asset_id) if session and existing.target_asset_id else None, persist=False)
+                continue
+            if existing:
+                add_record(session, run, manifest, table="provider_devices", legacy_id=row["id"], source_hash=fingerprint, outcome="changed_source", reason="V1 device changed; existing V2 device was preserved.", asset=session.get(Asset, existing.target_asset_id) if session and existing.target_asset_id else None)
+                continue
+            if (asset is None and (not dry_run or row["asset_id"] not in eligible_asset_ids)) or provider not in LEGACY_CONNECTIONS or not row["external_device_id"]:
+                add_record(session if not dry_run else None, run if not dry_run else None, manifest, table="provider_devices", legacy_id=row["id"], source_hash=fingerprint, outcome="excluded", reason="Parent asset, supported provider, or external device ID is unavailable.")
+                continue
+            kind = DEVICE_KIND_BY_V1_TYPE.get(row["dev_type_id"])
+            if kind is None:
+                add_record(session if not dry_run else None, run if not dry_run else None, manifest, table="provider_devices", legacy_id=row["id"], source_hash=fingerprint, outcome="quarantined", reason=f"Unmapped V1 device type {row['dev_type_id']} requires review.")
+                continue
+            if dry_run:
+                add_record(None, None, manifest, table="provider_devices", legacy_id=row["id"], source_hash=fingerprint, outcome="created")
+                continue
+            try:
+                device = create_device(
+                    session,
+                    asset_id=asset.id,
+                    device_kind=kind,
+                    serial_number=row["sn"],
+                    label=row["device_name"],
+                    model=row["model"],
+                    rated_power_kw=optional_decimal(row["rated_power_kw"]),
+                    lifecycle_status="active" if row["enabled"] else "inactive",
+                )
+            except ValueError as exc:
+                add_record(session, run, manifest, table="provider_devices", legacy_id=row["id"], source_hash=fingerprint, outcome="conflict", reason=str(exc), asset=asset)
+                continue
+            connection = connections.setdefault(provider, legacy_connection(session, provider))
+            normalized_device_id = normalize_external_id(provider, row["external_device_id"])
+            collision = session.scalar(
+                select(AssetProviderMapping).where(
+                    AssetProviderMapping.provider_connection_id == connection.id,
+                    AssetProviderMapping.resource_kind == "device",
+                    AssetProviderMapping.normalized_external_id == normalized_device_id,
+                )
+            )
+            if collision is not None:
+                add_record(session, run, manifest, table="provider_devices", legacy_id=row["id"], source_hash=fingerprint, outcome="conflict", reason="Provider device is already represented by a legacy mapping.", asset=asset, device=device)
+                continue
+            parent = session.scalar(
+                select(AssetProviderMapping).where(
+                    AssetProviderMapping.provider_connection_id == connection.id,
+                    AssetProviderMapping.resource_kind == "plant",
+                    AssetProviderMapping.normalized_external_id == normalize_external_id(provider, row["station_code"]),
+                )
+            ) if row["station_code"] else None
+            try:
+                mapping = create_mapping(
+                    session,
+                    asset_id=asset.id,
+                    provider_connection_id=connection.id,
+                    external_id=row["external_device_id"],
+                    external_name=row["device_name"],
+                    mapping_status="pending_review",
+                    resource_kind="device",
+                    device_id=device.id,
+                    parent_mapping_id=parent.id if parent is not None else None,
+                    notes="Imported from V1; disabled legacy connection.",
+                )
+            except ValueError as exc:
+                add_record(session, run, manifest, table="provider_devices", legacy_id=row["id"], source_hash=fingerprint, outcome="conflict", reason=str(exc), asset=asset, device=device)
+                continue
+            add_record(session, run, manifest, table="provider_devices", legacy_id=row["id"], source_hash=fingerprint, outcome="created", asset=asset, device=device, mapping=mapping, evidence={"dev_dn": row["dev_dn"] or "", "station_code": row["station_code"] or "", "device_type": str(row["dev_type_id"])})
+
         unresolved = list(source_db.execute("SELECT id, provider, external_id, external_name, normalized_name, external_status, resolution_status FROM integration_unresolved ORDER BY id")) if "integration_unresolved" in source_tables else []
         for row in unresolved:
             fingerprint = row_hash(row, row.keys())

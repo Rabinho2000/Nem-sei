@@ -32,6 +32,18 @@ the previous mapping instead of overwriting it. Connection scope is intentional:
 cross-account collisions are reconciliation conflicts until an adapter contract
 proves provider-global identifier semantics.
 
+## Device mapping rules
+
+A device claim sets `resource_kind='device'`, carries the `device_id` it
+describes, and may record the plant claim it was discovered under in
+`parent_mapping_id`. A device must belong to the same asset as the mapping.
+Uniqueness is per connection, resource kind and normalized external ID, so a
+plant and a device may legitimately share an identifier while two devices in
+one connection may not.
+
+Plant-scoped selection is untouched: `current_mappings_for_connection` and
+`mappings_for_connection_on_date` still return plant claims only.
+
 ## V1 import
 
 Run an explicit migration first, then use the importer from the V2 environment:
@@ -43,7 +55,11 @@ python -m nemsei.assets.v1_import --v1-db /path/to/monitoring_board.db
 
 The source is opened with SQLite URI `mode=ro` and `PRAGMA query_only=ON`.
 The importer uses SQL only; it cannot import `monitoring_board` and cannot
-write V1. It reads only V1 customers, assets, aliases, and asset integrations.
+write V1. It reads only V1 customers, assets, aliases, asset integrations, and
+`provider_devices`. `provider_devices` is optional: a V1 source without it
+imports normally and records no device outcomes. A V1 device type outside the
+known inverter types is quarantined rather than guessed, and a device whose
+parent asset was not imported is excluded rather than dropped silently.
 It excludes credentials, endpoints, payloads, contracts, portfolio rows,
 monitoring data, and provider snapshots.
 

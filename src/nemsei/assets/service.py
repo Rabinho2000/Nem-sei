@@ -8,7 +8,7 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
-from nemsei.assets.models import ASSET_LIFECYCLE_STATUSES, Asset, AssetAlias, Organization
+from nemsei.assets.models import ASSET_LIFECYCLE_STATUSES, DEVICE_KINDS, Asset, AssetAlias, Device, Organization
 from nemsei.assets.repository import AssetRepository
 from nemsei.shared.clock import utc_now
 
@@ -33,6 +33,14 @@ def normalize_country_code(value: str | None) -> str | None:
     if len(normalized) != 2 or not normalized.isascii() or not normalized.isalpha():
         raise ValueError("Country code must be exactly two ASCII letters.")
     return normalized.upper()
+
+
+def normalize_serial_number(value: str | None) -> str | None:
+    """Fold a hardware serial for comparison without inventing one."""
+    if value is None:
+        return None
+    folded = "".join(character for character in value.strip().upper() if character.isalnum())
+    return folded or None
 
 
 def required_text(value: str, label: str) -> str:
@@ -134,6 +142,59 @@ def update_asset(session: Session, *, asset_id: int, canonical_name: str, owner_
     asset.address, asset.technical_notes, asset.updated_at = (address.strip() if address else None), (technical_notes.strip() if technical_notes else None), utc_now()
     session.flush()
     return asset
+
+
+def create_device(
+    session: Session,
+    *,
+    asset_id: int,
+    device_kind: str,
+    serial_number: str | None = None,
+    label: str | None = None,
+    model: str | None = None,
+    rated_power_kw: Decimal | None = None,
+    lifecycle_status: str = "unknown",
+    parent_device_id: int | None = None,
+    valid_from: date | None = None,
+    review_status: str = "clear",
+    review_note: str | None = None,
+) -> Device:
+    repository = AssetRepository(session)
+    if repository.asset(asset_id) is None:
+        raise ValueError("Unknown asset.")
+    if device_kind not in DEVICE_KINDS:
+        raise ValueError("Invalid device kind.")
+    if lifecycle_status not in ASSET_LIFECYCLE_STATUSES:
+        raise ValueError("Invalid device lifecycle status.")
+    if rated_power_kw is not None and rated_power_kw < 0:
+        raise ValueError("Rated power cannot be negative.")
+    if parent_device_id is not None:
+        parent = repository.device(parent_device_id)
+        if parent is None or parent.asset_id != asset_id:
+            raise ValueError("A parent device must belong to the same asset.")
+    normalized_serial = normalize_serial_number(serial_number)
+    if normalized_serial and repository.active_serial_claim(asset_id=asset_id, normalized_serial_number=normalized_serial):
+        raise ValueError("Device serial number is already claimed for this asset.")
+    now = utc_now()
+    device = Device(
+        asset_id=asset_id,
+        parent_device_id=parent_device_id,
+        device_kind=device_kind,
+        serial_number=serial_number.strip() if serial_number and serial_number.strip() else None,
+        normalized_serial_number=normalized_serial,
+        label=label.strip() if label else None,
+        model=model.strip() if model else None,
+        rated_power_kw=rated_power_kw,
+        lifecycle_status=lifecycle_status,
+        review_status=review_status,
+        review_note=review_note.strip() if review_note else None,
+        valid_from=valid_from or now.date(),
+        created_at=now,
+        updated_at=now,
+    )
+    repository.add(device)
+    session.flush()
+    return device
 
 
 def add_alias(

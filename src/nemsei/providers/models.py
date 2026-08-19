@@ -9,6 +9,7 @@ from nemsei.db.base import Base
 
 
 PROVIDER_CODES = ("fusionsolar", "sigenergy", "sma")
+RESOURCE_KINDS = ("plant", "device")
 CONNECTION_STATUSES = ("not_configured", "configured", "disabled")
 MAPPING_STATUSES = ("active", "superseded", "invalid", "pending_review")
 IMPORT_OUTCOMES = ("created", "reused", "quarantined", "changed_source", "conflict", "excluded", "unresolved")
@@ -49,8 +50,13 @@ class ProviderConnection(Base):
 class AssetProviderMapping(Base):
     __tablename__ = "asset_provider_mappings"
     __table_args__ = (
-        CheckConstraint("resource_kind = 'plant'", name="ck_asset_provider_mappings_resource_kind"),
+        CheckConstraint(f"resource_kind IN {RESOURCE_KINDS!r}", name="ck_asset_provider_mappings_resource_kind"),
         CheckConstraint(f"mapping_status IN {MAPPING_STATUSES!r}", name="ck_asset_provider_mappings_status"),
+        # A device claim carries its device; a plant claim never does.
+        CheckConstraint(
+            "(resource_kind = 'device') = (device_id IS NOT NULL)",
+            name="ck_asset_provider_mappings_device_link",
+        ),
         UniqueConstraint(
             "asset_id",
             "provider_connection_id",
@@ -68,10 +74,12 @@ class AssetProviderMapping(Base):
             postgresql_where=text("mapping_status = 'active' AND valid_to IS NULL"),
         ),
         Index("ix_asset_provider_mappings_asset", "asset_id", "mapping_status"),
+        Index("ix_asset_provider_mappings_device", "device_id", "mapping_status"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     asset_id: Mapped[int] = mapped_column(ForeignKey("assets.id", ondelete="RESTRICT"), nullable=False)
+    device_id: Mapped[int | None] = mapped_column(ForeignKey("devices.id", ondelete="RESTRICT"))
     provider_connection_id: Mapped[int] = mapped_column(ForeignKey("provider_connections.id", ondelete="RESTRICT"), nullable=False)
     resource_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="plant")
     external_id: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -85,6 +93,10 @@ class AssetProviderMapping(Base):
     monitoring_priority: Mapped[int | None] = mapped_column(Integer)
     production_priority: Mapped[int | None] = mapped_column(Integer)
     replaced_by_mapping_id: Mapped[int | None] = mapped_column(ForeignKey("asset_provider_mappings.id", ondelete="SET NULL"))
+    # The plant claim a device claim was discovered under, so device provenance
+    # survives a plant remapping and reconciliation can tell an orphaned claim
+    # from a legitimately re-parented one.
+    parent_mapping_id: Mapped[int | None] = mapped_column(ForeignKey("asset_provider_mappings.id", ondelete="SET NULL"))
     notes: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -123,6 +135,7 @@ class LegacyImportRecord(Base):
     evidence_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     target_organization_id: Mapped[int | None] = mapped_column(ForeignKey("organizations.id", ondelete="SET NULL"))
     target_asset_id: Mapped[int | None] = mapped_column(ForeignKey("assets.id", ondelete="SET NULL"))
+    target_device_id: Mapped[int | None] = mapped_column(ForeignKey("devices.id", ondelete="SET NULL"))
     target_mapping_id: Mapped[int | None] = mapped_column(ForeignKey("asset_provider_mappings.id", ondelete="SET NULL"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 

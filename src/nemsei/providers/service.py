@@ -13,6 +13,7 @@ from nemsei.providers.audit import record_operator_action
 from nemsei.providers.models import (
     CONNECTION_STATUSES,
     MAPPING_STATUSES,
+    RESOURCE_KINDS,
     AssetProviderMapping,
     ProviderConnection,
     LegacyImportRecord,
@@ -142,6 +143,9 @@ def create_mapping(
     production_priority: int | None = None,
     mapping_status: str = "active",
     notes: str | None = None,
+    resource_kind: str = "plant",
+    device_id: int | None = None,
+    parent_mapping_id: int | None = None,
 ) -> AssetProviderMapping:
     assets = AssetRepository(session)
     providers = ProviderRepository(session)
@@ -152,6 +156,18 @@ def create_mapping(
         raise ValueError("Unknown provider connection.")
     if mapping_status not in MAPPING_STATUSES:
         raise ValueError("Invalid provider mapping status.")
+    if resource_kind not in RESOURCE_KINDS:
+        raise ValueError("Invalid provider resource kind.")
+    if (resource_kind == "device") != (device_id is not None):
+        raise ValueError("A device mapping requires a device; a plant mapping cannot carry one.")
+    if device_id is not None:
+        device = assets.device(device_id)
+        if device is None or device.asset_id != asset_id:
+            raise ValueError("A device mapping must reference a device of the same asset.")
+    if parent_mapping_id is not None:
+        parent = providers.mapping(parent_mapping_id)
+        if parent is None or parent.resource_kind != "plant":
+            raise ValueError("A device mapping parent must be a plant mapping.")
     external_id = external_id.strip()
     if not external_id:
         raise ValueError("Provider external ID is required.")
@@ -161,9 +177,14 @@ def create_mapping(
         claimed = providers.active_external_claim(
             connection_id=connection.id,
             normalized_external_id=normalize_external_id(connection.provider_code, external_id),
+            resource_kind=resource_kind,
         )
         if claimed is not None:
-            raise ValueError("Provider plant is already actively mapped to another asset.")
+            raise ValueError(
+                "Provider device is already actively mapped to another asset."
+                if resource_kind == "device"
+                else "Provider plant is already actively mapped to another asset."
+            )
     if any(priority is not None and priority <= 0 for priority in (monitoring_priority, production_priority)):
         raise ValueError("Source priorities must be positive.")
     now = utc_now()
@@ -172,8 +193,10 @@ def create_mapping(
         raise ValueError("Mapping valid_to cannot precede valid_from.")
     mapping = AssetProviderMapping(
         asset_id=asset_id,
+        device_id=device_id,
         provider_connection_id=connection.id,
-        resource_kind="plant",
+        resource_kind=resource_kind,
+        parent_mapping_id=parent_mapping_id,
         external_id=external_id,
         normalized_external_id=normalize_external_id(connection.provider_code, external_id),
         external_name=external_name.strip() if external_name else None,
@@ -308,6 +331,9 @@ def replace_mapping(
         valid_from=effective,
         monitoring_priority=previous.monitoring_priority,
         production_priority=previous.production_priority,
+        resource_kind=previous.resource_kind,
+        device_id=previous.device_id,
+        parent_mapping_id=previous.parent_mapping_id,
     )
     previous.mapping_status = "superseded"
     previous.valid_to = effective
