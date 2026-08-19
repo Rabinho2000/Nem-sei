@@ -32,7 +32,7 @@ depends on it.
 | **M5.1** | Financial model parsing with full provenance, golden parity on the real workbook | **done** |
 | M5.2 | Financial models persisted and versioned in PostgreSQL: source file, hash, cell provenance, derivation rules, warnings, base-year origin | **done** |
 | M5.3 | Commercial rules: tariffs, ESCO/EPC, billing, client outages | **done** |
-| M5.4 | Expected production, availability, data quality and the quality gate | next |
+| M5.4 | Expected production, availability, data quality and the quality gate | **partly done**: quality rules ported, availability and energy facts pending |
 | M5.5 | `ReportingDataset` and `ReportSnapshot`, reproducible from persisted facts alone | |
 | M5.6 | Excel and PDF rendering, visual and numerical parity | |
 | M5.7 | End-to-end golden tests V1 versus V2, with every difference explained | |
@@ -164,3 +164,18 @@ declared rather than worked around, and it is paired with a new check that no
 V2 **source** file reaches V1 dynamically either: the source tree may name V1 in
 a docstring, which several ports usefully do, but never in a string the code
 could act on.
+
+## M5.4 in part: the quality rules
+
+`quality_gate.py`, `data_quality.py` and `validation.py` carry no SQL at all, so
+they ported into `rules/` like the commercial ones. These are the rules that stop
+a wrong number reaching a customer, so parity is asserted on the whole verdict
+object rather than on a summary: thirty-one cases compare V1 and V2 findings
+field by field across seven month shapes, a mid-month and an after-close
+reference date, both report scopes, and both expected-production settings.
+
+Two modules of this phase remain: `services/energy_facts.py` and
+`services/sampled_availability.py`. Unlike everything ported so far they speak
+SQLite directly, with 24 and 46 lines of query code, so they cannot be copied.
+Their calculations have to be separated from their persistence before they can
+be carried over, which is the next slice rather than a rewrite done in passing.
