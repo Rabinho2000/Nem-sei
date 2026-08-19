@@ -32,6 +32,13 @@ class FakeTransport:
         value = self.responses.pop(0)
         if isinstance(value, Exception):
             raise value
+        # The real endpoint answers with one row per day of the month, each
+        # carrying its own collectTime. These fixtures describe the requested
+        # day, so stamp it; multi-day attribution has its own test file.
+        if "collectTime" in payload and isinstance(getattr(value, "payload", None), dict):
+            for entry in value.payload.get("data") or []:
+                if isinstance(entry, dict) and "collectTime" not in entry:
+                    entry["collectTime"] = payload["collectTime"]
         return value
 
 

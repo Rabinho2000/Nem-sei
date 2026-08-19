@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone as datetime_timezone
 from decimal import Decimal, InvalidOperation
 from itertools import islice
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -49,6 +49,10 @@ class DailyProductionSample:
     value: Decimal | None
     quality: str
     completeness: str
+    # The instant the row says it describes. `getKpiStationDay` answers with one
+    # row per day of the month, all carrying the same station code, so a row can
+    # only be attributed to a source day by its own timestamp.
+    source_timestamp: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -99,18 +103,25 @@ def normalize_daily_production_row(row: dict) -> DailyProductionSample:
     external_id = str(row.get("stationCode") or row.get("plantCode") or "").strip()
     if not external_id:
         raise ValueError("FusionSolar daily production row has no station code.")
+    collected_at = row.get("collectTime")
+    source_timestamp: datetime | None = None
+    if collected_at is not None:
+        try:
+            source_timestamp = datetime.fromtimestamp(int(collected_at) / 1000, datetime_timezone.utc)
+        except (TypeError, ValueError, OSError, OverflowError) as exc:
+            raise ValueError("FusionSolar daily row has an invalid collectTime.") from exc
     values = row.get("dataItemMap")
     values = values if isinstance(values, dict) else {}
     raw_value = values.get("PVYield")
     if raw_value is None or (isinstance(raw_value, str) and not raw_value.strip()):
-        return DailyProductionSample(external_id, None, "missing", "partial")
+        return DailyProductionSample(external_id, None, "missing", "partial", source_timestamp)
     try:
         value = Decimal(str(raw_value).strip())
     except (InvalidOperation, ValueError) as exc:
         raise ValueError("FusionSolar daily PVYield is not numeric.") from exc
     if not value.is_finite() or value < 0:
         raise ValueError("FusionSolar daily PVYield is invalid.")
-    return DailyProductionSample(external_id, value, "complete", "complete")
+    return DailyProductionSample(external_id, value, "complete", "complete", source_timestamp)
 
 
 class FusionSolarProductionService:
@@ -327,7 +338,7 @@ class FusionSolarProductionService:
         if error:
             return self._finish(run.id, connection_id, requested_from, requested_until, expected, 0, 0, selection_findings, error, mode=mode)
 
-        received = accepted = rejected = 0
+        received = accepted = rejected = out_of_window = 0
         first_error: ProviderError | None = None
         incomplete = bool(selection_findings)
         for source_day in _days(requested_from, requested_until):
@@ -338,6 +349,7 @@ class FusionSolarProductionService:
             received += outcome.received
             accepted += outcome.accepted
             rejected += outcome.rejected
+            out_of_window += outcome.out_of_window
             incomplete = incomplete or outcome.partial
             if outcome.error:
                 first_error = outcome.error
@@ -371,7 +383,9 @@ class FusionSolarProductionService:
     ) -> "_DayOutcome":
         expected = {mapping.normalized_external_id: mapping for mapping in selected}
         samples: dict[str, DailyProductionSample] = {}
-        received = rejected = 0
+        received = rejected = out_of_window = 0
+        window_start = datetime.combine(source_day, time.min, tzinfo=contract.source_timezone)
+        window_end = window_start + timedelta(days=1)
         for batch in _batches(selected, _MAX_BATCH):
             rows, error = self._calls.call(
                 connection_id=connection_id,
@@ -384,7 +398,7 @@ class FusionSolarProductionService:
             )
             if error:
                 accepted = self._persist_day(run_id, source_day, contract, expected, samples)
-                return _DayOutcome(received, accepted, rejected, True, error)
+                return _DayOutcome(received, accepted, rejected, True, error, out_of_window)
             assert rows is not None
             for row in rows:
                 received += 1
@@ -394,7 +408,20 @@ class FusionSolarProductionService:
                 except ValueError:
                     rejected += 1
                     continue
-                if normalized not in expected or normalized in samples:
+                if normalized not in expected:
+                    rejected += 1
+                    continue
+                # One request answers with a row per day of the month, every row
+                # carrying the same station code. A row belongs to this source
+                # day only if its own timestamp says so; without one it cannot be
+                # attributed at all.
+                if sample.source_timestamp is None:
+                    rejected += 1
+                    continue
+                if not window_start <= sample.source_timestamp < window_end:
+                    out_of_window += 1
+                    continue
+                if normalized in samples:
                     rejected += 1
                     continue
                 samples[normalized] = sample
@@ -402,7 +429,7 @@ class FusionSolarProductionService:
         # A matching row with PVYield absent is persisted as an explicit missing
         # fact, but its source day remains incomplete and cannot advance cursor.
         partial = len(samples) != len(expected) or any(sample.completeness != "complete" for sample in samples.values())
-        return _DayOutcome(received, accepted, rejected, partial, None)
+        return _DayOutcome(received, accepted, rejected, partial, None, out_of_window)
 
     def _persist_day(
         self,
@@ -618,6 +645,8 @@ class _DayOutcome:
     rejected: int
     partial: bool
     error: ProviderError | None
+    # Rows for other days of the same month: legitimate provider data, not a defect.
+    out_of_window: int = 0
 
 
 def _can_extend_cursor(
