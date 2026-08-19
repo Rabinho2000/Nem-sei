@@ -160,3 +160,73 @@ idempotent: an unchanged membership reuses its snapshot, and a rebuilt dataset
 over unchanged facts produces the same `input_digest`. A monthly job therefore
 needs scheduling, not new calculation, which is what M9 will wire up.
 
+## Reviewing and resolving unresolved members (added 2026-08-19)
+
+The settings page's original "type an asset id" form asked an operator to know
+an installation's numeric id by heart, which is neither simple nor auditable in
+practice. `/portfolios/<id>/members/review` replaces it: one card per open,
+unresolved member, each with whatever evidence exists — an exact NIF match
+against a V2 organization (which names the *customer*, never the installation,
+so it lists that customer's own assets to choose from) and a name search over
+assets using the same `asset_search_clause` the rest of the product searches
+with. Nothing on the page resolves a member by itself; `resolve_member_to_asset`
+is still the only path from `unresolved` to `resolved`, and it still takes an
+explicit id and records who chose it.
+
+Resolving to an asset already claimed by an overlapping membership in the same
+portfolio is rejected with a plain message rather than a raw database error —
+the exclusion constraint that stops a plant being counted twice now surfaces as
+something an operator can read.
+
+## The monthly workflow (added 2026-08-19)
+
+`portfolio_report_runs` and `portfolio_report_run_members` (migration
+`0014_portfolio_report_runs`) turn "the numbers for July" into an operational
+decision: **gerar -> rever -> aprovar**, sitting on top of the coverage check
+("Construir") that already existed.
+
+- **Generating** rebuilds the aggregate, then produces an individual report for
+  every member with an asset and any production fact in the period, through
+  `assemble_asset_report` + `snapshot_dataset` — the exact path an individual
+  report uses standing alone. A member with zero production facts is `blocked`
+  with a stated reason rather than handed an empty document.
+- **Regenerating** before approval is safe and expected: it replaces the run's
+  members against whatever facts exist now, and sends a `reviewed` run back to
+  `generated`, because a review is a statement about the numbers it was shown
+  and stops being true the moment they change.
+- **Approving** is final. A database trigger refuses to update or delete an
+  approved run, or any of its members, mirroring the guarantee
+  `report_snapshots` and `portfolio_snapshots` already give the records
+  beneath it. No distribution happens from this layer — that is deliberately
+  later work — but a scheduler will eventually read exactly this state to
+  decide whether a period needs attention at all.
+
+### Two structural bugs this surfaced, fixed at the cause
+
+Wiring the workflow to real HTTP requests — not just to unit tests calling the
+service functions directly — found two bugs neither prior test had reached:
+
+1. **`snapshot_dataset`'s own promise was false.** Its docstring says
+   "re-freezing identical input reuses it," but the digest it computed included
+   `payload["dataset_id"]`, the primary key of a `ReportingDataset` row that is
+   never deduplicated — two builds of the same unchanged facts get two
+   different ids. Every regeneration therefore looked like new content, and a
+   customer would receive a report reissued from scratch every time it was
+   asked for again. The digest now excludes that one bookkeeping field; the
+   stored payload still keeps it for provenance. `test_report_assembler.py`
+   pins the fix by assembling and freezing a real period's report twice.
+2. **A period-end convention mismatch made a freshly generated run invisible.**
+   `PortfolioSnapshot` and `PortfolioDataset` both key a period by its
+   **exclusive** end (`exclusive_end(period)`); `generate_report_run` wrote the
+   run with `ReportingPeriod`'s own **inclusive** end. The row existed, but
+   every subsequent lookup — including the one the "reports" tab itself uses —
+   searched for the wrong date and found nothing, so a portfolio's own
+   dashboard showed "not generated yet" for a period that had just been
+   generated. Caught only by a browser-level test that generated a run and
+   then reloaded the page, exactly as an operator would.
+
+Also fixed: `resolve_member_to_asset` now catches the exclusion-constraint
+violation from resolving into an asset that already overlaps, inside a nested
+transaction, and turns it into a clear `ValueError` instead of leaving a raw
+`IntegrityError` to abort whatever the caller's outer transaction was doing.
+

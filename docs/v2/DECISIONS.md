@@ -121,3 +121,32 @@ and `portfolio_report_profiles`, surveyed read-only on 2026-08-19 and recorded i
   sum of the 18 and a coverage of 18/20. A smaller total that looks complete is
   the most expensive wrong number a portfolio report can carry.
 
+## The monthly reporting workflow and the top-level Reporting UI (2026-08-19)
+
+- **A run has no stored "draft" state.** Validating coverage is a read against
+  data that already exists (`freeze_snapshot` + `build_portfolio_dataset`,
+  both idempotent); a `portfolio_report_runs` row only starts existing once an
+  operator actually generates it. `generated -> reviewed -> approved`.
+- **Regenerating before approval is expected, not an error.** It replaces the
+  run's members against current facts and resets a `reviewed` run back to
+  `generated`, because a review is a statement about the numbers it was shown.
+- **An approved run is locked by a database trigger**, not only by the service
+  layer — the same append-only guarantee `report_snapshots` and
+  `portfolio_snapshots` already give the records beneath it, extended to the
+  decision itself and to which members it covered.
+- **A member with zero production facts is `blocked` with a stated reason,
+  not generated with an empty document.** Partial coverage, a missing tariff,
+  a defaulted report type still generate — those are exactly what
+  `unavailable_fields` and the coverage counts exist to surface.
+- **`snapshot_dataset`'s digest excludes `payload["dataset_id"]`.**
+  `ReportingDataset` is never deduplicated, so two builds of the same
+  unchanged facts get two different row ids; hashing that id meant "re-freezing
+  identical input reuses it" was never actually true for a real payload. The
+  row id stays in the *stored* payload for provenance and is excluded only
+  from what decides whether a new snapshot is needed.
+- **The Reporting UI is one blueprint (`reporting_bp`) reading what already
+  exists.** It computes nothing: individual generation goes through
+  `assemble_asset_report` + `snapshot_dataset`, the same path the portfolio
+  workflow and the golden tests use. Downloads render on request from the
+  frozen `payload_json`, rehydrated through `rehydrate_snapshot_payload`.
+

@@ -8,8 +8,12 @@ It also holds persisted financial models, reporting datasets and snapshots, the
 ported reporting rules, both renderers, and the assembly layer between them. It
 intentionally excludes realtime production/performance calculations and
 automation/distribution. Portfolios now exist with temporal membership, dynamic
-rules, frozen snapshots and an aggregate dataset built from the per-asset
-reports.
+rules, frozen snapshots, an aggregate dataset built from the per-asset reports,
+a monthly gerar/rever/aprovar workflow, and a dedicated screen for reviewing
+and resolving members with no installation yet. Reporting has a real web
+surface at `/reports` — individual and portfolio reports, generated, listed,
+and downloaded as PDF or Excel from the browser — where previously generating
+one meant calling a Python function directly.
 
 A complete asset report can be produced from V2's database alone.
 `production_facts` carries five energy metrics, tariffs and billing
