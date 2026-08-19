@@ -17,6 +17,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Iterable
 
+from reportlab.lib.colors import Color, HexColor
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -256,6 +257,70 @@ def _row_digest_payload(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def json_safe(value: Any) -> Any:
+    """Recursively reduce a payload to what the JSON column can actually store.
+
+    `assemble_asset_report`'s payload carries real `date` objects, because that
+    is what the renderers want to format, and `customer_pdf.prepare_customer_report`
+    always adds `tariff_rows`, a list of `(label, value, reportlab.lib.colors.Color)`
+    tuples used to draw the donut chart. PostgreSQL's JSON column has no opinion
+    on how to serialize either, and SQLAlchemy does not fall back to `str()` the
+    way `digest_of` does — it raises. This is the one place that decides the
+    on-disk representation, applied uniformly so the same payload always
+    produces the same stored JSON and the same digest.
+    """
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, Color):
+        # A round-trippable hex string, not a description: `HexColor(hexval())`
+        # reconstructs the identical Color, which matters because the renderer
+        # compares colors by equality (`if color == NAVY`) to apply theming.
+        return value.hexval()
+    return value
+
+
+def rehydrate_snapshot_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Reverse the two lossy steps of `json_safe`.
+
+    `daily_rows[].date`: every other date-bearing field is only ever read back
+    through `str()` or an f-string in the renderers, and an ISO date string
+    sorts and prints exactly like the `date` it replaced. This field is the
+    exception — `customer_pdf.py` filters rows with
+    `isinstance(row["date"], date)` to draw the daily chart, so a snapshot
+    reopened without this step would render with its chart silently empty.
+
+    `tariff_rows[][2]`: stored as a hex string; reopened as the same
+    `reportlab.lib.colors.Color` the live payload carried, or the donut and
+    the client-outage chart would draw in whatever reportlab's default fill is
+    instead of the report's own palette, and `_themed_color`'s
+    `color == NAVY`-style comparisons would silently stop matching.
+    """
+    rehydrated = dict(payload)
+    daily_rows = rehydrated.get("daily_rows")
+    if isinstance(daily_rows, list):
+        rehydrated["daily_rows"] = [
+            {**row, "date": date.fromisoformat(row["date"])}
+            if isinstance(row, dict) and isinstance(row.get("date"), str)
+            else row
+            for row in daily_rows
+        ]
+    tariff_rows = rehydrated.get("tariff_rows")
+    if isinstance(tariff_rows, list):
+        rehydrated["tariff_rows"] = [
+            (row[0], row[1], HexColor(row[2]))
+            if isinstance(row, (list, tuple)) and len(row) == 3 and isinstance(row[2], str)
+            else row
+            for row in tariff_rows
+        ]
+    return rehydrated
+
+
 def snapshot_dataset(
     session: Session,
     *,
@@ -271,7 +336,17 @@ def snapshot_dataset(
         raise ValueError("A snapshot must record who created it.")
     if dataset.status != "ready":
         raise ValueError("Only a ready dataset can be snapshotted.")
-    snapshot_digest = digest_of({"dataset": dataset.input_digest, "payload": payload})
+    payload = json_safe(payload)
+    # `assemble_asset_report` embeds `dataset_id`, the primary key of the
+    # `ReportingDataset` row it happened to build. `build_dataset` is never
+    # deduplicated — two calls over the same unchanged facts get two different
+    # ids — so hashing it would mean "identical input" could never actually
+    # reuse a snapshot: every regeneration would look new even when nothing
+    # about the facts changed. `dataset.input_digest`, already part of what is
+    # hashed below, is the content-stable identity; the row id is bookkeeping,
+    # kept in the stored payload for provenance but excluded from the digest.
+    digest_payload = {key: value for key, value in payload.items() if key != "dataset_id"}
+    snapshot_digest = digest_of({"dataset": dataset.input_digest, "payload": digest_payload})
     existing = session.scalar(select(ReportSnapshot).where(ReportSnapshot.snapshot_digest == snapshot_digest))
     if existing is not None:
         return existing

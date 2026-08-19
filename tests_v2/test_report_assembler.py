@@ -26,7 +26,7 @@ from nemsei.reporting.assembler import (
     excel_payload_from_report,
 )
 from nemsei.reporting.customer_pdf import build_customer_report_pdf
-from nemsei.reporting.datasets import build_dataset
+from nemsei.reporting.datasets import build_dataset, rehydrate_snapshot_payload, snapshot_dataset
 from nemsei.reporting.excel import build_asset_report_workbook
 from nemsei.reporting.periods import build_period, monthly_period
 from nemsei.reporting.rules.types import ReportPeriodType
@@ -270,3 +270,116 @@ def test_a_zero_percent_donut_renders_instead_of_crashing(prepared) -> None:
     assert payload["self_sufficiency_pct"] == 0
     pdf_bytes = build_customer_report_pdf(payload)
     assert pdf_bytes[:5] == b"%PDF-"
+
+
+def test_a_real_assembled_payload_can_actually_be_frozen(prepared) -> None:
+    """`assemble_asset_report`'s payload carries real `date` objects.
+
+    `snapshot_dataset` stores it in a JSON column, which has no idea how to
+    serialize a `date` and previously raised `TypeError` on every real payload —
+    `report_snapshots` held zero rows in production for exactly this reason.
+    Freezing an individual report never actually worked end to end until this
+    was fixed at the source, in `snapshot_dataset` itself.
+    """
+    factory, (asset_id, mapping_id) = prepared
+    with factory() as session, session.begin():
+        for day, value in ((date(2026, 7, 10), "40"), (date(2026, 7, 11), "60")):
+            add_fact(session, asset_id, mapping_id, day, value)
+        assembled = assemble_asset_report(
+            session, asset_id=asset_id, period=monthly_period("2026-07"), built_by="operator"
+        )
+        snapshot = snapshot_dataset(
+            session, dataset=assembled.dataset, payload=assembled.payload, created_by="operator"
+        )
+        snapshot_id = snapshot.id
+        digest = snapshot.snapshot_digest
+
+    with factory() as session:
+        from nemsei.reporting.models import ReportSnapshot
+
+        stored = session.get(ReportSnapshot, snapshot_id)
+        assert stored.snapshot_digest == digest
+        # Stored as ISO strings: readable outside Python, and what makes the
+        # JSON column accept it in the first place.
+        assert stored.payload_json["period_start"] == "2026-07-01"
+        assert isinstance(stored.payload_json["daily_rows"][0]["date"], str)
+        # `prepare_customer_report` always adds tariff_rows carrying a
+        # reportlab Color; that is the other value the JSON column rejects.
+        assert isinstance(stored.payload_json["tariff_rows"][0][2], str)
+        assert stored.payload_json["tariff_rows"][0][2].startswith("0x")
+
+
+def test_regenerating_an_unchanged_period_reuses_the_same_snapshot(prepared) -> None:
+    """"Re-freezing identical input reuses it" is the docstring's promise.
+
+    `build_dataset` is never deduplicated — two calls over the same facts
+    produce two different `ReportingDataset` rows — and `assemble_asset_report`
+    embeds that row's id in the payload. Hashing the id along with everything
+    else meant no real payload could ever match a prior one: every
+    regeneration looked new even when nothing about the facts had changed.
+    """
+    factory, (asset_id, mapping_id) = prepared
+    with factory() as session, session.begin():
+        add_fact(session, asset_id, mapping_id, date(2026, 7, 10), "40")
+        first_assembled = assemble_asset_report(
+            session, asset_id=asset_id, period=monthly_period("2026-07"), built_by="operator"
+        )
+        first = snapshot_dataset(
+            session, dataset=first_assembled.dataset, payload=first_assembled.payload, created_by="operator"
+        )
+        first_id = first.id
+
+    with factory() as session, session.begin():
+        # A fresh build of the same unchanged facts: a new ReportingDataset row,
+        # a new dataset_id in the payload, but the same content.
+        second_assembled = assemble_asset_report(
+            session, asset_id=asset_id, period=monthly_period("2026-07"), built_by="operator"
+        )
+        assert second_assembled.dataset.id != first_assembled.dataset.id
+        second = snapshot_dataset(
+            session, dataset=second_assembled.dataset, payload=second_assembled.payload, created_by="operator"
+        )
+
+    assert second.id == first_id
+
+
+def test_a_reopened_snapshot_still_draws_its_daily_chart(prepared) -> None:
+    """The one field storage cannot round-trip losslessly: `daily_rows[].date`.
+
+    `customer_pdf.py` keeps a daily row only when `isinstance(row["date"], date)`
+    holds. Reopen a snapshot without rehydrating that field and every daily row
+    is silently dropped — the frozen record of what a customer was told would
+    render with an empty chart, which defeats the entire point of freezing it.
+    """
+    factory, (asset_id, mapping_id) = prepared
+    with factory() as session, session.begin():
+        for day, value in ((date(2026, 7, 10), "40"), (date(2026, 7, 11), "60")):
+            add_fact(session, asset_id, mapping_id, day, value)
+        assembled = assemble_asset_report(
+            session, asset_id=asset_id, period=monthly_period("2026-07"), built_by="operator"
+        )
+        live_pdf = build_customer_report_pdf(assembled.payload)
+        snapshot = snapshot_dataset(
+            session, dataset=assembled.dataset, payload=assembled.payload, created_by="operator"
+        )
+        snapshot_id = snapshot.id
+
+    with factory() as session:
+        from nemsei.reporting.models import ReportSnapshot
+
+        stored = session.get(ReportSnapshot, snapshot_id)
+        rehydrated = rehydrate_snapshot_payload(stored.payload_json)
+
+    assert [row["date"] for row in rehydrated["daily_rows"]] == [date(2026, 7, 10), date(2026, 7, 11)]
+    # The colour that decides the donut chart's theming survives the round
+    # trip as the identical Color, not a lookalike with a different identity.
+    from reportlab.lib.colors import Color
+
+    assert isinstance(rehydrated["tariff_rows"][0][2], Color)
+    assert rehydrated["tariff_rows"][0][2] == assembled.payload["tariff_rows"][0][2]
+
+    reopened_pdf = build_customer_report_pdf(rehydrated)
+    assert reopened_pdf[:5] == b"%PDF-"
+    # A page that silently dropped its chart is a materially smaller document,
+    # not merely a byte-identical one (reportlab stamps a creation time).
+    assert len(reopened_pdf) > len(live_pdf) * 0.9

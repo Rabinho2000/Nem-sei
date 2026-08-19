@@ -174,8 +174,3 @@ def build_asset_report_workbook(payload: dict[str, Any]) -> Workbook:
     _header_row(metadata, 2, 2)
     _apply_widths(metadata)
     return workbook
-
-
-def payload_from_snapshot(snapshot_payload: dict[str, Any]) -> dict[str, Any]:
-    """A snapshot payload already is the report payload; kept as the seam."""
-    return snapshot_payload
