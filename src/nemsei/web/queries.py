@@ -5,11 +5,11 @@ from collections import Counter, defaultdict
 from math import ceil
 from typing import Any
 
-from sqlalchemy import Select, exists, func, or_, select
+from sqlalchemy import Select, exists, func, select
 from sqlalchemy.orm import Session
 
 from nemsei.assets.models import Asset, AssetAlias, Organization
-from nemsei.assets.service import normalize_name
+from nemsei.assets.service import asset_search_clause, normalize_name
 from nemsei.monitoring.models import MonitoringObservation, ProductionFact
 from nemsei.providers.models import AssetProviderMapping, LegacyImportRecord, ProviderConnection
 from nemsei.providers.registry import descriptor_for
@@ -50,28 +50,9 @@ def _pagination(*, page: int, per_page: int, total: int) -> dict[str, Any]:
     }
 
 
-def _asset_search_clause(search: str):
-    normalized = normalize_name(search)
-    if not normalized:
-        return None
-    pattern = f"%{normalized}%"
-    alias_match = exists(
-        select(1).where(
-            AssetAlias.asset_id == Asset.id,
-            AssetAlias.active.is_(True),
-            AssetAlias.normalized_alias.ilike(pattern),
-        )
-    )
-    return or_(
-        Asset.normalized_name.ilike(pattern),
-        func.lower(Organization.display_name).ilike(pattern),
-        alias_match,
-    )
-
-
 def _asset_filters(*, search: str, needs_review: str, provider: str, mapping: str) -> list[Any]:
     filters: list[Any] = []
-    search_clause = _asset_search_clause(search)
+    search_clause = asset_search_clause(search)
     if search_clause is not None:
         filters.append(search_clause)
     if needs_review == "yes":

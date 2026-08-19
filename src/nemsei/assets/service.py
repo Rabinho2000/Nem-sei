@@ -6,6 +6,7 @@ import unicodedata
 from datetime import date
 from decimal import Decimal
 
+from sqlalchemy import exists, func, or_, select
 from sqlalchemy.orm import Session
 
 from nemsei.assets.models import ASSET_LIFECYCLE_STATUSES, DEVICE_KINDS, Asset, AssetAlias, Device, Organization
@@ -16,6 +17,28 @@ from nemsei.shared.clock import utc_now
 def normalize_name(value: str) -> str:
     folded = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii").lower()
     return " ".join("".join(character if character.isalnum() else " " for character in folded).split())
+
+
+def asset_search_clause(search: str):
+    """A name/alias/owner match clause, shared by every screen that searches
+    assets by free text, so "search for an asset" means one thing everywhere.
+    """
+    normalized = normalize_name(search)
+    if not normalized:
+        return None
+    pattern = f"%{normalized}%"
+    alias_match = exists(
+        select(1).where(
+            AssetAlias.asset_id == Asset.id,
+            AssetAlias.active.is_(True),
+            AssetAlias.normalized_alias.ilike(pattern),
+        )
+    )
+    return or_(
+        Asset.normalized_name.ilike(pattern),
+        func.lower(Organization.display_name).ilike(pattern),
+        alias_match,
+    )
 
 
 def normalize_tax_id(value: str | None) -> str | None:
