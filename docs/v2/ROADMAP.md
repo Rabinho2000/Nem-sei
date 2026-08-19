@@ -78,7 +78,7 @@ Rules:
 | M5 | Portfolios with validity periods (§9) | M1 | unassigned |
 | M6 | Canonical production and aggregation: MTD, YTD, monthly (§8) | M2 | unassigned |
 | M7 | Alarms, normalised status, operational dashboard (§6, §12) | M2, M6 | unassigned |
-| M8 | Reporting rebuilt on persisted canonical data (§10) | M5, M6 | unassigned |
+| M8 | Reporting rebuilt on persisted canonical data (§10) | M5, M6 | unassigned (financial source evidence surveyed — see `FINANCIAL_MODEL_SOURCES.md`) |
 | M9 | Automations, notifications, digests, scheduled reports (§11, §14) | M7, M8 | unassigned |
 
 This sequence departs from the order implied by `GOAL.md` in one place: the
