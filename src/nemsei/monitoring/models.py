@@ -13,7 +13,18 @@ from nemsei.db.base import Base
 OBSERVATION_CONDITIONS = ("operational", "warning", "fault", "offline", "unknown")
 FRESHNESS_STATES = ("fresh", "stale", "unknown")
 QUALITY_STATES = ("complete", "partial", "missing", "invalid", "unknown")
-PRODUCTION_METRICS = ("production_energy",)
+# The energy signals a report needs. Each one is a metric a provider states in
+# its own payload; none is derived from another, because the identity
+# production = self_use + export holds for FusionSolar and does *not* hold for
+# Sigenergy, where a battery absorbs the difference. Deriving would quietly
+# invent a number for every plant that stores energy.
+PRODUCTION_METRICS = (
+    "production_energy",
+    "self_use_energy",
+    "export_energy",
+    "consumption_energy",
+    "grid_import_energy",
+)
 
 
 class MonitoringObservation(Base):

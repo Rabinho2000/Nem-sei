@@ -9,13 +9,20 @@ ported reporting rules, both renderers, and the assembly layer between them. It
 intentionally excludes portfolio membership, realtime production/performance
 calculations, and automation/distribution.
 
-A report can be produced from V2's database alone, but not yet one a customer
-could receive. `production_facts` carries a single metric, `production_energy`,
-so self-consumption, export, consumption and grid import have no source. There
-are no tariff or billing-configuration tables, and `Asset` carries no commercial
-attributes, so report type falls back to EPC rather than being resolved. Every
-such field is emitted as `None` and named in the payload's `unavailable_fields`
-rather than rendered as a zero. `REPORTING_PARITY.md` lists all twenty-one.
+A complete asset report can be produced from V2's database alone.
+`production_facts` carries five energy metrics, tariffs and billing
+configuration are persisted with temporal validity, and `Asset` holds the
+contract attributes that resolve EPC against ESCO. What remains without any
+source is named in every payload's `unavailable_fields`: the four self-use
+splits by tariff period, which no provider V2 talks to states, and
+`availability_pct`, which needs device-level facts.
+
+Two limits are worth stating plainly. The additional energy metrics enter V2 by
+importing payloads V1 already stored; the **live** FusionSolar contract is still
+verified for `PVYield` only, so a plant with no V1 history has production and
+nothing else until those signals are verified per connection. And a tariff
+prices energy without stating a euro total, because V1 computes that from hourly
+rows split by tariff period and V2 holds no hourly facts.
 
 Devices exist as canonical identity only. Just the `inverter` kind is populated,
 because every V1 device is an inverter; meters, dataloggers and string boxes are

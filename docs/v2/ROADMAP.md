@@ -22,9 +22,11 @@ cutover.
 V2 runs on port 5002 from this worktree with PostgreSQL 16 and separate web,
 scheduler and worker processes, at Alembic revision `0011_reporting_datasets`.
 It holds imported identity data — 266 assets, 325 devices, 214 organizations,
-134 provider mappings — and **almost no facts**: the FusionSolar canary produced
-one monitoring observation and one production fact, the latter corrected once,
-so `production_facts` holds two rows describing a single day of a single plant.
+134 provider mappings — the contract attributes and commercial terms imported
+from V1, and daily energy facts imported from the provider payloads V1 stored.
+Only one of those facts came from a live V2 provider call: the FusionSolar
+canary's single corrected day. Everything else is V1 evidence, marked as such in
+each fact's metadata.
 
 That remains the most important scheduling fact in this document. The fact
 tables are still effectively empty, so structural changes to the canonical model
@@ -50,9 +52,9 @@ commercial attributes on `Asset`.
 | §1 Canonical model | **incomplete** | flat `Organization → Asset → AssetAlias`; no site/plant/device hierarchy |
 | §16 AuthN/AuthZ | not started | single configured administrator password hash; no users, no permissions |
 | §9 Portfolios | not started | — |
-| §8 Production | facts and expected production | `production_facts` holds daily energy with revision supersession; expected production comes from confirmed financial models; only `production_energy` exists as a metric |
+| §8 Production | facts and expected production | `production_facts` holds five daily energy metrics with revision supersession; expected production comes from confirmed financial models |
 | §6 §12 §13 Monitoring board, alarms, incidents | not started | — |
-| §10 Reporting | mostly built, blocked on facts | rules, datasets, snapshots, both renderers and `reporting/assembler.py`; see `REPORTING_PARITY.md` |
+| §10 Reporting | asset report complete | rules, datasets, snapshots, both renderers, `reporting/assembler.py`, and the tariff/billing/contract inputs it reads; see `REPORTING_PARITY.md` |
 | §11 Automated reporting | not started | — |
 | §14 Automations and notifications | not started | — |
 | §24 V1 migration | identity only | `MIGRATION_MATRIX.md` is still a stub; import residue unresolved |
@@ -83,7 +85,7 @@ Rules:
 | M2 | First real FusionSolar sync: one connection, small plant subset, read-only, end-to-end evidence | M1 | Claude (canary validated 2026-08-19; portfolio rollout needs a V2-only account — see `FUSIONSOLAR_CANARY.md`) |
 | M3 | Close the identity migration: resolve conflicts, quarantines and unresolved rows; fill `MIGRATION_MATRIX.md` | — (parallel) | Claude (done, five plants pending an operator ruling) |
 | M4 | Users and permissions (§16) plus audit events that actually get written (§17) | M2 | unassigned |
-| M5 | **Reporting rebuilt on persisted canonical data (§10)** — the milestone actually in progress; its phases are M5.1–M5.7 in `REPORTING_PARITY.md` | M1 | Claude (M5.1–M5.6 done; M5.7 assembly built, blocked on facts) |
+| M5 | **Reporting rebuilt on persisted canonical data (§10)** — its phases are M5.1–M5.7 in `REPORTING_PARITY.md` | M1 | Claude (done for the asset report; portfolio reporting waits on M8) |
 | M6 | Canonical production and aggregation: MTD, YTD, monthly (§8) | M2 | unassigned |
 | M7 | Alarms, normalised status, operational dashboard (§6, §12) | M2, M6 | unassigned |
 | M8 | Portfolios with validity periods (§9) | M1 | unassigned (the portfolio *renderer* is already pinned against V1's real artefact) |

@@ -194,6 +194,14 @@ class ReportingDatasetRow(Base):
         CheckConstraint(f"expected_state IN {VALUE_STATES!r}", name="ck_reporting_dataset_rows_expected_state"),
         CheckConstraint("actual_state <> 'missing' OR actual_production_kwh IS NULL", name="ck_reporting_dataset_rows_missing_actual"),
         CheckConstraint("expected_state <> 'missing' OR expected_production_kwh IS NULL", name="ck_reporting_dataset_rows_missing_expected"),
+        CheckConstraint(f"self_use_state IN {VALUE_STATES!r}", name="ck_reporting_dataset_rows_self_use_state"),
+        CheckConstraint("self_use_state <> 'missing' OR self_use_kwh IS NULL", name="ck_reporting_dataset_rows_missing_self_use"),
+        CheckConstraint(f"export_state IN {VALUE_STATES!r}", name="ck_reporting_dataset_rows_export_state"),
+        CheckConstraint("export_state <> 'missing' OR export_kwh IS NULL", name="ck_reporting_dataset_rows_missing_export"),
+        CheckConstraint(f"consumption_state IN {VALUE_STATES!r}", name="ck_reporting_dataset_rows_consumption_state"),
+        CheckConstraint("consumption_state <> 'missing' OR consumption_kwh IS NULL", name="ck_reporting_dataset_rows_missing_consumption"),
+        CheckConstraint(f"grid_import_state IN {VALUE_STATES!r}", name="ck_reporting_dataset_rows_grid_import_state"),
+        CheckConstraint("grid_import_state <> 'missing' OR grid_import_kwh IS NULL", name="ck_reporting_dataset_rows_missing_grid_import"),
         UniqueConstraint("dataset_id", "asset_id", "period_start", name="uq_reporting_dataset_rows_period"),
     )
 
@@ -207,6 +215,17 @@ class ReportingDatasetRow(Base):
     actual_state: Mapped[str] = mapped_column(String(16), nullable=False)
     expected_production_kwh: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
     expected_state: Mapped[str] = mapped_column(String(16), nullable=False)
+
+    # The other energy signals a report reads. Each keeps its own state, so a
+    # month that measured production but not consumption says exactly that.
+    self_use_kwh: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
+    self_use_state: Mapped[str] = mapped_column(String(16), nullable=False, default="missing")
+    export_kwh: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
+    export_state: Mapped[str] = mapped_column(String(16), nullable=False, default="missing")
+    consumption_kwh: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
+    consumption_state: Mapped[str] = mapped_column(String(16), nullable=False, default="missing")
+    grid_import_kwh: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
+    grid_import_state: Mapped[str] = mapped_column(String(16), nullable=False, default="missing")
 
     provenance_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
 

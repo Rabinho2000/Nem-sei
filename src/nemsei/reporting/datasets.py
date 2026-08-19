@@ -57,6 +57,17 @@ def digest_of(payload: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+# The report-facing name of each canonical metric. Production keeps the name it
+# already had in this module; the rest join it rather than being read elsewhere,
+# so the dataset digest still covers every number a report was built from.
+DATASET_METRICS = {
+    "self_use": "self_use_energy",
+    "export": "export_energy",
+    "consumption": "consumption_energy",
+    "grid_import": "grid_import_energy",
+}
+
+
 def _sum_actual(facts: Iterable[ProductionFact]) -> tuple[Decimal | None, str, list[str]]:
     """Total one month of daily facts, keeping missing distinguishable from zero."""
     values, sources, incomplete = [], [], False
@@ -108,11 +119,21 @@ def build_dataset(
     # Only the current revision of each source fact. `production_facts` is
     # append-only, so a corrected reading sits beside the one it replaced;
     # totalling the raw rows would report a plant's production twice over.
-    facts = CanonicalFactRepository(session).current_production_facts_for_asset(
+    repository = CanonicalFactRepository(session)
+    facts = repository.current_production_facts_for_asset(
         asset_id=asset_id,
         period_start=_as_datetime(period_start),
         period_end=_as_datetime(period_end),
     )
+    other_facts = {
+        name: repository.current_production_facts_for_asset(
+            asset_id=asset_id,
+            period_start=_as_datetime(period_start),
+            period_end=_as_datetime(period_end),
+            metric_kind=metric_kind,
+        )
+        for name, metric_kind in DATASET_METRICS.items()
+    }
 
     rows: list[dict[str, Any]] = []
     warnings: list[str] = []
@@ -120,6 +141,14 @@ def build_dataset(
         end = month_end(start)
         monthly_facts = [fact for fact in facts if start <= fact.period_start.date() < end]
         actual, actual_state, sources = _sum_actual(monthly_facts)
+
+        monthly_metrics: dict[str, Any] = {}
+        for name in DATASET_METRICS:
+            in_month = [fact for fact in other_facts[name] if start <= fact.period_start.date() < end]
+            value, state, keys = _sum_actual(in_month)
+            monthly_metrics[f"{name}_kwh"] = value
+            monthly_metrics[f"{name}_state"] = state
+            monthly_metrics[f"{name}_fact_keys"] = keys
 
         expected_row = expected_by_month.get(start.month)
         expected = expected_row.expected_production_kwh if expected_row else None
@@ -138,9 +167,13 @@ def build_dataset(
                 "actual_state": actual_state,
                 "expected_production_kwh": expected,
                 "expected_state": expected_state,
+                **{key: value for key, value in monthly_metrics.items() if not key.endswith("_fact_keys")},
                 "provenance": {
                     "actual_fact_keys": sources,
                     "actual_fact_count": len(monthly_facts),
+                    "metric_fact_keys": {
+                        name: monthly_metrics[f"{name}_fact_keys"] for name in DATASET_METRICS
+                    },
                     "expected_source": (
                         {
                             "financial_model_id": financial_model.id,
@@ -168,6 +201,9 @@ def build_dataset(
             "months": len(rows),
             "months_with_actual": sum(1 for row in rows if row["actual_state"] != "missing"),
             "months_with_expected": sum(1 for row in rows if row["expected_state"] != "missing"),
+            "months_by_metric": {
+                name: sum(1 for row in rows if row[f"{name}_state"] != "missing") for name in DATASET_METRICS
+            },
         },
         warnings_json=sorted(set(warnings)),
         built_at=utc_now(),
@@ -186,6 +222,11 @@ def build_dataset(
                 actual_state=row["actual_state"],
                 expected_production_kwh=row["expected_production_kwh"],
                 expected_state=row["expected_state"],
+                **{
+                    field: row[field]
+                    for name in DATASET_METRICS
+                    for field in (f"{name}_kwh", f"{name}_state")
+                },
                 provenance_json=row["provenance"],
             )
         )
@@ -206,6 +247,11 @@ def _row_digest_payload(row: dict[str, Any]) -> dict[str, Any]:
         "actual_state": row["actual_state"],
         "expected": None if row["expected_production_kwh"] is None else format(row["expected_production_kwh"], "f"),
         "expected_state": row["expected_state"],
+        **{
+            name: (None if row[f"{name}_kwh"] is None else format(row[f"{name}_kwh"], "f"))
+            for name in DATASET_METRICS
+        },
+        **{f"{name}_state": row[f"{name}_state"] for name in DATASET_METRICS},
         "provenance": row["provenance"],
     }
 

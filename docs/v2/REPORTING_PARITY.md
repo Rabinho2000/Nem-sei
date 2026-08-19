@@ -35,7 +35,7 @@ depends on it.
 | M5.4 | Expected production, availability, data quality and the quality gate | **done for what V2 can hold**: quality rules and the availability calculation ported; the rest needs device-level facts |
 | M5.5 | `ReportingDataset` and `ReportSnapshot`, reproducible from persisted facts alone | **done** |
 | M5.6 | Excel and PDF rendering, visual and numerical parity | **done**: asset Excel and PDF, and the portfolio workbook |
-| M5.7 | End-to-end golden tests V1 versus V2, with every difference explained | **assembly built**: a report is now produced from V2's database alone; the remaining differences are missing facts, not missing code |
+| M5.7 | End-to-end golden tests V1 versus V2, with every difference explained | **complete for the asset report**: assembly built, and the inputs it needs are persisted |
 
 ## M5.1: financial model parsing
 
@@ -49,6 +49,32 @@ version V1 parses with.
 Porting rather than rewriting is deliberate. Parity is the requirement; a
 cleaner parser that produces different numbers would fail the milestone, and any
 future change to this module must be justified against a real workbook.
+
+### The end-to-end result
+
+The M5.7 diagnosis compared against one artefact: the real Expertcom report for
+July 2026, which V1 generated from real Sigenergy data and still holds —
+22 965.45 kWh produced, 17 500.13 self-consumed, 5 461.22 exported. Rebuilding
+that report's payload from V1's database and rendering it with V2 reproduced the
+page geometry and 41 of 78 first-page lines, in one page rather than two, with
+every difference traced to a payload field V2 could not produce.
+
+Assembled from **V2's own database**, with no provider call and no hand-made
+payload, the same period now gives:
+
+| Field | V2 from its own database | V1's real report |
+| --- | --- | --- |
+| Production | 22 965.45 kWh | 22 965.45 kWh |
+| Self-consumption | 17 500.13 kWh | 17 500.13 kWh |
+| Export | 5 461.22 kWh | 5 461.22 kWh |
+
+with consumption at 31 465.16 kWh and grid import at 13 965.03 kWh, a
+tetra-hourly tariff across four priced periods, an electricity price carrying
+its full seventeen decimals, 31 daily rows, and the report type resolved to ESCO
+from the billing configuration rather than defaulted. The tariff rows are
+present, so the document is two pages again.
+
+Five fields remain absent, and the payload names all five.
 
 ### Golden evidence
 
@@ -426,3 +452,87 @@ docker run --rm --network host \
 `pypdf` must be installed on top of that image for `test_pdf_golden.py`. The 4
 remaining skips are `test_financial_workbook_golden.py`, which needs V1's live
 SQLite; it runs in WAL mode and cannot be opened from a read-only mount.
+
+## M5.7 concluded for the asset report: the inputs
+
+The assembly layer had nothing to assemble. Three things were missing from the
+database, and all three are now persisted.
+
+### Energy beyond production
+
+`production_facts.metric_kind` accepted one value. It now accepts five —
+`production_energy`, `self_use_energy`, `export_energy`, `consumption_energy`,
+`grid_import_energy` — and `reporting_dataset_rows` carries each with its own
+state, so the dataset digest still covers every number a report was built from.
+A month that measured production but not consumption says exactly that.
+
+The evidence came before the schema. V1 stores the provider's own daily payloads,
+and those payloads state the other signals directly: of **41 503** FusionSolar
+daily rows carrying `PVYield`, `selfUsePower` and `ongrid_power`, **40 303
+satisfy `PVYield = selfUsePower + ongrid_power` exactly**, and 39 322 satisfy
+`use_power = selfUsePower + buyPower` exactly. So importing them reads evidence
+V1 already collected rather than trusting an unverified live call — which is why
+the live FusionSolar adapter still accepts `PVYield` and nothing else. That gate
+was about live reads and it stays closed.
+
+Nothing is derived. The identity that validates FusionSolar **fails** for
+Sigenergy, whose 827.73 kWh of production against 630.38 self-used and 195.30
+exported does not balance because a battery took the difference. Deriving one
+metric from another would have invented a number for every plant that stores
+energy. The identity is used only to reject the impossible: 249 rows from one
+station export more than they produce, and those are persisted as `invalid`
+carrying the value they claimed, so the rejection is auditable rather than a
+silent deletion.
+
+### Tariffs and billing
+
+`asset_tariffs`, `tariff_period_rules` and `asset_billing_configs` exist, with
+temporal validity and provenance. A GiST exclusion constraint refuses two rows
+covering the same day for one asset; V1 permitted that overlap and resolved it
+by taking the newest row, which is how a customer gets billed at a price nobody
+chose. Prices are `Numeric(28, 18)` because V1's one real billing row carries
+seventeen decimal places, and a test asserts `0.17828857174332818` survives the
+round trip unchanged.
+
+### Contract attributes
+
+`assets` gained `contract_type`, `asset_type`, `coverage_type` and `sell_to`,
+imported as V1 wrote them. V1 populates `contract_type` on 254 of 267 assets, and
+its vocabulary is not two-valued: 155 EPC, 85 ESCO, 9 "EPC (O&M)", 5 "ESCO
+BUYOUT". Normalising would have thrown away distinctions its operators made.
+
+One behaviour needed adding rather than porting. `detect_report_type` answers EPC
+both when it reads "EPC" and when it reads nothing at all, so a payload now
+carries `report_type_resolved` and `report_type_source`. An asset that states no
+contract is reported as defaulted, with a note in `report_notes`, because
+sending an ESCO customer an EPC document is a commercial error rather than a
+formatting one.
+
+### What the payload still declares absent
+
+Two groups, down from four:
+
+| Field | Why |
+| --- | --- |
+| `self_use_cheia_kwh`, `self_use_ponta_kwh`, `self_use_vazio_kwh`, `self_use_super_vazio_kwh` | V1 reads these from payloads that state self-use per tariff period. No provider V2 talks to does, and splitting a monthly total across periods would be arithmetic invented to fill a chart. |
+| `availability_pct` | Needs device-level facts, which V2 does not collect yet. |
+
+A tariff also prices energy without stating a euro total: V1 computes that from
+hourly rows split by tariff period, and V2 holds no hourly facts, so
+`tariff_value_eur` stays absent and billing falls back to its own calculation
+rather than to a number the assembler made up.
+
+### Golden evidence
+
+`tests_v2/test_v1_energy_extraction_golden.py` compares the extraction against
+**what V1 itself persisted**: for 500 real rows, the value read from each stored
+payload is checked against the figure V1 wrote into its own `production_kwh`
+column for that same row. It also asserts the identity statistics directly, so a
+future provider change to these signals' semantics would fail a test rather than
+quietly change a customer's invoice.
+
+These tests read V1's live SQLite. That database runs in WAL mode, and whether it
+can be opened read-only from inside the test container depends on whether its
+write-ahead log happens to be checkpointed — so these tests, like
+`test_financial_workbook_golden.py`, skip cleanly rather than failing when it
+cannot. They run reliably from the host.

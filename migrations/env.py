@@ -11,6 +11,8 @@ import nemsei.providers.models  # noqa: F401 - register provider metadata
 import nemsei.sync.models  # noqa: F401 - register sync metadata
 import nemsei.monitoring.models  # noqa: F401 - register canonical fact metadata
 import nemsei.sources.models  # noqa: F401 - register source policy metadata
+import nemsei.reporting.models  # noqa: F401 - register reporting metadata
+import nemsei.reporting.commercial_models  # noqa: F401 - register tariff and billing metadata
 
 
 config = context.config

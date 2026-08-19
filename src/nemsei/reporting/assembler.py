@@ -39,7 +39,15 @@ from nemsei.assets.models import Asset, Organization
 from nemsei.monitoring.repository import CanonicalFactRepository
 from nemsei.providers.models import AssetProviderMapping, ProviderConnection
 from nemsei.reporting.customer_pdf import prepare_customer_report
-from nemsei.reporting.datasets import build_dataset
+from nemsei.reporting.commercial import (
+    billing_config_from,
+    report_type_is_resolved,
+    representative_price,
+    resolve_billing_config,
+    resolve_tariff,
+    tariff_price_summary,
+)
+from nemsei.reporting.datasets import DATASET_METRICS, build_dataset
 from nemsei.reporting.models import ReportingDataset, ReportingDatasetRow
 from nemsei.reporting.periods import exclusive_end
 from nemsei.reporting.rules.types import BillingConfig, ReportPeriodType, ReportingPeriod
@@ -48,27 +56,16 @@ from nemsei.reporting.rules.types import BillingConfig, ReportPeriodType, Report
 # Fields V1's payload carries that V2 has no persisted source for. Each one is
 # emitted as None; this tuple is what turns "absent" into something a caller can
 # assert on rather than discover in a rendered document.
-ENERGY_FIELDS_WITHOUT_SOURCE = (
-    "self_use_kwh",
-    "export_kwh",
-    "consumption_kwh",
-    "grid_import_kwh",
+# Self-use split by tariff period. V1 reads these from provider payloads that
+# state them per period; no provider V2 talks to does, and splitting a monthly
+# total across periods would be arithmetic invented to fill a chart.
+TARIFF_SPLIT_FIELDS_WITHOUT_SOURCE = (
     "self_use_cheia_kwh",
     "self_use_ponta_kwh",
     "self_use_vazio_kwh",
     "self_use_super_vazio_kwh",
 )
-COMMERCIAL_FIELDS_WITHOUT_SOURCE = (
-    "tariff_value_eur",
-    "tariff_type",
-    "tariff_period_breakdown",
-    "tariff_coverage_pct",
-    "electricity_price",
-    "sell_price",
-    "solcor_price_per_kwh",
-    "fixed_monthly_fee_eur",
-)
-ASSET_FIELDS_WITHOUT_SOURCE = ("contract_type", "asset_type", "coverage_type", "sell_to")
+# Availability needs device-level facts, which V2 does not collect yet.
 AVAILABILITY_FIELDS_WITHOUT_SOURCE = ("availability_pct",)
 
 
@@ -93,11 +90,10 @@ def _float_or_none(value: Decimal | None) -> float | None:
 def asset_descriptor(session: Session, asset: Asset) -> dict[str, Any]:
     """The asset fields V1's payload names, from V2's canonical identity.
 
-    `contract_type`, `asset_type`, `coverage_type` and `sell_to` are V1 columns
-    with no V2 equivalent. They stay None rather than being guessed, which means
-    `detect_report_type` falls back to EPC. A customer on an ESCO contract would
-    then receive an EPC report, so the caller is expected to pass an explicit
-    `billing_config` until those attributes are persisted.
+    The four contract attributes decide EPC against ESCO. They are persisted now,
+    but they are still nullable: an asset that states none of them makes
+    `detect_report_type` fall back to EPC, and the payload flags that through
+    `report_type_resolved` rather than letting a guess pass for a fact.
     """
     owner = session.get(Organization, asset.owner_id) if asset.owner_id else None
     # The plant claim that identifies this asset to its provider. Device claims
@@ -122,10 +118,10 @@ def asset_descriptor(session: Session, asset: Asset) -> dict[str, Any]:
         "external_id": mapping.external_id if mapping else None,
         "external_name": mapping.external_name if mapping else None,
         "energy_provider": connection.provider_code if connection else None,
-        "contract_type": None,
-        "asset_type": None,
-        "coverage_type": None,
-        "sell_to": None,
+        "contract_type": asset.contract_type,
+        "asset_type": asset.asset_type,
+        "coverage_type": asset.coverage_type,
+        "sell_to": asset.sell_to,
     }
 
 
@@ -138,29 +134,40 @@ def daily_rows_for(session: Session, *, asset_id: int, period: ReportingPeriod) 
     difference recorded in REPORTING_PARITY.md, now visible in the data rather
     than only in a document.
     """
-    facts = CanonicalFactRepository(session).current_production_facts_for_asset(
-        asset_id=asset_id,
-        period_start=_as_datetime(period.start),
-        period_end=_as_datetime(exclusive_end(period)),
-    )
-    rows: list[dict[str, Any]] = []
-    for fact in facts:
-        if fact.granularity != "day":
-            continue
-        rows.append(
-            {
-                "date": fact.period_start.date(),
-                "production_kwh": _float_or_none(fact.value),
-                "self_use_kwh": None,
-                "export_kwh": None,
-                "consumption_kwh": None,
-                "grid_import_kwh": None,
-                "quality": fact.quality,
-                "source_fact_key": fact.source_fact_key,
-            }
-        )
-    rows.sort(key=lambda row: row["date"])
-    return rows
+    repository = CanonicalFactRepository(session)
+    window = {
+        "asset_id": asset_id,
+        "period_start": _as_datetime(period.start),
+        "period_end": _as_datetime(exclusive_end(period)),
+    }
+    by_day: dict[Any, dict[str, Any]] = {}
+
+    def collect(metric_kind: str, field: str) -> None:
+        for fact in repository.current_production_facts_for_asset(metric_kind=metric_kind, **window):
+            if fact.granularity != "day":
+                continue
+            day = fact.period_start.date()
+            row = by_day.setdefault(
+                day,
+                {
+                    "date": day,
+                    "production_kwh": None,
+                    "self_use_kwh": None,
+                    "export_kwh": None,
+                    "consumption_kwh": None,
+                    "grid_import_kwh": None,
+                    "quality": {},
+                    "source_fact_keys": {},
+                },
+            )
+            row[field] = _float_or_none(fact.value)
+            row["quality"][field] = fact.quality
+            row["source_fact_keys"][field] = fact.source_fact_key
+
+    collect("production_energy", "production_kwh")
+    for name, metric_kind in DATASET_METRICS.items():
+        collect(metric_kind, f"{name}_kwh")
+    return [by_day[day] for day in sorted(by_day)]
 
 
 def monthly_rows_for(dataset_rows: list[ReportingDatasetRow]) -> list[dict[str, Any]]:
@@ -174,10 +181,8 @@ def monthly_rows_for(dataset_rows: list[ReportingDatasetRow]) -> list[dict[str, 
             "production_state": row.actual_state,
             "expected_production_kwh": _float_or_none(row.expected_production_kwh),
             "expected_state": row.expected_state,
-            "self_use_kwh": None,
-            "export_kwh": None,
-            "consumption_kwh": None,
-            "grid_import_kwh": None,
+            **{f"{name}_kwh": _float_or_none(getattr(row, f"{name}_kwh")) for name in DATASET_METRICS},
+            **{f"{name}_state": getattr(row, f"{name}_state") for name in DATASET_METRICS},
         }
         for row in dataset_rows
     ]
@@ -194,6 +199,22 @@ def aggregate_rows(dataset_rows: list[ReportingDatasetRow], daily_rows: list[dic
     expected_rows = [row for row in dataset_rows if row.expected_production_kwh is not None]
     expected_total = sum((row.expected_production_kwh for row in expected_rows), Decimal("0")) if expected_rows else None
 
+    # Each metric totals independently. A month that measured production but not
+    # consumption must report a production total and a missing consumption, not
+    # a consumption of zero.
+    metric_totals: dict[str, Any] = {}
+    for name in DATASET_METRICS:
+        present = [
+            getattr(row, f"{name}_kwh")
+            for row in dataset_rows
+            if getattr(row, f"{name}_state") != "missing" and getattr(row, f"{name}_kwh") is not None
+        ]
+        metric_totals[f"{name}_kwh"] = float(sum(present, Decimal("0"))) if present else None
+        metric_totals[f"{name}_state"] = (
+            "missing" if not present
+            else ("partial" if len(present) < len(dataset_rows) else "measured")
+        )
+
     daily_values = [row["production_kwh"] for row in daily_rows if row["production_kwh"] is not None]
     coverage_pct = (len(months_with_data) / len(dataset_rows) * 100.0) if dataset_rows else 0.0
 
@@ -205,6 +226,7 @@ def aggregate_rows(dataset_rows: list[ReportingDatasetRow], daily_rows: list[dic
         production_status = "complete"
 
     return {
+        **metric_totals,
         "production_kwh": _float_or_none(total),
         "expected_production_kwh": _float_or_none(expected_total),
         "raw_daily_total_kwh": sum(daily_values) if daily_values else None,
@@ -235,6 +257,13 @@ def assemble_asset_report(
     if asset is None:
         raise ValueError("Unknown asset.")
 
+    # Commercial inputs, resolved from persisted rows for the period's first day
+    # rather than passed in by whoever generated the report.
+    tariff = resolve_tariff(session, asset_id=asset_id, on=period.start)
+    persisted_billing = resolve_billing_config(session, asset_id=asset_id, on=period.start)
+    if billing_config is None and persisted_billing is not None:
+        billing_config = billing_config_from(persisted_billing)
+
     if dataset is None:
         dataset = build_dataset(
             session,
@@ -248,14 +277,32 @@ def assemble_asset_report(
     daily_rows = daily_rows_for(session, asset_id=asset_id, period=period)
     aggregate = aggregate_rows(dataset_rows, daily_rows)
 
-    unavailable = (
-        ENERGY_FIELDS_WITHOUT_SOURCE
-        + COMMERCIAL_FIELDS_WITHOUT_SOURCE
-        + AVAILABILITY_FIELDS_WITHOUT_SOURCE
-        + tuple(f"asset.{name}" for name in ASSET_FIELDS_WITHOUT_SOURCE)
-    )
+
+    unavailable = list(TARIFF_SPLIT_FIELDS_WITHOUT_SOURCE + AVAILABILITY_FIELDS_WITHOUT_SOURCE)
+    for name in DATASET_METRICS:
+        if aggregate[f"{name}_state"] == "missing":
+            unavailable.append(f"{name}_kwh")
+    if aggregate["production_status"] == "missing":
+        unavailable.append("production_kwh")
+    if tariff is None:
+        unavailable.extend(["tariff_value_eur", "tariff_type", "tariff_period_breakdown", "tariff_coverage_pct"])
+    if persisted_billing is None:
+        unavailable.extend(
+            ["electricity_price", "sell_price", "solcor_price_per_kwh", "fixed_monthly_fee_eur"]
+        )
+    if not report_type_is_resolved(asset):
+        unavailable.append("asset.contract_type")
+    unavailable = tuple(dict.fromkeys(unavailable))
 
     descriptor = asset_descriptor(session, asset)
+    # V1 resolves report type from the asset's own text fields and then forces
+    # the billing configuration to agree, so a persisted configuration alone
+    # would be overridden by an asset that states nothing. Rather than change
+    # that ported rule, an explicitly configured report type is written into the
+    # field the rule reads. An asset that already names its contract wins,
+    # because that is the customer's paperwork rather than a later setting.
+    if persisted_billing is not None and not report_type_is_resolved(asset):
+        descriptor["contract_type"] = persisted_billing.report_type.upper()
     report: dict[str, Any] = {
         "asset": descriptor,
         "station_code": descriptor["external_id"],
@@ -287,9 +334,50 @@ def assemble_asset_report(
         "covered_period": f"{period.start.isoformat()}/{exclusive_end(period).isoformat()}",
         "data_quality": aggregate["production_status"],
         "report_notes": [],
-        "tariff_types_used": [],
-        "tariff_source": "unavailable",
-        "tariff_warnings": ["tariff_configuration_not_persisted_in_v2"],
+        "tariff_type": tariff.tariff_type if tariff is not None else None,
+        "tariff_types_used": [tariff.tariff_type] if tariff is not None else [],
+        "tariff_source": (
+            f"persisted:{tariff.source_kind}" if tariff is not None else "unavailable"
+        ),
+        "tariff_value_eur": None,
+        "tariff_period_breakdown": (
+            [
+                {"period": name, "price_eur_kwh": float(price)}
+                for name, price in sorted(tariff_price_summary(tariff).items())
+            ]
+            if tariff is not None
+            else []
+        ),
+        "tariff_coverage_pct": None,
+        "tariff_warnings": [] if tariff is not None else ["no_tariff_in_force_for_this_period"],
+        "electricity_price": (
+            float(persisted_billing.default_electricity_price) if persisted_billing is not None else None
+        ),
+        "sell_price": (
+            float(persisted_billing.default_export_price) if persisted_billing is not None else None
+        ),
+        "solcor_price_per_kwh": (
+            float(persisted_billing.solcor_price_per_kwh) if persisted_billing is not None else None
+        ),
+        "fixed_monthly_fee_eur": (
+            float(persisted_billing.fixed_monthly_fee_eur) if persisted_billing is not None else None
+        ),
+        "billing_mode": persisted_billing.billing_mode if persisted_billing is not None else None,
+        "billing_energy_base": (
+            persisted_billing.billing_energy_base if persisted_billing is not None else None
+        ),
+        "export_revenue_enabled": (
+            persisted_billing.export_revenue_enabled if persisted_billing is not None else True
+        ),
+        # Whether the report type was decided or merely defaulted. EPC is what
+        # `detect_report_type` answers both when it reads "EPC" and when it reads
+        # nothing, and a customer on an ESCO contract must not silently receive
+        # the wrong document.
+        "report_type_resolved": report_type_is_resolved(asset),
+        "report_type_source": (
+            "billing_config" if persisted_billing is not None
+            else ("contract_attributes" if report_type_is_resolved(asset) else "default")
+        ),
         "include_availability_kpi": False,
         # Provenance a reader can follow back to the rows it came from.
         "dataset_id": dataset.id,
@@ -297,12 +385,30 @@ def assemble_asset_report(
         "financial_model_id": dataset.financial_model_id,
         "unavailable_fields": list(unavailable),
     }
-    # Everything V2 cannot source is explicitly absent, never zero.
-    for name in ENERGY_FIELDS_WITHOUT_SOURCE + COMMERCIAL_FIELDS_WITHOUT_SOURCE + AVAILABILITY_FIELDS_WITHOUT_SOURCE:
+    for name in DATASET_METRICS:
+        report[f"{name}_kwh"] = aggregate[f"{name}_kwh"]
+        report[f"{name}_state"] = aggregate[f"{name}_state"]
+    # What still has no source anywhere is explicitly absent, never zero.
+    for name in TARIFF_SPLIT_FIELDS_WITHOUT_SOURCE + AVAILABILITY_FIELDS_WITHOUT_SOURCE:
         report[name] = None
+
+    # A tariff prices the energy; it does not state a euro total. V1 computes
+    # that from hourly rows split by tariff period, which V2 does not hold, so
+    # the value stays absent and billing falls back to its own calculation
+    # rather than a number this module made up.
+    if tariff is not None:
+        price = representative_price(tariff)
+        report["tariff_value_eur"] = None
+        report["tariff_simple_price_eur_kwh"] = None if price is None else float(price)
 
     prepared = prepare_customer_report(report, billing_config=billing_config, months_count=period.month_count)
     prepared["unavailable_fields"] = list(unavailable)
+    prepared["report_type_resolved"] = report["report_type_resolved"]
+    prepared["report_type_source"] = report["report_type_source"]
+    if persisted_billing is None and not report["report_type_resolved"]:
+        prepared.setdefault("report_notes", []).append(
+            "report_type_defaulted_to_epc_without_contract_evidence"
+        )
     return AssembledReport(
         payload=prepared,
         dataset=dataset,

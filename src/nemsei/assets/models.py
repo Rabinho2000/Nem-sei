@@ -72,6 +72,15 @@ class Asset(Base):
     latitude: Mapped[Decimal | None] = mapped_column(Numeric(10, 7))
     longitude: Mapped[Decimal | None] = mapped_column(Numeric(10, 7))
     technical_notes: Mapped[str | None] = mapped_column(Text)
+    # What the customer contracted. These four decide EPC against ESCO, and
+    # without them `detect_report_type` defaults to EPC and sends an ESCO
+    # customer the wrong document. They are free text because V1's are, and
+    # normalising them would lose the distinctions its operators actually wrote
+    # ("EPC (O&M)", "ESCO BUYOUT").
+    contract_type: Mapped[str | None] = mapped_column(String(120))
+    asset_type: Mapped[str | None] = mapped_column(String(120))
+    coverage_type: Mapped[str | None] = mapped_column(String(120))
+    sell_to: Mapped[str | None] = mapped_column(String(120))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     owner: Mapped[Organization | None] = relationship(back_populates="assets")
