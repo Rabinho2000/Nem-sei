@@ -42,11 +42,13 @@ if config["services"]["postgres"].get("ports"):
     raise SystemExit("PostgreSQL must not publish a host port")
 PY
 
-# The migrate service sits behind the `manual` profile, so a plain
-# `docker compose build` silently skips it. Without this explicit build a stale
-# migrate image runs `alembic upgrade head` against its own older migration
-# graph, exits 0, and leaves the database behind the checked-out code.
-"${compose[@]}" --profile manual build migrate
+# Build every image this deployment is about to run, including the `migrate`
+# service that sits behind the `manual` profile and that a plain
+# `docker compose build` silently skips. A stale migrate image runs
+# `alembic upgrade head` against its own older migration graph, exits 0, and
+# leaves the database behind the checked-out code; a stale web image carries an
+# older graph than the migrated database and fails its readiness check.
+"${compose[@]}" --profile manual build
 "${compose[@]}" up -d postgres
 "${compose[@]}" run --rm migrate
 

@@ -50,14 +50,18 @@ def test_canonical_deployment_validates_before_starting_roles() -> None:
     assert "accepts no Compose scale arguments" in script
 
 
-def test_deployment_rebuilds_the_profiled_migrate_image_before_migrating() -> None:
+def test_deployment_rebuilds_every_image_it_is_about_to_run() -> None:
     # `migrate` sits behind the `manual` profile, so a plain `compose build`
-    # skips it and a stale image can migrate to its own older head.
+    # skips it and a stale image migrates to its own older head. A stale web
+    # image is the mirror image of the same fault: it carries an older graph
+    # than the migrated database and fails readiness.
     script = COMPOSE_UP.read_text(encoding="utf-8")
-    build = script.index("--profile manual build migrate")
+    build = script.index("--profile manual build")
     migrate = script.index("run --rm migrate")
     startup = script.index("up -d web scheduler worker")
     assert build < migrate < startup
+    # The build must not be narrowed to a single service again.
+    assert "--profile manual build\n" in script
 
 
 def test_deployment_verifies_the_migrated_revision_before_serving_traffic() -> None:
