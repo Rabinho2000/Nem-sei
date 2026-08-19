@@ -34,7 +34,7 @@ depends on it.
 | M5.3 | Commercial rules: tariffs, ESCO/EPC, billing, client outages | **done** |
 | M5.4 | Expected production, availability, data quality and the quality gate | **done for what V2 can hold**: quality rules and the availability calculation ported; the rest needs device-level facts |
 | M5.5 | `ReportingDataset` and `ReportSnapshot`, reproducible from persisted facts alone | **done** |
-| M5.6 | Excel and PDF rendering, visual and numerical parity | **started**: Excel structure and value rules pinned against a real V1 output; full visual fidelity and PDF pending |
+| M5.6 | Excel and PDF rendering, visual and numerical parity | **done for the asset report**; portfolio reports wait on V2 portfolios |
 | M5.7 | End-to-end golden tests V1 versus V2, with every difference explained | |
 
 ## M5.1: financial model parsing
@@ -252,3 +252,43 @@ value never becomes a zero while a real zero stays a zero. What is not yet
 ported is V1's template engine, its fonts, fills, merged cells and column
 widths, its per-section placeholder conventions, and PDF output. Portfolio
 reports additionally wait on V2 having portfolios at all.
+
+## M5.6 concluded for the asset report
+
+**Excel, against a real artefact.** The writer now matches a V1 output on the
+server cell for cell and style for style: the same five sheets in order, the
+same row vocabulary, the same metadata fields, V1's merged ranges, its column
+widths, its 30-point title row, and its palette of `0B2D52` and `4BA52E` with
+the exact font weights and sizes per banner. Twelve tests compare V2's workbook
+against the reference rather than against a fixture written from the same
+assumptions as the code.
+
+**PDF, against V1 itself.** `customer_reports.py` turned out to be portable for
+the same reason the parser was: its only V1 dependencies were the billing rules
+and their dataclasses, both already under V2 ownership, and an optional logo
+path the caller supplies. It moved across as a copy, and `reportlab==4.4.10` was
+added to the lock at V1's version.
+
+The golden test draws the same report with both implementations and compares
+page geometry, page count and extracted text page by page. Bytes cannot be
+compared because reportlab stamps a creation time into every file, so the
+comparison is on what a reader sees. Four payloads pass identically: an EPC
+report, an ESCO report, one where every value is missing, and one where
+production is a real zero. The missing and zero cases are also asserted to
+render differently, because two implementations agreeing on a wrong answer would
+still pass a pure parity check.
+
+**A guard that did its job.** The architecture test already caught dynamic
+`importlib.import_module` calls, not only static imports, so it flagged the new
+PDF parity test immediately. The fix was to rename the file to `*_golden.py`,
+which is the exemption this repository declares, rather than to loosen the
+check.
+
+## What remains
+
+`ReportingDataset` and the renderers meet in the middle but the end-to-end
+golden test of M5.7 is not yet written, and it cannot be meaningful until V2
+holds enough real facts to fill a report: today it has two production facts from
+the canary. Portfolio reports additionally require portfolios, which V2 does not
+have, and the portfolio artefact on the server needs 46 columns V2 cannot
+currently produce a single one of.

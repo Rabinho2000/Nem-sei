@@ -144,3 +144,43 @@ def test_rendering_never_reaches_a_database_or_a_provider() -> None:
         if isinstance(node, ast.ImportFrom)
     }
     assert imported <= {"__future__", "decimal", "typing", "openpyxl"}, imported
+
+
+def style_of(cell) -> dict:
+    """The visual facts a customer would notice, and nothing else."""
+    return {
+        "bold": bool(cell.font.b),
+        "italic": bool(cell.font.i),
+        "size": cell.font.sz,
+        "colour": getattr(cell.font.color, "rgb", None) if cell.font.color else None,
+        "fill": cell.fill.fgColor.rgb if cell.fill and cell.fill.fill_type else None,
+    }
+
+
+@requires_reference
+def test_the_banner_rows_are_painted_exactly_as_v1_paints_them() -> None:
+    reference = load_workbook(REFERENCE)
+    workbook = build_asset_report_workbook(sample_payload())
+    for sheet_name, cells in (("Resumo", ("A1", "A2", "A4")), ("Energia", ("A1", "A2", "B2"))):
+        for ref in cells:
+            assert style_of(workbook[sheet_name][ref]) == style_of(reference[sheet_name][ref]), f"{sheet_name}!{ref}"
+
+
+@requires_reference
+def test_merged_ranges_and_column_widths_match_v1() -> None:
+    reference = load_workbook(REFERENCE)
+    workbook = build_asset_report_workbook(sample_payload())
+    for sheet_name in SHEET_NAMES:
+        assert sorted(str(r) for r in workbook[sheet_name].merged_cells.ranges) == sorted(
+            str(r) for r in reference[sheet_name].merged_cells.ranges
+        ), sheet_name
+        expected = {key: value.width for key, value in reference[sheet_name].column_dimensions.items() if value.width}
+        actual = {key: value.width for key, value in workbook[sheet_name].column_dimensions.items() if value.width}
+        assert actual == expected, sheet_name
+
+
+@requires_reference
+def test_the_title_row_keeps_v1s_height() -> None:
+    reference = load_workbook(REFERENCE)
+    workbook = build_asset_report_workbook(sample_payload())
+    assert workbook["Resumo"].row_dimensions[1].height == reference["Resumo"].row_dimensions[1].height == 30.0

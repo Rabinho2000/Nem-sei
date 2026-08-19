@@ -19,7 +19,21 @@ from decimal import Decimal
 from typing import Any
 
 from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.worksheet import Worksheet
+
+
+# V1's palette, read from a real report on the server rather than chosen here.
+PRIMARY = "0B2D52"
+SECONDARY = "4BA52E"
+# Column widths differ per sheet in V1; these are the ones it actually writes.
+SHEET_WIDTHS = {
+    "Resumo": {"A": 27.0, "B": 16.0, "C": 4.0, "D": 27.0, "E": 16.0},
+    "Energia": {"A": 30.0, "B": 18.0},
+    "Financeiro": {"A": 32.0, "B": 18.0},
+    "Qualidade dos dados": {"A": 30.0, "B": 90.0},
+    "Metadados": {"A": 28.0, "B": 36.0},
+}
 
 
 ENERGY_METRICS = ("production_kwh", "self_use_kwh", "export_kwh", "consumption_kwh", "grid_import_kwh")
@@ -68,6 +82,31 @@ def format_value(value: Any) -> str | None:
     return str(value)
 
 
+def _apply_widths(sheet: Worksheet) -> None:
+    for column, width in SHEET_WIDTHS.get(sheet.title, {}).items():
+        sheet.column_dimensions[column].width = width
+
+
+def _banner(sheet: Worksheet, span: str, *, bold: bool = True, italic: bool = False, size: float | None = None, fill: str | None = None) -> None:
+    """V1 merges its banner rows and paints them; an unpainted banner reads wrong."""
+    sheet.merge_cells(span)
+    cell = sheet[span.split(":")[0]]
+    cell.font = Font(bold=bold, italic=italic, size=size, color="FFFFFF" if fill else PRIMARY)
+    if fill:
+        cell.fill = PatternFill("solid", fgColor=fill)
+    cell.alignment = Alignment(horizontal="left")
+
+
+def _header_row(sheet: Worksheet, row: int, columns: int) -> None:
+    for index in range(1, columns + 1):
+        cell = sheet.cell(row, index)
+        if cell.value is None:
+            continue
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor=SECONDARY)
+        cell.alignment = Alignment(horizontal="left")
+
+
 def _metric(payload: dict[str, Any], section: str, key: str) -> Any:
     return (payload.get(section) or {}).get(key)
 
@@ -77,6 +116,9 @@ def _write_metric_sheet(sheet: Worksheet, title: str, payload: dict[str, Any], s
     sheet.append(["Metrica", "Valor"])
     for key in keys:
         sheet.append([key, format_value(_metric(payload, section, key))])
+    _banner(sheet, "A1:F1", size=14.0, fill=PRIMARY)
+    _header_row(sheet, 2, 2)
+    _apply_widths(sheet)
 
 
 def build_asset_report_workbook(payload: dict[str, Any]) -> Workbook:
@@ -106,6 +148,12 @@ def build_asset_report_workbook(payload: dict[str, Any]) -> Workbook:
             ]
         )
 
+    _banner(summary, "A1:E1", size=18.0, fill=PRIMARY)
+    _banner(summary, "A2:E2", bold=False, italic=True, size=11.0, fill=SECONDARY)
+    _banner(summary, "A4:E4", bold=True)
+    summary.row_dimensions[1].height = 30
+    _apply_widths(summary)
+
     _write_metric_sheet(workbook.create_sheet("Energia"), "Energia e produção", payload, "energy", ENERGY_METRICS)
     _write_metric_sheet(workbook.create_sheet("Financeiro"), "Resumo financeiro", payload, "financial", FINANCIAL_METRICS)
 
@@ -114,11 +162,17 @@ def build_asset_report_workbook(payload: dict[str, Any]) -> Workbook:
     quality.append(["Campo", "Valor"])
     for label, key in QUALITY_FIELDS:
         quality.append([label, format_value(_metric(payload, "quality", key))])
+    _banner(quality, "A1:F1", size=14.0, fill=PRIMARY)
+    _header_row(quality, 2, 2)
+    _apply_widths(quality)
 
     metadata = workbook.create_sheet("Metadados")
     metadata.append(["Metadados do relatório"])
     for field in METADATA_FIELDS:
         metadata.append([field, format_value(_metric(payload, "metadata", field))])
+    _banner(metadata, "A1:F1", size=14.0, fill=PRIMARY)
+    _header_row(metadata, 2, 2)
+    _apply_widths(metadata)
     return workbook
 
 
