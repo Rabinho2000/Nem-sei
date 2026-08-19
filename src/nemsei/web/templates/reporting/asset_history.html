@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-header">
+  <div>
+    <p class="eyebrow">Relatórios</p>
+    <h1>{{ asset.canonical_name }}</h1>
+  </div>
+  <a class="button-link" href="{{ url_for('reporting.assets_index') }}">← Procurar outra instalação</a>
+</section>
+
+<section class="panel">
+  <header class="panel-header"><h2>Gerar relatório</h2></header>
+  <form class="inline-form" method="post" action="{{ url_for('reporting.generate_asset_report', asset_id=asset.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="month" name="month" value="{{ default_month }}" required>
+    <button type="submit">Gerar</button>
+  </form>
+  <p class="panel-foot muted">
+    Constrói o relatório a partir dos dados persistidos e congela-o. Gerar o mesmo período outra vez
+    devolve o relatório já existente em vez de duplicar.
+  </p>
+</section>
+
+<section class="panel">
+  <header class="panel-header"><h2>Histórico</h2></header>
+  <table class="data-table">
+    <thead><tr><th>Período</th><th>Criado</th><th></th></tr></thead>
+    <tbody>
+      {% for row in snapshots %}
+        <tr>
+          <td>{{ row.period_start.strftime('%Y-%m') }}</td>
+          <td class="muted">{{ row.snapshot.created_at.strftime('%Y-%m-%d %H:%M') }} · {{ row.snapshot.created_by }}</td>
+          <td class="num">
+            <a href="{{ url_for('reporting.asset_snapshot_pdf', asset_id=asset.id, snapshot_id=row.snapshot.id) }}">PDF</a>
+            · <a href="{{ url_for('reporting.asset_snapshot_xlsx', asset_id=asset.id, snapshot_id=row.snapshot.id) }}">Excel</a>
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="3" class="empty">Nenhum relatório gerado ainda para esta instalação.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

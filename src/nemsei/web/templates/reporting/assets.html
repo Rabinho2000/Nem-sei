@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-header">
+  <div><h1>Relatórios por instalação</h1><p class="lede">Procura uma instalação para ver o seu histórico ou gerar um relatório novo.</p></div>
+</section>
+
+<section class="panel">
+  <form class="filter-bar" method="get" action="{{ url_for('reporting.assets_index') }}">
+    <input type="search" name="search" value="{{ search }}" placeholder="Nome, alias ou cliente…" autofocus>
+    <button type="submit">Procurar</button>
+  </form>
+  <table class="data-table">
+    <thead><tr><th>Instalação</th><th></th></tr></thead>
+    <tbody>
+      {% for asset in assets %}
+        <tr>
+          <td>{{ asset.canonical_name }}</td>
+          <td class="num"><a href="{{ url_for('reporting.asset_history', asset_id=asset.id) }}">Ver relatórios</a></td>
+        </tr>
+      {% else %}
+        <tr><td colspan="2" class="empty">Sem instalações a mostrar.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

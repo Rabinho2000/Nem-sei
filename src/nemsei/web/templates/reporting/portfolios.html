@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-header">
+  <div><h1>Relatórios de portfolio</h1><p class="lede">Todos os períodos gerados, em qualquer portfolio, com o seu estado.</p></div>
+</section>
+
+<section class="panel">
+  <table class="data-table">
+    <thead><tr><th>Portfolio</th><th>Período</th><th>Estado</th><th>Cobertura</th><th>Gerado por</th></tr></thead>
+    <tbody>
+      {% for row in runs %}
+        <tr>
+          <td><a href="{{ url_for('portfolios.detail', portfolio_id=row.run.portfolio_id, section='reports', month=row.run.period_start.strftime('%Y-%m')) }}">{{ row.portfolio_name }}</a></td>
+          <td class="muted">{{ row.run.period_start.strftime('%Y-%m') }}</td>
+          <td>
+            <span class="pill pill-{{ 'ok' if row.run.status == 'approved' else 'warn' }}">
+              {{ {'generated':'gerado','reviewed':'revisto','approved':'aprovado'}.get(row.run.status, row.run.status) }}
+            </span>
+          </td>
+          <td class="muted">{{ row.run.coverage_json.get('label', '—') }}</td>
+          <td class="muted">{{ row.run.generated_by }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="5" class="empty">Nenhum período de portfolio gerado ainda.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

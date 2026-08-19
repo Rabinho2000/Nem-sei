@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-header">
+  <div><h1>Relatórios</h1><p class="lede">Individuais e de portfolio, gerados e consultados a partir daqui.</p></div>
+</section>
+
+<div class="two-column">
+  <section class="panel">
+    <header class="panel-header"><h2>Relatórios individuais recentes</h2></header>
+    <table class="data-table">
+      <thead><tr><th>Instalação</th><th>Criado</th><th></th></tr></thead>
+      <tbody>
+        {% for row in recent_snapshots %}
+          <tr>
+            <td><a href="{{ url_for('reporting.asset_history', asset_id=row.asset_id) }}">{{ row.asset_name }}</a></td>
+            <td class="muted">{{ row.snapshot.created_at.strftime('%Y-%m-%d %H:%M') }} · {{ row.snapshot.created_by }}</td>
+            <td class="num">
+              <a href="{{ url_for('reporting.asset_snapshot_pdf', asset_id=row.asset_id, snapshot_id=row.snapshot.id) }}">PDF</a>
+              · <a href="{{ url_for('reporting.asset_snapshot_xlsx', asset_id=row.asset_id, snapshot_id=row.snapshot.id) }}">Excel</a>
+            </td>
+          </tr>
+        {% else %}
+          <tr><td colspan="3" class="empty">Nenhum relatório individual gerado ainda.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <p class="panel-foot"><a href="{{ url_for('reporting.assets_index') }}">Procurar uma instalação →</a></p>
+  </section>
+
+  <section class="panel">
+    <header class="panel-header">
+      <h2>Relatórios de portfolio</h2>
+      {% if has_pending_review %}<span class="pill pill-warn">Há períodos por rever</span>{% endif %}
+    </header>
+    <table class="data-table">
+      <thead><tr><th>Portfolio</th><th>Período</th><th>Estado</th></tr></thead>
+      <tbody>
+        {% for row in recent_runs %}
+          <tr>
+            <td><a href="{{ url_for('portfolios.detail', portfolio_id=row.run.portfolio_id, section='reports', month=row.run.period_start.strftime('%Y-%m')) }}">{{ row.portfolio_name }}</a></td>
+            <td class="muted">{{ row.run.period_start.strftime('%Y-%m') }}</td>
+            <td>
+              <span class="pill pill-{{ 'ok' if row.run.status == 'approved' else 'warn' }}">
+                {{ {'generated':'gerado','reviewed':'revisto','approved':'aprovado'}.get(row.run.status, row.run.status) }}
+              </span>
+            </td>
+          </tr>
+        {% else %}
+          <tr><td colspan="3" class="empty">Nenhum período de portfolio gerado ainda.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <p class="panel-foot"><a href="{{ url_for('reporting.portfolios_index') }}">Ver todos os períodos →</a></p>
+  </section>
+</div>
+{% endblock %}
