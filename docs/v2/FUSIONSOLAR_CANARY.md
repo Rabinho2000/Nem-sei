@@ -4,8 +4,10 @@ M4 proves the FusionSolar pipeline end to end on one installation before the
 portfolio is switched on. This document records what was established without
 calling the provider, what remains blocked, and the exact procedure to finish.
 
-Status: **blocked before the first live request**, for two independent reasons
-recorded below. Nothing in V2 was enabled and no provider request was made.
+Status: the production pipeline is **validated end to end against real provider
+payloads**; the **live network leg and the source-day boundary remain blocked**
+for the reasons recorded below. Nothing was enabled on the live V2 runtime and
+no provider request was made.
 
 ## Chosen canary
 
@@ -118,6 +120,49 @@ Three ways to unblock, in order of preference:
 3. **Accepting the risk** of running alongside V1. Not recommended: the failure
    mode is an account-wide cooldown affecting production monitoring, and its
    probability cannot be estimated from here.
+
+## Validated: the production pipeline, on real provider data
+
+V1 stored the raw `getKpiStationDay` responses it received. Replaying those
+unmodified rows through V2's real client, service, request controller and
+persistence — into a restored copy of the live V2 database, on the real canary
+asset — exercises everything except the network call itself.
+
+Result of the replay for 2026-07-23 and 2026-07-24:
+
+| Evidence | Outcome |
+| --- | --- |
+| SyncRun | `success`, completeness `complete`, 3 provider calls, 2 items received, 2 accepted, 0 rejected |
+| Request attempts | 3 `succeeded`, one per purpose: authentication, then one per source day |
+| ProductionFact | 63.53 and 59.55 kWh, granularity `day`, quality `complete`, UTC period boundaries |
+| SyncCursor | `last_completed_day=2026-07-24`, `covered_through=2026-07-25T00:00Z`, source timezone recorded |
+| Idempotency | second identical run left exactly two facts |
+| Against V1 | identical values for both days |
+
+The canonical facts landed in PostgreSQL with the right value, unit, granularity,
+quality and provenance, and the run left complete request evidence. The replay
+ran on a restored copy rather than the live database so that no canonical fact
+in production carries a provenance V2 did not obtain from the provider itself.
+
+The captured row is pinned as a regression test in
+`tests_v2/test_fusionsolar_real_payload.py`. It is worth keeping because the
+provider disagrees with itself: on that day `PVYield` was 59.55 while
+`inverterYield` was 58.9. V1 would fall back to the second field if the first
+were absent; V2 accepts only `PVYield` and reports a missing value instead. A
+synthetic fixture cannot demonstrate that, because only the provider puts
+different numbers in those fields.
+
+The same row also settles the unit independently: the provider's own
+`perpower_ratio` of 5.224 equals 59.55 / 11.4, which only holds if `PVYield` is
+kWh against a kW capacity.
+
+## What could not be replayed
+
+Current monitoring could not be validated this way. V1 never stored a raw
+`getStationRealKpi` response — `monitoring_records` has no payload column and
+`integration_realtime_snapshots` holds Sigenergy rows only — so there is no
+genuine payload to replay, and inventing one would prove nothing about the
+provider contract. That leg needs a live call.
 
 ## What is ready
 
