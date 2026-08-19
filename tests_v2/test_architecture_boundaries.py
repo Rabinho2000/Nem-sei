@@ -26,8 +26,38 @@ def imports(path: Path) -> set[str]:
 
 
 def test_v2_never_imports_v1() -> None:
-    violations = [str(path.relative_to(ROOT)) for path in [*SOURCE.rglob("*.py"), *(ROOT / "tests_v2").rglob("*.py")] if any(name == "monitoring_board" or name.startswith("monitoring_board.") for name in imports(path))]
+    # Golden parity tests are the one declared exception: they load the frozen V1
+    # only to compare against it, and they load it dynamically, so no V2 source
+    # or ordinary test carries a V1 import.
+    candidates = [*SOURCE.rglob("*.py"), *(path for path in (ROOT / "tests_v2").rglob("*.py") if not path.name.endswith("_golden.py"))]
+    violations = [str(path.relative_to(ROOT)) for path in candidates if any(name == "monitoring_board" or name.startswith("monitoring_board.") for name in imports(path))]
     assert not violations
+
+
+def test_no_v2_source_file_reaches_v1_dynamically() -> None:
+    """A dynamic import would slip past the static check above.
+
+    Naming V1 in a docstring is fine and often useful, because several V2
+    modules are ports and should say so. Naming it in a string the code can act
+    on is not.
+    """
+    offenders = []
+    for path in SOURCE.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        docstrings = {
+            id(node.body[0].value)
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.body
+            and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Constant)
+            and isinstance(node.body[0].value.value, str)
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
+                if "monitoring_board" in node.value:
+                    offenders.append(f"{path.relative_to(ROOT)}: {node.value[:60]!r}")
+    assert offenders == []
 
 
 def test_non_web_modules_do_not_import_flask() -> None:

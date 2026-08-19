@@ -31,8 +31,8 @@ depends on it.
 | --- | --- | --- |
 | **M5.1** | Financial model parsing with full provenance, golden parity on the real workbook | **done** |
 | M5.2 | Financial models persisted and versioned in PostgreSQL: source file, hash, cell provenance, derivation rules, warnings, base-year origin | **done** |
-| M5.3 | Commercial rules: tariffs, ESCO/EPC, billing, client outages | next |
-| M5.4 | Expected production, availability, data quality and the quality gate | |
+| M5.3 | Commercial rules: tariffs, ESCO/EPC, billing, client outages | **done** |
+| M5.4 | Expected production, availability, data quality and the quality gate | next |
 | M5.5 | `ReportingDataset` and `ReportSnapshot`, reproducible from persisted facts alone | |
 | M5.6 | Excel and PDF rendering, visual and numerical parity | |
 | M5.7 | End-to-end golden tests V1 versus V2, with every difference explained | |
@@ -132,3 +132,35 @@ Migration 0010 was rehearsed against a restored copy of the live V2 database:
 upgrade and downgrade both clean, with the 266 assets, 325 devices and existing
 production facts untouched. Its downgrade refuses to run if any financial model
 exists, so imported provenance cannot be dropped by accident.
+
+## M5.3: commercial rules
+
+V1's tariff, billing, invoice and client-outage modules depend only on their own
+dataclasses and the standard library: no database, no Flask, no provider. They
+ported cleanly into `src/nemsei/reporting/rules/`, with V1's
+`reporting/models.py` becoming `rules/types.py` because V2 already uses
+`reporting/models.py` for persistence.
+
+### Golden parity, both implementations side by side
+
+`tests_v2/test_commercial_rules_golden.py` loads the frozen V1 modules and runs
+them against V2's over the same inputs, asserting identical results including
+identical failures. Thirty-eight cases pass:
+
+- self-use inference, including export larger than production;
+- decimal normalisation across European and US separators, grouped thousands,
+  empty and invalid input;
+- Portuguese NIF validation and normalisation;
+- tariff window membership, including a window that crosses midnight;
+- tariff type parsing;
+- and the enum vocabularies themselves, so a silently renamed member cannot
+  change reports without failing a test.
+
+### The V1 import boundary, kept honest
+
+`test_v2_never_imports_v1` now exempts files named `*_golden.py`, because a
+parity test has to load the reference it compares against. The exemption is
+declared rather than worked around, and it is paired with a new check that no
+V2 **source** file reaches V1 dynamically either: the source tree may name V1 in
+a docstring, which several ports usefully do, but never in a string the code
+could act on.
