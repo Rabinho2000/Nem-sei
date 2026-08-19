@@ -19,6 +19,7 @@ from typing import Any, Iterable
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from nemsei.assets.identity_decisions import decision_supersedes_prior_record, load_identity_decisions, resolve_duplicate_groups
 from nemsei.assets.models import Asset, AssetAlias, Device, Organization
 from nemsei.assets.service import create_asset, create_device, create_organization, normalize_country_code, normalize_name, normalize_tax_id
 from nemsei.config import Settings
@@ -171,6 +172,19 @@ def add_record(
     manifest.record(table, outcome, legacy_id=legacy_id, reason=reason)
     if session is None or run is None or not persist:
         return
+    # Re-evaluated rows may reach an outcome they already carry; keep the
+    # evidence single rather than letting a rerun collide on it.
+    already_recorded = session.scalar(
+        select(LegacyImportRecord.id).where(
+            LegacyImportRecord.source_database_sha256 == manifest.source_database_sha256,
+            LegacyImportRecord.legacy_table == table,
+            LegacyImportRecord.legacy_id == str(legacy_id),
+            LegacyImportRecord.source_hash == source_hash,
+            LegacyImportRecord.outcome == outcome,
+        )
+    )
+    if already_recorded is not None:
+        return
     session.add(
         LegacyImportRecord(
             import_run_id=run.id,
@@ -287,25 +301,44 @@ def import_v1_assets(session: Session | None, source_path: Path, *, dry_run: boo
             add_record(session, run, manifest, table="customers", legacy_id=row["id"], source_hash=fingerprint, outcome="created", organization=organization)
 
         assets = list(source_db.execute("SELECT id, project_name, address, location, kwp, commissioning_date, country, timezone, notes, customer_id FROM assets ORDER BY id"))
-        duplicate_names = {name for name, count in Counter(normalize_name(row["project_name"]) for row in assets).items() if count > 1}
+        duplicate_groups: dict[str, list[int]] = {}
+        for row in assets:
+            duplicate_groups.setdefault(normalize_name(row["project_name"]), []).append(row["id"])
+        duplicate_groups = {name: ids for name, ids in duplicate_groups.items() if len(ids) > 1}
+        # A dry run without a session cannot see operator decisions, so it
+        # conservatively previews every ambiguous group as quarantined.
+        canonical_by_name = resolve_duplicate_groups(
+            duplicate_groups, load_identity_decisions(session, legacy_table="assets") if session is not None else {}
+        )
         imported_assets: dict[int, Asset] = {}
         eligible_asset_ids: set[int] = set()
         for row in assets:
             fingerprint = row_hash(row, row.keys())
             normalized = normalize_name(row["project_name"])
             existing = prior_record(session, source, "assets", row["id"]) if session else None
-            if existing and existing.source_hash == fingerprint:
+            canonical_id = canonical_by_name.get(normalized)
+            superseded = decision_supersedes_prior_record(
+                existing.outcome if existing else None,
+                bool(existing and existing.target_asset_id is not None),
+                group_resolved=canonical_id is not None,
+                row_is_canonical=canonical_id is not None and row["id"] == canonical_id,
+            )
+            if existing and existing.source_hash == fingerprint and not superseded:
                 asset = session.get(Asset, existing.target_asset_id) if existing.target_asset_id else None
                 if asset:
                     imported_assets[row["id"]] = asset
                 add_record(session, run, manifest, table="assets", legacy_id=row["id"], source_hash=fingerprint, outcome="reused", asset=asset, persist=False)
                 continue
-            if existing:
+            if existing and not superseded:
                 add_record(session, run, manifest, table="assets", legacy_id=row["id"], source_hash=fingerprint, outcome="changed_source", reason="V1 asset changed; existing V2 asset was preserved.", asset=session.get(Asset, existing.target_asset_id) if existing.target_asset_id else None)
                 continue
-            if normalized in duplicate_names:
-                add_record(session, run, manifest, table="assets", legacy_id=row["id"], source_hash=fingerprint, outcome="quarantined", reason="Duplicate normalized V1 asset name requires identity review.")
-                continue
+            if normalized in duplicate_groups:
+                if canonical_id is None:
+                    add_record(session, run, manifest, table="assets", legacy_id=row["id"], source_hash=fingerprint, outcome="quarantined", reason="Duplicate normalized V1 asset name requires identity review.")
+                    continue
+                if row["id"] != canonical_id:
+                    add_record(session, run, manifest, table="assets", legacy_id=row["id"], source_hash=fingerprint, outcome="excluded", reason=f"Discarded by an operator identity decision in favour of V1 asset {canonical_id}.")
+                    continue
             eligible_asset_ids.add(row["id"])
             power = optional_decimal(row["kwp"])
             review_reasons = []
@@ -348,10 +381,11 @@ def import_v1_assets(session: Session | None, source_path: Path, *, dry_run: boo
             fingerprint = row_hash(row, row.keys())
             existing = prior_record(session, source, "asset_aliases", row["id"]) if session else None
             asset = imported_assets.get(row["asset_id"])
-            if existing and existing.source_hash == fingerprint:
+            parent_now_available = bool(existing and existing.outcome == "excluded" and existing.target_asset_id is None and asset is not None)
+            if existing and existing.source_hash == fingerprint and not parent_now_available:
                 add_record(session, run, manifest, table="asset_aliases", legacy_id=row["id"], source_hash=fingerprint, outcome="reused", asset=session.get(Asset, existing.target_asset_id) if session and existing.target_asset_id else None, persist=False)
                 continue
-            if existing:
+            if existing and not parent_now_available:
                 add_record(session, run, manifest, table="asset_aliases", legacy_id=row["id"], source_hash=fingerprint, outcome="changed_source", reason="V1 alias changed; existing V2 alias was preserved.", asset=session.get(Asset, existing.target_asset_id) if session and existing.target_asset_id else None)
                 continue
             if asset is None and (not dry_run or row["asset_id"] not in eligible_asset_ids):
@@ -375,11 +409,12 @@ def import_v1_assets(session: Session | None, source_path: Path, *, dry_run: boo
             fingerprint = row_hash(row, row.keys())
             existing = prior_record(session, source, "asset_integrations", row["id"]) if session else None
             asset = imported_assets.get(row["asset_id"])
+            parent_now_available = bool(existing and existing.outcome == "excluded" and existing.target_asset_id is None and asset is not None)
             provider = (row["provider"] or "").strip().lower()
-            if existing and existing.source_hash == fingerprint:
+            if existing and existing.source_hash == fingerprint and not parent_now_available:
                 add_record(session, run, manifest, table="asset_integrations", legacy_id=row["id"], source_hash=fingerprint, outcome="reused", asset=session.get(Asset, existing.target_asset_id) if session and existing.target_asset_id else None, persist=False)
                 continue
-            if existing:
+            if existing and not parent_now_available:
                 add_record(session, run, manifest, table="asset_integrations", legacy_id=row["id"], source_hash=fingerprint, outcome="changed_source", reason="V1 mapping changed; existing V2 mapping was preserved.", asset=session.get(Asset, existing.target_asset_id) if session and existing.target_asset_id else None)
                 continue
             if (asset is None and (not dry_run or row["asset_id"] not in eligible_asset_ids)) or provider not in LEGACY_CONNECTIONS or not row["external_id"]:
@@ -412,11 +447,12 @@ def import_v1_assets(session: Session | None, source_path: Path, *, dry_run: boo
             fingerprint = row_hash(row, row.keys())
             existing = prior_record(session, source, "provider_devices", row["id"]) if session else None
             asset = imported_assets.get(row["asset_id"])
+            parent_now_available = bool(existing and existing.outcome == "excluded" and existing.target_asset_id is None and asset is not None)
             provider = (row["provider"] or "").strip().lower()
-            if existing and existing.source_hash == fingerprint:
+            if existing and existing.source_hash == fingerprint and not parent_now_available:
                 add_record(session, run, manifest, table="provider_devices", legacy_id=row["id"], source_hash=fingerprint, outcome="reused", asset=session.get(Asset, existing.target_asset_id) if session and existing.target_asset_id else None, persist=False)
                 continue
-            if existing:
+            if existing and not parent_now_available:
                 add_record(session, run, manifest, table="provider_devices", legacy_id=row["id"], source_hash=fingerprint, outcome="changed_source", reason="V1 device changed; existing V2 device was preserved.", asset=session.get(Asset, existing.target_asset_id) if session and existing.target_asset_id else None)
                 continue
             if (asset is None and (not dry_run or row["asset_id"] not in eligible_asset_ids)) or provider not in LEGACY_CONNECTIONS or not row["external_device_id"]:

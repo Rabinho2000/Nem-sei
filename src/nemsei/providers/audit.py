@@ -23,6 +23,9 @@ _ALLOWED_METADATA = {
     "capability",
     "provider_call_count",
     "result_status",
+    "legacy_table",
+    "legacy_id",
+    "decision",
 }
 
 

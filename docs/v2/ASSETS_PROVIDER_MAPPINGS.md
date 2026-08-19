@@ -73,6 +73,16 @@ writes, so an interrupted run can safely be rerun. Duplicate normalized V1 asset
 created or merged. Legacy FusionSolar and Sigenergy mappings are connected only
 to disabled, credential-free V2 legacy connections.
 
+## Ambiguous identity
+
+Duplicate normalized V1 asset names are never merged by similarity. The
+importer quarantines the whole group until an operator records one `canonical`
+row and discards the rest in `legacy_identity_decisions`; see
+`MIGRATION_MATRIX.md` for the command and the reasoning it must carry. A
+decision reopens rows an earlier run quarantined, and reopening a parent also
+releases the aliases, mappings and devices that were excluded with it. Rows
+that already produced V2 data are never reopened, so manual V2 edits survive.
+
 ## Operating constraints
 
 There remains one worker and short SQLite units of work. Network work, parsing,

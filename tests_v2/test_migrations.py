@@ -3,7 +3,16 @@ from __future__ import annotations
 import pytest
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
+
+
+def device_revision() -> str:
+    """Locate the device migration without pinning a revision name."""
+    for revision in ScriptDirectory.from_config(Config("alembic.ini")).walk_revisions():
+        if "canonical_devices" in revision.path:
+            return revision.revision
+    raise AssertionError("The canonical device migration is missing from the graph.")
 
 
 def upgrade(settings, monkeypatch) -> None:
@@ -21,7 +30,7 @@ def test_initial_migration_creates_foundation_tables(settings, monkeypatch) -> N
         "asset_provider_mappings", "legacy_import_runs", "legacy_import_records",
         "integration_health", "sync_runs", "sync_cursors", "provider_request_states",
         "provider_request_attempts", "asset_source_policies", "monitoring_observations", "monitoring_current_states", "production_facts",
-        "operator_audit_events",
+        "operator_audit_events", "legacy_identity_decisions",
         "alembic_version",
     } <= set(inspect(engine).get_table_names())
 
@@ -30,7 +39,7 @@ def test_device_migration_downgrades_cleanly_when_no_devices_exist(settings, mon
     upgrade(settings, monkeypatch)
     engine = create_engine(settings.database_url)
     assert "devices" in set(inspect(engine).get_table_names())
-    command.downgrade(Config("alembic.ini"), "-1")
+    command.downgrade(Config("alembic.ini"), f"{device_revision()}-1")
     remaining = set(inspect(create_engine(settings.database_url)).get_table_names())
     assert "devices" not in remaining
     assert {"assets", "asset_provider_mappings", "legacy_import_records"} <= remaining
@@ -55,5 +64,5 @@ def test_device_migration_refuses_to_discard_existing_devices(settings, monkeypa
             )
         )
     with pytest.raises(RuntimeError, match="Refusing to downgrade"):
-        command.downgrade(Config("alembic.ini"), "-1")
+        command.downgrade(Config("alembic.ini"), f"{device_revision()}-1")
     assert "devices" in set(inspect(create_engine(settings.database_url)).get_table_names())

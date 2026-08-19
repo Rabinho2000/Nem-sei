@@ -73,7 +73,7 @@ Rules:
 | --- | --- | --- | --- |
 | **M1** | Canonical model extended to site/plant and device level | — | Claude |
 | M2 | First real FusionSolar sync: one connection, small plant subset, read-only, end-to-end evidence | M1 | unassigned |
-| M3 | Close the identity migration: resolve conflicts, quarantines and unresolved rows; fill `MIGRATION_MATRIX.md` | — (parallel) | unassigned |
+| M3 | Close the identity migration: resolve conflicts, quarantines and unresolved rows; fill `MIGRATION_MATRIX.md` | — (parallel) | Claude (done, five plants pending an operator ruling) |
 | M4 | Users and permissions (§16) plus audit events that actually get written (§17) | M2 | unassigned |
 | M5 | Portfolios with validity periods (§9) | M1 | unassigned |
 | M6 | Canonical production and aggregation: MTD, YTD, monthly (§8) | M2 | unassigned |

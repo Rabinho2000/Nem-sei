@@ -13,7 +13,9 @@ RESOURCE_KINDS = ("plant", "device")
 CONNECTION_STATUSES = ("not_configured", "configured", "disabled")
 MAPPING_STATUSES = ("active", "superseded", "invalid", "pending_review")
 IMPORT_OUTCOMES = ("created", "reused", "quarantined", "changed_source", "conflict", "excluded", "unresolved")
+IDENTITY_DECISIONS = ("canonical", "discard")
 OPERATOR_AUDIT_ACTIONS = (
+    "identity_decision_recorded",
     "mapping_approved",
     "mapping_rejected",
     "source_policy_created",
@@ -119,7 +121,10 @@ class LegacyImportRecord(Base):
     __tablename__ = "legacy_import_records"
     __table_args__ = (
         CheckConstraint(f"outcome IN {IMPORT_OUTCOMES!r}", name="ck_legacy_import_records_outcome"),
-        UniqueConstraint("source_database_sha256", "legacy_table", "legacy_id", "source_hash", name="uq_legacy_import_records_source_version"),
+        # `outcome` is part of the key so an operator decision can move a source
+        # row from quarantined to created without erasing the earlier evidence,
+        # while a rerun that reaches the same outcome still cannot duplicate it.
+        UniqueConstraint("source_database_sha256", "legacy_table", "legacy_id", "source_hash", "outcome", name="uq_legacy_import_records_source_version"),
         Index("ix_legacy_import_records_outcome", "outcome"),
     )
 
@@ -138,6 +143,31 @@ class LegacyImportRecord(Base):
     target_device_id: Mapped[int | None] = mapped_column(ForeignKey("devices.id", ondelete="SET NULL"))
     target_mapping_id: Mapped[int | None] = mapped_column(ForeignKey("asset_provider_mappings.id", ondelete="SET NULL"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class LegacyIdentityDecision(Base):
+    """One operator ruling on ambiguous V1 identity evidence.
+
+    The importer never merges installations by name similarity. When a single
+    normalized V1 name covers several rows, a human designates the canonical
+    row and discards the rest; recording that here keeps the import repeatable
+    instead of turning it into a manual database edit.
+    """
+
+    __tablename__ = "legacy_identity_decisions"
+    __table_args__ = (
+        CheckConstraint(f"decision IN {IDENTITY_DECISIONS!r}", name="ck_legacy_identity_decisions_decision"),
+        UniqueConstraint("legacy_table", "legacy_id", name="uq_legacy_identity_decisions_row"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    legacy_table: Mapped[str] = mapped_column(String(120), nullable=False)
+    legacy_id: Mapped[str] = mapped_column(String(120), nullable=False)
+    decision: Mapped[str] = mapped_column(String(24), nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text)
+    actor_username: Mapped[str] = mapped_column(String(120), nullable=False)
+    source_database_sha256: Mapped[str | None] = mapped_column(String(64))
+    decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class OperatorAuditEvent(Base):

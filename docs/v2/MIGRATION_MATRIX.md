@@ -33,9 +33,55 @@ deliberately left behind, are in `DEVICE_MODEL.md`.
 | Credentials, endpoints, payloads, provider snapshots | Never imported |
 | `background_jobs` | V1-specific states; V2 has its own queue contract |
 
-## Outstanding reconciliation
+## Reconciliation of the import residue
 
-The identity import left evidence that still needs a human decision: 21
-conflicts, 2 quarantines and 56 unresolved integrations. They are recorded in
-`legacy_import_records` with their reasons and are tracked as milestone M3 in
-`ROADMAP.md`.
+The identity import left 21 conflicts, 2 quarantines, 5 exclusions and 56
+unresolved integrations. Each group was investigated against the frozen V1
+snapshot; most were closed evidence rather than open work.
+
+**Duplicate installations (2 quarantined, 5 excluded).** V1 assets 2078 and 2102
+share the name "Lopal" and every field. 2078 carries three aliases, the
+FusionSolar plant mapping, one inverter, 95 monitoring records, 177 production
+records and 5 alerts; 2102 carries nothing. Quarantining both had also excluded
+all of 2078's children, so V2 was missing a real 23.6 kWp installation. An
+operator decision designated 2078 canonical and discarded 2102, and the
+importer then created the asset, its 3 aliases, its plant mapping and its
+inverter. The decision mechanism is described below.
+
+**Alias conflicts (21).** These are not duplicated rows. Each is the same
+normalized alias with different raw text, such as
+`DIALOGOS DO BOSQUE UNIPESSOAL LDA` from `mapping_confirmed` beside
+`Diálogos do Bosque, Unipessoal, LDA` from `excel`. Lookup is unaffected
+because the normalized alias is identical; only the displayed text differs, and
+V2 keeps whichever V1 row came first. No action was taken: choosing a different
+raw variant would churn identity data for a cosmetic gain.
+
+**Unresolved integrations (56).** Cross-checking every unresolved external ID
+against V1's own `asset_integrations` shows 50 were already resolved by
+creating a real mapping, which V2 imported. They are closed historical
+evidence. Six records remain genuinely unmapped and two of those describe the
+same plant, leaving five distinct FusionSolar plants that were never associated
+with any V1 asset: `NE=141213422`, `NE=155139007`, `NE=271939998`,
+`NE=310640320` and `NE=319590186`. Each needs an operator ruling on whether it
+is a missing installation, someone else's plant visible in the account, or a
+test entry. They stay recorded as `unresolved`; nothing is auto-mapped.
+
+## Operator identity decisions
+
+`legacy_identity_decisions` records one ruling per ambiguous V1 source row:
+`canonical` for the row that represents the real installation, `discard` for
+the rows that do not. A duplicate group is only resolved when exactly one
+member is canonical and every other member is explicitly discarded; anything
+less stays quarantined.
+
+```text
+python -m nemsei.assets.identity_decisions \
+  --legacy-table assets --legacy-id 2078 --decision canonical \
+  --actor <operator> --reason "<evidence>"
+```
+
+Each ruling writes an operator audit event. Re-running the importer replays the
+decision, so the resolution is reproducible from the snapshot rather than being
+a manual database edit. A decision reopens a row that a previous run
+quarantined; rows that already produced V2 data are never reopened, and the
+earlier quarantine stays on the record beside the new outcome.
