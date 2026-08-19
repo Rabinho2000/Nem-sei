@@ -32,9 +32,9 @@ depends on it.
 | **M5.1** | Financial model parsing with full provenance, golden parity on the real workbook | **done** |
 | M5.2 | Financial models persisted and versioned in PostgreSQL: source file, hash, cell provenance, derivation rules, warnings, base-year origin | **done** |
 | M5.3 | Commercial rules: tariffs, ESCO/EPC, billing, client outages | **done** |
-| M5.4 | Expected production, availability, data quality and the quality gate | **partly done**: quality rules ported, availability and energy facts pending |
+| M5.4 | Expected production, availability, data quality and the quality gate | **done for what V2 can hold**: quality rules and the availability calculation ported; the rest needs device-level facts |
 | M5.5 | `ReportingDataset` and `ReportSnapshot`, reproducible from persisted facts alone | **done** |
-| M5.6 | Excel and PDF rendering, visual and numerical parity | |
+| M5.6 | Excel and PDF rendering, visual and numerical parity | **started**: Excel structure and value rules pinned against a real V1 output; full visual fidelity and PDF pending |
 | M5.7 | End-to-end golden tests V1 versus V2, with every difference explained | |
 
 ## M5.1: financial model parsing
@@ -204,3 +204,51 @@ both raise.
 A test reads the dataset module's own source and asserts it contains no
 integration, HTTP or provider reference at all, so the report path stays
 answerable from the database alone.
+
+## M5.4 concluded: availability
+
+Only the calculation itself is portable. `weighted_sampled_availability` weights
+each device by rated power and falls back to a plain mean the moment any device
+has no usable rating, rather than treating an unknown rating as zero weight.
+Twenty golden cases pin it against V1, including the one that decides customer
+arguments: 90 kW at 100 % beside 10 kW at 0 % is 90 %, not 50 %.
+
+A device with unknown availability makes the plant's availability unknown. It is
+never counted as zero, because "one inverter did not report" and "one inverter
+was down all day" are different statements about a customer's plant.
+
+The rest of V1's `sampled_availability.py` is ten SQLite functions over inverter
+samples and device realtime snapshots, and V2 holds neither: devices exist as
+canonical identity but carry no facts yet. Persisting availability therefore
+waits for device-level facts rather than being ported against tables that do not
+exist. The same applies to `energy_facts.py`, whose pure half is entirely
+Sigenergy history parsing, for a provider whose production contract is still
+unverified.
+
+## M5.6 started: the Excel document
+
+`src/nemsei/reporting/excel.py` renders an asset report from a payload alone,
+with no database and no provider, and its structure is taken from a real V1
+output on the server rather than invented: the same five sheets in the same
+order, the same metric rows, the same metadata fields, and V1's summary layout
+including its blank spacer rows and the `Instalação: … | Período: …` line in A4.
+
+Two findings changed the code rather than the test:
+
+- **Float formatting, not Decimal.** V1 formats floats, so 0.005 renders as
+  0.01. Formatting through `Decimal` applies banker's rounding and would have
+  written 0.00. The difference is one cent on a boundary, which is exactly the
+  kind of difference a customer notices and nobody can explain later.
+- **V1 has several rendering paths, not one.** `report_rendering.py` drives
+  Excel through templates with per-section row builders, and they do not agree
+  on how a missing value appears: some sections leave the cell empty, others
+  write the literal `Dados indisponiveis`, and `str(report.get(key, default))`
+  writes the string `None` when a key exists holding None. The current V2 writer
+  reproduces the blank-cell convention seen in the real artefact.
+
+So this phase is honestly started, not finished. What is pinned is the sheet
+structure, the row vocabulary, the number formatting and the rule that a missing
+value never becomes a zero while a real zero stays a zero. What is not yet
+ported is V1's template engine, its fonts, fills, merged cells and column
+widths, its per-section placeholder conventions, and PDF output. Portfolio
+reports additionally wait on V2 having portfolios at all.
