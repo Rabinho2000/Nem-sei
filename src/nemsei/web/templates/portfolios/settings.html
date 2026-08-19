@@ -31,7 +31,12 @@
 <section class="panel">
   <header class="panel-header">
     <h2>Membros</h2>
-    <span class="muted">{{ memberships|selectattr('resolution_state', 'ne', 'resolved')|list|length }} por resolver</span>
+    {% set pending = memberships|selectattr('resolution_state', 'ne', 'resolved')|list|length %}
+    {% if pending %}
+      <a class="button-link" href="{{ url_for('portfolios.review_members', portfolio_id=portfolio.id) }}">{{ pending }} por resolver — rever</a>
+    {% else %}
+      <span class="muted">Todos resolvidos</span>
+    {% endif %}
   </header>
   <table class="data-table">
     <thead><tr><th>Subconta</th><th>Nome</th><th>NIF</th><th>Estado</th><th>Validade</th><th>Origem</th><th></th></tr></thead>
@@ -50,11 +55,7 @@
           <td class="muted">{{ membership.source_kind }}</td>
           <td class="num">
             {% if membership.resolution_state != 'resolved' %}
-              <form class="inline-form compact" method="post" action="{{ url_for('portfolios.resolve_member', portfolio_id=portfolio.id, membership_id=membership.id) }}">
-                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                <input type="number" name="asset_id" placeholder="ID da instalação" required>
-                <button type="submit">Associar</button>
-              </form>
+              <a href="{{ url_for('portfolios.review_members', portfolio_id=portfolio.id) }}">Rever</a>
             {% elif membership.valid_to is none %}
               <form class="inline-form compact" method="post" action="{{ url_for('portfolios.end_member', portfolio_id=portfolio.id, membership_id=membership.id) }}">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

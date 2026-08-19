@@ -21,6 +21,11 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from nemsei.assets.models import public_id
 from nemsei.db.base import Base
+# This module carries foreign keys into the reporting schema
+# (`reporting_datasets`, `report_snapshots`), so those tables must be
+# registered before SQLAlchemy tries to resolve them — the same reasoning
+# `commercial_models.py` documents for its own tariff/billing foreign keys.
+import nemsei.reporting.models  # noqa: E402,F401 - register the referenced tables
 
 
 PORTFOLIO_STATUSES = ("active", "archived")
@@ -220,3 +225,91 @@ class PortfolioDatasetMember(Base):
     states_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
 
     dataset: Mapped[PortfolioDataset] = relationship(back_populates="members")
+
+
+RUN_STATUSES = ("generated", "reviewed", "approved")
+RUN_MEMBER_STATUSES = ("ready", "blocked")
+
+
+class PortfolioReportRun(Base):
+    """The monthly workflow instance: portfolio, period, and where it stands.
+
+    Validating coverage is a read against data that already exists and leaves
+    no row here; a run only starts existing once it is generated. From there it
+    is `generated` -> `reviewed` -> `approved`, and a database trigger refuses
+    to touch it, or any of its members, once it reaches `approved` — the same
+    guarantee `report_snapshots` and `portfolio_snapshots` already give the
+    records beneath it.
+    """
+
+    __tablename__ = "portfolio_report_runs"
+    __table_args__ = (
+        CheckConstraint(f"status IN {RUN_STATUSES!r}", name="ck_portfolio_report_runs_status"),
+        CheckConstraint("period_end > period_start", name="ck_portfolio_report_runs_period"),
+        CheckConstraint(
+            "status = 'generated' OR (reviewed_at IS NOT NULL AND reviewed_by IS NOT NULL)",
+            name="ck_portfolio_report_runs_reviewed",
+        ),
+        CheckConstraint(
+            "status <> 'approved' OR (approved_at IS NOT NULL AND approved_by IS NOT NULL)",
+            name="ck_portfolio_report_runs_approved",
+        ),
+        CheckConstraint(
+            "status <> 'generated' OR (reviewed_at IS NULL AND approved_at IS NULL)",
+            name="ck_portfolio_report_runs_generated_is_untouched",
+        ),
+        UniqueConstraint("portfolio_id", "period_start", "period_end", name="uq_portfolio_report_runs_period"),
+        Index("ix_portfolio_report_runs_portfolio", "portfolio_id", "period_start"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    portfolio_id: Mapped[int] = mapped_column(ForeignKey("portfolios.id", ondelete="RESTRICT"), nullable=False)
+    period_start: Mapped[date] = mapped_column(Date, nullable=False)
+    period_end: Mapped[date] = mapped_column(Date, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="generated")
+
+    portfolio_dataset_id: Mapped[int] = mapped_column(
+        ForeignKey("portfolio_datasets.id", ondelete="RESTRICT"), nullable=False
+    )
+    coverage_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    generated_by: Mapped[str] = mapped_column(String(120), nullable=False)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reviewed_by: Mapped[str | None] = mapped_column(String(120))
+    review_notes: Mapped[str | None] = mapped_column(Text)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    approved_by: Mapped[str | None] = mapped_column(String(120))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    members: Mapped[list["PortfolioReportRunMember"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan"
+    )
+
+
+class PortfolioReportRunMember(Base):
+    """One member's outcome within a run: reported, or blocked and why."""
+
+    __tablename__ = "portfolio_report_run_members"
+    __table_args__ = (
+        CheckConstraint(f"status IN {RUN_MEMBER_STATUSES!r}", name="ck_portfolio_report_run_members_status"),
+        CheckConstraint(
+            "(status = 'ready') = (report_snapshot_id IS NOT NULL)",
+            name="ck_portfolio_report_run_members_snapshot",
+        ),
+        CheckConstraint("status = 'ready' OR reason IS NOT NULL", name="ck_portfolio_report_run_members_reason"),
+        UniqueConstraint("run_id", "asset_id", name="uq_portfolio_report_run_members_asset"),
+        Index("ix_portfolio_report_run_members_run", "run_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("portfolio_report_runs.id", ondelete="CASCADE"), nullable=False)
+    asset_id: Mapped[int] = mapped_column(ForeignKey("assets.id", ondelete="RESTRICT"), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text)
+    # Filled through the same assemble_asset_report + snapshot_dataset path an
+    # individual report uses on its own — never a second calculation.
+    report_snapshot_id: Mapped[int | None] = mapped_column(ForeignKey("report_snapshots.id", ondelete="RESTRICT"))
+
+    run: Mapped[PortfolioReportRun] = relationship(back_populates="members")

@@ -3,9 +3,10 @@ from __future__ import annotations
 
 from datetime import date
 
-from flask import Blueprint, abort, flash, redirect, render_template, request, url_for
+from flask import Blueprint, abort, flash, redirect, render_template, request, session as browser_session, url_for
 
 from nemsei.portfolios.datasets import build_portfolio_dataset
+from nemsei.portfolios.reporting import approve_run, generate_report_run, mark_run_reviewed
 from nemsei.portfolios.service import (
     add_rule,
     create_portfolio,
@@ -17,12 +18,22 @@ from nemsei.reporting.periods import ReportingPeriodError, exclusive_end, monthl
 from nemsei.web.csrf import require_valid_token, token
 from nemsei.web.db_session import get_request_session
 from nemsei.web.home_routes import require_authenticated
-from nemsei.web.portfolio_queries import SECTIONS, default_month, portfolio_detail, portfolio_list
+from nemsei.web.portfolio_queries import SECTIONS, default_month, member_review_data, portfolio_detail, portfolio_list
 
 
 portfolio_bp = Blueprint("portfolios", __name__)
 
 SECTION_KEYS = {key for key, _ in SECTIONS}
+
+
+def _actor() -> str:
+    """Who is acting, from the one identity the session actually has.
+
+    V2 has no per-user accounts yet — a single administrator login, per
+    `KNOWN_GAPS.md` — so this is the best attribution available. It is still
+    real: an operator's session username, not a constant every action shared.
+    """
+    return (browser_session.get("username") or "").strip() or "operador"
 
 
 @portfolio_bp.get("/portfolios")
@@ -48,7 +59,7 @@ def create():
                 session,
                 name=name,
                 description=request.form.get("description", "").strip() or None,
-                created_by=request.form.get("actor", "operador").strip() or "operador",
+                created_by=_actor(),
             )
             portfolio_id = portfolio.id
     except ValueError as error:
@@ -95,7 +106,7 @@ def build(portfolio_id: int):
     require_valid_token()
     session = get_request_session()
     report_month = request.form.get("month", "").strip()
-    actor = request.form.get("actor", "operador").strip() or "operador"
+    actor = _actor()
     try:
         period = monthly_period(report_month)
     except ReportingPeriodError:
@@ -119,6 +130,36 @@ def build(portfolio_id: int):
     return redirect(url_for("portfolios.detail", portfolio_id=portfolio_id, month=report_month))
 
 
+def _member_redirect(portfolio_id: int):
+    """Back to wherever a member action was started from: review or settings."""
+    if request.form.get("next") == "review":
+        return redirect(url_for("portfolios.review_members", portfolio_id=portfolio_id))
+    return redirect(url_for("portfolios.detail", portfolio_id=portfolio_id, section="installations"))
+
+
+@portfolio_bp.get("/portfolios/<int:portfolio_id>/members/review")
+@require_authenticated
+def review_members(portfolio_id: int) -> str:
+    """Every open member with no installation, one decision at a time.
+
+    This is the simple, auditable path the settings page's bare "type an ID"
+    form was not: a NIF that exactly matches a V2 organization and a name
+    search are offered as evidence, and resolving still takes an explicit
+    choice from whoever is looking, recorded with their name.
+    """
+    session = get_request_session()
+    try:
+        context = member_review_data(session, portfolio_id=portfolio_id)
+    except ValueError:
+        abort(404)
+    return render_template(
+        "portfolios/review_members.html",
+        title=f"Membros por resolver — {context['portfolio'].name}",
+        csrf_token=token(),
+        **context,
+    )
+
+
 @portfolio_bp.post("/portfolios/<int:portfolio_id>/members/<int:membership_id>/resolve")
 @require_authenticated
 def resolve_member(portfolio_id: int, membership_id: int):
@@ -128,8 +169,8 @@ def resolve_member(portfolio_id: int, membership_id: int):
         asset_id = int(request.form.get("asset_id", "").strip())
     except ValueError:
         flash("Indica a instalação.", "error")
-        return redirect(url_for("portfolios.detail", portfolio_id=portfolio_id, section="installations"))
-    actor = request.form.get("actor", "operador").strip() or "operador"
+        return _member_redirect(portfolio_id)
+    actor = _actor()
     try:
         with session.begin():
             resolve_member_to_asset(session, membership_id=membership_id, asset_id=asset_id, resolved_by=actor)
@@ -137,7 +178,7 @@ def resolve_member(portfolio_id: int, membership_id: int):
         flash(str(error), "error")
     else:
         flash("Membro associado à instalação.", "success")
-    return redirect(url_for("portfolios.detail", portfolio_id=portfolio_id, section="installations"))
+    return _member_redirect(portfolio_id)
 
 
 @portfolio_bp.post("/portfolios/<int:portfolio_id>/members/<int:membership_id>/end")
@@ -174,10 +215,71 @@ def create_rule(portfolio_id: int):
                 attribute=request.form.get("attribute", "").strip(),
                 operator=request.form.get("operator", "in").strip() or "in",
                 values=values,
-                created_by=request.form.get("actor", "operador").strip() or "operador",
+                created_by=_actor(),
             )
     except ValueError as error:
         flash(str(error), "error")
     else:
         flash("Filtro aplicado ao portfolio.", "success")
     return redirect(url_for("portfolios.detail", portfolio_id=portfolio_id, section="settings"))
+
+
+# --- the monthly workflow: validar cobertura -> gerar -> rever -> aprovar ---
+
+
+@portfolio_bp.post("/portfolios/<int:portfolio_id>/reports/generate")
+@require_authenticated
+def generate_reports(portfolio_id: int):
+    """Freeze the period, then generate a report for every ready member.
+
+    Safe to run again before approval: it rebuilds against whatever facts exist
+    now and replaces the run's members, sending any prior review back to
+    `generated` since it was a statement about numbers that no longer hold.
+    """
+    require_valid_token()
+    session = get_request_session()
+    report_month = request.form.get("month", "").strip()
+    try:
+        with session.begin():
+            run = generate_report_run(session, portfolio_id=portfolio_id, report_month=report_month, actor=_actor())
+            ready = sum(1 for member in run.members if member.status == "ready")
+            blocked = sum(1 for member in run.members if member.status == "blocked")
+    except ValueError as error:
+        flash(str(error), "error")
+    else:
+        flash(f"Gerados {ready} relatórios individuais; {blocked} instalações bloqueadas.", "success")
+    return redirect(url_for("portfolios.detail", portfolio_id=portfolio_id, section="reports", month=report_month))
+
+
+@portfolio_bp.post("/portfolios/<int:portfolio_id>/reports/<int:run_id>/review")
+@require_authenticated
+def review_run(portfolio_id: int, run_id: int):
+    require_valid_token()
+    session = get_request_session()
+    report_month = request.form.get("month", "").strip()
+    try:
+        with session.begin():
+            mark_run_reviewed(
+                session, run_id=run_id, actor=_actor(), notes=request.form.get("notes", "").strip() or None
+            )
+    except ValueError as error:
+        flash(str(error), "error")
+    else:
+        flash("Período marcado como revisto.", "success")
+    return redirect(url_for("portfolios.detail", portfolio_id=portfolio_id, section="reports", month=report_month))
+
+
+@portfolio_bp.post("/portfolios/<int:portfolio_id>/reports/<int:run_id>/approve")
+@require_authenticated
+def approve_run_route(portfolio_id: int, run_id: int):
+    require_valid_token()
+    session = get_request_session()
+    report_month = request.form.get("month", "").strip()
+    try:
+        with session.begin():
+            approve_run(session, run_id=run_id, actor=_actor())
+    except ValueError as error:
+        flash(str(error), "error")
+    else:
+        flash("Período aprovado. O registo fica bloqueado a partir de agora.", "success")
+    return redirect(url_for("portfolios.detail", portfolio_id=portfolio_id, section="reports", month=report_month))

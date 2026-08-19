@@ -146,3 +146,143 @@ def test_a_period_without_a_dataset_says_so_instead_of_showing_zeros(app, seeded
     body = client.get(f"/portfolios/{seeded}/overview?month=2026-09").get_data(as_text=True)
     assert "Sem dados construídos" in body
     assert "Construir" in body
+
+
+def csrf_token(response) -> str:
+    import re
+
+    match = re.search(r'name="csrf_token" value="([^"]+)"', response.get_data(as_text=True))
+    assert match
+    return match.group(1)
+
+
+def test_the_review_screen_offers_a_nif_match_as_evidence_not_a_decision(app, seeded) -> None:
+    client = app.test_client()
+    login(client)
+    body = client.get(f"/portfolios/{seeded}/members/review").get_data(as_text=True)
+    assert "Consumidor Final" in body
+    assert "Nada aqui associa sozinho" in body
+
+
+def test_resolving_a_member_from_the_review_screen_returns_there(app, seeded, settings) -> None:
+    client = app.test_client()
+    login(client)
+    from sqlalchemy import create_engine, select
+
+    from nemsei.assets.service import create_asset
+    from nemsei.db.session import build_session_factory
+    from nemsei.portfolios.models import PortfolioMembership
+
+    factory = build_session_factory(create_engine(settings.database_url))
+    with factory() as session, session.begin():
+        # An installation that is not already a member of this portfolio.
+        asset_id = create_asset(session, canonical_name="Newly Discovered Plant").id
+    with factory() as session:
+        membership_id = session.scalar(
+            select(PortfolioMembership.id).where(PortfolioMembership.sub_account == "040")
+        )
+
+    form = client.get(f"/portfolios/{seeded}/members/review")
+    response = client.post(
+        f"/portfolios/{seeded}/members/{membership_id}/resolve",
+        data={"csrf_token": csrf_token(form), "asset_id": str(asset_id), "next": "review"},
+    )
+    assert response.status_code == 302
+    assert response.location.endswith(f"/portfolios/{seeded}/members/review")
+
+    with factory() as session:
+        membership = session.get(PortfolioMembership, membership_id)
+        assert membership.resolution_state == "resolved"
+        assert membership.asset_id == asset_id
+
+
+def test_resolving_a_member_to_an_asset_already_in_the_portfolio_is_rejected_cleanly(app, seeded, settings) -> None:
+    """A raw IntegrityError reaching the browser is a 500; a friendly error is not."""
+    client = app.test_client()
+    login(client)
+    from sqlalchemy import create_engine, select
+
+    from nemsei.db.session import build_session_factory
+    from nemsei.portfolios.models import PortfolioMembership
+
+    factory = build_session_factory(create_engine(settings.database_url))
+    with factory() as session:
+        # "Reporting Plant" is already an active member of this portfolio.
+        membership_id = session.scalar(
+            select(PortfolioMembership.id).where(PortfolioMembership.sub_account == "040")
+        )
+        asset_id = session.scalar(
+            select(PortfolioMembership.asset_id).where(PortfolioMembership.asset_id.is_not(None)).limit(1)
+        )
+
+    form = client.get(f"/portfolios/{seeded}/members/review")
+    response = client.post(
+        f"/portfolios/{seeded}/members/{membership_id}/resolve",
+        data={"csrf_token": csrf_token(form), "asset_id": str(asset_id), "next": "review"},
+    )
+    assert response.status_code == 302
+    body = client.get(response.location).get_data(as_text=True)
+    assert "already a member of this portfolio" in body
+
+    with factory() as session:
+        membership = session.get(PortfolioMembership, membership_id)
+        # Untouched: the rejected resolution left no trace on the row.
+        assert membership.resolution_state == "unresolved"
+        assert membership.asset_id is None
+
+
+def test_the_monthly_workflow_goes_through_generate_review_approve(app, seeded, settings) -> None:
+    client = app.test_client()
+    login(client)
+
+    form = client.get(f"/portfolios/{seeded}/reports?month=2026-03")
+    generate = client.post(
+        f"/portfolios/{seeded}/reports/generate",
+        data={"csrf_token": csrf_token(form), "month": "2026-03"},
+    )
+    assert generate.status_code == 302
+
+    reports_page = client.get(f"/portfolios/{seeded}/reports?month=2026-03")
+    body = reports_page.get_data(as_text=True)
+    assert "Gerado" in body
+    assert "Reporting Plant" in body  # the ready member, with its download links
+    assert "Sem dados de produção no período" in body  # the blocked member, with a reason
+
+    from sqlalchemy import create_engine, select
+
+    from nemsei.db.session import build_session_factory
+    from nemsei.portfolios.models import PortfolioReportRun
+
+    factory = build_session_factory(create_engine(settings.database_url))
+    with factory() as session:
+        run_id = session.scalar(select(PortfolioReportRun.id).where(PortfolioReportRun.portfolio_id == seeded))
+
+    review = client.post(
+        f"/portfolios/{seeded}/reports/{run_id}/review",
+        data={"csrf_token": csrf_token(reports_page), "month": "2026-03", "notes": "tudo bem"},
+    )
+    assert review.status_code == 302
+    reports_page = client.get(f"/portfolios/{seeded}/reports?month=2026-03")
+
+    approve = client.post(
+        f"/portfolios/{seeded}/reports/{run_id}/approve",
+        data={"csrf_token": csrf_token(reports_page), "month": "2026-03"},
+    )
+    assert approve.status_code == 302
+    final_body = client.get(f"/portfolios/{seeded}/reports?month=2026-03").get_data(as_text=True)
+    assert "Aprovado" in final_body
+    assert "registo bloqueado" in final_body
+
+    # And the database itself now refuses to touch the run.
+    with factory() as session:
+        from sqlalchemy import text
+
+        with pytest.raises(Exception, match="cannot be changed"), session.begin():
+            session.execute(text("UPDATE portfolio_report_runs SET review_notes = 'x' WHERE id = :r"), {"r": run_id})
+
+
+def test_a_mutation_route_without_a_csrf_token_is_refused(app, seeded) -> None:
+    client = app.test_client()
+    login(client)
+    response = client.post(f"/portfolios/{seeded}/reports/generate", data={"month": "2026-03"})
+    assert response.status_code in (400, 403)

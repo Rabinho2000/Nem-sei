@@ -242,3 +242,21 @@ code { color: var(--brand-dark); font: 0.78rem ui-monospace, SFMono-Regular, Men
 .row-attention { background: #fffaf2; }
 .inline-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 14px; }
 .inline-form.compact { margin: 0; justify-content: flex-end; }
+
+.button-link { display: inline-flex; align-items: center; gap: 6px; padding: 7px 14px; border: 1px solid var(--line); border-radius: 7px; color: inherit; font-size: 0.85rem; font-weight: 650; text-decoration: none; }
+.button-link:hover { background: var(--surface-subtle); }
+
+/* Member review: one card per unresolved member, evidence then a choice. */
+.member-review-card { margin-bottom: 14px; }
+.candidate-block { padding: 12px 0; border-top: 1px solid var(--line); }
+.candidate-block:first-of-type { border-top: 0; padding-top: 4px; }
+.candidate-block h3 { margin: 0 0 8px; font-size: 0.85rem; font-weight: 700; }
+.candidate-block select { min-width: 260px; }
+
+/* Reporting workflow: portfolio -> period -> validate -> generate -> review -> approve. */
+.workflow-steps { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 18px; }
+.workflow-step { padding: 6px 12px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: 0.8rem; font-weight: 650; }
+.workflow-step.done { border-color: transparent; background: #e8f5e9; color: #1b5e20; }
+.workflow-step.current { border-color: currentColor; color: inherit; }
+.blocked-list { margin: 0; padding-left: 18px; font-size: 0.85rem; }
+.blocked-list li { margin-bottom: 4px; }

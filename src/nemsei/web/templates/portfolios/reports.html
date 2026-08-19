@@ -1,5 +1,110 @@
 {% extends "portfolios/_shell.html" %}
 {% block section %}
+{#
+  portfolio -> período -> validar cobertura -> gerar -> rever -> aprovar.
+  "Construir" (above, in the KPI strip) is the coverage check; what follows here
+  is the part that actually produces reports and locks them once approved.
+#}
+<section class="panel">
+  <header class="panel-header">
+    <h2>Workflow mensal — {{ period.label }}</h2>
+    {% if run %}<span class="muted">atualizado {{ run.updated_at.strftime('%Y-%m-%d %H:%M') }}</span>{% endif %}
+  </header>
+  <div class="workflow-steps">
+    {% for step in run_steps %}
+      <span class="workflow-step {{ step.state }}">{{ step.label }}</span>
+    {% endfor %}
+  </div>
+
+  {% if not dataset %}
+    <p class="empty">Constrói o período (acima) antes de gerar relatórios.</p>
+  {% elif not run %}
+    <p class="muted">{{ coverage.get('label', '0/0') }} instalações completas · {{ coverage.get('unresolved_members', 0) }} membros por resolver.</p>
+    <form class="inline-form" method="post" action="{{ url_for('portfolios.generate_reports', portfolio_id=portfolio.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="month" value="{{ report_month }}">
+      <button type="submit">Gerar relatórios de {{ period.label }}</button>
+    </form>
+  {% else %}
+    <p class="muted">
+      Gerado por {{ run.generated_by }} em {{ run.generated_at.strftime('%Y-%m-%d %H:%M') }}.
+      {% if run.reviewed_by %} Revisto por {{ run.reviewed_by }} em {{ run.reviewed_at.strftime('%Y-%m-%d %H:%M') }}.{% endif %}
+      {% if run.approved_by %} Aprovado por {{ run.approved_by }} em {{ run.approved_at.strftime('%Y-%m-%d %H:%M') }}.{% endif %}
+    </p>
+
+    {% set ready = run_members|selectattr('status', 'equalto', 'ready')|list %}
+    {% set blocked = run_members|selectattr('status', 'equalto', 'blocked')|list %}
+    <p><strong>{{ ready|length }}</strong> relatórios prontos · <strong>{{ blocked|length }}</strong> bloqueados</p>
+
+    {% if blocked %}
+      <h3>Bloqueadas, e porquê</h3>
+      <ul class="blocked-list">
+        {% for member in blocked %}
+          <li>{{ member.name }} — {{ member.reason_label }}</li>
+        {% endfor %}
+      </ul>
+    {% endif %}
+
+    <table class="data-table">
+      <thead><tr><th>Instalação</th><th>Estado</th><th></th></tr></thead>
+      <tbody>
+        {% for member in ready %}
+          <tr>
+            <td>{{ member.name }}</td>
+            <td><span class="pill pill-ok">pronto</span></td>
+            <td class="num">
+              <a href="{{ url_for('reporting.asset_snapshot_pdf', asset_id=member.asset_id, snapshot_id=member.report_snapshot_id) }}">PDF</a>
+              · <a href="{{ url_for('reporting.asset_snapshot_xlsx', asset_id=member.asset_id, snapshot_id=member.report_snapshot_id) }}">Excel</a>
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <div class="inline-form">
+      {% if run.status == 'generated' %}
+        <form method="post" action="{{ url_for('portfolios.generate_reports', portfolio_id=portfolio.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="month" value="{{ report_month }}">
+          <button type="submit">Gerar de novo</button>
+        </form>
+        <form method="post" action="{{ url_for('portfolios.review_run', portfolio_id=portfolio.id, run_id=run.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="month" value="{{ report_month }}">
+          <input type="text" name="notes" placeholder="Notas da revisão (opcional)">
+          <button type="submit">Marcar como revisto</button>
+        </form>
+      {% elif run.status == 'reviewed' %}
+        <form method="post" action="{{ url_for('portfolios.approve_run_route', portfolio_id=portfolio.id, run_id=run.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="month" value="{{ report_month }}">
+          <button type="submit">Aprovar</button>
+        </form>
+      {% else %}
+        <span class="pill pill-ok">Aprovado — registo bloqueado</span>
+      {% endif %}
+    </div>
+  {% endif %}
+</section>
+
+{% if history %}
+<section class="panel">
+  <header class="panel-header"><h2>Histórico de períodos</h2></header>
+  <table class="data-table">
+    <thead><tr><th>Período</th><th>Estado</th><th>Cobertura</th></tr></thead>
+    <tbody>
+      {% for past in history %}
+        <tr>
+          <td><a href="{{ url_for('portfolios.detail', portfolio_id=portfolio.id, section='reports', month=past.period_start.strftime('%Y-%m')) }}">{{ past.period_start.strftime('%Y-%m') }}</a></td>
+          <td><span class="pill pill-{{ 'ok' if past.status == 'approved' else 'warn' }}">{{ {'generated':'gerado','reviewed':'revisto','approved':'aprovado'}.get(past.status, past.status) }}</span></td>
+          <td class="muted">{{ past.coverage_json.get('label', '—') }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
 <div class="two-column">
   <section class="panel">
     <header class="panel-header"><h2>Relatório agregado</h2></header>

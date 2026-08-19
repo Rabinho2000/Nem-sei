@@ -19,10 +19,14 @@ from datetime import date
 from typing import Any
 
 from sqlalchemy import or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from nemsei.assets.models import Asset
+from nemsei.assets.models import Asset, Organization
+from nemsei.assets.service import asset_search_clause, normalize_tax_id
 from nemsei.portfolios.models import (
+    RULE_ATTRIBUTES,
+    RULE_OPERATORS,
     Portfolio,
     PortfolioMembership,
     PortfolioRule,
@@ -252,10 +256,21 @@ def add_member(
 
 
 def end_membership(session: Session, *, membership_id: int, on: date) -> PortfolioMembership:
-    """Close a membership from a date, without deleting the history."""
+    """Close a membership from a date, without deleting the history.
+
+    Only an **open** membership can be ended this way. Rewriting an already-set
+    `valid_to` would silently replace one operator's decision with another's and
+    leave no trace that it happened — the same reasoning `close_open_row` uses
+    for tariffs and billing configuration.
+    """
     membership = session.get(PortfolioMembership, membership_id)
     if membership is None:
         raise ValueError("Unknown membership.")
+    if membership.valid_to is not None:
+        raise ValueError(
+            f"This membership already ended on {membership.valid_to.isoformat()}; "
+            "record a new membership instead of rewriting the old one's end date."
+        )
     if on <= membership.valid_from:
         raise ValueError("A membership cannot end on or before the day it started.")
     membership.valid_to = on
@@ -276,8 +291,14 @@ def resolve_member_to_asset(
     membership = session.get(PortfolioMembership, membership_id)
     if membership is None:
         raise ValueError("Unknown membership.")
-    if session.get(Asset, asset_id) is None:
+    asset = session.get(Asset, asset_id)
+    if asset is None:
         raise ValueError("Unknown asset.")
+    # Read before the flush that might fail: a rollback expires every attribute
+    # on every object touched in this transaction, and re-fetching one to build
+    # an error message is exactly the kind of query a failed transaction can't
+    # serve.
+    asset_name = asset.canonical_name
     actor = resolved_by.strip()
     if not actor:
         raise ValueError("Resolving a member must record who did it.")
@@ -289,8 +310,87 @@ def resolve_member_to_asset(
         "resolved_at": utc_now().isoformat(),
     }
     membership.updated_at = utc_now()
-    session.flush()
+    # The database is the source of truth on whether this overlaps another
+    # membership of the same asset — the exclusion constraint already encodes
+    # the date-range arithmetic correctly. A nested transaction lets that
+    # answer surface as a clear message instead of a raw IntegrityError
+    # aborting whatever the caller's outer transaction was doing.
+    try:
+        with session.begin_nested():
+            session.flush()
+    except IntegrityError as error:
+        if "ex_portfolio_memberships_no_overlap" not in str(error.orig):
+            raise
+        raise ValueError(
+            f"{asset_name} is already a member of this portfolio for an overlapping period; "
+            "end that membership first if this one should replace it."
+        ) from error
     return membership
+
+
+def unresolved_members(session: Session, *, portfolio_id: int | None = None) -> list[PortfolioMembership]:
+    """Every open member that has no installation yet, across one portfolio or all.
+
+    Only open memberships are listed: a member whose row already ended is
+    history, not something to review.
+    """
+    statement = select(PortfolioMembership).where(
+        PortfolioMembership.resolution_state != "resolved",
+        PortfolioMembership.valid_to.is_(None),
+    )
+    if portfolio_id is not None:
+        statement = statement.where(PortfolioMembership.portfolio_id == portfolio_id)
+    return list(
+        session.scalars(statement.order_by(PortfolioMembership.portfolio_id, PortfolioMembership.sub_account)).all()
+    )
+
+
+def search_asset_candidates(session: Session, query: str, *, limit: int = 15) -> list[Asset]:
+    """Assets whose name, alias or owner matches free text.
+
+    A search result is only ever a suggestion. Nothing here writes anything;
+    `resolve_member_to_asset` is still the one place a link is actually made,
+    and it always takes an explicit asset id from whoever is looking.
+    """
+    clause = asset_search_clause(query)
+    if clause is None:
+        return []
+    statement = (
+        select(Asset)
+        .outerjoin(Organization, Organization.id == Asset.owner_id)
+        .where(clause)
+        .order_by(Asset.canonical_name)
+        .limit(limit)
+    )
+    return list(session.scalars(statement).all())
+
+
+def suggest_candidates_for_member(session: Session, membership: PortfolioMembership) -> dict[str, Any]:
+    """Everything that might help an operator resolve one member, and nothing that decides for them.
+
+    A NIF that matches a V2 organization exactly names a *customer*, not an
+    installation — an organization can own several plants, or none imported
+    yet — so it is offered as context, never as a one-click resolution. A name
+    search over assets is the closest thing to an actual candidate list, and it
+    is still just a list to choose from.
+    """
+    organization = None
+    tax_id = normalize_tax_id(membership.tax_id) if membership.tax_id else None
+    if tax_id:
+        organization = session.scalar(select(Organization).where(Organization.normalized_tax_id == tax_id))
+    name_candidates = (
+        search_asset_candidates(session, membership.external_name, limit=8) if membership.external_name else []
+    )
+    organization_assets = (
+        list(session.scalars(select(Asset).where(Asset.owner_id == organization.id).order_by(Asset.canonical_name)))
+        if organization is not None
+        else []
+    )
+    return {
+        "organization": organization,
+        "organization_assets": organization_assets,
+        "name_candidates": [asset for asset in name_candidates if asset not in organization_assets],
+    }
 
 
 def add_rule(
@@ -302,8 +402,15 @@ def add_rule(
     created_by: str,
     operator: str = "in",
 ) -> PortfolioRule:
+    actor = created_by.strip()
+    if not actor:
+        raise ValueError("A rule must record who added it.")
     if session.get(Portfolio, portfolio_id) is None:
         raise ValueError("Unknown portfolio.")
+    if attribute not in RULE_ATTRIBUTES:
+        raise ValueError(f"Unknown rule attribute: {attribute}.")
+    if operator not in RULE_OPERATORS:
+        raise ValueError(f"Unknown rule operator: {operator}.")
     if not values:
         raise ValueError("A rule with no values would select nothing; state its values.")
     rule = PortfolioRule(
@@ -311,7 +418,7 @@ def add_rule(
         attribute=attribute,
         operator=operator,
         values_json=list(values),
-        created_by=created_by.strip(),
+        created_by=actor,
         created_at=utc_now(),
     )
     session.add(rule)

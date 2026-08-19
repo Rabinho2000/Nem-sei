@@ -13,7 +13,7 @@
           <td><a href="{{ url_for('portfolios.detail', portfolio_id=row.portfolio.id) }}"><strong>{{ row.portfolio.name }}</strong></a></td>
           <td class="muted">{{ row.owner or '—' }}</td>
           <td class="num">{{ row.members }}</td>
-          <td class="num">{% if row.unresolved %}<span class="pill pill-warn">{{ row.unresolved }}</span>{% else %}0{% endif %}</td>
+          <td class="num">{% if row.unresolved %}<a class="pill pill-warn" href="{{ url_for('portfolios.review_members', portfolio_id=row.portfolio.id) }}">{{ row.unresolved }}</a>{% else %}0{% endif %}</td>
           <td>{{ 'Ativo' if row.portfolio.status == 'active' else 'Arquivado' }}</td>
         </tr>
       {% else %}

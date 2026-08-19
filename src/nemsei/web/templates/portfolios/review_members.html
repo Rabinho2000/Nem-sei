@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{#
+  One member, one decision. Every card shows exactly what evidence exists —
+  an exact NIF match, a name search — and nothing here resolves anything by
+  itself. Resolving still takes an explicit click and is recorded with who
+  made it.
+#}
+{% block content %}
+<section class="page-header">
+  <div>
+    <p class="eyebrow">Portfolio · {{ portfolio.name }}</p>
+    <h1>Membros por resolver</h1>
+    <p class="lede">{{ rows|length }} membros sem instalação associada. Nada aqui associa sozinho — cada linha precisa de uma escolha.</p>
+  </div>
+  <a class="button-link" href="{{ url_for('portfolios.detail', portfolio_id=portfolio.id, section='settings') }}">← Voltar ao portfolio</a>
+</section>
+
+{% if not rows %}
+  <section class="panel"><p class="empty">Todos os membros deste portfolio estão associados a uma instalação.</p></section>
+{% endif %}
+
+{% for row in rows %}
+  {% set membership = row.membership %}
+  <section class="panel member-review-card">
+    <header class="panel-header">
+      <div>
+        <h2>{{ membership.external_name or 'Sem nome' }}</h2>
+        <p class="muted">
+          Subconta {{ membership.sub_account or '—' }} · NIF {{ membership.tax_id or '—' }}
+          · <span class="pill pill-{{ 'ok' if membership.resolution_state != 'placeholder' else 'warn' }}">
+              {{ {'unresolved':'por resolver','placeholder':'reservado (V1: "importar mais tarde")'}.get(membership.resolution_state, membership.resolution_state) }}
+            </span>
+        </p>
+      </div>
+    </header>
+
+    {% if row.organization %}
+      <div class="candidate-block">
+        <h3>NIF corresponde exatamente a um cliente</h3>
+        <p class="muted">
+          <strong>{{ row.organization.display_name }}</strong> tem o NIF {{ membership.tax_id }}. Isto identifica o
+          <em>cliente</em>, não a instalação — confirma qual das instalações abaixo é a certa.
+        </p>
+        {% if row.organization_assets %}
+          <form class="inline-form compact" method="post" action="{{ url_for('portfolios.resolve_member', portfolio_id=portfolio.id, membership_id=membership.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="next" value="review">
+            <select name="asset_id" required>
+              <option value="">Escolher instalação de {{ row.organization.display_name }}…</option>
+              {% for asset in row.organization_assets %}
+                <option value="{{ asset.id }}">{{ asset.canonical_name }} (#{{ asset.id }})</option>
+              {% endfor %}
+            </select>
+            <button type="submit">Associar</button>
+          </form>
+        {% else %}
+          <p class="empty">Este cliente ainda não tem nenhuma instalação em V2.</p>
+        {% endif %}
+      </div>
+    {% endif %}
+
+    {% if row.name_candidates %}
+      <div class="candidate-block">
+        <h3>Instalações com nome parecido</h3>
+        <form class="inline-form compact" method="post" action="{{ url_for('portfolios.resolve_member', portfolio_id=portfolio.id, membership_id=membership.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="next" value="review">
+          <select name="asset_id" required>
+            <option value="">Escolher…</option>
+            {% for asset in row.name_candidates %}
+              <option value="{{ asset.id }}">{{ asset.canonical_name }} (#{{ asset.id }})</option>
+            {% endfor %}
+          </select>
+          <button type="submit">Associar</button>
+        </form>
+      </div>
+    {% endif %}
+
+    {% if not row.organization and not row.name_candidates %}
+      <p class="empty">Sem sugestões a partir do nome ou do NIF.</p>
+    {% endif %}
+
+    <div class="candidate-block">
+      <h3>Procurar manualmente</h3>
+      <form class="inline-form compact" method="get" action="{{ url_for('assets.list_assets') }}" target="_blank" rel="noopener">
+        <input type="text" name="search" placeholder="Procurar instalação por nome…">
+        <button type="submit">Procurar noutro separador</button>
+      </form>
+      <form class="inline-form compact" method="post" action="{{ url_for('portfolios.resolve_member', portfolio_id=portfolio.id, membership_id=membership.id) }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="next" value="review">
+        <input type="number" name="asset_id" placeholder="ID da instalação" required>
+        <button type="submit">Associar por ID</button>
+      </form>
+    </div>
+  </section>
+{% endfor %}
+{% endblock %}

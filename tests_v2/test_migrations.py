@@ -66,3 +66,38 @@ def test_device_migration_refuses_to_discard_existing_devices(settings, monkeypa
     with pytest.raises(RuntimeError, match="Refusing to downgrade"):
         command.downgrade(Config("alembic.ini"), f"{device_revision()}-1")
     assert "devices" in set(inspect(create_engine(settings.database_url)).get_table_names())
+
+
+def test_portfolio_report_run_migration_refuses_to_discard_a_run(settings, monkeypatch) -> None:
+    upgrade(settings, monkeypatch)
+    from datetime import date, datetime, timezone
+    from decimal import Decimal
+
+    from nemsei.assets.service import create_asset
+    from nemsei.db.session import build_session_factory
+    from nemsei.monitoring.service import record_production_fact
+    from nemsei.portfolios.reporting import generate_report_run
+    from nemsei.portfolios.service import add_member, create_portfolio
+    from nemsei.providers.service import create_connection, create_mapping
+
+    factory = build_session_factory(create_engine(settings.database_url))
+    with factory() as session, session.begin():
+        portfolio = create_portfolio(session, name="P", created_by="op")
+        asset = create_asset(session, canonical_name="A")
+        connection = create_connection(
+            session, provider_code="fusionsolar", connection_key="c1", display_name="c1",
+            credential_reference="REF", enabled=True, configuration_status="configured",
+        )
+        mapping = create_mapping(session, asset_id=asset.id, provider_connection_id=connection.id, external_id="E1")
+        record_production_fact(
+            session, asset_id=asset.id, provider_mapping_id=mapping.id, source_fact_key="k",
+            period_start=datetime(2026, 3, 10, tzinfo=timezone.utc), period_end=datetime(2026, 3, 11, tzinfo=timezone.utc),
+            granularity="day", metric_kind="production_energy", value=Decimal("10"), unit="kWh",
+            quality="complete", completeness="complete", metadata={},
+        )
+        add_member(session, portfolio_id=portfolio.id, asset_id=asset.id, valid_from=date(2026, 1, 1), created_by="op")
+        generate_report_run(session, portfolio_id=portfolio.id, report_month="2026-03", actor="op")
+
+    with pytest.raises(RuntimeError, match="Refusing to downgrade"):
+        command.downgrade(Config("alembic.ini"), "0013_portfolios")
+    assert "portfolio_report_runs" in set(inspect(create_engine(settings.database_url)).get_table_names())

@@ -21,12 +21,14 @@ from nemsei.portfolios.models import (
     PortfolioDataset,
     PortfolioDatasetMember,
     PortfolioMembership,
+    PortfolioReportRun,
     PortfolioRule,
     PortfolioSnapshot,
 )
-from nemsei.portfolios.service import resolve_members
+from nemsei.portfolios.reporting import existing_run, recent_runs, run_member_rows
+from nemsei.portfolios.service import resolve_members, suggest_candidates_for_member, unresolved_members
 from nemsei.providers.models import AssetProviderMapping, ProviderConnection
-from nemsei.reporting.periods import monthly_period
+from nemsei.reporting.periods import ReportingPeriodError, exclusive_end, monthly_period
 
 
 SECTIONS = (
@@ -79,14 +81,22 @@ def portfolio_list(session: Session) -> dict[str, Any]:
     return {"portfolios": rows}
 
 
-def _member_rows(session: Session, dataset: PortfolioDataset | None, snapshot: PortfolioSnapshot | None) -> list[dict[str, Any]]:
-    """One row per member, whether or not it has an installation or data."""
+def _member_rows(
+    session: Session, dataset: PortfolioDataset | None, members: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """One row per member, whether or not it has an installation or data.
+
+    `members` is a plain list of `ResolvedMember.as_dict()`-shaped entries — the
+    same shape whether it came from a frozen `PortfolioSnapshot.members_json` or
+    from a live `resolve_members()` call for a period nothing has been built
+    for yet. The caller decides which; this function does not need to know.
+    """
     metrics_by_asset: dict[int, PortfolioDatasetMember] = {}
     if dataset is not None:
         metrics_by_asset = {member.asset_id: member for member in dataset.members}
 
     rows: list[dict[str, Any]] = []
-    for entry in (snapshot.members_json if snapshot else []):
+    for entry in members:
         asset_id = entry.get("asset_id")
         asset = session.get(Asset, asset_id) if asset_id else None
         member = metrics_by_asset.get(asset_id) if asset_id else None
@@ -187,15 +197,11 @@ def portfolio_detail(
     if snapshot is None:
         # Nothing frozen for this period yet: show the live membership so the
         # screen is still useful, and say plainly that no dataset exists.
-        live = resolve_members(session, portfolio_id=portfolio_id, on=period.start)
-        snapshot_members = [member.as_dict() for member in live]
-        snapshot = None
+        members = [member.as_dict() for member in resolve_members(session, portfolio_id=portfolio_id, on=period.start)]
     else:
-        snapshot_members = list(snapshot.members_json or [])
+        members = list(snapshot.members_json or [])
 
-    rows = _member_rows(session, dataset, snapshot) if snapshot else _member_rows(
-        session, dataset, type("S", (), {"members_json": snapshot_members})()
-    )
+    rows = _member_rows(session, dataset, members)
     options = _filter_options(rows)
     filtered = _apply_filters(rows, filters or {})
 
@@ -234,7 +240,59 @@ def portfolio_detail(
             .order_by(PortfolioSnapshot.period_start.desc())
             .limit(12)
         ).all(),
+        **(workflow_context(session, portfolio_id=portfolio_id, report_month=report_month) if section == "reports" else {}),
     }
+
+
+RUN_STEP_LABELS = (("generated", "Gerado"), ("reviewed", "Revisto"), ("approved", "Aprovado"))
+RUN_STEP_ORDER = {key: index for index, (key, _) in enumerate(RUN_STEP_LABELS)}
+
+
+def _run_steps(run: PortfolioReportRun | None) -> list[dict[str, str]]:
+    """Each workflow step, already marked done/current/pending, so the template
+    only has to render — never to reason about status ordering itself.
+    """
+    current_index = RUN_STEP_ORDER[run.status] if run is not None else -1
+    return [
+        {
+            "key": key,
+            "label": label,
+            "state": "done" if index < current_index else ("current" if index == current_index else "pending"),
+        }
+        for index, (key, label) in enumerate(RUN_STEP_LABELS)
+    ]
+
+
+def workflow_context(session: Session, *, portfolio_id: int, report_month: str) -> dict[str, Any]:
+    """The monthly workflow's current state for one portfolio and period:
+    validar cobertura -> gerar -> rever -> aprovar.
+    """
+    try:
+        period = monthly_period(report_month)
+    except ReportingPeriodError:
+        return {"period": None, "run": None, "run_steps": _run_steps(None), "run_members": [], "history": []}
+    run = existing_run(session, portfolio_id=portfolio_id, period_start=period.start, period_end=exclusive_end(period))
+    return {
+        "period": period,
+        "run": run,
+        "run_steps": _run_steps(run),
+        "run_members": run_member_rows(session, run) if run is not None else [],
+        "history": recent_runs(session, portfolio_id=portfolio_id, limit=12),
+    }
+
+
+def member_review_data(session: Session, *, portfolio_id: int) -> dict[str, Any]:
+    """Everything the review screen needs: each open unresolved member, with
+    whatever might help decide it, and nothing that decides it automatically.
+    """
+    portfolio = session.get(Portfolio, portfolio_id)
+    if portfolio is None:
+        raise ValueError("Unknown portfolio.")
+    rows = []
+    for membership in unresolved_members(session, portfolio_id=portfolio_id):
+        candidates = suggest_candidates_for_member(session, membership)
+        rows.append({"membership": membership, **candidates})
+    return {"portfolio": portfolio, "rows": rows}
 
 
 def available_months(session: Session, portfolio_id: int) -> list[str]:
