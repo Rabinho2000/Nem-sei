@@ -16,6 +16,7 @@ from nemsei.web.home_routes import home_bp
 from nemsei.web.mapping_routes import mapping_bp
 from nemsei.web.reconciliation_routes import reconciliation_bp
 from nemsei.web.source_routes import source_bp
+from nemsei.web.portfolio_routes import portfolio_bp
 
 
 def create_app(
@@ -45,4 +46,5 @@ def create_app(
     app.register_blueprint(reconciliation_bp)
     app.register_blueprint(mapping_bp)
     app.register_blueprint(source_bp)
+    app.register_blueprint(portfolio_bp)
     return app

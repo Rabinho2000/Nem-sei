@@ -6,8 +6,10 @@ monitoring/current-state persistence, temporal source policy, and narrow guarded
 FusionSolar discovery, current-monitoring, and daily production-history reads.
 It also holds persisted financial models, reporting datasets and snapshots, the
 ported reporting rules, both renderers, and the assembly layer between them. It
-intentionally excludes portfolio membership, realtime production/performance
-calculations, and automation/distribution.
+intentionally excludes realtime production/performance calculations and
+automation/distribution. Portfolios now exist with temporal membership, dynamic
+rules, frozen snapshots and an aggregate dataset built from the per-asset
+reports.
 
 A complete asset report can be produced from V2's database alone.
 `production_facts` carries five energy metrics, tariffs and billing

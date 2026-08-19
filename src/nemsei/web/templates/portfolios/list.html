@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-header">
+  <div><h1>Portfolios</h1><p class="lede">Carteiras de instalações, com composição histórica.</p></div>
+</section>
+
+<section class="panel">
+  <table class="data-table">
+    <thead><tr><th>Portfolio</th><th>Cliente</th><th class="num">Membros</th><th class="num">Por resolver</th><th>Estado</th></tr></thead>
+    <tbody>
+      {% for row in portfolios %}
+        <tr>
+          <td><a href="{{ url_for('portfolios.detail', portfolio_id=row.portfolio.id) }}"><strong>{{ row.portfolio.name }}</strong></a></td>
+          <td class="muted">{{ row.owner or '—' }}</td>
+          <td class="num">{{ row.members }}</td>
+          <td class="num">{% if row.unresolved %}<span class="pill pill-warn">{{ row.unresolved }}</span>{% else %}0{% endif %}</td>
+          <td>{{ 'Ativo' if row.portfolio.status == 'active' else 'Arquivado' }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="5" class="empty">Nenhum portfolio ainda.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <header class="panel-header"><h2>Novo portfolio</h2></header>
+  <form class="inline-form" method="post" action="{{ url_for('portfolios.create') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="text" name="name" placeholder="Nome" required>
+    <input type="text" name="description" placeholder="Descrição (opcional)">
+    <button type="submit">Criar</button>
+  </form>
+</section>
+{% endblock %}

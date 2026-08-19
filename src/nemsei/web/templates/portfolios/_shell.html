@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{#
+  One shell for every portfolio section. Designed for this product: the header
+  answers "how is the portfolio doing" before the tabs offer any detail, and the
+  period selector is always present because every number below depends on it.
+#}
+{% macro kwh(value) %}{% if value is none %}<span class="muted">—</span>{% else %}{{ "{:,.0f}".format(value|float).replace(",", " ") }}{% endif %}{% endmacro %}
+{% macro pct(value) %}{% if value is none %}<span class="muted">—</span>{% else %}{{ "%.1f"|format(value|float) }} %{% endif %}{% endmacro %}
+{% macro state_pill(state) %}
+  <span class="pill pill-{{ {'measured':'ok','partial':'warn','missing':'bad'}.get(state,'bad') }}">
+    {{ {'measured':'completo','partial':'parcial','missing':'sem dados'}.get(state, state) }}
+  </span>
+{% endmacro %}
+
+{% block content %}
+<section class="page-header">
+  <div>
+    <p class="eyebrow">Portfolio{% if owner %} · {{ owner.display_name }}{% endif %}</p>
+    <h1>{{ portfolio.name }}</h1>
+    {% if portfolio.description %}<p class="lede">{{ portfolio.description }}</p>{% endif %}
+  </div>
+  <form class="period-form" method="get" action="{{ url_for('portfolios.detail', portfolio_id=portfolio.id, section=section) }}">
+    <label for="month">Período</label>
+    <input id="month" type="month" name="month" value="{{ report_month }}">
+    <button type="submit">Ver</button>
+  </form>
+</section>
+
+{% if dataset %}
+<section class="kpi-strip">
+  <div class="kpi"><small>Instalações</small><strong>{{ coverage.get('assets_in_snapshot', 0) }}</strong>
+    <span class="muted">{{ coverage.get('unresolved_members', 0) }} por resolver</span></div>
+  <div class="kpi"><small>Potência instalada</small><strong>{{ kwh(totals.get('installed_dc_power_kw', {}).get('value')) }} kWp</strong>
+    {{ state_pill(totals.get('installed_dc_power_kw', {}).get('state', 'missing')) }}</div>
+  <div class="kpi"><small>Produção</small><strong>{{ kwh(totals.get('production', {}).get('value')) }} kWh</strong>
+    {{ state_pill(totals.get('production', {}).get('state', 'missing')) }}</div>
+  <div class="kpi"><small>Esperado</small><strong>{{ kwh(totals.get('expected', {}).get('value')) }} kWh</strong>
+    {{ state_pill(totals.get('expected', {}).get('state', 'missing')) }}</div>
+  <div class="kpi"><small>Performance</small><strong>{{ pct(totals.get('performance_pct')) }}</strong>
+    {% if totals.get('performance_pct') is none %}<span class="muted">precisa dos dois lados completos</span>{% endif %}</div>
+  <div class="kpi kpi-coverage"><small>Cobertura</small><strong>{{ coverage.get('label', '0/0') }}</strong>
+    <span class="muted">completas</span></div>
+</section>
+{% else %}
+<section class="empty-note">
+  <p><strong>Sem dados construídos para {{ period.label }}.</strong>
+     Os KPIs aparecem depois de congelar a composição do período e agregar os relatórios individuais.</p>
+  <form method="post" action="{{ url_for('portfolios.build', portfolio_id=portfolio.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="month" value="{{ report_month }}">
+    <button type="submit">Construir {{ period.label }}</button>
+  </form>
+</section>
+{% endif %}
+
+<nav class="section-tabs" aria-label="Secções do portfolio">
+  {% for key, label in sections %}
+    <a class="{{ 'active' if key == section else '' }}"
+       href="{{ url_for('portfolios.detail', portfolio_id=portfolio.id, section=key, month=report_month) }}">{{ label }}</a>
+  {% endfor %}
+</nav>
+
+{% block section %}{% endblock %}
+{% endblock %}

@@ -1,0 +1,30 @@
+{% extends "portfolios/_shell.html" %}
+{% block section %}
+<section class="panel">
+  <header class="panel-header"><h2>Disponibilidade</h2></header>
+  {#
+    Stated honestly rather than filled with a plausible number. The weighted
+    availability calculation is ported and pinned against V1, but it needs
+    device-level facts and V2 collects none yet.
+  #}
+  <p class="empty">
+    A disponibilidade ponderada está implementada e validada contra a V1, mas depende de factos ao nível
+    do equipamento — e a V2 ainda não os recolhe. Enquanto isso, esta secção mostra a cobertura de dados,
+    que é a pergunta operacional mais próxima que os dados actuais conseguem responder.
+  </p>
+  <table class="data-table">
+    <thead><tr><th>Instalação</th><th>Estado dos dados</th><th class="num">Produção</th></tr></thead>
+    <tbody>
+      {% for row in rows if row.asset_id %}
+        <tr class="{{ 'row-attention' if row.production_state != 'measured' else '' }}">
+          <td><a href="{{ url_for('assets.asset_detail', asset_id=row.asset_id) }}">{{ row.name }}</a></td>
+          <td>{{ state_pill(row.production_state) }}</td>
+          <td class="num">{{ kwh(row.production_kwh) }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="3" class="empty">Sem instalações a mostrar.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

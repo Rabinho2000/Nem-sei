@@ -1,0 +1,20 @@
+{#
+  Country, status and provider are filters over one portfolio's members. They
+  narrow what is shown and never split the portfolio into smaller ones.
+#}
+<form class="filter-bar" method="get" action="{{ url_for('portfolios.detail', portfolio_id=portfolio.id, section=section) }}">
+  <input type="hidden" name="month" value="{{ report_month }}">
+  <input type="search" name="q" value="{{ filters.get('q', '') }}" placeholder="Nome, subconta ou NIF">
+  {% for key, label in [('country_code', 'País'), ('lifecycle_status', 'Estado'), ('provider_code', 'Provider'), ('contract_type', 'Contrato')] %}
+    <select name="{{ key }}" aria-label="{{ label }}">
+      <option value="">{{ label }}: todos</option>
+      {% for option in filter_options.get(key, []) %}
+        <option value="{{ option }}" {{ 'selected' if filters.get(key) == option else '' }}>{{ option }}</option>
+      {% endfor %}
+    </select>
+  {% endfor %}
+  <label class="check"><input type="checkbox" name="attention" value="1" {{ 'checked' if filters.get('attention') else '' }}> Só as que precisam de atenção</label>
+  <button type="submit">Filtrar</button>
+  <a class="clear" href="{{ url_for('portfolios.detail', portfolio_id=portfolio.id, section=section, month=report_month) }}">Limpar</a>
+</form>
+<p class="result-count">{{ rows|length }} de {{ all_rows|length }} membros</p>

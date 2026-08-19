@@ -51,7 +51,7 @@ commercial attributes on `Asset`.
 | §17 Auditability | table only | `operator_audit_events` exists and is empty |
 | §1 Canonical model | **incomplete** | flat `Organization → Asset → AssetAlias`; no site/plant/device hierarchy |
 | §16 AuthN/AuthZ | not started | single configured administrator password hash; no users, no permissions |
-| §9 Portfolios | not started | — |
+| §9 Portfolios | done | `portfolios/`, `web/portfolio_routes.py`; V1's two portfolios imported with all 80 members |
 | §8 Production | facts and expected production | `production_facts` holds five daily energy metrics with revision supersession; expected production comes from confirmed financial models |
 | §6 §12 §13 Monitoring board, alarms, incidents | not started | — |
 | §10 Reporting | asset report complete | rules, datasets, snapshots, both renderers, `reporting/assembler.py`, and the tariff/billing/contract inputs it reads; see `REPORTING_PARITY.md` |
@@ -88,7 +88,7 @@ Rules:
 | M5 | **Reporting rebuilt on persisted canonical data (§10)** — its phases are M5.1–M5.7 in `REPORTING_PARITY.md` | M1 | Claude (done for the asset report; portfolio reporting waits on M8) |
 | M6 | Canonical production and aggregation: MTD, YTD, monthly (§8) | M2 | unassigned |
 | M7 | Alarms, normalised status, operational dashboard (§6, §12) | M2, M6 | unassigned |
-| M8 | Portfolios with validity periods (§9) | M1 | unassigned (the portfolio *renderer* is already pinned against V1's real artefact) |
+| M8 | Portfolios with validity periods (§9) | M1 | Claude (done: domain, import, aggregate dataset and a rebuilt UI — see `PORTFOLIOS.md`) |
 | M9 | Automations, notifications, digests, scheduled reports (§11, §14) | M7, M8 | unassigned |
 
 This sequence departs from the order implied by `GOAL.md` in one place: the

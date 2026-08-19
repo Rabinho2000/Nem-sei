@@ -1,0 +1,20 @@
+{% extends "portfolios/_shell.html" %}
+{% block section %}
+<section class="panel">
+  <header class="panel-header">
+    <h2>Financeiro</h2>
+    <span class="muted">a partir da configuração de faturação de cada instalação</span>
+  </header>
+  <p class="empty">
+    Os valores financeiros de um portfolio são a soma dos relatórios individuais, e esses dependem da
+    configuração de faturação e da tarifa de cada instalação. Neste momento apenas
+    {{ all_rows|selectattr('asset_id')|list|length }} instalações estão neste portfolio e a maioria ainda não
+    tem tarifa nem configuração comercial registada — por isso esta secção não apresenta totais que dariam
+    a impressão de estarem completos.
+  </p>
+  <p class="panel-foot muted">
+    Assim que uma instalação tiver configuração de faturação, o seu relatório individual passa a produzir
+    poupança, receita de excedente e benefício líquido, e este total passa a somá-los.
+  </p>
+</section>
+{% endblock %}

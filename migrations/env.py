@@ -13,6 +13,7 @@ import nemsei.monitoring.models  # noqa: F401 - register canonical fact metadata
 import nemsei.sources.models  # noqa: F401 - register source policy metadata
 import nemsei.reporting.models  # noqa: F401 - register reporting metadata
 import nemsei.reporting.commercial_models  # noqa: F401 - register tariff and billing metadata
+import nemsei.portfolios.models  # noqa: F401 - register portfolio metadata
 
 
 config = context.config

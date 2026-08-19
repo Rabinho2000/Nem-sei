@@ -1,0 +1,85 @@
+{% extends "portfolios/_shell.html" %}
+{% block section %}
+<section class="panel">
+  <header class="panel-header">
+    <h2>Filtros dinâmicos</h2>
+    <span class="muted">seleccionam instalações; nunca criam sub-portfolios</span>
+  </header>
+  <table class="data-table">
+    <thead><tr><th>Atributo</th><th>Operador</th><th>Valores</th><th>Criado por</th></tr></thead>
+    <tbody>
+      {% for rule in rules %}
+        <tr><td>{{ rule.attribute }}</td><td>{{ rule.operator }}</td><td>{{ rule.values_json|join(', ') }}</td><td class="muted">{{ rule.created_by }}</td></tr>
+      {% else %}
+        <tr><td colspan="4" class="empty">Sem filtros. Os membros vêm todos de linhas explícitas.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <form class="inline-form" method="post" action="{{ url_for('portfolios.create_rule', portfolio_id=portfolio.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <select name="attribute" required>
+      {% for attribute in ['country_code', 'lifecycle_status', 'provider_code', 'contract_type', 'locality'] %}
+        <option value="{{ attribute }}">{{ attribute }}</option>
+      {% endfor %}
+    </select>
+    <select name="operator"><option value="in">inclui</option><option value="not_in">exclui</option></select>
+    <input type="text" name="values" placeholder="PT, ES" required>
+    <button type="submit">Adicionar filtro</button>
+  </form>
+</section>
+
+<section class="panel">
+  <header class="panel-header">
+    <h2>Membros</h2>
+    <span class="muted">{{ memberships|selectattr('resolution_state', 'ne', 'resolved')|list|length }} por resolver</span>
+  </header>
+  <table class="data-table">
+    <thead><tr><th>Subconta</th><th>Nome</th><th>NIF</th><th>Estado</th><th>Validade</th><th>Origem</th><th></th></tr></thead>
+    <tbody>
+      {% for membership in memberships %}
+        <tr>
+          <td class="muted">{{ membership.sub_account or '—' }}</td>
+          <td>{{ membership.external_name or '—' }}</td>
+          <td class="muted">{{ membership.tax_id or '—' }}</td>
+          <td>
+            <span class="pill pill-{{ 'ok' if membership.resolution_state == 'resolved' else 'warn' }}">
+              {{ {'resolved':'associado','unresolved':'por resolver','placeholder':'reservado'}.get(membership.resolution_state) }}
+            </span>
+          </td>
+          <td class="muted">{{ membership.valid_from }} → {{ membership.valid_to or 'aberto' }}</td>
+          <td class="muted">{{ membership.source_kind }}</td>
+          <td class="num">
+            {% if membership.resolution_state != 'resolved' %}
+              <form class="inline-form compact" method="post" action="{{ url_for('portfolios.resolve_member', portfolio_id=portfolio.id, membership_id=membership.id) }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="number" name="asset_id" placeholder="ID da instalação" required>
+                <button type="submit">Associar</button>
+              </form>
+            {% elif membership.valid_to is none %}
+              <form class="inline-form compact" method="post" action="{{ url_for('portfolios.end_member', portfolio_id=portfolio.id, membership_id=membership.id) }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="date" name="on" required>
+                <button type="submit">Terminar</button>
+              </form>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="panel-foot muted">
+    Associar um membro é uma decisão de operador e fica registada com o nome de quem a tomou.
+    Nada aqui adivinha instalações a partir de nomes.
+  </p>
+</section>
+
+<section class="panel">
+  <header class="panel-header"><h2>Construir período</h2></header>
+  <p class="muted">Congela a composição do período e agrega os relatórios individuais. É esta a unidade do reporting em lote.</p>
+  <form class="inline-form" method="post" action="{{ url_for('portfolios.build', portfolio_id=portfolio.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="month" name="month" value="{{ report_month }}" required>
+    <button type="submit">Construir</button>
+  </form>
+</section>
+{% endblock %}

@@ -1,0 +1,47 @@
+{% extends "portfolios/_shell.html" %}
+{% block section %}
+{% include "portfolios/_filters.html" %}
+<section class="panel">
+  <header class="panel-header">
+    <h2>Energia do período</h2>
+    <span class="muted">somada dos relatórios individuais, não recalculada</span>
+  </header>
+  <table class="data-table">
+    <thead><tr><th>Métrica</th><th class="num">Total</th><th>Estado</th><th class="num">Instalações</th></tr></thead>
+    <tbody>
+      {% for key, label in [('production','Produção'), ('expected','Esperado'), ('self_use','Autoconsumo'), ('export','Excedente'), ('consumption','Consumo'), ('grid_import','Importação de rede')] %}
+        {% set total = totals.get(key, {}) %}
+        <tr>
+          <td>{{ label }}</td>
+          <td class="num">{{ kwh(total.get('value')) }} kWh</td>
+          <td>{{ state_pill(total.get('state', 'missing')) }}</td>
+          <td class="num">{{ total.get('measured_assets', 0) }}/{{ total.get('total_assets', 0) }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="panel-foot muted">Um total “parcial” é a soma das instalações que reportaram. Nunca é completado com zeros.</p>
+</section>
+
+<section class="panel">
+  <header class="panel-header"><h2>Por instalação</h2></header>
+  <table class="data-table">
+    <thead><tr><th>Instalação</th><th class="num">Produção</th><th class="num">Autoconsumo</th><th class="num">Excedente</th><th class="num">Consumo</th><th class="num">Rede</th><th>Dados</th></tr></thead>
+    <tbody>
+      {% for row in rows if row.asset_id %}
+        <tr class="{{ 'row-attention' if row.production_state != 'measured' else '' }}">
+          <td><a href="{{ url_for('assets.asset_detail', asset_id=row.asset_id) }}">{{ row.name }}</a></td>
+          <td class="num">{{ kwh(row.production_kwh) }}</td>
+          <td class="num">{{ kwh(row.self_use_kwh) }}</td>
+          <td class="num">{{ kwh(row.export_kwh) }}</td>
+          <td class="num">{{ kwh(row.consumption_kwh) }}</td>
+          <td class="num">{{ kwh(row.grid_import_kwh) }}</td>
+          <td>{{ state_pill(row.production_state) }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="7" class="empty">Sem instalações a mostrar.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

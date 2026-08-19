@@ -198,3 +198,47 @@ code { color: var(--brand-dark); font: 0.78rem ui-monospace, SFMono-Regular, Men
   .detail-list div { grid-template-columns: 1fr; gap: 3px; }
   .detail-header .button { width: auto; }
 }
+
+/* Portfolios ------------------------------------------------------------- */
+.eyebrow { margin: 0 0 4px; color: var(--muted); font-size: 0.74rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+.lede { margin: 6px 0 0; color: var(--muted); }
+.period-form { display: flex; align-items: center; gap: 8px; }
+.period-form label { color: var(--muted); font-size: 0.8rem; }
+
+/* The KPI strip answers 'how is this portfolio doing' before any tab is opened. */
+.kpi-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 22px; }
+.kpi { padding: 14px 16px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); }
+.kpi small { display: block; color: var(--muted); font-size: 0.72rem; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; }
+.kpi strong { display: block; margin: 6px 0 4px; font-size: 1.5rem; letter-spacing: -0.03em; }
+.kpi .muted { font-size: 0.75rem; }
+.kpi-coverage strong { color: var(--accent, #0B2D52); }
+
+.section-tabs { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 20px; border-bottom: 1px solid var(--line); }
+.section-tabs a { padding: 10px 14px; border-bottom: 2px solid transparent; color: var(--muted); font-size: 0.9rem; font-weight: 600; text-decoration: none; }
+.section-tabs a:hover { color: inherit; }
+.section-tabs a.active { border-bottom-color: currentColor; color: inherit; }
+
+.pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 0.72rem; font-weight: 700; white-space: nowrap; }
+.pill-ok { background: #e8f5e9; color: #1b5e20; }
+.pill-warn { background: #fff4e0; color: #8a5200; }
+.pill-bad { background: #fdecec; color: #8c1c1c; }
+
+.filter-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px; }
+.filter-bar .check { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 0.85rem; }
+.filter-bar .clear { color: var(--muted); font-size: 0.85rem; }
+.result-count { margin: 0 0 14px; color: var(--muted); font-size: 0.82rem; }
+
+.two-column { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+.stat-list { display: grid; grid-template-columns: 1fr auto; gap: 6px 16px; margin: 0; }
+.stat-list dt { color: var(--muted); font-size: 0.85rem; }
+.stat-list dd { margin: 0; font-weight: 650; text-align: right; }
+.provenance { margin: 14px 0 0; color: var(--muted); font-size: 0.78rem; }
+.panel-foot { margin: 12px 0 0; font-size: 0.85rem; }
+.empty { padding: 14px 0; color: var(--muted); }
+.empty-note { margin-bottom: 22px; padding: 16px 18px; border: 1px dashed var(--line); border-radius: 9px; }
+.warning-list { margin: 0; padding-left: 18px; color: var(--muted); font-size: 0.82rem; }
+.num { text-align: right; }
+/* A row that needs attention is marked, not coloured over: the text stays readable. */
+.row-attention { background: #fffaf2; }
+.inline-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 14px; }
+.inline-form.compact { margin: 0; justify-content: flex-end; }

@@ -1,0 +1,55 @@
+{% extends "portfolios/_shell.html" %}
+{% block section %}
+{# The overview answers one question first: which installations need attention. #}
+<div class="two-column">
+  <section class="panel">
+    <header class="panel-header">
+      <h2>Precisam de atenção</h2>
+      <span class="muted">{{ attention|length }} de {{ all_rows|length }}</span>
+    </header>
+    {% if attention %}
+      <table class="data-table">
+        <thead><tr><th>Instalação</th><th>Subconta</th><th>Estado</th><th class="num">Produção</th></tr></thead>
+        <tbody>
+          {% for row in attention[:15] %}
+            <tr>
+              <td>{% if row.asset_id %}<a href="{{ url_for('assets.asset_detail', asset_id=row.asset_id) }}">{{ row.name }}</a>{% else %}{{ row.name }}{% endif %}</td>
+              <td class="muted">{{ row.sub_account or '—' }}</td>
+              <td>{{ state_pill(row.production_state) }}</td>
+              <td class="num">{{ kwh(row.production_kwh) }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% if attention|length > 15 %}
+        <p class="panel-foot"><a href="{{ url_for('portfolios.detail', portfolio_id=portfolio.id, section='installations', month=report_month, attention='1') }}">Ver as {{ attention|length }}</a></p>
+      {% endif %}
+    {% else %}
+      <p class="empty">Todas as instalações com dados reportaram o período completo.</p>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <header class="panel-header"><h2>Composição</h2></header>
+    <dl class="stat-list">
+      <dt>Membros no período</dt><dd>{{ (snapshot.members_json if snapshot else all_rows)|length }}</dd>
+      <dt>Com instalação</dt><dd>{{ coverage.get('assets_in_snapshot', all_rows|selectattr('asset_id')|list|length) }}</dd>
+      <dt>Por resolver</dt><dd>{{ coverage.get('unresolved_members', 0) }}</dd>
+      <dt>Completas</dt><dd>{{ coverage.get('assets_complete', 0) }}</dd>
+      <dt>Parciais</dt><dd>{{ coverage.get('assets_partial', 0) }}</dd>
+      <dt>Sem dados</dt><dd>{{ coverage.get('assets_missing', 0) }}</dd>
+    </dl>
+    {% if dataset %}
+      <p class="provenance">Construído em {{ dataset.built_at.strftime('%Y-%m-%d %H:%M') }} por {{ dataset.built_by }}.
+         Composição congelada: <code>{{ snapshot.membership_digest[:12] if snapshot else '—' }}</code>.</p>
+    {% endif %}
+  </section>
+</div>
+
+{% if dataset and dataset.warnings_json %}
+<section class="panel">
+  <header class="panel-header"><h2>Avisos</h2><span class="muted">{{ dataset.warnings_json|length }}</span></header>
+  <ul class="warning-list">{% for warning in dataset.warnings_json[:20] %}<li><code>{{ warning }}</code></li>{% endfor %}</ul>
+</section>
+{% endif %}
+{% endblock %}

@@ -89,3 +89,35 @@ and `assets`, surveyed read-only on 2026-08-19.
   sending an ESCO customer an EPC document is a commercial error, not a
   formatting one.
 
+## Portfolios (M8)
+
+Evidence: V1's `portfolio_groups`, `portfolio_assets`, `portfolio_mapping_events`
+and `portfolio_report_profiles`, surveyed read-only on 2026-08-19 and recorded in
+`PORTFOLIOS.md`. V1's screens were deliberately not consulted.
+
+- **Portfolios are flat.** There is no parent column, and a test asserts none
+  appears. V1 has no nesting either.
+- **A member is not always an asset.** 23 of V1's 80 members carry a name, a NIF
+  and a sub-account but no installation. `asset_id` is nullable and
+  `resolution_state` distinguishes `resolved`, `unresolved` and `placeholder`.
+  Dropping them would have lost real evidence and silently shrunk two portfolios.
+- **Membership is temporal and may overlap between portfolios.** Two assets and
+  four NIFs belong to both of V1's portfolios. A GiST exclusion constraint stops
+  one asset being counted twice inside the *same* portfolio, which would
+  double-weight a plant in every total.
+- **Nothing is matched fuzzily.** An exact NIF match names a customer, not an
+  installation, so it is reported as a candidate for an operator to confirm.
+  `resolve_member_to_asset` is the only path to `resolved` and it records who
+  decided.
+- **Country, region and provider are rule attributes and UI filters, never
+  structure.** A rule with no values selects nothing rather than everything.
+- **Snapshots freeze the exact list**, append-only by trigger, so a report keeps
+  naming what it covered after the portfolio changes.
+- **The aggregate reuses the individual reporting.** `PortfolioDataset` builds
+  one `ReportingDataset` per member and sums it; `portfolio_dataset_members`
+  stores the per-asset dataset id, so a disagreement between a portfolio total
+  and an asset's own report is a bug rather than a difference of method.
+- **A partial total says partial.** A portfolio of 20 with 18 reporting shows the
+  sum of the 18 and a coverage of 18/20. A smaller total that looks complete is
+  the most expensive wrong number a portfolio report can carry.
+

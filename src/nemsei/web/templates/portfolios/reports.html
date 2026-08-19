@@ -1,0 +1,58 @@
+{% extends "portfolios/_shell.html" %}
+{% block section %}
+<div class="two-column">
+  <section class="panel">
+    <header class="panel-header"><h2>Relatório agregado</h2></header>
+    {% if dataset %}
+      <p>Período <strong>{{ period.label }}</strong>, {{ coverage.get('label', '0/0') }} instalações completas.</p>
+      <dl class="stat-list">
+        <dt>Produção</dt><dd>{{ kwh(totals.get('production', {}).get('value')) }} kWh</dd>
+        <dt>Autoconsumo</dt><dd>{{ kwh(totals.get('self_use', {}).get('value')) }} kWh</dd>
+        <dt>Excedente</dt><dd>{{ kwh(totals.get('export', {}).get('value')) }} kWh</dd>
+        <dt>Potência</dt><dd>{{ kwh(totals.get('installed_dc_power_kw', {}).get('value')) }} kWp</dd>
+      </dl>
+      <p class="provenance">Digest do dataset: <code>{{ dataset.input_digest[:16] }}</code></p>
+    {% else %}
+      <p class="empty">Constrói o período para gerar o agregado.</p>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <header class="panel-header"><h2>Relatórios individuais</h2></header>
+    <p class="muted">Cada instalação usa o mesmo dataset que alimenta o agregado, por isso os números coincidem por construção.</p>
+    <table class="data-table">
+      <thead><tr><th>Instalação</th><th>Dados</th><th></th></tr></thead>
+      <tbody>
+        {% for row in rows if row.asset_id %}
+          <tr>
+            <td>{{ row.name }}</td>
+            <td>{{ state_pill(row.production_state) }}</td>
+            <td class="num"><a href="{{ url_for('assets.asset_detail', asset_id=row.asset_id) }}">Abrir</a></td>
+          </tr>
+        {% else %}
+          <tr><td colspan="3" class="empty">Sem instalações.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+</div>
+
+<section class="panel">
+  <header class="panel-header"><h2>Períodos congelados</h2><span class="muted">a base do reporting em lote</span></header>
+  <table class="data-table">
+    <thead><tr><th>Período</th><th class="num">Instalações</th><th>Composição</th><th>Criado</th></tr></thead>
+    <tbody>
+      {% for snap in snapshots %}
+        <tr>
+          <td><a href="{{ url_for('portfolios.detail', portfolio_id=portfolio.id, section='overview', month=snap.period_start.strftime('%Y-%m')) }}">{{ snap.period_start.strftime('%Y-%m') }}</a></td>
+          <td class="num">{{ snap.asset_ids_json|length }}</td>
+          <td><code>{{ snap.membership_digest[:12] }}</code></td>
+          <td class="muted">{{ snap.created_at.strftime('%Y-%m-%d') }} · {{ snap.created_by }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="4" class="empty">Nenhum período congelado ainda.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

@@ -30,6 +30,7 @@
           <div class="nav-group">
             <span class="nav-heading">Gestão</span>
             <a class="nav-link {{ 'active' if request.endpoint == 'assets.organizations' else '' }}" href="{{ url_for('assets.organizations') }}"><span aria-hidden="true">◎</span> Organizações</a>
+            <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('portfolios.') else '' }}" href="{{ url_for('portfolios.index') }}"><span aria-hidden="true">▤</span> Portfolios</a>
           </div>
         </nav>
         <div class="sidebar-footer">
