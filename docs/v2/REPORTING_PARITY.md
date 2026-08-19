@@ -35,7 +35,7 @@ depends on it.
 | M5.4 | Expected production, availability, data quality and the quality gate | **done for what V2 can hold**: quality rules and the availability calculation ported; the rest needs device-level facts |
 | M5.5 | `ReportingDataset` and `ReportSnapshot`, reproducible from persisted facts alone | **done** |
 | M5.6 | Excel and PDF rendering, visual and numerical parity | **done**: asset Excel and PDF, and the portfolio workbook |
-| M5.7 | End-to-end golden tests V1 versus V2, with every difference explained | **diagnosed**: renderers proven, payload assembly identified as the remaining gap |
+| M5.7 | End-to-end golden tests V1 versus V2, with every difference explained | **assembly built**: a report is now produced from V2's database alone; the remaining differences are missing facts, not missing code |
 
 ## M5.1: financial model parsing
 
@@ -335,3 +335,94 @@ billing, chart series and coverage into the payload.
 
 That layer is the natural next slice, and it is now precisely scoped rather than
 estimated: the comparison above lists exactly which fields it must produce.
+
+## M5.7 in part: the assembly layer
+
+`reporting/assembler.py` is the layer the diagnosis above identified. It turns
+persisted rows into the payload V1's renderers expect, reading nothing but the
+database, and a report for the canary asset now comes out of PostgreSQL end to
+end: **59.56 kWh for July 2026**, rendered to a PDF and a workbook with no
+provider call and nothing written back.
+
+`periods.py` came across with it, pinned against V1 across twelve period shapes,
+their rejections and the Portuguese month labels. One conversion is explicit
+rather than inline: V1's period end is the **last day** of the period and V2's
+persistence is **half-open**, so `exclusive_end` names the difference. Mixing the
+two silently drops a day from every report, and a test holds a fact on the 31st
+to prove it does not.
+
+### The bug this found
+
+`production_facts` is append-only: a corrected reading is a new row that
+supersedes the one it replaces, linked by `supersedes_fact_id`. `build_dataset`
+summed the raw rows, so it added a value to the value meant to replace it. On
+the only real data V2 holds — one day, corrected once — it reported **129.28 kWh
+for a day that produced 59.56**, a 117 % overstatement.
+
+Totalling now reduces to the current revision first, through
+`CanonicalFactRepository.current_production_facts_for_asset` so that the rule is
+named in one place rather than left to each caller. Two tests hold it, one at
+the payload level and one at the dataset level a snapshot would freeze.
+
+### What is absent, and why it says so
+
+Twenty-one payload fields have no persisted source in V2. Each is `None` and
+named in `unavailable_fields`, so the gap is legible in the payload and in the
+document rather than arriving as a zero that looks like a measurement:
+
+| Group | Fields | Blocked on |
+| --- | --- | --- |
+| Energy series | self-use, export, consumption, grid import, and the four tariff-period self-use splits | `production_facts` carries one metric, `production_energy`; the FusionSolar adapter accepts only the verified `PVYield` signal |
+| Commercial | tariff value, type, breakdown and coverage; electricity and sell price; Solcor price; fixed monthly fee | no tariff or billing-configuration tables in V2 |
+| Identity | `contract_type`, `asset_type`, `coverage_type`, `sell_to` | V2's `Asset` has no commercial attributes, so `detect_report_type` falls back to EPC and an ESCO customer would receive the wrong report unless the caller passes an explicit `BillingConfig` |
+| Availability | `availability_pct` | device-level facts, as already recorded |
+
+One exception is documented rather than hidden. `prepare_customer_report`
+derives grid import from consumption minus self-use, so two absent inputs
+produce a real `0.0`. That is V1's own behaviour and it is left alone, because
+changing it would break the renderer parity the golden tests assert.
+
+### A divergence from V1, and the evidence for it
+
+`_draw_donut` passes its percentage to reportlab as an angular *extent*, and an
+extent of exactly zero raises `ZeroDivisionError` inside `pdfgeom.bezierArc`.
+V1 does this too — verified directly against the frozen checkout, not inferred
+from the port. V1 never reached it because its payloads always carried a
+non-zero self-use figure; every V2-assembled report reaches it, because
+self-consumption is derived as zero. A zero now draws no arc. Nothing numeric
+changes: the hole still reads `0,0 %`, which stays distinct from the `N/D` a
+missing value shows.
+
+### What is still needed for a report a customer could receive
+
+The assembly layer is no longer the constraint. What remains is **data and
+configuration**, not code:
+
+1. Energy facts beyond production — self-use, export, consumption, grid import —
+   which needs the metric vocabulary extended and a provider contract verified
+   for each signal.
+2. Tariffs and billing configuration persisted, with the validity periods the
+   ported rules already expect.
+3. Commercial attributes on `Asset`, so report type is resolved rather than
+   defaulted.
+
+### Running the parity evidence
+
+The golden tests hardcode `/opt/server/apps/Nem-sei` and **skip silently** when
+it is absent, which makes a suite that proves nothing look green. Without the
+mount the suite reports 236 passed and 103 skipped; with it, 373 passed and 4
+skipped:
+
+```bash
+docker build --target acceptance -t nemsei-v2-testrunner:local -f Dockerfile.v2 .
+docker run --rm --network host \
+  -v /opt/server/apps/Nem-sei-v2:/repo \
+  -v /opt/server/apps/Nem-sei:/opt/server/apps/Nem-sei:ro \
+  -w /repo -e PYTHONPATH=/repo/src \
+  -e NEMSEI_V2_TEST_DATABASE_URL='postgresql+psycopg://nemsei:nemsei-test@127.0.0.1:55432/nemsei_v2_test' \
+  nemsei-v2-testrunner:local python -m pytest -q tests_v2
+```
+
+`pypdf` must be installed on top of that image for `test_pdf_golden.py`. The 4
+remaining skips are `test_financial_workbook_golden.py`, which needs V1's live
+SQLite; it runs in WAL mode and cannot be opened from a read-only mount.

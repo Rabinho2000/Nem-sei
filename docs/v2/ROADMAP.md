@@ -5,7 +5,12 @@ repository as it actually exists, sequences the remaining work, and records who
 owns which milestone. `DECISIONS.md` holds settled architectural decisions and
 `KNOWN_GAPS.md` holds the honest capability boundary of the current build.
 
-Last reviewed: 2026-08-18.
+Last reviewed: 2026-08-19.
+
+> **Milestone numbering.** This table previously numbered portfolios M5 and
+> reporting M8, while `REPORTING_PARITY.md` numbered reporting M5 with phases
+> M5.1–M5.7. The reporting numbering is the one in active use and the table now
+> follows it. Portfolios move to M8.
 
 ## Current state
 
@@ -14,16 +19,18 @@ port 5000: 267 assets, 214 customers, ~55k production records, ~29k Telegram
 alerts, 5.4 GB of runtime data. V1 remains the source of truth until an explicit
 cutover.
 
-V2 runs on port 5002 from this worktree (`rewrite/v2`) with PostgreSQL 16 and
-separate web, scheduler and worker processes. It holds imported identity data —
-265 assets, 214 organizations, 134 provider mappings — and **no facts at all**:
-`sync_runs`, `monitoring_observations`, `monitoring_current_states`,
-`production_facts` and `integration_health` are empty. No live provider call has
-ever been made from V2.
+V2 runs on port 5002 from this worktree with PostgreSQL 16 and separate web,
+scheduler and worker processes, at Alembic revision `0011_reporting_datasets`.
+It holds imported identity data — 266 assets, 325 devices, 214 organizations,
+134 provider mappings — and **almost no facts**: the FusionSolar canary produced
+one monitoring observation and one production fact, the latter corrected once,
+so `production_facts` holds two rows describing a single day of a single plant.
 
-That combination is the single most important scheduling fact in this document:
-the fact tables are still empty, so structural changes to the canonical model
-are currently free and will not be free later.
+That remains the most important scheduling fact in this document. The fact
+tables are still effectively empty, so structural changes to the canonical model
+are close to free now and will not be later — and the reporting work has just
+shown exactly which structures are missing: a second energy metric, tariffs, and
+commercial attributes on `Asset`.
 
 ## Goal to implementation map
 
@@ -43,9 +50,10 @@ are currently free and will not be free later.
 | §1 Canonical model | **incomplete** | flat `Organization → Asset → AssetAlias`; no site/plant/device hierarchy |
 | §16 AuthN/AuthZ | not started | single configured administrator password hash; no users, no permissions |
 | §9 Portfolios | not started | — |
-| §8 Production | schema only | `production_facts` empty; no aggregation, no expected production |
+| §8 Production | facts and expected production | `production_facts` holds daily energy with revision supersession; expected production comes from confirmed financial models; only `production_energy` exists as a metric |
 | §6 §12 §13 Monitoring board, alarms, incidents | not started | — |
-| §10 §11 Reporting and automated reporting | not started | — |
+| §10 Reporting | mostly built, blocked on facts | rules, datasets, snapshots, both renderers and `reporting/assembler.py`; see `REPORTING_PARITY.md` |
+| §11 Automated reporting | not started | — |
 | §14 Automations and notifications | not started | — |
 | §24 V1 migration | identity only | `MIGRATION_MATRIX.md` is still a stub; import residue unresolved |
 | §26 Provider discovery | partial | FusionSolar and Sigenergy discovery exist behind capability gates |
@@ -75,10 +83,10 @@ Rules:
 | M2 | First real FusionSolar sync: one connection, small plant subset, read-only, end-to-end evidence | M1 | Claude (canary validated 2026-08-19; portfolio rollout needs a V2-only account — see `FUSIONSOLAR_CANARY.md`) |
 | M3 | Close the identity migration: resolve conflicts, quarantines and unresolved rows; fill `MIGRATION_MATRIX.md` | — (parallel) | Claude (done, five plants pending an operator ruling) |
 | M4 | Users and permissions (§16) plus audit events that actually get written (§17) | M2 | unassigned |
-| M5 | Portfolios with validity periods (§9) | M1 | unassigned |
+| M5 | **Reporting rebuilt on persisted canonical data (§10)** — the milestone actually in progress; its phases are M5.1–M5.7 in `REPORTING_PARITY.md` | M1 | Claude (M5.1–M5.6 done; M5.7 assembly built, blocked on facts) |
 | M6 | Canonical production and aggregation: MTD, YTD, monthly (§8) | M2 | unassigned |
 | M7 | Alarms, normalised status, operational dashboard (§6, §12) | M2, M6 | unassigned |
-| M8 | Reporting rebuilt on persisted canonical data (§10) | M5, M6 | unassigned (financial source evidence surveyed — see `FINANCIAL_MODEL_SOURCES.md`) |
+| M8 | Portfolios with validity periods (§9) | M1 | unassigned (the portfolio *renderer* is already pinned against V1's real artefact) |
 | M9 | Automations, notifications, digests, scheduled reports (§11, §14) | M7, M8 | unassigned |
 
 This sequence departs from the order implied by `GOAL.md` in one place: the
