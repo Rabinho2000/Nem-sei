@@ -158,11 +158,24 @@ kWh against a kW capacity.
 
 ## What could not be replayed
 
-Current monitoring could not be validated this way. V1 never stored a raw
-`getStationRealKpi` response — `monitoring_records` has no payload column and
-`integration_realtime_snapshots` holds Sigenergy rows only — so there is no
-genuine payload to replay, and inventing one would prove nothing about the
-provider contract. That leg needs a live call.
+Current monitoring could not be validated this way, and this was established
+exhaustively rather than assumed. Every V1 table carrying a payload or JSON
+column was searched for `real_health_state`, the field that identifies a
+`getStationRealKpi` response and that V2 maps to its verified plant health
+codes. The result is zero rows, in `assets.source_payload`,
+`device_realtime_snapshots.payload_json`, `provider_devices.payload_json`,
+`integration_sync_runs.summary_json`, `production_records.payload_json` and
+`availability_daily.payload_json` alike. `monitoring_records` has no payload
+column at all, `integration_realtime_snapshots` holds Sigenergy rows only, and
+`assets.source_payload` is an Excel import row rather than provider data.
+
+V1 therefore never persisted a station status response. There is no genuine
+payload to replay, and fabricating one would prove nothing about the provider
+contract while looking like evidence. Current monitoring needs a live call.
+
+Authentication is in the same position. The replay exercises V2's login path,
+header token extraction and session reuse, but against a replayed response; only
+a real account can prove the credential exchange itself.
 
 ## What is ready
 
