@@ -30,8 +30,8 @@ depends on it.
 | Phase | Content | State |
 | --- | --- | --- |
 | **M5.1** | Financial model parsing with full provenance, golden parity on the real workbook | **done** |
-| M5.2 | Financial models persisted and versioned in PostgreSQL: source file, hash, cell provenance, derivation rules, warnings, base-year origin | next |
-| M5.3 | Commercial rules: tariffs, ESCO/EPC, billing, client outages | |
+| M5.2 | Financial models persisted and versioned in PostgreSQL: source file, hash, cell provenance, derivation rules, warnings, base-year origin | **done** |
+| M5.3 | Commercial rules: tariffs, ESCO/EPC, billing, client outages | next |
 | M5.4 | Expected production, availability, data quality and the quality gate | |
 | M5.5 | `ReportingDataset` and `ReportSnapshot`, reproducible from persisted facts alone | |
 | M5.6 | Excel and PDF rendering, visual and numerical parity | |
@@ -92,3 +92,43 @@ within the as-sold family.
 
 Any V2 report that depends on a family other than as-sold must therefore be
 treated as unproven until a real workbook for it is collected.
+
+## M5.2: financial models in PostgreSQL
+
+Migration `0010_financial_models` adds three tables. `report_source_files`
+records one uploaded artefact per content hash, so the same workbook cannot be
+registered twice or claimed by two assets. `financial_models` holds one parse,
+versioned per asset, and `financial_model_months` holds its twelve expected
+months.
+
+Provenance is not a side note here, it is the schema. Each model keeps the
+source file's SHA-256, the parser name and version, the warnings, the full
+detail payload and the source-cell map. Each month keeps the cell behind every
+value and the named rule behind every derived one, so a number in a report leads
+back to a cell in the customer's workbook.
+
+Two deliberate departures from V1, both recorded rather than silent:
+
+- **`base_year_source`.** V1 stored the workbook's year and an operator's choice
+  in the same column, which is how the same Expertcom file appears as 2025 and
+  2026. V2 records which one it was, and the cell when it came from the
+  workbook. A database constraint refuses an operator-chosen year that does not
+  name its actor.
+- **Numeric rather than float.** Monthly values are `Numeric(20, 10)` so sums are
+  exact. The scale is deliberately generous: the workbook holds IEEE-754 values
+  with about a dozen decimals, and rounding them away would break numerical
+  parity.
+
+### A V1 rule worth stating
+
+A workbook missing any month is **refused in full** with
+`financial_model_missing_month`; V1 does not store a null month and neither does
+V2. A financial model drives a whole year of expected production, so a month the
+workbook does not state cannot be guessed, interpolated or defaulted. The import
+raises and nothing reaches the database, which is the strongest possible form of
+"never turn missing into zero".
+
+Migration 0010 was rehearsed against a restored copy of the live V2 database:
+upgrade and downgrade both clean, with the 266 assets, 325 devices and existing
+production facts untouched. Its downgrade refuses to run if any financial model
+exists, so imported provenance cannot be dropped by accident.
