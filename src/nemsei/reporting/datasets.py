@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 
 from nemsei.assets.models import Asset
 from nemsei.monitoring.models import ProductionFact
+from nemsei.monitoring.repository import CanonicalFactRepository
 from nemsei.reporting.models import (
     FinancialModel,
     FinancialModelMonth,
@@ -104,15 +105,14 @@ def build_dataset(
             )
         }
 
-    facts = session.scalars(
-        select(ProductionFact)
-        .where(
-            ProductionFact.asset_id == asset_id,
-            ProductionFact.period_start >= _as_datetime(period_start),
-            ProductionFact.period_start < _as_datetime(period_end),
-        )
-        .order_by(ProductionFact.period_start, ProductionFact.id)
-    ).all()
+    # Only the current revision of each source fact. `production_facts` is
+    # append-only, so a corrected reading sits beside the one it replaced;
+    # totalling the raw rows would report a plant's production twice over.
+    facts = CanonicalFactRepository(session).current_production_facts_for_asset(
+        asset_id=asset_id,
+        period_start=_as_datetime(period_start),
+        period_end=_as_datetime(period_end),
+    )
 
     rows: list[dict[str, Any]] = []
     warnings: list[str] = []

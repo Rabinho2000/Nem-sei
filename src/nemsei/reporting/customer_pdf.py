@@ -734,7 +734,14 @@ def _draw_donut(pdf: canvas.Canvas, center_x: float, center_y: float, radius: fl
     display_pct = min(max(pct, 0), 100) if pct is not None else None
     pdf.setFillColor(MID_GRAY)
     pdf.wedge(center_x - radius, center_y - radius, center_x + radius, center_y + radius, 90, 360, fill=1, stroke=0)
-    if display_pct is not None:
+    # A zero percentage draws no arc at all. This is a deliberate divergence
+    # from V1, which passes an extent of 0 straight to reportlab and dies with
+    # a ZeroDivisionError inside `pdfgeom.bezierArc`; V1 never hit it because
+    # its payloads always carried a non-zero self-use figure. Every report V2
+    # assembles reaches this path, because self-consumption has no persisted
+    # source yet and is derived as zero. Nothing numeric changes: the hole still
+    # reads "0,0 %", which stays distinct from the "N/D" a missing value shows.
+    if display_pct:
         pdf.setFillColor(_themed_color(pdf, color))
         # ReportLab's sixth wedge argument is an angular *extent*, not the
         # finishing angle. Passing 90 + extent made the arc overflow and
