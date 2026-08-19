@@ -3,3 +3,5 @@ SQLAlchemy==2.0.46
 alembic==1.18.4
 psycopg[binary]==3.2.10
 gunicorn==26.0.0
+# Reading customer financial model workbooks; the same version V1 parses with.
+openpyxl==3.1.5
