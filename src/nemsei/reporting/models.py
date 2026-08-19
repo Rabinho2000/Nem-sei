@@ -12,7 +12,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, JSON, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import CheckConstraint, Date, DateTime, ForeignKey, Index, Integer, JSON, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from nemsei.db.base import Base
@@ -142,3 +142,92 @@ class FinancialModelMonth(Base):
 
     def period_start(self, base_year: int) -> date:
         return date(base_year, self.month, 1)
+
+
+DATASET_SCOPES = ("asset", "portfolio")
+DATASET_STATUSES = ("building", "ready", "failed")
+# What a row's actual production is backed by. `missing` is a first-class
+# outcome: a period with no fact is never reported as zero.
+VALUE_STATES = ("measured", "missing", "partial")
+
+
+class ReportingDataset(Base):
+    """The resolved inputs for one reporting period, built from persisted facts."""
+
+    __tablename__ = "reporting_datasets"
+    __table_args__ = (
+        CheckConstraint(f"scope IN {DATASET_SCOPES!r}", name="ck_reporting_datasets_scope"),
+        CheckConstraint(f"status IN {DATASET_STATUSES!r}", name="ck_reporting_datasets_status"),
+        CheckConstraint("period_end > period_start", name="ck_reporting_datasets_period"),
+        CheckConstraint(
+            "(scope = 'asset') = (asset_id IS NOT NULL)",
+            name="ck_reporting_datasets_scope_target",
+        ),
+        Index("ix_reporting_datasets_target", "scope", "asset_id", "period_start"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    scope: Mapped[str] = mapped_column(String(24), nullable=False)
+    asset_id: Mapped[int | None] = mapped_column(ForeignKey("assets.id", ondelete="RESTRICT"))
+    period_start: Mapped[date] = mapped_column(Date, nullable=False)
+    period_end: Mapped[date] = mapped_column(Date, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="building")
+
+    # The digest covers every input value and its provenance, so two datasets
+    # built from the same facts are recognisably the same dataset.
+    input_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    financial_model_id: Mapped[int | None] = mapped_column(ForeignKey("financial_models.id", ondelete="RESTRICT"))
+    quality_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    warnings_json: Mapped[list[Any]] = mapped_column(JSON, nullable=False, default=list)
+    built_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    built_by: Mapped[str] = mapped_column(String(120), nullable=False)
+
+    rows: Mapped[list["ReportingDatasetRow"]] = relationship(back_populates="dataset", cascade="all, delete-orphan")
+
+
+class ReportingDatasetRow(Base):
+    """One asset-month of a dataset, with where each number came from."""
+
+    __tablename__ = "reporting_dataset_rows"
+    __table_args__ = (
+        CheckConstraint(f"actual_state IN {VALUE_STATES!r}", name="ck_reporting_dataset_rows_actual_state"),
+        CheckConstraint(f"expected_state IN {VALUE_STATES!r}", name="ck_reporting_dataset_rows_expected_state"),
+        CheckConstraint("actual_state <> 'missing' OR actual_production_kwh IS NULL", name="ck_reporting_dataset_rows_missing_actual"),
+        CheckConstraint("expected_state <> 'missing' OR expected_production_kwh IS NULL", name="ck_reporting_dataset_rows_missing_expected"),
+        UniqueConstraint("dataset_id", "asset_id", "period_start", name="uq_reporting_dataset_rows_period"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    dataset_id: Mapped[int] = mapped_column(ForeignKey("reporting_datasets.id", ondelete="CASCADE"), nullable=False)
+    asset_id: Mapped[int] = mapped_column(ForeignKey("assets.id", ondelete="RESTRICT"), nullable=False)
+    period_start: Mapped[date] = mapped_column(Date, nullable=False)
+    period_end: Mapped[date] = mapped_column(Date, nullable=False)
+
+    actual_production_kwh: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
+    actual_state: Mapped[str] = mapped_column(String(16), nullable=False)
+    expected_production_kwh: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
+    expected_state: Mapped[str] = mapped_column(String(16), nullable=False)
+
+    provenance_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+
+    dataset: Mapped[ReportingDataset] = relationship(back_populates="rows")
+
+
+class ReportSnapshot(Base):
+    """An immutable capture of a dataset and the payload computed from it."""
+
+    __tablename__ = "report_snapshots"
+    __table_args__ = (
+        UniqueConstraint("snapshot_digest", name="uq_report_snapshots_digest"),
+        Index("ix_report_snapshots_dataset", "dataset_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    dataset_id: Mapped[int] = mapped_column(ForeignKey("reporting_datasets.id", ondelete="RESTRICT"), nullable=False)
+    dataset_input_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    snapshot_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    quality_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[str] = mapped_column(String(120), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

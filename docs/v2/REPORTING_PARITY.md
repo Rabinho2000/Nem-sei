@@ -33,7 +33,7 @@ depends on it.
 | M5.2 | Financial models persisted and versioned in PostgreSQL: source file, hash, cell provenance, derivation rules, warnings, base-year origin | **done** |
 | M5.3 | Commercial rules: tariffs, ESCO/EPC, billing, client outages | **done** |
 | M5.4 | Expected production, availability, data quality and the quality gate | **partly done**: quality rules ported, availability and energy facts pending |
-| M5.5 | `ReportingDataset` and `ReportSnapshot`, reproducible from persisted facts alone | |
+| M5.5 | `ReportingDataset` and `ReportSnapshot`, reproducible from persisted facts alone | **done** |
 | M5.6 | Excel and PDF rendering, visual and numerical parity | |
 | M5.7 | End-to-end golden tests V1 versus V2, with every difference explained | |
 
@@ -179,3 +179,28 @@ Two modules of this phase remain: `services/energy_facts.py` and
 SQLite directly, with 24 and 46 lines of query code, so they cannot be copied.
 Their calculations have to be separated from their persistence before they can
 be carried over, which is the next slice rather than a rewrite done in passing.
+
+## M5.5: datasets and snapshots
+
+A `ReportingDataset` resolves one asset's reporting period from persisted facts
+alone, pairing actual production from `production_facts` with expected
+production from the confirmed financial model, month by month. A
+`ReportSnapshot` freezes a dataset and the payload computed from it.
+
+Reproducibility is enforced by content, not by convention. The dataset hashes
+its resolved values and their provenance, deliberately excluding build time and
+the operator's name, so rebuilding from the same facts produces the same
+`input_digest` and adding one fact changes it. The snapshot hashes the dataset
+digest together with its payload, so freezing identical input returns the
+existing snapshot instead of creating a second one.
+
+Missing is a first-class state, in the schema rather than only in code. A month
+with no fact is `missing` with a null value, a month with some unusable facts is
+`partial`, and database constraints refuse a row that claims to be missing while
+carrying a number. `report_snapshots` is append-only at the database level,
+because a snapshot is the record of what a customer was told: update and delete
+both raise.
+
+A test reads the dataset module's own source and asserts it contains no
+integration, HTTP or provider reference at all, so the report path stays
+answerable from the database alone.
