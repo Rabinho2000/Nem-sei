@@ -150,3 +150,36 @@ and `portfolio_report_profiles`, surveyed read-only on 2026-08-19 and recorded i
   workflow and the golden tests use. Downloads render on request from the
   frozen `payload_json`, rehydrated through `rehydrate_snapshot_payload`.
 
+## Device status facts, Fatia 1 of M7 (2026-08-20)
+
+- **Anchored on `device_id`, not `provider_mapping_id`.** Every one of the 325
+  device-scoped provider mappings the M1 import created sits at
+  `pending_review` on a disabled, credential-free legacy connection — none is
+  `active`. A table requiring a usable mapping, the way `production_facts` and
+  `monitoring_observations` do, could not accept a single row today. `device_id`
+  is what M1 already resolved for every device independent of any provider
+  connection being usable, so it is the identity this table is keyed on
+  instead.
+- **A new table, not an extension of `production_facts`/`monitoring_observations`.**
+  The original proposal considered extending one of them with a nullable
+  `device_id`. Neither fits: `ProductionFact` represents energy summed over a
+  period (`period_start`/`period_end`), and a device reading is a point-in-time
+  instant; `MonitoringObservation`'s `condition` enum
+  (`operational`/`warning`/`fault`/`offline`/`unknown`) has no honest mapping
+  for V1's `standby`. `device_status_facts` keeps V1's own four-value
+  vocabulary rather than force-fitting it.
+- **The classification is ported code, not re-derived.** V1's raw
+  `inverter_state` codes are provider bitmask values with no documented
+  meaning beyond what V1's own operators encoded in
+  `classify_fusionsolar_inverter_availability`. That function's three state
+  sets are copied into `diagnostics/rules.py` verbatim and pinned by a golden
+  test against every real state code V1 ever saw, rather than the availability
+  status being re-derived or guessed at.
+- **`communication_status` is not imported.** It reads `"recent"` on all
+  51 289 real rows — checked by a test, not assumed — so "última comunicação"
+  is answered by `observed_at` itself.
+- **`inverter_power_samples` (54 593 rows, one day, power only) is not
+  imported in this slice.** `device_realtime_snapshots` already covers status,
+  power and energy over a much wider window; importing both would duplicate
+  evidence without answering a new question.
+

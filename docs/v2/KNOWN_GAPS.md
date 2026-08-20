@@ -30,11 +30,15 @@ nothing else until those signals are verified per connection. And a tariff
 prices energy without stating a euro total, because V1 computes that from hourly
 rows split by tariff period and V2 holds no hourly facts.
 
-Devices exist as canonical identity only. Just the `inverter` kind is populated,
-because every V1 device is an inverter; meters, dataloggers and string boxes are
-vocabulary with no rows. No device-level fact is collected yet, no provider
-device discovery is wired to the device level, and device claims imported from
-V1 stay `pending_review` on disabled, credential-free legacy connections.
+Devices carry canonical identity and, now, historical status. Just the
+`inverter` kind is populated, because every V1 device is an inverter; meters,
+dataloggers and string boxes are vocabulary with no rows. `device_status_facts`
+holds point-in-time availability, active power and day energy imported from
+V1's `device_realtime_snapshots`, keyed on device identity rather than a
+provider mapping, because none of the 325 device claims M1 imported is
+`active`. No **live** device-level read exists — no provider adapter has a
+verified device-level contract, mirroring the gate production reads already
+have — and no provider device discovery is wired to the device level.
 
 FusionSolar daily production remains gated on an operator-verified source
 timezone and `PVYield=kWh` contract per connection. Sigenergy has guarded

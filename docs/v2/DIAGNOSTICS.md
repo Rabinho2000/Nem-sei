@@ -1,10 +1,11 @@
-# Diagnóstico operacional: estudo e proposta (M7 foundation)
+# Diagnóstico operacional: estudo, proposta e Fatia 1 (M7 foundation)
 
-Este documento é o resultado do estudo pedido antes de qualquer implementação:
-o que a arquitetura atual já suporta, o que a V1 realmente prova, e o que fica
-deliberadamente por fazer nesta sessão. Não foi escrita nenhuma migração, modelo
-ou UI para diagnóstico — o âmbito pedido era estudar e propor, e implementar
-apenas o que encaixasse naturalmente sem inventar dados.
+Este documento começou como o estudo pedido antes de qualquer implementação —
+o que a arquitetura atual já suporta, o que a V1 realmente prova — e passou,
+na continuação da mesma sessão, a registar também a Fatia 1 que esse estudo
+propôs: schema, importador e um teste dourado, aplicados à base viva.
+A Fatia 2 (leitura live ao nível de dispositivo) continua deliberadamente por
+fazer, pelas razões abaixo.
 
 ## O que já existe e encaixa
 
@@ -58,7 +59,7 @@ ligação antes de qualquer persistência) ainda não tem equivalente ao nível 
 inversor. Construir a tabela de factos sem essa verificação repetiria
 exactamente o erro que esse portão existe para prevenir.
 
-## A proposta: duas fatias, nesta ordem
+## A proposta original: duas fatias, nesta ordem
 
 **Fatia 1 — histórico de dispositivo importado da V1 (valor imediato, risco
 baixo).** Estender `production_facts`/`monitoring_observations` — ou uma tabela
@@ -77,26 +78,80 @@ live. Alarmes ficam nesta fatia: `telegram_alerts` é histórico do que a V1
 enviou, não um feed de alarmes do provider — um alarme "ao vivo" precisa do seu
 próprio contrato verificado, tal como a produção precisou.
 
+## O que a Fatia 1 entregou, e onde a proposta original estava incompleta
+
+A ideia de "estender `production_facts`/`monitoring_observations`" não
+sobreviveu ao primeiro facto real: **nenhuma das 325 claims de dispositivo
+está `active`** — todas ficaram `pending_review` no import do M1, em ligações
+desativadas e sem credenciais. `production_facts`/`monitoring_observations`
+estão ambas ancoradas em `provider_mapping_id`; uma tabela que exigisse uma
+claim utilizável não podia aceitar uma única linha hoje. Isto só apareceu ao
+tentar escrever a primeira linha, não na leitura do schema — exactamente o
+tipo de coisa que "propõe" não podia ter previsto sem chegar a "implementa".
+
+`device_status_facts` (migração `0015_device_status_facts`) ficou ancorada em
+`device_id` em vez disso — a identidade que o M1 já resolveu para os 325
+dispositivos, independente de qualquer ligação de provider estar utilizável.
+Guarda leituras pontuais (`observed_at`, não um período): `availability_status`
+no vocabulário da própria V1 (`available`/`standby`/`unavailable`/`unknown`,
+não o `OBSERVATION_CONDITIONS` de cinco valores do V2, que não tem
+correspondência honesta para "standby"), mais `active_power_kw` e
+`day_energy_kwh`, ambos NULL quando ausentes e nunca zero por omissão.
+
+A classificação `inverter_state -> availability_status` foi portada, não
+reinventada, de `monitoring_board/services/fusionsolar.py`
+(`classify_fusionsolar_inverter_availability`) — os três conjuntos de códigos
+(`AVAILABLE_INVERTER_STATES`, `UNAVAILABLE_INVERTER_STATES`,
+`STANDBY_INVERTER_STATES`) são código real da V1, copiados, não adivinhados a
+partir dos números. `tests_v2/test_diagnostics_golden.py` compara a função
+portada contra a coluna `availability_status` que a V1 já tinha calculado, para
+cada `inverter_state` distinto real — só corre a partir do host
+(`/opt/server/apps/Nem-sei/.venv/bin/python`), pela mesma razão de WAL que os
+outros testes dourados desta sessão.
+
+`inverter_power_samples` (54 593 linhas, só potência, um único dia) não foi
+importado nesta fatia — `device_realtime_snapshots` já cobre estado, potência
+e energia numa janela muito mais larga, e importar as duas seria trabalho
+duplicado sem uma pergunta nova a responder. Fica registado, não esquecido.
+
+`communication_status` também não foi importado: lê `"recent"` nas 51 289
+linhas, sem excepção — `test_diagnostics_golden.py` verifica isto directamente
+em vez de assumir. "Última comunicação" é respondida pelo próprio
+`observed_at`, não por um rótulo que não varia.
+
+### Provado com dados reais
+
+Contra a base viva, depois de aplicada a migração `0015`: importação real de
+`device_realtime_snapshots`, seguida de uma segunda importação do mesmo
+período para confirmar zero linhas novas. Ver o resumo da sessão para os
+números exactos.
+
 ## O que fica deliberadamente fora
 
 - **Disponibilidade ponderada** já está portada e validada contra a V1
-  (`rules/availability.py`) — falta-lhe só o facto de dispositivo da Fatia 1
-  para deixar de estar bloqueada. Não é trabalho novo, é o mesmo bloqueio já
-  documentado em `KNOWN_GAPS.md`.
+  (`rules/availability.py`), e agora tem uma fonte de factos reais em
+  `device_status_facts` — mas as duas ainda não estão ligadas. Calcular
+  disponibilidade a partir destes factos, e expô-la no relatório individual em
+  vez de `availability_pct: None`, é o passo seguinte concreto, não mais
+  levantamento.
+- **Nenhuma UI de diagnóstico foi construída.** `current_device_status()` em
+  `diagnostics/service.py` é a leitura mínima que uma futura página
+  precisaria — "o que é que cada dispositivo desta instalação está a fazer
+  agora" — mas não há rota nem template. Fundação, não a funcionalidade.
 - **Nenhuma métrica financeira entra aqui.** Diagnóstico é estado de
   equipamento; reporting é dinheiro e energia contratada. `production_facts`
-  já separa isto por `metric_kind`, e um facto de dispositivo seguiria a mesma
-  regra — nunca uma linha que sirva as duas camadas.
+  já separa isto por `metric_kind`, e `device_status_facts` vive no seu
+  próprio pacote (`nemsei/diagnostics/`), nunca uma linha que sirva as duas
+  camadas.
 - **Strings/MPPT não são propostos como coluna nem como métrica** até um
   provider realmente os entregar. A coluna vazia na V1 é o argumento contra
   modelá-los agora, não a favor.
 
-## Porque não foi implementado nesta sessão
+## Próximo passo concreto
 
-Os quatro pontos anteriores (Portfolios, Reporting de portfolio, workflow
-mensal, Reporting UI) somaram cinco commits, uma migração aplicada à base viva
-e testada em dados reais. Uma quinta fatia deste tamanho — schema, importador,
-serviço e UI — nesta mesma sessão arriscaria a mesma pressa que já produziu dois
-bugs estruturais nas fatias anteriores (ambos corrigidos, mas só porque foram
-apanhados por teste). A Fatia 1 acima está suficientemente estudada para
-arrancar directamente na próxima sessão sem repetir este levantamento.
+Ligar `device_status_facts` ao cálculo de disponibilidade (`rules/availability.py`)
+e ao payload do relatório individual, substituindo `availability_pct: None`
+por um valor real onde os factos existirem. Depois disso: uma página mínima de
+diagnóstico por instalação, lendo `current_device_status()` — a leitura já
+existe, falta só a rota e o template, seguindo exactamente o padrão já usado em
+`/reports`.

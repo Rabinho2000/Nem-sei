@@ -87,7 +87,7 @@ Rules:
 | M4 | Users and permissions (§16) plus audit events that actually get written (§17) | M2 | unassigned |
 | M5 | **Reporting rebuilt on persisted canonical data (§10)** — its phases are M5.1–M5.7 in `REPORTING_PARITY.md` | M1 | Claude (done for the asset report and for portfolio reporting; see `PORTFOLIOS.md`) |
 | M6 | Canonical production and aggregation: MTD, YTD, monthly (§8) | M2 | unassigned |
-| M7 | Alarms, normalised status, operational dashboard (§6, §12) | M2, M6 | unassigned (studied 2026-08-19 — see `DIAGNOSTICS.md`; the identity and mapping layer already exists, only device-level facts are missing) |
+| M7 | Alarms, normalised status, operational dashboard (§6, §12) | M2, M6 | Claude (Fatia 1 done 2026-08-20: `device_status_facts`, imported from V1, migration `0015`; availability wiring and a diagnostic UI are the next concrete step — see `DIAGNOSTICS.md`) |
 | M8 | Portfolios with validity periods (§9) | M1 | Claude (done: domain, import, aggregate dataset, a rebuilt UI, and the monthly gerar/rever/aprovar workflow — see `PORTFOLIOS.md`) |
 | M9 | Automations, notifications, digests, scheduled reports (§11, §14) | M7, M8 | unassigned (the batch unit already exists: `generate_report_run` is idempotent and the workflow states are what a scheduler would read to decide whether a period needs attention) |
 
