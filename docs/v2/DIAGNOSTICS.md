@@ -166,11 +166,49 @@ Depende ainda de `provider_device_configuration_history` — "que dispositivos
 se esperava que reportassem nesta data" — que o M1 decidiu explicitamente não
 importar (`DECISIONS.md`: "as suas 325 linhas são todas de versão única e
 abertas, não há histórico de dispositivo para migrar"), o que simplifica mas
-não elimina a pergunta. Portar isto com o mesmo rigor desta sessão é o
-trabalho de uma fatia própria, não uma ligação de fim de sessão.
+não elimina a pergunta.
 
 **A página de diagnóstico é, essa sim, uma ligação.** `current_device_status()`
 já existe e já responde à pergunta "o que está cada dispositivo desta
 instalação a fazer agora"; falta-lhe rota e template, seguindo exactamente o
 padrão de `/reports`. Feito nesta mesma continuação — ver
 `web/diagnostics_routes.py`.
+
+## Porque a disponibilidade ponderada não avançou: um problema de dados, não de código
+
+Antes de portar o algoritmo, verifiquei quanto valor ele realmente produziria
+sobre a evidência que existe — e a resposta muda a prioridade desta peça.
+
+V1 já correu este cálculo sobre os seus próprios dados e guardou o resultado em
+`inverter_availability_sampled_daily` e `plant_availability_sampled_daily`.
+Consultado directamente:
+
+| Tabela | Linhas | Com `availability_pct` real |
+| --- | --- | --- |
+| `inverter_availability_sampled_daily` | 6 720 | **3** (0,045%) |
+| `plant_availability_sampled_daily` | 5 121 | **3** (0,059%) |
+
+6 717 das 6 720 linhas por dispositivo ficam `sampled_partial` com
+`availability_pct` **NULL**, na sua esmagadora maioria por
+`sample_gap_over_90_minutes` e/ou `insufficient_sample_count`. Isto não é um
+limiar demasiado apertado do algoritmo — é a densidade real da amostragem:
+`device_realtime_snapshots` tem, para a maioria dos pares dispositivo/dia,
+entre **1 e 6 leituras no dia inteiro** (964 dias com 1 leitura, 1619 com 2,
+3524 com 3...). Com um intervalo máximo aceite de 90 minutos e um dia inteiro
+de luz solar para cobrir, seis leituras dispersas quase nunca chegam.
+
+A conclusão é dura mas honesta: **a disponibilidade ponderada não é calculável
+a partir do histórico da V1**, nem pela implementação da V1 nem por um porte
+fiel dela — os dois usam a mesma evidência esparsa e chegam à mesma conclusão
+vazia. Portar o algoritmo agora produziria uma funcionalidade que parece
+existir mas devolve `None` em 99,95% dos casos, o que é exactamente o tipo de
+número silenciosamente ausente que esta sessão inteira tentou evitar, só que
+ao nível da funcionalidade em vez de ao nível de uma linha.
+
+Isto não invalida `weighted_sampled_availability` nem o desenho de
+`device_status_facts` — ambos ficam correctos e prontos para o dia em que
+existir uma leitura live com uma cadência de amostragem real (a Fatia 2, ainda
+bloqueada por falta de contrato de provider verificado ao nível de
+dispositivo). Só não há hoje dados suficientes para os alimentar
+retroactivamente, e isso só se soube ao consultar os números, não ao ler o
+schema.

@@ -21,7 +21,12 @@ configuration are persisted with temporal validity, and `Asset` holds the
 contract attributes that resolve EPC against ESCO. What remains without any
 source is named in every payload's `unavailable_fields`: the four self-use
 splits by tariff period, which no provider V2 talks to states, and
-`availability_pct`, which needs device-level facts.
+`availability_pct`. That one is not a missing import: V1's own weighted
+availability calculation, run against V1's own history, produces a real value
+for only 3 of 5 121 plant-days (0.06%) because `device_realtime_snapshots`
+samples most device-days only 1-6 times — nowhere near dense enough for its
+90-minute-gap completeness rule. Porting the algorithm would not change that;
+the gap is sampling density, not code. See `DIAGNOSTICS.md`.
 
 Two limits are worth stating plainly. The additional energy metrics enter V2 by
 importing payloads V1 already stored; the **live** FusionSolar contract is still
