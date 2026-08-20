@@ -29,7 +29,7 @@ data/
 *.xls
 *.pdf
 uploads/
-diagnostics/
+/diagnostics/
 resultado_*.json
 *_raw_export.py
 
