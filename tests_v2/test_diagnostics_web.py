@@ -102,3 +102,33 @@ def test_the_counts_summarise_attention_correctly(app, seeded) -> None:
     assert ">3<" in body
     assert ">1<" in body
     assert ">2<" in body
+
+
+def test_findings_appear_on_the_asset_page_worst_first(app, seeded) -> None:
+    """M7 Fatia 4 (docs/v2/DIAGNOSTICS.md): the deterministic rules engine,
+    not just the raw device table, must actually reach the page."""
+    client = app.test_client()
+    login(client)
+    body = client.get(f"/diagnostics/assets/{seeded}").get_data(as_text=True)
+    assert "device_unavailable" in body
+    assert "device_no_history" in body
+    assert "partial_device_coverage" in body
+    # Critical (Down Inverter, unavailable) must render before the
+    # asset-level info finding (partial coverage).
+    assert body.index("device_unavailable") < body.index("partial_device_coverage")
+
+
+def test_an_asset_with_no_problems_says_so_plainly(app, settings) -> None:
+    factory = build_session_factory(create_engine(settings.database_url))
+    with factory() as session, session.begin():
+        asset = create_asset(session, canonical_name="Quiet Plant")
+        device = create_device(session, asset_id=asset.id, device_kind="inverter", label="INV-1", valid_from=date(2026, 1, 1))
+        record_device_status(
+            session, device_id=device.id, asset_id=asset.id, source_fact_key="v1:1",
+            observed_at=datetime.now(timezone.utc), availability_status="available", active_power_kw=Decimal("5.0"),
+        )
+        asset_id = asset.id
+    client = app.test_client()
+    login(client)
+    body = client.get(f"/diagnostics/assets/{asset_id}").get_data(as_text=True)
+    assert "Nenhum problema detectado" in body

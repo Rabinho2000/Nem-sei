@@ -260,3 +260,17 @@ code { color: var(--brand-dark); font: 0.78rem ui-monospace, SFMono-Regular, Men
 .workflow-step.current { border-color: currentColor; color: inherit; }
 .blocked-list { margin: 0; padding-left: 18px; font-size: 0.85rem; }
 .blocked-list li { margin-bottom: 4px; }
+
+/* Diagnostic findings: worst-first list, deterministic rules over current
+   device status (diagnostics/findings.py) — not a persisted alert feed, so
+   no dismiss/resolve control here, see docs/v2/DIAGNOSTICS.md. */
+.finding-list { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.finding { display: flex; gap: 12px; align-items: flex-start; padding: 12px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-subtle); }
+.finding-critical { border-left: 3px solid var(--danger); }
+.finding-warning { border-left: 3px solid var(--warning); }
+.finding-info { border-left: 3px solid var(--success); }
+.finding-body { display: grid; gap: 3px; min-width: 0; }
+.finding-summary { margin: 0; font-weight: 650; }
+.finding-meta { margin: 0; font-size: 0.78rem; }
+.finding-meta code { font-size: 0.76rem; }
+.finding-missing { margin: 0; font-size: 0.78rem; font-style: italic; }

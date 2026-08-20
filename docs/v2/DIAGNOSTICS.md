@@ -212,3 +212,134 @@ bloqueada por falta de contrato de provider verificado ao nível de
 dispositivo). Só não há hoje dados suficientes para os alimentar
 retroactivamente, e isso só se soube ao consultar os números, não ao ler o
 schema.
+
+## Re-estudo de `sampled_availability.py`, 2026-08-20 (sessão posterior)
+
+Reli o ficheiro real (`monitoring_board/services/sampled_availability.py`, não
+o resumo acima) especificamente para confrontar as suas regras de
+completude com o que a V2 consegue realmente recolher hoje (Fatia 2/3), não
+para reconfirmar a conclusão de densidade já registada. Três factos mudam
+como este canário deve ser lido, e nenhum estava explícito acima:
+
+**1. A janela operacional não é meia-noite a meia-noite — é definida pelas
+próprias leituras de potência positiva.** `window_start`/`window_end` vêm de
+`positive_times`, o conjunto de instantes em que **qualquer** inversor
+esperado teve `active_power_kw > 0` nesse dia (linha 266-309). As regras de
+completude (`late_first_sample`, `early_last_sample`,
+`sample_gap_over_90_minutes`, `insufficient_sample_count`) só se aplicam
+**dentro** dessa janela. Isto significa que a noite — sem produção — nunca
+entra na avaliação: um canário que arranque de noite não precisa de "provar"
+cobertura nocturna nenhuma, porque o algoritmo nem olha para lá. O que
+precisa de provar é: (a) a primeira amostra de cada inversor cai a ≤30 min do
+início da janela real de produção, (b) a última cai a ≤30 min do fim, (c)
+nenhum intervalo dentro da janela excede 90 min, (d) pelo menos
+`max(4, ceil(duração_min / 90) + 1)` amostras por inversor — para uma janela
+de ~15h (900 min) isso são **11 amostras mínimas**; a cadência de 30 min já
+prevista dá ~30, larga margem.
+
+**2. `deduplicate_observed_at` (Fatia 2/3, `diagnostics/service.py`) não
+grava uma nova linha quando o conteúdo de uma leitura repete o anterior —
+isto interage com a regra dos 90 min, mas o risco prático é baixo, não
+inexistente.** Durante a noite isto é irrelevante (ponto 1). Durante produção
+real, `day_energy_kwh` é um total diário estritamente crescente e
+`active_power_kw` varia com nuvens/ângulo solar, pelo que três ciclos
+consecutivos (90 min) com valores byte-idênticos é improvável mas **não
+impossível** — um inversor preso num valor fixo, ou um período de céu limpo e
+carga estável a meio-dia arredondado sempre ao mesmo valor pelo provider,
+criaria um `sample_gap_over_90_minutes` **falso**: o poller correu na mesma,
+só não gravou porque nada mudou. Isto não é um bug a corrigir hoje — o
+`device_status_facts` não é uma série temporal pura, é um facto com
+supersessão (tal como `production_facts`), e alterar isso para "gravar sempre,
+mesmo sem mudança" trocaria um problema por outro (crescimento de revisões
+sem qualquer valor novo). É uma advertência a aplicar na leitura do
+resultado do canário: se aparecer um `sample_gap_over_90_minutes` dentro da
+janela de produção, confirmar primeiro se os polls realmente aconteceram
+(`provider_request_attempts`/`job_events`) antes de concluir que a cadência
+falhou.
+
+**3. `expected_devices_for_date` depende de
+`provider_device_configuration_history`, uma tabela específica do SQLite da
+V1 — a V2 não precisa de a portar literalmente.** O equivalente em V2 já
+existe: a identidade temporal de `Device` (`valid_from`/`valid_to`, do M1) já
+responde "que dispositivos eram esperados neste asset nesta data", pela
+mesma razão estrutural que já suporta `device_status_facts` — não é uma peça
+em falta, é uma peça já construída sob um nome diferente. Confirmar isto
+antes de portar `expected_devices_for_date` é o próximo passo concreto
+quando o gate de densidade passar, não uma segunda auditoria de dados.
+
+**O que isto muda na leitura do canário mais longo (§10,
+`docs/v2/DEVICE_TELEMETRY.md`):** o teste relevante não é "cobriu a
+meia-noite às duas pontas", é "a partir do primeiro instante de potência
+positiva até ao último, todos os inversores têm ≤90 min de intervalo e
+≥11 amostras, com a primeira/última a ≤30 min das bordas". Um canário
+capado a ~22,5h a partir de qualquer hora do dia cobre isso com folga desde
+que atravesse pelo menos um dia inteiro de produção — não precisa de
+começar exactamente à meia-noite nem à hora do nascer-do-sol para ser
+válido.
+
+## Fatia 4: um primeiro motor de findings determinístico, 2026-08-20 (sessão posterior)
+
+Com a Fatia 3 fechada e o re-estudo acima feito, a próxima peça independente
+que não depende do canário bloqueado (§10 de `DEVICE_TELEMETRY.md`) é
+tornar `/diagnostics` útil para além de uma tabela: responder "o que está
+mal nesta instalação agora" a partir de dados que já existem.
+
+**Desenho deliberado: regras, não uma tabela persistida.** `diagnostics/findings.py`
+avalia um conjunto de regras determinísticas sobre `current_device_status()`
+(mais o histórico de cada dispositivo, para "desde quando") e devolve uma
+lista de `DiagnosticFinding` recalculada em cada carregamento da página —
+não existe uma tabela nova, nem migração, nem um ciclo de vida
+open/acknowledged/resolved. Isto não é uma simplificação apressada: sem essa
+tabela, o mesmo problema persistente nunca pode acumular-se em centenas de
+findings independentes, porque não há nada a acumular — o finding
+desaparece da lista sozinho assim que a condição deixa de ser verdadeira na
+leitura mais recente. Um ciclo de vida persistido fica para quando existir
+uma necessidade operacional real de o "reconhecer" (a instrução do próprio
+milestone), não antes.
+
+**Regras implementadas**, todas com evidência, severidade e "que dados
+faltam para confirmar" explícitos:
+
+| Regra | Severidade | Precisa de |
+| --- | --- | --- |
+| `device_no_history` | aviso | nenhuma leitura alguma vez registada |
+| `device_unavailable` | crítico | última leitura com `availability_status='unavailable'` |
+| `device_unknown_status` | aviso | última leitura com `availability_status='unknown'` |
+| `stale_reading` | aviso | última leitura há mais de 24h (configurável) |
+| `zero_power_while_peers_active` | crítico | potência zero enquanto um dispositivo comparável (mesmo `device_kind`, leitura a ≤45 min de distância) produz >0,5 kW |
+| `power_disparity_among_peers` | aviso | potência <50% da de um dispositivo comparável, acima do limiar de ruído |
+| `daily_energy_disparity_among_peers` | aviso | energia do dia <50% da de um dispositivo comparável, com o par já a produzir ≥1 kWh |
+| `partial_device_coverage` | informação | nem todos os dispositivos do asset têm alguma leitura (finding ao nível do asset, não de um device específico) |
+
+**Duas escolhas de desenho que valem a pena registar:**
+
+- **Comparação entre pares só dentro de uma tolerância temporal (45 min).**
+  Sem isto, um dispositivo genuinamente `stale` (leitura antiga) pareceria
+  também estar em "disparidade" contra um dispositivo com leitura fresca —
+  o mesmo sintoma teria duas causas confundidas num só finding.
+  `test_readings_too_far_apart_in_time_are_not_compared_to_each_other`
+  prova isto directamente.
+- **`active_since` vem do histórico real quando disponível, não é inventado.**
+  Para as regras de estado por dispositivo (indisponível/desconhecido), o
+  módulo percorre `history_for_device` para trás até a condição deixar de
+  ser verdadeira — não assume que "desde agora" é o mesmo que "desde
+  sempre". Para as regras de comparação entre pares, `active_since` é
+  apenas a leitura mais recente (reconstituir a disparidade ao longo do
+  histórico recalcularia a mesma comparação em cada ponto passado, um custo
+  não justificado ainda) — e cada finding desse tipo diz isso explicitamente
+  em `missing_data`, em vez de fingir uma precisão que não tem.
+
+**Testado, não apenas escrito**: 18 testes puros (`test_diagnostics_findings.py`,
+sem base de dados) cobrindo cada regra, os dois limiares de ruído (potência
+mínima do par, tolerância temporal), a ordenação worst-first, e o caso "sem
+problemas" — mais 2 testes de integração web
+(`test_diagnostics_web.py`) confirmando que os findings chegam mesmo à
+página `/diagnostics/assets/<id>`, antes da tabela de dispositivos, worst
+first. Suite completa da V2 sem regressões (ver relatório da sessão).
+
+**O que fica deliberadamente fora desta fatia**: um resumo de severidade ao
+nível do asset na página de índice `/diagnostics` (Prioridade 4 do pedido
+original, UI mais rica), qualquer coisa ao nível do portfolio, e qualquer
+noção de "motor de IA" — tudo isto seria construir em cima de uma fundação
+ainda não exercida com dados operacionais reais para além do canário de um
+asset.

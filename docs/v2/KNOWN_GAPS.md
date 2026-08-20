@@ -73,6 +73,39 @@ device endpoint (0 of 325 `provider_devices` rows, 0 of 51 289
 inverters/strings/availability as explicitly out of scope — this is not a
 missing import, there is nothing to import from.
 
+A later session (2026-08-20) recovered from a suspected connection loss
+during that 70-minute window and found the window had, in fact, completed
+cleanly on its own schedule (`DEVICE_TELEMETRY.md` §9.1). The real gap it
+found instead: the three live cycles were driven by a session-local
+one-off `Scheduler`/`Worker` pair, not the standing `nemsei-v2-scheduler-1`
+container, which never had polling enabled — the mechanism was correct, its
+deployment was not persistent (§9.2). Fixed: `Settings` now requires an
+explicit, positive lifetime cycle cap (`device_status_poll_max_cycles`)
+whenever polling is enabled, enforced by counting real jobs back from the
+`jobs` table itself, not a separate counter (§9.3) — closing the "does this
+survive without an interactive session" question for good. A day-plus
+canary (48 lifetime cycles, enough to cross a full daylight operating
+window per a fresh re-read of `sampled_availability.py`'s actual
+operating-window definition — see `DIAGNOSTICS.md`'s 2026-08-20 addendum)
+is fully prepared (`docker-compose.v2.device-status-canary.yml`, a verified
+backup taken) but **BLOCKED**, deliberately not forced through: the one
+live-database write it needs was refused by this session's own action
+classifier as a production write, correctly, for something this
+consequential — see `DEVICE_TELEMETRY.md` §10 for the exact commands
+awaiting a human's go-ahead.
+
+A first deterministic operational-findings layer now also exists (M7
+Fatia 4, `diagnostics/findings.py`): device-unavailable, unknown-status,
+no-history, stale-reading, zero-power-while-peers-active, power/day-energy
+disparity among comparable devices at the same asset, and partial device
+coverage, each recomputed fresh from `device_status_facts` on every page
+load rather than persisted with an open/acknowledged/resolved lifecycle —
+deliberately, since nothing operational yet needs that lifecycle and a
+recomputed-not-stored finding cannot itself become stale or duplicate.
+Wired into `/diagnostics/assets/<id>`, worst-first, alongside the existing
+per-device table. Not yet an asset-level severity summary or a portfolio
+view — see `ROADMAP.md`.
+
 FusionSolar daily production remains gated on an operator-verified source
 timezone and `PVYield=kWh` contract per connection. Sigenergy has guarded
 read-only connection validation, discovery, and current monitoring; its daily

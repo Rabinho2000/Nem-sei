@@ -26,6 +26,42 @@
   <div class="kpi"><small>Sem qualquer leitura</small><strong>{{ counts.no_reading }}</strong></div>
 </section>
 
+{#
+  Findings, worst first — regras determinísticas sobre o estado actual
+  (diagnostics.findings), não um motor de IA. Cada finding é recalculado a
+  cada carregamento da página a partir de device_status_facts; não há um
+  "resolvido" para clicar porque não há nada persistido a resolver — o
+  problema desaparece desta lista sozinho assim que a próxima leitura deixar
+  de o confirmar.
+#}
+<section class="panel">
+  <h2>O que precisa de atenção</h2>
+  {% if findings %}
+    <ul class="finding-list">
+      {% for finding in findings %}
+        <li class="finding finding-{{ finding.severity }}">
+          <span class="pill pill-{{ {'critical': 'bad', 'warning': 'warn', 'info': 'ok'}.get(finding.severity, 'warn') }}">
+            {{ {'critical': 'crítico', 'warning': 'aviso', 'info': 'informação'}.get(finding.severity, finding.severity) }}
+          </span>
+          <div class="finding-body">
+            <p class="finding-summary">{{ finding.summary }}</p>
+            <p class="finding-meta muted">
+              regra: <code>{{ finding.rule_code }}</code>
+              {% if finding.active_since %} · desde {{ finding.active_since.strftime('%Y-%m-%d %H:%M') }}{% endif %}
+              {% if finding.observed_at %} · observado em {{ finding.observed_at.strftime('%Y-%m-%d %H:%M') }}{% endif %}
+            </p>
+            {% if finding.missing_data %}
+              <p class="finding-missing muted">em falta para confirmar: {{ finding.missing_data }}</p>
+            {% endif %}
+          </div>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="empty">Nenhum problema detectado pelas regras actuais nas leituras mais recentes.</p>
+  {% endif %}
+</section>
+
 <section class="panel">
   <table class="data-table">
     <thead>
@@ -50,8 +86,9 @@
     </tbody>
   </table>
   <p class="panel-foot muted">
-    A leitura mais recente de cada dispositivo, importada do histórico da V1. Sem leitura ao vivo ainda —
-    ver <code>docs/v2/DIAGNOSTICS.md</code>.
+    A leitura mais recente de cada dispositivo — da V1 (importada) ou de uma leitura ao vivo ao provider,
+    consoante o dispositivo. Ver <code>docs/v2/DEVICE_TELEMETRY.md</code> para que ligações têm leitura ao
+    vivo hoje.
   </p>
 </section>
 {% endblock %}

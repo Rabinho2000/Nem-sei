@@ -13,7 +13,10 @@ from sqlalchemy.orm import Session
 
 from nemsei.assets.models import Asset, Device, Organization
 from nemsei.assets.service import asset_search_clause
+from nemsei.diagnostics.findings import evaluate_asset_findings
+from nemsei.diagnostics.repository import DeviceStatusRepository
 from nemsei.diagnostics.service import current_device_status
+from nemsei.shared.clock import utc_now
 
 
 # Worse first: a device with no reading at all is at least as concerning as
@@ -44,9 +47,19 @@ def asset_diagnostics(session: Session, *, asset_id: int) -> dict[str, Any] | No
         return None
     rows = current_device_status(session, asset_id=asset_id)
     rows.sort(key=lambda row: (_SEVERITY.get(row["availability_status"], 1), row["label"] or ""))
+    device_repo = DeviceStatusRepository(session)
+    findings = evaluate_asset_findings(
+        rows,
+        asset_id=asset_id,
+        now=utc_now(),
+        # Real history, not just the latest reading -- lets device-level
+        # findings answer "desde quando", not just "agora".
+        history_for_device=lambda device_id: device_repo.history_for_device(device_id=device_id),
+    )
     return {
         "asset": asset,
         "rows": rows,
+        "findings": findings,
         "counts": {
             "total": len(rows),
             "available": sum(1 for row in rows if row["availability_status"] == "available"),
