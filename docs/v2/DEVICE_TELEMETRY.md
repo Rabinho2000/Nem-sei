@@ -1,4 +1,4 @@
-# Device-level live telemetry: contract audit, design, and Fatia 2 (M7)
+# Device-level live telemetry: contract audit, design, and Fatia 2/3 (M7)
 
 This document is the audit requested before any implementation, followed by
 what that audit produced. [`DIAGNOSTICS.md`](DIAGNOSTICS.md) built Fatia 1
@@ -437,12 +437,216 @@ was deliberately not started here.
 - **Is density sufficient for availability now**: no, and this canary could
   not have made it sufficient by design -- one reading is not a sustained
   poll. Availability stays off (§6).
-- **Gaps still open**: (1) sustained multi-day density has not been measured
-  -- the cadence has not been scheduled or left running, deliberately, per
-  "não escalar ainda à carteira"; (2) Sigenergy device telemetry has no
-  contract to build on at all (§1, Sigenergy) -- a real gap, not a to-do;
-  (3) V2 still shares one FusionSolar account with V1, so any cadence beyond
-  this single canary asset needs either a dedicated V2 account or an
-  operator's explicit acceptance of that contention (§4); (4) scheduler wiring
-  for the proposed cadence does not exist yet, by design -- turning it on is a
-  distinct, later decision.
+- **Gaps still open (as of Fatia 2)**: (1) sustained multi-day density has not
+  been measured -- the cadence has not been scheduled or left running,
+  deliberately, per "não escalar ainda à carteira"; (2) Sigenergy device
+  telemetry has no contract to build on at all (§1, Sigenergy) -- a real gap,
+  not a to-do; (3) V2 still shares one FusionSolar account with V1, so any
+  cadence beyond this single canary asset needs either a dedicated V2 account
+  or an operator's explicit acceptance of that contention (§4); (4) scheduler
+  wiring for the proposed cadence does not exist yet, by design -- turning it
+  on is a distinct, later decision. **Fatia 3 (below) closes (1) and (4).**
+
+## 8. Fatia 3: persistent scheduling and a sustained sampling window
+
+Fatia 2 proved the contract works; it could not prove the contract works
+*repeatedly, unattended, safely*. That is what M7 Fatia 3 built and measured
+-- still restricted to the one canary asset Fatia 2 already validated, per
+this milestone's own instruction not to escalate to the portfolio.
+
+### 8.1 What was built
+
+No new database table. `Job`/`JobEvent`/`ScheduleState`/`SchedulerLease`
+(migration predating this session, already carrying real
+`production.*` jobs in the live database) already have everything a
+persistent, restart-safe, idempotent recurring poll needs -- this slice adds
+one job type and one repository method, not new infrastructure.
+
+- **`Settings`** (`config.py`) gains `device_status_poll_enabled` (default
+  `False`), `device_status_poll_interval_minutes` (default `30`), and
+  `device_status_poll_connection_id` (default `None`). `validate()` refuses
+  `enabled=True` with no connection id -- there is no "poll every FusionSolar
+  connection" mode; scaling to the portfolio needs a second, deliberate call
+  site, not a config flip. This is the config-toggle "cadência desligável"
+  this milestone asked for: set `_ENABLED=false` (or leave it unset, the
+  default) and the schedule is structurally inert.
+- **`JobRepository.enqueue_due_device_status_poll`** -- same shape as the
+  existing `enqueue_due_noop`: a `ScheduleState` row persists `next_run_at`,
+  so a process restart reads the same cadence a prior instance left behind
+  rather than re-deriving it from wall-clock alone (restart safety), and a
+  `dedupe_key` scoped to the due slot makes a duplicate or concurrent
+  enqueue for that slot inert (idempotency) -- backed by the same partial
+  unique index `enqueue()` already relies on, with the same
+  catch-the-`IntegrityError`-and-re-read fallback for the concurrent case
+  (added here; `enqueue_due_noop` shares the same latent race but had no
+  test exercising it before this slice).
+- **`jobs/handlers.py`**: `device_status.poll` dispatches to
+  `FusionSolarDeviceStatusService.sync_device_status`, mirroring
+  `_execute_production` exactly -- non-`"success"` outcomes
+  (`failed`/`rate_limited`/`deferred`/`partial`) raise `RetryableJobError`,
+  which the existing, job-type-agnostic `Worker.retry_or_fail` backs off
+  (60s, then 300s) and eventually terminates after `max_attempts=3`, exactly
+  as it already does for every other job type. **A failure never writes an
+  "offline" fact and never touches a previous fact**: the handler raises
+  before `record_device_status` is ever called for that cycle, and
+  `record_device_status` was already append-only from Fatia 2 -- a device
+  this cycle could not read simply gets no new row, so
+  `current_device_status()` keeps reporting its last successful reading.
+  Proven by a dedicated regression test
+  (`test_failed_read_never_erases_or_overwrites_last_known_device_status`),
+  not just argued.
+- **`jobs/scheduler.py`**: `Scheduler.run_once()` gains one extra call,
+  gated on the two settings above, alongside the existing
+  `enqueue_due_noop()` -- the real, single scheduler process this milestone
+  targets calls exactly this method in its existing loop; nothing new to
+  deploy beyond the code itself.
+- **Cooldown/rate-limit respect**: inherited structurally, not rebuilt.
+  `FusionSolarRequestController`'s persisted `ProviderRequestState` cooldown
+  (Fatia 2) already makes a call during an active cooldown return
+  `rate_limited` without any HTTP attempt; a scheduled poll during cooldown
+  therefore costs zero real calls. Proven by
+  `test_rate_limited_poll_makes_zero_provider_calls` (an empty fake
+  transport -- any attempted call would crash the test).
+- **6 new tests**: 4 in `test_jobs.py` (idempotent + interval math, restart
+  safety via a fresh `JobRepository` instance, concurrent-tick race safety
+  via `ThreadPoolExecutor`, positive-interval validation), 2 in
+  `test_fusionsolar_device_status.py` (failure-preserves-last-known-state,
+  rate-limit-costs-zero-calls). Full V2 suite: 488 passed, 1 skipped
+  (482 + 6 new, no regressions).
+
+### 8.2 Deploy discipline, mirroring Fatia 2
+
+Before any of this ran against the real account: a fresh verified backup
+(`pg_dump -Fc`, `PGDMP` header checked) of the live `nemsei_v2` database, no
+schema migration needed (confirmed: `jobs`/`job_events`/`schedule_state`/
+`scheduler_leases` already existed in production from earlier job-queue
+work), code deployed via `docker cp` into the already-running
+`nemsei-v2-web-1` container -- the standing `web`/`worker`/`scheduler`
+containers were not rebuilt or restarted. V1 was not touched at all in this
+slice: no code path in Fatia 3 reads from or pauses V1: FusionSolar's
+credentials remain sourced from the same account M4 and Fatia 2 already
+used, and V1's own database was never opened.
+
+**A real wiring hazard, found and worked around before any live call:** the
+sustained-window driver deliberately does **not** call
+`Scheduler.run_once()` as a second live process, because the real, already
+-running `nemsei-v2-scheduler-1` container renews the single shared
+`v2-scheduler` lease roughly every 2 seconds and would starve a second
+`Scheduler` instance almost permanently -- confirmed directly (first tick:
+`acquire_scheduler_lease` returned `False`, zero enqueue attempted). Calling
+`JobRepository.enqueue_due_device_status_poll` directly tests the part that
+actually matters -- the persisted schedule's own correctness -- without an
+artifact of deliberately running two scheduler processes side by side for
+one test window. In the real, single-process deployment this code targets,
+that contention does not exist.
+
+**The standing `nemsei-v2-worker-1` container was paused (`docker pause`,
+cgroup freeze, our own system, not V1) for the test window**, for one
+concrete reason: it runs Fatia-3-unaware code, and `Worker.claim_next` claims
+*any* due job regardless of type -- had it won the race to claim a
+`device_status.poll` job, it would have failed it with an unrecognised-type
+`ValueError` on every attempt, exhausting `max_attempts` and reporting a
+false "failed" that has nothing to do with FusionSolar. Confirmed
+before pausing that this had zero real operational cost: the entire `jobs`
+table held nothing but hourly `system.noop` rows (no
+`production.*` job has ever been enqueued in this deployment), so nothing
+meaningful was delayed. `nemsei-v2-worker-1` was resumed immediately after
+the window, guarded by a shell `trap` exactly like Fatia 2's V1 pause.
+
+### 8.3 Sustained window: results
+
+Run live, 2026-08-20, 09:59:09–11:09:18 UTC (70 minutes, the full configured
+duration -- no early stop). Interval: 30 minutes, the lower/more
+conservative bound of the proposed 30-45 min range. Asset 153, both
+inverters, same connection Fatia 2 already validated.
+
+| Metric | Result |
+| --- | --- |
+| Cycles expected (70 min ÷ 30 min, first cycle immediate) | 3 |
+| Cycles run | **3** (jobs 68, 70, 71) |
+| Cycle outcomes | **3/3 `success`, 0 failures, 0 retries** (`attempt_count=1` on every job) |
+| Readings expected (3 cycles × 2 devices) | 6 |
+| Readings received/accepted | **6/6 (100%)** |
+| Gap between cycle 1→2 | 30 min 02.4 s |
+| Gap between cycle 2→3 | 30 min 03.2 s |
+| **Largest gap during the window** | **30 min 03.2 s** -- 60 s of scheduler-tick jitter (`TICK_SECONDS=30`) over 30 minutes, not drift: the persisted `ScheduleState` advances by exactly `interval_minutes` from its own previous value, so error never compounds across cycles |
+| Rate limits hit | **0** |
+| Provider calls consumed | **9 total** (3/cycle: auth + `getDevList` + `getDevRealKpi`), well under the 15-call hard cap |
+| `freshness` on every reading | `unknown` -- `collectTime` absent again, independently, on 3 more live calls; strengthens §1.3/§5's conclusion rather than merely repeating it |
+| Values | Both inverters' power/energy climbed monotonically across all 3 cycles (device 289: 15.79→18.44→9.47 kW as a cloud passed mid-window; day energy 24.83→34.78→41.42 kWh, strictly increasing as a running daily total must) -- self-consistent, plausible solar production shape, not noise |
+
+**Idempotency and restart safety.** Not just argued -- both are proven at two
+levels. Deterministically (`test_jobs.py`, run against a real PostgreSQL
+database, not mocked): a fresh `JobRepository` instance reading only
+persisted state reproduces the exact cadence a prior instance left behind,
+four concurrent ticks for the same due slot yield exactly one job. Live,
+during this window: the schedule fired at :09, :13→:29:13, :59:15 -- always
+once, never a duplicate `device_status.poll` job at any of the three due
+slots, confirmed by `schedule_state`'s single row and `jobs`' three distinct
+ids. A full process restart was not exercised mid-window (the deterministic
+test is what actually exercises that path -- a live restart would only
+re-demonstrate what the test already proves under controlled conditions).
+
+**Failure handling.** No real failure occurred during this window to observe
+live (0/3 cycles failed) -- the append-only, never-overwrite property
+(`current_device_status()` keeps the last good reading; a failed cycle
+writes nothing) is proven by the dedicated regression test in §8.1, not by
+this window, since this window had nothing to fail.
+
+### 8.4 Does this density satisfy V1's availability algorithm's criteria?
+
+**Not yet provably for a full day -- and this window could not have proven
+that by design.** 70 minutes covers a late-morning slice, not a plant's full
+daylight operating window (roughly 06:00-21:00 local in August Portugal, per
+`sampled_availability.py`'s own operating-window detection). What this window
+proves, precisely:
+
+- A sustained 30-minute cadence holds to within ~60 seconds of jitter over
+  three consecutive cycles, with **zero** dropped or duplicated cycles.
+- Every observed gap (30:02, 30:03) is **three times inside**
+  `sampled_availability.py`'s `MAX_SAMPLE_GAP_MINUTES=90` tolerance, with
+  wide margin even accounting for realistic occasional single-cycle retries
+  (a 60s/300s backoff on one failed cycle would still land the next
+  successful reading well under 90 minutes from the last).
+- Extrapolated across a ~15-hour operating day at this same cadence: ~30
+  readings/device/day. V1's own historical density (`DIAGNOSTICS.md`) was
+  1-6 readings/device/day, the reason `weighted_sampled_availability`
+  computed a real value for only 3 of 6 720 device-days. Thirty readings a
+  day, each comfortably inside the 90-minute gap rule, is the kind of
+  density that rule was written for.
+
+The honest gap: **extrapolation is not measurement.** A single day has an
+early-morning first-light edge and a late-evening last-light edge that this
+70-minute midday slice never touched, and `sampled_availability.py`'s
+completeness rules (`late_first_sample`, `early_last_sample`,
+`sample_gap_over_90_minutes`, `insufficient_sample_count`) are specifically
+about those edges as much as the middle. **Per this milestone's own
+instruction, availability is not proposed for turning on yet.** The
+concrete next step -- not a new study -- is the same mechanism run
+unattended for one full operating day (or several), then that real history
+replayed through `sampled_availability.py`'s actual completeness rules,
+unmodified, exactly the way `DIAGNOSTICS.md` replayed V1's own history
+against them. Only if *that* run clears `late_first_sample`/
+`early_last_sample`/`sample_gap_over_90_minutes`/`insufficient_sample_count`
+for real operating days does turning on `weighted_sampled_availability` for
+this one canary device become a proposal worth making -- and even then,
+scoped to this one device/asset, not the portfolio, which stays an explicit,
+separate, later decision.
+
+### 8.5 Summary: what Fatia 3 answers
+
+- **Expected vs received**: 6/6 (100%), 3/3 cycles succeeded, 0 retries.
+- **Maior gap**: 30 min 03 s -- within design tolerance, not a symptom of drift.
+- **Falhas/rate limits**: 0/3 cycles, and the zero-call cooldown-respect path
+  is proven separately by test (§8.1) since none occurred live to observe.
+- **Chamadas consumidas**: 9 of a 15-call hard cap (60%), 3/cycle, matching
+  Fatia 2's measured cost exactly -- no surprises at sustained cadence.
+- **Densidade suficiente para availability**: not yet provable for a full
+  day from 70 minutes of evidence -- extrapolation is strongly positive
+  (§8.4), proof is not proposed here. Availability stays off.
+- **Escala**: unchanged -- one asset, two devices, the same connection Fatia
+  2 validated. No portfolio-wide code path exists to accidentally trigger.
+  V1 was not touched at any point in Fatia 3 (no pause, no read, no write --
+  only its `.env` file was read locally for the shared account's
+  credentials, exactly as Fatia 2 already did).
+

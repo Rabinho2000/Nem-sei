@@ -533,6 +533,119 @@ class JobRepository:
             schedule.updated_at = now_value
             return job, created
 
+    def enqueue_due_device_status_poll(
+        self, *, connection_id: int, interval_minutes: int, now: datetime | None = None
+    ) -> tuple[Job | None, bool]:
+        """Enqueue one device-status poll job when its persisted schedule is due.
+
+        M7 Fatia 3 (`docs/v2/DEVICE_TELEMETRY.md`). Same shape as
+        `enqueue_due_noop`: a `ScheduleState` row survives a scheduler
+        restart without re-deriving cadence from wall-clock alone (restart
+        safety), and the dedupe key makes a concurrent or repeated call for
+        the same slot inert rather than duplicating work (idempotency).
+        Unlike the noop schedule this interval is configurable and not
+        hour-aligned -- `next_run_at` advances by exactly `interval_minutes`
+        from its own previous value, so drift never compounds across many
+        cycles the way re-deriving from `now` on every tick would.
+
+        `connection_id` is a required, explicit parameter, not a loop over
+        every enabled FusionSolar connection -- there is no code path here
+        that could poll more than the one connection a caller names, which
+        is the structural half of "não escalar para a carteira": scaling
+        would need a second, deliberate call site, not a config change to
+        this one.
+
+        Two concurrent ticks racing for the same due slot (e.g. during a
+        scheduler rolling restart) both compute the same `dedupe_key`; the
+        loser's insert hits `uq_jobs_active_dedupe` as an `IntegrityError`,
+        caught below the same way `enqueue()` already handles it -- rather
+        than raising, the loser re-reads and reports the winner's job.
+        """
+        if interval_minutes <= 0:
+            raise ValueError("Device status poll interval must be positive.")
+        now_value = now or utc_now()
+        key = f"device_status.poll:{connection_id}"
+        try:
+            with self._immediate_session() as session:
+                schedule = session.get(ScheduleState, key)
+                if schedule is not None and as_utc(schedule.next_run_at) > now_value:
+                    return None, False
+                slot = as_utc(schedule.next_run_at) if schedule is not None else now_value
+                dedupe_key = f"{key}:{slot.isoformat()}"
+                existing = session.scalar(
+                    select(Job).where(
+                        Job.job_type == "device_status.poll", Job.dedupe_key == dedupe_key, Job.status.in_(ACTIVE_STATUSES)
+                    )
+                )
+                if existing is None:
+                    job = Job(
+                        job_type="device_status.poll",
+                        status="queued",
+                        payload_json={"connection_id": connection_id, "scheduled_for": slot.isoformat()},
+                        dedupe_key=dedupe_key,
+                        # Lower priority than the default 100 production/report
+                        # jobs use -- V1's own real account-wide priority order
+                        # (docs/v2/DEVICE_TELEMETRY.md §4) ranks device-level
+                        # diagnostics below production, and this mirrors that.
+                        priority=150,
+                        available_at=now_value,
+                        attempt_count=0,
+                        max_attempts=3,
+                        created_at=now_value,
+                        updated_at=now_value,
+                    )
+                    session.add(job)
+                    session.flush()
+                    self._event(
+                        session,
+                        job_id=job.id,
+                        event_type="enqueued",
+                        attempt=0,
+                        from_status=None,
+                        to_status="queued",
+                        actor_source="scheduler",
+                        metadata={"schedule_key": key, "dedupe_key": dedupe_key},
+                        occurred_at=now_value,
+                    )
+                    created = True
+                else:
+                    job = existing
+                    created = False
+                if schedule is None:
+                    schedule = ScheduleState(schedule_key=key, next_run_at=slot, updated_at=now_value)
+                    session.add(schedule)
+                schedule.last_enqueued_at = now_value
+                schedule.next_run_at = slot + timedelta(minutes=interval_minutes)
+                schedule.updated_at = now_value
+                session.flush()
+                session.expunge(job)
+                return job, created
+        except IntegrityError:
+            # A concurrent tick already won this slot -- and, since it
+            # committed first, already advanced the schedule too. Nothing is
+            # left for this loser to do but report the winner's job.
+            with self._immediate_session() as session:
+                existing = session.scalar(
+                    select(Job).where(
+                        Job.job_type == "device_status.poll", Job.dedupe_key == dedupe_key, Job.status.in_(ACTIVE_STATUSES)
+                    )
+                )
+                if existing is None:
+                    raise
+                self._event(
+                    session,
+                    job_id=existing.id,
+                    event_type="dedupe_reused",
+                    attempt=existing.attempt_count,
+                    from_status=existing.status,
+                    to_status=existing.status,
+                    actor_source="scheduler",
+                    metadata={"schedule_key": key, "dedupe_key": dedupe_key},
+                    occurred_at=now_value,
+                )
+                session.expunge(existing)
+                return existing, False
+
     def events_for(self, job_id: int) -> list[JobEvent]:
         with self.session_factory() as session:
             return list(session.scalars(select(JobEvent).where(JobEvent.job_id == job_id).order_by(JobEvent.id)))

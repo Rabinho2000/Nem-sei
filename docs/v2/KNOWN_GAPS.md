@@ -57,9 +57,16 @@ has. The live canary (asset 153, two inverters, real production account,
 state, active power (`kW`), and day energy (`kWh`) — and confirmed
 `collectTime` is genuinely absent from this endpoint's response, not just
 unchecked. It caught and fixed one real defect (a device-identity field
-priority bug) before any wrong fact was persisted. Only one asset is active;
-nothing was scheduled, and availability stays off pending sustained (not
-single-reading) density — see `DEVICE_TELEMETRY.md` §5-§7. Sigenergy has
+priority bug) before any wrong fact was persisted. M7 Fatia 3 then added a
+persistent, restart-safe, idempotent poll schedule (reusing the existing
+`Job`/`ScheduleState` infrastructure, no new tables) and ran it live for a
+real 70-minute/30-minute-cadence window on the same one asset: 3/3 cycles
+succeeded, 6/6 readings, 0 failures, largest gap 30 min 03 s, 9 of a 15-call
+hard cap. That density is strongly extrapolated, not yet provably measured
+for a full operating day, as sufficient for `sampled_availability.py`'s
+90-minute-gap rule — availability stays off until a full-day run is replayed
+through its actual completeness rules, not extrapolated. See
+`DEVICE_TELEMETRY.md` §5-§8. Sigenergy has
 **no** device-level contract to build on at all: V1 never called a Sigenergy
 device endpoint (0 of 325 `provider_devices` rows, 0 of 51 289
 `device_realtime_snapshots` rows), and V1's own docs list

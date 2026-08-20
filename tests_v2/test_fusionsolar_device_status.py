@@ -249,6 +249,77 @@ def test_unverified_device_types_are_not_persisted(settings, monkeypatch):
         assert session.scalar(select(DeviceStatusFact)) is None
 
 
+def test_failed_read_never_erases_or_overwrites_last_known_device_status(settings, monkeypatch):
+    """M7 Fatia 3: a failure must not create 'offline' nor erase the last known state.
+
+    `record_device_status` is called only for a device this cycle actually
+    read; a cycle that fails outright calls it for nobody. The prior
+    successful fact must survive completely untouched -- same revision,
+    same values -- and `current_device_status()` must keep reporting it.
+    """
+    configured_environment(monkeypatch)
+    factory = factory_for(settings, monkeypatch)
+    connection_id, asset_id, station_code, devices = selected_connection(factory, count=1)
+    device_1, _mapping = devices[0]
+
+    good = service(factory, settings, FakeTransport([
+        response(LOGIN_OK, headers={"XSRF-TOKEN": "t"}),
+        devlist([devrow("DEV-001", 1)]),
+        devkpi([kpirow("DEV-001", state="512", power="3.5", energy="12.4")]),
+    ])).sync_device_status(connection_id)
+    assert good.status == "success"
+
+    from nemsei.diagnostics.service import current_device_status
+    from nemsei.integrations.fusionsolar.client import FusionSolarClientError
+    from nemsei.providers.errors import ProviderError, ProviderErrorCode
+
+    with factory() as session:
+        before = list(session.scalars(select(DeviceStatusFact).where(DeviceStatusFact.device_id == device_1.id)))
+        assert len(before) == 1
+        before_fact = (before[0].source_revision, before[0].availability_status, before[0].active_power_kw, before[0].day_energy_kwh, before[0].observed_at)
+        before_current = current_device_status(session, asset_id=asset_id)
+
+    failed = service(factory, settings, FakeTransport([
+        FusionSolarClientError(ProviderError(ProviderErrorCode.AUTHENTICATION, "provider rejected credentials")),
+    ])).sync_device_status(connection_id)
+    assert failed.status == "failed"
+
+    with factory() as session:
+        after = list(session.scalars(select(DeviceStatusFact).where(DeviceStatusFact.device_id == device_1.id)))
+        # No new revision, no deletion: the exact same single row.
+        assert len(after) == 1
+        after_fact = (after[0].source_revision, after[0].availability_status, after[0].active_power_kw, after[0].day_energy_kwh, after[0].observed_at)
+        assert after_fact == before_fact
+        after_current = current_device_status(session, asset_id=asset_id)
+        assert after_current == before_current
+        # Explicitly: the failure did not fabricate an "offline"/"unknown" reading.
+        assert after_current[0]["availability_status"] == "available"
+        assert after_current[0]["has_reading"] is True
+
+
+def test_rate_limited_poll_makes_zero_provider_calls(settings, monkeypatch):
+    """A cooldown persisted from one failed attempt makes the next attempt call nothing."""
+    from nemsei.integrations.fusionsolar.client import FusionSolarClientError
+    from nemsei.providers.errors import ProviderError, ProviderErrorCode
+    from nemsei.sync.models import ProviderRequestState
+
+    configured_environment(monkeypatch)
+    factory = factory_for(settings, monkeypatch)
+    connection_id, *_rest = selected_connection(factory, count=1)
+
+    limited = service(factory, settings, FakeTransport([
+        FusionSolarClientError(ProviderError(ProviderErrorCode.RATE_LIMITED, "later", retry_after_seconds=60, transient=True)),
+    ])).sync_device_status(connection_id)
+    assert limited.status == "rate_limited"
+    with factory() as session:
+        state = session.scalar(select(ProviderRequestState).where(ProviderRequestState.provider_connection_id == connection_id, ProviderRequestState.endpoint_family == "authentication"))
+        assert state is not None and state.provider_retry_at is not None
+
+    # An empty FakeTransport: any attempted HTTP call would IndexError on pop(0).
+    blocked = service(factory, settings, FakeTransport([])).sync_device_status(connection_id)
+    assert blocked.status == "rate_limited"
+
+
 def test_missing_device_contract_configuration_makes_no_provider_call(settings, monkeypatch):
     monkeypatch.setenv("NEMSEI_V2_FUSIONSOLAR_DEV_USERNAME", "u")
     monkeypatch.setenv("NEMSEI_V2_FUSIONSOLAR_DEV_PASSWORD", "p")

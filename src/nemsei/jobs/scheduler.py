@@ -24,6 +24,15 @@ class Scheduler:
         if not self.repository.acquire_scheduler_lease(owner_token=self.owner_token, lease_seconds=self.settings.scheduler_lease_seconds):
             return False
         _job, created = self.repository.enqueue_due_noop()
+        # M7 Fatia 3: off by default (`device_status_poll_enabled=False`),
+        # and even when on, restricted to exactly the one connection id
+        # configured -- never a loop over every FusionSolar connection.
+        if self.settings.device_status_poll_enabled and self.settings.device_status_poll_connection_id is not None:
+            _device_job, device_created = self.repository.enqueue_due_device_status_poll(
+                connection_id=self.settings.device_status_poll_connection_id,
+                interval_minutes=self.settings.device_status_poll_interval_minutes,
+            )
+            created = created or device_created
         return created
 
     def run_forever(self) -> None:
