@@ -1,0 +1,38 @@
+# M7 Fatia 3 §10 (docs/v2/DEVICE_TELEMETRY.md): the day-plus availability
+# canary, wired into the real standing scheduler/worker containers instead
+# of a session-local driver script.
+#
+# Deliberately a *separate* compose file layered with `-f`, not an edit to
+# `.env.v2`: `.env.v2` is shared by `web` and `migrate` too, and this override
+# must reach only `scheduler`/`worker`, and only for the one already-canary-
+# validated FusionSolar connection (id 3). `environment:` here takes
+# precedence over `.env.v2`'s `NEMSEI_V2_PROVIDER_READS=false` for exactly
+# these two services -- `web`/`migrate` are untouched and keep provider reads
+# disabled, and are not even restarted by deploying this file.
+#
+# To stop the canary at any time (kill switch): remove this file from the
+# `docker compose -f ... -f ...` invocation and re-run `up -d scheduler
+# worker` (or set `NEMSEI_V2_DEVICE_STATUS_POLL_ENABLED=false` here and
+# redeploy) -- either recreates both containers from a config with polling
+# off, which is safe and restart-safe by construction (the persisted
+# `ScheduleState`/lifetime job count are untouched either way).
+#
+# The lifetime hard cap (device_status_poll_max_cycles) is
+# enforced in code (`JobRepository.enqueue_due_device_status_poll`), not by
+# this file -- this file only turns the mechanism on and states the cap;
+# see docs/v2/DEVICE_TELEMETRY.md §9.3 for why the cap counts from the jobs
+# table itself rather than trusting this config not to be misapplied twice.
+name: nemsei-v2
+
+services:
+  scheduler:
+    environment:
+      NEMSEI_V2_PROVIDER_READS: "true"
+      NEMSEI_V2_DEVICE_STATUS_POLL_ENABLED: "true"
+      NEMSEI_V2_DEVICE_STATUS_POLL_CONNECTION_ID: "3"
+      NEMSEI_V2_DEVICE_STATUS_POLL_INTERVAL_MINUTES: "30"
+      NEMSEI_V2_DEVICE_STATUS_POLL_MAX_CYCLES: "48"
+
+  worker:
+    environment:
+      NEMSEI_V2_PROVIDER_READS: "true"

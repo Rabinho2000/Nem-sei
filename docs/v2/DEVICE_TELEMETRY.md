@@ -780,3 +780,77 @@ that is a deliberate, explicit deployment action (wiring the real
 restarting them), reasoned about and recorded separately in §10, not implied
 by the code existing.
 
+## 10. Priority-2 longer canary: prepared and safety-reviewed, **not yet deployed**
+
+**Status: BLOCKED on an explicit go-ahead for one live write, not on missing
+code, evidence, or design.** Everything needed to run an unattended, capped,
+restart-safe, day-plus canary is built and reviewed; the one step left --
+writing to the live `schedule_state` row and deploying the two containers --
+was refused by this session's own action classifier as a live-database
+write, and the instructions accompanying that refusal are explicit not to
+route around it. This is the correct outcome for an action this consequential
+(unattended live provider calls against production for ~22 hours) to require
+a human's explicit sign-off, not a Claude-side workaround -- documented here
+rather than forced through.
+
+**What is ready:**
+
+- `docker-compose.v2.device-status-canary.yml` -- a compose override (`-f`
+  layered on top of `docker-compose.v2.yml`, never editing the shared,
+  more-tightly-permissioned `.env.v2`) that sets
+  `NEMSEI_V2_PROVIDER_READS=true` and the four
+  `NEMSEI_V2_DEVICE_STATUS_POLL_*` variables (`ENABLED=true`,
+  `CONNECTION_ID=3`, `INTERVAL_MINUTES=30`, `MAX_CYCLES=48`) for the
+  `scheduler`/`worker` services only. `web`/`migrate` are not in this file
+  and are not restarted by deploying it, so they keep
+  `NEMSEI_V2_PROVIDER_READS=false` exactly as now -- no code path anywhere
+  in the live `web` process becomes capable of a real provider call by
+  deploying this.
+- A fresh, verified `pg_dump -Fc` backup of `nemsei_v2` (`PGDMP` header
+  checked), taken immediately before attempting the blocked step.
+- The one **required** live write, precisely scoped: `UPDATE schedule_state
+  SET next_run_at = now(), updated_at = now() WHERE schedule_key =
+  'device_status.poll:3';`. This is not optional bookkeeping -- without it,
+  the persisted schedule is still parked at `2026-08-20T11:29:09Z` (§9.1),
+  ~10 hours stale. Because `enqueue_due_device_status_poll` advances
+  `next_run_at` from its **own previous value**, not from wall-clock `now`
+  (by design, for drift-free cadence -- §8.1), deploying without this reset
+  would make the newly-enabled scheduler catch up through ~20 backlog slots
+  one per tick (every `NEMSEI_V2_WORKER_POLL_SECONDS`, a few seconds apart)
+  instead of the intended 30-minute cadence -- a real burst-of-calls risk
+  against the live FusionSolar account this session would rather not create
+  in order to *reduce* provider-side risk, not increase it. Found by
+  reasoning through the exact deploy sequence before running it, not
+  observed live.
+- Cap sizing, reasoned explicitly: 48 lifetime cycles total (3 already spent
+  by Fatia 3, so 45 remain) at 30-minute cadence is ~22.5 more hours from
+  whenever it is deployed -- enough to cross tonight's dark hours, all of
+  tomorrow's daylight operating window (first light through last light, the
+  specific edges §8.4 said the 70-minute window could not reach), and into
+  tomorrow evening, still capped well short of a second full day. Chosen
+  against real evidence, not guessed: V1's own FusionSolar account state
+  (`production_api_queue_state`, read via a `VACUUM INTO` snapshot of V1's
+  SQLite, not the live WAL file) shows V1's own conservative self-imposed
+  budgets for this exact account (`daily_budget=20` for `production_kpi`,
+  `36` for `wat_history`, both on different endpoint families than device
+  status) with actual usage of only ~4-6 calls/day recently -- and Fatia
+  2+3 already made ~18 real device-status-family calls against this same
+  account across two live windows with zero rate-limits observed. 144
+  planned calls (48 cycles × 3) over ~22.5 hours is a meaningfully larger
+  but still bounded and single-asset-scoped ask, not an open-ended one.
+
+**What is needed to unblock:** a human runs (or explicitly authorizes
+running) the one `UPDATE` above against the live `nemsei_v2` database, then
+`docker compose -f docker-compose.v2.yml -f
+docker-compose.v2.device-status-canary.yml up -d --build scheduler worker`
+from `/opt/server/apps/Nem-sei-v2`. Both steps are reversible: the schedule
+reset only changes a bookmark timestamp (no data loss), and redeploying
+`scheduler`/`worker` from `docker-compose.v2.yml` alone (dropping the `-f`
+override) turns polling back off on the next `up -d`, restart-safely, with
+the lifetime cap unaffected either way.
+
+**Kill switch, once running:** either drop the override file from the next
+`up -d` (fastest), or set `NEMSEI_V2_DEVICE_STATUS_POLL_ENABLED: "false"` in
+it and redeploy -- both stop new cycles immediately and are restart-safe;
+neither touches `device_status_facts`/`jobs` history.
+
