@@ -149,9 +149,28 @@ números exactos.
 
 ## Próximo passo concreto
 
-Ligar `device_status_facts` ao cálculo de disponibilidade (`rules/availability.py`)
-e ao payload do relatório individual, substituindo `availability_pct: None`
-por um valor real onde os factos existirem. Depois disso: uma página mínima de
-diagnóstico por instalação, lendo `current_device_status()` — a leitura já
-existe, falta só a rota e o template, seguindo exactamente o padrão já usado em
-`/reports`.
+Duas peças, e afinal não do mesmo tamanho — verificado ao tentar ligar a
+primeira, não assumido.
+
+**A disponibilidade não é uma simples ligação.** `weighted_sampled_availability`
+em `rules/availability.py` já está portado, mas é a parte pequena: só pesa um
+`availability_pct` por dispositivo que já lhe é dado. Calcular esse valor a
+partir de leituras pontuais é `services/sampled_availability.py`,
+~250 linhas por si só — uma janela de operação por dia (do primeiro ao último
+instante com potência positiva, com tolerância de `OPERATING_EDGE_MINUTES=30`
+nos extremos), um mínimo de amostras derivado do intervalo máximo aceite entre
+leituras (`MAX_SAMPLE_GAP_MINUTES=90`), regras de completude por dispositivo
+(`late_first_sample`, `early_last_sample`, `sample_gap_over_90_minutes`,
+`insufficient_sample_count`), e o dia definido no fuso de Lisboa, não em UTC.
+Depende ainda de `provider_device_configuration_history` — "que dispositivos
+se esperava que reportassem nesta data" — que o M1 decidiu explicitamente não
+importar (`DECISIONS.md`: "as suas 325 linhas são todas de versão única e
+abertas, não há histórico de dispositivo para migrar"), o que simplifica mas
+não elimina a pergunta. Portar isto com o mesmo rigor desta sessão é o
+trabalho de uma fatia própria, não uma ligação de fim de sessão.
+
+**A página de diagnóstico é, essa sim, uma ligação.** `current_device_status()`
+já existe e já responde à pergunta "o que está cada dispositivo desta
+instalação a fazer agora"; falta-lhe rota e template, seguindo exactamente o
+padrão de `/reports`. Feito nesta mesma continuação — ver
+`web/diagnostics_routes.py`.

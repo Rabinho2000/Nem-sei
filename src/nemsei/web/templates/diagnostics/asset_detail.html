@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{#
+  Worst first. The question this page exists to answer is "which of this
+  installation's inverters need a look", not "here is a table" — so severity
+  order does the work, not a filter the operator has to remember to apply.
+#}
+{% macro status_pill(status) %}
+  {% set tone = {'available': 'ok', 'standby': 'warn', 'unavailable': 'bad', 'unknown': 'warn'}.get(status, 'warn') %}
+  <span class="pill pill-{{ tone }}">
+    {{ {'available': 'disponível', 'standby': 'standby', 'unavailable': 'indisponível', 'unknown': 'desconhecido'}.get(status, status) }}
+  </span>
+{% endmacro %}
+{% block content %}
+<section class="page-header">
+  <div>
+    <p class="eyebrow">Diagnóstico</p>
+    <h1>{{ asset.canonical_name }}</h1>
+  </div>
+  <a class="button-link" href="{{ url_for('diagnostics.index') }}">← Procurar outra instalação</a>
+</section>
+
+<section class="kpi-strip">
+  <div class="kpi"><small>Dispositivos</small><strong>{{ counts.total }}</strong></div>
+  <div class="kpi"><small>Disponíveis</small><strong>{{ counts.available }}</strong></div>
+  <div class="kpi"><small>Precisam de atenção</small><strong>{{ counts.attention }}</strong></div>
+  <div class="kpi"><small>Sem qualquer leitura</small><strong>{{ counts.no_reading }}</strong></div>
+</section>
+
+<section class="panel">
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Dispositivo</th><th>Modelo</th><th>Estado</th>
+        <th class="num">Potência</th><th class="num">Energia do dia</th><th>Última leitura</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in rows %}
+        <tr class="{{ 'row-attention' if row.availability_status != 'available' else '' }}">
+          <td>{{ row.label }}</td>
+          <td class="muted">{{ row.model or '—' }}</td>
+          <td>{{ status_pill(row.availability_status) }}</td>
+          <td class="num">{% if row.active_power_kw is none %}<span class="muted">—</span>{% else %}{{ '%.2f'|format(row.active_power_kw|float) }} kW{% endif %}</td>
+          <td class="num">{% if row.day_energy_kwh is none %}<span class="muted">—</span>{% else %}{{ '%.1f'|format(row.day_energy_kwh|float) }} kWh{% endif %}</td>
+          <td class="muted">{% if row.observed_at %}{{ row.observed_at.strftime('%Y-%m-%d %H:%M') }}{% else %}sem histórico{% endif %}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="6" class="empty">Esta instalação não tem dispositivos.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="panel-foot muted">
+    A leitura mais recente de cada dispositivo, importada do histórico da V1. Sem leitura ao vivo ainda —
+    ver <code>docs/v2/DIAGNOSTICS.md</code>.
+  </p>
+</section>
+{% endblock %}

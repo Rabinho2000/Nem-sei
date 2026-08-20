@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-header">
+  <div><h1>Diagnóstico</h1><p class="lede">Estado de cada dispositivo, a partir do histórico persistido.</p></div>
+</section>
+
+<section class="panel">
+  <form class="filter-bar" method="get" action="{{ url_for('diagnostics.index') }}">
+    <input type="search" name="search" value="{{ search }}" placeholder="Nome, alias ou cliente…" autofocus>
+    <button type="submit">Procurar</button>
+  </form>
+  <table class="data-table">
+    <thead><tr><th>Instalação</th><th class="num">Dispositivos</th><th></th></tr></thead>
+    <tbody>
+      {% for row in assets %}
+        <tr>
+          <td>{{ row.asset.canonical_name }}</td>
+          <td class="num">{{ row.device_count }}</td>
+          <td class="num"><a href="{{ url_for('diagnostics.asset_detail', asset_id=row.asset.id) }}">Ver diagnóstico</a></td>
+        </tr>
+      {% else %}
+        <tr><td colspan="3" class="empty">Sem instalações com dispositivos a mostrar.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

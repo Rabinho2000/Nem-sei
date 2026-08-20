@@ -32,6 +32,7 @@
             <a class="nav-link {{ 'active' if request.endpoint == 'assets.organizations' else '' }}" href="{{ url_for('assets.organizations') }}"><span aria-hidden="true">◎</span> Organizações</a>
             <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('portfolios.') else '' }}" href="{{ url_for('portfolios.index') }}"><span aria-hidden="true">▤</span> Portfolios</a>
             <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('reporting.') else '' }}" href="{{ url_for('reporting.index') }}"><span aria-hidden="true">▧</span> Relatórios</a>
+            <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('diagnostics.') else '' }}" href="{{ url_for('diagnostics.index') }}"><span aria-hidden="true">◉</span> Diagnóstico</a>
           </div>
         </nav>
         <div class="sidebar-footer">

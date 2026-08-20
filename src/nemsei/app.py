@@ -18,6 +18,7 @@ from nemsei.web.reconciliation_routes import reconciliation_bp
 from nemsei.web.source_routes import source_bp
 from nemsei.web.portfolio_routes import portfolio_bp
 from nemsei.web.reporting_routes import reporting_bp
+from nemsei.web.diagnostics_routes import diagnostics_bp
 
 
 def create_app(
@@ -49,4 +50,5 @@ def create_app(
     app.register_blueprint(source_bp)
     app.register_blueprint(portfolio_bp)
     app.register_blueprint(reporting_bp)
+    app.register_blueprint(diagnostics_bp)
     return app
