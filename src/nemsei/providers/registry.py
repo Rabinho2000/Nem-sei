@@ -75,6 +75,13 @@ _DESCRIPTORS = {
             ProviderCapability.DISCOVERY,
             ProviderCapability.CURRENT_MONITORING,
             ProviderCapability.PRODUCTION_HISTORY,
+            # M7 Fatia 2 (docs/v2/DEVICE_TELEMETRY.md): getDevList + getDevRealKpi
+            # are V1-evidenced (51 289 historical device rows), but "implemented"
+            # here means the code path exists behind its own verified-contract
+            # gate (FusionSolarDeviceContract), same as PRODUCTION_HISTORY -- it
+            # does not mean a live canary has run yet. See DEVICE_TELEMETRY.md.
+            ProviderCapability.DEVICE_DISCOVERY,
+            ProviderCapability.DEVICE_MONITORING,
         }),
     ),
     ProviderCode.SIGENERGY: ProviderDescriptor(
@@ -85,6 +92,12 @@ _DESCRIPTORS = {
             ProviderCapability.CONNECTION_VALIDATION,
             ProviderCapability.DISCOVERY,
             ProviderCapability.CURRENT_MONITORING,
+            # Deliberately absent: V1 never called a Sigenergy device/inverter
+            # endpoint (0 provider_devices rows, 0 device_realtime_snapshots
+            # rows for provider='Sigenergy'), and V1's own API docs list
+            # inverters/strings/availability as explicitly out of scope. There
+            # is no evidence a device-level Sigenergy contract exists to audit,
+            # let alone implement. See docs/v2/DEVICE_TELEMETRY.md.
         }),
     ),
     ProviderCode.SMA: ProviderDescriptor(

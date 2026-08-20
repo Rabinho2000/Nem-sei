@@ -31,6 +31,12 @@ from nemsei.db.base import Base
 # inverter states, and has no honest mapping for "standby".
 AVAILABILITY_STATES = ("available", "standby", "unavailable", "unknown")
 SOURCE_KINDS = ("v1_import", "live_read")
+# Same vocabulary as monitoring.FRESHNESS_STATES/QUALITY_STATES (migration
+# 0016). Added for Fatia 2's live reads; every Fatia 1 (`v1_import`) row
+# defaults to `unknown` on all three rather than a guessed value, since V1
+# recorded neither.
+FRESHNESS_STATES = ("fresh", "stale", "unknown")
+QUALITY_STATES = ("complete", "partial", "missing", "invalid", "unknown")
 
 
 class DeviceStatusFact(Base):
@@ -40,6 +46,9 @@ class DeviceStatusFact(Base):
     __table_args__ = (
         CheckConstraint(f"availability_status IN {AVAILABILITY_STATES!r}", name="ck_device_status_facts_availability"),
         CheckConstraint(f"source_kind IN {SOURCE_KINDS!r}", name="ck_device_status_facts_source_kind"),
+        CheckConstraint(f"freshness IN {FRESHNESS_STATES!r}", name="ck_device_status_facts_freshness"),
+        CheckConstraint(f"quality IN {QUALITY_STATES!r}", name="ck_device_status_facts_quality"),
+        CheckConstraint(f"completeness IN {QUALITY_STATES!r}", name="ck_device_status_facts_completeness"),
         CheckConstraint("active_power_kw IS NULL OR active_power_kw >= 0", name="ck_device_status_facts_power"),
         CheckConstraint("day_energy_kwh IS NULL OR day_energy_kwh >= 0", name="ck_device_status_facts_energy"),
         UniqueConstraint("device_id", "source_fact_key", "source_revision", name="uq_device_status_facts_revision"),
@@ -59,4 +68,8 @@ class DeviceStatusFact(Base):
     active_power_kw: Mapped[Decimal | None] = mapped_column(Numeric(12, 3))
     day_energy_kwh: Mapped[Decimal | None] = mapped_column(Numeric(14, 3))
     source_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="v1_import")
+    freshness: Mapped[str] = mapped_column(String(24), nullable=False, default="unknown")
+    quality: Mapped[str] = mapped_column(String(24), nullable=False, default="unknown")
+    completeness: Mapped[str] = mapped_column(String(24), nullable=False, default="unknown")
+    sync_run_id: Mapped[int | None] = mapped_column(ForeignKey("sync_runs.id", ondelete="SET NULL"))
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)

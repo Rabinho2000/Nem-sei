@@ -56,6 +56,28 @@ class ProviderRepository:
             )
         )
 
+    def current_device_mappings_for_connection(self, connection_id: int) -> list[AssetProviderMapping]:
+        """Return only unresolved/current device-scoped mappings for this connection.
+
+        Same shape as `current_mappings_for_connection`, filtered to
+        `resource_kind == 'device'` instead of `'plant'` (M7 Fatia 2, device
+        telemetry). A device claim always carries `device_id`
+        (`ck_asset_provider_mappings_device_link`), so this never needs a
+        second identity resolution the way plant reconciliation does.
+        """
+        return list(
+            self.session.scalars(
+                select(AssetProviderMapping)
+                .where(
+                    AssetProviderMapping.provider_connection_id == connection_id,
+                    AssetProviderMapping.resource_kind == "device",
+                    AssetProviderMapping.valid_to.is_(None),
+                    AssetProviderMapping.mapping_status.in_(("active", "invalid", "pending_review")),
+                )
+                .order_by(AssetProviderMapping.id)
+            )
+        )
+
     def mappings_for_connection_on_date(self, connection_id: int, on_date: date) -> list[AssetProviderMapping]:
         """Plant mappings effective for a historical source period."""
         return list(

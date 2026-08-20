@@ -1,8 +1,11 @@
 """Small FusionSolar HTTP boundary for implemented read capabilities only.
 
 The endpoint shapes below are limited to behavior observed in frozen V1 fixtures.
-Only plant discovery, current plant monitoring, and one daily production
-endpoint evidenced by frozen V1 fixtures are implemented.  The caller owns
+Plant discovery, current plant monitoring, one daily production endpoint, and
+(M7 Fatia 2) device discovery and device-level current KPIs are implemented --
+all evidenced by V1's own working code (`monitoring_board/services/
+fusionsolar_client.py`: `fetch_device_list`, `fetch_device_realtime_map`), not
+by documentation this codebase has never seen. The caller owns
 production-period and unit contracts; this HTTP boundary never guesses them.
 """
 from __future__ import annotations
@@ -95,6 +98,8 @@ class FusionSolarClient:
     plants_endpoint: str = "/thirdData/stations"
     current_monitoring_endpoint: str = "/thirdData/getStationRealKpi"
     daily_production_endpoint: str = "/thirdData/getKpiStationDay"
+    device_list_endpoint: str = "/thirdData/getDevList"
+    device_current_monitoring_endpoint: str = "/thirdData/getDevRealKpi"
 
     def authenticate(self) -> None:
         response = self._post(
@@ -138,6 +143,53 @@ class FusionSolarClient:
         rows = response.payload.get("data")
         if not isinstance(rows, list):
             raise FusionSolarClientError(ProviderError(ProviderErrorCode.INVALID_RESPONSE, "FusionSolar monitoring response has no plant list."))
+        return [row for row in rows if isinstance(row, dict)]
+
+    def device_list_batch(self, station_codes: list[str]) -> list[dict[str, Any]]:
+        """Read one verified device inventory batch (at most 100 station codes).
+
+        Mirrors V1's `fetch_device_list`: one `stationCodes` payload returns
+        every device V1's account can see across those plants, inverters and
+        otherwise alike -- the `devTypeId` filter to inverters only happens on
+        the caller side, exactly as V1 filtered on `FUSIONSOLAR_INVERTER_
+        DEVICE_TYPE_IDS` after this call, not before it.
+        """
+        if self._token is None:
+            raise FusionSolarClientError(ProviderError(ProviderErrorCode.AUTHENTICATION, "FusionSolar authentication is required."))
+        codes = [code.strip() for code in station_codes if code and code.strip()]
+        if not codes or len(codes) > 100:
+            raise FusionSolarClientError(ProviderError(ProviderErrorCode.CONFIGURATION, "FusionSolar device list batch must contain one to 100 station codes."))
+        response = self._post(self.device_list_endpoint, {"stationCodes": ",".join(codes)}, include_token=True)
+        self._validate(response, phase="device_discovery")
+        data = response.payload.get("data")
+        rows = data.get("list") if isinstance(data, dict) else data
+        if not isinstance(rows, list):
+            raise FusionSolarClientError(ProviderError(ProviderErrorCode.INVALID_RESPONSE, "FusionSolar device list response has no device list."))
+        return [row for row in rows if isinstance(row, dict)]
+
+    def device_current_monitoring_batch(self, device_ids: list[str], *, device_type_id: int) -> list[dict[str, Any]]:
+        """Read one verified device-level current-KPI batch for one device type.
+
+        `getDevRealKpi` groups by `devTypeId` (V1: `fetch_device_realtime_map`),
+        so a caller must partition mixed device types into one call per type
+        rather than sending them together; this method does not partition for
+        the caller, to keep its contract as narrow and literal as the plant
+        equivalent above.
+        """
+        if self._token is None:
+            raise FusionSolarClientError(ProviderError(ProviderErrorCode.AUTHENTICATION, "FusionSolar authentication is required."))
+        ids = [value.strip() for value in device_ids if value and value.strip()]
+        if not ids or len(ids) > 100:
+            raise FusionSolarClientError(ProviderError(ProviderErrorCode.CONFIGURATION, "FusionSolar device monitoring batch must contain one to 100 device IDs."))
+        response = self._post(
+            self.device_current_monitoring_endpoint,
+            {"devIds": ",".join(ids), "devTypeId": device_type_id},
+            include_token=True,
+        )
+        self._validate(response, phase="device_current_monitoring")
+        rows = response.payload.get("data")
+        if not isinstance(rows, list):
+            raise FusionSolarClientError(ProviderError(ProviderErrorCode.INVALID_RESPONSE, "FusionSolar device monitoring response has no device list."))
         return [row for row in rows if isinstance(row, dict)]
 
     def daily_production_batch(

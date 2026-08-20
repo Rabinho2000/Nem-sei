@@ -77,6 +77,10 @@ def test_live_implemented_capabilities_are_narrow_and_runtime_availability_is_se
             ProviderCapability.DISCOVERY,
             ProviderCapability.CURRENT_MONITORING,
             ProviderCapability.PRODUCTION_HISTORY,
+            # M7 Fatia 2 (docs/v2/DEVICE_TELEMETRY.md): getDevList + getDevRealKpi,
+            # both V1-evidenced, behind their own verified-contract gate.
+            ProviderCapability.DEVICE_DISCOVERY,
+            ProviderCapability.DEVICE_MONITORING,
         }:
             assert status.implementation_support is ImplementationSupport.SUPPORTED
             assert status.runtime_availability is RuntimeAvailability.AVAILABLE

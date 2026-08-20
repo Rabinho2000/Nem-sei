@@ -41,9 +41,30 @@ dataloggers and string boxes are vocabulary with no rows. `device_status_facts`
 holds point-in-time availability, active power and day energy imported from
 V1's `device_realtime_snapshots`, keyed on device identity rather than a
 provider mapping, because none of the 325 device claims M1 imported is
-`active`. No **live** device-level read exists — no provider adapter has a
-verified device-level contract, mirroring the gate production reads already
-have — and no provider device discovery is wired to the device level.
+`active`.
+
+A **live** FusionSolar device-level read now exists (M7 Fatia 2, see
+`docs/v2/DEVICE_TELEMETRY.md`) and has been **canary-proven against the real
+account**, 2026-08-20: `getDevList` + `getDevRealKpi`, both V1-evidenced,
+behind their own verified-contract gate (`FusionSolarDeviceContract`,
+requiring an explicit operator-verified active-power/day-energy unit, since
+V1's own unit handling was an unverified magnitude guess, not a contract).
+`device_status_facts` gained `freshness`/`quality`/`completeness`/`sync_run_id`
+(migration `0016`, applied to the live database with a verified backup) to
+carry this evidence with the same provenance `monitoring_observations` already
+has. The live canary (asset 153, two inverters, real production account,
+`docker pause`d V1 for 5.63 s total across two windows) confirmed inverter
+state, active power (`kW`), and day energy (`kWh`) — and confirmed
+`collectTime` is genuinely absent from this endpoint's response, not just
+unchecked. It caught and fixed one real defect (a device-identity field
+priority bug) before any wrong fact was persisted. Only one asset is active;
+nothing was scheduled, and availability stays off pending sustained (not
+single-reading) density — see `DEVICE_TELEMETRY.md` §5-§7. Sigenergy has
+**no** device-level contract to build on at all: V1 never called a Sigenergy
+device endpoint (0 of 325 `provider_devices` rows, 0 of 51 289
+`device_realtime_snapshots` rows), and V1's own docs list
+inverters/strings/availability as explicitly out of scope — this is not a
+missing import, there is nothing to import from.
 
 FusionSolar daily production remains gated on an operator-verified source
 timezone and `PVYield=kWh` contract per connection. Sigenergy has guarded
