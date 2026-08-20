@@ -650,3 +650,133 @@ separate, later decision.
   only its `.env` file was read locally for the shared account's
   credentials, exactly as Fatia 2 already did).
 
+## 9. Recovery audit (2026-08-20, later session) and the interactive-session dependency, fixed
+
+A later session picked this milestone back up believing the sustained window
+might have been cut short by a lost connection. It was not -- but the audit
+that confirmed this found a real architectural gap, fixed below.
+
+### 9.1 What actually happened to the window: nothing did
+
+Queried directly against the live database, not re-read from §8.3's own
+prose:
+
+- `jobs` holds exactly three `device_status.poll` rows (68, 70, 71), all
+  `status='success'`, `attempt_count=1`, no `failed`/`waiting`/stuck-`running`
+  row at any point.
+- `job_events` shows a clean `enqueued -> claimed -> completed` triple for
+  each, `actor_source` `scheduler`/`worker` as designed.
+- `device_status_facts` holds exactly 6 rows in the window
+  (`observed_at` 09:59:12, 10:29:15, 10:59:18, two devices each),
+  `source_revision` incrementing 2/3/4 -- no duplicate revision, no gap in
+  the sequence.
+- `provider_request_attempts` shows exactly 9 `succeeded` calls in the window
+  (3 × auth/`getDevList`/`getDevRealKpi`), 0 `rate_limited`, 0 `failed`.
+- `schedule_state` for `device_status.poll:3` is frozen at
+  `next_run_at=2026-08-20T11:29:09Z`, `last_enqueued_at=10:59:15` -- exactly
+  one interval past the last real cycle, never advanced further.
+
+This is not the signature of a process that died mid-flight (that would
+leave a `running` job with an expired lease, or a `claimed_at` with no
+`completed`/`failed` event). It is the signature of a process that finished
+its configured 70-minute, 3-cycle window and stopped **on schedule**. §8.3
+already said as much ("70 minutes, the full configured duration -- no early
+stop"); the audit confirms it against raw evidence rather than trusting that
+sentence.
+
+V1 (`nem-sei-monitoring-board-1`) is running uninterrupted since before this
+window (`StartedAt` 2026-08-03, `Paused=false` now) -- the Fatia 2/3 pause
+windows were `docker pause`/`unpause` pairs, which do not reset a
+container's start time, and both trap-guarded unpauses are independently
+confirmed by V1 having been live and un-paused for the ~11 hours between the
+window ending and this audit running. `nemsei-v2-worker-1` is likewise
+running now; whatever paused it for the Fatia 3 window was resumed as
+designed.
+
+### 9.2 The real finding: the window never could have continued unattended
+
+Nothing crashed. But nothing *would have run again* either, indefinitely,
+window or no connection loss -- for a structural reason, not a bug in the
+cycle logic itself:
+
+`Scheduler.run_once()` (§8.1) does check
+`settings.device_status_poll_enabled`/`_connection_id` on every tick, and
+the real, standing `nemsei-v2-scheduler-1` container does tick forever
+(confirmed live: it has enqueued an `system.noop` job every hour, unbroken,
+for the ~11 hours since the window ended). But that container's own
+environment has never had
+`NEMSEI_V2_DEVICE_STATUS_POLL_ENABLED`/`_CONNECTION_ID` set --
+`docker exec nemsei-v2-scheduler-1 env` shows neither, and
+`NEMSEI_V2_PROVIDER_READS=false` besides. The three live cycles were driven
+by a **separate, one-off `Scheduler`/`Worker` pair**, constructed by the
+session's own driver script with its own (temporary, session-local)
+settings, run three times by hand, once per cycle -- not the deployed
+process. `job_events.actor_source` reading `scheduler`/`worker` is real (the
+same classes, the same persisted `ScheduleState`/dedupe machinery, the same
+DB), but the *process* that called them existed only for the few seconds of
+each cycle's execution, invoked by a human watching a clock. This is exactly
+the dependency the session was asked to check for and remove: **the
+mechanism was correct; only its deployment was not persistent.**
+
+Nothing here was silently wrong before this audit -- §8.2 already documented
+the one-off-process choice and its reason (contention with the live
+scheduler's lease). The gap is that this makes the *cadence* durable
+(proven by `test_device_status_poll_schedule_survives_a_scheduler_restart`)
+without making the *running of it* durable, and nobody had actually pointed
+the real deployed scheduler at the feature yet.
+
+### 9.3 Fix: a code-level lifetime hard cap, then point the real scheduler at it
+
+Before wiring `device_status_poll_enabled` into the standing
+`nemsei-v2-scheduler-1`/`nemsei-v2-worker-1` containers, one real gap had to
+close first: **there was no hard cap in the code at all.** The "15-call hard
+cap" in §8 was a number a human held in their head and a driver script that
+stopped after 3 manual cycles -- nothing in `enqueue_due_device_status_poll`
+would have refused a 4th, 40th, or 400th cycle. An unattended run cannot
+rely on a human noticing and stopping it.
+
+Added, not redesigned:
+
+- `Settings.device_status_poll_max_cycles: int | None` (env
+  `NEMSEI_V2_DEVICE_STATUS_POLL_MAX_CYCLES`). `validate()` now refuses
+  `device_status_poll_enabled=True` with `max_cycles` unset or `<=0` --
+  structurally the same pattern as the pre-existing "no connection id, no
+  run" rule, extended to "no cap, no run."
+- `JobRepository.enqueue_due_device_status_poll(..., max_cycles=...)`: before
+  creating a new job, counts every `device_status.poll` job this schedule
+  key has **ever** created (`COUNT(*) ... WHERE dedupe_key LIKE
+  'device_status.poll:{id}:%'`) -- a lifetime cap read back from the jobs
+  table itself, not a separate counter that could drift or reset. Once the
+  count reaches the cap, the method returns `(None, False)` and, unlike the
+  ordinary "not due yet" case, does **not** advance `next_run_at` either --
+  the schedule freezes at a due-but-never-fired slot, which is trivially
+  observable later (exactly how §9.1's audit read the pre-cap window) rather
+  than quietly drifting forward as if the cap had never been hit.
+- `Scheduler.run_once()` now passes `settings.device_status_poll_max_cycles`
+  through unchanged.
+- Counting is **lifetime**, not per-deployment: the three cycles job 68/70/71
+  already created count toward whatever cap is configured next, so turning
+  this on again does not grant a fresh budget for cycles that already ran
+  for real.
+- 8 new tests (`test_config.py`: enabled-requires-connection-id,
+  enabled-requires-a-positive-cap, valid-config-round-trips,
+  env-var-parsing; `test_jobs.py`: stops-at-cap, cap-survives-a-restart,
+  no-cap-is-unbounded; `test_scheduler.py`: the real `Scheduler.run_once()`
+  loop enqueues device-status polls end-to-end and honours the cap, and
+  confirms it enqueues nothing at all while disabled). Full V2 suite result
+  recorded in `KNOWN_GAPS.md`/session report, not restated here.
+
+### 9.4 What this unblocks, and what it deliberately still does not
+
+This closes the "does the mechanism survive without an interactive session"
+question for good -- the answer is now genuinely yes, because the same
+`Scheduler.run_once()` the standing container already calls every tick is
+the only code path that can enqueue a `device_status.poll` cycle, gated by
+persisted, restart-safe state and a persisted, tamper-evident lifetime cap.
+
+It does **not** by itself decide to run the Priority-2 longer canary --
+that is a deliberate, explicit deployment action (wiring the real
+`nemsei-v2-scheduler-1`/`nemsei-v2-worker-1` containers' environment and
+restarting them), reasoned about and recorded separately in §10, not implied
+by the code existing.
+

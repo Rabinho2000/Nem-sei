@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import Engine, insert, or_, select, update
+from sqlalchemy import Engine, func, insert, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -534,9 +534,20 @@ class JobRepository:
             return job, created
 
     def enqueue_due_device_status_poll(
-        self, *, connection_id: int, interval_minutes: int, now: datetime | None = None
+        self, *, connection_id: int, interval_minutes: int, max_cycles: int | None = None, now: datetime | None = None
     ) -> tuple[Job | None, bool]:
         """Enqueue one device-status poll job when its persisted schedule is due.
+
+        `max_cycles`, when given, is a **lifetime** hard cap on how many
+        `device_status.poll` jobs this schedule (`connection_id`) may ever
+        create, counted directly from the `jobs` table -- not a separate
+        counter that could drift out of sync with reality or reset on a
+        restart. Once the count of jobs ever enqueued for this schedule key
+        reaches `max_cycles`, this method stops enqueueing (returns
+        `(None, False)`) and stops advancing `next_run_at`, forever, until a
+        human raises the cap. This is the structural "hard cap" an
+        unattended, restart-safe run needs so it can never run away just
+        because nobody is watching it tick.
 
         M7 Fatia 3 (`docs/v2/DEVICE_TELEMETRY.md`). Same shape as
         `enqueue_due_noop`: a `ScheduleState` row survives a scheduler
@@ -577,6 +588,20 @@ class JobRepository:
                         Job.job_type == "device_status.poll", Job.dedupe_key == dedupe_key, Job.status.in_(ACTIVE_STATUSES)
                     )
                 )
+                if existing is None and max_cycles is not None:
+                    lifetime_count = session.scalar(
+                        select(func.count(Job.id)).where(
+                            Job.job_type == "device_status.poll",
+                            Job.dedupe_key.like(f"{key}:%"),
+                        )
+                    )
+                    if lifetime_count >= max_cycles:
+                        # Capped: never create the job, never advance the
+                        # schedule. `next_run_at` stays exactly where it was,
+                        # so this is trivially observable later (the schedule
+                        # frozen at a due, never-fired slot) rather than
+                        # silently drifting forward as if nothing happened.
+                        return None, False
                 if existing is None:
                     job = Job(
                         job_type="device_status.poll",

@@ -3,7 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from nemsei.db import build_engine, build_session_factory
 from nemsei.jobs.models import Job
@@ -193,6 +193,69 @@ def test_device_status_poll_schedule_requires_a_positive_interval(settings, monk
         assert False, "must reject a non-positive interval"
     except ValueError:
         pass
+
+
+def test_device_status_poll_stops_at_its_lifetime_hard_cap(settings, monkeypatch) -> None:
+    """An unattended run must not run away just because nobody is watching it."""
+    repo = repository(settings, monkeypatch)
+    t0 = utc_now()
+
+    first, created_first = repo.enqueue_due_device_status_poll(connection_id=3, interval_minutes=30, max_cycles=2, now=t0)
+    assert created_first and first is not None
+
+    second, created_second = repo.enqueue_due_device_status_poll(
+        connection_id=3, interval_minutes=30, max_cycles=2, now=t0 + timedelta(minutes=30)
+    )
+    assert created_second and second is not None and second.id != first.id
+
+    # The cap is now reached (2/2): a third due tick must not create a job...
+    third, created_third = repo.enqueue_due_device_status_poll(
+        connection_id=3, interval_minutes=30, max_cycles=2, now=t0 + timedelta(minutes=60)
+    )
+    assert created_third is False and third is None
+
+    # ...and must never create one on any later tick either -- the cap is
+    # permanent, not a one-time skip that resumes on the next slot.
+    fourth, created_fourth = repo.enqueue_due_device_status_poll(
+        connection_id=3, interval_minutes=30, max_cycles=2, now=t0 + timedelta(minutes=180)
+    )
+    assert created_fourth is False and fourth is None
+
+    with repo.session_factory() as session:
+        count = session.scalar(
+            select(func.count(Job.id)).where(Job.job_type == "device_status.poll")
+        )
+    assert count == 2
+
+
+def test_device_status_poll_hard_cap_counts_cycles_from_a_prior_process(settings, monkeypatch) -> None:
+    """The cap is read back from persisted state, not a counter private to one process --
+    a restarted scheduler must not get a fresh budget."""
+    t0 = utc_now()
+    first_instance = repository(settings, monkeypatch)
+    job, created = first_instance.enqueue_due_device_status_poll(connection_id=3, interval_minutes=30, max_cycles=1, now=t0)
+    assert created and job is not None
+
+    engine = build_engine(settings)
+    restarted_instance = JobRepository(engine, build_session_factory(engine))
+    again, created_again = restarted_instance.enqueue_due_device_status_poll(
+        connection_id=3, interval_minutes=30, max_cycles=1, now=t0 + timedelta(minutes=30)
+    )
+    assert created_again is False and again is None
+
+
+def test_device_status_poll_with_no_cap_configured_is_unbounded(settings, monkeypatch) -> None:
+    """`max_cycles=None` (the default) preserves the pre-cap behaviour exactly --
+    this is exercised at the `Settings` layer (a real deployment can never reach
+    here with polling enabled and no cap; see test_config.py), but the
+    repository method itself must not silently assume a cap."""
+    repo = repository(settings, monkeypatch)
+    t0 = utc_now()
+    for cycle in range(3):
+        job, created = repo.enqueue_due_device_status_poll(
+            connection_id=3, interval_minutes=30, max_cycles=None, now=t0 + timedelta(minutes=30 * cycle)
+        )
+        assert created and job is not None
 
 
 def test_production_backfill_progress_is_persisted_before_reschedule(settings, monkeypatch) -> None:

@@ -92,6 +92,15 @@ class Settings:
     device_status_poll_enabled: bool = False
     device_status_poll_interval_minutes: int = 30
     device_status_poll_connection_id: int | None = None
+    # A hard cap on the *lifetime* number of `device_status.poll` cycles ever
+    # enqueued for `device_status_poll_connection_id` (counted from the jobs
+    # table itself, not a separate counter -- see
+    # `JobRepository.enqueue_due_device_status_poll`). Required whenever
+    # polling is enabled, same structural pattern as the connection-id
+    # requirement just above: there is no "enabled with no cap" mode, so an
+    # unattended run can never run away unbounded even if nobody is watching
+    # it. docs/v2/DEVICE_TELEMETRY.md §9.
+    device_status_poll_max_cycles: int | None = None
     testing: bool = False
 
     @property
@@ -130,6 +139,7 @@ class Settings:
             device_status_poll_enabled=parse_bool(os.environ.get("NEMSEI_V2_DEVICE_STATUS_POLL_ENABLED"), default=False),
             device_status_poll_interval_minutes=int(os.environ.get("NEMSEI_V2_DEVICE_STATUS_POLL_INTERVAL_MINUTES", "30")),
             device_status_poll_connection_id=_optional_int(os.environ.get("NEMSEI_V2_DEVICE_STATUS_POLL_CONNECTION_ID")),
+            device_status_poll_max_cycles=_optional_int(os.environ.get("NEMSEI_V2_DEVICE_STATUS_POLL_MAX_CYCLES")),
             testing=parse_bool(os.environ.get("NEMSEI_V2_TESTING"), default=False),
         )
 
@@ -156,6 +166,10 @@ class Settings:
             raise ConfigurationError("Device status poll interval must be positive.")
         if self.device_status_poll_enabled and self.device_status_poll_connection_id is None:
             raise ConfigurationError("Device status polling requires an explicit connection id; there is no portfolio-wide mode.")
+        if self.device_status_poll_enabled and (
+            self.device_status_poll_max_cycles is None or self.device_status_poll_max_cycles <= 0
+        ):
+            raise ConfigurationError("Device status polling requires a positive lifetime cycle cap; there is no uncapped mode.")
         if min(self.worker_poll_seconds, self.worker_lease_seconds, self.scheduler_lease_seconds, self.db_pool_size, self.db_statement_timeout_ms, self.db_lock_timeout_ms, self.db_idle_transaction_timeout_ms, self.db_pool_recycle_seconds, self.production_max_source_days, self.production_reconciliation_max_source_days, self.production_backfill_max_source_days, self.production_backfill_chunk_days) <= 0 or self.db_max_overflow < 0:
             raise ConfigurationError("V2 timing and pool settings must be positive.")
         if self.production_backfill_chunk_days > self.production_backfill_max_source_days:

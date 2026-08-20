@@ -31,6 +31,7 @@ class Scheduler:
             _device_job, device_created = self.repository.enqueue_due_device_status_poll(
                 connection_id=self.settings.device_status_poll_connection_id,
                 interval_minutes=self.settings.device_status_poll_interval_minutes,
+                max_cycles=self.settings.device_status_poll_max_cycles,
             )
             created = created or device_created
         return created
