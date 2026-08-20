@@ -106,6 +106,16 @@ Wired into `/diagnostics/assets/<id>`, worst-first, alongside the existing
 per-device table. Not yet an asset-level severity summary or a portfolio
 view — see `ROADMAP.md`.
 
+Alarms remain audit-only (`docs/v2/ALARMS_AUDIT.md`, 2026-08-20): V1 never
+persisted a single alarm row for any provider, ever — the only alarm read
+is a live, on-demand, never-stored call used solely to render one admin
+screen. Device identity in that payload is name-only (no stable id),
+severity/status vocabulary was never confirmed against a real stored value,
+and no alarm call was made during any of this session's live canaries.
+**BLOCKED**, correctly — not enough evidence to design a schema against,
+let alone implement one. Sigenergy has no alarm contract at all, re-confirmed
+against its own docs with no change since the prior audit.
+
 FusionSolar daily production remains gated on an operator-verified source
 timezone and `PVYield=kWh` contract per connection. Sigenergy has guarded
 read-only connection validation, discovery, and current monitoring; its daily
