@@ -6,6 +6,7 @@ x-v2-environment: &v2-environment
 services:
   postgres:
     image: postgres:16.11-bookworm@sha256:a2420e9555e2224583fe84d0bb3f0b967e69354ae3a0be55a9c14e251388c4eb
+    restart: unless-stopped
     environment:
       POSTGRES_DB: nemsei_v2
       POSTGRES_USER: nemsei
@@ -23,6 +24,10 @@ services:
   migrate:
     build: {context: ., dockerfile: Dockerfile.v2}
     profiles: ["manual"]
+    # No restart policy, deliberately: this runs `alembic upgrade head` once
+    # and exits. Auto-restarting it would mean a host reboot repeatedly
+    # re-runs migrations against a database that may not be ready yet, or
+    # worse, keeps retrying an intentionally-failed migration forever.
     env_file: ${NEMSEI_V2_ENV_FILE:-.env.v2}
     environment:
       <<: *v2-environment
@@ -34,6 +39,7 @@ services:
 
   web:
     build: {context: ., dockerfile: Dockerfile.v2}
+    restart: unless-stopped
     env_file: ${NEMSEI_V2_ENV_FILE:-.env.v2}
     environment:
       <<: *v2-environment
@@ -46,6 +52,7 @@ services:
 
   scheduler:
     build: {context: ., dockerfile: Dockerfile.v2}
+    restart: unless-stopped
     env_file: ${NEMSEI_V2_ENV_FILE:-.env.v2}
     environment:
       <<: *v2-environment
@@ -57,6 +64,7 @@ services:
 
   worker:
     build: {context: ., dockerfile: Dockerfile.v2}
+    restart: unless-stopped
     env_file: ${NEMSEI_V2_ENV_FILE:-.env.v2}
     environment:
       <<: *v2-environment
