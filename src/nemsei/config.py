@@ -110,6 +110,14 @@ class Settings:
     # across every asset that owns a device, by design.
     diagnostic_incident_evaluation_enabled: bool = False
     diagnostic_incident_evaluation_interval_minutes: int = 15
+    # D3 (docs/v2/DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md): the periodic
+    # notification-policy evaluator. Off by default. Also makes zero
+    # provider calls (only reads diagnostic_incidents, writes
+    # notification_events) -- and even once enabled, delivery can only ever
+    # reach `notifications/telegram_client.py`'s mock: no real Telegram
+    # client exists in this codebase yet (D4).
+    notification_processing_enabled: bool = False
+    notification_processing_interval_minutes: int = 15
     testing: bool = False
 
     @property
@@ -155,6 +163,12 @@ class Settings:
             diagnostic_incident_evaluation_interval_minutes=int(
                 os.environ.get("NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_INTERVAL_MINUTES", "15")
             ),
+            notification_processing_enabled=parse_bool(
+                os.environ.get("NEMSEI_V2_NOTIFICATION_PROCESSING_ENABLED"), default=False
+            ),
+            notification_processing_interval_minutes=int(
+                os.environ.get("NEMSEI_V2_NOTIFICATION_PROCESSING_INTERVAL_MINUTES", "15")
+            ),
             testing=parse_bool(os.environ.get("NEMSEI_V2_TESTING"), default=False),
         )
 
@@ -187,6 +201,8 @@ class Settings:
             raise ConfigurationError("Device status polling requires a positive lifetime cycle cap; there is no uncapped mode.")
         if self.diagnostic_incident_evaluation_interval_minutes <= 0:
             raise ConfigurationError("Diagnostic incident evaluation interval must be positive.")
+        if self.notification_processing_interval_minutes <= 0:
+            raise ConfigurationError("Notification processing interval must be positive.")
         if min(self.worker_poll_seconds, self.worker_lease_seconds, self.scheduler_lease_seconds, self.db_pool_size, self.db_statement_timeout_ms, self.db_lock_timeout_ms, self.db_idle_transaction_timeout_ms, self.db_pool_recycle_seconds, self.production_max_source_days, self.production_reconciliation_max_source_days, self.production_backfill_max_source_days, self.production_backfill_chunk_days) <= 0 or self.db_max_overflow < 0:
             raise ConfigurationError("V2 timing and pool settings must be positive.")
         if self.production_backfill_chunk_days > self.production_backfill_max_source_days:

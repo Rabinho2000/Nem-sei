@@ -12,6 +12,7 @@ from nemsei.diagnostics.service import record_device_status
 from nemsei.jobs.models import Job
 from nemsei.jobs.repository import JobRepository
 from nemsei.jobs.worker import Worker
+from nemsei.notifications.models import NotificationChannel, NotificationEvent, NotificationPolicy
 from nemsei.shared.clock import as_utc, utc_now
 from tests_v2.test_migrations import upgrade
 
@@ -63,6 +64,51 @@ def test_worker_executes_a_real_incident_evaluation_end_to_end(settings, monkeyp
     assert len(incidents) == 1
     assert incidents[0].rule_code == "device_unavailable"
     assert incidents[0].status == "open"
+
+
+def test_worker_executes_a_real_notification_processing_cycle_end_to_end(settings, monkeypatch) -> None:
+    """D3, proven through the real Job/Scheduler/Worker pipeline, not by
+    calling evaluate_and_process_notifications directly -- and through the
+    worker's own default client factory, which can only ever build a mock."""
+    upgrade(settings, monkeypatch)
+    engine = build_engine(settings)
+    session_factory = build_session_factory(engine)
+    now = datetime.now(timezone.utc)
+    with session_factory() as session, session.begin():
+        asset = create_asset(session, canonical_name="Notification Worker Plant")
+        device = create_device(session, asset_id=asset.id, device_kind="inverter", label="INV-1", valid_from=date(2026, 1, 1))
+        channel = NotificationChannel(
+            name="Ops", kind="telegram", enabled=True, target_chat_id="chat-1", created_at=now, updated_at=now
+        )
+        session.add(channel)
+        session.flush()
+        session.add(
+            NotificationPolicy(
+                name="Default", enabled=True, channel_id=channel.id, min_severity="warning",
+                notify_on_open=True, notify_on_resolve=True, created_at=now, updated_at=now,
+            )
+        )
+        session.flush()
+        record_device_status(
+            session, device_id=device.id, asset_id=asset.id, source_fact_key="v1:1",
+            observed_at=now - timedelta(hours=1), availability_status="unavailable",
+        )
+
+    incident_repo = JobRepository(engine, session_factory)
+    incident_job, _ = incident_repo.enqueue_due_incident_evaluation(interval_minutes=15)
+    assert Worker(settings, worker_id="test-worker-incidents-for-notifications").run_once()
+    assert incident_repo.events_for(incident_job.id)[-1].to_status == "success"
+
+    notification_job, created = incident_repo.enqueue_due_notification_processing(interval_minutes=15)
+    assert created and notification_job is not None
+    assert Worker(settings, worker_id="test-worker-notifications").run_once()
+    assert incident_repo.events_for(notification_job.id)[-1].to_status == "success"
+
+    with session_factory() as session:
+        rows = session.scalars(select(NotificationEvent)).all()
+    assert len(rows) == 1
+    assert rows[0].kind == "opened"
+    assert rows[0].status == "sent"  # decided and delivered via the worker's own mock client
 
 
 def test_worker_persists_partial_as_a_distinct_terminal_result(settings, monkeypatch) -> None:

@@ -106,3 +106,30 @@ def test_scheduler_never_enqueues_incident_evaluation_when_disabled(settings, mo
     with build_session_factory(engine)() as session:
         jobs = session.scalars(select(Job).where(Job.job_type == "diagnostics.evaluate_incidents")).all()
     assert jobs == []
+
+
+def test_scheduler_enqueues_notification_processing_when_enabled(settings, monkeypatch) -> None:
+    """D3: no connection id, no cap needed -- this makes no provider calls,
+    and delivery can only ever reach the mock Telegram client."""
+    upgrade(settings, monkeypatch)
+    notification_settings = dataclasses.replace(
+        settings, notification_processing_enabled=True, notification_processing_interval_minutes=15
+    )
+    scheduler = Scheduler(notification_settings, owner_token="scheduler-notifications")
+    assert scheduler.run_once() is True
+    assert scheduler.run_once() is False
+
+    engine = build_engine(settings)
+    with build_session_factory(engine)() as session:
+        jobs = session.scalars(select(Job).where(Job.job_type == "notifications.process")).all()
+    assert len(jobs) == 1
+
+
+def test_scheduler_never_enqueues_notification_processing_when_disabled(settings, monkeypatch) -> None:
+    upgrade(settings, monkeypatch)
+    scheduler = Scheduler(settings, owner_token="scheduler-notifications-off")
+    scheduler.run_once()
+    engine = build_engine(settings)
+    with build_session_factory(engine)() as session:
+        jobs = session.scalars(select(Job).where(Job.job_type == "notifications.process")).all()
+    assert jobs == []

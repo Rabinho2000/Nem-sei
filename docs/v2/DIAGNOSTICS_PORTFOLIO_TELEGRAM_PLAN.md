@@ -723,3 +723,240 @@ para login, não `500`). **Não confirmado visualmente num browser
 autenticado** — esta sessão não tem a credencial de administrador real, e
 não tentou contorná-la; os 642 incidentes reais de D1 estão prontos na BD
 para esta UI os mostrar assim que alguém entrar.
+
+## 21. D3 — Notification infrastructure, mock-only, implementado e testado (2026-08-21)
+
+Aprovado explicitamente com um limite muito claro: **nenhuma mensagem
+Telegram real nesta fatia**. Cumprido estruturalmente, não por convenção —
+`notifications/telegram_client.py` só tem uma interface (`TelegramClient`,
+um `Protocol`) e um mock (`MockTelegramClient`, que nunca abre um socket).
+Não existe nenhum caminho de código nesta fatia capaz de uma chamada HTTP
+real; um cliente real é trabalho de D4, atrás da mesma interface.
+
+### Modelo: três tabelas novas, `diagnostic_incidents` inalterada
+
+```
+DiagnosticIncident (D1, inalterado)
+        │
+        ▼
+NotificationPolicy   -- decide SE um episódio merece notificar, e quando
+        │
+        ▼
+NotificationEvent    -- registo persistido e auditável de UMA decisão
+        │              (e, separadamente, da sua entrega)
+        ▼
+NotificationChannel  -- para onde a decisão seria entregue
+        │
+        ▼
+TelegramClient (interface + mock; D4 adiciona o real)
+```
+
+Migration `0018_notifications` (aditiva, `diagnostic_incidents` intocada).
+**Um bug real apanhado pelo próprio teste de migração**, não hipotético:
+`CHANNEL_KINDS = ("telegram",)` é um tuplo Python de um elemento — a sua
+representação `!r` mantém a vírgula final (`('telegram',)`), que o Postgres
+rejeita dentro de `IN (...)` como erro de sintaxe mesmo antes de qualquer
+dado real existir. Corrigido com um pequeno helper (`_sql_in_list`) em vez
+de reescrever a constraint à mão; aplicado tanto ao modelo como à migration.
+
+### Identidade estrutural, não texto de mensagem
+
+`NotificationEvent` é único em `(incident_id, kind, channel_id)` —
+`kind ∈ {opened, escalated, resolved}`. Isto, sozinho, responde à maior
+parte dos nove fluxos pedidos:
+
+- Um incidente novo elegível cria exactamente uma linha `opened`.
+- Reavaliar o mesmo incidente não cria nada novo — a identidade já existe.
+- Um incidente que continua aberto **não** volta a notificar por si só; só
+  uma regra explícita (`escalation_after_minutes`) pode criar uma segunda
+  linha, `escalated`, e mesmo essa só uma vez por incidente (a mesma
+  identidade estrutural aplica-se a cada `kind`).
+- Um incidente resolvido pode produzir uma linha `resolved`, se
+  `notify_on_resolve=True`.
+- Um episódio que resolve e reaparece é, por desenho da própria D1, uma
+  **nova linha `DiagnosticIncident`** — logo automaticamente uma nova
+  identidade de notificação também, sem nada a repor aqui.
+- Incidentes diferentes no mesmo asset/device (rule_codes diferentes) nunca
+  colidem — a identidade inclui `incident_id`, não `(asset_id, device_id)`.
+
+### Um bug real de concorrência, apanhado pelo próprio teste de concorrência
+
+A primeira versão de `_decide_for_policy` verificava `_has_event` e depois
+inseria — uma janela real entre leitura e escrita. Um teste com 4 threads a
+decidir o mesmo incidente em paralelo (proof #7) fez exactamente o que
+devia: a constraint única do Postgres rejeitou a segunda inserção, mas o
+código **deixava o `IntegrityError` propagar e abortar a transacção
+inteira**, em vez de tratar a corrida como um não-evento gracioso. Corrigido
+com um `SAVEPOINT` (`session.begin_nested()`) à volta de cada inserção
+individual — quem perde a corrida devolve `None` e simplesmente não conta
+nada, sem abortar o resto do lote. Sem isto, um restart/concorrência real
+teria podido falhar o job inteiro por causa de uma única colisão, não só
+"duplicar" — um bug mais grave do que o pedido original antecipava.
+
+### Estados de `NotificationEvent`: quatro, não mais
+
+`pending` (decidido, ainda por entregar) → `sent` **ou** `failed` (só a
+partir de `pending`/`failed`, nunca de `skipped`) — mais `skipped`, uma
+decisão real e final tomada no momento da criação (canal desligado), não um
+não-evento silencioso. Uma falha nunca marca `sent` — `sent_at` só é escrito
+quando `TelegramClient.send_message` devolve `delivered=True`, e a
+constraint `(status = 'sent') = (sent_at IS NOT NULL)` torna isto impossível
+de violar mesmo por um bug futuro no código. Um `failed` é reavaliado em
+cada passagem seguinte (retry ilimitado — D3 não tem nenhum modo de falha
+real contra o qual desenhar um limite/backoff; isso é trabalho de D4, com
+um cliente real).
+
+### Anti-recorrência bruta
+
+`occurrence_count`/dedup nunca contam linhas brutas — a identidade é
+`(incident_id, kind, channel_id)`, e `DiagnosticIncident.occurrence_count`
+(D1) já era um contador por ciclo de avaliação, não por linha de facto.
+`MINIMUM_ALERT_SEVERITY` da V1 (config morta, nunca lida) não foi portado —
+`min_severity` aqui é um campo real, verificado em `_in_scope` a cada
+decisão.
+
+### Baseline, não mascarado na policy
+
+Ver §22 (dry-run) — a decisão de excluir incidentes pré-existentes da
+notificação `opened` é feita de forma honesta e documentada
+(`NotificationPolicy.baseline_at`), o mesmo mecanismo que a V1 já precisou
+de construir (`ALERT_BASELINE_AT`), não uma forma de esconder o volume real.
+
+### Testado
+
+19 testes em `test_notifications.py`, um por cada um dos nove fluxos
+pedidos mais os limites de âmbito (severidade, rule_codes, baseline,
+baseline não se aplica a `resolved`) e a constraint da BD directamente. Mais
+6 testes de agendamento (`test_jobs.py`/`test_scheduler.py`, mesmo padrão de
+D1: idempotente, restart-safe, ticks concorrentes) e 1 teste
+Job→Scheduler→Worker→handler de ponta a ponta
+(`test_worker_executes_a_real_notification_processing_cycle_end_to_end`).
+Suite completa da V2: ver resultado no relatório da sessão.
+
+## 22. Dry-run contra os 644 incidentes reais e vivos (2026-08-21)
+
+**Só leitura.** Nenhuma escrita à base de dados de produção para produzir
+isto — um `SELECT` directo à BD viva (`diagnostic_incidents`, `status='open'`),
+depois simulado localmente com a mesma lógica de âmbito de
+`notifications/service.py` (severidade + `rule_codes` + `baseline_at`),
+sem nenhuma `NotificationPolicy` real criada em produção.
+
+(O número subiu de 642 para **644** entre D2 e agora — os dois dispositivos
+canário do asset 153 ficaram `stale_reading` desde a última leitura viva de
+ontem, 2026-08-20 10:59:18Z, exactamente como esperado: o polling do
+dispositivo nunca foi reactivado depois da janela da Fatia 3. Sinal real,
+não ruído do dry-run.)
+
+### Composição real, hoje
+
+| rule_code | severidade | contagem |
+| --- | --- | --- |
+| `device_unknown_status` | warning | 319 |
+| `stale_reading` | warning | 325 |
+
+**Zero `critical`. Zero `device_unavailable`. Zero disparidade entre pares.**
+Os únicos dois rule_codes activos hoje são os dois que `DIAGNOSTICS.md` e o
+audit da V1 já tinham identificado como "sinal de fundo estrutural", não
+"evento operacional novo" — `device_unknown_status` porque a maioria dos
+códigos de estado brutos importados da V1 nunca caiu no vocabulário
+reconhecido, `stale_reading` porque a esmagadora maioria dos 325
+dispositivos não tem nenhum polling ao vivo activo.
+
+### Simulação de quatro propostas de policy
+
+| Policy | Notificáveis | Excluídos por âmbito | Excluídos por baseline |
+| --- | --- | --- | --- |
+| A — severidade≥aviso, sem âmbito, sem baseline (ingénua) | **644 / 644** | 0 | 0 |
+| B — só crítico, sem baseline | 0 / 644 | 644 | 0 |
+| C — **recomendada**: rule_codes accionáveis + severidade≥aviso + baseline=agora | 0 / 644 | 644 | 0 |
+| D — mesmo âmbito de C, sem baseline (isola o âmbito) | 0 / 644 | 644 | 0 |
+| E — severidade≥aviso, sem âmbito, com baseline=agora (isola a baseline) | 0 / 644 | 0 | 644 |
+
+**Policy A confirma exactamente o risco que o pedido antecipava**: uma
+policy ingénua por severidade sozinha dispararia as 644 de uma vez — uma
+tempestade real, não hipotética.
+
+**Policy C (a recomendada) chega a zero por uma razão honesta, não por
+mascarar o volume**: nenhum dos 644 incidentes de hoje é
+`device_unavailable`/disparidade entre pares — os únicos rule_codes
+genuinamente accionáveis. Não é a baseline a fazer esse trabalho (Policy D,
+mesmo âmbito sem baseline, chega ao mesmo zero) — é a composição real dos
+dados. **Isto responde directamente ao pedido de "identifica primeiro se o
+problema está nos findings/incidents"**: está. `device_unknown_status` e
+`stale_reading`, à densidade de amostragem actual (quase todos os 325
+dispositivos sem polling ao vivo), não são hoje sinais accionáveis
+individualmente — são visíveis no dashboard (D2), correctamente, mas não
+deviam ainda disparar uma notificação Telegram por dispositivo.
+
+**Policy E prova que a baseline, sozinha, também chegaria a zero** — todos
+os 644 têm `opened_at` de Maio-Agosto, antes de qualquer momento de
+activação de uma policy hoje. As duas defesas (âmbito de regra + baseline)
+são complementares, não redundantes: o âmbito protege contra
+`device_unknown_status`/`stale_reading` continuarem ruidosos mesmo depois de
+zerar a baseline; a baseline protege contra qualquer futuro backlog de
+importação, de qualquer rule_code, criar uma tempestade semelhante outra
+vez.
+
+### Recomendação sobre a policy proposta
+
+**Não portar `device_unknown_status`/`stale_reading` para notificação
+individual por agora.** Ficam visíveis no dashboard (`/diagnostics`,
+`/diagnostics/incidents`, D2) — que é precisamente onde um sinal de fundo,
+não-urgente, pertence. Reconsiderar `stale_reading` especificamente quando
+o polling ao vivo cobrir uma fracção maior da carteira (hoje: 2 de 325
+dispositivos) e deixar de ser uma característica estrutural quase universal.
+
+**Não foi necessário mascarar nada na `NotificationPolicy`** — o âmbito
+recomendado (`rule_codes` restrito a `device_unavailable`,
+`zero_power_while_peers_active`, `power_disparity_among_peers`,
+`daily_energy_disparity_among_peers`) é uma decisão honesta sobre que
+sinais são accionáveis, documentada, não um ajuste para esconder um número
+feio.
+
+### Estado em produção
+
+**Schema aplicado (migration `0018`), código deployado, processamento
+ainda DESLIGADO.** `notification_processing_enabled=False` por omissão, sem
+override de compose criado para o ligar — ao contrário de D1, esta sessão
+optou por não activar a avaliação ao vivo de notificações mesmo sabendo
+(pelo dry-run) que produziria zero eventos reais hoje. Razão: o conteúdo da
+policy proposta ainda não teve uma aprovação explícita separada do "D3 está
+implementado" — este dry-run é precisamente o que serve essa revisão. Nem
+um único `NotificationChannel`/`NotificationPolicy` real foi criado na BD
+de produção.
+
+### Milestone
+
+**D3: IMPLEMENTED, TESTED. Schema em produção, processamento ao vivo
+DESLIGADO por decisão deliberada**, não por limitação técnica — ver
+recomendação em §23.
+
+## 23. Recomendação sobre D4 (Telegram real)
+
+**Ainda não avançar para D4 sem mais uma decisão intermédia primeiro**, e
+por uma razão específica, não genérica: a infraestrutura (D3) está pronta e
+testada, mas **a policy real ainda não foi activada nem revista por um
+humano com os números do dry-run à frente** — activar D4 (entrega real)
+sem antes confirmar a policy resultaria em zero mensagens reais hoje de
+qualquer forma (dado o dry-run), o que é seguro, mas significa que D4
+ficaria "aprovado" sem nunca ter sido genuinamente exercitado contra uma
+decisão real.
+
+Ordem recomendada:
+
+1. Rever e aprovar explicitamente o conteúdo da Policy C (ou uma variante)
+   como a policy real a activar — não implícito em "D3 está aprovado".
+2. Activar `notification_processing_enabled` em produção (mesmo padrão de
+   override de compose que D1 usou), com essa policy real mas
+   **`NotificationChannel.enabled=False`** — prova que o pipeline decide
+   correctamente em produção (cria `NotificationEvent` `skipped`, nunca
+   `pending`) sem nenhum risco de entrega, nem mock nem real.
+3. Só depois disso, D4: um `TelegramClient` real atrás da mesma interface,
+   com um bot/chat de teste, `enabled=True` só para esse canal de teste,
+   antes de qualquer canal de produção real.
+
+Isto não é burocracia extra — é a mesma disciplina que M7 já seguiu em
+Fatia 2/3 (canário antes de escala) e em D1 (schema e mecanismo antes de
+dados reais visíveis), aplicada ao único componente desta fatia que ainda
+não foi genuinamente exercitado: uma policy real, decidindo sobre
+incidentes reais, à frente de um humano.

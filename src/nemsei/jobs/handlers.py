@@ -11,6 +11,7 @@ from nemsei.diagnostics.incidents import evaluate_and_persist_incidents
 from nemsei.integrations.fusionsolar.device_status import FusionSolarDeviceStatusService
 from nemsei.integrations.fusionsolar.production import FusionSolarProductionService
 from nemsei.jobs.repository import ClaimedJob
+from nemsei.notifications.service import evaluate_and_process_notifications
 from nemsei.system.noop_service import execute_noop
 
 
@@ -46,6 +47,10 @@ def execute(
         if session_factory is None:
             raise ValueError("Diagnostic incident evaluation requires a worker session factory.")
         return _execute_incident_evaluation(session_factory=session_factory)
+    if job.job_type == "notifications.process":
+        if session_factory is None:
+            raise ValueError("Notification processing requires a worker session factory.")
+        return _execute_notification_processing(session_factory=session_factory)
     raise ValueError(f"Unsupported V2 foundation job type: {job.job_type}")
 
 
@@ -135,5 +140,28 @@ def _execute_incident_evaluation(*, session_factory: sessionmaker[Session]) -> J
             "incidents_opened": summary.incidents_opened,
             "incidents_confirmed": summary.incidents_confirmed,
             "incidents_resolved": summary.incidents_resolved,
+        },
+    )
+
+
+def _execute_notification_processing(*, session_factory: sessionmaker[Session]) -> JobOutcome:
+    """One notification-policy evaluation + mock-delivery pass (D3).
+
+    No provider calls. Delivery can only ever reach
+    `notifications.telegram_client.MockTelegramClient` -- `service.py`'s
+    default client factory has no other client to construct. A delivery
+    "failure" here is the mock's own, deterministic, test-configured
+    behaviour, never a real network error, since D4 has not happened.
+    """
+    with session_factory() as session, session.begin():
+        summary = evaluate_and_process_notifications(session)
+    return JobOutcome(
+        status="success",
+        result={
+            "policies_evaluated": summary.policies_evaluated,
+            "events_created": summary.events_created,
+            "events_skipped": summary.events_skipped,
+            "delivery_sent": summary.delivery_sent,
+            "delivery_failed": summary.delivery_failed,
         },
     )

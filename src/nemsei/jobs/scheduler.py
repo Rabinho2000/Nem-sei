@@ -41,6 +41,13 @@ class Scheduler:
                 interval_minutes=self.settings.diagnostic_incident_evaluation_interval_minutes,
             )
             created = created or incident_created
+        # D3: off by default. Even enabled, delivery can only ever reach the
+        # mock Telegram client -- no real one exists in this codebase yet.
+        if self.settings.notification_processing_enabled:
+            _notification_job, notification_created = self.repository.enqueue_due_notification_processing(
+                interval_minutes=self.settings.notification_processing_interval_minutes,
+            )
+            created = created or notification_created
         return created
 
     def run_forever(self) -> None:

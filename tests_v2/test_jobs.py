@@ -318,6 +318,63 @@ def test_incident_evaluation_schedule_requires_a_positive_interval(settings, mon
         pass
 
 
+def test_notification_processing_schedule_is_idempotent_and_advances_by_configured_interval(settings, monkeypatch) -> None:
+    repo = repository(settings, monkeypatch)
+    t0 = utc_now()
+
+    job, created = repo.enqueue_due_notification_processing(interval_minutes=15, now=t0)
+    assert created and job is not None
+    assert job.job_type == "notifications.process"
+
+    again, created_again = repo.enqueue_due_notification_processing(interval_minutes=15, now=t0)
+    assert created_again is False and again is None
+
+    second, created_second = repo.enqueue_due_notification_processing(interval_minutes=15, now=t0 + timedelta(minutes=15))
+    assert created_second and second is not None and second.id != job.id
+
+
+def test_notification_processing_schedule_survives_a_restart(settings, monkeypatch) -> None:
+    t0 = utc_now()
+    first_instance = repository(settings, monkeypatch)
+    job, created = first_instance.enqueue_due_notification_processing(interval_minutes=15, now=t0)
+    assert created and job is not None
+
+    engine = build_engine(settings)
+    restarted_instance = JobRepository(engine, build_session_factory(engine))
+    immediate, created_immediate = restarted_instance.enqueue_due_notification_processing(interval_minutes=15, now=t0 + timedelta(seconds=1))
+    assert created_immediate is False and immediate is None
+
+    due, created_due = restarted_instance.enqueue_due_notification_processing(interval_minutes=15, now=t0 + timedelta(minutes=15))
+    assert created_due and due is not None and due.id != job.id
+
+
+def test_notification_processing_concurrent_ticks_enqueue_one_job(settings, monkeypatch) -> None:
+    repo = repository(settings, monkeypatch)
+    t0 = utc_now()
+
+    def tick(_unused) -> tuple[int | None, bool]:
+        engine = build_engine(settings)
+        concurrent_repo = JobRepository(engine, build_session_factory(engine))
+        job, created = concurrent_repo.enqueue_due_notification_processing(interval_minutes=15, now=t0)
+        return (job.id if job else None), created
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(tick, range(4)))
+
+    created_jobs = {job_id for job_id, created in results if created}
+    assert len(created_jobs) == 1
+    assert sum(created for _job_id, created in results) == 1
+
+
+def test_notification_processing_schedule_requires_a_positive_interval(settings, monkeypatch) -> None:
+    repo = repository(settings, monkeypatch)
+    try:
+        repo.enqueue_due_notification_processing(interval_minutes=0)
+        assert False, "must reject a non-positive interval"
+    except ValueError:
+        pass
+
+
 def test_production_backfill_progress_is_persisted_before_reschedule(settings, monkeypatch) -> None:
     repo = repository(settings, monkeypatch)
     job, _ = repo.enqueue(
