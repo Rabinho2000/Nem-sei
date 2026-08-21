@@ -133,3 +133,30 @@ def test_scheduler_never_enqueues_notification_processing_when_disabled(settings
     with build_session_factory(engine)() as session:
         jobs = session.scalars(select(Job).where(Job.job_type == "notifications.process")).all()
     assert jobs == []
+
+
+def test_scheduler_enqueues_digest_generation_when_enabled(settings, monkeypatch) -> None:
+    """D6: no provider call, no channel needed to generate -- delivery (a
+    separate step) can only ever reach the mock Telegram client anyway."""
+    upgrade(settings, monkeypatch)
+    digest_settings = dataclasses.replace(
+        settings, digest_generation_enabled=True, digest_generation_interval_minutes=1440
+    )
+    scheduler = Scheduler(digest_settings, owner_token="scheduler-digests")
+    assert scheduler.run_once() is True
+    assert scheduler.run_once() is False
+
+    engine = build_engine(settings)
+    with build_session_factory(engine)() as session:
+        jobs = session.scalars(select(Job).where(Job.job_type == "digests.generate")).all()
+    assert len(jobs) == 1
+
+
+def test_scheduler_never_enqueues_digest_generation_when_disabled(settings, monkeypatch) -> None:
+    upgrade(settings, monkeypatch)
+    scheduler = Scheduler(settings, owner_token="scheduler-digests-off")
+    scheduler.run_once()
+    engine = build_engine(settings)
+    with build_session_factory(engine)() as session:
+        jobs = session.scalars(select(Job).where(Job.job_type == "digests.generate")).all()
+    assert jobs == []

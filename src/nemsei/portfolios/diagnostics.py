@@ -72,7 +72,7 @@ class PortfolioDiagnosticsSummary:
     oldest_incident_age_days: float | None
 
 
-def _asset_ids_for_portfolio(session: Session, *, portfolio_id: int, on: date) -> list[int]:
+def asset_ids_for_portfolio(session: Session, *, portfolio_id: int, on: date) -> list[int]:
     """Distinct, resolved asset ids currently in this portfolio.
 
     `resolve_members` already deduplicates an asset claimed by both an
@@ -117,7 +117,7 @@ def portfolio_diagnostics_summary(
 ) -> PortfolioDiagnosticsSummary:
     on_value = on or date.today()
     now_value = now or utc_now()
-    asset_ids = _asset_ids_for_portfolio(session, portfolio_id=portfolio_id, on=on_value)
+    asset_ids = asset_ids_for_portfolio(session, portfolio_id=portfolio_id, on=on_value)
 
     device_counts = _device_counts_by_asset(session, asset_ids=asset_ids)
     incidents = _open_incidents_for_assets(session, asset_ids=asset_ids)
@@ -191,7 +191,7 @@ def portfolio_installation_rows(
     """
     on_value = on or date.today()
     now_value = now or utc_now()
-    asset_ids = _asset_ids_for_portfolio(session, portfolio_id=portfolio_id, on=on_value)
+    asset_ids = asset_ids_for_portfolio(session, portfolio_id=portfolio_id, on=on_value)
     if not asset_ids:
         return []
 
@@ -243,7 +243,7 @@ def portfolio_incident_rows(
     on_value = on or date.today()
     now_value = now or utc_now()
     filters = filters or {}
-    asset_ids = _asset_ids_for_portfolio(session, portfolio_id=portfolio_id, on=on_value)
+    asset_ids = asset_ids_for_portfolio(session, portfolio_id=portfolio_id, on=on_value)
     if not asset_ids:
         return []
 

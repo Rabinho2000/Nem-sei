@@ -12,7 +12,8 @@ from nemsei.diagnostics.service import record_device_status
 from nemsei.jobs.models import Job
 from nemsei.jobs.repository import JobRepository
 from nemsei.jobs.worker import Worker
-from nemsei.notifications.models import NotificationChannel, NotificationEvent, NotificationPolicy
+from nemsei.notifications.models import DigestRun, NotificationChannel, NotificationEvent, NotificationPolicy
+from nemsei.portfolios.service import add_member, create_portfolio
 from nemsei.shared.clock import as_utc, utc_now
 from tests_v2.test_migrations import upgrade
 
@@ -109,6 +110,41 @@ def test_worker_executes_a_real_notification_processing_cycle_end_to_end(setting
     assert len(rows) == 1
     assert rows[0].kind == "opened"
     assert rows[0].status == "sent"  # decided and delivered via the worker's own mock client
+
+
+def test_worker_executes_a_real_digest_generation_cycle_end_to_end(settings, monkeypatch) -> None:
+    """D6, proven through the real Job/Scheduler/Worker pipeline: the job's
+    own `scheduled_for` payload is what becomes the digest's window_end,
+    not a fresh clock read inside the handler."""
+    upgrade(settings, monkeypatch)
+    engine = build_engine(settings)
+    session_factory = build_session_factory(engine)
+    now = datetime.now(timezone.utc)
+    with session_factory() as session, session.begin():
+        asset = create_asset(session, canonical_name="Digest Worker Plant")
+        device = create_device(session, asset_id=asset.id, device_kind="inverter", label="INV-1", valid_from=date(2026, 1, 1))
+        portfolio = create_portfolio(session, name="Digest Portfolio", created_by="tester")
+        add_member(session, portfolio_id=portfolio.id, asset_id=asset.id, valid_from=date(2026, 1, 1), created_by="tester")
+        record_device_status(
+            session, device_id=device.id, asset_id=asset.id, source_fact_key="v1:1",
+            observed_at=now - timedelta(hours=1), availability_status="unavailable",
+        )
+
+    repo = JobRepository(engine, session_factory)
+    incident_job, _ = repo.enqueue_due_incident_evaluation(interval_minutes=15)
+    assert Worker(settings, worker_id="test-worker-incidents-for-digest").run_once()
+    assert repo.events_for(incident_job.id)[-1].to_status == "success"
+
+    digest_job, created = repo.enqueue_due_digest_generation(interval_minutes=1440)
+    assert created and digest_job is not None
+    assert Worker(settings, worker_id="test-worker-digest").run_once()
+    assert repo.events_for(digest_job.id)[-1].to_status == "success"
+
+    with session_factory() as session:
+        runs = session.scalars(select(DigestRun)).all()
+    assert len(runs) == 1
+    assert "Digest Portfolio" in runs[0].rendered_text
+    assert runs[0].delivery_status == "pending"  # no channel configured -- never delivered, by design
 
 
 def test_worker_persists_partial_as_a_distinct_terminal_result(settings, monkeypatch) -> None:

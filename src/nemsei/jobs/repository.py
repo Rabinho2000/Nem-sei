@@ -863,6 +863,104 @@ class JobRepository:
                 session.expunge(existing)
                 return existing, False
 
+    def enqueue_due_digest_generation(
+        self, *, interval_minutes: int, now: datetime | None = None
+    ) -> tuple[Job | None, bool]:
+        """Enqueue one digest-generation cycle when due.
+
+        D6 (`docs/v2/DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md`). Same shape as
+        `enqueue_due_notification_processing` -- the `scheduled_for` value
+        stashed in `payload_json` here is what
+        `notifications.digests.generate_digest` uses as the digest's
+        `window_end`, not a fresh `now()` read at execution time. That is
+        what makes two concurrent attempts for the *same due slot* compute
+        the identical window, so `DigestRun`'s own unique
+        `(window_start, window_end)` constraint actually catches a real
+        race instead of two almost-but-not-quite-equal timestamps that
+        would never collide.
+        """
+        if interval_minutes <= 0:
+            raise ValueError("Digest generation interval must be positive.")
+        now_value = now or utc_now()
+        key = "digests.generate"
+        try:
+            with self._immediate_session() as session:
+                schedule = session.get(ScheduleState, key)
+                if schedule is not None and as_utc(schedule.next_run_at) > now_value:
+                    return None, False
+                slot = as_utc(schedule.next_run_at) if schedule is not None else now_value
+                dedupe_key = f"{key}:{slot.isoformat()}"
+                existing = session.scalar(
+                    select(Job).where(
+                        Job.job_type == "digests.generate",
+                        Job.dedupe_key == dedupe_key,
+                        Job.status.in_(ACTIVE_STATUSES),
+                    )
+                )
+                if existing is None:
+                    job = Job(
+                        job_type="digests.generate",
+                        status="queued",
+                        payload_json={"scheduled_for": slot.isoformat()},
+                        dedupe_key=dedupe_key,
+                        priority=150,
+                        available_at=now_value,
+                        attempt_count=0,
+                        max_attempts=3,
+                        created_at=now_value,
+                        updated_at=now_value,
+                    )
+                    session.add(job)
+                    session.flush()
+                    self._event(
+                        session,
+                        job_id=job.id,
+                        event_type="enqueued",
+                        attempt=0,
+                        from_status=None,
+                        to_status="queued",
+                        actor_source="scheduler",
+                        metadata={"schedule_key": key, "dedupe_key": dedupe_key},
+                        occurred_at=now_value,
+                    )
+                    created = True
+                else:
+                    job = existing
+                    created = False
+                if schedule is None:
+                    schedule = ScheduleState(schedule_key=key, next_run_at=slot, updated_at=now_value)
+                    session.add(schedule)
+                schedule.last_enqueued_at = now_value
+                schedule.next_run_at = slot + timedelta(minutes=interval_minutes)
+                schedule.updated_at = now_value
+                session.flush()
+                session.expunge(job)
+                return job, created
+        except IntegrityError:
+            with self._immediate_session() as session:
+                existing = session.scalar(
+                    select(Job).where(
+                        Job.job_type == "digests.generate",
+                        Job.dedupe_key == dedupe_key,
+                        Job.status.in_(ACTIVE_STATUSES),
+                    )
+                )
+                if existing is None:
+                    raise
+                self._event(
+                    session,
+                    job_id=existing.id,
+                    event_type="dedupe_reused",
+                    attempt=existing.attempt_count,
+                    from_status=existing.status,
+                    to_status=existing.status,
+                    actor_source="scheduler",
+                    metadata={"schedule_key": key, "dedupe_key": dedupe_key},
+                    occurred_at=now_value,
+                )
+                session.expunge(existing)
+                return existing, False
+
     def events_for(self, job_id: int) -> list[JobEvent]:
         with self.session_factory() as session:
             return list(session.scalars(select(JobEvent).where(JobEvent.job_id == job_id).order_by(JobEvent.id)))

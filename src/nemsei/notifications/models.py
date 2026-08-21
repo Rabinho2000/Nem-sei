@@ -164,3 +164,62 @@ class NotificationEvent(Base):
     evidence_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+DIGEST_DELIVERY_STATUSES = ("pending", "delivered", "failed")
+
+
+class DigestRun(Base):
+    """One periodic diagnostic digest -- a *summary* of incidents over a
+    window, never a second finding or a second incident (D6,
+    `docs/v2/DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md`).
+
+    Deliberately one table, not two: unlike `NotificationEvent` (one row per
+    incident per channel, because many incidents can each need their own
+    decision), a digest is one summary of everything, delivered at most once
+    to at most one channel per run -- there is no per-item identity to track
+    separately, so decision and delivery share this row instead of a second
+    `DigestEvent` table that would only ever have one child per parent.
+
+    `window_start`/`window_end` are the same values, in a job's own
+    `payload_json["scheduled_for"]`, that
+    `JobRepository.enqueue_due_digest_generation` already persists in
+    `ScheduleState` -- not a fresh `now()` read at generation time. This is
+    what makes the unique constraint below actually catch a real race: two
+    concurrent attempts for the *same due slot* compute the identical
+    `window_end`, not two almost-but-not-quite-equal timestamps a millisecond
+    apart that would never collide.
+    """
+
+    __tablename__ = "digest_runs"
+    __table_args__ = (
+        CheckConstraint(f"delivery_status IN {DIGEST_DELIVERY_STATUSES!r}", name="ck_digest_runs_delivery_status"),
+        CheckConstraint("window_end > window_start", name="ck_digest_runs_window"),
+        CheckConstraint("(delivery_status = 'delivered') = (delivered_at IS NOT NULL)", name="ck_digest_runs_delivered_at"),
+        CheckConstraint("delivery_attempt_count >= 0", name="ck_digest_runs_attempt_count"),
+        UniqueConstraint("window_start", "window_end", name="uq_digest_runs_window"),
+        Index("ix_digest_runs_window_end", "window_end"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    window_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # Structured content -- per-portfolio breakdown, top installations, the
+    # new/persistent/resolved split -- everything `rendered_text` was built
+    # from, kept separately so a future renderer (or a real Telegram
+    # message format) can reuse the same numbers without re-querying
+    # `diagnostic_incidents` for a window that has already closed.
+    summary_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    rendered_text: Mapped[str] = mapped_column(Text, nullable=False)
+    # Delivery: optional and inert by default. D6 ships no real Telegram
+    # client, same structural guarantee as D3 -- `channel_id` nullable means
+    # a digest can be generated and rendered with no delivery attempted at
+    # all, which is exactly today's state (no channel configured).
+    channel_id: Mapped[int | None] = mapped_column(ForeignKey("notification_channels.id", ondelete="RESTRICT"))
+    delivery_status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    delivery_attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

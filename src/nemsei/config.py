@@ -118,6 +118,14 @@ class Settings:
     # client exists in this codebase yet (D4).
     notification_processing_enabled: bool = False
     notification_processing_interval_minutes: int = 15
+    # D6 (docs/v2/DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md): the periodic
+    # digest generator. Off by default, zero provider calls (reads
+    # diagnostic_incidents via portfolios/diagnostics.py, writes
+    # digest_runs). Daily by default (1440 min) -- a digest is a summary
+    # over a window, not an immediate alert, so it does not need D1/D3's
+    # 15-minute cadence.
+    digest_generation_enabled: bool = False
+    digest_generation_interval_minutes: int = 1440
     testing: bool = False
 
     @property
@@ -169,6 +177,10 @@ class Settings:
             notification_processing_interval_minutes=int(
                 os.environ.get("NEMSEI_V2_NOTIFICATION_PROCESSING_INTERVAL_MINUTES", "15")
             ),
+            digest_generation_enabled=parse_bool(os.environ.get("NEMSEI_V2_DIGEST_GENERATION_ENABLED"), default=False),
+            digest_generation_interval_minutes=int(
+                os.environ.get("NEMSEI_V2_DIGEST_GENERATION_INTERVAL_MINUTES", "1440")
+            ),
             testing=parse_bool(os.environ.get("NEMSEI_V2_TESTING"), default=False),
         )
 
@@ -203,6 +215,8 @@ class Settings:
             raise ConfigurationError("Diagnostic incident evaluation interval must be positive.")
         if self.notification_processing_interval_minutes <= 0:
             raise ConfigurationError("Notification processing interval must be positive.")
+        if self.digest_generation_interval_minutes <= 0:
+            raise ConfigurationError("Digest generation interval must be positive.")
         if min(self.worker_poll_seconds, self.worker_lease_seconds, self.scheduler_lease_seconds, self.db_pool_size, self.db_statement_timeout_ms, self.db_lock_timeout_ms, self.db_idle_transaction_timeout_ms, self.db_pool_recycle_seconds, self.production_max_source_days, self.production_reconciliation_max_source_days, self.production_backfill_max_source_days, self.production_backfill_chunk_days) <= 0 or self.db_max_overflow < 0:
             raise ConfigurationError("V2 timing and pool settings must be positive.")
         if self.production_backfill_chunk_days > self.production_backfill_max_source_days:

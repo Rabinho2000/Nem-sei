@@ -1353,3 +1353,205 @@ Não D4 (continua a precisar da mesma aprovação humana de política descrita
 em §25). O passo independente e de baixo risco mais óbvio a seguir é D6
 (digest periódico) — reaproveitaria exactamente esta agregação de portfolio
 para produzir um resumo diário/semanal, sem tocar em Telegram real também.
+
+## 27. D6 — Digest periódico: implementado, testado, dry-run real (2026-08-21)
+
+Aprovado com um limite claro, mantido: **ainda sem Telegram real**. Alertas
+imediatos (D3) e digest periódico (D6) ficam explicitamente separados —
+nenhum código partilhado além da mesma interface `TelegramClient`/mock e do
+mesmo `NotificationChannel`; nenhuma `NotificationPolicy` foi tocada.
+
+### Arquitectura
+
+```
+facts → findings → incidents (D1) → Portfolio Diagnostics (D5, reutilizado)
+                                              │
+                                              ▼
+                                   digest decision (generate_digest)
+                                              │
+                                              ▼
+                                    DigestRun  (uma linha por janela)
+                                              │
+                                              ▼
+                                  delivery (deliver_digest, mock apenas)
+```
+
+Uma tabela só, não duas: ao contrário de `NotificationEvent` (uma linha por
+incidente por canal — muitos incidentes, muitas decisões independentes), um
+digest é **um** resumo, entregue no máximo uma vez a no máximo um canal por
+execução — não há identidade por item a rastrear separadamente, por isso
+`DigestRun` guarda decisão e entrega na mesma linha, em vez de uma segunda
+tabela `DigestEvent` que só teria sempre um filho por pai.
+
+`portfolios/diagnostics.py` foi reutilizado tal e qual — `portfolio
+_diagnostics_summary`/`portfolio_installation_rows` (D5) continuam a única
+fonte da verdade sobre o estado actual; `asset_ids_for_portfolio` (antes
+privada, agora exposta) é a única forma de saber que assets pertencem a um
+portfolio. Nenhum finding novo, nenhum incidente novo, nenhuma regra
+reavaliada — só uma nova pergunta feita aos mesmos dados: "o que mudou
+desde a última janela".
+
+### Janela temporal: janelas encadeadas, nunca aproximadas
+
+`window_end` vem sempre do próprio `scheduled_for` que
+`enqueue_due_digest_generation` já persiste em `ScheduleState`/`Job.payload_json`
+— nunca uma leitura fresca de `now()` dentro do handler. `window_start` é o
+`window_end` do `DigestRun` anterior, sempre — "desde o último digest" é
+literalmente verdade, nunca aproximado. Sem digest anterior, a primeira
+janela é bootstrapped a exactamente um intervalo de cadência (não um
+tamanho arbitrário diferente), para que o primeiro digest tenha a mesma
+forma de todos os seguintes.
+
+### Um bug real na própria lógica de janelas, apanhado pelo teste de idempotência
+
+A primeira versão calculava `window_start` a partir do `DigestRun` mais
+recente **antes** de verificar se o `window_end` pedido já tinha sido
+gerado. Pedir o mesmo digest duas vezes fazia a segunda chamada encontrar o
+digest da primeira chamada como "o anterior", calcular `window_start ==
+window_end` (uma janela vazia) e devolver `None` em vez do digest já
+existente — a própria idempotência falhava exactamente no caso que devia
+provar. Corrigido invertendo a ordem: primeiro procurar um `DigestRun` já
+existente para este `window_end` exacto (devolvê-lo directamente, sem
+tentar encadear nada); só uma janela genuinamente nova chega à lógica de
+encadeamento. Apanhado por
+`test_generating_the_same_window_twice_returns_the_same_row` e
+`test_restarted_process_reconciles_from_persisted_state_alone`, não por
+inspecção.
+
+### Novo / persistente / resolvido — a partir dos próprios campos de D1
+
+- **Novo**: `opened_at` dentro de `[window_start, window_end)`, seja qual
+  for o estado actual.
+- **Resolvido**: `resolved_at` dentro de `[window_start, window_end)`.
+- **Persistente** (backlog): `status='open' AND opened_at < window_start`.
+
+Um incidente aberto e resolvido dentro da mesma janela conta honestamente
+como as duas coisas — não escondido nem contado só uma vez. Provado por
+`test_incidents_are_classified_new_persistent_and_resolved_correctly`.
+
+### Prioridade no texto renderizado
+
+Ordem fixa: novidades críticas → outras novidades → resolvidos → backlog
+dominante por `rule_code`. "Sem alterações desde o último digest" quando
+`new_count == resolved_count == 0`, explicitamente, nunca uma secção vazia
+silenciosa. `TOP_INSTALLATIONS_PER_PORTFOLIO = 3` — nunca lista centenas de
+incidentes, mesmo quando uma instalação de teste tinha 10 instalações
+afectadas (`test_top_installations_are_capped_and_never_list_hundreds`).
+
+### Entrega: mesma disciplina de D3
+
+`deliver_digest` usa exactamente o padrão restart-safe de D3
+(`deliver_pending_notifications`): uma transacção, commit imediato,
+re-verificação do estado antes de agir. Sem canal configurado (`channel_id
+IS NULL`, o estado real hoje) ou canal desligado, nunca chama nenhum
+cliente — provado com um `client_factory` que levanta excepção se for
+chamado. Uma falha nunca marca `delivered` (constraint `(delivery_status =
+'delivered') = (delivered_at IS NOT NULL)`); um retry sucede sem duplicar a
+linha.
+
+### Testado
+
+14 testes em `test_digests.py` (encadeamento de janelas, idempotência,
+restart, concorrência real com 4 threads, constraint da BD directamente,
+classificação novo/persistente/resolvido, "sem alterações", prioridade no
+texto, cap de instalações, quatro cenários de entrega). 6 testes de
+agendamento (`test_jobs.py`/`test_scheduler.py`, mesmo padrão de D1/D3). 1
+teste de ponta a ponta pelo pipeline real Job→Scheduler→Worker→handler.
+Suite completa da V2: **602 passed, 1 skipped**, sem regressões.
+
+### Dry-run real contra os 2 portfolios de produção — só leitura, zero escritas
+
+Migration `0019` aplicada (backup verificado primeiro), `web`/`worker`/
+`scheduler` reconstruídos e redeployados com o override de D1 incluído
+(sem repetir o erro operacional de D3). **Nenhuma linha `digest_runs` foi
+criada em produção** — o dry-run usou só `build_digest_payload`/
+`render_digest_text` (as mesmas funções puras, só leitura, que
+`generate_digest` chama por baixo), correndo dentro do container `web` já
+a correr, contra a janela real das últimas 24h:
+
+```
+Diagnóstico — 21/08/2026 15:28
+Sem alterações desde o último digest (20/08/2026 15:28).
+
+Prioridade:
+- nenhuma ocorrência crítica nova
+- backlog persistente dominante: stale_reading (117), device_unknown_status (117)
+
+Solcorelios I
+  32/35 instalações com incidentes
+  0 novos · 0 resolvidos
+  186 avisos
+  3 instalações sem dispositivos
+  Prioritárias:
+    - Mármores Galrão (persistente, 0c/22w/0i, 40d)
+    - Sicobrita (persistente, 0c/12w/0i, 95d)
+    - Marmores da Granja (persistente, 0c/10w/0i, 95d)
+
+Solcorelios II
+  13/22 instalações com incidentes
+  0 novos · 0 resolvidos
+  48 avisos
+  9 instalações sem dispositivos
+  Prioritárias:
+    - FC Alverca - Pavilhão (persistente, 0c/8w/0i, 40d)
+    - Neutripuro (persistente, 0c/6w/0i, 40d)
+    - BV Sintra (persistente, 0c/4w/0i, 40d)
+```
+
+`totals`: `{portfolios_included: 2, installations_with_incidents: 45,
+incidents_critical: 0, incidents_warning: 234, new_count: 0,
+resolved_count: 0}` — consistente, número a número, com o dry-run de D3/D5
+já documentado (234 = 186+48, todos os mesmos incidentes de sempre, nenhum
+novo desde ontem).
+
+**Um segundo exemplo, com mudanças reais, gerado numa base de dados
+descartável (não produção)** — para mostrar o formato quando há de facto
+algo a dizer, sem inventar dados de produção que não existem hoje:
+
+```
+Diagnóstico — 21/08/2026 15:28
+1 novo(s) · 0 resolvido(s) desde 20/08/2026 15:28.
+
+Prioridade:
+- 1 ocorrência(s) crítica(s) nova(s)
+- backlog persistente dominante: stale_reading (1)
+
+Exemplo Portfolio
+  2/2 instalações com incidentes
+  1 novos · 0 resolvidos
+  1 críticos · 1 avisos
+  Prioritárias:
+    - Central Nova Falha (novo, 1c/0w/0i, 0d)
+    - Central Backlog Antigo (persistente, 0c/1w/0i, 95d)
+```
+
+Note-se `Central Nova Falha` claramente marcada "novo" e à frente na lista
+(prioridade 1: novidades), `Central Backlog Antigo` claramente marcada
+"persistente" com a sua idade real (95 dias) — nunca confundidas.
+
+### Estado em produção
+
+Schema aplicado, código deployado, **`digest_generation_enabled=False`**
+por omissão — nenhum override de compose criado para o ligar. Nenhum
+`DigestRun` real existe na BD de produção; o dry-run acima é inteiramente
+reconstituível a qualquer momento a partir de `diagnostic_incidents`, sem
+nada persistido a apagar ou a rever.
+
+### Milestone
+
+**D6: IMPLEMENTED, TESTED. Dry-run real feito, zero escritas em produção.**
+Nenhuma `NotificationPolicy` alterada, nenhum Telegram enviado, nenhuma
+chamada a provider.
+
+### Recomendação: D4 ainda não — primeiro a política, não a infraestrutura
+
+A pergunta do pedido é directa: "D4 Telegram real ou primeiro limpar/ajustar
+a policy". **A policy, não D4** — e não porque falte alguma coisa a
+"limpar": o dry-run deste slice (e o de D3/D5 antes dele) mostra a mesma
+conclusão de três ângulos diferentes agora — 0 críticos, 234 avisos, todos
+com mais de 39 dias, nenhuma novidade real nos portfolios reais. A
+infraestrutura (D1, D3, D5, D6) está pronta, testada e, onde fazia
+sentido, verificada ao vivo. O que falta não é código — é a mesma decisão
+humana já identificada em §23/§25: aprovar explicitamente qual policy
+activar (e para o digest, com que cadência e para que canal), antes de
+qualquer entrega real. Só depois disso faz sentido D4.

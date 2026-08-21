@@ -48,6 +48,14 @@ class Scheduler:
                 interval_minutes=self.settings.notification_processing_interval_minutes,
             )
             created = created or notification_created
+        # D6: off by default, daily by default. A summary over an already-
+        # closed window, never an immediate alert -- and generation itself
+        # makes no provider call either.
+        if self.settings.digest_generation_enabled:
+            _digest_job, digest_created = self.repository.enqueue_due_digest_generation(
+                interval_minutes=self.settings.digest_generation_interval_minutes,
+            )
+            created = created or digest_created
         return created
 
     def run_forever(self) -> None:

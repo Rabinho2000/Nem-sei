@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 from sqlalchemy.orm import Session, sessionmaker
@@ -11,6 +11,7 @@ from nemsei.diagnostics.incidents import evaluate_and_persist_incidents
 from nemsei.integrations.fusionsolar.device_status import FusionSolarDeviceStatusService
 from nemsei.integrations.fusionsolar.production import FusionSolarProductionService
 from nemsei.jobs.repository import ClaimedJob
+from nemsei.notifications.digests import deliver_digest, generate_digest
 from nemsei.notifications.service import evaluate_and_process_notifications
 from nemsei.system.noop_service import execute_noop
 
@@ -51,6 +52,10 @@ def execute(
         if session_factory is None:
             raise ValueError("Notification processing requires a worker session factory.")
         return _execute_notification_processing(session_factory=session_factory)
+    if job.job_type == "digests.generate":
+        if settings is None or session_factory is None:
+            raise ValueError("Digest generation requires worker settings and a session factory.")
+        return _execute_digest_generation(job, settings=settings, session_factory=session_factory)
     raise ValueError(f"Unsupported V2 foundation job type: {job.job_type}")
 
 
@@ -167,5 +172,39 @@ def _execute_notification_processing(*, session_factory: sessionmaker[Session]) 
             "events_skipped": summary.events_skipped,
             "delivery_sent": summary.delivery_sent,
             "delivery_failed": summary.delivery_failed,
+        },
+    )
+
+
+def _execute_digest_generation(job: ClaimedJob, *, settings: Settings, session_factory: sessionmaker[Session]) -> JobOutcome:
+    """One digest-generation pass, then a delivery attempt (D6).
+
+    `window_end` comes from the job's own `scheduled_for` payload -- the
+    same due-slot value `JobRepository.enqueue_due_digest_generation`
+    persisted -- never a fresh `datetime.now()` read here, which is what
+    makes `DigestRun`'s unique `(window_start, window_end)` constraint
+    actually catch a concurrent-retry race. No provider call anywhere in
+    this path; delivery can only ever reach the mock Telegram client.
+    """
+    scheduled_for = job.payload.get("scheduled_for")
+    if not isinstance(scheduled_for, str):
+        raise ValueError("Digest generation job is missing its scheduled_for window end.")
+    window_end = datetime.fromisoformat(scheduled_for)
+
+    with session_factory() as session, session.begin():
+        digest = generate_digest(session, window_end=window_end, interval_minutes=settings.digest_generation_interval_minutes)
+        digest_id = digest.id if digest is not None else None
+
+    delivery_attempted = False
+    if digest_id is not None:
+        result = deliver_digest(session_factory, digest_run_id=digest_id)
+        delivery_attempted = result.attempted
+
+    return JobOutcome(
+        status="success",
+        result={
+            "digest_generated": digest_id is not None,
+            "digest_id": digest_id,
+            "delivery_attempted": delivery_attempted,
         },
     )
