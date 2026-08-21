@@ -1,5 +1,22 @@
 name: nemsei-v2
 
+# Deploy/redeploy canonically with every override this environment currently
+# has active, or a redeploy silently drops whatever env vars only exist in
+# an omitted override -- found live, 2026-08-21 (D3): redeploying web/worker
+# /scheduler with only this file, forgetting
+# `docker-compose.v2.diagnostic-incidents.yml`, silently turned the D1
+# incident evaluator off for ~12 minutes with no error, only caught by
+# checking `schedule_state` directly. See
+# docs/v2/DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md's D3 write-up.
+#
+# As of 2026-08-21, the canonical `up -d` for `web`/`worker`/`scheduler` is:
+#   docker compose -f docker-compose.v2.yml \
+#     -f docker-compose.v2.diagnostic-incidents.yml \
+#     --env-file .env.v2 up -d --build web worker scheduler
+# `docker-compose.v2.device-status-canary.yml` exists but is NOT currently
+# applied in production (docs/v2/DEVICE_TELEMETRY.md ss10, still blocked) --
+# do not add it to the command above without that separate approval.
+
 x-v2-environment: &v2-environment
   NEMSEI_V2_DATABASE_URL_FILE: /run/secrets/v2_database_url
 

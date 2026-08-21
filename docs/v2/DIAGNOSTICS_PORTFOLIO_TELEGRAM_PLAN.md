@@ -925,6 +925,23 @@ implementado" — este dry-run é precisamente o que serve essa revisão. Nem
 um único `NotificationChannel`/`NotificationPolicy` real foi criado na BD
 de produção.
 
+**Erro real cometido e corrigido durante o próprio deploy, registado por
+honestidade**: o redeploy de `web`/`worker`/`scheduler` foi feito
+inicialmente só com `docker-compose.v2.yml`, sem o override
+`docker-compose.v2.device-status-canary.yml`'s irmão de D1
+(`docker-compose.v2.diagnostic-incidents.yml`) — o que desligou
+`NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED` no processo recriado,
+parando o avaliador de incidentes do D1 por ~12 minutos, sem nenhum aviso
+até uma verificação directa aos `schedule_state`/`jobs` o apanhar.
+Corrigido imediatamente redeployando com ambos os overrides
+(`-f docker-compose.v2.yml -f docker-compose.v2.diagnostic-incidents.yml`).
+Sem perda de dados — o mecanismo é idempotente e restart-safe por desenho
+(D1), e a janela foi curta — mas um lembrete real de que **cada override
+de compose tem de ser explicitamente incluído em cada redeploy seguinte**,
+não assumido como persistente. Vale a pena, numa fatia futura, consolidar
+os overrides activos num único ficheiro para reduzir este risco
+estruturalmente em vez de depender de lembrar todos de cada vez.
+
 ### Milestone
 
 **D3: IMPLEMENTED, TESTED. Schema em produção, processamento ao vivo
