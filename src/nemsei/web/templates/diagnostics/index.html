@@ -1,7 +1,20 @@
 {% extends "base.html" %}
+{#
+  D2: worst-first, with real numbers, not just a searchable list. Findings
+  come from already-persisted DiagnosticIncident rows -- nothing here
+  re-evaluates a rule.
+#}
 {% block content %}
 <section class="page-header">
-  <div><h1>Diagnóstico</h1><p class="lede">Estado de cada dispositivo, a partir do histórico persistido.</p></div>
+  <div><h1>Diagnóstico</h1><p class="lede">Que instalações precisam de atenção agora, a partir dos incidentes activos.</p></div>
+  <a class="button-link" href="{{ url_for('diagnostics.incidents') }}">Ver todos os incidentes →</a>
+</section>
+
+<section class="kpi-strip">
+  <div class="kpi"><small>Instalações</small><strong>{{ summary.total }}</strong></div>
+  <div class="kpi"><small>Com problema crítico</small><strong>{{ summary.with_critical }}</strong></div>
+  <div class="kpi"><small>Só com avisos</small><strong>{{ summary.with_warning }}</strong></div>
+  <div class="kpi"><small>Sem findings activos</small><strong>{{ summary.healthy }}</strong></div>
 </section>
 
 <section class="panel">
@@ -10,18 +23,32 @@
     <button type="submit">Procurar</button>
   </form>
   <table class="data-table">
-    <thead><tr><th>Instalação</th><th class="num">Dispositivos</th><th></th></tr></thead>
+    <thead><tr><th>Instalação</th><th class="num">Dispositivos</th><th>Findings activos</th><th></th></tr></thead>
     <tbody>
       {% for row in assets %}
-        <tr>
+        <tr class="{{ 'row-attention' if not row.healthy else '' }}">
           <td>{{ row.asset.canonical_name }}</td>
           <td class="num">{{ row.device_count }}</td>
+          <td>
+            {% if row.healthy %}
+              <span class="pill pill-ok">sem findings activos</span>
+            {% else %}
+              {% if row.critical_count %}<span class="pill pill-bad">{{ row.critical_count }} crítico{{ 's' if row.critical_count != 1 else '' }}</span>{% endif %}
+              {% if row.warning_count %}<span class="pill pill-warn">{{ row.warning_count }} aviso{{ 's' if row.warning_count != 1 else '' }}</span>{% endif %}
+              {% if row.info_count %}<span class="pill pill-ok">{{ row.info_count }} info</span>{% endif %}
+            {% endif %}
+          </td>
           <td class="num"><a href="{{ url_for('diagnostics.asset_detail', asset_id=row.asset.id) }}">Ver diagnóstico</a></td>
         </tr>
       {% else %}
-        <tr><td colspan="3" class="empty">Sem instalações com dispositivos a mostrar.</td></tr>
+        <tr><td colspan="4" class="empty">Sem instalações com dispositivos a mostrar.</td></tr>
       {% endfor %}
     </tbody>
   </table>
+  {% if truncated %}
+    <p class="panel-foot muted">
+      A mostrar as {{ shown }} instalações mais graves de {{ matched }} — refina a pesquisa para ver as restantes.
+    </p>
+  {% endif %}
 </section>
 {% endblock %}

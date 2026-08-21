@@ -1,7 +1,9 @@
 """Diagnostic screens: what each device is doing, from persisted facts alone.
 
-Computes nothing. Every row comes from `diagnostics.service.current_device_status`,
-the same read the milestone's foundation exists to make possible.
+Computes nothing. Every row comes from `diagnostics.service.current_device_status`
+or `diagnostics.findings.evaluate_asset_findings` (the asset detail page) or
+already-persisted `DiagnosticIncident` rows (overview/incidents, D2) -- no
+route here ever re-derives a rule's logic.
 """
 from __future__ import annotations
 
@@ -9,7 +11,7 @@ from flask import Blueprint, abort, render_template, request
 
 from nemsei.web.csrf import token
 from nemsei.web.db_session import get_request_session
-from nemsei.web.diagnostics_queries import asset_diagnostics, searchable_assets_with_devices
+from nemsei.web.diagnostics_queries import asset_diagnostics, diagnostics_overview, open_incidents_overview
 from nemsei.web.home_routes import require_authenticated
 
 
@@ -25,7 +27,20 @@ def index() -> str:
         "diagnostics/index.html",
         title="Diagnóstico",
         search=search,
-        assets=searchable_assets_with_devices(session, search=search),
+        **diagnostics_overview(session, search=search),
+    )
+
+
+@diagnostics_bp.get("/incidents")
+@require_authenticated
+def incidents() -> str:
+    session = get_request_session()
+    search = request.args.get("search", "").strip()
+    return render_template(
+        "diagnostics/incidents.html",
+        title="Incidentes",
+        search=search,
+        incidents=open_incidents_overview(session, search=search),
     )
 
 

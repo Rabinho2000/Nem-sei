@@ -649,3 +649,73 @@ histórico de incidentes.
 chamada a provider nova, nenhuma migration destrutiva. D2 (UI de
 Diagnostics Overview/Incidents) é o próximo passo natural — já tem dados
 reais prontos para mostrar.
+
+## 20. D2 — Overview + Incidents, implementado e testado (2026-08-21)
+
+Sem migration nova, sem tabela nova — só leitura sobre `diagnostic_incidents`
+(D1). `diagnostics/findings.py` continua intocado.
+
+### Decisão de navegação: duas páginas, não quatro
+
+O esboço original de §11 sugeria `Overview`/`Incidents`/`Installations`/
+`Notification history` como quatro entradas separadas. Implementado como
+**duas**: a página `Installations`/`Overview` original (`/diagnostics`) foi
+enriquecida no próprio lugar em vez de duplicada — teria sido exactamente o
+tipo de "navegação excessiva" que o pedido original pediu para evitar.
+`Notification history` fica fora até D3/D4 existirem (não há nada para
+mostrar sem notificações). `Incidents` (`/diagnostics/incidents`) é a única
+página nova.
+
+### `/diagnostics` (Overview, enriquecido)
+
+- Tira de KPIs no topo: total de instalações, quantas têm um crítico activo,
+  quantas só têm avisos, quantas não têm nenhum finding activo.
+- Cada linha mostra badges de severidade (contagem real de incidentes
+  `open` por severidade, não um número inventado) em vez de nada.
+- **Ordenado por gravidade primeiro, não alfabeticamente** — e a ordenação
+  acontece **antes** de qualquer limite de exibição, nunca depois: um limite
+  aplicado antes da ordenação esconderia uma instalação genuinamente crítica
+  só por não começar por uma letra cedo no alfabeto. Provado directamente
+  por teste (`test_overview_sorts_a_critical_installation_before_a_healthy_one_regardless_of_name`).
+- Pesquisa existente mantida sem alteração de comportamento.
+
+### `/diagnostics/incidents` (nova)
+
+Todos os incidentes `open`, em todas as instalações, mais graves primeiro e
+depois mais antigos primeiro (`opened_at` ascendente) — um problema há mais
+tempo sem ninguém ver é pelo menos tão relevante como um mais recente da
+mesma severidade. Mostra "aberto há" e "última confirmação há" (duração
+humana, `diagnostics_queries.duration_label`), a regra que originou o
+incidente, e liga de volta ao diagnóstico da instalação. Sem botão de
+"resolver" — o incidente fecha-se sozinho quando o finding deixar de
+aparecer, consistente com o lifecycle já definido em D1.
+
+### Um bug real encontrado pelo próprio teste, não hipotético
+
+A pesquisa em `/diagnostics/incidents` devolvia **zero resultados sempre**,
+mesmo para uma pesquisa que devia bater certo. Causa: `asset_search_clause`
+referencia `Organization.display_name`, mas a query de incidentes nunca
+juntava `Organization` — o SQLAlchemy acrescentava-a como uma tabela não
+associada no `FROM` (um produto cartesiano real, avisado pelo próprio
+SQLAlchemy como `SAWarning`), e com zero organizações na base de dados (o
+caso normal para a maioria das instalações), um cross join com uma tabela
+vazia devolve sempre zero linhas — para todas as pesquisas, correctas ou
+não. Corrigido com o mesmo `outerjoin(Organization, ...)` que
+`searchable_assets_with_devices` já tinha, por a mesma razão. Encontrado
+porque o teste de pesquisa (`test_incidents_page_search_filters_by_installation`)
+falhou de propósito, não por inspecção manual.
+
+### Testado
+
+8 testes novos em `test_diagnostics_web.py`: ordenação worst-first
+independente do nome, badge "sem findings activos", contagem do resumo,
+listagem de incidentes worst-first, página vazia quando nada está aberto, e
+o teste de pesquisa que apanhou o bug acima. Suite completa da V2: sem
+regressões (ver relatório da sessão).
+
+### Milestone
+
+**D2: IMPLEMENTED, TESTED.** Ainda não live-verified num browser real contra
+produção (a lógica já corre lá desde D1 — os 642 incidentes reais já
+existem na BD viva, prontos para esta UI os mostrar) — sem alteração de
+dados, um deploy de `web` chega para isso ficar visível.

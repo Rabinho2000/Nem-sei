@@ -13,6 +13,7 @@ from sqlalchemy import create_engine
 from nemsei.app import create_app
 from nemsei.assets.service import create_asset, create_device
 from nemsei.db.session import build_session_factory
+from nemsei.diagnostics.incidents import evaluate_and_persist_incidents
 from nemsei.diagnostics.service import record_device_status
 
 
@@ -132,3 +133,90 @@ def test_an_asset_with_no_problems_says_so_plainly(app, settings) -> None:
     login(client)
     body = client.get(f"/diagnostics/assets/{asset_id}").get_data(as_text=True)
     assert "Nenhum problema detectado" in body
+
+
+# --- D2: overview and incidents pages -----------------------------------------
+
+
+@pytest.fixture
+def two_assets_one_critical(app, settings):
+    """"Alpha" is healthy, "Zulu" has a real open incident -- alphabetically
+    Alpha would sort first; severity must override that."""
+    factory = build_session_factory(create_engine(settings.database_url))
+    with factory() as session, session.begin():
+        healthy = create_asset(session, canonical_name="Alpha Healthy Plant")
+        healthy_device = create_device(session, asset_id=healthy.id, device_kind="inverter", label="INV-1", valid_from=date(2026, 1, 1))
+        record_device_status(
+            session, device_id=healthy_device.id, asset_id=healthy.id, source_fact_key="v1:1",
+            observed_at=datetime.now(timezone.utc), availability_status="available", active_power_kw=Decimal("5.0"),
+        )
+
+        broken = create_asset(session, canonical_name="Zulu Broken Plant")
+        broken_device = create_device(session, asset_id=broken.id, device_kind="inverter", label="INV-1", valid_from=date(2026, 1, 1))
+        record_device_status(
+            session, device_id=broken_device.id, asset_id=broken.id, source_fact_key="v1:1",
+            observed_at=datetime.now(timezone.utc), availability_status="unavailable",
+        )
+        evaluate_and_persist_incidents(session)
+    return healthy.id, broken.id
+
+
+def test_overview_sorts_a_critical_installation_before_a_healthy_one_regardless_of_name(app, two_assets_one_critical) -> None:
+    client = app.test_client()
+    login(client)
+    body = client.get("/diagnostics").get_data(as_text=True)
+    zulu_index = body.index("Zulu Broken Plant")
+    alpha_index = body.index("Alpha Healthy Plant")
+    assert zulu_index < alpha_index
+
+
+def test_overview_shows_a_healthy_badge_and_a_critical_count(app, two_assets_one_critical) -> None:
+    client = app.test_client()
+    login(client)
+    body = client.get("/diagnostics").get_data(as_text=True)
+    assert "sem findings activos" in body
+    assert "1 crítico" in body
+
+
+def test_overview_summary_counts_installations_by_worst_severity(app, two_assets_one_critical) -> None:
+    client = app.test_client()
+    login(client)
+    body = client.get("/diagnostics").get_data(as_text=True)
+    # 2 installations total, 1 with a critical, 1 fully healthy.
+    assert ">2<" in body
+    assert ">1<" in body
+
+
+def test_incidents_page_lists_the_open_incident_worst_first(app, two_assets_one_critical) -> None:
+    client = app.test_client()
+    login(client)
+    body = client.get("/diagnostics/incidents").get_data(as_text=True)
+    assert "Zulu Broken Plant" in body
+    assert "device_unavailable" in body
+    assert "Alpha Healthy Plant" not in body  # no open incident there -- must not appear
+
+
+def test_incidents_page_is_empty_when_nothing_is_open(app, settings) -> None:
+    factory = build_session_factory(create_engine(settings.database_url))
+    with factory() as session, session.begin():
+        asset = create_asset(session, canonical_name="Nothing Wrong Plant")
+        device = create_device(session, asset_id=asset.id, device_kind="inverter", label="INV-1", valid_from=date(2026, 1, 1))
+        record_device_status(
+            session, device_id=device.id, asset_id=asset.id, source_fact_key="v1:1",
+            observed_at=datetime.now(timezone.utc), availability_status="available", active_power_kw=Decimal("5.0"),
+        )
+        evaluate_and_persist_incidents(session)
+    client = app.test_client()
+    login(client)
+    body = client.get("/diagnostics/incidents").get_data(as_text=True)
+    assert "Nenhum incidente activo" in body
+
+
+def test_incidents_page_search_filters_by_installation(app, two_assets_one_critical) -> None:
+    client = app.test_client()
+    login(client)
+    body = client.get("/diagnostics/incidents?search=Zulu").get_data(as_text=True)
+    assert "Zulu Broken Plant" in body
+    body_filtered_out = client.get("/diagnostics/incidents?search=Nonexistent").get_data(as_text=True)
+    assert "Zulu Broken Plant" not in body_filtered_out
+    assert "Nenhum incidente activo" in body_filtered_out
