@@ -1197,3 +1197,159 @@ Só depois de 1 e 2 observados a decidir correctamente contra dados reais
 (o que hoje seria "zero eventos `pending`, todos os `device_unavailable`
 futuros correctamente detectados quando/se aparecerem") é que D4 (cliente
 Telegram real, canal de teste primeiro) deveria começar.
+
+## 26. D5 — Portfolio Diagnostics: implementado, testado, LIVE VERIFIED (2026-08-21)
+
+Sem migration nova — `portfolios/diagnostics.py` só lê tabelas já existentes
+(`diagnostic_incidents`, `devices`, `assets`, `portfolio_memberships`,
+`asset_provider_mappings`). Nem `diagnostics/findings.py` nem
+`diagnostics/incidents.py` foram tocados; nenhum finding novo é criado a
+nível de portfolio — só contagem e ranking sobre o que já existe.
+
+### Modelo
+
+```
+Portfolio → resolve_members(session, portfolio_id, on=data)   -- já existia, reutilizado tal e qual
+              │  (só assets resolvidos, deduplicados por desenho)
+              ▼
+      diagnostic_incidents WHERE asset_id IN (...) AND status='open'
+              │
+              ▼
+   PortfolioDiagnosticsSummary  (tira de KPIs)  +  portfolio_installation_rows (worst-first)
+              │                                            +  portfolio_incident_rows (filtrável)
+              ▼
+        UI: Overview (painel compacto) + nova secção "Diagnóstico"
+```
+
+Identidade nunca inventada: `resolve_members` já deduplicava um asset
+reclamado por membership explícita e por regra (`portfolios/service.py`,
+código pré-existente) — este módulo só filtra os `asset_id` não nulos antes
+de consultar `diagnostic_incidents`, nunca reprocessa a resolução.
+
+### "Missing nunca vira healthy" — não é só uma frase, é uma distinção de 4 estados
+
+`_classify_coverage` devolve `complete` / `partial` / `none` / `no_devices` —
+quatro estados, não dois. Uma instalação sem nenhum `Device` associado
+(`no_devices`) nunca entra na contagem de `installations_healthy`, mesmo
+tendo formalmente "zero incidentes" (porque não há nada para avaliar).
+Só uma instalação com pelo menos um device e zero incidentes abertos conta
+como `installations_healthy`. Provado directamente por
+`test_coverage_distinguishes_complete_partial_none_and_no_devices` — que
+apanhou um erro real no próprio teste (não no código): a primeira versão do
+teste esperava `installations_healthy == 0`, mas o comportamento correcto
+(e o que o código já fazia) é `== 1` — só a instalação genuinamente completa
+conta, a instalação sem dispositivos fica correctamente excluída, mas isso
+não significa "zero saudáveis no total". Corrigido no teste, não no código.
+
+### Histórico vs. recente, ao nível de portfolio
+
+`RECENT_THRESHOLD_DAYS = 7`, herdado directamente da evidência real de D3
+(a distribuição bimodal real dos 644 incidentes — nada entre 7 e 30 dias).
+Cada instalação e cada incidente carrega esta distinção
+(`has_recent_incident`/`is_recent`) — nunca um resumo que confunda os dois.
+
+### Um bug real, apanhado por um teste escrito para o filtro, não hipotético
+
+`diagnostics_section_context` calculava as opções dos dropdowns de filtro
+(severidade/regra/provider) a partir da lista **já filtrada** de incidentes
+— exactamente o mesmo erro já encontrado e corrigido em D2
+(`/diagnostics/incidents`), desta vez reintroduzido no contexto do
+portfolio. Escolher `severity=critical` faria o dropdown de regras esconder
+`stale_reading` só porque nenhuma linha visível o tinha, tornando impossível
+voltar atrás sem apagar o URL. Corrigido: as opções vêm de uma segunda
+consulta não filtrada (só `status` aplicado), a mesma disciplina que
+`_filter_options`/`_apply_filters` já seguiam para as linhas de reporting.
+Apanhado por `test_the_diagnostics_severity_filter_does_not_hide_other_filter_options`,
+escrito precisamente para testar isto, não por acaso.
+
+### UI
+
+`/portfolios/<id>/diagnostics` (nova secção, `SECTIONS` já suportava isto
+de graça) e um painel "Diagnóstico" novo em `/portfolios/<id>/overview` —
+deliberadamente **não** chamado "Precisam de atenção" ao nível do título da
+secção, para não colidir com o painel de "Precisam de atenção" já existente
+no Overview (que é sobre completude de reporting, não sobre saúde de
+equipamento) — a mesma colisão de nomes identificada na auditoria original
+(§2). Instalações e incidentes ligam directamente para
+`/diagnostics/assets/<id>` (já existente); incidentes individuais ligam
+para `/diagnostics/incidents?search=<nome>` (D2, já existente) — nenhuma
+página nova de detalhe de incidente foi inventada.
+
+### Testado
+
+9 testes em `test_portfolio_diagnostics.py` (um por requisito: dois
+portfolios sem duplicação, múltiplos devices de um asset, resolved≠open,
+portfolio sem incidentes, cobertura de 4 estados, ordenação worst-first,
+filtros, membership histórica, recente vs. histórico). 5 testes novos em
+`test_portfolio_web.py` (secção renderiza com dados reais, filtro não
+esconde opções, painel compacto no Overview, painel de reporting
+pré-existente intacto, secção na navegação partilhada). Suite completa da
+V2: **581 passed, 1 skipped**, sem regressões.
+
+### LIVE VERIFIED contra os 2 portfolios reais de produção
+
+Sem migration a aplicar (D5 não cria tabelas). `web`/`worker`/`scheduler`
+reconstruídos a partir do código committed e redeployados com o override de
+D1 incluído desta vez (sem repetir o erro de D3). Corrido directamente
+dentro do container `web` já a correr, contra a BD real:
+
+| | Solcorelios I | Solcorelios II |
+| --- | --- | --- |
+| Instalações resolvidas | 35 | 22 |
+| Com incidentes | 32 | 13 |
+| Saudáveis (evidência real) | **0** | **0** |
+| Sem dispositivos | 3 | 9 |
+| Dados de diagnóstico completos | 32/35 | 13/22 |
+| Incidentes críticos | 0 | 0 |
+| Incidentes de aviso | 186 | 48 |
+| Devices afectados | 93 | 24 |
+| Recentes (≤7 dias) | **0** | **0** |
+| Histórico (>7 dias) | 186 | 48 |
+| Incidente mais antigo | 95,2 dias | 95,2 dias |
+
+**Zero instalações "saudáveis" em qualquer um dos dois portfolios reais** —
+honesto, não um bug: todo o device com histórico tem exactamente 2
+incidentes (`device_unknown_status` + `stale_reading`, confirmado no top 10
+de cada portfolio — contagem de avisos = 2× contagem de devices, em todas as
+instalações, sem excepção). **Zero incidentes recentes em qualquer um dos
+dois portfolios reais** — porque o asset canário (153, com os 2 incidentes
+recentes de todo o sistema) **não pertence a nenhum dos dois portfolios
+reais**, confirmado directamente (`portfolio_memberships` não tem nenhuma
+linha para o asset 153). `installations_full_coverage` == `installations
+_with_incidents` exactamente nos dois portfolios — não uma coincidência
+suspeita, consequência directa de zero incidentes `device_no_history` nestes
+234 incidentes reais (nenhum device sem histórico nenhum, só devices com
+histórico desactualizado ou não classificado).
+
+### Os 234 incidentes reais destes dois portfolios: não precisam de migração/normalização
+
+Pedido explícito: se os incidentes parecerem semanticamente errados por
+causa do bootstrap do D1, documentar e propor uma migração separada, nunca
+apagar ou reclassificar em silêncio. **Não encontrei nada semanticamente
+errado para corrigir.** Os 234 incidentes (186+48) são exactamente o mesmo
+padrão já documentado e aceite em D3 §25, agora confirmado à escala dos
+portfolios reais, não just do universo completo da BD: `opened_at` reflecte
+honestamente a primeira evidência real (histórico importado da V1), a
+distinção histórico/recente já é calculada correctamente a partir desse
+mesmo campo, e nenhuma incidência foi tratada como "nova" quando não era. Não
+há dado corrompido, duplicado, ou mal classificado — há uma imagem honesta e
+pouco lisonjeira do estado real dos dados (a maioria dos devices tem leituras
+antigas ou não classificadas). **Recomendação: nenhuma migração/normalização
+necessária.** Se algo mudar no futuro, seria acrescentar um sinalizador
+explícito "importado no bootstrap" — mas isso duplicaria informação que
+`opened_at` já dá honestamente, sem ganho real.
+
+### Milestone
+
+**D5: IMPLEMENTED, TESTED, LIVE VERIFIED** contra os 2 portfolios reais de
+produção. Nenhuma `NotificationPolicy` alterada, nenhuma mensagem Telegram
+enviada, nenhuma chamada a provider. Availability continua ausente desta
+UI, deliberadamente — nada a mostrar enquanto o canário (`DEVICE_TELEMETRY.md`
+§10) continuar bloqueado.
+
+### Próximo passo recomendado
+
+Não D4 (continua a precisar da mesma aprovação humana de política descrita
+em §25). O passo independente e de baixo risco mais óbvio a seguir é D6
+(digest periódico) — reaproveitaria exactamente esta agregação de portfolio
+para produzir um resumo diário/semanal, sem tocar em Telegram real também.

@@ -83,7 +83,13 @@ def detail(portfolio_id: int, section: str = "overview") -> str:
         report_month = date.today().strftime("%Y-%m")
     filters = {
         key: request.args.get(key, "").strip()
-        for key in ("country_code", "lifecycle_status", "provider_code", "contract_type", "resolution_state", "q", "attention")
+        for key in (
+            "country_code", "lifecycle_status", "provider_code", "contract_type", "resolution_state", "q", "attention",
+            # D5 (Diagnostics tab): severity/rule/asset_id/status filter the
+            # portfolio's incident list; provider_code is already shared
+            # with the installations filters above.
+            "severity", "rule", "asset_id", "status",
+        )
     }
     try:
         context = portfolio_detail(

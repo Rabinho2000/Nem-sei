@@ -46,6 +46,60 @@
   </section>
 </div>
 
+{#
+  Diagnóstico (D5) -- deliberately not called "Precisam de atenção" as a
+  page-level label on its own: "Precisam de atenção" above is about
+  reporting-period completeness (production_state), a different question.
+  This panel is scoped and named "Diagnóstico" throughout so the two never
+  get read as the same thing.
+#}
+<section class="panel">
+  <header class="panel-header">
+    <h2>Diagnóstico</h2>
+    <a class="button-link" href="{{ url_for('portfolios.detail', portfolio_id=portfolio.id, section='diagnostics') }}">Ver tudo →</a>
+  </header>
+  <div class="kpi-strip">
+    <div class="kpi"><small>Instalações</small><strong>{{ diagnostics_summary.total_installations }}</strong></div>
+    <div class="kpi"><small>Com incidentes</small><strong>{{ diagnostics_summary.installations_with_incidents }}</strong></div>
+    <div class="kpi"><small>Críticos</small><strong>{{ diagnostics_summary.incidents_critical }}</strong></div>
+    <div class="kpi"><small>Avisos</small><strong>{{ diagnostics_summary.incidents_warning }}</strong></div>
+    <div class="kpi"><small>Dados de diagnóstico completos</small>
+      <strong>{{ diagnostics_summary.installations_full_coverage }}/{{ diagnostics_summary.total_installations }}</strong></div>
+  </div>
+  {% if diagnostics_summary.historical_backlog_incidents %}
+    <p class="panel-foot muted">
+      {{ diagnostics_summary.recent_incidents }} recente{{ 's' if diagnostics_summary.recent_incidents != 1 else '' }}
+      (≤{{ 7 }} dias) · {{ diagnostics_summary.historical_backlog_incidents }} de histórico mais antigo — não confundir os dois.
+    </p>
+  {% endif %}
+
+  {% set priority = diagnostics_installations|selectattr('incident_count', 'gt', 0)|list %}
+  {% if priority %}
+    <table class="data-table">
+      <thead><tr><th>Instalação</th><th>Severidade</th><th class="num">Incidentes</th><th class="num">Mais antigo</th></tr></thead>
+      <tbody>
+        {% for row in priority[:8] %}
+          <tr class="{{ 'row-attention' if row.critical_count else '' }}">
+            <td><a href="{{ url_for('diagnostics.asset_detail', asset_id=row.asset_id) }}">{{ row.name }}</a></td>
+            <td>
+              {% if row.critical_count %}<span class="pill pill-bad">{{ row.critical_count }} crítico{{ 's' if row.critical_count != 1 else '' }}</span>{% endif %}
+              {% if row.warning_count %}<span class="pill pill-warn">{{ row.warning_count }} aviso{{ 's' if row.warning_count != 1 else '' }}</span>{% endif %}
+              {% if row.info_count %}<span class="pill pill-ok">{{ row.info_count }} info</span>{% endif %}
+            </td>
+            <td class="num">{{ row.incident_count }}</td>
+            <td class="num muted">{{ '%.0f dias'|format(row.oldest_incident_age_days) if row.oldest_incident_age_days is not none else '—' }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% if priority|length > 8 %}
+      <p class="panel-foot"><a href="{{ url_for('portfolios.detail', portfolio_id=portfolio.id, section='diagnostics') }}">Ver as {{ priority|length }} instalações com incidentes</a></p>
+    {% endif %}
+  {% else %}
+    <p class="empty">Nenhuma instalação com incidentes activos neste portfolio.</p>
+  {% endif %}
+</section>
+
 {% if dataset and dataset.warnings_json %}
 <section class="panel">
   <header class="panel-header"><h2>Avisos</h2><span class="muted">{{ dataset.warnings_json|length }}</span></header>

@@ -10,8 +10,9 @@ from alembic.config import Config
 from sqlalchemy import create_engine
 
 from nemsei.app import create_app
-from nemsei.assets.service import create_asset
+from nemsei.assets.service import create_asset, create_device
 from nemsei.db.session import build_session_factory
+from nemsei.diagnostics.models import DiagnosticIncident
 from nemsei.monitoring.service import record_production_fact
 from nemsei.portfolios.datasets import build_portfolio_dataset
 from nemsei.portfolios.service import add_member, create_portfolio, freeze_snapshot
@@ -286,3 +287,91 @@ def test_a_mutation_route_without_a_csrf_token_is_refused(app, seeded) -> None:
     login(client)
     response = client.post(f"/portfolios/{seeded}/reports/generate", data={"month": "2026-03"})
     assert response.status_code in (400, 403)
+
+
+# --- D5: Portfolio Diagnostics ---------------------------------------------------
+
+
+@pytest.fixture
+def seeded_with_incident(app, settings):
+    """A second portfolio, deliberately separate from `seeded`, with one
+    real open critical incident and one real open warning incident on two
+    different installations -- enough for the diagnostics tab and the
+    Overview panel to have something real to render."""
+    factory = build_session_factory(create_engine(settings.database_url))
+    with factory() as session, session.begin():
+        portfolio = create_portfolio(session, name="Diagnostics Portfolio", created_by="op")
+
+        broken = create_asset(session, canonical_name="Broken Plant")
+        broken_device = create_device(session, asset_id=broken.id, device_kind="inverter", label="INV-1", valid_from=date(2026, 1, 1))
+        session.add(
+            DiagnosticIncident(
+                rule_code="device_unavailable", asset_id=broken.id, device_id=broken_device.id, severity="critical",
+                status="open", opened_at=datetime.now(timezone.utc), last_observed_at=datetime.now(timezone.utc),
+                occurrence_count=1, detector_version="1", evidence_json={},
+                created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc),
+            )
+        )
+
+        warning_asset = create_asset(session, canonical_name="Warning Plant")
+        warning_device = create_device(session, asset_id=warning_asset.id, device_kind="inverter", label="INV-1", valid_from=date(2026, 1, 1))
+        session.add(
+            DiagnosticIncident(
+                rule_code="stale_reading", asset_id=warning_asset.id, device_id=warning_device.id, severity="warning",
+                status="open", opened_at=datetime.now(timezone.utc), last_observed_at=datetime.now(timezone.utc),
+                occurrence_count=1, detector_version="1", evidence_json={},
+                created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc),
+            )
+        )
+
+        healthy = create_asset(session, canonical_name="Healthy Plant")
+        create_device(session, asset_id=healthy.id, device_kind="inverter", label="INV-1", valid_from=date(2026, 1, 1))
+
+        for asset in (broken, warning_asset, healthy):
+            add_member(session, portfolio_id=portfolio.id, asset_id=asset.id, valid_from=date(2026, 1, 1), created_by="op")
+        portfolio_id = portfolio.id
+    return portfolio_id
+
+
+def test_the_diagnostics_tab_shows_real_incidents_worst_first(app, seeded_with_incident) -> None:
+    client = app.test_client()
+    login(client)
+    body = client.get(f"/portfolios/{seeded_with_incident}/diagnostics").get_data(as_text=True)
+    assert "Broken Plant" in body
+    assert "Warning Plant" in body
+    assert "device_unavailable" in body
+    assert "stale_reading" in body
+    assert body.index("Broken Plant") < body.index("Warning Plant")
+
+
+def test_the_diagnostics_severity_filter_does_not_hide_other_filter_options(app, seeded_with_incident) -> None:
+    """Regression: filter options must come from the unfiltered set, or
+    picking one filter hides the very options that could undo it. The
+    installation ranking above the incident list is deliberately unaffected
+    by this filter -- only the incident list itself narrows."""
+    client = app.test_client()
+    login(client)
+    body = client.get(f"/portfolios/{seeded_with_incident}/diagnostics?severity=critical").get_data(as_text=True)
+    assert "device_unavailable" in body  # the one incident row that matches
+    assert "<code>stale_reading</code>" not in body  # no incident row for the filtered-out one
+    # But the rule dropdown must still offer stale_reading as an option,
+    # even though no incident row on this filtered page has it.
+    assert '<option value="stale_reading"' in body
+
+
+def test_the_overview_shows_the_compact_diagnostics_panel(app, seeded_with_incident) -> None:
+    client = app.test_client()
+    login(client)
+    body = client.get(f"/portfolios/{seeded_with_incident}/overview").get_data(as_text=True)
+    assert "Diagnóstico" in body
+    assert "Broken Plant" in body  # the priority installation appears on Overview too
+    # The pre-existing reporting-completeness panel ("Composição") must
+    # still be there, untouched -- this is an addition, not a replacement.
+    assert "Composição" in body
+
+
+def test_diagnostics_section_is_included_in_the_shared_navigation(app, seeded) -> None:
+    client = app.test_client()
+    login(client)
+    body = client.get(f"/portfolios/{seeded}/overview?month=2026-03").get_data(as_text=True)
+    assert f"/portfolios/{seeded}/diagnostics" in body

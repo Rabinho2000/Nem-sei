@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from nemsei.assets.models import Asset, Organization
 from nemsei.portfolios.datasets import assets_needing_attention, latest_dataset
+from nemsei.portfolios.diagnostics import portfolio_diagnostics_summary, portfolio_incident_rows, portfolio_installation_rows
 from nemsei.portfolios.models import (
     Portfolio,
     PortfolioDataset,
@@ -34,6 +35,7 @@ from nemsei.reporting.periods import ReportingPeriodError, exclusive_end, monthl
 SECTIONS = (
     ("overview", "Visão geral"),
     ("installations", "Instalações"),
+    ("diagnostics", "Diagnóstico"),
     ("production", "Produção"),
     ("availability", "Disponibilidade"),
     ("financial", "Financeiro"),
@@ -209,6 +211,16 @@ def portfolio_detail(
     coverage = (dataset.coverage_json if dataset else {}) or {}
     attention = [row for row in filtered if row["production_state"] != "measured"]
 
+    # Summary + worst-first installation ranking are computed on every
+    # section, not just "diagnostics": the Overview tile wants the compact
+    # summary and its own "top priority installations" too. Both are cheap
+    # (one pass over the portfolio's current membership). The filterable
+    # raw incident list is heavier and not needed outside the diagnostics
+    # tab itself, so it stays gated below, same pattern as `workflow_context`
+    # for "reports".
+    diagnostics_summary = portfolio_diagnostics_summary(session, portfolio_id=portfolio_id, on=date.today())
+    diagnostics_installations = portfolio_installation_rows(session, portfolio_id=portfolio_id, on=date.today())
+
     return {
         "portfolio": portfolio,
         "owner": session.get(Organization, portfolio.owner_id) if portfolio.owner_id else None,
@@ -240,7 +252,36 @@ def portfolio_detail(
             .order_by(PortfolioSnapshot.period_start.desc())
             .limit(12)
         ).all(),
+        "diagnostics_summary": diagnostics_summary,
+        "diagnostics_installations": diagnostics_installations,
         **(workflow_context(session, portfolio_id=portfolio_id, report_month=report_month) if section == "reports" else {}),
+        **(diagnostics_section_context(session, portfolio_id=portfolio_id, filters=filters or {}) if section == "diagnostics" else {}),
+    }
+
+
+def diagnostics_section_context(session: Session, *, portfolio_id: int, filters: dict[str, str]) -> dict[str, Any]:
+    """Everything the Diagnostics tab needs beyond the compact summary and
+    installation ranking already computed above (D5): the filterable
+    incident list. Reads `diagnostic_incidents` directly (via
+    `portfolios/diagnostics.py`) -- nothing here re-evaluates a rule or
+    creates a row.
+    """
+    # Options come from the *unfiltered* set (status aside) -- otherwise
+    # picking one filter would hide the very options that could undo it,
+    # the same trap `_filter_options`/`_apply_filters` above are careful
+    # to avoid for the reporting rows.
+    unfiltered = portfolio_incident_rows(
+        session, portfolio_id=portfolio_id, on=date.today(), filters={"status": filters.get("status", "open")}
+    )
+    incidents = portfolio_incident_rows(session, portfolio_id=portfolio_id, on=date.today(), filters=filters)
+    return {
+        "diagnostics_incidents": incidents,
+        "diagnostics_filters": filters,
+        "diagnostics_filter_options": {
+            "severity": ["critical", "warning", "info"],
+            "rule": sorted({row["incident"].rule_code for row in unfiltered}),
+            "provider_code": sorted({row["provider_code"] for row in unfiltered if row["provider_code"]}),
+        },
     }
 
 

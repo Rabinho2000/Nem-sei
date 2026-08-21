@@ -1,0 +1,141 @@
+{% extends "portfolios/_shell.html" %}
+{#
+  D5: aggregates DiagnosticIncident (D1) for this portfolio's current
+  membership -- nothing here evaluates a rule or writes a row. Distinct
+  vocabulary from "Precisam de atenção"/"Cobertura" on Overview/Installations
+  on purpose: those are about reporting-period completeness, this is about
+  device/installation health right now.
+#}
+{% macro severity_pill(severity) %}
+  {% set tone = {'critical': 'bad', 'warning': 'warn', 'info': 'ok'}.get(severity, 'warn') %}
+  <span class="pill pill-{{ tone }}">{{ {'critical': 'crítico', 'warning': 'aviso', 'info': 'informação'}.get(severity, severity) }}</span>
+{% endmacro %}
+{% macro coverage_pill(coverage) %}
+  {% set tone = {'complete': 'ok', 'partial': 'warn', 'none': 'bad', 'no_devices': 'warn'}.get(coverage, 'warn') %}
+  <span class="pill pill-{{ tone }}">
+    {{ {'complete': 'dados completos', 'partial': 'dados parciais', 'none': 'sem dados', 'no_devices': 'sem dispositivos'}.get(coverage, coverage) }}
+  </span>
+{% endmacro %}
+{% block section %}
+
+<section class="kpi-strip">
+  <div class="kpi"><small>Instalações</small><strong>{{ diagnostics_summary.total_installations }}</strong></div>
+  <div class="kpi"><small>Com incidentes</small><strong>{{ diagnostics_summary.installations_with_incidents }}</strong></div>
+  <div class="kpi"><small>Saudáveis (evidência)</small><strong>{{ diagnostics_summary.installations_healthy }}</strong></div>
+  <div class="kpi"><small>Sem dispositivos</small><strong>{{ diagnostics_summary.installations_no_devices }}</strong></div>
+  <div class="kpi"><small>Críticos</small><strong>{{ diagnostics_summary.incidents_critical }}</strong></div>
+  <div class="kpi"><small>Avisos</small><strong>{{ diagnostics_summary.incidents_warning }}</strong></div>
+  <div class="kpi"><small>Devices afectados</small><strong>{{ diagnostics_summary.devices_affected }}</strong></div>
+  <div class="kpi"><small>Dados completos</small><strong>{{ diagnostics_summary.installations_full_coverage }}/{{ diagnostics_summary.total_installations }}</strong></div>
+</section>
+
+<section class="panel">
+  <header class="panel-header">
+    <h2>Histórico vs. recente</h2>
+  </header>
+  <p class="muted">
+    {{ diagnostics_summary.recent_incidents }} incidente{{ 's' if diagnostics_summary.recent_incidents != 1 else '' }}
+    recente{{ 's' if diagnostics_summary.recent_incidents != 1 else '' }} (últimos 7 dias) ·
+    {{ diagnostics_summary.historical_backlog_incidents }} de histórico mais antigo
+    {% if diagnostics_summary.oldest_incident_age_days is not none %}
+      (o mais antigo tem {{ '%.0f'|format(diagnostics_summary.oldest_incident_age_days) }} dias)
+    {% endif %}.
+    Um incidente antigo não é um problema novo — só continua por resolver.
+  </p>
+</section>
+
+<section class="panel">
+  <header class="panel-header"><h2>Instalações mais problemáticas</h2></header>
+  {% if diagnostics_installations %}
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Instalação</th><th>Severidade</th><th class="num">Incidentes</th>
+          <th>Cobertura de diagnóstico</th><th class="num">Mais antigo</th><th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in diagnostics_installations %}
+          <tr class="{{ 'row-attention' if row.critical_count else '' }}">
+            <td>{{ row.name }}{% if row.has_recent_incident %} <span class="pill pill-warn">recente</span>{% endif %}</td>
+            <td>
+              {% if row.incident_count == 0 %}
+                <span class="pill pill-ok">sem incidentes</span>
+              {% else %}
+                {% if row.critical_count %}<span class="pill pill-bad">{{ row.critical_count }} crítico{{ 's' if row.critical_count != 1 else '' }}</span>{% endif %}
+                {% if row.warning_count %}<span class="pill pill-warn">{{ row.warning_count }} aviso{{ 's' if row.warning_count != 1 else '' }}</span>{% endif %}
+                {% if row.info_count %}<span class="pill pill-ok">{{ row.info_count }} info</span>{% endif %}
+              {% endif %}
+            </td>
+            <td class="num">{{ row.incident_count }}</td>
+            <td>{{ coverage_pill(row.coverage) }} <span class="muted">({{ row.device_count }} device{{ 's' if row.device_count != 1 else '' }})</span></td>
+            <td class="num muted">{{ '%.0f dias'|format(row.oldest_incident_age_days) if row.oldest_incident_age_days is not none else '—' }}</td>
+            <td class="num"><a href="{{ url_for('diagnostics.asset_detail', asset_id=row.asset_id) }}">Ver diagnóstico</a></td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="empty">Este portfolio não tem instalações resolvidas para diagnosticar.</p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <header class="panel-header"><h2>Incidentes</h2><span class="muted">{{ diagnostics_incidents|length }}</span></header>
+  <form class="filter-bar" method="get" action="{{ url_for('portfolios.detail', portfolio_id=portfolio.id, section='diagnostics') }}">
+    <input type="hidden" name="month" value="{{ report_month }}">
+    <select name="severity">
+      <option value="">Severidade (todas)</option>
+      {% for value in diagnostics_filter_options.severity %}
+        <option value="{{ value }}" {{ 'selected' if diagnostics_filters.get('severity') == value else '' }}>{{ {'critical':'crítico','warning':'aviso','info':'informação'}.get(value, value) }}</option>
+      {% endfor %}
+    </select>
+    <select name="rule">
+      <option value="">Regra (todas)</option>
+      {% for value in diagnostics_filter_options.rule %}
+        <option value="{{ value }}" {{ 'selected' if diagnostics_filters.get('rule') == value else '' }}>{{ value }}</option>
+      {% endfor %}
+    </select>
+    {% if diagnostics_filter_options.provider_code %}
+      <select name="provider_code">
+        <option value="">Provider (todos)</option>
+        {% for value in diagnostics_filter_options.provider_code %}
+          <option value="{{ value }}" {{ 'selected' if diagnostics_filters.get('provider_code') == value else '' }}>{{ value }}</option>
+        {% endfor %}
+      </select>
+    {% endif %}
+    <select name="status">
+      <option value="open" {{ 'selected' if diagnostics_filters.get('status', 'open') == 'open' else '' }}>Abertos</option>
+      <option value="resolved" {{ 'selected' if diagnostics_filters.get('status') == 'resolved' else '' }}>Resolvidos</option>
+      <option value="all" {{ 'selected' if diagnostics_filters.get('status') == 'all' else '' }}>Todos</option>
+    </select>
+    <input type="text" name="asset_id" placeholder="ID da instalação" value="{{ diagnostics_filters.get('asset_id', '') }}">
+    <button type="submit">Filtrar</button>
+  </form>
+
+  {% if diagnostics_incidents %}
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Severidade</th><th>Instalação</th><th>Dispositivo</th><th>Regra</th>
+          <th class="num">Idade</th><th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in diagnostics_incidents %}
+          <tr class="{{ 'row-attention' if row.incident.severity == 'critical' else '' }}">
+            <td>{{ severity_pill(row.incident.severity) }}{% if row.is_recent %} <span class="pill pill-warn">recente</span>{% endif %}</td>
+            <td><a href="{{ url_for('diagnostics.asset_detail', asset_id=row.asset_id) }}">{{ row.asset_name }}</a></td>
+            <td class="muted">{{ row.device_label or '— (instalação)' }}</td>
+            <td class="muted"><code>{{ row.incident.rule_code }}</code></td>
+            <td class="num">{{ '%.0f dias'|format(row.age_days) }}</td>
+            <td class="num"><a href="{{ url_for('diagnostics.incidents', search=row.asset_name) }}">Ver incidente →</a></td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="empty">Nenhum incidente corresponde aos filtros.</p>
+  {% endif %}
+</section>
+{% endblock %}
