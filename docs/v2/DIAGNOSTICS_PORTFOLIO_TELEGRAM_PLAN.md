@@ -977,3 +977,223 @@ Fatia 2/3 (canário antes de escala) e em D1 (schema e mecanismo antes de
 dados reais visíveis), aplicada ao único componente desta fatia que ainda
 não foi genuinamente exercitado: uma policy real, decidindo sobre
 incidentes reais, à frente de um humano.
+
+## 24. D3 fechado: restart safety real, e o dry-run final (2026-08-21, mais tarde)
+
+Pedido explícito de fechar a fatia antes de a dar por concluída. Duas coisas
+mudaram de facto no código; o resto é confirmação.
+
+### O bug real que faltava: restart safety da *entrega*, não só do agendamento
+
+D1/D3 já tinham restart safety do **agendamento** (`ScheduleState` persistido)
+e da **decisão** (`decide_notification_events`, idempotente via a constraint
+única + `SAVEPOINT`). Faltava a mesma garantia para a **entrega** — e esta é
+a que importa de verdade, porque é a única com um efeito colateral externo
+real (uma mensagem Telegram, em D4).
+
+A versão anterior de `deliver_pending_notifications` corria a decisão de
+entrega de **todos** os eventos `pending`/`failed` dentro de **uma única
+transacção**. Isto tem um problema real: se o processo morresse depois de o
+evento 3 de 5 ser realmente enviado mas antes da transacção fazer commit, um
+restart replicaria os 5 — reenviando 3 mensagens reais que já tinham saído.
+
+**Corrigido**: `deliver_pending_notifications` agora abre **uma transacção
+por evento**, com commit imediato a seguir à sua própria tentativa de
+entrega — não uma transacção para o lote inteiro. Cada evento também é
+re-verificado (`status in (pending, failed)`) mesmo dentro da sua própria
+transacção, não só na query inicial, o que torna esta função segura tanto
+para um restart como para dois processos a correr em concorrência ao mesmo
+tempo. `evaluate_and_process_notifications` e o handler do job
+(`jobs/handlers.py`) foram actualizados para já não abrirem uma transacção
+exterior a envolver a entrega.
+
+**Provado directamente**, não só argumentado:
+`test_a_crash_mid_batch_never_resends_an_already_delivered_message` — um
+cliente que "morre" (levanta uma excepção real, não uma falha reportada)
+depois do primeiro de dois envios reais. O evento 1 fica `sent`,
+irrevogavelmente committed; o evento 2 fica `pending`. Um "restart" (uma
+segunda chamada, cliente novo) só toca o evento 2 — o cliente nunca recebe
+uma segunda chamada para o evento já enviado. Distinto de propósito do teste
+de falha reportada (`MockTelegramClient(fail_for_chat_ids=...)`, que simula
+o Telegram a dizer "não consegui", não o processo a morrer sem avisar).
+
+### Lifecycle final de `NotificationEvent`
+
+```
+                    decisão                      entrega
+                 ┌───────────┐               ┌─────────────┐
+  incidente  ──► │  pending  │ ──────────────►│  sent        │ (terminal)
+  elegível       └───────────┘  delivered=True└─────────────┘
+                       │
+                       │ delivered=False
+                       ▼
+                  ┌───────────┐   nova tentativa (próxima
+                  │  failed   │ ──passagem, sem limite)──┐
+                  └───────────┘                          │
+                       ▲                                 │
+                       └─────────────────────────────────┘
+
+  canal/policy desligado no momento da decisão:
+  incidente elegível ──► skipped (terminal, decisão real e auditável)
+```
+
+Quatro estados, sem mais — `pending`/`sent`/`failed`/`skipped`, exactamente
+os quatro já modelados na migration `0018`. Nenhuma alteração de schema
+nesta fatia final; só a forma como `deliver_pending_notifications` transaciona
+o trabalho mudou.
+
+### Testes: 21 em `test_notifications.py` (2 novos face à versão anterior)
+
+`test_a_crash_mid_batch_never_resends_an_already_delivered_message` (acima)
+e o ajuste de `test_a_failed_delivery_can_be_retried_and_then_succeeds` para
+também confirmar explicitamente que um retry nunca cria uma segunda linha
+(`len(rows) == 1`), não só que a linha existente muda de estado. Suite
+completa da V2 corrida de novo depois desta alteração — ver resultado no
+relatório da sessão.
+
+## 25. Dry-run final contra os `DiagnosticIncident` reais e vivos, `open` + `resolved`
+
+**Só leitura** — `SELECT` directo à BD viva, simulado localmente com a mesma
+lógica de âmbito/baseline/escalation de `notifications/service.py`. Nenhuma
+`NotificationPolicy`/`NotificationChannel` real foi criada, nenhuma escrita
+à BD de produção.
+
+### Números pedidos, sem arredondar
+
+| Métrica | Valor |
+| --- | --- |
+| Total de incidentes avaliados | **644** |
+| `open` | 644 |
+| `resolved` | **0** |
+| Por severidade | `warning`: 644 · `critical`: 0 · `info`: 0 |
+| Por rule_code | `stale_reading`: 325 · `device_unknown_status`: 319 |
+| Assets distintos afectados | **133** |
+| Idade mediana desde `opened_at` | **39,6 dias** |
+| Incidentes com >30 dias | **642 (99,7%)** |
+| Notificáveis agora, policy recomendada | **0** |
+| Suprimidos (excluídos por âmbito de regra), policy recomendada | 644 |
+| Suprimidos por baseline, policy recomendada | 0 (o âmbito já excluiu tudo primeiro) |
+| Recovery (kind=`resolved`) | **0** — não existe nenhum incidente resolvido em todo o histórico ainda |
+| Escalation/reminder, policy recomendada | **0** |
+
+### Top 10 exemplos (os mais antigos — os que uma escalada atingiria primeiro, se estivessem no âmbito)
+
+| # | rule_code | severidade | instalação | device_id | opened_at | idade |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | device_unknown_status | warning | Absorvalor | 79 | 2026-05-18 10:13:52Z | 95,1 dias |
+| 2 | device_unknown_status | warning | Absorvalor | 77 | 2026-05-18 10:13:52Z | 95,1 dias |
+| 3 | device_unknown_status | warning | Queijaria Inácio Corvelo | 235 | 2026-05-18 10:13:52Z | 95,1 dias |
+| 4 | device_unknown_status | warning | Granetos | 30 | 2026-05-18 10:13:52Z | 95,1 dias |
+| 5 | device_unknown_status | warning | Topeca | 251 | 2026-05-18 10:13:52Z | 95,1 dias |
+| 6 | device_unknown_status | warning | Topeca | 252 | 2026-05-18 10:13:52Z | 95,1 dias |
+| 7 | device_unknown_status | warning | Granetos | 31 | 2026-05-18 10:13:52Z | 95,1 dias |
+| 8 | device_unknown_status | warning | Granetos | 29 | 2026-05-18 10:13:52Z | 95,1 dias |
+| 9 | device_unknown_status | warning | Granetos | 32 | 2026-05-18 10:13:52Z | 95,1 dias |
+| 10 | device_unknown_status | warning | Absorvalor | 80 | 2026-05-18 10:13:52Z | 95,1 dias |
+
+### Os 644 são histórico da inicialização de D1, não problemas actuais — com números, não impressão
+
+**642 dos 644 (99,7%) têm `opened_at` com mais de 30 dias** — a mais antiga,
+95 dias. Isto não é coincidência nem um artefacto do dry-run: `opened_at`
+vem directamente de `DiagnosticFinding.active_since` (D1), que por sua vez
+vem do histórico real importado da V1 (`device_status_facts`, Fatia 1,
+2026-05 a 2026-07). Quando o avaliador de incidentes correu pela primeira
+vez, encontrou estas condições **já verdadeiras havia meses** e, correctamente,
+registou `opened_at` na primeira evidência real, não no momento em que o
+avaliador as viu — exactamente o comportamento documentado e testado em D1
+(`test_opened_at_uses_the_findings_own_active_since_not_evaluator_start_time`).
+
+Os únicos **2 incidentes com menos de 7 dias** são genuinamente recentes:
+os dois dispositivos canário do asset 153 (`stale_reading`, desde
+2026-08-20T10:59:18Z) — o polling ao vivo do canário parou depois da janela
+da Fatia 3 e nunca foi reactivado, e isso é uma condição real e nova, não
+histórico. Curiosamente **estes dois não aparecem no "top 10 mais antigo"**
+porque são recentes, não antigos — o que confirma que a distinção
+"histórico vs. actual" está a funcionar correctamente nos dados, não só na
+teoria.
+
+**Resposta directa à pergunta**: a esmagadora maioria (642/644) representa a
+materialização de histórico estático pela inicialização do D1, não
+problemas novos. Uma minoria real e genuína (2/644) representa uma
+degradação actual (perda de cobertura ao vivo do canário). Uma
+`NotificationPolicy` sem baseline trataria as duas categorias de forma
+idêntica — exactamente o que a baseline existe para evitar.
+
+### Onde está o risco de ruído, e onde não está
+
+**Não está na `NotificationPolicy`.** Já tinha sido identificado em §22 e
+confirma-se aqui com o universo completo (`open`+`resolved`, não só
+`open`): zero incidentes resolvidos existem, então "recovery" não é sequer
+uma questão hoje — não há nada para a policy suprimir ou não nessa
+dimensão.
+
+**Está nos dois rule_codes específicos, à densidade de amostragem actual.**
+Simulação adicional (Policy F, ver script) confirma o risco composto: se
+`device_unknown_status`/`stale_reading` estivessem no âmbito de uma policy
+com escalation de 24h, seria **644 aberturas + 644 escalações = 1288
+mensagens** de uma só vez — porque todos já passam o limiar de 24h. Isto
+não é hipotético nem exagerado: é o resultado directo e mecânico de
+qualquer policy que inclua estes dois rule_codes sem uma baseline, hoje.
+
+**Não foi necessário afrouxar a `NotificationPolicy` para reduzir esta
+contagem.** O âmbito recomendado (excluir estes dois rule_codes) não é um
+ajuste cosmético da policy para esconder um número feio — é um
+reconhecimento honesto de que, à densidade de amostragem actual (2 de 325
+dispositivos com polling ao vivo), estes dois sinais são estruturais, não
+accionáveis individualmente. Nem os findings nem os incidents estão
+"demasiado agressivos" no sentido de estarem errados — `device_unknown_status`
+reflecte fielmente que a maioria dos códigos de estado brutos importados da
+V1 nunca caiu no vocabulário reconhecido, e `stale_reading` reflecte
+fielmente que quase nenhum dispositivo tem polling ao vivo. Ambos são
+verdadeiros. A decisão correcta não é mudar o que é verdade — é decidir
+que, hoje, nem tudo o que é verdade merece uma notificação Telegram
+individual.
+
+### Proposta de policy inicial, decidida pelos dados reais, ainda sem Telegram live
+
+| Severidade | Comportamento proposto | Justificação nos dados |
+| --- | --- | --- |
+| `critical` (`device_unavailable`) | Notificar imediatamente na abertura (`notify_on_open=True`, sem atraso) | Zero exemplos reais hoje para testar, mas é o único nível onde uma notificação imediata é inequivocamente correcta — nenhuma amostra suficiente ainda para hesitar |
+| `warning` accionável (`zero_power_while_peers_active`, `power_disparity_among_peers`, `daily_energy_disparity_among_peers`) | Notificar na abertura, com uma escalada única às 24h se continuar aberto | Mesmos rule_codes já identificados como accionáveis em §22; zero exemplos reais hoje, mas o desenho (uma escalada, não um lembrete repetido) já está testado |
+| `warning` estrutural (`stale_reading`, `device_unknown_status`) | **Nunca notificação individual por agora** — visível no dashboard (D2) apenas | 644/644 dos incidentes reais são deste tipo; 99,7% são histórico de importação, não eventos; a densidade de polling ao vivo (2/325 dispositivos) não sustenta um sinal individual accionável ainda |
+| `info` (`partial_device_coverage`) | Nunca imediato — candidato a digest periódico (D6, não implementado) | Nenhum exemplo real hoje; por desenho, informação de cobertura não é urgente por natureza |
+| Baseline | `baseline_at` = momento de activação da policy, sempre | Sem esta, os 644 (ou uma fracção deles, consoante o âmbito) disparariam de uma vez no primeiro `notify_on_open` |
+
+### Testes, resultado final
+
+`test_notifications.py`: 21 testes (19 anteriores + `_CrashingClient`'s teste
+de restart safety + o reforço de não-duplicação no teste de retry).
+`test_jobs.py`/`test_scheduler.py`: 6 testes de agendamento (idempotente,
+restart-safe, ticks concorrentes). `test_worker.py`: 1 teste de ponta a
+ponta pelo pipeline real Job→Scheduler→Worker→handler. Suite completa da
+V2: ver resultado no relatório da sessão — sem regressões.
+
+### Milestones
+
+**D3: IMPLEMENTED, TESTED, restart-safe na decisão E na entrega, dry-run
+final feito com o universo completo (`open`+`resolved`).** Migration `0018`
+em produção, `notification_processing_enabled` ainda DESLIGADO, nenhuma
+policy real criada.
+
+### Recomendação final GO / NO-GO para D4 (Telegram real)
+
+**NO-GO ainda — mas por uma razão diferente da de §23, já resolvida.** §23
+identificou a infraestrutura como pronta mas a policy como não revista;
+esse dry-run está agora feito, completo, com o universo `open`+`resolved`.
+A infraestrutura está agora também restart-safe na entrega, não só na
+decisão — a lacuna que §23 não tinha identificado ainda.
+
+**O que falta não é mais engenharia — é uma decisão humana de duas partes:**
+
+1. Aprovar explicitamente a proposta de policy acima (tabela de severidades)
+   como a policy real a activar — incluindo a decisão deliberada de excluir
+   `stale_reading`/`device_unknown_status` de notificação individual por
+   agora.
+2. Activar `notification_processing_enabled` em produção com essa policy
+   real, **canal ainda desligado** (prova a decisão em produção sem nenhum
+   risco de entrega) — o passo 2 de §23, ainda não dado.
+
+Só depois de 1 e 2 observados a decidir correctamente contra dados reais
+(o que hoje seria "zero eventos `pending`, todos os `device_unavailable`
+futuros correctamente detectados quando/se aparecerem") é que D4 (cliente
+Telegram real, canal de teste primeiro) deveria começar.

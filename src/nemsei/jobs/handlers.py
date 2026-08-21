@@ -153,8 +153,12 @@ def _execute_notification_processing(*, session_factory: sessionmaker[Session]) 
     "failure" here is the mock's own, deterministic, test-configured
     behaviour, never a real network error, since D4 has not happened.
     """
-    with session_factory() as session, session.begin():
-        summary = evaluate_and_process_notifications(session)
+    # No outer `session.begin()` here, deliberately -- `evaluate_and_process
+    # _notifications` manages its own transactions per step (one for
+    # deciding, one per event for delivering), which is what makes a crash
+    # mid-delivery unable to resend an already-committed, already-sent
+    # message on the next retry. See notifications/service.py's docstring.
+    summary = evaluate_and_process_notifications(session_factory)
     return JobOutcome(
         status="success",
         result={

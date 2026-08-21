@@ -1,6 +1,7 @@
 """Notification policy evaluation and mock delivery (D3).
 
-Two separable steps, both exposed on purpose:
+Two separable steps, both exposed on purpose, and deliberately transactioned
+differently because one has an external side effect and the other does not:
 
 `decide_notification_events` is the only writer that ever *creates* a
 `NotificationEvent` -- it never reads `diagnostics/findings.py` directly and
@@ -8,10 +9,22 @@ never decides whether a *finding* is true, that question is already
 answered by `DiagnosticIncident` (D1). It only decides whether an
 already-open-or-resolved incident's episode is worth telling a channel
 about, and leaves every new row `pending` (or `skipped`, an equally real,
-equally final decision) -- it never delivers anything itself.
+equally final decision) -- it never delivers anything itself. Pure
+database work, so one transaction for the whole pass is fine: a crash
+midway loses nothing that was not already re-derivable from
+`diagnostic_incidents` on the next run.
 
 `deliver_pending_notifications` is the only step that ever calls a
 `TelegramClient`, and only ever touches rows already `pending`/`failed`.
+**Each event gets its own transaction, committed immediately after its own
+delivery attempt** -- not one transaction for the whole batch. This is not
+a style choice: a `TelegramClient.send_message` call is a real external
+side effect. If the whole batch shared one transaction and the process
+died after message 3 of 5 was actually sent but before the transaction
+committed, a restart would replay all 5 -- resending 3 real messages. One
+transaction per event means a crash can only ever leave an event's own
+single attempt uncommitted, never un-send a message that already went out
+and already got recorded.
 
 `evaluate_and_process_notifications` runs both in sequence -- the one job
 this codebase actually schedules -- but keeping them separate functions
@@ -27,7 +40,7 @@ from typing import Callable
 
 from sqlalchemy import exists, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from nemsei.assets.models import Asset, Device
 from nemsei.diagnostics.findings import SEVERITY_ORDER
@@ -85,24 +98,76 @@ def decide_notification_events(session: Session, *, now: datetime | None = None)
 
 
 def deliver_pending_notifications(
-    session: Session,
+    session_factory: sessionmaker[Session],
     *,
     now: datetime | None = None,
     client_factory: Callable[[NotificationChannel], TelegramClient] = _default_client_factory,
 ) -> NotificationDeliverySummary:
-    attempted, sent, failed = _deliver_pending(session, client_factory=client_factory, now=now or utc_now())
+    """Attempt delivery for every `pending`/`failed` event, one commit each.
+
+    Restart-safe by construction, not just by retrying: the id list is read
+    once, but each event is re-checked (`status in (pending, failed)`)
+    inside its *own* transaction right before acting on it, so a second
+    process racing this one (or this same process retried after a crash)
+    can never act twice on an event another run already finished -- the
+    re-check, not just the initial query, is what makes a concurrent or
+    restarted delivery pass safe.
+
+    `failed` is retried every processing run, unbounded -- D3 has no real
+    failure mode to design a backoff/max-attempts policy against yet (the
+    mock only fails when a test explicitly configures it to); that belongs
+    with the real client in D4, not invented here.
+    """
+    now_value = now or utc_now()
+    with session_factory() as session:
+        pending_ids = list(
+            session.scalars(
+                select(NotificationEvent.id)
+                .where(NotificationEvent.status.in_(("pending", "failed")))
+                .order_by(NotificationEvent.decided_at, NotificationEvent.id)
+            )
+        )
+
+    attempted = sent = failed = 0
+    for event_id in pending_ids:
+        with session_factory() as session, session.begin():
+            event = session.get(NotificationEvent, event_id)
+            if event is None or event.status not in ("pending", "failed"):
+                continue  # already resolved by a concurrent or prior run
+            channel = session.get(NotificationChannel, event.channel_id)
+            if channel is None or not channel.enabled:
+                continue
+            client = client_factory(channel)
+            attempted += 1
+            event.attempt_count += 1
+            event.last_attempted_at = now_value
+            event.updated_at = now_value
+            result = client.send_message(chat_id=channel.target_chat_id or "", text=event.message)
+            if result.delivered:
+                event.status = "sent"
+                event.sent_at = now_value
+                event.last_error = None
+                sent += 1
+            else:
+                event.status = "failed"
+                event.last_error = result.error
+                failed += 1
+        # `with session.begin()` commits here, per event -- see the module
+        # docstring for why this cannot be one transaction for the batch.
+
     return NotificationDeliverySummary(delivery_attempted=attempted, delivery_sent=sent, delivery_failed=failed)
 
 
 def evaluate_and_process_notifications(
-    session: Session,
+    session_factory: sessionmaker[Session],
     *,
     now: datetime | None = None,
     client_factory: Callable[[NotificationChannel], TelegramClient] = _default_client_factory,
 ) -> NotificationProcessingSummary:
     now_value = now or utc_now()
-    decision = decide_notification_events(session, now=now_value)
-    delivery = deliver_pending_notifications(session, now=now_value, client_factory=client_factory)
+    with session_factory() as session, session.begin():
+        decision = decide_notification_events(session, now=now_value)
+    delivery = deliver_pending_notifications(session_factory, now=now_value, client_factory=client_factory)
     return NotificationProcessingSummary(
         policies_evaluated=decision.policies_evaluated,
         events_created=decision.events_created,
@@ -274,35 +339,3 @@ def _render_message(
     return f"🟢 {incident.rule_code}{device_part} — {asset_name} recuperado{duration}"
 
 
-def _deliver_pending(
-    session: Session, *, client_factory: Callable[[NotificationChannel], TelegramClient], now: datetime
-) -> tuple[int, int, int]:
-    # `failed` is retried every processing run, unbounded -- D3 has no real
-    # failure mode to design a backoff/max-attempts policy against yet
-    # (the mock only fails when a test explicitly configures it to); that
-    # belongs with the real client in D4, not invented here.
-    pending = list(
-        session.scalars(select(NotificationEvent).where(NotificationEvent.status.in_(("pending", "failed"))))
-    )
-    attempted = sent = failed = 0
-    for event in pending:
-        channel = session.get(NotificationChannel, event.channel_id)
-        if channel is None or not channel.enabled:
-            continue
-        client = client_factory(channel)
-        attempted += 1
-        event.attempt_count += 1
-        event.last_attempted_at = now
-        event.updated_at = now
-        result = client.send_message(chat_id=channel.target_chat_id or "", text=event.message)
-        if result.delivered:
-            event.status = "sent"
-            event.sent_at = now
-            event.last_error = None
-            sent += 1
-        else:
-            event.status = "failed"
-            event.last_error = result.error
-            failed += 1
-    session.flush()
-    return attempted, sent, failed

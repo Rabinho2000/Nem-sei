@@ -26,7 +26,25 @@ from nemsei.notifications.service import (
     deliver_pending_notifications,
     evaluate_and_process_notifications,
 )
-from nemsei.notifications.telegram_client import MockTelegramClient
+from nemsei.notifications.telegram_client import DeliveryResult, MockTelegramClient
+
+
+class _CrashingClient:
+    """Simulates the *worker process* dying mid-delivery -- an unhandled
+    exception, not a delivery failure the client reports. Only used to
+    prove restart safety (proof: restart do processador); never a stand-in
+    for a real Telegram error, which is `MockTelegramClient(fail_for_chat_ids=...)`.
+    """
+
+    def __init__(self, crash_after: int) -> None:
+        self.calls = 0
+        self.crash_after = crash_after
+
+    def send_message(self, *, chat_id: str, text: str) -> DeliveryResult:
+        self.calls += 1
+        if self.calls > self.crash_after:
+            raise RuntimeError("simulated worker crash mid-delivery")
+        return DeliveryResult(delivered=True)
 
 
 def upgrade(settings, monkeypatch) -> None:
@@ -308,8 +326,7 @@ def test_a_failed_delivery_is_recorded_and_never_falsely_marked_sent(factory, as
         decide_notification_events(session, now=utc(10))
 
     failing_client = MockTelegramClient(fail_for_chat_ids=frozenset({"chat-fails"}))
-    with factory() as session, session.begin():
-        summary = deliver_pending_notifications(session, now=utc(10, 1), client_factory=lambda _channel: failing_client)
+    summary = deliver_pending_notifications(factory, now=utc(10, 1), client_factory=lambda _channel: failing_client)
 
     assert summary.delivery_attempted == 1
     assert summary.delivery_sent == 0
@@ -330,15 +347,15 @@ def test_a_failed_delivery_can_be_retried_and_then_succeeds(factory, asset_id) -
         decide_notification_events(session, now=utc(10))
 
     failing_client = MockTelegramClient(fail_for_chat_ids=frozenset({"chat-fails"}))
-    with factory() as session, session.begin():
-        deliver_pending_notifications(session, now=utc(10, 1), client_factory=lambda _channel: failing_client)
+    deliver_pending_notifications(factory, now=utc(10, 1), client_factory=lambda _channel: failing_client)
 
     succeeding_client = MockTelegramClient()  # a later retry, e.g. after the operator fixed the chat id
-    with factory() as session, session.begin():
-        summary = deliver_pending_notifications(session, now=utc(11), client_factory=lambda _channel: succeeding_client)
+    summary = deliver_pending_notifications(factory, now=utc(11), client_factory=lambda _channel: succeeding_client)
 
     assert summary.delivery_sent == 1
-    row = events(factory)[0]
+    rows = events(factory)
+    assert len(rows) == 1  # the retry updated the same row, never created a second one
+    row = rows[0]
     assert row.status == "sent"
     assert row.sent_at is not None
     assert row.last_error is None
@@ -362,8 +379,7 @@ def test_a_disabled_channel_never_calls_a_client_at_all(factory, asset_id) -> No
     def explode(_channel):
         raise AssertionError("a disabled channel must never reach the client factory")
 
-    with factory() as session, session.begin():
-        summary = deliver_pending_notifications(session, now=utc(11), client_factory=explode)
+    summary = deliver_pending_notifications(factory, now=utc(11), client_factory=explode)
     assert summary.delivery_attempted == 0
 
 
@@ -375,6 +391,51 @@ def test_a_disabled_policy_produces_no_events_at_all(factory, asset_id) -> None:
         summary = decide_notification_events(session, now=utc(10))
     assert summary.policies_evaluated == 0
     assert events(factory) == []
+
+
+# --- restart safety of the delivery processor itself ---------------------------
+
+
+def test_a_crash_mid_batch_never_resends_an_already_delivered_message(factory, asset_id) -> None:
+    """Each event commits in its own transaction (notifications/service.py),
+    so a crash right after event 1's real send but before event 2's can only
+    ever leave event 2 unresolved -- event 1 must never be attempted again on
+    the next run ("restart" of the processor)."""
+    with factory() as session, session.begin():
+        device_a = create_device(session, asset_id=asset_id, device_kind="inverter", label="A", valid_from=date(2026, 1, 1))
+        device_b = create_device(session, asset_id=asset_id, device_kind="inverter", label="B", valid_from=date(2026, 1, 1))
+        channel = make_channel(session)
+        make_policy(session, channel=channel)
+        make_incident(session, asset_id=asset_id, device_id=device_a.id, rule_code="device_unavailable", severity="critical", opened_at=utc(9))
+        make_incident(session, asset_id=asset_id, device_id=device_b.id, rule_code="stale_reading", severity="warning", opened_at=utc(9))
+        decide_notification_events(session, now=utc(10))
+
+    assert len(events(factory)) == 2
+
+    crashing_client = _CrashingClient(crash_after=1)
+    with pytest.raises(RuntimeError):
+        deliver_pending_notifications(factory, now=utc(10, 1), client_factory=lambda _channel: crashing_client)
+
+    rows = events(factory)
+    assert len(rows) == 2  # the crash never lost or duplicated a row
+    sent_rows = [row for row in rows if row.status == "sent"]
+    pending_rows = [row for row in rows if row.status == "pending"]
+    assert len(sent_rows) == 1  # event 1's real send survives, committed on its own
+    assert len(pending_rows) == 1  # event 2 never got a chance to commit anything
+    assert crashing_client.calls == 2
+
+    # "Restart": a fresh, working client resumes -- it must only see what is
+    # still pending, never the one already sent.
+    recovering_client = MockTelegramClient()
+    summary = deliver_pending_notifications(factory, now=utc(11), client_factory=lambda _channel: recovering_client)
+    assert summary.delivery_attempted == 1
+    assert summary.delivery_sent == 1
+    assert len(recovering_client.sent) == 1  # never re-sent the one that already went out
+
+    final_rows = events(factory)
+    assert len(final_rows) == 2  # still exactly two events, never duplicated
+    assert all(row.status == "sent" for row in final_rows)
+    assert sent_rows[0].sent_at == [row for row in final_rows if row.id == sent_rows[0].id][0].sent_at  # untouched by the restart
 
 
 # --- scope: severity, rule_codes, baseline -------------------------------------
@@ -428,7 +489,8 @@ def test_evaluate_and_process_notifications_decides_and_delivers_in_one_call(fac
         channel = make_channel(session)
         make_policy(session, channel=channel)
         make_incident(session, asset_id=asset_id, opened_at=utc(9))
-        summary = evaluate_and_process_notifications(session, now=utc(10))
+
+    summary = evaluate_and_process_notifications(factory, now=utc(10))
 
     assert summary.events_created == 1
     assert summary.delivery_sent == 1
