@@ -31,6 +31,13 @@ from nemsei.diagnostics.models import DeviceStatusFact
 
 SEVERITY_ORDER = {"critical": 0, "warning": 1, "info": 2}
 
+# Bumped whenever a rule's *logic* changes meaningfully (a threshold, a new
+# condition, a removed rule) -- persisted verbatim as `DiagnosticIncident
+# .detector_version` (D1, docs/v2/DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md) so
+# an old incident's provenance always says which rule set actually detected
+# it, even after this module evolves. Not bumped for comments/refactors.
+RULES_VERSION = "1"
+
 # Below this power, two readings are both "essentially off" and comparing
 # their ratio would be noise (e.g. 0.02kW vs 0.05kW is a 150% "disparity"
 # that means nothing). Chosen as a conservative floor, not tuned to any one

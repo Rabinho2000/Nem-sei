@@ -34,6 +34,13 @@ class Scheduler:
                 max_cycles=self.settings.device_status_poll_max_cycles,
             )
             created = created or device_created
+        # D1: off by default, no connection id or cap needed -- this evaluates
+        # every asset from already-persisted facts, never calls a provider.
+        if self.settings.diagnostic_incident_evaluation_enabled:
+            _incident_job, incident_created = self.repository.enqueue_due_incident_evaluation(
+                interval_minutes=self.settings.diagnostic_incident_evaluation_interval_minutes,
+            )
+            created = created or incident_created
         return created
 
     def run_forever(self) -> None:

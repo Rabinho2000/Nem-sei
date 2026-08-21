@@ -17,7 +17,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Iterable
 
-from reportlab.lib.colors import Color, HexColor
+from reportlab.lib.colors import HexColor
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -32,6 +32,7 @@ from nemsei.reporting.models import (
     ReportingDatasetRow,
 )
 from nemsei.shared.clock import utc_now
+from nemsei.shared.json_safe import json_safe
 
 
 def month_starts(period_start: date, period_end: date) -> list[date]:
@@ -257,32 +258,13 @@ def _row_digest_payload(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def json_safe(value: Any) -> Any:
-    """Recursively reduce a payload to what the JSON column can actually store.
-
-    `assemble_asset_report`'s payload carries real `date` objects, because that
-    is what the renderers want to format, and `customer_pdf.prepare_customer_report`
-    always adds `tariff_rows`, a list of `(label, value, reportlab.lib.colors.Color)`
-    tuples used to draw the donut chart. PostgreSQL's JSON column has no opinion
-    on how to serialize either, and SQLAlchemy does not fall back to `str()` the
-    way `digest_of` does — it raises. This is the one place that decides the
-    on-disk representation, applied uniformly so the same payload always
-    produces the same stored JSON and the same digest.
-    """
-    if isinstance(value, dict):
-        return {key: json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [json_safe(item) for item in value]
-    if isinstance(value, (datetime, date)):
-        return value.isoformat()
-    if isinstance(value, Decimal):
-        return float(value)
-    if isinstance(value, Color):
-        # A round-trippable hex string, not a description: `HexColor(hexval())`
-        # reconstructs the identical Color, which matters because the renderer
-        # compares colors by equality (`if color == NAVY`) to apply theming.
-        return value.hexval()
-    return value
+# `json_safe` now lives in `nemsei.shared.json_safe` (imported above) --
+# moved out of this module (D1, docs/v2/DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md)
+# because `diagnostics/incidents.py` hit the exact same "JSON column raises on
+# Decimal/date" problem this module solved first, persisting a plain evidence
+# dict that happened to carry a `Decimal`. Everything below still calls
+# `json_safe(...)` exactly as before -- only where the function is defined
+# changed.
 
 
 def rehydrate_snapshot_payload(payload: dict[str, Any]) -> dict[str, Any]:

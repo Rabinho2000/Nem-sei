@@ -671,6 +671,104 @@ class JobRepository:
                 session.expunge(existing)
                 return existing, False
 
+    def enqueue_due_incident_evaluation(
+        self, *, interval_minutes: int, now: datetime | None = None
+    ) -> tuple[Job | None, bool]:
+        """Enqueue one diagnostic-incident evaluation cycle when due.
+
+        D1 (`docs/v2/DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md`). Same shape as
+        `enqueue_due_device_status_poll` (persisted `ScheduleState`, restart
+        -safe, idempotent dedupe key) minus the two things that job needs and
+        this one does not: a `connection_id` (this evaluates every asset that
+        owns a device, not one provider connection) and a lifetime cap (this
+        makes zero provider calls -- it only reads already-persisted
+        `device_status_facts` and writes `diagnostic_incidents` -- so there is
+        no external budget to protect).
+        """
+        if interval_minutes <= 0:
+            raise ValueError("Diagnostic incident evaluation interval must be positive.")
+        now_value = now or utc_now()
+        key = "diagnostics.evaluate_incidents"
+        try:
+            with self._immediate_session() as session:
+                schedule = session.get(ScheduleState, key)
+                if schedule is not None and as_utc(schedule.next_run_at) > now_value:
+                    return None, False
+                slot = as_utc(schedule.next_run_at) if schedule is not None else now_value
+                dedupe_key = f"{key}:{slot.isoformat()}"
+                existing = session.scalar(
+                    select(Job).where(
+                        Job.job_type == "diagnostics.evaluate_incidents",
+                        Job.dedupe_key == dedupe_key,
+                        Job.status.in_(ACTIVE_STATUSES),
+                    )
+                )
+                if existing is None:
+                    job = Job(
+                        job_type="diagnostics.evaluate_incidents",
+                        status="queued",
+                        payload_json={"scheduled_for": slot.isoformat()},
+                        dedupe_key=dedupe_key,
+                        # Same tier as device_status.poll: diagnostics ranks
+                        # below production/report jobs.
+                        priority=150,
+                        available_at=now_value,
+                        attempt_count=0,
+                        max_attempts=3,
+                        created_at=now_value,
+                        updated_at=now_value,
+                    )
+                    session.add(job)
+                    session.flush()
+                    self._event(
+                        session,
+                        job_id=job.id,
+                        event_type="enqueued",
+                        attempt=0,
+                        from_status=None,
+                        to_status="queued",
+                        actor_source="scheduler",
+                        metadata={"schedule_key": key, "dedupe_key": dedupe_key},
+                        occurred_at=now_value,
+                    )
+                    created = True
+                else:
+                    job = existing
+                    created = False
+                if schedule is None:
+                    schedule = ScheduleState(schedule_key=key, next_run_at=slot, updated_at=now_value)
+                    session.add(schedule)
+                schedule.last_enqueued_at = now_value
+                schedule.next_run_at = slot + timedelta(minutes=interval_minutes)
+                schedule.updated_at = now_value
+                session.flush()
+                session.expunge(job)
+                return job, created
+        except IntegrityError:
+            with self._immediate_session() as session:
+                existing = session.scalar(
+                    select(Job).where(
+                        Job.job_type == "diagnostics.evaluate_incidents",
+                        Job.dedupe_key == dedupe_key,
+                        Job.status.in_(ACTIVE_STATUSES),
+                    )
+                )
+                if existing is None:
+                    raise
+                self._event(
+                    session,
+                    job_id=existing.id,
+                    event_type="dedupe_reused",
+                    attempt=existing.attempt_count,
+                    from_status=existing.status,
+                    to_status=existing.status,
+                    actor_source="scheduler",
+                    metadata={"schedule_key": key, "dedupe_key": dedupe_key},
+                    occurred_at=now_value,
+                )
+                session.expunge(existing)
+                return existing, False
+
     def events_for(self, job_id: int) -> list[JobEvent]:
         with self.session_factory() as session:
             return list(session.scalars(select(JobEvent).where(JobEvent.job_id == job_id).order_by(JobEvent.id)))

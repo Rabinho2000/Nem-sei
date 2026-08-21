@@ -1,0 +1,31 @@
+# D1 (docs/v2/DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md): turns on the periodic
+# diagnostic-incident evaluator for the real, standing scheduler/worker
+# containers. Deliberately a separate compose override, not an edit to the
+# shared .env.v2 -- same reasoning as
+# docker-compose.v2.device-status-canary.yml: scope the change to exactly
+# the two services that need it, and never touch web/migrate.
+#
+# Unlike that canary override, this one makes zero provider calls (it only
+# reads already-persisted device_status_facts and writes
+# diagnostic_incidents), so there is no connection id, no call budget, and no
+# hard cap to reason about here -- it runs across every asset that owns a
+# device, by design.
+#
+# Kill switch: drop this file from the next `up -d` (or flip ENABLED to
+# "false" here and redeploy) -- either stops new evaluations immediately and
+# is restart-safe; no incident history is touched either way.
+name: nemsei-v2
+
+# Live-verified 2026-08-21 at a 5-minute interval (two real cycles against
+# production: 642 real incidents opened from the V1-imported history, then
+# reconfirmed -- same 642 rows, occurrence_count 1->2, not duplicated). Left
+# running at the code default (15 minutes, config.py) for steady state --
+# see docs/v2/DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md's D1 write-up.
+services:
+  scheduler:
+    environment:
+      NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED: "true"
+
+  worker:
+    environment:
+      NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED: "true"

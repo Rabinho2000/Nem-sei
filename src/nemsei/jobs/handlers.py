@@ -7,6 +7,7 @@ from typing import Any
 from sqlalchemy.orm import Session, sessionmaker
 
 from nemsei.config import Settings
+from nemsei.diagnostics.incidents import evaluate_and_persist_incidents
 from nemsei.integrations.fusionsolar.device_status import FusionSolarDeviceStatusService
 from nemsei.integrations.fusionsolar.production import FusionSolarProductionService
 from nemsei.jobs.repository import ClaimedJob
@@ -41,6 +42,10 @@ def execute(
         if settings is None or session_factory is None:
             raise ValueError("Device status jobs require worker settings and sessions.")
         return _execute_device_status_poll(job, settings=settings, session_factory=session_factory)
+    if job.job_type == "diagnostics.evaluate_incidents":
+        if session_factory is None:
+            raise ValueError("Diagnostic incident evaluation requires a worker session factory.")
+        return _execute_incident_evaluation(session_factory=session_factory)
     raise ValueError(f"Unsupported V2 foundation job type: {job.job_type}")
 
 
@@ -112,3 +117,23 @@ def _execute_device_status_poll(job: ClaimedJob, *, settings: Settings, session_
     if result.status in {"failed", "rate_limited", "deferred", "partial"}:
         raise RetryableJobError(f"Device status poll stopped with {result.status}.")
     return JobOutcome(status="success", result=result_json)
+
+
+def _execute_incident_evaluation(*, session_factory: sessionmaker[Session]) -> JobOutcome:
+    """One diagnostic-incident evaluation pass. No provider calls, no retry logic
+    needed beyond the worker's own generic retry: a failure here (e.g. a
+    transient DB error) never writes a partial row, because
+    `evaluate_and_persist_incidents` flushes per asset inside the caller's
+    transaction and the whole job either commits or rolls back as one unit.
+    """
+    with session_factory() as session, session.begin():
+        summary = evaluate_and_persist_incidents(session)
+    return JobOutcome(
+        status="success",
+        result={
+            "assets_evaluated": summary.assets_evaluated,
+            "incidents_opened": summary.incidents_opened,
+            "incidents_confirmed": summary.incidents_confirmed,
+            "incidents_resolved": summary.incidents_resolved,
+        },
+    )

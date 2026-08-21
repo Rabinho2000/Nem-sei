@@ -101,6 +101,15 @@ class Settings:
     # unattended run can never run away unbounded even if nobody is watching
     # it. docs/v2/DEVICE_TELEMETRY.md §9.
     device_status_poll_max_cycles: int | None = None
+    # M7 Fatia 5 / D1 (docs/v2/DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md): the
+    # periodic diagnostic-incident evaluator. Off by default, same pattern as
+    # every other recurring behaviour this codebase adds -- but unlike
+    # device-status polling this makes zero provider calls (it only reads
+    # already-persisted device_status_facts and writes diagnostic_incidents),
+    # so it needs neither a connection id nor a call-budget hard cap; it runs
+    # across every asset that owns a device, by design.
+    diagnostic_incident_evaluation_enabled: bool = False
+    diagnostic_incident_evaluation_interval_minutes: int = 15
     testing: bool = False
 
     @property
@@ -140,6 +149,12 @@ class Settings:
             device_status_poll_interval_minutes=int(os.environ.get("NEMSEI_V2_DEVICE_STATUS_POLL_INTERVAL_MINUTES", "30")),
             device_status_poll_connection_id=_optional_int(os.environ.get("NEMSEI_V2_DEVICE_STATUS_POLL_CONNECTION_ID")),
             device_status_poll_max_cycles=_optional_int(os.environ.get("NEMSEI_V2_DEVICE_STATUS_POLL_MAX_CYCLES")),
+            diagnostic_incident_evaluation_enabled=parse_bool(
+                os.environ.get("NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED"), default=False
+            ),
+            diagnostic_incident_evaluation_interval_minutes=int(
+                os.environ.get("NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_INTERVAL_MINUTES", "15")
+            ),
             testing=parse_bool(os.environ.get("NEMSEI_V2_TESTING"), default=False),
         )
 
@@ -170,6 +185,8 @@ class Settings:
             self.device_status_poll_max_cycles is None or self.device_status_poll_max_cycles <= 0
         ):
             raise ConfigurationError("Device status polling requires a positive lifetime cycle cap; there is no uncapped mode.")
+        if self.diagnostic_incident_evaluation_interval_minutes <= 0:
+            raise ConfigurationError("Diagnostic incident evaluation interval must be positive.")
         if min(self.worker_poll_seconds, self.worker_lease_seconds, self.scheduler_lease_seconds, self.db_pool_size, self.db_statement_timeout_ms, self.db_lock_timeout_ms, self.db_idle_transaction_timeout_ms, self.db_pool_recycle_seconds, self.production_max_source_days, self.production_reconciliation_max_source_days, self.production_backfill_max_source_days, self.production_backfill_chunk_days) <= 0 or self.db_max_overflow < 0:
             raise ConfigurationError("V2 timing and pool settings must be positive.")
         if self.production_backfill_chunk_days > self.production_backfill_max_source_days:

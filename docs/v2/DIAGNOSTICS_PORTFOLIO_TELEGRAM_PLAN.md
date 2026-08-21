@@ -1,7 +1,10 @@
-# Diagnostics UI, Portfolio Diagnostics, Telegram: plano (não implementado)
+# Diagnostics UI, Portfolio Diagnostics, Telegram: plano e progresso
 
-Documento de planeamento apenas — sem código, sem migrations, sem alterações à
-BD. Auditoria feita contra o V2 real e o V1 real (código, não memória), 2026-08-21.
+Auditoria feita contra o V2 real e o V1 real (código, não memória), 2026-08-21.
+O plano abaixo (secções 1-18) foi escrito **antes** de qualquer implementação,
+como pedido. **D1 foi aprovado e está implementado, testado e LIVE VERIFIED**
+contra a base de dados de produção real — ver §19 no fim. D2-D6 continuam por
+implementar, sem aprovação ainda.
 
 ## 1. Estado actual real
 
@@ -526,3 +529,123 @@ alteração face à auditoria anterior. Nenhuma fatia abaixo depende disto.
 5. **D4** — só depois de D3 estar testada e revista: é o primeiro momento
    em que uma mensagem real sai para o Telegram, e deve ficar escopada ao
    canário, tal como todo o resto desta sessão.
+
+## 19. D1 — implementado, testado, LIVE VERIFIED (2026-08-21)
+
+`findings.py` está inalterado, exactamente como pedido: continua recomputado
+por pedido, sem persistência, a única fonte da lógica de regras.
+
+### O que foi construído
+
+- `diagnostics/models.py`: `DiagnosticIncident` — identidade
+  `(rule_code, asset_id, device_id)`, `status` (`open`/`resolved`),
+  `opened_at`/`last_observed_at`/`resolved_at`, `occurrence_count`,
+  `detector_version` (= `findings.RULES_VERSION`, provenance da regra),
+  `evidence_json` (snapshot do `evidence` do finding). Um único incidente
+  `open` por identidade garantido por um índice único parcial funcional
+  (`COALESCE(device_id, -1)`, porque Postgres trata cada `NULL` como
+  distinto — um `UniqueConstraint` simples deixaria coexistir dois
+  incidentes `open` para o mesmo finding ao nível de asset).
+- `diagnostics/incidents.py`: `evaluate_and_persist_incidents` — uma
+  passagem por avaliação, por asset, que chama `evaluate_asset_findings`
+  (nunca reimplementa uma regra) e reconcilia com os incidentes `open`
+  já persistidos: abre o que é novo, confirma o que continua, resolve o
+  que deixou de aparecer.
+- Migration `0017_diagnostic_incidents` (aditiva, nenhuma tabela existente
+  tocada; `downgrade()` recusa-se se houver linhas, tal como `0015`/`0016`).
+- `Job`/`ScheduleState`/`Scheduler` reutilizados sem tabela nova:
+  `JobRepository.enqueue_due_incident_evaluation` (sem `connection_id` nem
+  cap — zero chamadas a provider, nunca precisou de nenhum dos dois) e
+  `jobs.handlers._execute_incident_evaluation`, o job type
+  `diagnostics.evaluate_incidents`.
+- `Settings.diagnostic_incident_evaluation_enabled`/`_interval_minutes`
+  (desligado por omissão, 15 min por omissão).
+
+### Um bug real encontrado ao tentar persistir, não hipotético
+
+`DiagnosticFinding.evidence` inclui valores `Decimal` (ex.:
+`active_power_kw`) — a primeira tentativa de gravar um incidente falhou com
+`TypeError: Object of type Decimal is not JSON serializable`. A mesma classe
+de bug que `reporting/datasets.py` já tinha resolvido para outro payload.
+Corrigido correctamente, não com um workaround local: `json_safe` foi
+extraído para `nemsei/shared/json_safe.py` (utilizado agora por
+`reporting/datasets.py` e por `diagnostics/incidents.py`), em vez de
+duplicar a função.
+
+### Testado
+
+54 testes novos: `test_diagnostics_incidents.py` (10 — identidade,
+provenance, dedup por episódio, idempotência, restart, resolução com
+duração, novo episódio após resolução não reutiliza a linha, finding ao
+nível de asset com `device_id` nulo, o índice único a recusar um duplicado
+mesmo contornando o serviço, dispositivos independentes não se
+contaminam), `test_jobs.py`/`test_scheduler.py` (agendamento idempotente,
+restart-safe, ticks concorrentes só criam um job, o `Scheduler.run_once()`
+real liga/desliga com a config), `test_worker.py` (o pipeline completo
+Job→Scheduler→Worker→handler, não a função chamada directamente). Suite
+completa da V2: **535 passed, 1 skipped**, sem regressões.
+
+### LIVE VERIFIED contra produção real
+
+Antes de tocar na BD viva: `pg_dump -Fc` verificado (cabeçalho `PGDMP`
+confirmado). Migration `0017` aplicada via o serviço `migrate` canónico
+(`docker compose ... run --rm migrate`), não SQL manual. Imagens
+`web`/`worker`/`scheduler` reconstruídas a partir do código committed
+(`docker compose ... up -d --build`) — não `docker cp` avulso desta vez,
+dado o número de ficheiros tocados.
+
+Ligado via `docker-compose.v2.diagnostic-incidents.yml` (override,
+`scheduler`/`worker` apenas, `.env.v2` nunca tocado — mesmo padrão do
+override do canário). Dois ciclos reais observados, 5 min de intervalo:
+
+| Ciclo | Hora (UTC) | Incidentes abertos | Incidentes confirmados | Total de incidentes `open` |
+| --- | --- | --- | --- | --- |
+| 1 (job 96) | 10:38:59 | 642 | 0 | 642 |
+| 2 (job 97) | 10:44:00 | 0 | 642 | 642 |
+
+**Prova directa, com dados reais de produção, do requisito central: o mesmo
+problema persistente continua a ser um único incidente.** Nenhuma linha
+duplicada entre os dois ciclos — os mesmos 642 incidentes, `occurrence_count`
+1→2, `opened_at` inalterado (datas reais de Maio-Julho 2026, herdadas do
+histórico importado da V1 via `active_since`), `last_observed_at` avançado
+para a hora real de cada ciclo.
+
+Composição real dos 642: 323 `stale_reading` + 319 `device_unknown_status`
+— nenhum `device_unavailable`/disparidade entre pares hoje. Isto não é uma
+falha do motor: reflecte honestamente o que `DIAGNOSTICS.md` já tinha
+documentado — a maioria dos 325 dispositivos importados da V1 só tem uma
+leitura histórica esporádica, sem cadência viva, e uma parte relevante dos
+códigos de estado brutos da V1 nunca caiu em `available`/`unavailable`
+reconhecidos pelo classificador (correctamente devolvendo `unknown`, não
+inventando um valor). Um resultado honesto, não um resultado bonito.
+
+**A prova de "a recuperação fecha o incidente" não foi feita contra produção
+real, deliberadamente** — os 325 dispositivos importados da V1 não têm
+nenhuma leitura nova a chegar (sem canário activo mais além do que já existia),
+pelo que não há nenhum episódio real a recuperar-se dentro desta janela.
+Forjar uma leitura de recuperação sintética na BD de produção violaria a
+honestidade dos dados que esta sessão inteira defende. Em vez disso, essa
+propriedade está provada pela suite de testes automatizada, contra um
+Postgres real (não SQLite, não mocks) —
+`test_recovery_resolves_the_incident_and_preserves_its_duration` e
+`test_a_new_episode_after_resolution_is_a_new_incident_not_a_reused_row`,
+ambos verdes. Quando o canário de disponibilidade (§10 de
+`DEVICE_TELEMETRY.md`, ainda bloqueado) alguma vez recuperar um dispositivo
+real, essa mesma propriedade fica automaticamente observável em produção
+também, sem alterar nada aqui.
+
+### Estado, config actual em produção
+
+`NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED=true` para
+`scheduler`/`worker`, intervalo por omissão (15 min, código), `web`/`migrate`
+inalterados. Kill switch: remover
+`docker-compose.v2.diagnostic-incidents.yml` do próximo `up -d`, ou pôr
+`ENABLED=false` nesse ficheiro e redeployar — nenhum dos dois apaga
+histórico de incidentes.
+
+### Milestone
+
+**D1: IMPLEMENTED, TESTED, LIVE VERIFIED.** Nenhum Telegram, nenhuma
+chamada a provider nova, nenhuma migration destrutiva. D2 (UI de
+Diagnostics Overview/Incidents) é o próximo passo natural — já tem dados
+reais prontos para mostrar.

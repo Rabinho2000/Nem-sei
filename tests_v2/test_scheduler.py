@@ -80,3 +80,29 @@ def test_scheduler_never_enqueues_device_status_poll_when_disabled(settings, mon
     with build_session_factory(engine)() as session:
         polls = session.scalars(select(Job).where(Job.job_type == "device_status.poll")).all()
     assert polls == []
+
+
+def test_scheduler_enqueues_incident_evaluation_when_enabled(settings, monkeypatch) -> None:
+    """D1: no connection id, no cap needed -- this makes no provider calls."""
+    upgrade(settings, monkeypatch)
+    incident_settings = dataclasses.replace(
+        settings, diagnostic_incident_evaluation_enabled=True, diagnostic_incident_evaluation_interval_minutes=15
+    )
+    scheduler = Scheduler(incident_settings, owner_token="scheduler-incidents")
+    assert scheduler.run_once() is True
+    assert scheduler.run_once() is False
+
+    engine = build_engine(settings)
+    with build_session_factory(engine)() as session:
+        jobs = session.scalars(select(Job).where(Job.job_type == "diagnostics.evaluate_incidents")).all()
+    assert len(jobs) == 1
+
+
+def test_scheduler_never_enqueues_incident_evaluation_when_disabled(settings, monkeypatch) -> None:
+    upgrade(settings, monkeypatch)
+    scheduler = Scheduler(settings, owner_token="scheduler-incidents-off")
+    scheduler.run_once()
+    engine = build_engine(settings)
+    with build_session_factory(engine)() as session:
+        jobs = session.scalars(select(Job).where(Job.job_type == "diagnostics.evaluate_incidents")).all()
+    assert jobs == []
