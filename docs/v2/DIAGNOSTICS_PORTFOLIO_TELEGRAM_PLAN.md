@@ -715,7 +715,11 @@ regressões (ver relatório da sessão).
 
 ### Milestone
 
-**D2: IMPLEMENTED, TESTED.** Ainda não live-verified num browser real contra
-produção (a lógica já corre lá desde D1 — os 642 incidentes reais já
-existem na BD viva, prontos para esta UI os mostrar) — sem alteração de
-dados, um deploy de `web` chega para isso ficar visível.
+**D2: IMPLEMENTED, TESTED, deployed to production.** `web` reconstruído a
+partir do código committed e redeployado (`docker compose ... up -d --build
+web`), sem alteração de dados. Confirmado a responder correctamente sem
+erro de servidor (`/diagnostics` e `/diagnostics/incidents`, ambos `302`
+para login, não `500`). **Não confirmado visualmente num browser
+autenticado** — esta sessão não tem a credencial de administrador real, e
+não tentou contorná-la; os 642 incidentes reais de D1 estão prontos na BD
+para esta UI os mostrar assim que alguém entrar.
