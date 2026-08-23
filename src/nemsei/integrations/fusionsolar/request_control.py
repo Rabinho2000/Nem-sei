@@ -1,12 +1,15 @@
 """Persisted request-control wrapper shared by FusionSolar read capabilities."""
 from __future__ import annotations
 
+import contextlib
+import os
 from collections.abc import Callable
 from typing import TypeVar
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from nemsei.integrations.fusionsolar import v1_ownership
 from nemsei.integrations.fusionsolar.client import FusionSolarClientError
 from nemsei.providers.errors import ProviderError, ProviderErrorCode
 from nemsei.sync.models import ProviderRequestAttempt, ProviderRequestState
@@ -14,6 +17,14 @@ from nemsei.sync.service import record_request_result, reserve_request
 
 
 T = TypeVar("T")
+
+# Mandatory by default while V1 is active, per the shared-account design in
+# docs/v2/FUSIONSOLAR_OWNERSHIP_WINDOW.md -- every real HTTP call this
+# controller makes must hold V1's account lease first. This exists only as
+# an explicit, loud escape hatch for a future point where V1 no longer runs
+# FusionSolar at all; it is not a performance knob and must not be set to
+# skip the check for convenience while V1 is still live.
+_SKIP_V1_OWNERSHIP_CHECK = os.environ.get("NEMSEI_V2_SKIP_V1_OWNERSHIP_CHECK", "").strip().lower() in {"1", "true", "yes"}
 
 
 class FusionSolarRequestController:
@@ -49,9 +60,26 @@ class FusionSolarRequestController:
                     "FusionSolar request is deferred by persisted provider state.",
                     transient=True,
                 )
+            v1_lease = (
+                v1_ownership.lease_for(
+                    session_factory=self._sessions,
+                    connection_id=connection_id,
+                    owner=f"nemsei-v2-req-{attempt_id}",
+                )
+                if not _SKIP_V1_OWNERSHIP_CHECK
+                else contextlib.nullcontext()
+            )
             try:
-                value = operation()
+                with v1_lease:
+                    value = operation()
                 error = None
+            except v1_ownership.V1LeaseUnavailable as exc:
+                self._finalize(
+                    state_id,
+                    attempt_id,
+                    ProviderError(ProviderErrorCode.RATE_LIMITED, f"V1 ownership unavailable: {exc}", transient=True),
+                )
+                return None, ProviderError(ProviderErrorCode.RATE_LIMITED, f"V1 ownership unavailable: {exc}", transient=True)
             except FusionSolarClientError as exc:
                 value, error = None, exc.error
             except Exception:

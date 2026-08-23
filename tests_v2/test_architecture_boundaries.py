@@ -84,6 +84,12 @@ def test_network_dependency_is_confined_to_provider_http_clients() -> None:
     allowed = {
         SOURCE / "integrations" / "fusionsolar" / "client.py",
         SOURCE / "integrations" / "sigenergy" / "client.py",
+        # A second, deliberately narrow network client: the V1 ownership
+        # broker's lease API (docs/v2/FUSIONSOLAR_OWNERSHIP_WINDOW.md). Not
+        # a provider client, but the same shape of concern this test
+        # guards -- one small, single-purpose file making the only calls of
+        # its kind, not network code scattered through the domain packages.
+        SOURCE / "integrations" / "fusionsolar" / "v1_ownership.py",
     }
     for package in packages:
         for path in package.rglob("*.py"):

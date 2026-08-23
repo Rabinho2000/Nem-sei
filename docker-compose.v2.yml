@@ -20,6 +20,28 @@ name: nemsei-v2
 x-v2-environment: &v2-environment
   NEMSEI_V2_DATABASE_URL_FILE: /run/secrets/v2_database_url
 
+# FusionSolar-call environment shared by worker and scheduler only (web and
+# migrate never call a provider). NEMSEI_V1_OWNERSHIP_BROKER_URL points at
+# the separate nemsei-v1-fusionsolar-broker container
+# (docker-compose.v1-ownership-broker.yml) over the Docker bridge gateway --
+# deliberately not a volume mount of V1's runtime data here, so
+# scripts/verify_v2_runtime_isolation.py's ban on this file naming V1's
+# storage location stays meaningful. See docs/v2/FUSIONSOLAR_OWNERSHIP_WINDOW.md.
+x-v2-fusionsolar-environment: &v2-fusionsolar-environment
+  NEMSEI_V2_PROVIDER_READS: "true"
+  NEMSEI_V1_OWNERSHIP_BROKER_URL: http://host.docker.internal:8765
+  NEMSEI_V1_OWNERSHIP_BROKER_TOKEN_FILE: /run/secrets/v1_broker_token
+  NEMSEI_V2_FUSIONSOLAR_PRIMARY_USERNAME_FILE: /run/secrets/fusionsolar_primary_username
+  NEMSEI_V2_FUSIONSOLAR_PRIMARY_PASSWORD_FILE: /run/secrets/fusionsolar_primary_password
+  NEMSEI_V2_FUSIONSOLAR_PRIMARY_BASE_URL: https://eu5.fusionsolar.huawei.com
+  # Operator-verified production contract (docs/v2/FUSIONSOLAR_CANARY.md):
+  # the account labels its daily KPI buckets by UTC midnight, and PVYield is
+  # verified kWh. production_contract_for() in production.py refuses to run
+  # without both of these -- a missing verification is a safe configuration
+  # failure, never a silently guessed unit or window.
+  NEMSEI_V2_FUSIONSOLAR_PRIMARY_PRODUCTION_TIMEZONE: UTC
+  NEMSEI_V2_FUSIONSOLAR_PRIMARY_PRODUCTION_UNIT: kWh
+
 services:
   postgres:
     image: postgres:16.11-bookworm@sha256:a2420e9555e2224583fe84d0bb3f0b967e69354ae3a0be55a9c14e251388c4eb
@@ -72,10 +94,14 @@ services:
     restart: unless-stopped
     env_file: ${NEMSEI_V2_ENV_FILE:-.env.v2}
     environment:
-      <<: *v2-environment
+      <<: [*v2-environment, *v2-fusionsolar-environment]
       NEMSEI_V2_PROCESS_ROLE: scheduler
+    extra_hosts: ["host.docker.internal:host-gateway"]
     secrets:
       - v2_database_url
+      - v1_broker_token
+      - fusionsolar_primary_username
+      - fusionsolar_primary_password
     depends_on: {postgres: {condition: service_healthy}}
     command: python -m nemsei.jobs.scheduler
 
@@ -84,10 +110,14 @@ services:
     restart: unless-stopped
     env_file: ${NEMSEI_V2_ENV_FILE:-.env.v2}
     environment:
-      <<: *v2-environment
+      <<: [*v2-environment, *v2-fusionsolar-environment]
       NEMSEI_V2_PROCESS_ROLE: worker
+    extra_hosts: ["host.docker.internal:host-gateway"]
     secrets:
       - v2_database_url
+      - v1_broker_token
+      - fusionsolar_primary_username
+      - fusionsolar_primary_password
     depends_on: {postgres: {condition: service_healthy}}
     command: python -m nemsei.jobs.worker
 
@@ -99,3 +129,15 @@ secrets:
     file: ${NEMSEI_V2_DATABASE_URL_SECRET_FILE:?set NEMSEI_V2_DATABASE_URL_SECRET_FILE}
   v2_postgres_password:
     file: ${NEMSEI_V2_POSTGRES_PASSWORD_SECRET_FILE:?set NEMSEI_V2_POSTGRES_PASSWORD_SECRET_FILE}
+  # V1<->V2 FusionSolar ownership coordination. Never the FusionSolar
+  # credential itself -- just the bearer token for the narrow lease API in
+  # docker-compose.v1-ownership-broker.yml.
+  v1_broker_token:
+    file: ./runtime/fusionsolar_ownership_broker/token.secret
+  # The one shared FusionSolar account's credential, per
+  # docs/v2/FUSIONSOLAR_OWNERSHIP_WINDOW.md -- same account V1 uses,
+  # coordinated through the ownership broker rather than a second account.
+  fusionsolar_primary_username:
+    file: ./secrets/fusionsolar_primary_username
+  fusionsolar_primary_password:
+    file: ./secrets/fusionsolar_primary_password
