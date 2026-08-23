@@ -22,6 +22,12 @@ from nemsei.config import Settings
 from nemsei.integrations.fusionsolar.client import FusionSolarClient, FusionSolarClientError, FusionSolarCredentials
 from nemsei.integrations.fusionsolar.request_control import FusionSolarRequestController
 from nemsei.integrations.fusionsolar.service import credentials_for
+from nemsei.integrations.fusionsolar.session_cache import (
+    FusionSolarSessionCache,
+    authenticated_client,
+    invalidate_session,
+    is_session_expiry,
+)
 from nemsei.monitoring.service import record_production_fact
 from nemsei.providers.errors import ProviderError, ProviderErrorCode
 from nemsei.providers.models import AssetProviderMapping, ProviderConnection
@@ -134,11 +140,13 @@ class FusionSolarProductionService:
         *,
         client_factory: Callable[[FusionSolarCredentials], FusionSolarClient] = FusionSolarClient,
         max_transient_retries: int = 1,
+        session_cache: "FusionSolarSessionCache | None" = None,
     ) -> None:
         self._sessions = session_factory
         self._settings = settings
         self._client_factory = client_factory
         self._calls = FusionSolarRequestController(session_factory, max_transient_retries=max_transient_retries)
+        self._session_cache = session_cache or FusionSolarSessionCache()
 
     def sync_daily_production(
         self,
@@ -327,15 +335,18 @@ class FusionSolarProductionService:
             error = ProviderError(ProviderErrorCode.CONFIGURATION, "No FusionSolar mapping is selected for production.")
             return self._finish(run.id, connection_id, requested_from, requested_until, 0, 0, 0, selection_findings, error, mode=mode)
 
-        client = self._client_factory(credentials)
-        _value, error = self._calls.call(
+        client, error = authenticated_client(
+            calls=self._calls,
             connection_id=connection_id,
             sync_run_id=run.id,
-            endpoint_family="authentication",
             purpose="fusionsolar_production_authentication",
-            operation=client.authenticate,
+            credentials=credentials,
+            client_factory=self._client_factory,
+            cache=self._session_cache,
         )
         if error:
+            if is_session_expiry(error):
+                invalidate_session(credentials, cache=self._session_cache)
             return self._finish(run.id, connection_id, requested_from, requested_until, expected, 0, 0, selection_findings, error, mode=mode)
 
         received = accepted = rejected = out_of_window = 0
@@ -397,6 +408,8 @@ class FusionSolarProductionService:
                 ),
             )
             if error:
+                if is_session_expiry(error):
+                    invalidate_session(client.credentials, cache=self._session_cache)
                 accepted = self._persist_day(run_id, source_day, contract, expected, samples)
                 return _DayOutcome(received, accepted, rejected, True, error, out_of_window)
             assert rows is not None

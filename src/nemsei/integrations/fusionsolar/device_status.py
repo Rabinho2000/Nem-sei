@@ -60,6 +60,12 @@ from nemsei.diagnostics.service import record_device_status
 from nemsei.integrations.fusionsolar.client import FusionSolarClient, FusionSolarClientError, FusionSolarCredentials
 from nemsei.integrations.fusionsolar.request_control import FusionSolarRequestController
 from nemsei.integrations.fusionsolar.service import credentials_for
+from nemsei.integrations.fusionsolar.session_cache import (
+    FusionSolarSessionCache,
+    authenticated_client,
+    invalidate_session,
+    is_session_expiry,
+)
 from nemsei.providers.errors import ProviderError, ProviderErrorCode
 from nemsei.providers.models import AssetProviderMapping, ProviderConnection
 from nemsei.providers.registry import ProviderCapability, ProviderCode
@@ -258,11 +264,13 @@ class FusionSolarDeviceStatusService:
         *,
         client_factory: Callable[[FusionSolarCredentials], FusionSolarClient] = FusionSolarClient,
         max_transient_retries: int = 1,
+        session_cache: "FusionSolarSessionCache | None" = None,
     ) -> None:
         self._sessions = session_factory
         self._settings = settings
         self._client_factory = client_factory
         self._calls = FusionSolarRequestController(session_factory, max_transient_retries=max_transient_retries)
+        self._session_cache = session_cache or FusionSolarSessionCache()
 
     def sync_device_status(self, connection_id: int) -> DeviceStatusSyncResult:
         connection = self._connection(connection_id)
@@ -290,12 +298,18 @@ class FusionSolarDeviceStatusService:
         except FusionSolarClientError as exc:
             return self._finish(run.id, connection_id, len(selected), 0, 0, 0, exc.error)
 
-        client = self._client_factory(credentials)
-        _value, error = self._calls.call(
-            connection_id=connection_id, sync_run_id=run.id, endpoint_family="authentication",
-            purpose="fusionsolar_device_status_authentication", operation=client.authenticate,
+        client, error = authenticated_client(
+            calls=self._calls,
+            connection_id=connection_id,
+            sync_run_id=run.id,
+            purpose="fusionsolar_device_status_authentication",
+            credentials=credentials,
+            client_factory=self._client_factory,
+            cache=self._session_cache,
         )
         if error:
+            if is_session_expiry(error):
+                invalidate_session(credentials, cache=self._session_cache)
             return self._finish(run.id, connection_id, len(selected), 0, 0, 0, error)
 
         expected_ids = frozenset(mapping.external_id.strip() for mapping in selected)
@@ -307,6 +321,8 @@ class FusionSolarDeviceStatusService:
                 purpose="fusionsolar_device_discovery", operation=lambda batch=batch: client.device_list_batch(batch),
             )
             if error:
+                if is_session_expiry(error):
+                    invalidate_session(credentials, cache=self._session_cache)
                 return self._finish(run.id, connection_id, len(selected), 0, 0, 0, error)
             assert rows is not None
             for row in rows:
@@ -329,6 +345,8 @@ class FusionSolarDeviceStatusService:
                     operation=lambda batch=batch, dev_type_id=dev_type_id: client.device_current_monitoring_batch(batch, device_type_id=dev_type_id),
                 )
                 if error:
+                    if is_session_expiry(error):
+                        invalidate_session(credentials, cache=self._session_cache)
                     first_error = error
                     break
                 assert rows is not None

@@ -25,6 +25,12 @@ from nemsei.integrations.fusionsolar.discovery import (
     plant_from_payload,
 )
 from nemsei.integrations.fusionsolar.request_control import FusionSolarRequestController
+from nemsei.integrations.fusionsolar.session_cache import (
+    FusionSolarSessionCache,
+    authenticated_client,
+    invalidate_session,
+    is_session_expiry,
+)
 from nemsei.providers.errors import ProviderError, ProviderErrorCode
 from nemsei.providers.models import AssetProviderMapping, ProviderConnection
 from nemsei.providers.registry import ProviderCapability, ProviderCode
@@ -47,11 +53,13 @@ class FusionSolarDiscoveryService:
         *,
         client_factory: Callable[[FusionSolarCredentials], FusionSolarClient] = FusionSolarClient,
         max_transient_retries: int = 1,
+        session_cache: "FusionSolarSessionCache | None" = None,
     ) -> None:
         self._sessions = session_factory
         self._settings = settings
         self._client_factory = client_factory
         self._calls = FusionSolarRequestController(session_factory, max_transient_retries=max_transient_retries)
+        self._session_cache = session_cache or FusionSolarSessionCache()
 
     def validate_connection(self, connection_id: int) -> DiscoveryResult:
         """Authenticate then read only page one, proving account access without a full scan."""
@@ -72,9 +80,18 @@ class FusionSolarDiscoveryService:
             self._record_configuration_failure(connection_id, exc.error)
             return self._finish_without_call(run.id, connection_id, capability, exc.error, "failed")
 
-        client = self._client_factory(credentials)
-        _value, error = self._calls.call(connection_id=connection_id, sync_run_id=run.id, endpoint_family="authentication", purpose="fusionsolar_authentication", operation=client.authenticate)
+        client, error = authenticated_client(
+            calls=self._calls,
+            connection_id=connection_id,
+            sync_run_id=run.id,
+            purpose="fusionsolar_authentication",
+            credentials=credentials,
+            client_factory=self._client_factory,
+            cache=self._session_cache,
+        )
         if error:
+            if is_session_expiry(error):
+                invalidate_session(credentials, cache=self._session_cache)
             return self._finish_discovery(run.id, connection_id, (), frozenset(), error, received=0, rejected=0, pages=0)
 
         plants: list[DiscoveredPlant] = []
@@ -92,6 +109,8 @@ class FusionSolarDiscoveryService:
                 operation=lambda page=page: client.discover_page(page),
             )
             if error:
+                if is_session_expiry(error):
+                    invalidate_session(credentials, cache=self._session_cache)
                 return self._finish_discovery(run.id, connection_id, tuple(plants), frozenset(duplicate_ids), error, received=len(plants), rejected=rejected, pages=page - 1)
             assert rows is not None
             page_rows, expected_pages = rows

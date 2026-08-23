@@ -10,6 +10,7 @@ from nemsei.config import Settings
 from nemsei.diagnostics.incidents import evaluate_and_persist_incidents
 from nemsei.integrations.fusionsolar.device_status import FusionSolarDeviceStatusService
 from nemsei.integrations.fusionsolar.production import FusionSolarProductionService
+from nemsei.integrations.fusionsolar.session_cache import default_session_cache
 from nemsei.jobs.repository import ClaimedJob
 from nemsei.notifications.digests import deliver_digest, generate_digest
 from nemsei.notifications.service import evaluate_and_process_notifications
@@ -75,7 +76,13 @@ def _execute_production(job: ClaimedJob, *, settings: Settings, session_factory:
     connection_id = job.payload.get("connection_id")
     if not isinstance(connection_id, int) or connection_id <= 0:
         raise ValueError("Production job connection_id is invalid.")
-    service = FusionSolarProductionService(session_factory, settings)
+    # Shared, process-wide session cache: this worker's other production and
+    # device-status jobs reuse the same FusionSolar login instead of each
+    # authenticating from scratch (session_cache.py; see
+    # docs/v2/FUSIONSOLAR_OWNERSHIP_WINDOW.md's rollout write-up for why --
+    # 13 logins from a handful of test syncs tripped the provider's own
+    # login rate limit before this existed).
+    service = FusionSolarProductionService(session_factory, settings, session_cache=default_session_cache())
     if job.job_type == "production.incremental":
         result = service.sync_incremental(connection_id, start_date=_date(job.payload, "start_date"), end_date=_date(job.payload, "end_date"))
     elif job.job_type == "production.reconciliation":
@@ -115,7 +122,7 @@ def _execute_device_status_poll(job: ClaimedJob, *, settings: Settings, session_
     connection_id = job.payload.get("connection_id")
     if not isinstance(connection_id, int) or connection_id <= 0:
         raise ValueError("Device status poll job connection_id is invalid.")
-    service = FusionSolarDeviceStatusService(session_factory, settings)
+    service = FusionSolarDeviceStatusService(session_factory, settings, session_cache=default_session_cache())
     result = service.sync_device_status(connection_id)
     result_json = {
         "result_status": result.status,

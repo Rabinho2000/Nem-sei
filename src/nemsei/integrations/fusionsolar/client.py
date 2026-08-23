@@ -245,6 +245,17 @@ class FusionSolarClient:
             raise FusionSolarClientError(ProviderError(ProviderErrorCode.RATE_LIMITED, "FusionSolar rate limited the request.", retry_after_seconds=_retry_after(response.headers), transient=True))
         if phase == "authentication" and fail_code in {201, 302, 303, 304, 305}:
             raise FusionSolarClientError(ProviderError(ProviderErrorCode.AUTHENTICATION, "FusionSolar credentials were rejected."))
+        # A reused session can die between logins during ordinary use --
+        # failCode 305 / "USER_MUST_RELOGIN" means exactly that regardless of
+        # which endpoint returned it, not only the login endpoint itself
+        # (V1's own `is_session_expired_payload` in monitoring_board/services/
+        # api_rate_limit.py checks this the same way, phase-independent).
+        # Session reuse (session_cache.py) relies on this classification to
+        # know when to invalidate a cached session and force a fresh login,
+        # rather than silently retrying with a session the provider already
+        # discarded.
+        if fail_code == 305 or "USER_MUST_RELOGIN" in message:
+            raise FusionSolarClientError(ProviderError(ProviderErrorCode.AUTHENTICATION, "FusionSolar session expired; re-authentication is required."))
         if response.status_code == 403 or fail_code in {401, 403}:
             raise FusionSolarClientError(ProviderError(ProviderErrorCode.AUTHORIZATION, "FusionSolar access was denied."))
         raise FusionSolarClientError(ProviderError(ProviderErrorCode.INVALID_RESPONSE, "FusionSolar rejected an unrecognized request."))

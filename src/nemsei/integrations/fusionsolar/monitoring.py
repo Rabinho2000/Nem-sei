@@ -17,6 +17,12 @@ from nemsei.config import Settings
 from nemsei.integrations.fusionsolar.client import FusionSolarClient, FusionSolarClientError, FusionSolarCredentials
 from nemsei.integrations.fusionsolar.request_control import FusionSolarRequestController
 from nemsei.integrations.fusionsolar.service import credentials_for
+from nemsei.integrations.fusionsolar.session_cache import (
+    FusionSolarSessionCache,
+    authenticated_client,
+    invalidate_session,
+    is_session_expiry,
+)
 from nemsei.monitoring.service import confirm_current_monitoring, record_current_monitoring_attempt
 from nemsei.providers.errors import ProviderError, ProviderErrorCode
 from nemsei.providers.models import AssetProviderMapping, ProviderConnection
@@ -81,11 +87,19 @@ class FusionSolarMonitoringService:
         *,
         client_factory: Callable[[FusionSolarCredentials], FusionSolarClient] = FusionSolarClient,
         max_transient_retries: int = 1,
+        session_cache: "FusionSolarSessionCache | None" = None,
     ) -> None:
         self._sessions = session_factory
         self._settings = settings
         self._client_factory = client_factory
         self._calls = FusionSolarRequestController(session_factory, max_transient_retries=max_transient_retries)
+        # Defaults to one fresh, empty cache per service instance -- NOT the
+        # process-wide `default_session_cache()` -- so constructing a new
+        # service (as every test and, deliberately, every job invocation
+        # today does) never silently inherits another instance's cached
+        # session. Real cross-invocation reuse within one worker process is
+        # opt-in: callers that want it pass `session_cache=default_session_cache()`.
+        self._session_cache = session_cache or FusionSolarSessionCache()
 
     def sync_current_monitoring(self, connection_id: int) -> MonitoringSyncResult:
         connection, selected, selection_findings = self._selected_mappings(connection_id)
@@ -104,15 +118,18 @@ class FusionSolarMonitoringService:
         except FusionSolarClientError as exc:
             return self._finish(run.id, connection_id, expected=len(selected), received=0, accepted=0, rejected=0, selection_findings=selection_findings, error=exc.error)
 
-        client = self._client_factory(credentials)
-        _value, error = self._calls.call(
+        client, error = authenticated_client(
+            calls=self._calls,
             connection_id=connection_id,
             sync_run_id=run.id,
-            endpoint_family="authentication",
             purpose="fusionsolar_monitoring_authentication",
-            operation=client.authenticate,
+            credentials=credentials,
+            client_factory=self._client_factory,
+            cache=self._session_cache,
         )
         if error:
+            if is_session_expiry(error):
+                invalidate_session(credentials, cache=self._session_cache)
             return self._finish(run.id, connection_id, expected=len(selected), received=0, accepted=0, rejected=0, selection_findings=selection_findings, error=error)
 
         by_external_id = {mapping.normalized_external_id: mapping for mapping in selected}
@@ -132,6 +149,8 @@ class FusionSolarMonitoringService:
                 operation=lambda codes=codes: client.current_monitoring_batch(codes),
             )
             if error:
+                if is_session_expiry(error):
+                    invalidate_session(credentials, cache=self._session_cache)
                 first_error = error
                 failed += len(batch)
                 skipped += len(selected) - attempted
