@@ -79,9 +79,12 @@ class NotificationPolicy(Base):
     `DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md`'s V1 audit): an incident whose
     `opened_at` predates the baseline is not a *new* problem this policy
     should announce, it is pre-existing history the policy happened to be
-    turned on after. `notify_on_resolve` is exempt from the baseline check
-    on purpose -- a genuinely old problem finally clearing is worth saying
-    regardless of when the policy started watching it.
+    turned on after -- unless it later changes in a way that would put it
+    in scope for the first time, which `NotificationBaselineSnapshot`
+    exists to detect (`opened_at` alone cannot). `notify_on_resolve` never
+    needs a baseline check itself -- it is already gated on a prior
+    `opened`/`escalated` event existing, which a pre-existing, unchanged
+    incident never earns.
     """
 
     __tablename__ = "notification_policies"
@@ -162,6 +165,49 @@ class NotificationEvent(Base):
     # for rendering `message`, never re-derived from a later, possibly
     # different incident state.
     evidence_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class NotificationBaselineSnapshot(Base):
+    """Closes the one gap `baseline_at` alone cannot: `opened_at` says
+    *when* an incident started, never *what it looked like* at that time, so
+    a pre-existing incident that later worsens into a different policy's
+    scope was, until this table existed, indistinguishable from one that
+    never changed -- both just "opened_at < baseline_at", forever excluded.
+
+    The first time a policy evaluates a pre-existing incident (`opened_at <
+    baseline_at`) at or after its own `baseline_at`, it captures that
+    incident's severity *right then* as the closest available proxy for
+    "what this looked like when we started watching" -- `DiagnosticIncident`
+    keeps no severity history, so this is the earliest point one can be
+    recorded. Captured once, never overwritten: it is a fixed historical
+    record, not a moving target, which is what makes "did this change since
+    baseline" a stable, auditable question instead of a re-derived guess.
+
+    A later evaluation compares the *current* incident scope against this
+    frozen snapshot, not against `opened_at`: still in scope at capture time
+    means nothing has changed since baseline (skip, forever, same as
+    today); no longer matching at capture time but matching now means a
+    genuine post-baseline transition (a warning that became critical, most
+    commonly) -- worth exactly one notification, no different in kind from
+    a brand-new incident reaching the same scope for the first time.
+
+    One row per (incident, policy): a snapshot is relative to what a
+    *specific* policy's scope considered "in" at baseline, not a global
+    property of the incident.
+    """
+
+    __tablename__ = "notification_baseline_snapshots"
+    __table_args__ = (
+        UniqueConstraint("incident_id", "policy_id", name="uq_notification_baseline_snapshots_identity"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    incident_id: Mapped[int] = mapped_column(ForeignKey("diagnostic_incidents.id", ondelete="RESTRICT"), nullable=False)
+    policy_id: Mapped[int] = mapped_column(ForeignKey("notification_policies.id", ondelete="RESTRICT"), nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    severity_at_capture: Mapped[str] = mapped_column(String(24), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 

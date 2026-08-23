@@ -45,7 +45,12 @@ from sqlalchemy.orm import Session, sessionmaker
 from nemsei.assets.models import Asset, Device
 from nemsei.diagnostics.findings import SEVERITY_ORDER
 from nemsei.diagnostics.models import DiagnosticIncident
-from nemsei.notifications.models import NotificationChannel, NotificationEvent, NotificationPolicy
+from nemsei.notifications.models import (
+    NotificationBaselineSnapshot,
+    NotificationChannel,
+    NotificationEvent,
+    NotificationPolicy,
+)
 from nemsei.notifications.telegram_client import MockTelegramClient, TelegramClient
 from nemsei.shared.clock import utc_now
 
@@ -178,12 +183,95 @@ def evaluate_and_process_notifications(
     )
 
 
-def _in_scope(incident: DiagnosticIncident, *, policy: NotificationPolicy) -> bool:
-    if SEVERITY_ORDER.get(incident.severity, 99) > SEVERITY_ORDER.get(policy.min_severity, 0):
+def _in_scope_for(severity: str, rule_code: str, *, policy: NotificationPolicy) -> bool:
+    if SEVERITY_ORDER.get(severity, 99) > SEVERITY_ORDER.get(policy.min_severity, 0):
         return False
-    if policy.rule_codes_json and incident.rule_code not in policy.rule_codes_json:
+    if policy.rule_codes_json and rule_code not in policy.rule_codes_json:
         return False
     return True
+
+
+def _in_scope(incident: DiagnosticIncident, *, policy: NotificationPolicy) -> bool:
+    return _in_scope_for(incident.severity, incident.rule_code, policy=policy)
+
+
+def _rule_code_in_scope(rule_code: str, *, policy: NotificationPolicy) -> bool:
+    # Severity deliberately not consulted: rule_code never changes for a
+    # given incident, so this is the one half of `_in_scope` stable enough
+    # to gate which incidents are candidates for a baseline snapshot at all
+    # -- severity is exactly the dimension a snapshot exists to watch for
+    # changing, so it cannot also gate whether one gets captured.
+    return not policy.rule_codes_json or rule_code in policy.rule_codes_json
+
+
+def _is_backlog(incident: DiagnosticIncident, *, policy: NotificationPolicy) -> bool:
+    return policy.baseline_at is not None and incident.opened_at < policy.baseline_at
+
+
+def _capture_backlog_snapshots(session: Session, *, policy: NotificationPolicy, now: datetime) -> None:
+    """Freeze a baseline severity for every open, pre-existing incident this
+    policy could ever care about -- run on *every* decide pass, before the
+    per-kind branches below, specifically so a snapshot exists from the
+    earliest possible evaluation, even for an incident currently out of
+    scope on severity alone (a warning under a critical-only policy, most
+    commonly). Capturing lazily only once an incident is already in scope
+    would be too late: by then its *current* severity is whatever it just
+    transitioned to, and comparing that against itself can never detect a
+    transition. Idempotent per (incident, policy) -- see
+    `_get_or_create_baseline_snapshot` -- so this is a no-op on every pass
+    after the first for a given incident.
+    """
+    if policy.baseline_at is None:
+        return
+    candidates = session.scalars(
+        select(DiagnosticIncident).where(
+            DiagnosticIncident.status == "open",
+            DiagnosticIncident.opened_at < policy.baseline_at,
+        )
+    )
+    for incident in candidates:
+        if not _rule_code_in_scope(incident.rule_code, policy=policy):
+            continue
+        _get_or_create_baseline_snapshot(session, incident=incident, policy=policy, now=now)
+
+
+def _get_or_create_baseline_snapshot(
+    session: Session, *, incident: DiagnosticIncident, policy: NotificationPolicy, now: datetime
+) -> NotificationBaselineSnapshot:
+    """Freeze, once, what a pre-existing incident's severity looked like the
+    first time this policy ever evaluated it at/after its own `baseline_at`
+    -- see the model docstring for why `opened_at` alone cannot answer "did
+    this change since baseline". Idempotent and restart-safe like
+    `_create_event`: a SAVEPOINT absorbs a concurrent insert racing for the
+    same (incident_id, policy_id) identity, and the loser re-reads what the
+    winner just committed instead of erroring or creating a second one.
+    """
+    existing = session.scalar(
+        select(NotificationBaselineSnapshot).where(
+            NotificationBaselineSnapshot.incident_id == incident.id,
+            NotificationBaselineSnapshot.policy_id == policy.id,
+        )
+    )
+    if existing is not None:
+        return existing
+    snapshot = NotificationBaselineSnapshot(
+        incident_id=incident.id, policy_id=policy.id, captured_at=now,
+        severity_at_capture=incident.severity, created_at=now, updated_at=now,
+    )
+    try:
+        with session.begin_nested():
+            session.add(snapshot)
+            session.flush()
+    except IntegrityError:
+        won = session.scalar(
+            select(NotificationBaselineSnapshot).where(
+                NotificationBaselineSnapshot.incident_id == incident.id,
+                NotificationBaselineSnapshot.policy_id == policy.id,
+            )
+        )
+        assert won is not None  # the only thing that could have made our insert fail
+        return won
+    return snapshot
 
 
 def _has_event(session: Session, *, incident_id: int, kind: str, channel_id: int) -> bool:
@@ -205,19 +293,27 @@ def _decide_for_policy(
 ) -> tuple[int, int]:
     created = skipped = 0
 
+    if policy.notify_on_open or policy.escalation_after_minutes:
+        _capture_backlog_snapshots(session, policy=policy, now=now)
+
     if policy.notify_on_open:
         candidates = session.scalars(select(DiagnosticIncident).where(DiagnosticIncident.status == "open"))
         for incident in candidates:
             if not _in_scope(incident, policy=policy):
                 continue
-            # Baseline: an incident already open before the policy started
-            # watching is pre-existing history, not a new problem to
-            # announce -- the same reason V1 needed ALERT_BASELINE_AT before
-            # it could turn alerts on at all without a storm. Not a
-            # "skipped" decision, deliberately: it was never a candidate,
-            # the same way an out-of-scope rule_code or severity is not.
-            if policy.baseline_at is not None and incident.opened_at < policy.baseline_at:
-                continue
+            if _is_backlog(incident, policy=policy):
+                # Pre-existing history, not automatically a new problem to
+                # announce -- the same reason V1 needed ALERT_BASELINE_AT
+                # before it could turn alerts on at all without a storm.
+                # But "pre-existing" must not mean "permanently invisible":
+                # a snapshot of the severity this policy saw at/just after
+                # baseline is the fixed reference point that tells the two
+                # cases apart -- see NotificationBaselineSnapshot.
+                snapshot = _get_or_create_baseline_snapshot(session, incident=incident, policy=policy, now=now)
+                if _in_scope_for(snapshot.severity_at_capture, incident.rule_code, policy=policy):
+                    continue  # already matched this policy's scope at baseline -- nothing changed
+                # else: a genuine post-baseline transition into scope --
+                # treated exactly like a fresh "opened", not a "skipped".
             if _has_event(session, incident_id=incident.id, kind="opened", channel_id=channel.id):
                 continue
             event = _create_event(session, incident=incident, policy=policy, channel=channel, kind="opened", now=now)
@@ -229,19 +325,25 @@ def _decide_for_policy(
         for incident in candidates:
             if not _in_scope(incident, policy=policy):
                 continue
-            # Same baseline rule as notify_on_open, and for the same reason:
-            # an escalation is the natural continuation of an "opened" alert
-            # that was itself suppressed as pre-existing history. Without
-            # this check, activating an escalation policy against a backlog
-            # where every incident is already older than the threshold would
-            # fire an "escalated" message for the entire backlog on its very
-            # first evaluation -- not "mudança relevante depois da ativação",
-            # just the baseline exclusion leaking through a second door.
-            if policy.baseline_at is not None and incident.opened_at < policy.baseline_at:
-                continue
-            age_minutes = (now - incident.opened_at).total_seconds() / 60
-            if age_minutes < threshold:
-                continue
+            if _is_backlog(incident, policy=policy):
+                # Same snapshot rule as notify_on_open, and duration since
+                # opened_at is deliberately *not* consulted here at all: a
+                # backlog incident has been "old" since before this policy
+                # existed, so age alone can never be this branch's signal
+                # for it -- only a genuine scope transition can be. Without
+                # this, every already-old backlog incident would clear the
+                # age check on the very first evaluation and escalate in a
+                # storm, baseline or not.
+                snapshot = _get_or_create_baseline_snapshot(session, incident=incident, policy=policy, now=now)
+                if _in_scope_for(snapshot.severity_at_capture, incident.rule_code, policy=policy):
+                    continue  # unchanged backlog -- never escalates on age alone
+                # transitioned into scope after baseline: the transition
+                # itself is the trigger, notify now, do not also wait out
+                # the duration threshold on top of it.
+            else:
+                age_minutes = (now - incident.opened_at).total_seconds() / 60
+                if age_minutes < threshold:
+                    continue
             if _has_event(session, incident_id=incident.id, kind="escalated", channel_id=channel.id):
                 continue
             event = _create_event(session, incident=incident, policy=policy, channel=channel, kind="escalated", now=now)

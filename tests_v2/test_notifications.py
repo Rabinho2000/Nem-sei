@@ -20,7 +20,12 @@ from sqlalchemy.exc import IntegrityError
 from nemsei.assets.service import create_asset, create_device
 from nemsei.db.session import build_session_factory
 from nemsei.diagnostics.models import DiagnosticIncident
-from nemsei.notifications.models import NotificationChannel, NotificationEvent, NotificationPolicy
+from nemsei.notifications.models import (
+    NotificationBaselineSnapshot,
+    NotificationChannel,
+    NotificationEvent,
+    NotificationPolicy,
+)
 from nemsei.notifications.service import (
     decide_notification_events,
     deliver_pending_notifications,
@@ -539,17 +544,14 @@ def test_baseline_excludes_resolution_of_an_incident_that_never_alerted(factory,
     assert events(factory) == []
 
 
-def test_baseline_exclusion_is_permanent_by_opened_at_not_a_one_time_grace_period(factory, asset_id) -> None:
-    """A known, documented limit of today's baseline mechanism: exclusion is
-    keyed purely on `opened_at < baseline_at`, forever -- there is no
-    persisted "severity as of baseline" to compare against, so a backlog
-    incident that later worsens in severity, or simply stays open long past
-    an escalation threshold, is *not* distinguished from one that never
-    changed. docs/v2/DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md documents this
-    as an open gap for the "piora de severidade" / "perda de produção"
-    escalation triggers on pre-existing incidents specifically -- not
-    invented here as a heuristic, because a wrong one risks exactly the
-    storm baseline exists to prevent."""
+def test_unchanged_backlog_stays_excluded_from_escalation_no_matter_how_old_it_gets(factory, asset_id) -> None:
+    """A backlog incident that never changes must never escalate on age
+    alone: `NotificationBaselineSnapshot` freezes its severity at the first
+    post-baseline evaluation, and since that snapshot still matches the
+    policy's scope (nothing changed), every later evaluation -- no matter
+    how long the incident has been open -- keeps skipping it. Duration
+    since `opened_at` is deliberately never consulted for a backlog
+    incident at all; only a genuine scope transition can be its trigger."""
     with factory() as session, session.begin():
         channel = make_channel(session)
         make_policy(
@@ -557,15 +559,148 @@ def test_baseline_exclusion_is_permanent_by_opened_at_not_a_one_time_grace_perio
             notify_on_open=False, notify_on_resolve=True,
         )
         make_incident(session, asset_id=asset_id, severity="warning", opened_at=utc(9))  # pre-baseline
-        decide_notification_events(session, now=utc(9, 30))  # before baseline: nothing yet
+        decide_notification_events(session, now=utc(9, 30))  # before baseline: nothing yet, snapshot captured
     assert events(factory) == []
+    assert len(list(factory().scalars(select(NotificationBaselineSnapshot)))) == 1
 
     with factory() as session, session.begin():
         # Long past both baseline and the 60min escalation threshold --
-        # still nothing, because opened_at is still before baseline_at.
+        # still nothing, because the frozen snapshot still matches.
         summary = decide_notification_events(session, now=utc(20, 0))
     assert summary.events_created == 0
     assert events(factory) == []
+
+
+# --- baseline transition: closing the opened_at-only gap (docs s28) -----------
+#
+# The six scenarios asked for explicitly. Policy A-shaped (critical,
+# rule_codes=None, notify_on_open=True) unless a test needs escalation.
+
+
+def test_1_old_warning_unchanged_produces_zero_events(factory, asset_id) -> None:
+    with factory() as session, session.begin():
+        channel = make_channel(session)
+        make_policy(session, channel=channel, baseline_at=utc(12), min_severity="critical")
+        make_incident(session, asset_id=asset_id, severity="warning", opened_at=utc(9))  # pre-baseline, never critical
+        summary = decide_notification_events(session, now=utc(13))
+    assert summary.events_created == 0
+    assert events(factory) == []
+    # Re-evaluated again, much later, still nothing -- not a one-time grace period.
+    with factory() as session, session.begin():
+        summary2 = decide_notification_events(session, now=utc(20))
+    assert summary2.events_created == 0
+    assert events(factory) == []
+
+
+def test_2_old_warning_becomes_critical_after_baseline_produces_one_event(factory, asset_id) -> None:
+    with factory() as session, session.begin():
+        channel = make_channel(session)
+        make_policy(session, channel=channel, baseline_at=utc(10), min_severity="critical")
+        incident = make_incident(session, asset_id=asset_id, severity="warning", opened_at=utc(9))  # pre-baseline
+        # First post-baseline evaluation, still warning: out of scope for a
+        # critical-only policy, so nothing fires -- but this is also the
+        # moment the (irrelevant here, since out-of-scope) snapshot logic
+        # would apply were it in scope. Included to mirror a real periodic
+        # evaluator having run before the transition happened.
+        decide_notification_events(session, now=utc(10, 5))
+    assert events(factory) == []
+
+    with factory() as session, session.begin():
+        stored = session.get(DiagnosticIncident, incident.id)
+        stored.severity = "critical"  # a real re-evaluation by D1 worsened it
+        session.flush()
+        summary = decide_notification_events(session, now=utc(11))
+    assert summary.events_created == 1
+    rows = events(factory)
+    assert len(rows) == 1
+    assert rows[0].kind == "opened"
+    assert rows[0].incident_id == incident.id
+
+    # Re-evaluating again does not create a second one.
+    with factory() as session, session.begin():
+        summary2 = decide_notification_events(session, now=utc(12))
+    assert summary2.events_created == 0
+    assert len(events(factory)) == 1
+
+
+def test_3_old_critical_already_critical_at_baseline_produces_zero_events(factory, asset_id) -> None:
+    with factory() as session, session.begin():
+        channel = make_channel(session)
+        make_policy(session, channel=channel, baseline_at=utc(10), min_severity="critical")
+        make_incident(session, asset_id=asset_id, severity="critical", opened_at=utc(9))  # pre-baseline, already critical
+        summary = decide_notification_events(session, now=utc(11))
+    assert summary.events_created == 0
+    assert events(factory) == []
+
+
+def test_4_old_critical_that_never_alerted_resolves_with_zero_recovery(factory, asset_id) -> None:
+    """Follows directly from #3: since the incident never earned an
+    "opened"/"escalated" event (already critical at baseline, so never a
+    new development), its later resolution is not a recovery either."""
+    with factory() as session, session.begin():
+        channel = make_channel(session)
+        make_policy(session, channel=channel, baseline_at=utc(10), min_severity="critical", notify_on_resolve=True)
+        incident = make_incident(session, asset_id=asset_id, severity="critical", opened_at=utc(9))
+        decide_notification_events(session, now=utc(11))
+    assert events(factory) == []
+
+    with factory() as session, session.begin():
+        stored = session.get(DiagnosticIncident, incident.id)
+        stored.status = "resolved"
+        stored.resolved_at = utc(12)
+        session.flush()
+        summary = decide_notification_events(session, now=utc(13))
+    assert summary.events_created == 0
+    assert events(factory) == []
+
+
+def test_5_new_critical_after_baseline_produces_one_opened(factory, asset_id) -> None:
+    with factory() as session, session.begin():
+        channel = make_channel(session)
+        make_policy(session, channel=channel, baseline_at=utc(10), min_severity="critical")
+        make_incident(session, asset_id=asset_id, severity="critical", opened_at=utc(11))  # after baseline: not backlog
+        summary = decide_notification_events(session, now=utc(11, 30))
+    assert summary.events_created == 1
+    rows = events(factory)
+    assert len(rows) == 1
+    assert rows[0].kind == "opened"
+
+
+def test_6_repeated_and_concurrent_evaluation_never_duplicates_the_transition_event(factory, asset_id) -> None:
+    """Both halves of "no duplication": repeated sequential evaluation after
+    the transition, and a real concurrency race hitting the snapshot and
+    the event at the same time."""
+    with factory() as session, session.begin():
+        channel = make_channel(session)
+        make_policy(session, channel=channel, baseline_at=utc(10), min_severity="critical")
+        incident = make_incident(session, asset_id=asset_id, severity="warning", opened_at=utc(9))
+        decide_notification_events(session, now=utc(10, 5))  # captures the warning snapshot
+        stored = session.get(DiagnosticIncident, incident.id)
+        stored.severity = "critical"
+        session.flush()
+
+    def evaluate() -> None:
+        with factory() as session, session.begin():
+            decide_notification_events(session, now=utc(11))
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(lambda _: evaluate(), range(8)))
+
+    rows = events(factory)
+    assert len(rows) == 1
+    assert rows[0].kind == "opened"
+    with factory() as session:
+        snapshots = list(
+            session.scalars(
+                select(NotificationBaselineSnapshot).where(NotificationBaselineSnapshot.incident_id == incident.id)
+            )
+        )
+    assert len(snapshots) == 1
+
+    # Sequential re-evaluation afterwards still does not add a second one.
+    with factory() as session, session.begin():
+        decide_notification_events(session, now=utc(15))
+    assert len(events(factory)) == 1
 
 
 # --- end-to-end: the one function the job actually calls -----------------------
