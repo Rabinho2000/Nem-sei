@@ -1779,3 +1779,138 @@ não o momento deste dry-run), e confirmar a cadência/canal do digest diário
 (decisão 6). O gap de "piora de severidade em incidente de backlog" fica
 documentado e sem impacto prático hoje (0 casos reais); não bloqueia a
 activação.
+## 29. Fecho do último gap da baseline: transição pós-activação, auditável e restart-safe (2026-08-23)
+
+Pedido explícito: `opened_at` sozinho não pode distinguir "backlog inalterado"
+de "backlog que piorou depois da activação" — fechar isto antes de criar as
+policies reais.
+
+### O mecanismo: `NotificationBaselineSnapshot`
+
+Uma tabela nova (migration `0020`), não um campo em `DiagnosticIncident` --
+o incidente continua a não saber que notificações existem. Uma linha por
+`(incident_id, policy_id)`: a primeira vez que uma policy avalia um
+incidente pré-existente (`opened_at < baseline_at`) a qualquer momento
+depois do seu próprio `baseline_at`, regista **a severidade desse incidente
+nesse preciso momento** -- a única aproximação possível de "como estava
+isto quando começámos a vigiar", já que `DiagnosticIncident` não guarda
+histórico de severidade. Capturado uma vez, nunca reescrito.
+
+Ponto crítico da implementação, corrigido antes de chegar aos testes: a
+captura tem de acontecer **antes** de qualquer filtro de âmbito por
+severidade, não só quando o incidente já está em âmbito. Uma primeira
+versão só criava o snapshot dentro do próprio ramo `notify_on_open`/
+`escalation`, já depois de `_in_scope` confirmar que a severidade actual
+batia certo -- o que significa capturar a severidade **depois** da
+transição já ter acontecido, tornando impossível detectar qualquer
+transição (comparar o valor actual consigo mesmo nunca dá diferença).
+Corrigido com uma passagem prévia, `_capture_backlog_snapshots`, chamada em
+cada avaliação, sobre todo o backlog compatível com o `rule_codes_json` da
+policy (nunca filtrado por severidade — é exactamente a severidade que o
+snapshot existe para vigiar) -- assim a primeira avaliação depois da
+activação regista o estado antes de qualquer mudança futura, mesmo que o
+incidente esteja fora de âmbito nesse momento.
+
+### Decisão por avaliação, agora
+
+```
+para cada incidente aberto, em âmbito de rule_code/severidade actuais:
+  se não é backlog (opened_at >= baseline_at):
+      comportamento normal, sem alterações
+  se é backlog:
+      snapshot = obter ou criar (severidade capturada na 1a avaliação pós-baseline)
+      se snapshot.severidade já batia no âmbito desta policy:
+          nunca notifica -- nada mudou desde a baseline
+      senão (transição real: não batia no snapshot, bate agora):
+          notifica exactamente como um incidente novo -- imediato para
+          notify_on_open, sem esperar a janela de escalação para
+          escalation_after_minutes (a própria transição é o gatilho)
+```
+
+A duração desde `opened_at` deixa de ser sequer consultada para um
+incidente de backlog -- só a transição de âmbito o pode disparar, nunca a
+idade, o que fecha em definitivo o risco (já identificado antes) de um
+`escalation_after_minutes` disparar para todo o backlog só por ele já ser
+antigo.
+
+### Testes explícitos, os 6 pedidos, mais restart/concorrência real
+
+`tests_v2/test_notifications.py`, 6 novos: `test_1_old_warning_unchanged_
+produces_zero_events`, `test_2_old_warning_becomes_critical_after_baseline_
+produces_one_event`, `test_3_old_critical_already_critical_at_baseline_
+produces_zero_events`, `test_4_old_critical_that_never_alerted_resolves_
+with_zero_recovery`, `test_5_new_critical_after_baseline_produces_one_
+opened`, `test_6_repeated_and_concurrent_evaluation_never_duplicates_the_
+transition_event` (8 threads reais via `ThreadPoolExecutor`, contra o
+mesmo incidente já transicionado -- exactamente 1 `NotificationEvent` e 1
+`NotificationBaselineSnapshot` sobrevivem à corrida). `_get_or_create_
+baseline_snapshot` usa o mesmo padrão SAVEPOINT que `_create_event` já usava
+para o mesmo tipo de corrida -- o perdedor relê a linha do vencedor em vez
+de falhar ou duplicar.
+
+Suite completa da V2: **611 passed, 1 skipped** (subiu de 605: +1 teste de
+migração/deployment já existente continuou a passar depois de renomear o
+ficheiro, +6 novos deste fecho de gap, líquido 611). Um bug de deployment
+apanhado no processo, não hipotético: a primeira revisão da migration
+chamava-se `0020_notification_baseline_snapshots`, 37 caracteres — mais do
+que os 32 que `alembic_version.version_num` permite (`StringDataRight
+Truncation` ao aplicar). Corrigido encurtando o id para
+`0020_baseline_snapshots` e renomeando o ficheiro para bater certo com ele,
+exactamente como `test_repository_head_is_resolved_dynamically_and_is_
+single` exige.
+
+### Dry-run real (código real, dados reais, zero escritas)
+
+`decide_notification_events` chamado directamente contra os 644 incidentes
+reais de produção, dentro de uma transacção sempre revertida (nunca
+commitada) -- não uma simulação à parte, o próprio código que ia correr em
+produção, com as duas policies propostas (A crítica imediata, B warnings
+acionáveis) construídas em memória:
+
+```
+decision summary: policies_evaluated=2, events_created=0, events_skipped=0
+baseline snapshots criados (na transacção, depois revertidos): 644
+total de incidentes abertos: 644
+--- revertido, zero escritas persistidas ---
+```
+
+0 eventos, exactamente como esperado: os 644 incidentes são todos
+`device_unknown_status`/`stale_reading`, nenhum critico, nenhum nas 3 regras
+de disparidade da Policy B -- nada para transicionar hoje.
+
+### Migration aplicada, policies reais criadas
+
+Migration `0020` aplicada com backup verificado (`pg_dump -Fc`, cabeçalho
+`PGDMP` confirmado, antes de qualquer escrita). Duas `NotificationPolicy`
+criadas para valer, ligadas a um `NotificationChannel` com **`enabled=
+False`** -- nenhuma chamada externa possível, mock ou real, independente de
+qualquer decisão de policy:
+
+```
+notification_channels: id=2, name="Ops Telegram", kind=telegram, enabled=False, target_chat_id=NULL
+notification_policies:
+  id=3 "Criticos imediatos"    min_severity=critical rule_codes=null           notify_on_open=t notify_on_resolve=t escalation=null baseline_at=2026-08-23 18:13:52
+  id=4 "Warnings acionaveis"   min_severity=warning  rule_codes=[zero_power_while_peers_active, power_disparity_among_peers, daily_energy_disparity_among_peers]  notify_on_open=f notify_on_resolve=t escalation=1440min baseline_at=2026-08-23 18:13:52
+```
+
+Uma avaliação real (`evaluate_and_process_notifications`, decisão + tentativa
+de entrega, canal desactivado) foi corrida a sério contra produção -- esta
+já não foi revertida, é o estado real:
+
+```
+NotificationProcessingSummary(policies_evaluated=2, events_created=0, events_skipped=0,
+                               delivery_attempted=0, delivery_sent=0, delivery_failed=0)
+```
+
+Contagens finais confirmadas em produção: `notification_events` = **0**,
+`notification_baseline_snapshots` = **644** (todos `policy_id=3`, todos
+`severity_at_capture='warning'` -- Policy A capturou baseline para os 644,
+já que o seu `rule_codes_json` é `null`; Policy B capturou 0, porque nenhum
+dos 644 bate nas suas 3 regras), `diagnostic_incidents` inalterado (644
+`open`), `digest_runs` inalterado (0).
+
+### Ainda não D4
+
+Nenhuma mensagem Telegram foi enviada, nenhum cliente HTTP-capaz existe no
+código. O canal criado fica desactivado por omissão; activá-lo é uma
+decisão humana separada e explícita, ainda pendente.
