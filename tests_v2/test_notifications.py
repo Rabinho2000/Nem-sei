@@ -203,30 +203,61 @@ def test_escalation_fires_exactly_once_after_the_configured_threshold(factory, a
 
 
 # --- 4. resolution produces exactly one recovery notification, if the policy wants it -
+#
+# Recovery is conditioned on the episode having actually alerted before:
+# an incident this policy never told the channel about (never "opened" or
+# "escalated" here) clearing is not a recovery from the channel's point of
+# view -- see _decide_for_policy's notify_on_resolve comment. So these tests
+# create the incident open, let it alert, *then* resolve it, instead of
+# creating it pre-resolved.
 
 
 def test_resolution_produces_exactly_one_recovery_notification_when_the_policy_defines_it(factory, asset_id) -> None:
     with factory() as session, session.begin():
         channel = make_channel(session)
         make_policy(session, channel=channel, notify_on_resolve=True)
-        make_incident(
-            session, asset_id=asset_id, status="resolved", opened_at=utc(9),
-            last_observed_at=utc(11), resolved_at=utc(11, 30),
-        )
+        incident = make_incident(session, asset_id=asset_id, status="open", opened_at=utc(9))
+        decide_notification_events(session, now=utc(10))  # the prior alert this recovery depends on
+
+    with factory() as session, session.begin():
+        stored = session.get(DiagnosticIncident, incident.id)
+        stored.status = "resolved"
+        stored.resolved_at = utc(11, 30)
+        session.flush()  # decide's own query does not autoflush pending changes
         summary = decide_notification_events(session, now=utc(12))
 
     assert summary.events_created == 1
-    rows = events(factory)
+    rows = [event for event in events(factory) if event.kind == "resolved"]
     assert len(rows) == 1
-    assert rows[0].kind == "resolved"
     assert rows[0].evidence_json["duration_minutes"] == pytest.approx(150.0)  # 09:00 -> 11:30
 
 
 def test_resolution_produces_nothing_when_the_policy_does_not_want_it(factory, asset_id) -> None:
     with factory() as session, session.begin():
         channel = make_channel(session)
-        make_policy(session, channel=channel, notify_on_resolve=False)
-        make_incident(session, asset_id=asset_id, status="resolved", opened_at=utc(9), resolved_at=utc(11))
+        make_policy(session, channel=channel, notify_on_open=True, notify_on_resolve=False)
+        incident = make_incident(session, asset_id=asset_id, status="open", opened_at=utc(9))
+        decide_notification_events(session, now=utc(10))
+
+    with factory() as session, session.begin():
+        stored = session.get(DiagnosticIncident, incident.id)
+        stored.status = "resolved"
+        stored.resolved_at = utc(11)
+        session.flush()
+        summary = decide_notification_events(session, now=utc(12))
+    assert summary.events_created == 0
+    assert {event.kind for event in events(factory)} == {"opened"}
+
+
+def test_resolution_produces_nothing_for_an_incident_that_never_alerted(factory, asset_id) -> None:
+    """The prior-alert requirement itself: notify_on_resolve is on, the
+    incident is in scope, but it never generated an "opened"/"escalated"
+    event (e.g. it was pre-baseline the whole time it was open) -- silence
+    resolving into more silence produces no recovery message."""
+    with factory() as session, session.begin():
+        channel = make_channel(session)
+        make_policy(session, channel=channel, baseline_at=utc(8), notify_on_resolve=True)
+        make_incident(session, asset_id=asset_id, status="resolved", opened_at=utc(6), resolved_at=utc(7))
         summary = decide_notification_events(session, now=utc(12))
     assert summary.events_created == 0
     assert events(factory) == []
@@ -240,11 +271,19 @@ def test_a_resolved_and_reopened_episode_is_a_new_incident_and_can_notify_again(
         channel = make_channel(session)
         make_policy(session, channel=channel)
         first_episode = make_incident(
-            session, asset_id=asset_id, rule_code="device_unavailable", status="resolved",
-            opened_at=utc(9), resolved_at=utc(10),
+            session, asset_id=asset_id, rule_code="device_unavailable", status="open", opened_at=utc(9),
         )
+        decide_notification_events(session, now=utc(9, 30))  # the prior alert its recovery depends on
+
+    with factory() as session, session.begin():
+        stored = session.get(DiagnosticIncident, first_episode.id)
+        stored.status = "resolved"
+        stored.resolved_at = utc(10)
+        session.flush()
         decide_notification_events(session, now=utc(10, 30))
-    assert {(event.incident_id, event.kind) for event in events(factory)} == {(first_episode.id, "resolved")}
+    assert {(event.incident_id, event.kind) for event in events(factory)} == {
+        (first_episode.id, "opened"), (first_episode.id, "resolved"),
+    }
 
     with factory() as session, session.begin():
         # A brand-new DiagnosticIncident row -- D1's own episode boundary,
@@ -253,7 +292,9 @@ def test_a_resolved_and_reopened_episode_is_a_new_incident_and_can_notify_again(
         decide_notification_events(session, now=utc(15, 30))
 
     kinds_by_incident = {(event.incident_id, event.kind) for event in events(factory)}
-    assert kinds_by_incident == {(first_episode.id, "resolved"), (second_episode.id, "opened")}
+    assert kinds_by_incident == {
+        (first_episode.id, "opened"), (first_episode.id, "resolved"), (second_episode.id, "opened"),
+    }
 
 
 # --- 6. different incidents on the same asset/device never collide ------------
@@ -469,16 +510,62 @@ def test_baseline_excludes_an_incident_opened_before_it(factory, asset_id) -> No
     assert summary.events_created == 0
 
 
-def test_baseline_does_not_exclude_resolution_of_a_pre_baseline_incident(factory, asset_id) -> None:
-    """A genuinely old problem finally clearing is worth saying regardless of
-    when the policy started watching it."""
+def test_baseline_excludes_escalation_of_a_pre_baseline_incident_too(factory, asset_id) -> None:
+    """The baseline exclusion is not just about "opened": an escalation is
+    that same suppressed alert's natural continuation, so a backlog incident
+    already older than the escalation threshold must not fire the moment the
+    policy turns on -- that is not "mudança relevante depois da ativação",
+    it is the baseline exclusion leaking through a second door."""
+    with factory() as session, session.begin():
+        channel = make_channel(session)
+        make_policy(session, channel=channel, baseline_at=utc(12), escalation_after_minutes=60, notify_on_open=False)
+        make_incident(session, asset_id=asset_id, severity="warning", opened_at=utc(9))  # 3h old before baseline
+        summary = decide_notification_events(session, now=utc(13))  # 4h old, well past the 60min threshold
+    assert summary.events_created == 0
+    assert events(factory) == []
+
+
+def test_baseline_excludes_resolution_of_an_incident_that_never_alerted(factory, asset_id) -> None:
+    """A pre-baseline incident that resolves without ever having crossed
+    into scope while open never told the channel it was a problem, so its
+    resolution is not a recovery message either -- see the prior-alert
+    requirement on notify_on_resolve."""
     with factory() as session, session.begin():
         channel = make_channel(session)
         make_policy(session, channel=channel, baseline_at=utc(12), notify_on_resolve=True)
         make_incident(session, asset_id=asset_id, status="resolved", opened_at=utc(9), resolved_at=utc(10))
         summary = decide_notification_events(session, now=utc(13))
-    assert summary.events_created == 1
-    assert events(factory)[0].kind == "resolved"
+    assert summary.events_created == 0
+    assert events(factory) == []
+
+
+def test_baseline_exclusion_is_permanent_by_opened_at_not_a_one_time_grace_period(factory, asset_id) -> None:
+    """A known, documented limit of today's baseline mechanism: exclusion is
+    keyed purely on `opened_at < baseline_at`, forever -- there is no
+    persisted "severity as of baseline" to compare against, so a backlog
+    incident that later worsens in severity, or simply stays open long past
+    an escalation threshold, is *not* distinguished from one that never
+    changed. docs/v2/DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md documents this
+    as an open gap for the "piora de severidade" / "perda de produção"
+    escalation triggers on pre-existing incidents specifically -- not
+    invented here as a heuristic, because a wrong one risks exactly the
+    storm baseline exists to prevent."""
+    with factory() as session, session.begin():
+        channel = make_channel(session)
+        make_policy(
+            session, channel=channel, baseline_at=utc(10), escalation_after_minutes=60,
+            notify_on_open=False, notify_on_resolve=True,
+        )
+        make_incident(session, asset_id=asset_id, severity="warning", opened_at=utc(9))  # pre-baseline
+        decide_notification_events(session, now=utc(9, 30))  # before baseline: nothing yet
+    assert events(factory) == []
+
+    with factory() as session, session.begin():
+        # Long past both baseline and the 60min escalation threshold --
+        # still nothing, because opened_at is still before baseline_at.
+        summary = decide_notification_events(session, now=utc(20, 0))
+    assert summary.events_created == 0
+    assert events(factory) == []
 
 
 # --- end-to-end: the one function the job actually calls -----------------------

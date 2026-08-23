@@ -1555,3 +1555,227 @@ sentido, verificada ao vivo. O que falta não é código — é a mesma decisão
 humana já identificada em §23/§25: aprovar explicitamente qual policy
 activar (e para o digest, com que cadência e para que canal), antes de
 qualquer entrega real. Só depois disso faz sentido D4.
+## 28. Revisão da NotificationPolicy antes do D4 — decisões do utilizador traduzidas em regras concretas (2026-08-23)
+
+Pedido explícito: transformar 6 decisões de política em `NotificationPolicy`
+concreta(s), mostrar exactamente que `rule_code`s entram em imediato /
+escalation / digest-only / never-notify, fazer um dry-run real contra os
+incidentes actuais, dizer quantas mensagens seriam geradas hoje. **Nenhuma
+`NotificationPolicy` real foi criada, nenhum Telegram foi enviado** — tudo
+abaixo é simulação em memória contra a lógica real de
+`notifications/service.py`, lida directamente da produção só para leitura.
+
+### As 6 decisões, mapeadas
+
+| # | Decisão do utilizador | Como fica representada |
+|---|---|---|
+| 1 | Críticos novos → imediato | Policy A: `min_severity=critical`, `rule_codes_json=None`, `notify_on_open=True` |
+| 2 | Warnings não imediatos; escalam se >24h, ou piora de severidade, ou perda de produção/vários devices | Policy B (`escalation_after_minutes=1440`) cobre ">24h" para as regras de disparidade; "piora de severidade" e "perda de produção" já são a própria razão de existir das regras `zero_power_while_peers_active`/`power_disparity_among_peers`/`daily_energy_disparity_among_peers` (ver §rule_codes abaixo) — não são um segundo critério a inventar em cima da policy, são o próprio `rule_code`/severidade que já as distingue de `stale_reading`/`device_unknown_status` |
+| 3 | Estruturais nunca imediato, vão para digest | Nenhuma policy criada para estas 4 regras — o digest (D6) já lê `DiagnosticIncident` directamente, sem depender de nenhuma `NotificationPolicy`, por isso "vão para digest" é garantido pela ausência de policy, não por uma regra extra |
+| 4 | Recuperação só de incidentes que já alertaram, com duração total | **Bug real corrigido nesta revisão** — ver abaixo |
+| 5 | Backlog não gera alerta imediato; só notifica se mudar depois da activação | `baseline_at`, já existente — mas tinha um bug: só se aplicava a `notify_on_open`, não a `escalation_after_minutes`. Corrigido. |
+| 6 | 1 digest diário com novos/resolvidos/críticos abertos/warnings persistentes/por portfolio/prioridades, sem spam | Já implementado no D6 tal como está — confirmado abaixo, sem alterações de código |
+
+### As duas policies concretas propostas (ainda não persistidas)
+
+```python
+Policy A — "Críticos imediatos"
+  enabled=True
+  min_severity="critical"
+  rule_codes_json=None            # qualquer rule_code que atinja severidade crítica
+  notify_on_open=True
+  notify_on_resolve=True
+  escalation_after_minutes=None   # crítico já é imediato; escalar não acrescenta nada
+  baseline_at=<momento de activação>
+
+Policy B — "Warnings acionáveis (disparidade/produção)"
+  enabled=True
+  min_severity="warning"
+  rule_codes_json=["zero_power_while_peers_active",
+                    "power_disparity_among_peers",
+                    "daily_energy_disparity_among_peers"]
+  notify_on_open=False            # nunca imediato para warnings, por decisão 2
+  notify_on_resolve=True
+  escalation_after_minutes=1440   # 24h
+  baseline_at=<mesmo momento de activação>
+```
+
+Não há Policy C: "estruturais vão para digest" é a ausência deliberada de
+qualquer policy para essas 4 regras, não uma terceira linha na tabela
+`notification_policies`.
+
+### Tabela `rule_code` → categoria (a resposta directa ao pedido)
+
+| rule_code | severidade | categoria | porquê |
+|---|---|---|---|
+| `device_unavailable` | critical | **imediato** | Policy A, por severidade, independente do rule_code |
+| `zero_power_while_peers_active` | critical | **imediato** | idem — é a versão "crítica" de perda de produção |
+| `power_disparity_among_peers` | warning | **escalation (24h)** | Policy B — perda de produção parcial, mas ainda warning |
+| `daily_energy_disparity_among_peers` | warning | **escalation (24h)** | Policy B — idem, integrado ao dia |
+| `stale_reading` | warning | **digest-only** | estrutural (decisão 3), 325 dos 644 incidentes actuais |
+| `device_unknown_status` | warning | **digest-only** | estrutural (decisão 3), 319 dos 644 incidentes actuais |
+| `device_no_history` | warning | **digest-only** | estrutural (decisão 3), 0 hoje mas na lista explícita do utilizador |
+| `partial_device_coverage` | info | **digest-only** | cobertura, nunca crítica, sempre digest |
+
+**Never-notify: nenhum.** Dos 8 `rule_code`s conhecidos, todos caem numa das
+três categorias activas — não há nenhum que deva ser permanentemente
+ignorado. Se isso mudar (ex.: uma regra puramente informativa sem valor
+operacional), fica documentado aqui como decisão explícita, não como
+omissão silenciosa.
+
+### Dois bugs reais encontrados e corrigidos ao formalizar a decisão 4 e 5
+
+Ambos em `notifications/service.py::_decide_for_policy`, ambos cobertos por
+teste novo em `tests_v2/test_notifications.py` (23 testes agora, antes 21):
+
+**1. `baseline_at` não se aplicava à escalação.** A verificação de baseline
+só existia no ramo `notify_on_open`; o ramo `escalation_after_minutes` não
+tinha nenhuma. Activar uma Policy B contra o backlog real faria disparar
+"escalated" para todo o backlog já com mais de 24h **na primeira avaliação**
+— exactamente a fuga de baseline que a decisão 5 pede para fechar (não é
+"mudança relevante depois da activação", é a mesma exclusão de baseline a
+escapar por uma segunda porta). Corrigido aplicando a mesma verificação
+`opened_at < baseline_at` também no ramo de escalação. Provado por
+`test_baseline_excludes_escalation_of_a_pre_baseline_incident_too`.
+
+**2. `notify_on_resolve` não exigia um alerta anterior.** O código original
+notificava recuperação para **qualquer** incidente resolvido dentro do
+âmbito da policy, mesmo que nunca tivesse gerado um evento `opened`/
+`escalated` (por exemplo, por estar excluído por baseline enquanto estava
+aberto). A decisão 4 é explícita: "recuperação para incidentes que **tenham
+gerado alerta anteriormente**". Corrigido: o ramo `notify_on_resolve` agora
+só cria o evento `resolved` se já existir um `opened` ou `escalated` para o
+mesmo incidente/canal. Provado por
+`test_resolution_produces_nothing_for_an_incident_that_never_alerted` e
+`test_baseline_excludes_resolution_of_an_incident_that_never_alerted`; o
+comportamento correcto (recuperação depois de um alerta real) continua
+provado por `test_resolution_produces_exactly_one_recovery_notification_
+when_the_policy_defines_it`, agora reescrito para criar o incidente aberto,
+deixá-lo alertar, só depois resolvê-lo — não mais criado já resolvido sem
+história.
+
+### Gap documentado, não implementado: "piora de severidade" / "perda de produção" num incidente de backlog
+
+A decisão 2 pede escalação também quando um warning "piora de severidade"
+ou passa a envolver "perda relevante de produção / vários devices". Para um
+incidente **novo** (aberto depois da activação), isto já funciona sem
+código novo: `_in_scope` é recalculado a cada avaliação contra a severidade
+**actual** do incidente, por isso um `power_disparity_among_peers` que
+piora para `zero_power_while_peers_active` (crítico) passa a estar em
+âmbito da Policy A na avaliação seguinte, e recebe um `opened` imediato
+mesmo sem nunca ter sido notificado como warning antes.
+
+Para um incidente de **backlog** (aberto antes da baseline), isto **não
+funciona hoje**: `baseline_at` só compara `opened_at`, não guarda "qual era
+a severidade na altura da activação" nem tem histórico de severidade. Um
+incidente de backlog que piorasse de warning para crítico depois de
+activarmos a policy ficaria, com o código actual, permanentemente excluído
+pela baseline em ambas as policies — a piora não seria notificada. Isto
+**não foi corrigido nesta revisão** deliberadamente: não há nenhum caso
+real hoje para desenhar a correcção contra (0 incidentes críticos, 0
+incidentes nas regras de disparidade, em toda a produção), e uma heurística
+inventada sem esse caso real arrisca exactamente a explosão que a baseline
+existe para evitar. Documentado e coberto por
+`test_baseline_exclusion_is_permanent_by_opened_at_not_a_one_time_grace_period`,
+que prova o comportamento actual (conservador) em vez de fingir suportar o
+caso. Revisitar quando houver um primeiro caso real de piora de severidade
+num incidente pré-baseline.
+
+### "Marca-os como preexistentes ou equivalente" (decisão 5)
+
+`baseline_at` **é** esse mecanismo, não uma etiqueta nova a inventar: todo
+o incidente com `opened_at < baseline_at` fica estrutural e permanentemente
+fora do âmbito de `notify_on_open`/`escalation_after_minutes`, de forma
+auditável (basta comparar as duas datas, nada é apagado ou reescrito no
+`DiagnosticIncident`). Não implementado agora, porque nenhuma policy real
+existe ainda para ter um `baseline_at` real: proposta para quando a policy
+for activada — um badge "Pré-existente" nas páginas de Diagnostics/Incidents
+(D2) quando `incident.opened_at < policy.baseline_at`, calculado on-the-fly,
+sem migração nem novo campo.
+
+### Dry-run real, números exactos (produção, só leitura, 2026-08-23)
+
+Simulação com as duas policies acima (`baseline_at = agora`, ou seja: tudo o
+que está aberto hoje é backlog) contra os 644 `DiagnosticIncident` reais e
+abertos, usando a função real `_in_scope` do `notifications/service.py`:
+
+```
+total de incidentes abertos: 644
+rule_codes presentes hoje:   device_unknown_status, stale_reading
+
+Policy A (críticos imediatos):
+  em âmbito (qualquer severidade crítica): 0
+  dos quais pré-baseline (excluídos hoje): 0
+  dos quais disparariam "opened" hoje:      0
+
+Policy B (warnings acionáveis, escalação 24h):
+  em âmbito (rule_codes de disparidade):    0
+  dos quais pré-baseline (excluídos hoje):  0
+  dos quais já teriam ≥24h (sem baseline):  0
+
+Digest-only (estrutural): 644
+Sem categoria (deveria ser 0): 0
+```
+
+**Mensagens Telegram geradas hoje, com esta policy: 0.** Não por exclusão de
+baseline — por ausência genuína de qualquer incidente crítico ou de
+disparidade em toda a carteira real neste momento. Os 644 incidentes
+existentes (319 `device_unknown_status` + 325 `stale_reading`, o mesmo
+backlog já documentado em §22/§25/§26/§27) caem inteiramente em digest-only,
+tal como a decisão 3 pede.
+
+O digest diário (D6, sem alterações) já apresenta este mesmo backlog sem
+spam — confirmado ao vivo com `build_digest_payload`/`render_digest_text`
+directamente contra a produção (sem criar `DigestRun`):
+
+```
+Diagnóstico — 23/08/2026 17:44
+Sem alterações desde o último digest (22/08/2026 17:44).
+
+Prioridade:
+- nenhuma ocorrência crítica nova
+- backlog persistente dominante: stale_reading (117), device_unknown_status (117)
+
+Solcorelios I
+  32/35 instalações com incidentes
+  0 novos · 0 resolvidos
+  186 avisos
+  3 instalações sem dispositivos
+  Prioritárias: Mármores Galrão (persistente, 0c/22w/0i, 42d); Sicobrita
+  (persistente, 0c/12w/0i, 97d); Marmores da Granja (persistente, 0c/10w/0i, 97d)
+
+Solcorelios II
+  13/22 instalações com incidentes
+  0 novos · 0 resolvidos
+  48 avisos
+  9 instalações sem dispositivos
+  Prioritárias: FC Alverca - Pavilhão (persistente, 0c/8w/0i, 42d); Neutripuro
+  (persistente, 0c/6w/0i, 42d); BV Sintra (persistente, 0c/4w/0i, 42d)
+```
+
+Isto satisfaz a decisão 6 (novos/resolvidos/críticos abertos/warnings
+persistentes/por portfolio/prioridades, sem lista de centenas) tal como já
+implementado — nenhuma alteração de código foi necessária no D6 para esta
+revisão.
+
+### O que muda no código, o que não muda
+
+Mudou: dois bugs reais em `_decide_for_policy` (baseline em escalação,
+alerta prévio obrigatório em resolução), cobertos por 4 testes novos/
+reescritos, suite completa a passar. Não mudou: nenhuma migração, nenhum
+campo novo em `NotificationPolicy`/`NotificationEvent`, nenhuma
+`NotificationPolicy`/`NotificationChannel` real criada em produção
+(continuam a 0 linhas), nenhuma mensagem Telegram enviada, nenhuma chamada
+a provider.
+
+### Recomendação
+
+As duas policies acima (A e B) reflectem directamente as 6 decisões e
+produzem **zero mensagens hoje**, com os 644 incidentes existentes
+correctamente roteados para o digest diário já existente. Antes de D4:
+aprovar explicitamente a criação real de `NotificationChannel` +
+`NotificationPolicy` A e B (com `baseline_at` = momento real de activação,
+não o momento deste dry-run), e confirmar a cadência/canal do digest diário
+(decisão 6). O gap de "piora de severidade em incidente de backlog" fica
+documentado e sem impacto prático hoje (0 casos reais); não bloqueia a
+activação.

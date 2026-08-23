@@ -229,6 +229,16 @@ def _decide_for_policy(
         for incident in candidates:
             if not _in_scope(incident, policy=policy):
                 continue
+            # Same baseline rule as notify_on_open, and for the same reason:
+            # an escalation is the natural continuation of an "opened" alert
+            # that was itself suppressed as pre-existing history. Without
+            # this check, activating an escalation policy against a backlog
+            # where every incident is already older than the threshold would
+            # fire an "escalated" message for the entire backlog on its very
+            # first evaluation -- not "mudança relevante depois da ativação",
+            # just the baseline exclusion leaking through a second door.
+            if policy.baseline_at is not None and incident.opened_at < policy.baseline_at:
+                continue
             age_minutes = (now - incident.opened_at).total_seconds() / 60
             if age_minutes < threshold:
                 continue
@@ -241,9 +251,20 @@ def _decide_for_policy(
         # Baseline does not apply here on purpose: a genuinely old problem
         # finally clearing is worth saying regardless of when the policy
         # started watching it (docs/v2/DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md).
+        # But a recovery message only makes sense for an episode that
+        # actually *told someone it was a problem* -- an incident this
+        # policy never announced (baseline-excluded, or never in scope while
+        # open) clearing is not a recovery from the channel's point of view,
+        # it is silence resolving into more silence. Require a prior
+        # "opened" or "escalated" event under this same policy/channel.
         candidates = session.scalars(select(DiagnosticIncident).where(DiagnosticIncident.status == "resolved"))
         for incident in candidates:
             if not _in_scope(incident, policy=policy):
+                continue
+            if not (
+                _has_event(session, incident_id=incident.id, kind="opened", channel_id=channel.id)
+                or _has_event(session, incident_id=incident.id, kind="escalated", channel_id=channel.id)
+            ):
                 continue
             if _has_event(session, incident_id=incident.id, kind="resolved", channel_id=channel.id):
                 continue
