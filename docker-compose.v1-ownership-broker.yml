@@ -1,0 +1,80 @@
+# Separate, standalone compose project -- deliberately NOT merged into
+# docker-compose.v2.yml and NEVER passed to scripts/v2_compose_up.sh.
+#
+# scripts/verify_v2_runtime_isolation.py hard-fails any deploy of
+# docker-compose.v2.yml whose text mentions "Nem-sei/data" or
+# "monitoring_board.db" -- a guardrail the V2 team built on purpose so V2's
+# real application containers (web/worker/scheduler/migrate) never gain
+# filesystem access to V1's runtime data. This file is how that guardrail
+# stays intact while V2 still gets a working FusionSolar ownership broker:
+# exactly one small, purpose-built container gets the V1 mount, and it does
+# nothing else -- no V2 application code, no V1 application code, just the
+# lease read/write protocol in scripts/fusionsolar_ownership_core.py,
+# reachable only over HTTP with a bearer token.
+#
+# Deploy / redeploy:
+#   docker compose -p nemsei-v1-fusionsolar-broker \
+#     -f docker-compose.v1-ownership-broker.yml up -d --force-recreate
+# Stop (kill switch -- V1 keeps running untouched either way, this only
+# removes V2's ability to borrow the account):
+#   docker compose -p nemsei-v1-fusionsolar-broker \
+#     -f docker-compose.v1-ownership-broker.yml down
+#
+# V2's worker/scheduler reach this container via the host's Docker bridge
+# gateway (`host.docker.internal`, mapped through `extra_hosts:
+# host-gateway` on those two services in docker-compose.v2.yml -- no V1
+# path string appears there, so the isolation check keeps passing) at
+# NEMSEI_V1_OWNERSHIP_BROKER_URL, authenticated with
+# NEMSEI_V1_OWNERSHIP_BROKER_TOKEN. Neither of those two values is a
+# FusionSolar credential; this broker never sees one.
+
+name: nemsei-v1-fusionsolar-broker
+
+services:
+  broker:
+    image: python:3.12-slim
+    restart: unless-stopped
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    working_dir: /app
+    environment:
+      NEMSEI_V1_DB_PATH: /v1data/monitoring_board.db
+      NEMSEI_V1_BROKER_TOKEN_FILE: /run/secrets/broker_token
+      NEMSEI_V1_BROKER_BIND_HOST: 0.0.0.0
+      NEMSEI_V1_BROKER_BIND_PORT: "8765"
+      NEMSEI_V1_BROKER_AUDIT_LOG: /var/log/broker/audit.jsonl
+    volumes:
+      - ./scripts/fusionsolar_ownership_core.py:/app/fusionsolar_ownership_core.py:ro
+      - ./scripts/fusionsolar_ownership_broker_daemon.py:/app/fusionsolar_ownership_broker_daemon.py:ro
+      # The whole directory, not a single-file mount: monitoring_board.db-wal
+      # and -shm are siblings SQLite creates/removes as it pleases in WAL
+      # mode, and were not present at the time this file was written.
+      # Bind-mounting a *file* path that does not yet exist makes Docker
+      # silently create a directory there instead -- which would then break
+      # V1 the next time it tries to open its own database. Mounting the
+      # parent directory sidesteps that trap entirely.
+      - /opt/server/apps/Nem-sei/data:/v1data:rw
+      - ./runtime/fusionsolar_ownership_broker:/var/log/broker:rw
+    # Bound to the Docker bridge gateway address specifically (not
+    # 127.0.0.1, which containers cannot reach; not 0.0.0.0, which would
+    # also publish on the host's real network interfaces). 172.17.0.1 is
+    # what `extra_hosts: host.docker.internal:host-gateway` resolves to for
+    # any container on the default bridge network, worker/scheduler
+    # included -- confirmed live via `getent hosts host.docker.internal`
+    # inside nemsei-v2-worker-1. Bearer-token auth still gates every route.
+    ports:
+      - "172.17.0.1:8765:8765"
+    command: >
+      sh -c "export NEMSEI_V1_BROKER_TOKEN=$$(cat $$NEMSEI_V1_BROKER_TOKEN_FILE) &&
+             exec python /app/fusionsolar_ownership_broker_daemon.py"
+    secrets:
+      - broker_token
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,os; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8765/healthz', headers={'Authorization': 'Bearer ' + open('/run/secrets/broker_token').read().strip()}), timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+secrets:
+  broker_token:
+    file: ./runtime/fusionsolar_ownership_broker/token.secret

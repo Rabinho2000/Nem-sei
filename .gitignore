@@ -22,6 +22,7 @@ SolarFusionAPI.txt
 backups/
 logs/
 data/
+runtime/
 
 # Imported/exported business files
 *.xlsx
