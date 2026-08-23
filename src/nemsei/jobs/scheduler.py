@@ -34,6 +34,17 @@ class Scheduler:
                 max_cycles=self.settings.device_status_poll_max_cycles,
             )
             created = created or device_created
+        # Off by default, and even when on, restricted to exactly the one
+        # connection id configured -- never a loop over every FusionSolar
+        # connection (docs/v2/FUSIONSOLAR_OWNERSHIP_WINDOW.md's rollout
+        # write-up: this is a shared, rate-limited account, so scaling here
+        # needs a deliberate second call site, not a config flip).
+        if self.settings.production_sync_scheduler_enabled and self.settings.production_sync_scheduler_connection_id is not None:
+            _production_job, production_created = self.repository.enqueue_due_production_incremental(
+                connection_id=self.settings.production_sync_scheduler_connection_id,
+                interval_hours=self.settings.production_sync_scheduler_interval_hours,
+            )
+            created = created or production_created
         # D1: off by default, no connection id or cap needed -- this evaluates
         # every asset from already-persisted facts, never calls a provider.
         if self.settings.diagnostic_incident_evaluation_enabled:

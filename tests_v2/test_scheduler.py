@@ -160,3 +160,33 @@ def test_scheduler_never_enqueues_digest_generation_when_disabled(settings, monk
     with build_session_factory(engine)() as session:
         jobs = session.scalars(select(Job).where(Job.job_type == "digests.generate")).all()
     assert jobs == []
+
+
+def test_scheduler_enqueues_production_sync_when_enabled(settings, monkeypatch) -> None:
+    upgrade(settings, monkeypatch)
+    production_settings = dataclasses.replace(
+        settings,
+        production_sync_scheduler_enabled=True,
+        production_sync_scheduler_connection_id=3,
+        production_sync_scheduler_interval_hours=24,
+    )
+    scheduler = Scheduler(production_settings, owner_token="scheduler-production")
+
+    assert scheduler.run_once() is True
+    assert scheduler.run_once() is False
+
+    engine = build_engine(settings)
+    with build_session_factory(engine)() as session:
+        jobs = session.scalars(select(Job).where(Job.job_type == "production.incremental")).all()
+    assert len(jobs) == 1
+    assert jobs[0].payload_json["connection_id"] == 3
+
+
+def test_scheduler_never_enqueues_production_sync_when_disabled(settings, monkeypatch) -> None:
+    upgrade(settings, monkeypatch)
+    scheduler = Scheduler(settings, owner_token="scheduler-production-off")
+    scheduler.run_once()
+    engine = build_engine(settings)
+    with build_session_factory(engine)() as session:
+        jobs = session.scalars(select(Job).where(Job.job_type == "production.incremental")).all()
+    assert jobs == []

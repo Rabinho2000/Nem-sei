@@ -86,3 +86,38 @@ def test_device_status_poll_settings_read_from_environment(monkeypatch) -> None:
     assert settings.device_status_poll_enabled is True
     assert settings.device_status_poll_connection_id == 3
     assert settings.device_status_poll_max_cycles == 48
+
+
+def test_production_sync_scheduler_disabled_by_default_needs_no_extra_config() -> None:
+    assert configured().validate().production_sync_scheduler_enabled is False
+
+
+def test_production_sync_scheduler_enabled_requires_an_explicit_connection_id() -> None:
+    """Same structural restraint as device-status polling: no 'sync every
+    FusionSolar connection' mode exists -- a shared, rate-limited account
+    needs a deliberate second call site to scale, not a config flip."""
+    settings = dataclasses.replace(configured(), production_sync_scheduler_enabled=True)
+    with pytest.raises(ConfigurationError):
+        settings.validate()
+
+
+def test_production_sync_scheduler_enabled_with_connection_id_validates() -> None:
+    settings = dataclasses.replace(
+        configured(),
+        production_sync_scheduler_enabled=True,
+        production_sync_scheduler_connection_id=3,
+    )
+    validated = settings.validate()
+    assert validated.production_sync_scheduler_connection_id == 3
+    assert validated.production_sync_scheduler_interval_hours == 24
+
+
+def test_production_sync_scheduler_settings_read_from_environment(monkeypatch) -> None:
+    monkeypatch.setenv("NEMSEI_V2_DATABASE_URL", "postgresql+psycopg://nemsei:secret@postgres:5432/nemsei_v2")
+    monkeypatch.setenv("NEMSEI_V2_PRODUCTION_SYNC_SCHEDULER_ENABLED", "true")
+    monkeypatch.setenv("NEMSEI_V2_PRODUCTION_SYNC_SCHEDULER_CONNECTION_ID", "3")
+    monkeypatch.setenv("NEMSEI_V2_PRODUCTION_SYNC_SCHEDULER_INTERVAL_HOURS", "12")
+    settings = Settings.from_environment()
+    assert settings.production_sync_scheduler_enabled is True
+    assert settings.production_sync_scheduler_connection_id == 3
+    assert settings.production_sync_scheduler_interval_hours == 12

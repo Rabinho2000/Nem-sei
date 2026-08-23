@@ -293,3 +293,60 @@ default) never share a session; two services explicitly sharing one cache
 log in once across both syncs. Full `tests_v2` suite run (broker URL
 unset, matching CI) to confirm no regression -- see the rollout report for
 the pass count.
+
+## Real canary retry, 2 hours later: still rate-limited
+
+Ran the same rollout stage again (target unchanged at 3 active, no new
+activations) after waiting ~2 hours -- well past V1's own 55-minute session
+window, the only reference point either codebase has for this account.
+`logins_this_stage: 0` (the reused-session bookkeeping itself worked
+correctly -- nothing tried to log in twice), but the one real login attempt
+this stage made was rejected: `provider_request_states.actual_call_count`
+for `authentication` moved from 13 to 14, `last_attempt_at` matched the
+retry exactly, and `last_success_at` stayed frozen at the very first
+successful login hours earlier. This was a genuine second rejection by the
+provider, not leftover local state. Per the rollout plan's own stop
+condition ("STOP se houver rate-limit inesperado"), stages 4/5 (5, 20, 50,
+full portfolio) were not attempted. V1 was unaffected throughout --
+confirmed clean before, during, and after via the broker's `/status`.
+
+**What this means going forward**: the provider's login-endpoint cooldown
+for this account is longer than 2 hours, or keys off a broader signal (e.g.
+a cumulative/daily count of logins across all of this session's testing,
+not a short sliding window) than the code assumed. Nobody should retry a
+real canary against this account without either a much longer wait or the
+provider's actual documented limit, whichever the account owner has.
+
+## Production/monitoring scheduling (hardening, no network calls)
+
+The rollout's Priority 5 gap: `production.incremental` had a working job
+*handler* (`jobs/handlers.py`) but nothing ever enqueued it -- no
+persistent job path fired it automatically; every real run so far was
+triggered by hand (`fusionsolar_rollout_stage.py` or a manual script).
+Plant-level current monitoring (`sync_current_monitoring`) has no job type
+at all yet and remains that way -- adding one was judged riskier to rush
+than to leave as a named, honest gap.
+
+Closed the production half the same way M7 Fatia 3 already closed device-
+status polling: `JobRepository.enqueue_due_production_incremental()`
+mirrors `enqueue_due_device_status_poll()`'s exact restart-safe, idempotent,
+concurrent-tick-safe shape (a `ScheduleState` row, a dedupe key, one lock
+per due slot), wired into `Scheduler.run_once()` behind
+`production_sync_scheduler_enabled` (default off) +
+`production_sync_scheduler_connection_id` (required when enabled -- there
+is structurally no "sync every FusionSolar connection" mode, so turning
+this on always names exactly one connection, matching the same restraint
+device-status polling already enforces for a shared, rate-limited account).
+No lifetime cycle cap, unlike device-status polling -- this is meant to run
+indefinitely once enabled, the same way V1's own daily
+`fusionsolar_production_sync` never had one either.
+
+Proven with the same test shapes `test_scheduler.py`/`test_jobs.py`/
+`test_config.py` already use for device-status polling (idempotent
+scheduling, restart survival, one job per concurrent tick, positive-
+interval requirement, config validation, env parsing) -- all against a real
+Postgres, zero network calls, zero real FusionSolar credentials involved.
+Deliberately **not enabled** anywhere yet: turning
+`production_sync_scheduler_enabled` on for connection 3 is a one-line
+compose change left for whoever decides it's safe to have this run
+unattended against the still-unresolved login rate limit above.

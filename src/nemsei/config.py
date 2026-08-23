@@ -101,6 +101,18 @@ class Settings:
     # unattended run can never run away unbounded even if nobody is watching
     # it. docs/v2/DEVICE_TELEMETRY.md §9.
     device_status_poll_max_cycles: int | None = None
+    # Same structural shape, for `production.incremental` instead of device
+    # status: off by default, restricted to one explicit connection (no
+    # "sync every active FusionSolar connection" mode -- scaling to the
+    # portfolio needs a deliberate second call site, not a config flip; see
+    # docs/v2/FUSIONSOLAR_OWNERSHIP_WINDOW.md's rollout write-up for why
+    # that restraint matters here specifically: a shared, rate-limited
+    # account). No lifetime cap, unlike device-status polling -- this is
+    # meant to run indefinitely once turned on, matching V1's own daily
+    # `fusionsolar_production_sync` having none either.
+    production_sync_scheduler_enabled: bool = False
+    production_sync_scheduler_interval_hours: int = 24
+    production_sync_scheduler_connection_id: int | None = None
     # M7 Fatia 5 / D1 (docs/v2/DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md): the
     # periodic diagnostic-incident evaluator. Off by default, same pattern as
     # every other recurring behaviour this codebase adds -- but unlike
@@ -165,6 +177,9 @@ class Settings:
             device_status_poll_interval_minutes=int(os.environ.get("NEMSEI_V2_DEVICE_STATUS_POLL_INTERVAL_MINUTES", "30")),
             device_status_poll_connection_id=_optional_int(os.environ.get("NEMSEI_V2_DEVICE_STATUS_POLL_CONNECTION_ID")),
             device_status_poll_max_cycles=_optional_int(os.environ.get("NEMSEI_V2_DEVICE_STATUS_POLL_MAX_CYCLES")),
+            production_sync_scheduler_enabled=parse_bool(os.environ.get("NEMSEI_V2_PRODUCTION_SYNC_SCHEDULER_ENABLED"), default=False),
+            production_sync_scheduler_interval_hours=int(os.environ.get("NEMSEI_V2_PRODUCTION_SYNC_SCHEDULER_INTERVAL_HOURS", "24")),
+            production_sync_scheduler_connection_id=_optional_int(os.environ.get("NEMSEI_V2_PRODUCTION_SYNC_SCHEDULER_CONNECTION_ID")),
             diagnostic_incident_evaluation_enabled=parse_bool(
                 os.environ.get("NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED"), default=False
             ),
@@ -211,6 +226,10 @@ class Settings:
             self.device_status_poll_max_cycles is None or self.device_status_poll_max_cycles <= 0
         ):
             raise ConfigurationError("Device status polling requires a positive lifetime cycle cap; there is no uncapped mode.")
+        if self.production_sync_scheduler_interval_hours <= 0:
+            raise ConfigurationError("Production sync scheduler interval must be positive.")
+        if self.production_sync_scheduler_enabled and self.production_sync_scheduler_connection_id is None:
+            raise ConfigurationError("Production sync scheduling requires an explicit connection id; there is no portfolio-wide mode.")
         if self.diagnostic_incident_evaluation_interval_minutes <= 0:
             raise ConfigurationError("Diagnostic incident evaluation interval must be positive.")
         if self.notification_processing_interval_minutes <= 0:

@@ -671,6 +671,105 @@ class JobRepository:
                 session.expunge(existing)
                 return existing, False
 
+    def enqueue_due_production_incremental(
+        self, *, connection_id: int, interval_hours: int, now: datetime | None = None
+    ) -> tuple[Job | None, bool]:
+        """Enqueue one `production.incremental` job when its persisted
+        schedule is due -- same restart-safe, idempotent, single-connection
+        shape as `enqueue_due_device_status_poll` above (read that
+        docstring for the full rationale; this one only notes what differs).
+
+        No lifetime hard cap, unlike device-status polling: V1's own daily
+        `fusionsolar_production_sync` has none either, and unlike that
+        M7 Fatia 3 canary this is meant to run indefinitely once turned on
+        for a connection -- capping it would mean silently going stale
+        after N days with no signal beyond a frozen `next_run_at`.
+
+        The enqueued payload carries no `start_date`/`end_date` -- an empty
+        payload is exactly what `_execute_production` already interprets as
+        "resume from wherever `sync_cursors` last got to", the same
+        cursor-driven incremental mode this job type always meant, whether
+        triggered by a scheduler tick or (as it was for asset 2 today) a
+        manual rollout stage.
+        """
+        if interval_hours <= 0:
+            raise ValueError("Production sync interval must be positive.")
+        now_value = now or utc_now()
+        key = f"production.incremental:{connection_id}"
+        try:
+            with self._immediate_session() as session:
+                schedule = session.get(ScheduleState, key)
+                if schedule is not None and as_utc(schedule.next_run_at) > now_value:
+                    return None, False
+                slot = as_utc(schedule.next_run_at) if schedule is not None else now_value
+                dedupe_key = f"{key}:{slot.isoformat()}"
+                existing = session.scalar(
+                    select(Job).where(
+                        Job.job_type == "production.incremental", Job.dedupe_key == dedupe_key, Job.status.in_(ACTIVE_STATUSES)
+                    )
+                )
+                if existing is None:
+                    job = Job(
+                        job_type="production.incremental",
+                        status="queued",
+                        payload_json={"connection_id": connection_id, "scheduled_for": slot.isoformat()},
+                        dedupe_key=dedupe_key,
+                        priority=100,
+                        available_at=now_value,
+                        attempt_count=0,
+                        max_attempts=3,
+                        created_at=now_value,
+                        updated_at=now_value,
+                    )
+                    session.add(job)
+                    session.flush()
+                    self._event(
+                        session,
+                        job_id=job.id,
+                        event_type="enqueued",
+                        attempt=0,
+                        from_status=None,
+                        to_status="queued",
+                        actor_source="scheduler",
+                        metadata={"schedule_key": key, "dedupe_key": dedupe_key},
+                        occurred_at=now_value,
+                    )
+                    created = True
+                else:
+                    job = existing
+                    created = False
+                if schedule is None:
+                    schedule = ScheduleState(schedule_key=key, next_run_at=slot, updated_at=now_value)
+                    session.add(schedule)
+                schedule.last_enqueued_at = now_value
+                schedule.next_run_at = slot + timedelta(hours=interval_hours)
+                schedule.updated_at = now_value
+                session.flush()
+                session.expunge(job)
+                return job, created
+        except IntegrityError:
+            with self._immediate_session() as session:
+                existing = session.scalar(
+                    select(Job).where(
+                        Job.job_type == "production.incremental", Job.dedupe_key == dedupe_key, Job.status.in_(ACTIVE_STATUSES)
+                    )
+                )
+                if existing is None:
+                    raise
+                self._event(
+                    session,
+                    job_id=existing.id,
+                    event_type="dedupe_reused",
+                    attempt=existing.attempt_count,
+                    from_status=existing.status,
+                    to_status=existing.status,
+                    actor_source="scheduler",
+                    metadata={"schedule_key": key, "dedupe_key": dedupe_key},
+                    occurred_at=now_value,
+                )
+                session.expunge(existing)
+                return existing, False
+
     def enqueue_due_incident_evaluation(
         self, *, interval_minutes: int, now: datetime | None = None
     ) -> tuple[Job | None, bool]:
