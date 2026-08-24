@@ -13,6 +13,7 @@ from nemsei.assets.service import asset_search_clause, normalize_name
 from nemsei.monitoring.models import MonitoringObservation, ProductionFact
 from nemsei.providers.models import AssetProviderMapping, LegacyImportRecord, ProviderConnection
 from nemsei.providers.registry import descriptor_for
+from nemsei.providers.service import mapping_approval_blockers
 from nemsei.sources.models import AssetSourcePolicy
 from nemsei.sync.models import IntegrationHealth, SyncRun
 
@@ -386,6 +387,18 @@ def provider_connections_data(session: Session, *, settings: Any | None = None) 
     return result
 
 
+# The service speaks English to raise with; the screen speaks to an operator.
+BLOCKER_LABELS = {
+    "not_pending": "Já não está pendente",
+    "missing_relation": "Central ou ligação em falta",
+    "asset_needs_review": "Central por rever",
+    "connection_not_ready": "Ligação não configurada",
+    "external_id_missing": "Sem identificador externo",
+    "already_claimed": "Identificador já reclamado",
+    "quarantined_evidence": "Evidência em quarentena",
+}
+
+
 def mapping_review_data(
     session: Session,
     *,
@@ -458,14 +471,38 @@ def mapping_review_data(
                 "asset_review_status": asset.review_status,
                 "aliases": aliases,
                 "evidence": [{"table": item.legacy_table, "legacy_id": item.legacy_id, "outcome": item.outcome, "reason": item.reason} for item in evidence],
+                # Computed by the same function `approve_mapping` obeys, so the
+                # screen can never promise an approval the service refuses.
+                "blockers": [
+                    {"code": blocker.code, "label": BLOCKER_LABELS.get(blocker.code, blocker.message)}
+                    for blocker in (
+                        mapping_approval_blockers(session, mapping=mapping, asset=asset, connection=connection)
+                        if mapping.mapping_status == "pending_review"
+                        else ()
+                    )
+                ],
             }
         )
     connections = list(session.scalars(select(ProviderConnection).order_by(ProviderConnection.display_name)))
+    pending = [row for row in mappings if row["mapping_status"] == "pending_review"]
+    blocker_counts: dict[str, int] = {}
+    for row in pending:
+        for blocker in row["blockers"]:
+            blocker_counts[blocker["code"]] = blocker_counts.get(blocker["code"], 0) + 1
     return {
         "mappings": mappings,
         "connections": connections,
         "provider_options": [(code, provider_label(code)) for code in PROVIDER_LABELS],
         "filters": {"provider": provider, "connection_id": connection_id, "status": status, "asset_search": asset_search, "organization_search": organization_search, "needs_review": needs_review},
+        "readiness": {
+            "pending": len(pending),
+            "ready": sum(1 for row in pending if not row["blockers"]),
+            "blocked": sum(1 for row in pending if row["blockers"]),
+            "by_blocker": sorted(
+                ({"code": code, "label": BLOCKER_LABELS.get(code, code), "count": count} for code, count in blocker_counts.items()),
+                key=lambda item: (-item["count"], item["label"]),
+            ),
+        },
     }
 
 

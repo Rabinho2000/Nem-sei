@@ -1,6 +1,7 @@
 """Validation and historical transition rules for provider mappings."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date
 
 from sqlalchemy import select
@@ -218,6 +219,68 @@ def create_mapping(
     return mapping
 
 
+@dataclass(frozen=True)
+class ApprovalBlocker:
+    """One reason a pending mapping cannot be approved right now."""
+
+    code: str
+    message: str
+
+
+def mapping_approval_blockers(
+    session: Session,
+    *,
+    mapping: AssetProviderMapping,
+    asset: Asset | None,
+    connection: ProviderConnection | None,
+) -> tuple[ApprovalBlocker, ...]:
+    """Every reason `approve_mapping` would refuse this mapping, in order.
+
+    `approve_mapping` calls this and raises on the first one, so the review
+    screen and the button can never disagree: a row shown as approvable is
+    approvable, and a blocked row explains itself with the same words the
+    service would have used.
+
+    This matters more than it looks. All 460 pending mappings in production sit
+    on the two disabled V1-legacy connections, and every asset they point at is
+    still `needs_review` -- so a bulk approve button on its own would have
+    failed 460 times out of 460 and told the operator nothing.
+    """
+    blockers: list[ApprovalBlocker] = []
+    if mapping.mapping_status != "pending_review":
+        blockers.append(ApprovalBlocker("not_pending", "Only pending mappings can be approved."))
+    if asset is None or connection is None:
+        blockers.append(ApprovalBlocker("missing_relation", "Mapping asset and provider connection are required."))
+        return tuple(blockers)
+    if asset.review_status == "needs_review":
+        blockers.append(ApprovalBlocker("asset_needs_review", "Asset identity review must be completed before mapping approval."))
+    if connection.configuration_status != "configured" or not connection.enabled or not connection.credential_reference:
+        blockers.append(ApprovalBlocker("connection_not_ready", "Provider connection must be configured and enabled before mapping approval."))
+    if not mapping.external_id.strip():
+        blockers.append(ApprovalBlocker("external_id_missing", "Provider external ID is required."))
+    claimed = session.scalar(
+        select(AssetProviderMapping.id).where(
+            AssetProviderMapping.provider_connection_id == mapping.provider_connection_id,
+            AssetProviderMapping.resource_kind == mapping.resource_kind,
+            AssetProviderMapping.normalized_external_id == mapping.normalized_external_id,
+            AssetProviderMapping.mapping_status == "active",
+            AssetProviderMapping.valid_to.is_(None),
+            AssetProviderMapping.id != mapping.id,
+        )
+    )
+    if claimed is not None:
+        blockers.append(ApprovalBlocker("already_claimed", "Provider plant is already actively mapped to another asset."))
+    quarantined = session.scalar(
+        select(LegacyImportRecord.id).where(
+            LegacyImportRecord.target_asset_id == asset.id,
+            LegacyImportRecord.outcome == "quarantined",
+        )
+    )
+    if quarantined is not None:
+        blockers.append(ApprovalBlocker("quarantined_evidence", "Asset is associated with quarantined legacy identity evidence."))
+    return tuple(blockers)
+
+
 def approve_mapping(session: Session, *, mapping_id: int, actor_username: str) -> AssetProviderMapping:
     mapping = session.execute(
         select(AssetProviderMapping).where(AssetProviderMapping.id == mapping_id).with_for_update()
@@ -226,42 +289,15 @@ def approve_mapping(session: Session, *, mapping_id: int, actor_username: str) -
         raise ValueError("Unknown provider mapping.")
     if mapping.mapping_status == "active":
         return mapping
-    if mapping.mapping_status != "pending_review":
-        raise ValueError("Only pending mappings can be approved.")
     asset = session.execute(select(Asset).where(Asset.id == mapping.asset_id).with_for_update()).scalar_one_or_none()
     connection = session.execute(
         select(ProviderConnection).where(ProviderConnection.id == mapping.provider_connection_id).with_for_update()
     ).scalar_one_or_none()
-    if asset is None or connection is None:
-        raise ValueError("Mapping asset and provider connection are required.")
-    if asset.review_status == "needs_review":
-        raise ValueError("Asset identity review must be completed before mapping approval.")
-    if connection.configuration_status != "configured" or not connection.enabled or not connection.credential_reference:
-        raise ValueError("Provider connection must be configured and enabled before mapping approval.")
-    if not mapping.external_id.strip():
-        raise ValueError("Provider external ID is required.")
-    claimed = session.scalar(
-        select(AssetProviderMapping)
-        .where(
-            AssetProviderMapping.provider_connection_id == mapping.provider_connection_id,
-            AssetProviderMapping.resource_kind == mapping.resource_kind,
-            AssetProviderMapping.normalized_external_id == mapping.normalized_external_id,
-            AssetProviderMapping.mapping_status == "active",
-            AssetProviderMapping.valid_to.is_(None),
-            AssetProviderMapping.id != mapping.id,
-        )
-        .with_for_update()
-    )
-    if claimed is not None:
-        raise ValueError("Provider plant is already actively mapped to another asset.")
-    quarantined = session.scalar(
-        select(LegacyImportRecord.id).where(
-            LegacyImportRecord.target_asset_id == asset.id,
-            LegacyImportRecord.outcome == "quarantined",
-        )
-    )
-    if quarantined is not None:
-        raise ValueError("Asset is associated with quarantined legacy identity evidence.")
+    # Take the row locks above first, then judge: the claim check inside must
+    # not race another approval of the same external id.
+    blockers = mapping_approval_blockers(session, mapping=mapping, asset=asset, connection=connection)
+    if blockers:
+        raise ValueError(blockers[0].message)
     mapping.mapping_status = "active"
     mapping.updated_at = utc_now()
     record_operator_action(

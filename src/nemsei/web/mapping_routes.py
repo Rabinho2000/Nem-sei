@@ -64,6 +64,45 @@ def reject(mapping_id: int):
     return redirect(url_for("mappings.index"))
 
 
+@mapping_bp.post("/mappings/bulk")
+@require_authenticated
+def bulk_decide():
+    """Approve or reject many mappings at once, selection always explicit.
+
+    Each one still goes through `approve_mapping`/`reject_mapping` unchanged --
+    this is a loop over the same guarded call, not a shortcut past it. One
+    refusal does not discard the rest: the successes commit and the failures
+    are reported with their count, because a batch of 460 in which one asset is
+    unreviewed should not be an all-or-nothing.
+    """
+    require_valid_token()
+    session = get_request_session()
+    decision = request.form.get("decision", "")
+    selected = [int(value) for value in request.form.getlist("mapping_ids") if value.isdigit()]
+    if decision not in {"approve", "reject"} or not selected:
+        flash("Escolha uma ação e pelo menos um mapping.", "error")
+        return redirect(request.referrer or url_for("mappings.index"))
+
+    act = approve_mapping if decision == "approve" else reject_mapping
+    actor = browser_session.get("username", "web")
+    done, failures = 0, []
+    for mapping_id in selected:
+        try:
+            act(session, mapping_id=mapping_id, actor_username=actor)
+            session.commit()
+            done += 1
+        except ValueError as exc:
+            session.rollback()
+            failures.append(str(exc))
+    verb = "aprovados" if decision == "approve" else "rejeitados"
+    if done:
+        flash(f"{done} de {len(selected)} mappings {verb}.", "success")
+    if failures:
+        reason = max(set(failures), key=failures.count)
+        flash(f"{len(failures)} recusados. Motivo mais comum: {reason}", "error")
+    return redirect(request.referrer or url_for("mappings.index"))
+
+
 @mapping_bp.get("/mappings/<int:mapping_id>/preflight")
 @require_authenticated
 def preflight(mapping_id: int) -> str:

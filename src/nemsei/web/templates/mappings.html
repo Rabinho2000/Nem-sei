@@ -1,6 +1,29 @@
 {% extends "base.html" %}
+{#
+  Bloco B: a aprovação continua a ser um a um por baixo -- cada linha passa
+  pelo mesmo `approve_mapping` guardado. O que muda é que a página diz agora,
+  antes de qualquer clique, quais é que passariam. Sem isso, um botão de lote
+  sobre os 460 pendentes reais falharia 460 vezes e não explicava nada.
+#}
 {% block content %}
 <header class="page-header"><div><p class="eyebrow">Integrações</p><h1>Revisão de mappings</h1><p class="page-intro">Aprovação explícita, com evidência de identidade e sem ativação automática.</p></div></header>
+
+{% if readiness.pending %}
+  <section class="panel readiness-panel">
+    <div class="panel-header"><div><p class="eyebrow">Prontidão</p><h2>{{ readiness.pending }} pendente{{ '' if readiness.pending == 1 else 's' }} nestes filtros</h2></div></div>
+    <div class="readiness-grid">
+      <div class="{{ 'ready' if readiness.ready else 'none' }}"><strong>{{ readiness.ready }}</strong><span>prontos a aprovar</span></div>
+      <div class="blocked"><strong>{{ readiness.blocked }}</strong><span>bloqueados</span></div>
+      {% for blocker in readiness.by_blocker %}
+        <div class="reason"><strong>{{ blocker.count }}</strong><span>{{ blocker.label }}</span></div>
+      {% endfor %}
+    </div>
+    {% if not readiness.ready %}
+      <p class="provenance">Nenhum destes mappings pode ser aprovado já. Um mapping só passa a ativo quando a central estiver revista <em>e</em> a ligação provider estiver configurada e ativa — as duas condições que o serviço exige e que esta contagem espelha.</p>
+    {% endif %}
+  </section>
+{% endif %}
+
 <section class="panel">
   <form class="filter-bar" method="get">
     <input name="asset" value="{{ filters.asset_search }}" placeholder="Central">
@@ -11,14 +34,70 @@
     <button class="button secondary" type="submit">Filtrar</button>
   </form>
 </section>
-<section class="panel table-panel"><div class="table-scroll"><table class="data-table compact-table"><thead><tr><th>Central / organização</th><th>Provider / ligação</th><th>ID externo</th><th>Estado</th><th>Evidência</th><th>Ações</th></tr></thead><tbody>
-{% for mapping in mappings %}<tr>
-  <th scope="row"><a href="{{ url_for('assets.asset_detail', asset_id=mapping.asset_id) }}">{{ mapping.asset_name }}</a><small>{{ mapping.organization_name or 'Sem organização' }}</small></th>
-  <td>{{ mapping.provider }}<small>{{ mapping.connection_name }}</small></td>
-  <td><code>{{ mapping.external_id }}</code>{% if mapping.external_name %}<small>{{ mapping.external_name }}</small>{% endif %}</td>
-  <td><span class="status-badge {{ 'success' if mapping.mapping_status == 'active' else 'warning' if mapping.mapping_status == 'pending_review' else 'muted' }}">{{ mapping.mapping_status }}</span></td>
-  <td><small>{{ mapping.aliases|length }} aliases · {{ mapping.evidence|length }} registos importados</small>{% if mapping.asset_review_status == 'needs_review' %}<small class="text-warning">Identidade requer revisão</small>{% endif %}</td>
-  <td class="action-stack"><a class="button secondary" href="{{ url_for('mappings.preflight', mapping_id=mapping.id, capability='current_monitoring') }}">Preflight</a>{% if mapping.mapping_status == 'pending_review' %}<form method="post" action="{{ url_for('mappings.approve', mapping_id=mapping.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button" type="submit">Aprovar</button></form><form method="post" action="{{ url_for('mappings.reject', mapping_id=mapping.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button danger" type="submit">Rejeitar</button></form>{% endif %}</td>
-</tr>{% else %}<tr><td class="table-empty" colspan="6">Não existem mappings para os filtros escolhidos.</td></tr>{% endfor %}
-</tbody></table></div></section>
+
+<form method="post" action="{{ url_for('mappings.bulk_decide') }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <section class="panel table-panel">
+    <div class="table-scroll">
+      <table class="data-table compact-table wide-table">
+        <thead><tr><th class="pick-column"><span class="sr-only">Selecionar</span></th><th>Central / organização</th><th>Provider / ligação</th><th>ID externo</th><th>Estado</th><th>Prontidão</th><th>Ações</th></tr></thead>
+        <tbody>
+          {% for mapping in mappings %}
+            <tr class="{{ 'row-attention' if mapping.blockers else '' }}">
+              <td class="pick-column">
+                {% if mapping.mapping_status == 'pending_review' %}
+                  <label class="pick"><input type="checkbox" name="mapping_ids" value="{{ mapping.id }}"><span class="sr-only">Selecionar mapping {{ mapping.id }}</span></label>
+                {% endif %}
+              </td>
+              <th scope="row"><a href="{{ url_for('assets.asset_detail', asset_id=mapping.asset_id) }}">{{ mapping.asset_name }}</a><small>{{ mapping.organization_name or 'Sem organização' }}</small></th>
+              <td>{{ mapping.provider }}<small>{{ mapping.connection_name }}</small></td>
+              <td><code>{{ mapping.external_id }}</code>{% if mapping.external_name %}<small>{{ mapping.external_name }}</small>{% endif %}</td>
+              <td><span class="status-badge {{ 'success' if mapping.mapping_status == 'active' else 'warning' if mapping.mapping_status == 'pending_review' else 'muted' }}">{{ mapping.mapping_status }}</span></td>
+              <td>
+                {% if mapping.mapping_status != 'pending_review' %}
+                  <small>—</small>
+                {% elif mapping.blockers %}
+                  <span class="blocker-stack">
+                    {% for blocker in mapping.blockers %}
+                      {% if blocker.code == 'asset_needs_review' %}
+                        <a class="status-badge warning" href="{{ url_for('assets.asset_detail', asset_id=mapping.asset_id) }}">{{ blocker.label }} →</a>
+                      {% elif blocker.code == 'connection_not_ready' %}
+                        <a class="status-badge warning" href="{{ url_for('assets.provider_connections') }}">{{ blocker.label }} →</a>
+                      {% else %}
+                        <span class="status-badge danger">{{ blocker.label }}</span>
+                      {% endif %}
+                    {% endfor %}
+                  </span>
+                {% else %}
+                  <span class="status-badge success">Pronto</span>
+                {% endif %}
+                <small>{{ mapping.aliases|length }} aliases · {{ mapping.evidence|length }} registos importados</small>
+              </td>
+              <td class="action-stack">
+                <a class="button secondary" href="{{ url_for('mappings.preflight', mapping_id=mapping.id, capability='current_monitoring') }}">Preflight</a>
+                {% if mapping.mapping_status == 'pending_review' and not mapping.blockers %}
+                  <form method="post" action="{{ url_for('mappings.approve', mapping_id=mapping.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button" type="submit">Aprovar</button></form>
+                {% endif %}
+                {% if mapping.mapping_status == 'pending_review' %}
+                  <form method="post" action="{{ url_for('mappings.reject', mapping_id=mapping.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button danger" type="submit">Rejeitar</button></form>
+                {% endif %}
+              </td>
+            </tr>
+          {% else %}<tr><td class="table-empty" colspan="7">Não existem mappings para os filtros escolhidos.</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  {% if readiness.pending %}
+    <section class="panel bulk-panel">
+      <div class="panel-header"><div><p class="eyebrow">Decisão em lote</p><h2>Aplicar aos mappings selecionados</h2></div></div>
+      <div class="bulk-grid">
+        <button class="button primary" type="submit" name="decision" value="approve">Aprovar selecionados</button>
+        <button class="button danger" type="submit" name="decision" value="reject">Rejeitar selecionados</button>
+      </div>
+      <p class="provenance">Cada mapping passa pela mesma aprovação individual, com as mesmas verificações. Uma recusa não deita fora as restantes: as que passam ficam gravadas e as recusadas são contadas com o motivo mais comum.</p>
+    </section>
+  {% endif %}
+</form>
 {% endblock %}

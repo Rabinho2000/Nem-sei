@@ -395,3 +395,21 @@ code { color: var(--brand-dark); font: 0.78rem ui-monospace, SFMono-Regular, Men
   .inline-form, .bulk-grid { flex-direction: column; align-items: stretch; }
   .inline-form .button, .bulk-grid .button { width: 100%; }
 }
+
+/* Bloco B: prontidao de mappings --------------------------------------- */
+.readiness-panel { border-color: var(--line-strong); }
+.readiness-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 11px; }
+.readiness-grid div { padding: 13px 15px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-subtle); position: relative; overflow: hidden; }
+.readiness-grid div::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--line-strong); }
+.readiness-grid .ready::before { background: var(--brand-vivid); }
+.readiness-grid .blocked::before, .readiness-grid .reason::before { background: var(--warning-mark); }
+.readiness-grid .none::before { background: var(--line-strong); }
+.readiness-grid strong { display: block; font-size: 1.5rem; letter-spacing: -0.04em; line-height: 1.15; }
+.readiness-grid .ready strong { color: var(--success); }
+.readiness-grid .blocked strong, .readiness-grid .reason strong { color: var(--warning); }
+.readiness-grid span { display: block; margin-top: 3px; color: var(--muted); font-size: 0.76rem; }
+.blocker-stack { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 4px; }
+a.status-badge:hover, a.status-badge:focus-visible { text-decoration: underline; outline: none; }
+.action-stack { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.button.danger { border-color: var(--danger-line); color: var(--danger); background: var(--danger-soft); }
+.button.danger:hover, .button.danger:focus-visible { border-color: var(--danger); outline: 3px solid var(--danger-soft); }
