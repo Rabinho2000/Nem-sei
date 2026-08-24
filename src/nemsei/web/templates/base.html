@@ -2,37 +2,45 @@
 <html lang="pt-PT">
   <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" content="Nem-sei — operações O&M">
-    <title>{{ title or "Nem-sei" }} · Nem-sei</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="description" content="Solcor O&M — operações e manutenção">
+    <meta name="theme-color" content="#333e48">
+    <title>{{ title or "Solcor O&M" }} · Solcor O&amp;M</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <link rel="icon" href="{{ url_for('static', filename='solcor-logo.png') }}">
   </head>
   <body>
+    {% set is_home = request.endpoint == 'home.index' %}
+    {% set is_assets = request.endpoint in ['assets.list_assets', 'assets.new_asset', 'assets.asset_detail'] %}
+    {% set is_diagnostics = request.endpoint and request.endpoint.startswith('diagnostics.') %}
+    {% set is_more = not (is_home or is_assets or is_diagnostics) %}
+    <a class="sr-only" href="#conteudo">Saltar para o conteúdo</a>
     <div class="app-shell">
       <aside class="sidebar">
         <a class="brand" href="{{ url_for('home.index') }}">
-          <span class="brand-mark" aria-hidden="true">N</span>
-          <span><strong>Nem-sei</strong><small>Operações O&amp;M</small></span>
+          <img class="brand-logo" src="{{ url_for('static', filename='solcor-logo.png') }}" alt="Solcor" width="527" height="147">
+          <span class="brand-rule" aria-hidden="true"></span>
+          <span><strong>O&amp;M</strong><small>Operações</small></span>
         </a>
         <nav class="primary-nav" aria-label="Navegação principal">
           <div class="nav-group">
             <span class="nav-heading">Operação</span>
-            <a class="nav-link {{ 'active' if request.endpoint == 'home.index' else '' }}" href="{{ url_for('home.index') }}"><span aria-hidden="true">⌂</span> Visão geral</a>
-            <a class="nav-link {{ 'active' if request.endpoint in ['assets.list_assets', 'assets.new_asset', 'assets.asset_detail'] else '' }}" href="{{ url_for('assets.list_assets') }}"><span aria-hidden="true">▦</span> Centrais</a>
+            <a class="nav-link {{ 'active' if is_home else '' }}" href="{{ url_for('home.index') }}"><span aria-hidden="true">⌂</span> Visão geral</a>
+            <a class="nav-link {{ 'active' if is_assets else '' }}" href="{{ url_for('assets.list_assets') }}"><span aria-hidden="true">▦</span> Centrais</a>
+            <a class="nav-link {{ 'active' if is_diagnostics else '' }}" href="{{ url_for('diagnostics.index') }}"><span aria-hidden="true">◉</span> Diagnóstico</a>
           </div>
           <div class="nav-group">
-            <span class="nav-heading">Integrações</span>
+            <span class="nav-heading">Carteira</span>
+            <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('portfolios.') else '' }}" href="{{ url_for('portfolios.index') }}"><span aria-hidden="true">▤</span> Portfolios</a>
+            <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('reporting.') else '' }}" href="{{ url_for('reporting.index') }}"><span aria-hidden="true">▧</span> Relatórios</a>
+            <a class="nav-link {{ 'active' if request.endpoint == 'assets.organizations' else '' }}" href="{{ url_for('assets.organizations') }}"><span aria-hidden="true">◎</span> Organizações</a>
+          </div>
+          <div class="nav-group">
+            <span class="nav-heading">Configuração</span>
             <a class="nav-link {{ 'active' if request.endpoint == 'assets.provider_connections' else '' }}" href="{{ url_for('assets.provider_connections') }}"><span aria-hidden="true">⇄</span> Ligações</a>
             <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('mappings.') else '' }}" href="{{ url_for('mappings.index') }}"><span aria-hidden="true">✓</span> Mappings</a>
             <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('sources.') else '' }}" href="{{ url_for('sources.index') }}"><span aria-hidden="true">◷</span> Políticas de fonte</a>
             <a class="nav-link {{ 'active' if request.endpoint == 'reconciliation.index' else '' }}" href="{{ url_for('reconciliation.index') }}"><span aria-hidden="true">⌁</span> Reconciliação</a>
-          </div>
-          <div class="nav-group">
-            <span class="nav-heading">Gestão</span>
-            <a class="nav-link {{ 'active' if request.endpoint == 'assets.organizations' else '' }}" href="{{ url_for('assets.organizations') }}"><span aria-hidden="true">◎</span> Organizações</a>
-            <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('portfolios.') else '' }}" href="{{ url_for('portfolios.index') }}"><span aria-hidden="true">▤</span> Portfolios</a>
-            <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('reporting.') else '' }}" href="{{ url_for('reporting.index') }}"><span aria-hidden="true">▧</span> Relatórios</a>
-            <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('diagnostics.') else '' }}" href="{{ url_for('diagnostics.index') }}"><span aria-hidden="true">◉</span> Diagnóstico</a>
           </div>
         </nav>
         <div class="sidebar-footer">
@@ -43,9 +51,13 @@
           </form>
         </div>
       </aside>
-      <main class="main-content">
+      <main class="main-content" id="conteudo">
         <header class="mobile-header">
-          <a class="brand" href="{{ url_for('home.index') }}"><span class="brand-mark" aria-hidden="true">N</span><strong>Nem-sei</strong></a>
+          <a class="brand" href="{{ url_for('home.index') }}">
+            <img class="brand-logo" src="{{ url_for('static', filename='solcor-logo.png') }}" alt="Solcor" width="527" height="147">
+            <span class="brand-rule" aria-hidden="true"></span>
+            <span><strong>O&amp;M</strong></span>
+          </a>
           <span class="mobile-user">{{ session.get('username', 'Operador') }}</span>
         </header>
         {% with messages = get_flashed_messages(with_categories=true) %}
@@ -58,5 +70,29 @@
         {% block content %}{% endblock %}
       </main>
     </div>
+    {#
+      Navegação em telemóvel. Abaixo de 680 px a barra lateral desaparece e,
+      até agora, não era substituída por nada — não havia forma de sair da
+      primeira página. Quatro destinos ao alcance do polegar, alvos de 48 px;
+      os restantes vivem em "Mais", aberto por <details> para não introduzir
+      JavaScript numa aplicação que não tem nenhum.
+    #}
+    <nav class="mobile-tabs" aria-label="Navegação em telemóvel">
+      <a class="tab {{ 'active' if is_home else '' }}" href="{{ url_for('home.index') }}"{% if is_home %} aria-current="page"{% endif %}><i aria-hidden="true">⌂</i>Painel</a>
+      <a class="tab {{ 'active' if is_assets else '' }}" href="{{ url_for('assets.list_assets') }}"{% if is_assets %} aria-current="page"{% endif %}><i aria-hidden="true">▦</i>Centrais</a>
+      <a class="tab {{ 'active' if is_diagnostics else '' }}" href="{{ url_for('diagnostics.index') }}"{% if is_diagnostics %} aria-current="page"{% endif %}><i aria-hidden="true">◉</i>Diagnóstico</a>
+      <details>
+        <summary class="{{ 'active' if is_more else '' }}"><i aria-hidden="true">☰</i>Mais</summary>
+        <div class="more-sheet">
+          <a class="{{ 'active' if request.endpoint and request.endpoint.startswith('portfolios.') else '' }}" href="{{ url_for('portfolios.index') }}"><span aria-hidden="true">▤</span> Portfolios</a>
+          <a class="{{ 'active' if request.endpoint and request.endpoint.startswith('reporting.') else '' }}" href="{{ url_for('reporting.index') }}"><span aria-hidden="true">▧</span> Relatórios</a>
+          <a class="{{ 'active' if request.endpoint == 'assets.organizations' else '' }}" href="{{ url_for('assets.organizations') }}"><span aria-hidden="true">◎</span> Organizações</a>
+          <a class="{{ 'active' if request.endpoint == 'assets.provider_connections' else '' }}" href="{{ url_for('assets.provider_connections') }}"><span aria-hidden="true">⇄</span> Ligações</a>
+          <a class="{{ 'active' if request.endpoint and request.endpoint.startswith('mappings.') else '' }}" href="{{ url_for('mappings.index') }}"><span aria-hidden="true">✓</span> Mappings</a>
+          <a class="{{ 'active' if request.endpoint and request.endpoint.startswith('sources.') else '' }}" href="{{ url_for('sources.index') }}"><span aria-hidden="true">◷</span> Políticas de fonte</a>
+          <a class="{{ 'active' if request.endpoint == 'reconciliation.index' else '' }}" href="{{ url_for('reconciliation.index') }}"><span aria-hidden="true">⌁</span> Reconciliação</a>
+        </div>
+      </details>
+    </nav>
   </body>
 </html>
