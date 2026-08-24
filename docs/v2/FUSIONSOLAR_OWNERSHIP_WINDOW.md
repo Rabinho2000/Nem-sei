@@ -194,6 +194,50 @@ them -- without it every production sync failed closed with a
 `configuration` error, which is what happened on the first stage-3 attempt
 before the fix.
 
+## Third canary attempt, ~12h later (2026-08-24) -- still blocked, now classified
+
+Redeployed via the canonical wrapper first (the `PRODUCTION_TIMEZONE`/`_UNIT`
+env vars had been in `docker-compose.v2.yml` since the previous session but
+were never actually applied -- the containers had only restarted via a host
+reboot, which reuses the existing images/config, not a real `docker compose
+up`). Confirmed present after redeploy.
+
+One controlled attempt (monitoring + production + device_status, one shared
+session cache, one ownership window) ~12h after the first rejection and
+~10h after the second: **still `rate_limited` on login**, both monitoring's
+and production's authentication attempts genuinely rejected
+(`actual_call_count` 14->16, `last_success_at` still frozen at the original
+2026-08-23 19:16:42 login). Session reuse behaved correctly throughout --
+zero duplicate logins, the failed attempt was never cached (matches
+`test_a_failed_login_is_never_cached`), no retry storm. `device_status`
+additionally failed with `configuration`: `NEMSEI_V2_FUSIONSOLAR_PRIMARY_
+DEVICE_POWER_UNIT`/`_DEVICE_ENERGY_UNIT` were never configured -- a
+separate, not-yet-fixed gap, moot until login itself works.
+
+**One important new signal**: V1's own `production_api_queue_state` showed
+`wat_history` `daily_call_count: 2` for *today* (2026-08-24) at the time of
+this attempt -- V1 successfully called FusionSolar today. This does not
+prove the *login* endpoint itself is open, since V1 renews its session only
+every ~55 minutes and may not have needed a fresh login in that window; it
+does confirm the account and password are not disabled or globally locked
+-- only new-login creation is being refused.
+
+**Classification**: `ProviderErrorCode.RATE_LIMITED` (client.py: FusionSolar
+failCode 407 or a rate/call-limit message), specifically on the
+`/thirdData/login` call, not a credential rejection (would classify as
+`AUTHENTICATION`) and not an account lock. No `Retry-After`-equivalent
+signal was ever returned (`cooldown_until` keeps landing on the attempt's
+own timestamp), so there is no machine-readable "safe to retry at" value --
+this is the provider withholding that information, not a gap in this
+codebase's handling of it. Most likely explanation given the evidence: a
+cumulative new-login ceiling (not a simple rolling cooldown window, since
+12h > any duration V1's own code has ever assumed) that our test burst
+across 2026-08-19/20/23 exhausted, on a reset schedule this session cannot
+observe from outside. Per the operator's explicit instruction, no further
+attempt was made. Real rollout stages remain stopped until either enough
+time passes or the account owner has better information about FusionSolar's
+actual login-rate policy for this account.
+
 ## Residual risks
 
 1. Coupling to V1's internal schema/hash algorithm (not a public API) --
