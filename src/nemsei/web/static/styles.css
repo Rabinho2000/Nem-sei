@@ -371,3 +371,27 @@ code { color: var(--brand-dark); font: 0.78rem ui-monospace, SFMono-Regular, Men
 .login-card h1 { margin: 0; font-size: 1.45rem; letter-spacing: -0.03em; }
 .login-submit { width: 100%; margin-top: 4px; }
 .login-foot { margin: 0; color: var(--shell-muted); font-size: 0.78rem; text-align: center; }
+
+/* Bloco A: escrita ------------------------------------------------------ */
+/* Formularios inline dentro de um painel de leitura: acao junto do que muda. */
+.inline-field { display: grid; gap: 5px; flex: 1 1 190px; min-width: 0; color: var(--muted); font-size: 0.8rem; font-weight: 700; }
+.inline-field input, .inline-field select { min-height: 38px; }
+.inline-form { padding-top: 14px; border-top: 1px solid var(--line); align-items: end; }
+.inline-form .button { flex: 0 0 auto; }
+.review-form { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line); }
+.detail-grid .stack-form { gap: 13px; }
+
+/* Selecao em lote: a coluna e estreita e o alvo e grande. */
+.pick-column { width: 42px; }
+.pick { display: grid; place-items: center; min-height: 34px; margin: 0; cursor: pointer; }
+.pick input { width: 17px; min-height: 17px; height: 17px; padding: 0; accent-color: var(--brand-vivid); cursor: pointer; }
+.wide-table { min-width: 1020px; }
+.bulk-panel { border-color: var(--line-strong); }
+.bulk-grid { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
+.bulk-grid label { display: grid; gap: 5px; flex: 1 1 210px; color: var(--muted); font-size: 0.8rem; font-weight: 700; }
+.bulk-grid .button { flex: 0 0 auto; min-height: 40px; }
+
+@media (max-width: 680px) {
+  .inline-form, .bulk-grid { flex-direction: column; align-items: stretch; }
+  .inline-form .button, .bulk-grid .button { width: 100%; }
+}

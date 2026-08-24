@@ -3,14 +3,27 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Sequence
 from datetime import date
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import exists, func, or_, select
 from sqlalchemy.orm import Session
 
-from nemsei.assets.models import ASSET_LIFECYCLE_STATUSES, DEVICE_KINDS, Asset, AssetAlias, Device, Organization
+from nemsei.assets.models import (
+    ASSET_LIFECYCLE_STATUSES,
+    DEVICE_KINDS,
+    IMPORT_REVIEW_STATUSES,
+    Asset,
+    AssetAlias,
+    Device,
+    Organization,
+)
 from nemsei.assets.repository import AssetRepository
+# identity_decisions.py already reaches for this from inside assets/, so the
+# direction is established, not new.
+from nemsei.providers.audit import record_operator_action
 from nemsei.shared.clock import utc_now
 
 
@@ -144,27 +157,164 @@ def create_asset(
     return asset
 
 
-def update_asset(session: Session, *, asset_id: int, canonical_name: str, owner_id: int | None, lifecycle_status: str, country_code: str | None, timezone: str, installed_dc_power_kw: Decimal | None, locality: str | None, address: str | None, technical_notes: str | None) -> Asset:
+def _clean(value: str | None) -> str | None:
+    """Empty and whitespace-only both mean "not stated", never the empty string."""
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def update_asset(
+    session: Session,
+    *,
+    asset_id: int,
+    canonical_name: str,
+    owner_id: int | None,
+    lifecycle_status: str,
+    country_code: str | None,
+    timezone: str | None,
+    installed_dc_power_kw: Decimal | None,
+    locality: str | None,
+    address: str | None,
+    technical_notes: str | None,
+    commissioned_on: date | None = None,
+    review_status: str | None = None,
+    review_note: str | None = None,
+    actor_username: str | None = None,
+) -> Asset:
+    """Apply an operator's edit to one asset and record what actually changed.
+
+    `timezone` is deliberately optional. Before Bloco A the web route passed
+    `"Europe/Lisbon"` whenever the form omitted the field and this function
+    then required it, so any edit stamped a timezone on a plant nobody had
+    checked -- and stamped `timezone_source="manual"` alongside, asserting a
+    human decision that never happened. Half the fleet has no timezone; a
+    missing value has to stay missing.
+
+    `review_status` is the field the detail page could never reach: it was not
+    a parameter here at all, so every one of the 266 imported assets was stuck
+    on "needs review" no matter what an operator did.
+    """
     repository = AssetRepository(session)
     asset = repository.asset(asset_id)
     if asset is None:
         raise ValueError("Unknown asset.")
     if lifecycle_status not in ASSET_LIFECYCLE_STATUSES:
         raise ValueError("Invalid asset lifecycle status.")
+    if review_status is not None and review_status not in IMPORT_REVIEW_STATUSES:
+        raise ValueError("Invalid asset review status.")
     if owner_id is not None and repository.organization(owner_id) is None:
         raise ValueError("Unknown asset owner.")
     if installed_dc_power_kw is not None and installed_dc_power_kw < 0:
         raise ValueError("Installed power cannot be negative.")
+
     name = required_text(canonical_name, "Asset name")
-    normalized_country = normalize_country_code(country_code)
-    asset.canonical_name, asset.normalized_name = name, normalize_name(name)
-    asset.owner_id, asset.lifecycle_status = owner_id, lifecycle_status
-    asset.country_code, asset.timezone = normalized_country, required_text(timezone, "Timezone")
-    asset.timezone_source = "manual"
-    asset.installed_dc_power_kw, asset.locality = installed_dc_power_kw, (locality.strip() if locality else None)
-    asset.address, asset.technical_notes, asset.updated_at = (address.strip() if address else None), (technical_notes.strip() if technical_notes else None), utc_now()
+    incoming: dict[str, Any] = {
+        "canonical_name": name,
+        "owner_id": owner_id,
+        "lifecycle_status": lifecycle_status,
+        "country_code": normalize_country_code(country_code),
+        "timezone": _clean(timezone),
+        "installed_dc_power_kw": installed_dc_power_kw,
+        "commissioned_on": commissioned_on,
+        "locality": _clean(locality),
+        "address": _clean(address),
+        "technical_notes": _clean(technical_notes),
+    }
+    if review_status is not None:
+        incoming["review_status"] = review_status
+        incoming["review_note"] = _clean(review_note)
+
+    changed = [field for field, value in incoming.items() if getattr(asset, field) != value]
+    if not changed:
+        return asset
+
+    for field, value in incoming.items():
+        setattr(asset, field, value)
+    asset.normalized_name = normalize_name(name)
+    # Provenance follows the edit, not the request: only say a human chose the
+    # timezone when a human actually changed it.
+    if "timezone" in changed:
+        asset.timezone_source = "manual"
+    asset.updated_at = utc_now()
+
+    if actor_username:
+        record_operator_action(
+            session,
+            actor_username=actor_username,
+            action="asset_reviewed" if "review_status" in changed else "asset_updated",
+            entity_type="asset",
+            entity_id=asset.id,
+            metadata={"asset_id": asset.id, "fields_changed": sorted(changed), "review_status": asset.review_status},
+        )
     session.flush()
     return asset
+
+
+_UNSET: Any = object()
+
+
+def bulk_update_assets(
+    session: Session,
+    *,
+    asset_ids: Sequence[int],
+    actor_username: str,
+    timezone: str | None = _UNSET,
+    lifecycle_status: str | None = _UNSET,
+    review_status: str | None = _UNSET,
+) -> int:
+    """Apply one change to many assets, for the fixes that are fleet-wide.
+
+    132 assets have no timezone and all 266 sit at lifecycle "unknown"; those
+    are not 266 visits to a form. A field left at `_UNSET` is untouched, which
+    is what separates "clear this value" from "do not consider this field".
+    """
+    if lifecycle_status is not _UNSET and lifecycle_status not in ASSET_LIFECYCLE_STATUSES:
+        raise ValueError("Invalid asset lifecycle status.")
+    if review_status is not _UNSET and review_status not in IMPORT_REVIEW_STATUSES:
+        raise ValueError("Invalid asset review status.")
+    if timezone is not _UNSET and not _clean(timezone):
+        raise ValueError("Bulk edit cannot blank a timezone; edit the asset instead.")
+    requested = {field for field, value in (("timezone", timezone), ("lifecycle_status", lifecycle_status), ("review_status", review_status)) if value is not _UNSET}
+    if not requested:
+        raise ValueError("Nothing to change.")
+
+    unique_ids = list(dict.fromkeys(int(value) for value in asset_ids))
+    if not unique_ids:
+        raise ValueError("Select at least one asset.")
+
+    repository = AssetRepository(session)
+    now = utc_now()
+    touched = 0
+    for asset_id in unique_ids:
+        asset = repository.asset(asset_id)
+        if asset is None:
+            raise ValueError("Unknown asset.")
+        changed = []
+        if timezone is not _UNSET and asset.timezone != _clean(timezone):
+            asset.timezone, asset.timezone_source = _clean(timezone), "manual"
+            changed.append("timezone")
+        if lifecycle_status is not _UNSET and asset.lifecycle_status != lifecycle_status:
+            asset.lifecycle_status = lifecycle_status
+            changed.append("lifecycle_status")
+        if review_status is not _UNSET and asset.review_status != review_status:
+            asset.review_status = review_status
+            changed.append("review_status")
+        if changed:
+            asset.updated_at = now
+            touched += 1
+
+    record_operator_action(
+        session,
+        actor_username=actor_username,
+        action="asset_reviewed" if review_status is not _UNSET else "asset_updated",
+        entity_type="asset",
+        entity_id=None,
+        metadata={"fields_changed": sorted(requested), "asset_count": touched},
+    )
+    session.flush()
+    return touched
 
 
 def create_device(

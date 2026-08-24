@@ -50,6 +50,9 @@ def _pagination(*, page: int, per_page: int, total: int) -> dict[str, Any]:
     }
 
 
+ASSET_LIFECYCLE_LABELS = {"unknown": "Desconhecida", "active": "Ativa", "inactive": "Inativa", "decommissioned": "Desativada"}
+
+
 def _asset_filters(*, search: str, needs_review: str, provider: str, mapping: str) -> list[Any]:
     filters: list[Any] = []
     search_clause = asset_search_clause(search)
@@ -176,6 +179,11 @@ def list_assets_data(
                 "installed_dc_power_kw": asset.installed_dc_power_kw,
                 "country_code": asset.country_code,
                 "locality": asset.locality,
+                # Shown so the bulk editor tells the operator what they are
+                # about to overwrite, instead of asking them to trust it.
+                "timezone": asset.timezone,
+                "lifecycle_status": asset.lifecycle_status,
+                "lifecycle_label": ASSET_LIFECYCLE_LABELS.get(asset.lifecycle_status, asset.lifecycle_status),
                 "review_status": asset.review_status,
                 "review_label": "Precisa de revisão" if asset.review_status == "needs_review" else "OK",
                 "review_tone": "warning" if asset.review_status == "needs_review" else "success",

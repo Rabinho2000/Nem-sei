@@ -1,15 +1,139 @@
 {% extends "base.html" %}
+{#
+  Bloco A: esta página era só de leitura. As rotas de escrita existiam e
+  funcionavam -- POST /assets/<id>, /aliases e /mappings -- mas nenhuma tinha
+  formulário, por isso nenhuma central podia ser corrigida pelo browser.
+#}
+{% set lifecycles = [('unknown', 'Desconhecida'), ('active', 'Ativa'), ('inactive', 'Inativa'), ('decommissioned', 'Desativada')] %}
 {% block content %}
-<header class="page-header detail-header"><div><a class="back-link" href="{{ url_for('assets.list_assets') }}">← Centrais</a><h1>{{ asset.canonical_name }}</h1><div class="inline-status"><span class="status-badge {{ 'warning' if asset.review_status == 'needs_review' else 'success' }}">{{ 'Precisa de revisão' if asset.review_status == 'needs_review' else 'OK' }}</span><span class="status-badge muted">{{ {'active':'Ativa','inactive':'Inativa','decommissioned':'Desativada','unknown':'Desconhecida'}.get(asset.lifecycle_status, asset.lifecycle_status) }}</span></div></div><a class="button secondary" href="{{ url_for('assets.list_assets') }}">Voltar à lista</a></header>
+<header class="page-header detail-header">
+  <div>
+    <a class="back-link" href="{{ url_for('assets.list_assets') }}">← Centrais</a>
+    <h1>{{ asset.canonical_name }}</h1>
+    <div class="inline-status">
+      <span class="status-badge {{ 'warning' if asset.review_status == 'needs_review' else 'success' }}">{{ 'Precisa de revisão' if asset.review_status == 'needs_review' else 'Revista' }}</span>
+      <span class="status-badge muted">{{ dict(lifecycles).get(asset.lifecycle_status, asset.lifecycle_status) }}</span>
+      {% if asset.timezone_source and asset.timezone %}<span class="status-badge muted">fuso {{ 'manual' if asset.timezone_source == 'manual' else asset.timezone_source }}</span>{% endif %}
+    </div>
+  </div>
+  <a class="button secondary" href="{{ url_for('assets.list_assets') }}">Voltar à lista</a>
+</header>
 
 <div class="content-grid two-columns detail-grid">
-  <section class="panel"><div class="panel-header"><div><p class="eyebrow">Identificação</p><h2>Dados da central</h2></div></div><dl class="detail-list">
-    <div><dt>Organização</dt><dd>{{ organization_name or '—' }}</dd></div><div><dt>Potência DC instalada</dt><dd>{{ ('%.1f kW'|format(asset.installed_dc_power_kw)) if asset.installed_dc_power_kw is not none else '—' }}</dd></div><div><dt>País</dt><dd>{{ asset.country_code or '—' }}</dd></div><div><dt>Localidade</dt><dd>{{ asset.locality or '—' }}</dd></div><div><dt>Morada</dt><dd>{{ asset.address or '—' }}</dd></div><div><dt>Fuso horário</dt><dd>{{ asset.timezone or '—' }}</dd></div><div><dt>Comissionamento</dt><dd>{{ asset.commissioned_on or '—' }}</dd></div>
-  </dl></section>
-  <section class="panel"><div class="panel-header"><div><p class="eyebrow">Qualidade</p><h2>Dados a confirmar</h2></div></div>{% if review_issues %}<ul class="issue-list">{% for issue in review_issues %}<li><span class="status-marker warning" aria-hidden="true">!</span><span>{{ issue }}</span></li>{% endfor %}</ul>{% else %}<div class="empty-state positive"><strong>Sem problemas de qualidade assinalados.</strong><p>Não há evidência de revisão pendente para esta central.</p></div>{% endif %}</section>
+  <section class="panel">
+    <div class="panel-header"><div><p class="eyebrow">Identificação</p><h2>Dados da central</h2></div></div>
+    <form method="post" class="stack-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>Nome da central<input name="canonical_name" value="{{ asset.canonical_name }}" required></label>
+      <div class="form-grid">
+        <label>Organização
+          <select name="owner_id">
+            <option value="">—</option>
+            {% for organization in organizations %}<option value="{{ organization.id }}" {{ 'selected' if asset.owner_id == organization.id else '' }}>{{ organization.display_name }}</option>{% endfor %}
+          </select>
+        </label>
+        <label>Estado do ciclo de vida
+          <select name="lifecycle_status">
+            {% for value, label in lifecycles %}<option value="{{ value }}" {{ 'selected' if asset.lifecycle_status == value else '' }}>{{ label }}</option>{% endfor %}
+          </select>
+        </label>
+        <label>Potência DC (kW)<input name="installed_dc_power_kw" inputmode="decimal" value="{{ asset.installed_dc_power_kw if asset.installed_dc_power_kw is not none else '' }}"></label>
+        <label>Comissionamento<input name="commissioned_on" type="date" value="{{ asset.commissioned_on.isoformat() if asset.commissioned_on else '' }}"></label>
+        <label>País<input name="country_code" maxlength="2" placeholder="PT" value="{{ asset.country_code or '' }}"></label>
+        <label>Fuso horário<input name="timezone" list="fusos" placeholder="Europe/Lisbon" value="{{ asset.timezone or '' }}"><small class="field-hint">Deixar vazio mantém-no por preencher. Nada é assumido.</small></label>
+        <label>Localidade<input name="locality" value="{{ asset.locality or '' }}"></label>
+        <label>Morada<input name="address" value="{{ asset.address or '' }}"></label>
+      </div>
+      <datalist id="fusos"><option value="Europe/Lisbon"></option><option value="Atlantic/Madeira"></option><option value="Atlantic/Azores"></option><option value="Europe/Madrid"></option><option value="UTC"></option></datalist>
+      <label>Notas técnicas<textarea name="technical_notes">{{ asset.technical_notes or '' }}</textarea></label>
+      <div class="form-actions"><button class="button primary" type="submit">Guardar</button></div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="panel-header"><div><p class="eyebrow">Qualidade</p><h2>Dados a confirmar</h2></div></div>
+    {% if review_issues %}
+      <ul class="issue-list">{% for issue in review_issues %}<li><span class="status-marker warning" aria-hidden="true">!</span><span>{{ issue }}</span></li>{% endfor %}</ul>
+    {% else %}
+      <div class="empty-state positive"><strong>Sem problemas de qualidade assinalados.</strong><p>Não há evidência de revisão pendente para esta central.</p></div>
+    {% endif %}
+    {#
+      As restantes linhas caem sozinhas quando o campo é preenchido. Esta não:
+      é o estado de revisão deixado pelo importador, e precisa de alguém que
+      diga que olhou. Fica registado em operator_audit_events.
+    #}
+    {% if asset.review_status == 'needs_review' %}
+      <form method="post" class="stack-form review-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="canonical_name" value="{{ asset.canonical_name }}">
+        <input type="hidden" name="owner_id" value="{{ asset.owner_id or '' }}">
+        <input type="hidden" name="lifecycle_status" value="{{ asset.lifecycle_status }}">
+        <input type="hidden" name="country_code" value="{{ asset.country_code or '' }}">
+        <input type="hidden" name="timezone" value="{{ asset.timezone or '' }}">
+        <input type="hidden" name="installed_dc_power_kw" value="{{ asset.installed_dc_power_kw if asset.installed_dc_power_kw is not none else '' }}">
+        <input type="hidden" name="commissioned_on" value="{{ asset.commissioned_on.isoformat() if asset.commissioned_on else '' }}">
+        <input type="hidden" name="locality" value="{{ asset.locality or '' }}">
+        <input type="hidden" name="address" value="{{ asset.address or '' }}">
+        <input type="hidden" name="technical_notes" value="{{ asset.technical_notes or '' }}">
+        <input type="hidden" name="review_status" value="clear">
+        <label>Nota de revisão <span class="field-hint">opcional</span><input name="review_note" placeholder="O que foi verificado"></label>
+        <div class="form-actions"><button class="button secondary" type="submit">Marcar como revista</button></div>
+      </form>
+    {% else %}
+      <p class="provenance">Estado de revisão: limpo{% if asset.review_note %} — {{ asset.review_note }}{% endif %}</p>
+    {% endif %}
+  </section>
 </div>
 
-<section class="panel"><div class="panel-header"><div><p class="eyebrow">Integrações</p><h2>Provider mappings</h2></div><span class="status-badge muted">Somente leitura</span></div><div class="table-scroll"><table class="data-table compact-table"><thead><tr><th>Provider</th><th>Ligação</th><th>Nome externo</th><th>ID externo</th><th>Estado</th><th>Válido desde</th><th>Válido até</th></tr></thead><tbody>{% for mapping in mappings %}<tr><td>{{ mapping.provider }}</td><td>{{ mapping.connection_name }}</td><td>{{ mapping.external_name or '—' }}</td><td><code>{{ mapping.external_id }}</code></td><td><span class="status-badge {{ mapping.mapping_tone }}">{{ mapping.mapping_label }}</span></td><td>{{ mapping.valid_from or '—' }}</td><td>{{ mapping.valid_to or '—' }}</td></tr>{% else %}<tr><td class="table-empty" colspan="7">Ainda não existe um provider mapping para esta central.</td></tr>{% endfor %}</tbody></table></div></section>
+<section class="panel">
+  <div class="panel-header"><div><p class="eyebrow">Integrações</p><h2>Provider mappings</h2></div><span class="status-badge {{ 'muted' if mappings else 'warning' }}">{{ mappings|length }} ligação{{ '' if mappings|length == 1 else 'ões' }}</span></div>
+  <div class="table-scroll">
+    <table class="data-table compact-table">
+      <thead><tr><th>Provider</th><th>Ligação</th><th>Nome externo</th><th>ID externo</th><th>Estado</th><th>Válido desde</th><th>Válido até</th></tr></thead>
+      <tbody>
+        {% for mapping in mappings %}
+          <tr><td>{{ mapping.provider }}</td><td>{{ mapping.connection_name }}</td><td>{{ mapping.external_name or '—' }}</td><td><code>{{ mapping.external_id }}</code></td><td><span class="status-badge {{ mapping.mapping_tone }}">{{ mapping.mapping_label }}</span></td><td>{{ mapping.valid_from or '—' }}</td><td>{{ mapping.valid_to or '—' }}</td></tr>
+        {% else %}
+          <tr><td class="table-empty" colspan="7">Ainda não existe um provider mapping para esta central. Sem um, a plataforma não recebe produção nem estado desta instalação.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if connections %}
+    <form method="post" action="{{ url_for('assets.create_asset_mapping', asset_id=asset.id) }}" class="inline-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label class="inline-field">Ligação
+        <select name="provider_connection_id" required>{% for connection in connections %}<option value="{{ connection.id }}">{{ connection.provider }} · {{ connection.display_name }}</option>{% endfor %}</select>
+      </label>
+      <label class="inline-field">ID externo<input name="external_id" required placeholder="NE=154743789"></label>
+      <label class="inline-field">Nome externo <span class="field-hint">opcional</span><input name="external_name"></label>
+      <button class="button secondary" type="submit">Ligar</button>
+    </form>
+  {% else %}
+    <p class="provenance">Não há ligações provider configuradas. <a class="text-link" href="{{ url_for('assets.provider_connections') }}">Configurar uma →</a></p>
+  {% endif %}
+</section>
 
-<div class="content-grid two-columns"><section class="panel"><div class="panel-header"><div><p class="eyebrow">Evidência</p><h2>Aliases</h2></div></div>{% if aliases %}<ul class="plain-list">{% for alias in aliases %}<li><strong>{{ alias.alias }}</strong><small>{{ alias.alias_kind }} · {{ alias.source }}</small></li>{% endfor %}</ul>{% else %}<p class="empty-state">Não existem aliases ativos.</p>{% endif %}</section><section class="panel"><div class="panel-header"><div><p class="eyebrow">Dados operacionais</p><h2>Monitorização e produção</h2></div></div><div class="honest-stack"><div><strong>{{ 'Existem observações' if has_monitoring else 'Ainda sem observações de monitorização.' }}</strong>{% if not has_monitoring %}<small>O provider ainda não confirmou estado operacional.</small>{% endif %}</div><div><strong>{{ 'Existem dados de produção' if has_production else 'Ainda sem dados de produção.' }}</strong>{% if not has_production %}<small>Não é apresentado zero quando não há factos importados.</small>{% endif %}</div></div></section></div>
+<div class="content-grid two-columns">
+  <section class="panel">
+    <div class="panel-header"><div><p class="eyebrow">Evidência</p><h2>Aliases</h2></div></div>
+    {% if aliases %}
+      <ul class="plain-list">{% for alias in aliases %}<li><strong>{{ alias.alias }}</strong><small>{{ alias.alias_kind }} · {{ alias.source }}</small></li>{% endfor %}</ul>
+    {% else %}
+      <p class="empty-state">Não existem aliases ativos.</p>
+    {% endif %}
+    <form method="post" action="{{ url_for('assets.create_alias', asset_id=asset.id) }}" class="inline-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label class="inline-field"><span class="sr-only">Novo alias</span><input name="alias" required placeholder="Outro nome por que esta central é conhecida"></label>
+      <button class="button secondary" type="submit">Adicionar</button>
+    </form>
+  </section>
+  <section class="panel">
+    <div class="panel-header"><div><p class="eyebrow">Dados operacionais</p><h2>Monitorização e produção</h2></div></div>
+    <div class="honest-stack">
+      <div><strong>{{ 'Existem observações' if has_monitoring else 'Ainda sem observações de monitorização.' }}</strong>{% if not has_monitoring %}<small>O provider ainda não confirmou estado operacional.</small>{% endif %}</div>
+      <div><strong>{{ 'Existem dados de produção' if has_production else 'Ainda sem dados de produção.' }}</strong>{% if not has_production %}<small>Não é apresentado zero quando não há factos importados.</small>{% endif %}</div>
+    </div>
+  </section>
+</div>
 {% endblock %}

@@ -24,6 +24,10 @@ OPERATOR_AUDIT_ACTIONS = (
     "connection_enabled",
     "connection_disabled",
     "validation_requested",
+    # Bloco A: identity edits made from the browser. Until now the asset form
+    # had no UI at all, so nothing an operator did to a plant left a trace.
+    "asset_updated",
+    "asset_reviewed",
 )
 
 

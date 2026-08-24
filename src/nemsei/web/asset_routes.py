@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal, InvalidOperation
 
 from flask import Blueprint, abort, flash, redirect, render_template, request, session as browser_session, url_for, current_app
 
 from nemsei.assets.repository import AssetRepository
-from nemsei.assets.service import add_alias, create_asset, create_organization, update_asset
+from nemsei.assets.service import add_alias, bulk_update_assets, create_asset, create_organization, update_asset
 from nemsei.providers.repository import ProviderRepository
 from nemsei.providers.service import configure_connection, create_connection, create_mapping, set_connection_enabled
 from nemsei.web.csrf import require_valid_token, token
@@ -28,6 +29,30 @@ def optional_decimal(value: str | None) -> Decimal | None:
 
 def optional_int(value: str | None) -> int | None:
     return int(value) if value and value.strip() else None
+
+
+def optional_date(value: str | None) -> date | None:
+    if not value or not value.strip():
+        return None
+    try:
+        return date.fromisoformat(value.strip())
+    except ValueError as exc:
+        raise ValueError("Data de comissionamento inválida. Use o formato AAAA-MM-DD.") from exc
+
+
+def actor() -> str:
+    return browser_session.get("username", "web")
+
+
+def submitted_timezone() -> str | None:
+    """The form's value, or nothing.
+
+    Never a default. This used to be `request.form.get("timezone",
+    "Europe/Lisbon")`, which stamped Lisbon on any asset whose form omitted the
+    field and recorded it as a manual decision. 132 of 266 assets have no
+    timezone; guessing one is worse than leaving it empty.
+    """
+    return request.form.get("timezone")
 
 
 @assets_bp.get("/assets")
@@ -55,7 +80,7 @@ def new_asset() -> str:
     if request.method == "POST":
         require_valid_token()
         try:
-            asset = create_asset(session, canonical_name=request.form.get("canonical_name", ""), owner_id=optional_int(request.form.get("owner_id")), lifecycle_status=request.form.get("lifecycle_status", "unknown"), country_code=request.form.get("country_code"), timezone=request.form.get("timezone", "Europe/Lisbon"), installed_dc_power_kw=optional_decimal(request.form.get("installed_dc_power_kw")), locality=request.form.get("locality"), address=request.form.get("address"), technical_notes=request.form.get("technical_notes"))
+            asset = create_asset(session, canonical_name=request.form.get("canonical_name", ""), owner_id=optional_int(request.form.get("owner_id")), lifecycle_status=request.form.get("lifecycle_status", "unknown"), country_code=request.form.get("country_code"), timezone=submitted_timezone(), installed_dc_power_kw=optional_decimal(request.form.get("installed_dc_power_kw")), locality=request.form.get("locality"), address=request.form.get("address"), technical_notes=request.form.get("technical_notes"))
             session.commit()
             return redirect(url_for("assets.asset_detail", asset_id=asset.id))
         except (ValueError, InvalidOperation) as exc:
@@ -74,9 +99,27 @@ def asset_detail(asset_id: int) -> str:
     if request.method == "POST":
         require_valid_token()
         try:
-            update_asset(session, asset_id=asset.id, canonical_name=request.form.get("canonical_name", ""), owner_id=optional_int(request.form.get("owner_id")), lifecycle_status=request.form.get("lifecycle_status", "unknown"), country_code=request.form.get("country_code"), timezone=request.form.get("timezone", "Europe/Lisbon"), installed_dc_power_kw=optional_decimal(request.form.get("installed_dc_power_kw")), locality=request.form.get("locality"), address=request.form.get("address"), technical_notes=request.form.get("technical_notes"))
+            update_asset(
+                session,
+                asset_id=asset.id,
+                canonical_name=request.form.get("canonical_name", ""),
+                owner_id=optional_int(request.form.get("owner_id")),
+                lifecycle_status=request.form.get("lifecycle_status", asset.lifecycle_status),
+                country_code=request.form.get("country_code"),
+                timezone=submitted_timezone(),
+                installed_dc_power_kw=optional_decimal(request.form.get("installed_dc_power_kw")),
+                commissioned_on=optional_date(request.form.get("commissioned_on")),
+                locality=request.form.get("locality"),
+                address=request.form.get("address"),
+                technical_notes=request.form.get("technical_notes"),
+                # Only present when the operator used the "mark as reviewed"
+                # control; absent means "leave the review state alone".
+                review_status=request.form.get("review_status") or None,
+                review_note=request.form.get("review_note"),
+                actor_username=actor(),
+            )
             session.commit()
-            flash("Asset saved.", "success")
+            flash("Central guardada.", "success")
             return redirect(url_for("assets.asset_detail", asset_id=asset.id))
         except ValueError as exc:
             session.rollback()
@@ -91,6 +134,31 @@ def asset_detail(asset_id: int) -> str:
         csrf_token=token(),
         title=asset.canonical_name,
     )
+
+
+@assets_bp.post("/assets/bulk")
+@require_authenticated
+def bulk_edit_assets():
+    """One change applied to many assets, from the list screen.
+
+    The fleet-wide gaps are fleet-wide: 132 assets without a timezone and 266
+    at lifecycle "unknown". Fixing those one form at a time is not a workflow.
+    """
+    require_valid_token()
+    session = get_request_session()
+    field, value = request.form.get("field", ""), request.form.get("value", "")
+    selected = request.form.getlist("asset_ids")
+    changes = {"timezone": {"timezone": value}, "lifecycle_status": {"lifecycle_status": value}, "review_status": {"review_status": value}}
+    try:
+        if field not in changes:
+            raise ValueError("Campo desconhecido para edição em lote.")
+        touched = bulk_update_assets(session, asset_ids=[int(item) for item in selected], actor_username=actor(), **changes[field])
+        session.commit()
+        flash(f"{touched} de {len(selected)} centrais alteradas.", "success")
+    except (ValueError, TypeError) as exc:
+        session.rollback()
+        flash(str(exc), "error")
+    return redirect(request.referrer or url_for("assets.list_assets"))
 
 
 @assets_bp.post("/assets/<int:asset_id>/aliases")

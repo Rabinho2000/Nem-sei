@@ -13,33 +13,76 @@
   </form>
 </section>
 
-<section class="panel table-panel">
-  <div class="table-meta"><span>{{ pagination.total }} centrais encontradas</span>{% if pagination.pages > 1 %}<span>Página {{ pagination.page }} de {{ pagination.pages }}</span>{% endif %}</div>
-  <div class="table-scroll">
-    <table class="data-table">
-      <caption class="sr-only">Lista de centrais</caption>
-      <thead><tr><th scope="col">Central</th><th scope="col">Organização</th><th scope="col">Potência DC</th><th scope="col">País / localidade</th><th scope="col">Provider</th><th scope="col">Mapping</th><th scope="col">Qualidade</th></tr></thead>
-      <tbody>
-        {% for asset in assets %}
-          <tr>
-            <th scope="row"><a class="table-primary" href="{{ url_for('assets.asset_detail', asset_id=asset.id) }}">{{ asset.canonical_name }}</a><small>ID {{ asset.id }}</small></th>
-            <td>{{ asset.organization_name or '—' }}</td>
-            <td>{{ ('%.1f kW'|format(asset.installed_dc_power_kw)) if asset.installed_dc_power_kw is not none else '—' }}</td>
-            <td>{{ [asset.country_code, asset.locality]|select|join(' · ') or '—' }}</td>
-            <td>{% if asset.providers %}<span class="provider-stack">{% for provider in asset.providers %}<span>{{ provider }}</span>{% endfor %}</span>{% else %}—{% endif %}</td>
-            <td><span class="status-badge {{ asset.mapping_tone }}">{{ asset.mapping_label }}</span></td>
-            <td><span class="status-badge {{ asset.review_tone }}">{{ asset.review_label }}</span></td>
-          </tr>
-        {% else %}<tr><td class="table-empty" colspan="7">Não existem centrais para estes filtros.</td></tr>{% endfor %}
-      </tbody>
-    </table>
-  </div>
-  {% if pagination.pages > 1 %}
-    <nav class="pagination" aria-label="Paginação de centrais">
-      {% if pagination.has_previous %}<a href="{{ url_for('assets.list_assets', q=filters.search, needs_review=filters.needs_review, provider=filters.provider, mapping=filters.mapping, page=pagination.previous) }}">Anterior</a>{% endif %}
-      <span>Página {{ pagination.page }} / {{ pagination.pages }}</span>
-      {% if pagination.has_next %}<a href="{{ url_for('assets.list_assets', q=filters.search, needs_review=filters.needs_review, provider=filters.provider, mapping=filters.mapping, page=pagination.next) }}">Seguinte</a>{% endif %}
-    </nav>
+{#
+  Bloco A: a tabela vive dentro de um form de escrita. A seleção é sempre
+  explícita -- não existe "aplicar a tudo o que o filtro devolve". O caso do
+  fuso horário mostra porquê: as 132 centrais sem fuso não são todas de Lisboa,
+  há Madeira e Açores no parque, e carimbar um valor a todas seria repetir o
+  defeito que esta mesma alteração corrigiu na rota.
+#}
+<form method="post" action="{{ url_for('assets.bulk_edit_assets') }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <section class="panel table-panel">
+    <div class="table-meta"><span>{{ pagination.total }} centrais encontradas</span>{% if pagination.pages > 1 %}<span>Página {{ pagination.page }} de {{ pagination.pages }}</span>{% endif %}</div>
+    <div class="table-scroll">
+      <table class="data-table wide-table">
+        <caption class="sr-only">Lista de centrais</caption>
+        <thead><tr><th scope="col" class="pick-column"><span class="sr-only">Selecionar</span></th><th scope="col">Central</th><th scope="col">Organização</th><th scope="col">Potência DC</th><th scope="col">País / localidade</th><th scope="col">Fuso</th><th scope="col">Estado</th><th scope="col">Mapping</th><th scope="col">Qualidade</th></tr></thead>
+        <tbody>
+          {% for asset in assets %}
+            <tr>
+              <td class="pick-column"><label class="pick"><input type="checkbox" name="asset_ids" value="{{ asset.id }}"><span class="sr-only">Selecionar {{ asset.canonical_name }}</span></label></td>
+              <th scope="row"><a class="table-primary" href="{{ url_for('assets.asset_detail', asset_id=asset.id) }}">{{ asset.canonical_name }}</a><small>ID {{ asset.id }}</small></th>
+              <td>{{ asset.organization_name or '—' }}</td>
+              <td>{{ ('%.1f kW'|format(asset.installed_dc_power_kw)) if asset.installed_dc_power_kw is not none else '—' }}</td>
+              <td>{{ [asset.country_code, asset.locality]|select|join(' · ') or '—' }}</td>
+              <td>{% if asset.timezone %}<code>{{ asset.timezone }}</code>{% else %}<span class="status-badge warning">em falta</span>{% endif %}</td>
+              <td><span class="status-badge {{ 'muted' if asset.lifecycle_status == 'unknown' else 'success' }}">{{ asset.lifecycle_label }}</span></td>
+              <td><span class="status-badge {{ asset.mapping_tone }}">{{ asset.mapping_label }}</span></td>
+              <td><span class="status-badge {{ asset.review_tone }}">{{ asset.review_label }}</span></td>
+            </tr>
+          {% else %}<tr><td class="table-empty" colspan="9">Não existem centrais para estes filtros.</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% if pagination.pages > 1 %}
+      <nav class="pagination" aria-label="Paginação de centrais">
+        {% if pagination.has_previous %}<a href="{{ url_for('assets.list_assets', q=filters.search, needs_review=filters.needs_review, provider=filters.provider, mapping=filters.mapping, page=pagination.previous) }}">Anterior</a>{% endif %}
+        <span>Página {{ pagination.page }} / {{ pagination.pages }}</span>
+        {% if pagination.has_next %}<a href="{{ url_for('assets.list_assets', q=filters.search, needs_review=filters.needs_review, provider=filters.provider, mapping=filters.mapping, page=pagination.next) }}">Seguinte</a>{% endif %}
+      </nav>
+    {% endif %}
+  </section>
+
+  {% if assets %}
+    <section class="panel bulk-panel">
+      <div class="panel-header"><div><p class="eyebrow">Edição em lote</p><h2>Aplicar às centrais selecionadas</h2></div></div>
+      <div class="bulk-grid">
+        <label>Campo
+          <select name="field">
+            <option value="lifecycle_status">Estado do ciclo de vida</option>
+            <option value="timezone">Fuso horário</option>
+            <option value="review_status">Estado de revisão</option>
+          </select>
+        </label>
+        <label>Valor
+          <input name="value" list="bulk-values" placeholder="active · Europe/Lisbon · clear" required>
+        </label>
+        <button class="button primary" type="submit">Aplicar</button>
+      </div>
+      <datalist id="bulk-values">
+        <option value="active">Estado: ativa</option>
+        <option value="inactive">Estado: inativa</option>
+        <option value="decommissioned">Estado: desativada</option>
+        <option value="unknown">Estado: desconhecida</option>
+        <option value="Europe/Lisbon">Fuso: continente</option>
+        <option value="Atlantic/Madeira">Fuso: Madeira</option>
+        <option value="Atlantic/Azores">Fuso: Açores</option>
+        <option value="clear">Revisão: limpa</option>
+        <option value="needs_review">Revisão: precisa de revisão</option>
+      </datalist>
+      <p class="provenance">Só as centrais com a caixa marcada são alteradas, e só quando o valor difere do que já lá está. Fica registado quem aplicou e a quantas centrais.</p>
+    </section>
   {% endif %}
-</section>
+</form>
 {% endblock %}

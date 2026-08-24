@@ -26,6 +26,12 @@ _ALLOWED_METADATA = {
     "legacy_table",
     "legacy_id",
     "decision",
+    # Bloco A: which fields an operator actually changed, and how many rows a
+    # bulk edit touched. Field *names* only -- never the values, which can be
+    # free text.
+    "fields_changed",
+    "review_status",
+    "asset_count",
 }
 
 
