@@ -12,7 +12,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import CheckConstraint, Date, DateTime, ForeignKey, Index, Integer, JSON, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import CheckConstraint, Date, DateTime, ForeignKey, Index, Integer, JSON, LargeBinary, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from nemsei.db.base import Base
@@ -54,6 +54,10 @@ class ReportSourceFile(Base):
     uploaded_by: Mapped[str | None] = mapped_column(String(120))
     uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     notes: Mapped[str | None] = mapped_column(Text)
+    # The workbook itself. `stored_path` says where it came from; this is the
+    # only copy the platform controls, since the web container has no writable
+    # storage -- see migration 0022 for the trade-off.
+    content: Mapped[bytes | None] = mapped_column(LargeBinary)
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 

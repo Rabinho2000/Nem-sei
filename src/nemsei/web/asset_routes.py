@@ -12,7 +12,7 @@ from nemsei.providers.service import configure_connection, create_connection, cr
 from nemsei.web.csrf import require_valid_token, token
 from nemsei.web.db_session import get_request_session
 from nemsei.web.home_routes import require_authenticated
-from nemsei.web.queries import asset_detail_data, list_assets_data, organization_list_data, provider_connections_data
+from nemsei.web.queries import asset_detail_data, commercial_panel_data, list_assets_data, organization_list_data, provider_connections_data
 
 
 assets_bp = Blueprint("assets", __name__)
@@ -131,6 +131,7 @@ def asset_detail(asset_id: int) -> str:
         **detail,
         organizations=repository.list_organizations(),
         connections=providers.list_connections(),
+        **commercial_panel_data(session, asset_id=asset.id),
         csrf_token=token(),
         title=asset.canonical_name,
     )

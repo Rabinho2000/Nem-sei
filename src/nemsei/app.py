@@ -10,6 +10,7 @@ from nemsei.db import build_engine, build_session_factory
 from nemsei.system.health import ReadinessCheck, database_readiness
 from nemsei.web.auth_routes import auth_bp
 from nemsei.web.asset_routes import assets_bp
+from nemsei.web.commercial_routes import commercial_bp
 from nemsei.web.db_session import close_request_session
 from nemsei.web.health_routes import health_bp
 from nemsei.web.home_routes import home_bp
@@ -35,6 +36,9 @@ def create_app(
         SESSION_COOKIE_SAMESITE="Lax",
         SESSION_COOKIE_SECURE=configured.environment == "production",
         PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+        # The real financial workbooks are ~16.5 MB; the cap leaves room for a
+        # larger one without accepting an unbounded upload.
+        MAX_CONTENT_LENGTH=32 * 1024 * 1024,
     )
     app.extensions["nemsei.settings"] = configured
     app.extensions["nemsei.engine"] = engine
@@ -50,5 +54,6 @@ def create_app(
     app.register_blueprint(source_bp)
     app.register_blueprint(portfolio_bp)
     app.register_blueprint(reporting_bp)
+    app.register_blueprint(commercial_bp)
     app.register_blueprint(diagnostics_bp)
     return app

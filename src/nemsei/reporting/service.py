@@ -62,6 +62,7 @@ def register_source_file(
     uploaded_by: str,
     mime_type: str | None = None,
     notes: str | None = None,
+    content: bytes | None = None,
 ) -> ReportSourceFile:
     """Record an uploaded artefact, or return the one that already has this hash."""
     if session.get(Asset, asset_id) is None:
@@ -83,6 +84,7 @@ def register_source_file(
         uploaded_by=uploaded_by.strip() or None,
         uploaded_at=utc_now(),
         notes=notes.strip() if notes else None,
+        content=content,
     )
     session.add(source)
     session.flush()

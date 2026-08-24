@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{#
+  Bloco C: um modelo entra como rascunho e só passa a confirmado quando alguém
+  olha para ele. Confirmar é o acto que faz a produção esperada deste cliente
+  passar a sair daqui, por isso não acontece no carregamento.
+#}
+{% set months = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'] %}
+{% macro kwh(value) %}{% if value is none %}<span class="muted">—</span>{% else %}{{ "{:,.0f}".format(value|float).replace(",", " ") }}{% endif %}{% endmacro %}
+{% block content %}
+<header class="page-header detail-header">
+  <div>
+    <a class="back-link" href="{{ url_for('assets.asset_detail', asset_id=model.asset_id) }}">← {{ asset.canonical_name if asset else 'Central' }}</a>
+    <h1>Modelo financeiro v{{ model.version }}</h1>
+    <div class="inline-status">
+      <span class="status-badge {{ {'confirmed':'success','draft':'warning','superseded':'muted','rejected':'danger'}.get(model.status,'muted') }}">{{ {'confirmed':'Confirmado','draft':'Rascunho','superseded':'Substituído','rejected':'Rejeitado'}.get(model.status, model.status) }}</span>
+      <span class="status-badge muted">{{ model.workbook_format }}</span>
+      {% if model.base_year %}<span class="status-badge muted">ano base {{ model.base_year }} · {{ model.base_year_source }}</span>{% endif %}
+    </div>
+  </div>
+  <div class="action-stack">
+    {% if source and source.content %}<a class="button secondary" href="{{ url_for('commercial.download_financial_model', model_id=model.id) }}">Descarregar livro</a>{% endif %}
+    {% if model.status == 'draft' %}
+      <form method="post" action="{{ url_for('commercial.confirm_financial_model', model_id=model.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button primary" type="submit">Confirmar modelo</button></form>
+    {% endif %}
+    {% if model.status in ['draft', 'confirmed'] %}
+      <form method="post" action="{{ url_for('commercial.reject_financial_model', model_id=model.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button danger" type="submit">Rejeitar</button></form>
+    {% endif %}
+  </div>
+</header>
+
+<div class="content-grid two-columns">
+  <section class="panel">
+    <div class="panel-header"><div><p class="eyebrow">Identidade detetada</p><h2>O que o livro diz ser</h2></div></div>
+    <dl class="detail-list">
+      <div><dt>Nome no livro</dt><dd>{{ model.detected_name or '—' }}</dd></div>
+      <div><dt>NIF no livro</dt><dd>{{ model.detected_nif or '—' }}</dd></div>
+      <div><dt>Potência no livro</dt><dd>{{ ('%.1f kWp'|format(model.detected_kwp)) if model.detected_kwp is not none else '—' }}</dd></div>
+      <div><dt>Potência da central</dt><dd>{{ ('%.1f kWp'|format(asset.installed_dc_power_kw)) if asset and asset.installed_dc_power_kw is not none else '—' }}</dd></div>
+      <div><dt>Folha</dt><dd>{{ model.sheet_name or '—' }}</dd></div>
+      <div><dt>Parser</dt><dd><code>{{ model.parser_name }} v{{ model.parser_version }}</code></dd></div>
+      <div><dt>SHA-256</dt><dd><code>{{ model.source_file_sha256[:16] }}…</code></dd></div>
+    </dl>
+    {% if asset and model.detected_kwp is not none and asset.installed_dc_power_kw is not none and (model.detected_kwp - asset.installed_dc_power_kw)|abs > 0.5 %}
+      <p class="provenance"><strong>A potência do livro não bate com a da central.</strong> Confirme que este livro é mesmo desta instalação antes de o confirmar.</p>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-header"><div><p class="eyebrow">Qualidade</p><h2>Avisos do parser</h2></div></div>
+    {% if model.warnings_json %}
+      <ul class="issue-list">{% for warning in model.warnings_json %}<li><span class="status-marker warning" aria-hidden="true">!</span><span>{{ warning }}</span></li>{% endfor %}</ul>
+    {% else %}
+      <div class="empty-state positive"><strong>O livro foi lido sem avisos.</strong></div>
+    {% endif %}
+    <dl class="detail-list" style="margin-top:14px">
+      <div><dt>Carregado por</dt><dd>{{ source.uploaded_by or '—' }} · {{ source.uploaded_at.strftime('%Y-%m-%d %H:%M') if source else '—' }}</dd></div>
+      <div><dt>Ficheiro</dt><dd>{{ source.original_filename if source else '—' }}{% if source %} <small>({{ (source.size_bytes / 1048576)|round(1) }} MB)</small>{% endif %}</dd></div>
+      {% if model.confirmed_by %}<div><dt>Confirmado por</dt><dd>{{ model.confirmed_by }} · {{ model.confirmed_at.strftime('%Y-%m-%d %H:%M') if model.confirmed_at else '' }}</dd></div>{% endif %}
+    </dl>
+  </section>
+</div>
+
+<section class="panel table-panel">
+  <div class="table-meta"><span>Produção esperada por mês</span><span>{{ kwh(expected_total) }} kWh no ano</span></div>
+  <div class="table-scroll">
+    <table class="data-table">
+      <thead><tr><th>Mês</th><th class="num">Produção</th><th class="num">Consumo</th><th class="num">Autoconsumo</th><th class="num">Injeção</th><th class="num">Importação</th><th class="num">Taxa autoconsumo</th></tr></thead>
+      <tbody>
+        {% for month in months %}
+          <tr>
+            <th scope="row">{{ months[loop.index0] }}</th>
+            {% set row = months_by_index.get(loop.index) %}
+            <td class="num">{{ kwh(row.expected_production_kwh) if row else '—' }}</td>
+            <td class="num">{{ kwh(row.expected_consumption_kwh) if row else '—' }}</td>
+            <td class="num">{{ kwh(row.expected_self_use_kwh) if row else '—' }}</td>
+            <td class="num">{{ kwh(row.expected_export_kwh) if row else '—' }}</td>
+            <td class="num">{{ kwh(row.expected_grid_import_kwh) if row else '—' }}</td>
+            <td class="num">{% if row and row.expected_self_consumption_rate_pct is not none %}{{ "%.1f"|format(row.expected_self_consumption_rate_pct|float) }} %{% else %}<span class="muted">—</span>{% endif %}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if not months_by_index %}<p class="table-empty">O parser não extraiu nenhum mês deste livro.</p>{% endif %}
+</section>
+{% endblock %}

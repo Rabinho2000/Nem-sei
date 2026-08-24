@@ -114,6 +114,97 @@
   {% endif %}
 </section>
 
+
+{#
+  Bloco C: as entradas comerciais. Os servicos existiam sem uma unica rota, e
+  producao tem 0 modelos, 1 tarifa e 1 configuracao de faturacao para 266
+  centrais -- e por isso que a producao esperada nao tem de onde vir. Nada
+  disto faz uma chamada ao provider.
+#}
+<section class="panel">
+  <div class="panel-header">
+    <div><p class="eyebrow">Comercial</p><h2>Modelo financeiro</h2></div>
+    {% if confirmed_model %}<span class="status-badge success">Confirmado · v{{ confirmed_model.version }}</span>{% else %}<span class="status-badge warning">Sem modelo confirmado</span>{% endif %}
+  </div>
+  {% if financial_models %}
+    <ul class="plain-list">
+      {% for item in financial_models %}
+        <li>
+          <strong><a class="table-primary" href="{{ url_for('commercial.financial_model', model_id=item.id) }}">v{{ item.version }} · {{ {'confirmed':'confirmado','draft':'rascunho','superseded':'substituído','rejected':'rejeitado'}.get(item.status, item.status) }}</a></strong>
+          <small>{{ item.detected_name or 'sem nome detetado' }}{% if item.base_year %} · ano base {{ item.base_year }}{% endif %}{% if item.warnings_json %} · {{ item.warnings_json|length }} aviso{{ '' if item.warnings_json|length == 1 else 's' }}{% endif %}</small>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <div class="honest-empty"><span class="empty-icon" aria-hidden="true">—</span><div><strong>Sem modelo financeiro.</strong><p>Sem um modelo confirmado não há produção esperada, nem desvio, nem performance — nem para esta central nem para os portfolios que a contêm.</p></div></div>
+  {% endif %}
+  <form method="post" action="{{ url_for('commercial.upload_financial_model', asset_id=asset.id) }}" enctype="multipart/form-data" class="inline-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label class="inline-field">Livro Excel <span class="field-hint">.xlsm ou .xlsx</span><input type="file" name="workbook" accept=".xlsm,.xlsx" required></label>
+    <label class="inline-field">Ano base <span class="field-hint">opcional, sobrepõe o do livro</span><input name="base_year" inputmode="numeric" placeholder="2026"></label>
+    <button class="button secondary" type="submit">Carregar</button>
+  </form>
+  <p class="provenance">Um livro carregado entra como rascunho. Só passa a valer depois de alguém o rever e confirmar.</p>
+</section>
+
+<div class="content-grid two-columns">
+  <section class="panel">
+    <div class="panel-header"><div><p class="eyebrow">Comercial</p><h2>Tarifa</h2></div>{% if tariff %}<span class="status-badge muted">desde {{ tariff.valid_from }}</span>{% endif %}</div>
+    {% if tariff %}
+      <dl class="detail-list">
+        <div><dt>Tipo</dt><dd>{{ tariff.tariff_type }}{% if tariff.cycle_type %} · {{ tariff.cycle_type }}{% endif %}</dd></div>
+        <div><dt>Simples</dt><dd>{{ tariff.simple_price_eur_kwh if tariff.simple_price_eur_kwh is not none else '—' }}</dd></div>
+        <div><dt>Ponta / Cheia</dt><dd>{{ tariff.ponta_price_eur_kwh or '—' }} / {{ tariff.cheia_price_eur_kwh or '—' }}</dd></div>
+        <div><dt>Vazio / Super-vazio</dt><dd>{{ tariff.vazio_price_eur_kwh or '—' }} / {{ tariff.super_vazio_price_eur_kwh or '—' }}</dd></div>
+        <div><dt>Origem</dt><dd>{{ tariff.source_kind }}</dd></div>
+      </dl>
+    {% else %}
+      <p class="empty-state">Sem tarifa registada. O relatório mostra energia sem valor em euros.</p>
+    {% endif %}
+    <form method="post" action="{{ url_for('commercial.save_tariff', asset_id=asset.id) }}" class="stack-form review-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="form-grid">
+        <label>Tipo<select name="tariff_type">{% for value in tariff_types %}<option value="{{ value }}" {{ 'selected' if tariff and tariff.tariff_type == value else '' }}>{{ value }}</option>{% endfor %}</select></label>
+        <label>Válida desde<input type="date" name="valid_from" required></label>
+        <label>Simples €/kWh<input name="price_simple" inputmode="decimal"></label>
+        <label>Ponta €/kWh<input name="price_ponta" inputmode="decimal"></label>
+        <label>Cheia €/kWh<input name="price_cheia" inputmode="decimal"></label>
+        <label>Vazio €/kWh<input name="price_vazio" inputmode="decimal"></label>
+        <label>Super-vazio €/kWh<input name="price_super_vazio" inputmode="decimal"></label>
+      </div>
+      <p class="field-hint">Uma tarifa por ciclos exige vazio e cheia; a tetra-horária exige também super-vazio.</p>
+      <div class="form-actions"><button class="button secondary" type="submit">Gravar tarifa</button></div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="panel-header"><div><p class="eyebrow">Comercial</p><h2>Faturação</h2></div>{% if billing %}<span class="status-badge muted">{{ billing.report_type|upper }} · desde {{ billing.valid_from }}</span>{% endif %}</div>
+    {% if billing %}
+      <dl class="detail-list">
+        <div><dt>Tipo de relatório</dt><dd>{{ billing.report_type|upper }}</dd></div>
+        <div><dt>Modo</dt><dd>{{ billing.billing_mode }} sobre {{ billing.billing_energy_base }}</dd></div>
+        <div><dt>Preço Solcor</dt><dd>{{ billing.solcor_price_per_kwh }} €/kWh</dd></div>
+        <div><dt>Avença mensal</dt><dd>{{ billing.fixed_monthly_fee_eur }} €</dd></div>
+      </dl>
+    {% else %}
+      <p class="empty-state">Sem configuração de faturação. É isto que decide se o relatório sai EPC ou ESCO.</p>
+    {% endif %}
+    <form method="post" action="{{ url_for('commercial.save_billing', asset_id=asset.id) }}" class="stack-form review-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="form-grid">
+        <label>Tipo de relatório<select name="report_type">{% for value in report_types %}<option value="{{ value }}" {{ 'selected' if billing and billing.report_type == value else '' }}>{{ value|upper }}</option>{% endfor %}</select></label>
+        <label>Válida desde<input type="date" name="valid_from" required></label>
+        <label>Modo<select name="billing_mode">{% for value in billing_modes %}<option value="{{ value }}" {{ 'selected' if billing and billing.billing_mode == value else '' }}>{{ value }}</option>{% endfor %}</select></label>
+        <label>Base de energia<select name="billing_energy_base">{% for value in billing_energy_bases %}<option value="{{ value }}" {{ 'selected' if billing and billing.billing_energy_base == value else '' }}>{{ value }}</option>{% endfor %}</select></label>
+        <label>Preço Solcor €/kWh<input name="solcor_price_per_kwh" inputmode="decimal" value="{{ billing.solcor_price_per_kwh if billing else '' }}"></label>
+        <label>Avença mensal €<input name="fixed_monthly_fee_eur" inputmode="decimal" value="{{ billing.fixed_monthly_fee_eur if billing else '' }}"></label>
+      </div>
+      <label class="inline-field" style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" name="export_revenue_enabled" style="width:17px;min-height:17px" {{ 'checked' if not billing or billing.export_revenue_enabled else '' }}> Contabilizar receita de injeção</label>
+      <div class="form-actions"><button class="button secondary" type="submit">Gravar faturação</button></div>
+    </form>
+  </section>
+</div>
+
 <div class="content-grid two-columns">
   <section class="panel">
     <div class="panel-header"><div><p class="eyebrow">Evidência</p><h2>Aliases</h2></div></div>

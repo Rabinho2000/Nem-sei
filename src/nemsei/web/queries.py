@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from datetime import date
 from math import ceil
 from typing import Any
 
@@ -14,6 +15,10 @@ from nemsei.monitoring.models import MonitoringObservation, ProductionFact
 from nemsei.providers.models import AssetProviderMapping, LegacyImportRecord, ProviderConnection
 from nemsei.providers.registry import descriptor_for
 from nemsei.providers.service import mapping_approval_blockers
+from nemsei.reporting.commercial import resolve_billing_config, resolve_tariff
+from nemsei.reporting.commercial_models import BILLING_ENERGY_BASES, BILLING_MODES, REPORT_TYPES, TARIFF_TYPES
+from nemsei.reporting.models import FinancialModel
+from nemsei.shared.clock import utc_now
 from nemsei.sources.models import AssetSourcePolicy
 from nemsei.sync.models import IntegrationHealth, SyncRun
 
@@ -600,3 +605,25 @@ def asset_detail_data(session: Session, asset_id: int) -> dict[str, Any] | None:
 
 def reconciliation_data(session: Session) -> dict[str, int]:
     return review_summary(session)
+
+
+def commercial_panel_data(session: Session, *, asset_id: int, on: date | None = None) -> dict[str, Any]:
+    """Everything the asset page needs to show and edit the commercial inputs."""
+    today = on or utc_now().date()
+    models = list(
+        session.scalars(
+            select(FinancialModel)
+            .where(FinancialModel.asset_id == asset_id)
+            .order_by(FinancialModel.version.desc())
+        )
+    )
+    return {
+        "financial_models": models,
+        "confirmed_model": next((model for model in models if model.status == "confirmed"), None),
+        "tariff": resolve_tariff(session, asset_id=asset_id, on=today),
+        "billing": resolve_billing_config(session, asset_id=asset_id, on=today),
+        "tariff_types": TARIFF_TYPES,
+        "report_types": REPORT_TYPES,
+        "billing_modes": BILLING_MODES,
+        "billing_energy_bases": BILLING_ENERGY_BASES,
+    }
