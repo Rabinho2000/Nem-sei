@@ -19,7 +19,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, JSON, Numeric, String, UniqueConstraint, text
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, JSON, Numeric, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from nemsei.db.base import Base
@@ -85,6 +85,11 @@ class DeviceStatusFact(Base):
 # when did it start, is it still going, and when did it stop -- the questions
 # notifications (a later slice) cannot answer from findings.py alone.
 INCIDENT_STATUSES = ("open", "resolved")
+# The human dimension, deliberately NOT folded into INCIDENT_STATUSES. `status`
+# is owned by the evaluator; `handling_state` is owned by whoever is dealing
+# with it. An incident the detector still sees can be `done` ("seen, known, not
+# acting") and one the detector resolved can still be `investigating`.
+INCIDENT_HANDLING_STATES = ("new", "acknowledged", "investigating", "visit_scheduled", "done")
 
 
 class DiagnosticIncident(Base):
@@ -101,6 +106,9 @@ class DiagnosticIncident(Base):
     __tablename__ = "diagnostic_incidents"
     __table_args__ = (
         CheckConstraint(f"status IN {INCIDENT_STATUSES!r}", name="ck_diagnostic_incidents_status"),
+        CheckConstraint(
+            f"handling_state IN {INCIDENT_HANDLING_STATES!r}", name="ck_diagnostic_incidents_handling_state"
+        ),
         CheckConstraint("(status = 'resolved') = (resolved_at IS NOT NULL)", name="ck_diagnostic_incidents_resolved_at"),
         CheckConstraint("occurrence_count >= 1", name="ck_diagnostic_incidents_occurrence_count"),
         CheckConstraint("last_observed_at >= opened_at", name="ck_diagnostic_incidents_observed_after_open"),
@@ -132,6 +140,13 @@ class DiagnosticIncident(Base):
     device_id: Mapped[int | None] = mapped_column(ForeignKey("devices.id", ondelete="RESTRICT"))
     severity: Mapped[str] = mapped_column(String(24), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="open")
+    # Where a person is with this, independent of whether the rule is still
+    # true. See INCIDENT_HANDLING_STATES for why the two never merge.
+    handling_state: Mapped[str] = mapped_column(String(24), nullable=False, default="new", server_default="new")
+    # Free text until users exist (§16). Recording an owner badly beats not
+    # recording who owns 644 open incidents at all.
+    assigned_to: Mapped[str | None] = mapped_column(String(120))
+    handling_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # First detection: the earliest evidence available for this episode --
     # a device-state rule's real `active_since` (walked from history) when
     # the detector has one, or the evaluation run's own timestamp otherwise.
@@ -159,3 +174,27 @@ class DiagnosticIncident(Base):
     evidence_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class IncidentNote(Base):
+    """Append-only record of what a person did to an incident, and why.
+
+    A note may carry a comment, a state transition, an owner change, or any
+    combination -- but never nothing, which the CHECK enforces. Reading the
+    column back in id order replays the whole handling history; there is no
+    second table and no mutable "current note".
+    """
+
+    __tablename__ = "incident_notes"
+    __table_args__ = (
+        CheckConstraint("body IS NOT NULL OR handling_state_after IS NOT NULL", name="ck_incident_notes_not_empty"),
+        Index("ix_incident_notes_incident", "incident_id", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    incident_id: Mapped[int] = mapped_column(ForeignKey("diagnostic_incidents.id", ondelete="CASCADE"), nullable=False)
+    author: Mapped[str] = mapped_column(String(120), nullable=False)
+    body: Mapped[str | None] = mapped_column(Text)
+    handling_state_after: Mapped[str | None] = mapped_column(String(24))
+    assigned_to_after: Mapped[str | None] = mapped_column(String(120))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

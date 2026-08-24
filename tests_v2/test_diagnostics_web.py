@@ -219,4 +219,7 @@ def test_incidents_page_search_filters_by_installation(app, two_assets_one_criti
     assert "Zulu Broken Plant" in body
     body_filtered_out = client.get("/diagnostics/incidents?search=Nonexistent").get_data(as_text=True)
     assert "Zulu Broken Plant" not in body_filtered_out
-    assert "Nenhum incidente activo" in body_filtered_out
+    # Bloco D: a search that hides everything is not the same as nothing being
+    # open, and the page no longer says it is. The unfiltered case still reads
+    # "Nenhum incidente activo" -- see the test above, deliberately unchanged.
+    assert "Nenhum incidente corresponde a estes filtros" in body_filtered_out

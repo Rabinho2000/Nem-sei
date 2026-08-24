@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{#
+  Bloco D: as duas dimensões nunca se misturam. `status` é do detetor -- abre
+  e resolve sozinho a partir da evidência. `handling_state` é de quem trata do
+  assunto. Um incidente que o detetor ainda vê pode estar "concluído" ("visto,
+  conhecido, não vamos agir"), e um que o detetor resolveu pode continuar em
+  análise. Não é caso extremo, é O&M real.
+#}
+{% set labels = {'new':'Por triar','acknowledged':'Reconhecido','investigating':'Em análise','visit_scheduled':'Visita marcada','done':'Concluído'} %}
+{% block content %}
+<header class="page-header detail-header">
+  <div>
+    <a class="back-link" href="{{ url_for('diagnostics.incidents') }}">← Incidentes</a>
+    <h1>{{ incident.rule_code }}</h1>
+    <p class="page-intro">{{ asset.canonical_name if asset else 'Central desconhecida' }}{% if device %} · {{ device.label }}{% endif %}</p>
+    <div class="inline-status">
+      <span class="status-badge {{ 'danger' if incident.severity == 'critical' else 'warning' if incident.severity == 'warning' else 'muted' }}">{{ incident.severity }}</span>
+      <span class="status-badge {{ 'warning' if incident.status == 'open' else 'success' }}">detetor: {{ 'ativo' if incident.status == 'open' else 'resolvido' }}</span>
+      <span class="status-badge {{ 'muted' if incident.handling_state == 'new' else 'success' if incident.handling_state == 'done' else 'warning' }}">{{ labels.get(incident.handling_state, incident.handling_state) }}</span>
+      {% if incident.assigned_to %}<span class="status-badge muted">{{ incident.assigned_to }}</span>{% endif %}
+    </div>
+  </div>
+  {% if asset %}<a class="button secondary" href="{{ url_for('diagnostics.asset_detail', asset_id=asset.id) }}">Ver a central</a>{% endif %}
+</header>
+
+{% if incident.status == 'open' and incident.handling_state == 'done' %}
+  <div class="notice-panel"><p><strong>O detetor continua a ver esta condição.</strong> Marcar como concluído diz que uma pessoa terminou com o assunto, não que o problema desapareceu — e essa discordância é informação, não um erro a esconder.</p></div>
+{% endif %}
+
+<div class="content-grid two-columns">
+  <section class="panel">
+    <div class="panel-header"><div><p class="eyebrow">Evidência</p><h2>O que o detetor sabe</h2></div></div>
+    <dl class="detail-list">
+      <div><dt>Aberto há</dt><dd>{{ duration }}</dd></div>
+      <div><dt>Última confirmação</dt><dd>há {{ since_confirmed }}</dd></div>
+      <div><dt>Ocorrências</dt><dd>{{ incident.occurrence_count }} ciclo{{ '' if incident.occurrence_count == 1 else 's' }} de avaliação</dd></div>
+      <div><dt>Aberto em</dt><dd>{{ incident.opened_at.strftime('%Y-%m-%d %H:%M') }}</dd></div>
+      {% if incident.resolved_at %}<div><dt>Resolvido em</dt><dd>{{ incident.resolved_at.strftime('%Y-%m-%d %H:%M') }}</dd></div>{% endif %}
+      <div><dt>Versão do detetor</dt><dd><code>{{ incident.detector_version }}</code></dd></div>
+    </dl>
+    {% if incident.evidence_json %}
+      <div class="honest-stack" style="margin-top:14px">
+        {% for key, value in incident.evidence_json.items() %}<div><strong>{{ key }}</strong><small>{{ value }}</small></div>{% endfor %}
+      </div>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-header"><div><p class="eyebrow">Tratamento</p><h2>O que fazemos com isto</h2></div></div>
+    <form method="post" action="{{ url_for('diagnostics.update_handling', incident_id=incident.id) }}" class="stack-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="form-grid">
+        <label>Estado
+          <select name="handling_state">
+            {% for state in handling_states %}<option value="{{ state }}" {{ 'selected' if incident.handling_state == state else '' }}>{{ labels.get(state, state) }}</option>{% endfor %}
+          </select>
+        </label>
+        <label>Responsável <span class="field-hint">texto livre até haver utilizadores</span><input name="assigned_to" value="{{ incident.assigned_to or '' }}" placeholder="Quem fica com isto"></label>
+      </div>
+      <label>Nota<textarea name="note" placeholder="O que foi verificado, decidido ou combinado"></textarea></label>
+      <div class="form-actions">
+        <label class="inline-field" style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" name="clear_assignment" style="width:17px;min-height:17px"> Retirar responsável</label>
+        <button class="button primary" type="submit">Registar</button>
+      </div>
+    </form>
+  </section>
+</div>
+
+<section class="panel">
+  <div class="panel-header"><div><p class="eyebrow">Histórico</p><h2>Quem fez o quê</h2></div><span class="status-badge muted">{{ notes|length }} registo{{ '' if notes|length == 1 else 's' }}</span></div>
+  {% if notes %}
+    <ul class="plain-list">
+      {% for note in notes %}
+        <li>
+          <strong>{{ note.author }}{% if note.handling_state_after %} → {{ labels.get(note.handling_state_after, note.handling_state_after) }}{% endif %}{% if note.assigned_to_after %} · responsável: {{ note.assigned_to_after }}{% endif %}</strong>
+          {% if note.body %}<span>{{ note.body }}</span>{% endif %}
+          <small>{{ note.created_at.strftime('%Y-%m-%d %H:%M') }}</small>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <div class="honest-empty"><span class="empty-icon" aria-hidden="true">—</span><div><strong>Ninguém tocou neste incidente.</strong><p>É o estado de 644 dos incidentes abertos: detetados, contados, envelhecidos e sem dono.</p></div></div>
+  {% endif %}
+</section>
+{% endblock %}

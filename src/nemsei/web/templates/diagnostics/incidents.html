@@ -1,10 +1,11 @@
 {% extends "base.html" %}
 {#
   D2: every currently-open DiagnosticIncident, portfolio-wide, worst-first
-  then longest-open-first. No "resolve"/"acknowledge" control here yet --
-  D1 deliberately kept the lifecycle to open/resolved, inferred from whether
-  a finding still appears, not a button an operator has to remember to press.
+  then longest-open-first. O ciclo do detetor continua a ser inferido da
+  evidência e não de um botão -- o que o Bloco D acrescenta é a coluna do lado
+  humano, que é outra dimensão e nunca mexe no `status`.
 #}
+{% set labels = {'new':'Por triar','acknowledged':'Reconhecido','investigating':'Em análise','visit_scheduled':'Visita marcada','done':'Concluído'} %}
 {% macro severity_pill(severity) %}
   {% set tone = {'critical': 'bad', 'warning': 'warn', 'info': 'ok'}.get(severity, 'warn') %}
   <span class="pill pill-{{ tone }}">{{ {'critical': 'crítico', 'warning': 'aviso', 'info': 'informação'}.get(severity, severity) }}</span>
@@ -15,16 +16,32 @@
   <a class="button-link" href="{{ url_for('diagnostics.index') }}">← Diagnóstico</a>
 </section>
 
+<section class="panel readiness-panel">
+  <div class="panel-header"><div><p class="eyebrow">Backlog</p><h2>Onde está cada incidente aberto</h2></div></div>
+  <div class="readiness-grid">
+    <div class="{{ 'blocked' if summary.new else 'ready' }}"><strong>{{ summary.new }}</strong><span>por triar</span></div>
+    <div class="reason"><strong>{{ summary.acknowledged }}</strong><span>reconhecidos</span></div>
+    <div class="reason"><strong>{{ summary.investigating }}</strong><span>em análise</span></div>
+    <div class="reason"><strong>{{ summary.visit_scheduled }}</strong><span>visita marcada</span></div>
+    <div class="ready"><strong>{{ summary.done }}</strong><span>concluídos</span></div>
+  </div>
+</section>
+
 <section class="panel">
   <form class="filter-bar" method="get" action="{{ url_for('diagnostics.incidents') }}">
     <input type="search" name="search" value="{{ search }}" placeholder="Nome, alias ou cliente…" autofocus>
+    <select name="handling">
+      <option value="">Todo o tratamento</option>
+      <option value="untouched" {{ 'selected' if handling == 'untouched' else '' }}>Ninguém tocou</option>
+      {% for state, label in labels.items() %}<option value="{{ state }}" {{ 'selected' if handling == state else '' }}>{{ label }}</option>{% endfor %}
+    </select>
     <button type="submit">Procurar</button>
   </form>
   <table class="data-table">
     <thead>
       <tr>
         <th>Severidade</th><th>Instalação</th><th>Dispositivo</th><th>Regra</th>
-        <th class="num">Aberto há</th><th class="num">Última confirmação há</th>
+        <th>Tratamento</th><th class="num">Aberto há</th><th class="num">Última confirmação há</th>
       </tr>
     </thead>
     <tbody>
@@ -33,18 +50,28 @@
           <td>{{ severity_pill(row.incident.severity) }}</td>
           <td><a href="{{ url_for('diagnostics.asset_detail', asset_id=row.asset.id) }}">{{ row.asset.canonical_name }}</a></td>
           <td class="muted">{{ row.device_label or '— (instalação)' }}</td>
-          <td class="muted"><code>{{ row.incident.rule_code }}</code></td>
+          <td class="muted"><code><a href="{{ url_for('diagnostics.incident', incident_id=row.incident.id) }}">{{ row.incident.rule_code }}</a></code></td>
+          <td>
+            <span class="status-badge {{ 'muted' if row.incident.handling_state == 'new' else 'success' if row.incident.handling_state == 'done' else 'warning' }}">{{ labels.get(row.incident.handling_state, row.incident.handling_state) }}</span>
+            {% if row.incident.assigned_to %}<small>{{ row.incident.assigned_to }}</small>{% endif %}
+          </td>
           <td class="num">{{ row.duration }}</td>
           <td class="num">{{ row.since_confirmed }}</td>
         </tr>
       {% else %}
-        <tr><td colspan="6" class="empty">Nenhum incidente activo — nada a mostrar.</td></tr>
+        {#
+          Duas ausências diferentes, ditas de forma diferente. Sem filtros, não
+          há mesmo nada aberto. Com filtros, há incidentes -- estes é que não
+          passam. Dizer "nenhum incidente activo" no segundo caso seria falso.
+        #}
+        <tr><td colspan="7" class="empty">{% if search or handling %}Nenhum incidente corresponde a estes filtros — há outros abertos.{% else %}Nenhum incidente activo — nada a mostrar.{% endif %}</td></tr>
       {% endfor %}
     </tbody>
   </table>
   <p class="panel-foot muted">
-    Um incidente aberto é um finding que continua verdadeiro em cada reavaliação; fecha-se sozinho assim que deixar de
-    o ser — não há um botão de "resolver" aqui. Ver <code>docs/v2/DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md</code>.
+    Um incidente aberto é um finding que continua verdadeiro em cada reavaliação e fecha-se sozinho assim que deixar de o ser.
+    A coluna «Tratamento» é a outra dimensão: onde <em>uma pessoa</em> está com o assunto. Marcar como concluído não fecha a
+    deteção, e é suposto que não feche. Ver <code>docs/v2/DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md</code>.
   </p>
 </section>
 {% endblock %}

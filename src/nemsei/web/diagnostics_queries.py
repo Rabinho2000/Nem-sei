@@ -16,7 +16,8 @@ from sqlalchemy.orm import Session
 from nemsei.assets.models import Asset, Device, Organization
 from nemsei.assets.service import asset_search_clause
 from nemsei.diagnostics.findings import SEVERITY_ORDER, evaluate_asset_findings
-from nemsei.diagnostics.models import DiagnosticIncident
+from nemsei.diagnostics.handling import incident_notes
+from nemsei.diagnostics.models import INCIDENT_HANDLING_STATES, DiagnosticIncident
 from nemsei.diagnostics.repository import DeviceStatusRepository
 from nemsei.diagnostics.service import current_device_status
 from nemsei.shared.clock import utc_now
@@ -122,7 +123,7 @@ def diagnostics_overview(session: Session, *, search: str = "", limit: int = 50)
     }
 
 
-def open_incidents_overview(session: Session, *, search: str = "") -> list[dict[str, Any]]:
+def open_incidents_overview(session: Session, *, search: str = "", handling: str = "") -> list[dict[str, Any]]:
     """Every open incident, portfolio-wide, worst-first then longest-open-first.
 
     Duration is the point of this page (`docs/v2/DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md`'s
@@ -147,6 +148,12 @@ def open_incidents_overview(session: Session, *, search: str = "") -> list[dict[
     clause = asset_search_clause(search) if search else None
     if clause is not None:
         statement = statement.where(clause)
+    if handling == "untouched":
+        # The question this page exists to answer today: 644 open incidents,
+        # how many has nobody looked at at all.
+        statement = statement.where(DiagnosticIncident.handling_state == "new")
+    elif handling in INCIDENT_HANDLING_STATES:
+        statement = statement.where(DiagnosticIncident.handling_state == handling)
 
     now = utc_now()
     rows: list[dict[str, Any]] = []
@@ -162,6 +169,35 @@ def open_incidents_overview(session: Session, *, search: str = "") -> list[dict[
         )
     rows.sort(key=lambda row: (SEVERITY_ORDER.get(row["incident"].severity, 99), row["incident"].opened_at))
     return rows
+
+
+def incident_detail(session: Session, *, incident_id: int) -> dict[str, Any] | None:
+    """One incident with its handling history. Computes no rule of its own."""
+    incident = session.get(DiagnosticIncident, incident_id)
+    if incident is None:
+        return None
+    now = utc_now()
+    return {
+        "incident": incident,
+        "asset": session.get(Asset, incident.asset_id),
+        "device": session.get(Device, incident.device_id) if incident.device_id else None,
+        "notes": incident_notes(session, incident_id=incident.id),
+        "duration": duration_label(now - incident.opened_at),
+        "since_confirmed": duration_label(now - incident.last_observed_at),
+        "handling_states": INCIDENT_HANDLING_STATES,
+    }
+
+
+def handling_summary(session: Session) -> dict[str, int]:
+    """How the open backlog is distributed across the human states."""
+    counts = dict(
+        session.execute(
+            select(DiagnosticIncident.handling_state, func.count(DiagnosticIncident.id))
+            .where(DiagnosticIncident.status == "open")
+            .group_by(DiagnosticIncident.handling_state)
+        ).all()
+    )
+    return {state: int(counts.get(state, 0)) for state in INCIDENT_HANDLING_STATES}
 
 
 def asset_diagnostics(session: Session, *, asset_id: int) -> dict[str, Any] | None:
