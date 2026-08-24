@@ -262,6 +262,41 @@ differently and was not tried, per the same one-attempt discipline.
 V1 was unaffected throughout (different account_key, clean handback
 confirmed on both keys immediately after).
 
+## Public research on the login block (2026-08-24)
+
+Since a second, brand-new credential failed identically (previous section),
+researched Huawei's own documentation and other integrators' real-world
+experience with this exact API:
+
+- FusionSolar's documented `failCode 407` (`ACCESS_FREQUENCY_IS_TOO_HIGH`)
+  is officially specified as **5 login attempts per northbound user per 10
+  minutes** -- [Huawei support: "Why Does the Northbound API Return Error
+  Code 407 or 429"](https://support.huawei.com/enterprise/en/doc/EDOC1100379184/ec16189c/why-does-the-northbound-api-return-error-code-407-or-429).
+  That alone cannot explain a block still standing 12+ hours later.
+- The Northbound API also documents a **single login session limit per
+  account**, and the standard community workaround for testing alongside a
+  live production integration is exactly what was tried here: provision a
+  second, identical Northbound API account
+  ([meteocontrol help center](https://help-center.meteocontrol.com/en/vcom-cloud/latest/huawei-fusionsolar-api-1);
+  discussed in [tijsverkoyen/HomeAssistant-FusionSolar issue #29](https://github.com/tijsverkoyen/HomeAssistant-FusionSolar/issues/29)
+  and [#89](https://github.com/tijsverkoyen/HomeAssistant-FusionSolar/issues/89)).
+  That workaround did not help here.
+
+Both documented mechanisms (10-minute login throttle, per-account session
+limit) are ruled out by our own evidence: the throttle would have cleared
+in minutes, and a fresh, never-used second account should have bypassed a
+per-account limit per the community's own standard practice, but was
+rejected identically. The most consistent remaining explanation is an
+**undocumented, longer-lived anti-abuse mechanism scoped above the
+individual account** -- most plausibly the calling IP or the SOLCOR
+tenant as a whole -- triggered by the unusually high count of distinct
+login attempts (14-16) this account/IP made across 2026-08-19/20/23/24
+while this session iterated on session reuse. This is inference from
+public documentation plus our own two-credential test, not a confirmed
+root cause; Huawei support is the only party who can confirm it and say
+whether/how it can be lifted or IP-allowlisted. Neither V1's nor V2's code
+can detect, wait out, or work around this from outside.
+
 ## Residual risks
 
 1. Coupling to V1's internal schema/hash algorithm (not a public API) --
