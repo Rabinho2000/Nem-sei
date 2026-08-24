@@ -238,6 +238,30 @@ attempt was made. Real rollout stages remain stopped until either enough
 time passes or the account owner has better information about FusionSolar's
 actual login-rate policy for this account.
 
+## Fourth attempt, a second/different Northbound API credential (2026-08-24)
+
+To isolate whether the block was specific to the `primary` credential's own
+login history, the operator provisioned a genuinely separate FusionSolar
+Northbound API user (`solcor_om_api2`, same SOLCOR company, its own
+deadline/scope) and one controlled attempt was made with it (username/
+password overridden only for that one process via docker secret files,
+never touching the standing containers' committed config): **same result --
+`rate_limited` on login**, for an account_key that had never been used
+before (`d7092...` vs the original `a472c...`), which had never held a
+lease, cooldown, or made a single prior call.
+
+This is the decisive finding: **the block is not tied to a specific
+credential's login history.** A brand-new Northbound API user, on its first
+ever login attempt, was rejected the same way. That rules out a simple
+"too many logins on this specific account" ceiling and points instead at
+something scoped above the individual API user -- most likely the source
+IP (this server's outbound address) or the SOLCOR company/tenant as a
+whole, at Huawei's API gateway. Neither V1 nor V2's code can see or control
+either of those. A third credential would not be expected to behave any
+differently and was not tried, per the same one-attempt discipline.
+V1 was unaffected throughout (different account_key, clean handback
+confirmed on both keys immediately after).
+
 ## Residual risks
 
 1. Coupling to V1's internal schema/hash algorithm (not a public API) --
