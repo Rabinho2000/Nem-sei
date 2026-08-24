@@ -28,6 +28,10 @@ OPERATOR_AUDIT_ACTIONS = (
     # had no UI at all, so nothing an operator did to a plant left a trace.
     "asset_updated",
     "asset_reviewed",
+    # Bloco E: the notification channel and its policies are the only
+    # automations the interface can switch; the schedulers are environment.
+    "automation_enabled",
+    "automation_disabled",
 )
 
 

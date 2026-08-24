@@ -413,3 +413,9 @@ a.status-badge:hover, a.status-badge:focus-visible { text-decoration: underline;
 .action-stack { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .button.danger { border-color: var(--danger-line); color: var(--danger); background: var(--danger-soft); }
 .button.danger:hover, .button.danger:focus-visible { border-color: var(--danger); outline: 3px solid var(--danger-soft); }
+
+/* Bloco E: pre-visualizacao do digest -- texto tal e qual seria enviado. */
+.digest-preview { margin: 0; padding: 16px 18px; border: 1px solid var(--line); border-radius: 9px;
+  background: var(--surface-subtle); color: var(--text);
+  font: 0.84rem/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap;
+  overflow-wrap: anywhere; }

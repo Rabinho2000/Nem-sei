@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block content %}
+<header class="page-header detail-header">
+  <div>
+    <a class="back-link" href="{{ url_for('automations.index') }}">← Automações</a>
+    <h1>O que o digest diria agora</h1>
+    <p class="page-intro">Janela de {{ interval_minutes }} minutos: {{ window_start.strftime('%Y-%m-%d %H:%M') }} → {{ window_end.strftime('%Y-%m-%d %H:%M') }}</p>
+  </div>
+  <span class="status-badge muted">nada foi escrito</span>
+</header>
+<section class="panel">
+  <div class="panel-header"><div><p class="eyebrow">Simulação</p><h2>Texto da mensagem</h2></div></div>
+  <pre class="digest-preview">{{ text }}</pre>
+  <p class="panel-foot muted">Gerado pela mesma função que a execução real usa, chamada sem o passo que persiste — não cria um <code>DigestRun</code> nem avança a janela de que o próximo digest encadeia.</p>
+</section>
+{% endblock %}

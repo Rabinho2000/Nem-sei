@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+{#
+  Bloco E: a distinção que este ecrã existe para fazer. Os agendadores são
+  variáveis de ambiente lidas no arranque do processo — a página mostra-os e
+  não oferece interruptor, porque um botão que não fizesse nada era pior que
+  botão nenhum. O canal de notificação e as políticas são linhas na base de
+  dados, e esses mudam mesmo.
+#}
+{% block content %}
+<header class="page-header">
+  <div><p class="eyebrow">Configuração</p><h1>Automações</h1><p class="page-intro">O que a plataforma faz sozinha, quando o fez pela última vez, e o que daqui se pode mudar.</p></div>
+</header>
+
+<section class="panel">
+  <div class="panel-header"><div><p class="eyebrow">Agendadores</p><h2>Controlados por ambiente</h2></div><span class="status-badge muted">só leitura</span></div>
+  <p class="provenance">O estado abaixo é lido do que o próprio agendador escreveu em <code>schedule_state</code>, não das variáveis deste processo — o contentor web não tem as variáveis do contentor do agendador, e perguntar-lhas daria a resposta errada com toda a confiança.</p>
+  <div class="table-scroll">
+    <table class="data-table compact-table">
+      <thead><tr><th>Automação</th><th>Estado</th><th>Última vez</th><th>Próxima</th><th>Chave</th><th>Interruptor</th></tr></thead>
+      <tbody>
+        {% for item in scheduled %}
+          <tr class="{{ 'row-attention' if item.state == 'overdue' else '' }}">
+            <th scope="row">{{ item.label }}<small>{{ item.purpose }}</small></th>
+            <td>
+              {% if item.state == 'running' %}<span class="status-badge success">a correr</span>
+              {% elif item.state == 'overdue' %}<span class="status-badge warning">atrasada</span>
+              {% else %}<span class="status-badge muted">sem registo</span>{% endif %}
+            </td>
+            <td>{{ item.last_enqueued_at.strftime('%Y-%m-%d %H:%M') if item.last_enqueued_at else '—' }}</td>
+            <td>{{ item.next_run_at.strftime('%Y-%m-%d %H:%M') if item.next_run_at else '—' }}</td>
+            <td>{% if item.schedule_key %}<code>{{ item.schedule_key }}</code>{% else %}<span class="muted">—</span>{% endif %}</td>
+            <td>{% if item.setting_name != '—' %}<code>{{ item.setting_name }}</code>{% else %}<span class="muted">—</span>{% endif %}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="panel-foot muted">«Sem registo» significa que esta automação nunca escreveu nada — pode estar desligada ou pode nunca ter chegado a correr, e daqui não se distingue. Os interruptores vivem no <code>docker-compose.v2.yml</code> e nos seus ficheiros de override, e são lidas uma vez quando o processo arranca. Mudá-las exige um redeploy, não um clique — e o cabeçalho do compose explica porquê omitir um override já desligou silenciosamente uma delas.</p>
+</section>
+
+<section class="panel">
+  <div class="panel-header"><div><p class="eyebrow">Notificações</p><h2>Canais</h2></div><span class="status-badge muted">{{ open_incidents }} incidentes abertos</span></div>
+  {% if channels %}
+    <div class="rows">
+      {% for channel in channels %}
+        <div class="row" style="grid-template-columns:1fr auto auto">
+          <span class="nm"><b>{{ channel.name }}</b><span>{{ channel.kind }}{% if channel.target_chat_id %} · destino {{ channel.target_chat_id }}{% else %} · <strong>sem destino configurado</strong>{% endif %}</span></span>
+          <span class="status-badge {{ 'success' if channel.enabled else 'muted' }}">{{ 'ativo' if channel.enabled else 'desativado' }}</span>
+          <form method="post" action="{{ url_for('automations.toggle_channel', channel_id=channel.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            {% if not channel.enabled %}<input type="hidden" name="enabled" value="on">{% endif %}
+            <button class="button {{ 'danger' if channel.enabled else 'primary' }}" type="submit">{{ 'Desativar' if channel.enabled else 'Ativar' }}</button>
+          </form>
+        </div>
+      {% endfor %}
+    </div>
+    {% if not channels[0].enabled %}
+      <div class="notice-panel" style="margin-top:14px"><p><strong>Enquanto o canal estiver desativado não sai nada.</strong> É um corte estrutural: o passo de entrega nem sequer chama um cliente. As políticas abaixo continuam a decidir e a registar, e é isso que permite ver o que aconteceria antes de ligar seja o que for.</p></div>
+    {% endif %}
+  {% else %}
+    <p class="empty-state">Não há canais configurados.</p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <div class="panel-header"><div><p class="eyebrow">Notificações</p><h2>Políticas</h2></div>
+    <span class="status-badge muted">{% for status, count in event_counts.items() %}{{ count }} {{ status }}{% if not loop.last %} · {% endif %}{% else %}0 eventos{% endfor %}</span>
+  </div>
+  {% if policies %}
+    <div class="table-scroll">
+      <table class="data-table compact-table">
+        <thead><tr><th>Política</th><th>Canal</th><th>Severidade mínima</th><th>Escalar</th><th class="num">No âmbito</th><th>Estado</th><th></th></tr></thead>
+        <tbody>
+          {% for policy in policies %}
+            <tr>
+              <th scope="row">{{ policy.name }}{% if policy.baseline_at %}<small>desde {{ policy.baseline_at.strftime('%Y-%m-%d %H:%M') }}</small>{% endif %}</th>
+              <td>{{ channels_by_id[policy.channel_id].name if policy.channel_id in channels_by_id else '—' }}
+                {% if policy.channel_id in channels_by_id and not channels_by_id[policy.channel_id].enabled %}<small>canal desativado</small>{% endif %}</td>
+              <td>{{ policy.min_severity }}</td>
+              <td>{{ (policy.escalation_after_minutes ~ ' min') if policy.escalation_after_minutes else '—' }}</td>
+              <td class="num">{{ scope_counts.get(policy.id, 0) }}</td>
+              <td><span class="status-badge {{ 'success' if policy.enabled else 'muted' }}">{{ 'ativa' if policy.enabled else 'inativa' }}</span></td>
+              <td>
+                <form method="post" action="{{ url_for('automations.toggle_policy', policy_id=policy.id) }}">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  {% if not policy.enabled %}<input type="hidden" name="enabled" value="on">{% endif %}
+                  <button class="button secondary" type="submit">{{ 'Desativar' if policy.enabled else 'Ativar' }}</button>
+                </form>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <p class="panel-foot muted">«No âmbito» conta os incidentes abertos que passam a severidade mínima e a data de baseline. <strong>Não é o número de mensagens</strong>: a decisão real pesa também o tempo de escalada e os eventos anteriores, e calculá-la a sério escreveria linhas — uma pré-visualização não pode fazer isso.</p>
+  {% else %}
+    <p class="empty-state">Não há políticas definidas.</p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <div class="panel-header"><div><p class="eyebrow">Notificações</p><h2>Digest periódico</h2></div><a class="button secondary" href="{{ url_for('automations.digest_preview') }}">Ver o que diria agora</a></div>
+  {% if digests %}
+    <div class="rows">
+      {% for digest in digests %}
+        <div class="row" style="grid-template-columns:1fr auto auto">
+          <span class="nm"><b>{{ digest.window_start.strftime('%Y-%m-%d %H:%M') }} → {{ digest.window_end.strftime('%Y-%m-%d %H:%M') }}</b><span>gerado {{ digest.created_at.strftime('%Y-%m-%d %H:%M') }}</span></span>
+          <span class="status-badge muted">{{ digest.status }}</span>
+        </div>
+      {% endfor %}
+    </div>
+  {% else %}
+    <div class="honest-empty"><span class="empty-icon" aria-hidden="true">—</span><div><strong>Nenhum digest foi gerado.</strong><p>A pré-visualização lê os mesmos dados sem escrever nada nem avançar a janela do próximo.</p></div></div>
+  {% endif %}
+</section>
+{% endblock %}

@@ -41,6 +41,7 @@
             <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('mappings.') else '' }}" href="{{ url_for('mappings.index') }}"><span aria-hidden="true">✓</span> Mappings</a>
             <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('sources.') else '' }}" href="{{ url_for('sources.index') }}"><span aria-hidden="true">◷</span> Políticas de fonte</a>
             <a class="nav-link {{ 'active' if request.endpoint == 'reconciliation.index' else '' }}" href="{{ url_for('reconciliation.index') }}"><span aria-hidden="true">⌁</span> Reconciliação</a>
+            <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('automations.') else '' }}" href="{{ url_for('automations.index') }}"><span aria-hidden="true">◴</span> Automações</a>
           </div>
         </nav>
         <div class="sidebar-footer">
@@ -91,6 +92,7 @@
           <a class="{{ 'active' if request.endpoint and request.endpoint.startswith('mappings.') else '' }}" href="{{ url_for('mappings.index') }}"><span aria-hidden="true">✓</span> Mappings</a>
           <a class="{{ 'active' if request.endpoint and request.endpoint.startswith('sources.') else '' }}" href="{{ url_for('sources.index') }}"><span aria-hidden="true">◷</span> Políticas de fonte</a>
           <a class="{{ 'active' if request.endpoint == 'reconciliation.index' else '' }}" href="{{ url_for('reconciliation.index') }}"><span aria-hidden="true">⌁</span> Reconciliação</a>
+          <a class="{{ 'active' if request.endpoint and request.endpoint.startswith('automations.') else '' }}" href="{{ url_for('automations.index') }}"><span aria-hidden="true">◴</span> Automações</a>
         </div>
       </details>
     </nav>

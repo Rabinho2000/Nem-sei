@@ -10,6 +10,7 @@ from nemsei.db import build_engine, build_session_factory
 from nemsei.system.health import ReadinessCheck, database_readiness
 from nemsei.web.auth_routes import auth_bp
 from nemsei.web.asset_routes import assets_bp
+from nemsei.web.automation_routes import automation_bp
 from nemsei.web.commercial_routes import commercial_bp
 from nemsei.web.db_session import close_request_session
 from nemsei.web.health_routes import health_bp
@@ -54,6 +55,7 @@ def create_app(
     app.register_blueprint(source_bp)
     app.register_blueprint(portfolio_bp)
     app.register_blueprint(reporting_bp)
+    app.register_blueprint(automation_bp)
     app.register_blueprint(commercial_bp)
     app.register_blueprint(diagnostics_bp)
     return app
