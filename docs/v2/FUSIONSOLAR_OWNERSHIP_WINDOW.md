@@ -334,6 +334,62 @@ none of this finding changes anything about how V1 and V2 must coordinate
 access to the account once V2 can reach FusionSolar from an unblocked
 network path.
 
+## Proxying through an unblocked network path (2026-08-24)
+
+Built `src/nemsei/integrations/fusionsolar/socks5_transport.py` -- a
+`FusionSolarTransport` implementation (stdlib-only: raw-socket SOCKS5
+CONNECT handshake, TLS, minimal HTTP/1.1, manual cookie persistence across
+calls on one instance) so the real client can route through a SOCKS5 proxy
+instead of the default direct connection. The operator opened one via
+`ssh -R 1080 <server>` from their workplace network while at work -- a
+different egress than the server's own blocked IP.
+
+**A raw, single-call test succeeded**: `FusionSolarClient` with
+`Socks5FusionSolarTransport`, run directly on the host (not through the
+worker container, which cannot reach the tunnel -- see below), logged in
+and fetched a real discovery page (100 plants across 2 pages) through the
+tunnel. This is the second, independent confirmation that the block is
+IP-scoped, using the real production client code this time, not just the
+standalone probe script.
+
+**A full-stack run (ownership broker + session cache + real Postgres,
+routed through the same tunnel) then failed again**, `rate_limited`, with
+`actual_call_count` advancing by 2 (confirmed real network attempts, not
+local state). The likely cause: `FusionSolarMonitoringService`'s and
+`FusionSolarProductionService`'s authentication attempts landed **29
+milliseconds apart** -- the first service's login failed for an unrelated
+reason, session reuse correctly refused to cache that failure, and the
+very next service call immediately retried a fresh login with no backoff
+at all, plausibly tripping a burst-detection layer distinct from the
+longer IP-scoped block. This is a real, separate finding: today's session-
+cache design has no delay between "a login just failed" and "immediately
+try another fresh login from the next caller," which is exactly the kind
+of rapid-fire pattern an anti-abuse system would flag on its own. Worth a
+follow-up (a short backoff after a failed authentication attempt, shared
+across callers via the session cache) before relying on any unblocked path
+at portfolio scale.
+
+**Container networking note**: the worker/scheduler containers cannot
+reach a service bound to the host's `127.0.0.1` (SSH's default `-R` bind) --
+confirmed through several attempts (a docker-published relay forwarding to
+`host.docker.internal`, a `--network host` relay) -- Docker's bridge
+network cannot reach a host-loopback-only service by design, and this
+environment's firewalling only permits bridge-to-host traffic that Docker
+itself published via `-p`, not raw host processes or host-networked
+containers binding the same address. The two real-network validations
+above were both run directly on the host (a throwaway venv + the real
+`src/nemsei` package on `PYTHONPATH`, Postgres reached via the container's
+bridge IP directly, host→container reachability being unrestricted in that
+direction), not from inside the worker container. A durable fix would
+need either the SSH server's `GatewayPorts` opened for a non-loopback bind,
+or a small proxy service deployed the same way the ownership broker was
+(its own docker-published container) -- not attempted here given the
+credential-burst finding above makes it moot until that is fixed first.
+
+No further real login attempts were made after this. Both test account_keys
+confirmed clean (no lease, no cooldown) immediately after; V1 unaffected
+throughout.
+
 ## Residual risks
 
 1. Coupling to V1's internal schema/hash algorithm (not a public API) --
