@@ -297,6 +297,43 @@ root cause; Huawei support is the only party who can confirm it and say
 whether/how it can be lifted or IP-allowlisted. Neither V1's nor V2's code
 can detect, wait out, or work around this from outside.
 
+## Confirmed: the block is scoped to the server's outbound IP (2026-08-24)
+
+Decisive test: `scripts/fusionsolar_login_probe.py` (standalone, stdlib-only,
+no V2 dependency) run from the operator's own laptop -- a different
+network entirely -- with the exact same `solcor_om_api2` credentials that
+were rejected from this server minutes earlier. **Login succeeded
+immediately**: HTTP 200, `success: true`, `failCode: 0`, valid XSRF token.
+
+This confirms the hypothesis from the public-documentation research above:
+the block is tied to this server's outbound address
+(`161.230.174.153` at the time of this test, `curl https://api.ipify.org`),
+not to the `solcor_om_api`/`solcor_om_api2` accounts and not to the SOLCOR
+tenant generally -- both accounts remain valid and usable from anywhere
+else right now. No further attempt was made from this server itself
+(retrying here would just reuse the same blocked IP and produce no new
+information).
+
+**What this changes**: waiting longer from this server was never going to
+resolve it, since the block is not time-based from what we can observe --
+it is IP-based. The actionable paths forward are infrastructure decisions,
+not code:
+1. Ask Huawei/FusionSolar support to unblock or allowlist this server's
+   outbound IP for the Northbound API.
+2. Run FusionSolar-calling V2 processes (worker, or specifically the
+   `fusion-canary` connection's calls) through a different egress path
+   that is not blocked -- a proxy, a different host, or a NAT/outbound-IP
+   change for this deployment.
+3. Confirm with Huawei whether this is a temporary anti-abuse flag (in
+   which case it may still lift on its own after enough time) or a
+   deliberate, standing block that requires manual intervention to clear.
+
+The ownership broker, session reuse, and shared budget guard all remain
+correct and necessary regardless of which of the above happens next --
+none of this finding changes anything about how V1 and V2 must coordinate
+access to the account once V2 can reach FusionSolar from an unblocked
+network path.
+
 ## Residual risks
 
 1. Coupling to V1's internal schema/hash algorithm (not a public API) --
