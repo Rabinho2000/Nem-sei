@@ -1,6 +1,34 @@
 {% extends "portfolios/_shell.html" %}
 {% block section %}
 {% include "portfolios/_filters.html" %}
+{% import "macros/chart.html" as chart %}
+{#
+  Gráficos do portfolio. Construídos a partir das linhas que o relatório já
+  congelou -- um gráfico que discordasse da tabela ao lado era pior que
+  gráfico nenhum. A tendência é a excepção: precisa de doze meses de factos,
+  que nenhum período isolado contém.
+#}
+<section class="panel chart-panel">
+  <div class="chart-head">
+    <h3>Produção do portfolio · {{ charts.trend.months }} meses</h3>
+    <span class="meta">MWh · a barra fina é quantas das {{ charts.trend.total_assets }} instalações reportaram</span>
+  </div>
+  {{ chart.bars(charts.trend.chart, 'Produção mensal do portfolio') }}
+  {{ chart.legend([('Produção medida', '1'), ('Cobertura', 'cov'), ('Sem leituras', 'void')]) }}
+</section>
+
+<div class="two-column">
+  <section class="panel chart-panel">
+    <div class="chart-head"><h3>Maiores produtoras do período</h3><span class="meta">{{ charts.ranking.shown }} de {{ charts.ranking.total }}</span></div>
+    {{ chart.bars(charts.ranking.chart, 'Produção por instalação no período') }}
+  </section>
+  <section class="panel chart-panel">
+    <div class="chart-head"><h3>Balanço energético</h3><span class="meta">{% if charts.balance.self_use_share is not none %}{{ "%.0f"|format(charts.balance.self_use_share * 100) }} % autoconsumido{% else %}sem produção medida{% endif %}</span></div>
+    <div style="max-width:320px">{{ chart.stack(charts.balance.stack, 'Produção e consumo do portfolio repartidos') }}</div>
+    {{ chart.legend([('Autoconsumo', '1'), ('Excedente', '2'), ('Rede', '3')]) }}
+  </section>
+</div>
+
 <section class="panel">
   <header class="panel-header">
     <h2>Energia do período</h2>

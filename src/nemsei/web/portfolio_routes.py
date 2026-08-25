@@ -16,6 +16,7 @@ from nemsei.portfolios.service import (
 )
 from nemsei.reporting.periods import ReportingPeriodError, exclusive_end, monthly_period
 from nemsei.web.csrf import require_valid_token, token
+from nemsei.web.series import portfolio_balance, portfolio_monthly_series, ranked_installations
 from nemsei.web.db_session import get_request_session
 from nemsei.web.home_routes import require_authenticated
 from nemsei.web.portfolio_queries import SECTIONS, default_month, member_review_data, portfolio_detail, portfolio_list
@@ -97,10 +98,22 @@ def detail(portfolio_id: int, section: str = "overview") -> str:
         )
     except ValueError:
         abort(404)
+    charts: dict[str, object] = {}
+    if section == "production":
+        # Built from the dataset rows the report already froze, never a second
+        # query -- a chart that disagreed with the table beside it would be
+        # worse than no chart. The trend is the exception: it needs facts over
+        # twelve months, which no single period's dataset holds.
+        rows = context.get("rows") or []
+        charts["ranking"] = ranked_installations(rows)
+        charts["balance"] = portfolio_balance(context.get("totals") or {})
+        member_ids = [row["asset_id"] for row in rows if row.get("asset_id")]
+        charts["trend"] = portfolio_monthly_series(session, asset_ids=member_ids, total_assets=len(member_ids) or None)
     return render_template(
         f"portfolios/{section}.html",
         title=context["portfolio"].name,
         csrf_token=token(),
+        charts=charts,
         **context,
     )
 

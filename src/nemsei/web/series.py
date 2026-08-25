@@ -183,7 +183,13 @@ def headline(session: Session, *, asset_id: int, days: int = 30) -> dict[str, An
     }
 
 
-def portfolio_monthly_series(session: Session, *, months: int = 12, total_assets: int | None = None) -> dict[str, Any]:
+def portfolio_monthly_series(
+    session: Session,
+    *,
+    months: int = 12,
+    total_assets: int | None = None,
+    asset_ids: list[int] | None = None,
+) -> dict[str, Any]:
     """Monthly production across the whole portfolio, with how much of it reported.
 
     One query rather than 266, but the same reduction: `DISTINCT ON
@@ -213,6 +219,7 @@ def portfolio_monthly_series(session: Session, *, months: int = 12, total_assets
         .where(
             ProductionFact.metric_kind == "production_energy",
             ProductionFact.period_start >= _moment(starts[0]),
+            *([ProductionFact.asset_id.in_(asset_ids)] if asset_ids is not None else []),
         )
         .distinct(ProductionFact.provider_mapping_id, ProductionFact.source_fact_key)
         .order_by(
@@ -234,7 +241,7 @@ def portfolio_monthly_series(session: Session, *, months: int = 12, total_assets
     }
 
     if total_assets is None:
-        total_assets = int(session.scalar(select(func.count(Asset.id))) or 0)
+        total_assets = len(asset_ids) if asset_ids is not None else int(session.scalar(select(func.count(Asset.id))) or 0)
     names = ("Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez")
     points = []
     for month_start in starts:
@@ -252,3 +259,43 @@ def portfolio_monthly_series(session: Session, *, months: int = 12, total_assets
             )
         )
     return {"chart": bar_chart(points, unit="MWh"), "total_assets": total_assets, "months": months}
+
+
+def ranked_installations(rows: list[dict[str, Any]], *, limit: int = 12) -> dict[str, Any]:
+    """The period's production per installation, biggest first.
+
+    Reads the dataset rows the portfolio report already built rather than
+    querying again: a chart that disagreed with the table beside it would be
+    worse than no chart. An installation with no measurement stays a gap, so a
+    plant that reported nothing never looks like a plant that produced nothing.
+    """
+    named = [row for row in rows if row.get("asset_id")]
+    ordered = sorted(named, key=lambda row: -(float(row["production_kwh"]) if row.get("production_kwh") else -1))
+    points = [
+        Point(
+            label=(row["name"][:11] + "…") if len(row["name"]) > 12 else row["name"],
+            value=float(row["production_kwh"]) if row.get("production_kwh") else None,
+            hint=f"{row['name']}: " + (f"{float(row['production_kwh']):.0f} kWh" if row.get("production_kwh") else "sem medição"),
+        )
+        for row in ordered[:limit]
+    ]
+    return {"chart": bar_chart(points, width=760, plot_height=140, unit="kWh"), "shown": len(points), "total": len(named)}
+
+
+def portfolio_balance(totals: dict[str, Any]) -> dict[str, Any]:
+    """The portfolio's energy balance from its own frozen totals."""
+
+    def value(key: str) -> float:
+        entry = totals.get(key) or {}
+        raw = entry.get("value")
+        return float(raw) if raw else 0.0
+
+    production, self_use = value("production"), value("self_use")
+    columns = [
+        ("Produção", [("Autoconsumo", self_use, 1), ("Excedente", value("export"), 2)]),
+        ("Consumo", [("Autoconsumo", self_use, 1), ("Rede", value("grid_import"), 3)]),
+    ]
+    return {
+        "stack": stacked_bars(columns),
+        "self_use_share": (self_use / production) if production else None,
+    }
