@@ -74,7 +74,11 @@ x-v2-sigenergy-environment: &v2-sigenergy-environment
   NEMSEI_V2_SIGENERGY_PRIMARY_APP_SECRET_FILE: /run/secrets/sigenergy_primary_app_secret
   NEMSEI_V2_SIGENERGY_PRIMARY_BASE_URL: https://api-eu.sigencloud.com
   NEMSEI_V2_SIGENERGY_PRIMARY_AUTH_ENDPOINT: /openapi/auth/login/key
-  NEMSEI_V2_SIGENERGY_PRIMARY_SYSTEMS_ENDPOINT: /openapi/system/list
+  # /openapi/system, nao /openapi/system/list: o segundo devolve HTTP 200 com
+  # corpo vazio, e era por isso que a descoberta parecia nao existir neste
+  # provider. O V1 sempre usou o primeiro. Devolve systemId, systemName, addr,
+  # timeZone, pvCapacity e estado por sistema.
+  NEMSEI_V2_SIGENERGY_PRIMARY_SYSTEMS_ENDPOINT: /openapi/system
   NEMSEI_V2_SIGENERGY_PRIMARY_ENERGY_FLOW_ENDPOINT: /openapi/systems/{system_id}/energyFlow
   NEMSEI_V2_SIGENERGY_PRIMARY_REGION: eu
   # Contrato de producao verificado em 2026-08-25 contra a API real, nao
