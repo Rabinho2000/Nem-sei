@@ -51,7 +51,7 @@ from nemsei.notifications.models import (
     NotificationEvent,
     NotificationPolicy,
 )
-from nemsei.notifications.telegram_client import MockTelegramClient, TelegramClient
+from nemsei.notifications.telegram_client import TelegramClient, default_client_factory
 from nemsei.shared.clock import utc_now
 
 
@@ -80,10 +80,9 @@ class NotificationProcessingSummary:
 
 
 def _default_client_factory(channel: NotificationChannel) -> TelegramClient:
-    # The only client this codebase can build today: no factory path here
-    # can produce anything that makes a real HTTP call. See
-    # notifications/telegram_client.py.
-    return MockTelegramClient()
+    # One decision point for the whole process: telegram_client.py returns the
+    # real client only when a bot token is configured, and the mock otherwise.
+    return default_client_factory(channel)
 
 
 def decide_notification_events(session: Session, *, now: datetime | None = None) -> NotificationDecisionSummary:

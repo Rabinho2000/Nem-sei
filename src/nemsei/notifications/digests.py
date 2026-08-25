@@ -24,10 +24,9 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from nemsei.diagnostics.findings import SEVERITY_ORDER
 from nemsei.diagnostics.models import DiagnosticIncident
 from nemsei.notifications.models import DigestRun, NotificationChannel
-from nemsei.notifications.telegram_client import MockTelegramClient, TelegramClient
+from nemsei.notifications.telegram_client import TelegramClient, default_client_factory
 from nemsei.portfolios.diagnostics import (
     asset_ids_for_portfolio,
     portfolio_diagnostics_summary,
@@ -45,9 +44,9 @@ TOP_INSTALLATIONS_PER_PORTFOLIO = 3
 
 
 def _default_client_factory(channel: NotificationChannel) -> TelegramClient:
-    # Same structural guarantee as D3: no factory path here can produce
-    # anything that makes a real HTTP call.
-    return MockTelegramClient()
+    # One decision point for the whole process: telegram_client.py returns the
+    # real client only when a bot token is configured, and the mock otherwise.
+    return default_client_factory(channel)
 
 
 # --- decide: build the window's content, deterministically --------------------
