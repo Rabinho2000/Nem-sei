@@ -40,6 +40,29 @@ def safe_metadata(values: dict[str, Any] | None = None) -> dict[str, Any]:
     }
 
 
+def _catch_up_slot(slot: datetime, *, now: datetime, interval: timedelta) -> datetime:
+    """The slot to fire, skipping a backlog instead of replaying it.
+
+    `next_run_at` advances from its own prior value so the cadence does not
+    drift. That is right while the scheduler is running and wrong after it
+    stops: on 2026-08-25 the device-status schedule had sat at 2026-08-20 for
+    five days, and every tick advanced it by one interval, enqueueing one real
+    provider call per tick to work through ~250 missed slots. Eighty cycles and
+    165 provider calls went out in five minutes before it was stopped.
+
+    Replaying them was never meaningful. Every one of these schedules reads or
+    processes *current* state -- a device poll from five days ago would have
+    read exactly the same "now" as the newest one, and a cursor-driven
+    production sync does identical work whichever slot triggered it. The
+    backlog is duplicate work, not recoverable data.
+
+    Deliberately not applied to digest generation, whose windows chain from the
+    previous digest rather than from the slot, and where skipping is therefore
+    a different question with a different answer.
+    """
+    return now if now - slot > interval else slot
+
+
 class JobRepository:
     def __init__(self, engine: Engine, session_factory: sessionmaker[Session]) -> None:
         self.engine = engine
@@ -582,6 +605,7 @@ class JobRepository:
                 if schedule is not None and as_utc(schedule.next_run_at) > now_value:
                     return None, False
                 slot = as_utc(schedule.next_run_at) if schedule is not None else now_value
+                slot = _catch_up_slot(slot, now=now_value, interval=timedelta(minutes=interval_minutes))
                 dedupe_key = f"{key}:{slot.isoformat()}"
                 existing = session.scalar(
                     select(Job).where(
@@ -702,6 +726,7 @@ class JobRepository:
                 if schedule is not None and as_utc(schedule.next_run_at) > now_value:
                     return None, False
                 slot = as_utc(schedule.next_run_at) if schedule is not None else now_value
+                slot = _catch_up_slot(slot, now=now_value, interval=timedelta(hours=interval_hours))
                 dedupe_key = f"{key}:{slot.isoformat()}"
                 existing = session.scalar(
                     select(Job).where(
@@ -794,6 +819,7 @@ class JobRepository:
                 if schedule is not None and as_utc(schedule.next_run_at) > now_value:
                     return None, False
                 slot = as_utc(schedule.next_run_at) if schedule is not None else now_value
+                slot = _catch_up_slot(slot, now=now_value, interval=timedelta(minutes=interval_minutes))
                 dedupe_key = f"{key}:{slot.isoformat()}"
                 existing = session.scalar(
                     select(Job).where(
@@ -890,6 +916,7 @@ class JobRepository:
                 if schedule is not None and as_utc(schedule.next_run_at) > now_value:
                     return None, False
                 slot = as_utc(schedule.next_run_at) if schedule is not None else now_value
+                slot = _catch_up_slot(slot, now=now_value, interval=timedelta(minutes=interval_minutes))
                 dedupe_key = f"{key}:{slot.isoformat()}"
                 existing = session.scalar(
                     select(Job).where(

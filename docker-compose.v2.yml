@@ -55,6 +55,25 @@ x-v2-fusionsolar-environment: &v2-fusionsolar-environment
   # header comment above and docs/v2/DEVICE_TELEMETRY.md ss10).
   NEMSEI_V2_PRODUCTION_SYNC_SCHEDULER_ENABLED: "true"
   NEMSEI_V2_PRODUCTION_SYNC_SCHEDULER_CONNECTION_ID: "3"
+  # 2026-08-25: sonda de dispositivos ligada. Estava parada desde 2026-08-20, e
+  # era essa a raiz do silencio no Telegram -- sem leituras novas nao ha regras
+  # a disparar, sem regras nao ha incidentes, sem incidentes nao ha alertas.
+  #
+  # Custo medido, nao estimado: um ciclo bem sucedido gastou 3 chamadas
+  # (sync run 10, 2026-08-20) para os 2 inversores activos da ligacao 3. A 30
+  # minutos sao 48 ciclos/dia, ~144 chamadas/dia -- mas o travao desta conta e
+  # de *frequencia*, nao de volume: recuperou em ~10 minutos depois de 25
+  # chamadas seguidas, e 3 chamadas a cada meia hora nao se parece com isso.
+  # A cadencia de 30 min e a que o canario provou (DEVICE_TELEMETRY.md ss8) e a
+  # que a regra de completude de 90 minutos da disponibilidade exige.
+  #
+  # O cap e vitalicio e conta os 3 ciclos ja corridos: 1443 = 30 dias a 48/dia
+  # mais esses 3. Nao e um numero grande para desligar o travao -- e um ponto
+  # de paragem deliberado por volta de 2026-09-24, para alguem decidir de novo.
+  NEMSEI_V2_DEVICE_STATUS_POLL_ENABLED: "true"
+  NEMSEI_V2_DEVICE_STATUS_POLL_CONNECTION_ID: "3"
+  NEMSEI_V2_DEVICE_STATUS_POLL_INTERVAL_MINUTES: "30"
+  NEMSEI_V2_DEVICE_STATUS_POLL_MAX_CYCLES: "1443"
 
 # Notificacoes (D4, 2026-08-25). Ancora separada da do FusionSolar de proposito:
 # nada disto e uma chamada a provider, e misturar as duas faria um leitor futuro
