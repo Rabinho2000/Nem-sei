@@ -419,3 +419,63 @@ a.status-badge:hover, a.status-badge:focus-visible { text-decoration: underline;
   background: var(--surface-subtle); color: var(--text);
   font: 0.84rem/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap;
   overflow-wrap: anywhere; }
+
+/* Graficos ------------------------------------------------------------- */
+/* SVG servido pelo servidor. Nenhuma biblioteca, nenhum JavaScript: o mesmo
+   markup imprime no PDF pelo mesmo caminho. As series foram validadas por
+   simulacao de daltonismo (Machado-Oliveira-Fernandes 2009) contra a
+   superficie de cada tema, com separacao minima OKLab de 9,1 no claro. */
+:root {
+  --c-s1: #4e8c1f;
+  --c-s2: #2c7fd4;
+  --c-s3: #8a3fa0;
+  --c-grid: #e2e8dc;
+  --c-void: #dfe5d9;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --c-s1: #62a805; --c-s2: #2a8eff; --c-s3: #9c55b2; --c-grid: #2e3841; --c-void: #2a333b; }
+}
+
+.chart { display: block; width: 100%; height: auto; overflow: visible; }
+.chart-empty { margin: 12px 0; padding: 14px 16px; border: 1px dashed var(--line-strong); border-radius: 8px; color: var(--muted); font-size: 0.85rem; }
+.c-grid { stroke: var(--c-grid); stroke-width: 1; }
+.c-axis-y, .c-axis-x, .c-cap, .c-dow, .c-cal-num, .c-seg-label { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; fill: var(--muted); }
+.c-axis-y { font-size: 9.5px; text-anchor: end; }
+.c-axis-x { font-size: 9.5px; text-anchor: middle; }
+.c-cap { font-size: 8px; text-anchor: end; letter-spacing: 0.06em; }
+.c-bar { fill: var(--c-s1); transform-box: fill-box; transform-origin: bottom; animation: c-rise 0.6s cubic-bezier(0.22, 0.9, 0.3, 1) both; animation-delay: var(--d, 0s); }
+.c-bar:hover { fill: var(--brand-dark); }
+/* Um dia sem leitura e um vazio tramado, nunca uma barra a zero. */
+.c-void { fill: var(--c-void); opacity: 0.4; }
+.c-cov-track { fill: var(--surface-raised); }
+.c-cov { fill: var(--brand-vivid); transform-box: fill-box; transform-origin: bottom; animation: c-rise 0.5s cubic-bezier(0.22, 0.9, 0.3, 1) both; animation-delay: var(--d, 0s); }
+.c-seg { transform-box: fill-box; transform-origin: bottom; animation: c-rise 0.5s cubic-bezier(0.22, 0.9, 0.3, 1) both; animation-delay: var(--d, 0s); }
+.c-s1 { fill: var(--c-s1); } .c-s2 { fill: var(--c-s2); } .c-s3 { fill: var(--c-s3); }
+.c-seg-label { font-size: 10px; font-weight: 600; text-anchor: middle; fill: #ffffff; paint-order: stroke; stroke: rgba(0, 0, 0, 0.42); stroke-width: 2.4px; stroke-linejoin: round; }
+.c-cal { animation: c-pop 0.35s ease-out both; animation-delay: var(--d, 0s); }
+.c-cal-0 { fill: none; stroke: var(--line-strong); stroke-width: 1; stroke-dasharray: 2 3; }
+.c-cal-1 { fill: var(--c-void); }
+.c-cal-2 { fill: color-mix(in srgb, var(--brand-vivid) 30%, var(--surface-raised)); }
+.c-cal-3 { fill: color-mix(in srgb, var(--brand-vivid) 62%, var(--surface-raised)); }
+.c-cal-4 { fill: var(--c-s1); }
+.c-cal-num { font-size: 9px; text-anchor: middle; pointer-events: none; }
+.c-cal-num-4 { fill: #ffffff; }
+.c-dow { font-size: 8.5px; text-anchor: middle; letter-spacing: 0.06em; }
+.spark { display: block; width: 104px; height: 28px; overflow: visible; }
+.spark-line { fill: none; stroke: var(--c-s1); stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 320; stroke-dashoffset: 320; animation: c-draw 1s ease-out 0.2s forwards; }
+.spark-area { fill: var(--brand-vivid); opacity: 0.13; }
+.spark-dot { fill: var(--c-s1); opacity: 0; animation: c-fade 0.3s ease-out 1.05s forwards; }
+.chart-legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 10px; color: var(--muted); font-size: 0.76rem; }
+.chart-legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; }
+.lg-1 { background: var(--c-s1); } .lg-2 { background: var(--c-s2); } .lg-3 { background: var(--c-s3); }
+.lg-cov { background: var(--brand-vivid); }
+.lg-void { background: repeating-linear-gradient(45deg, var(--line-strong) 0 3px, transparent 3px 6px); }
+.chart-panel { min-width: 0; }
+.chart-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+.chart-head h3 { margin: 0; font-size: 0.92rem; font-weight: 700; }
+.chart-head .meta { color: var(--muted); font-size: 0.76rem; }
+
+@keyframes c-rise { from { transform: scaleY(0); opacity: 0.35; } to { transform: scaleY(1); opacity: 1; } }
+@keyframes c-draw { to { stroke-dashoffset: 0; } }
+@keyframes c-fade { to { opacity: 1; } }
+@keyframes c-pop { from { opacity: 0; transform: scale(0.85); transform-box: fill-box; transform-origin: center; } to { opacity: 1; transform: scale(1); } }

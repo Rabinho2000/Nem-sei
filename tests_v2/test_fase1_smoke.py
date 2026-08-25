@@ -36,6 +36,39 @@ PAGES = (
 )
 
 
+def _token_names(text: str) -> set[str]:
+    return set(re.findall(r"(--[a-z0-9-]+)\s*:", text))
+
+
+def _dark_regions(css: str) -> list[tuple[int, int]]:
+    """Character ranges of every block whose selector targets dark mode."""
+    regions: list[tuple[int, int]] = []
+    for match in re.finditer(r"(@media[^{]*prefers-color-scheme:\s*dark[^{]*|:root\s*\[data-theme=\"dark\"\])\s*\{", css):
+        depth, index = 1, match.end()
+        while index < len(css) and depth:
+            depth += 1 if css[index] == "{" else -1 if css[index] == "}" else 0
+            index += 1
+        regions.append((match.end(), index))
+    return regions
+
+
+def tokens_defined_only_in_dark(css: str) -> set[str]:
+    """Custom properties a dark block defines that no light-side rule defines.
+
+    A token whose only definition sits behind a theme block does not apply in
+    the default "system" state, and the page then paints one theme's text on
+    the other theme's ground.
+    """
+    regions = _dark_regions(css)
+    dark: set[str] = set()
+    for start, end in regions:
+        dark |= _token_names(css[start:end])
+    light_source = css
+    for start, end in sorted(regions, reverse=True):
+        light_source = light_source[:start] + light_source[end:]
+    return dark - _token_names(light_source)
+
+
 def csrf_token(response) -> str:
     match = re.search(r'name="csrf_token" value="([^"]+)"', response.text)
     assert match
@@ -84,9 +117,11 @@ def test_logo_and_stylesheet_are_served_by_the_application(settings, monkeypatch
     # Modo escuro com degraus proprios, e a barra de separadores movel.
     assert "prefers-color-scheme: dark" in body
     assert ".mobile-tabs" in body
-    # Uma paleta clara completa em :root, e uma segunda so com os tokens
-    # redefinidos -- nenhuma cor pode existir apenas dentro do bloco escuro.
-    assert body.count(":root {") == 2
+    # A regra que interessa, verificada em vez de aproximada por uma contagem:
+    # nenhum token pode existir apenas dentro de um bloco de tema. Um token so
+    # definido no escuro nao se aplica no estado "sistema" sem preferencia
+    # declarada, e a pagina renderiza o texto de um tema sobre o fundo do outro.
+    assert not tokens_defined_only_in_dark(body)
 
 
 def test_login_page_carries_the_brand_and_a_stylesheet(settings) -> None:

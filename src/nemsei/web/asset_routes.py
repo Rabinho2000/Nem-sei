@@ -9,10 +9,12 @@ from nemsei.assets.repository import AssetRepository
 from nemsei.assets.service import add_alias, bulk_update_assets, create_asset, create_organization, update_asset
 from nemsei.providers.repository import ProviderRepository
 from nemsei.providers.service import configure_connection, create_connection, create_mapping, set_connection_enabled
+from nemsei.shared.clock import utc_now
 from nemsei.web.csrf import require_valid_token, token
 from nemsei.web.db_session import get_request_session
 from nemsei.web.home_routes import require_authenticated
 from nemsei.web.queries import asset_detail_data, commercial_panel_data, list_assets_data, organization_list_data, provider_connections_data
+from nemsei.web.series import daily_series, energy_balance, headline, month_calendar, monthly_series
 
 
 assets_bp = Blueprint("assets", __name__)
@@ -126,12 +128,23 @@ def asset_detail(asset_id: int) -> str:
             flash(str(exc), "error")
     providers = ProviderRepository(session)
     detail = asset_detail_data(session, asset.id)
+    # Charts of an installation's own production, read from canonical facts.
+    # The window is the current month for the calendar and the balance, which
+    # is the period an operator is usually asking about.
+    today = utc_now().date()
+    month_start = date(today.year, today.month, 1)
+    next_month = date(today.year + 1, 1, 1) if today.month == 12 else date(today.year, today.month + 1, 1)
     return render_template(
         "assets/detail.html",
         **detail,
         organizations=repository.list_organizations(),
         connections=providers.list_connections(),
         **commercial_panel_data(session, asset_id=asset.id),
+        headline=headline(session, asset_id=asset.id),
+        monthly=monthly_series(session, asset_id=asset.id),
+        daily=daily_series(session, asset_id=asset.id),
+        calendar_month=month_calendar(session, asset_id=asset.id, year=today.year, month=today.month),
+        balance=energy_balance(session, asset_id=asset.id, start=month_start, end=next_month),
         csrf_token=token(),
         title=asset.canonical_name,
     )

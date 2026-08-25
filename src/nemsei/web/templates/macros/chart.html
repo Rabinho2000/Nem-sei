@@ -1,0 +1,106 @@
+{#
+  Gráficos em SVG servido pelo servidor. Zero JavaScript, zero bibliotecas: o
+  mesmo markup que chega ao browser sobrevive ao PDF, e uma página que se
+  desenha a si própria não pode discordar dos números ao lado.
+
+  Toda a aritmética vem de web/charts.py, que tem testes. Estas macros só
+  desenham. As dicas de contexto são <title> de SVG, que o browser mostra
+  nativamente ao passar o rato — não é preciso script para isso.
+#}
+
+{% macro bars(chart, caption='') %}
+  {% if chart.empty %}
+    <p class="chart-empty">Sem dados para desenhar. Não é um gráfico a zero — é a ausência de leituras.</p>
+  {% else %}
+    <svg class="chart" viewBox="0 0 {{ chart.width }} {{ chart.height }}" role="img"
+         aria-label="{{ caption or 'Série temporal' }}" preserveAspectRatio="xMidYMid meet">
+      {% for y, label in chart.gridlines %}
+        <line class="c-grid" x1="46" y1="{{ '%.1f'|format(y) }}" x2="{{ chart.width - 10 }}" y2="{{ '%.1f'|format(y) }}"/>
+        <text class="c-axis-y" x="38" y="{{ '%.1f'|format(y + 4) }}">{{ label }}</text>
+      {% endfor %}
+      {% for bar in chart.bars %}
+        {% if bar.point.missing %}
+          <rect class="c-void" x="{{ '%.1f'|format(bar.x) }}" y="{{ '%.1f'|format(bar.y) }}"
+                width="{{ '%.1f'|format(bar.width) }}" height="{{ '%.1f'|format(bar.height) }}" rx="2">
+            <title>{{ bar.point.hint }}</title></rect>
+        {% else %}
+          <rect class="c-bar" x="{{ '%.1f'|format(bar.x) }}" y="{{ '%.1f'|format(bar.y) }}"
+                width="{{ '%.1f'|format(bar.width) }}" height="{{ '%.1f'|format(bar.height) }}"
+                rx="{{ '%.1f'|format([bar.width / 3, bar.height / 2, 3]|min) }}" style="--d:{{ bar.delay }}s">
+            <title>{{ bar.point.hint }}</title></rect>
+        {% endif %}
+        {% if chart.has_coverage %}
+          <rect class="c-cov-track" x="{{ '%.1f'|format(bar.x) }}" y="{{ chart.coverage_top }}"
+                width="{{ '%.1f'|format(bar.width) }}" height="{{ chart.coverage_height }}" rx="2"/>
+          {% if bar.coverage_height > 0 %}
+            <rect class="c-cov" x="{{ '%.1f'|format(bar.x) }}" y="{{ '%.1f'|format(bar.coverage_y) }}"
+                  width="{{ '%.1f'|format(bar.width) }}" height="{{ '%.1f'|format(bar.coverage_height) }}" rx="2"
+                  style="--d:{{ bar.delay + 0.12 }}s"><title>{{ bar.point.hint }}</title></rect>
+          {% endif %}
+        {% endif %}
+        {% if bar.point.label %}
+          <text class="c-axis-x" x="{{ '%.1f'|format(bar.x + bar.width / 2) }}" y="{{ chart.label_y }}">{{ bar.point.label }}</text>
+        {% endif %}
+      {% endfor %}
+      {% if chart.has_coverage %}
+        <text class="c-cap" x="38" y="{{ chart.coverage_top + chart.coverage_height - 4 }}">cobertura</text>
+      {% endif %}
+    </svg>
+  {% endif %}
+{% endmacro %}
+
+{% macro spark(line) %}
+  {% if not line.empty %}
+    <svg class="spark" viewBox="0 0 {{ line.width }} {{ line.height }}" aria-hidden="true" preserveAspectRatio="none">
+      <path class="spark-area" d="{{ line.area }}"/>
+      <path class="spark-line" d="{{ line.line }}"/>
+      <circle class="spark-dot" cx="{{ '%.1f'|format(line.last_x) }}" cy="{{ '%.1f'|format(line.last_y) }}" r="2.4"/>
+    </svg>
+  {% endif %}
+{% endmacro %}
+
+{% macro calendar(cal, caption='') %}
+  {% if cal.empty %}
+    <p class="chart-empty">Nenhum dia deste mês tem leituras.</p>
+  {% else %}
+    <svg class="chart cal" viewBox="0 0 {{ cal.width }} {{ cal.height }}" role="img" aria-label="{{ caption or 'Cobertura diária' }}">
+      {% for x, name in cal.weekday_labels %}
+        <text class="c-dow" x="{{ '%.1f'|format(x) }}" y="10">{{ name }}</text>
+      {% endfor %}
+      {% for cell in cal.cells %}
+        <rect class="c-cal c-cal-{{ cell.level }}" x="{{ cell.x }}" y="{{ cell.y }}"
+              width="{{ cal.cell_size }}" height="{{ cal.cell_size }}" rx="4" style="--d:{{ cell.delay }}s">
+          <title>Dia {{ cell.day }}: {% if cell.value is none %}sem leitura{% else %}{{ '%.1f'|format(cell.value) }} kWh{% endif %}</title>
+        </rect>
+        <text class="c-cal-num c-cal-num-{{ cell.level }}" x="{{ cell.x + cal.cell_size / 2 }}" y="{{ cell.y + cal.cell_size / 2 + 3.5 }}">{{ cell.day }}</text>
+      {% endfor %}
+    </svg>
+  {% endif %}
+{% endmacro %}
+
+{% macro stack(bars, caption='') %}
+  {% if bars.empty %}
+    <p class="chart-empty">Sem energia registada neste período.</p>
+  {% else %}
+    <svg class="chart" viewBox="0 0 {{ bars.width }} {{ bars.height }}" role="img" aria-label="{{ caption or 'Balanço energético' }}">
+      <line class="c-grid" x1="8" y1="{{ bars.baseline }}" x2="{{ bars.width - 8 }}" y2="{{ bars.baseline }}"/>
+      {% for seg in bars.segments %}
+        <rect class="c-seg c-s{{ seg.series }}" x="{{ '%.1f'|format(seg.x) }}" y="{{ '%.1f'|format(seg.y) }}"
+              width="{{ '%.1f'|format(seg.width) }}" height="{{ '%.1f'|format(seg.height) }}" rx="3" style="--d:{{ seg.delay }}s">
+          <title>{{ seg.label }}: {{ '%.0f'|format(seg.value) }} kWh ({{ '%.0f'|format(seg.share * 100) }} %)</title></rect>
+        {% if seg.show_label %}
+          <text class="c-seg-label" x="{{ '%.1f'|format(seg.x + seg.width / 2) }}" y="{{ '%.1f'|format(seg.y + seg.height / 2 + 4) }}">{{ '%.0f'|format(seg.share * 100) }} %</text>
+        {% endif %}
+      {% endfor %}
+      {% for x, name in bars.labels %}
+        <text class="c-axis-x" x="{{ '%.1f'|format(x) }}" y="{{ bars.baseline + 17 }}">{{ name }}</text>
+      {% endfor %}
+    </svg>
+  {% endif %}
+{% endmacro %}
+
+{% macro legend(items) %}
+  <div class="chart-legend">
+    {% for label, kind in items %}<span><i class="lg lg-{{ kind }}"></i>{{ label }}</span>{% endfor %}
+  </div>
+{% endmacro %}

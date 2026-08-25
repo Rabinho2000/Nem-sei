@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "macros/chart.html" as chart %}
 {#
   Bloco A: esta página era só de leitura. As rotas de escrita existiam e
   funcionavam -- POST /assets/<id>, /aliases e /mappings -- mas nenhuma tinha
@@ -18,6 +19,84 @@
   </div>
   <a class="button secondary" href="{{ url_for('assets.list_assets') }}">Voltar à lista</a>
 </header>
+
+
+{#
+  Fase 2: os gráficos. É a primeira coisa que se vê ao analisar uma
+  instalação, antes de qualquer formulário. Tudo SVG desenhado pelo servidor
+  a partir de web/charts.py, sem uma linha de JavaScript -- e nenhuma barra a
+  zero onde não houve leitura: um dia sem dados é um vazio tramado.
+#}
+<section class="kpis" aria-label="Resumo de produção">
+  <div class="kpi">
+    <small>Produção · {{ headline.window_days }} dias</small>
+    <b>{% if headline.total_kwh is none %}—{% else %}{{ "{:,.0f}".format(headline.total_kwh).replace(",", " ") }} <u>kWh</u>{% endif %}</b>
+    <div class="cov {{ '' if headline.coverage > 0.9 else 'partial' }}"><i style="--w:{{ (headline.coverage * 100)|round(0, 'floor') }}%"></i></div>
+    <span class="cov-txt">{{ headline.days_with_data }} de {{ headline.window_days }} dias com leitura</span>
+  </div>
+  <div class="kpi">
+    <small>Melhor dia</small>
+    <b>{% if headline.best_day is none %}—{% else %}{{ "%.1f"|format(headline.best_day) }} <u>kWh</u>{% endif %}</b>
+    {{ chart.spark(headline.spark) }}
+  </div>
+  <div class="kpi {{ 'noval' if headline.latest_fact_on is none else '' }}">
+    <small>Leitura mais recente</small>
+    <b>{% if headline.latest_fact_on %}{{ headline.latest_fact_on.strftime('%d/%m') }}{% else %}—{% endif %}</b>
+    {% if headline.stale_days is none %}
+      <div class="hatch"></div><span class="cov-txt">nunca houve leituras</span>
+    {% else %}
+      <div class="cov {{ '' if headline.stale_days <= 2 else 'partial' }}"><i style="--w:{{ 100 if headline.stale_days <= 2 else 30 }}%"></i></div>
+      <span class="cov-txt">{{ 'hoje' if headline.stale_days == 0 else ('há ' ~ headline.stale_days ~ ' dias') }}</span>
+    {% endif %}
+  </div>
+  <div class="kpi {{ 'noval' if balance.self_use_share is none else '' }}">
+    <small>Autoconsumo · mês</small>
+    <b>{% if balance.self_use_share is none %}—{% else %}{{ "%.0f"|format(balance.self_use_share * 100) }} <u>%</u>{% endif %}</b>
+    {% if balance.self_use_share is none %}<div class="hatch"></div><span class="cov-txt">sem produção registada este mês</span>
+    {% else %}<div class="cov"><i style="--w:{{ (balance.self_use_share * 100)|round(0, 'floor') }}%"></i></div><span class="cov-txt">do que produziu</span>{% endif %}
+  </div>
+  <div class="kpi noval">
+    <small>Esperado</small><b>—</b><div class="hatch"></div>
+    <span class="cov-txt">{% if confirmed_model %}modelo v{{ confirmed_model.version }} confirmado{% else %}modelo por carregar{% endif %}</span>
+  </div>
+</section>
+
+<section class="panel chart-panel">
+  <div class="chart-head">
+    <h3>Produção mensal · {{ monthly.months }} meses</h3>
+    <span class="meta">a barra fina por baixo é a fração de dias do mês que reportaram</span>
+  </div>
+  {{ chart.bars(monthly.chart, 'Produção mensal em kWh com a cobertura de dias') }}
+  {{ chart.legend([('Produção medida', '1'), ('Cobertura', 'cov'), ('Sem leituras', 'void')]) }}
+</section>
+
+<div class="content-grid two-columns">
+  <section class="panel chart-panel">
+    <div class="chart-head"><h3>Produção diária · {{ daily.days }} dias</h3><span class="meta">{{ daily.days_with_data }} dias com leitura</span></div>
+    {{ chart.bars(daily.chart, 'Produção diária em kWh') }}
+  </section>
+  <section class="panel chart-panel">
+    <div class="chart-head"><h3>Cobertura do mês</h3><span class="meta">{{ calendar_month.with_data }} de {{ calendar_month.days_in_month }} dias</span></div>
+    <div style="max-width:230px">{{ chart.calendar(calendar_month.calendar, 'Cobertura diária do mês corrente') }}</div>
+  </section>
+</div>
+
+<div class="content-grid two-columns">
+  <section class="panel chart-panel">
+    <div class="chart-head"><h3>Balanço energético · mês</h3><span class="meta">partes da própria coluna</span></div>
+    <div style="max-width:320px">{{ chart.stack(balance.stack, 'Produção e consumo repartidos') }}</div>
+    {{ chart.legend([('Autoconsumo', '1'), ('Injeção na rede', '2'), ('Importação da rede', '3')]) }}
+  </section>
+  <section class="panel">
+    <div class="panel-header"><div><p class="eyebrow">Energia</p><h2>Totais do mês</h2></div></div>
+    <dl class="detail-list">
+      {% for key, label in [('production_energy', 'Produção'), ('self_use_energy', 'Autoconsumo'), ('export_energy', 'Injeção na rede'), ('consumption_energy', 'Consumo'), ('grid_import_energy', 'Importação da rede')] %}
+        <div><dt>{{ label }}</dt><dd>{% if balance.metrics[key] %}{{ "{:,.0f}".format(balance.metrics[key]).replace(",", " ") }} kWh{% else %}<span class="muted">sem registo</span>{% endif %}</dd></div>
+      {% endfor %}
+    </dl>
+    <p class="provenance">Somados a partir da revisão actual de cada facto. Um valor corrigido substitui o anterior em vez de se somar a ele.</p>
+  </section>
+</div>
 
 <div class="content-grid two-columns detail-grid">
   <section class="panel">
