@@ -113,6 +113,14 @@ class Settings:
     production_sync_scheduler_enabled: bool = False
     production_sync_scheduler_interval_hours: int = 24
     production_sync_scheduler_connection_id: int | None = None
+    # Sigenergy's own account, own rate limits, own switch. Deliberately not
+    # folded into the FusionSolar settings above: the two share nothing --
+    # not the account, not the ownership broker, not the throttling -- and one
+    # flag governing both would make turning on the quiet one also turn on the
+    # contended one.
+    sigenergy_sync_scheduler_enabled: bool = False
+    sigenergy_sync_scheduler_interval_hours: int = 24
+    sigenergy_sync_scheduler_connection_id: int | None = None
     # M7 Fatia 5 / D1 (docs/v2/DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md): the
     # periodic diagnostic-incident evaluator. Off by default, same pattern as
     # every other recurring behaviour this codebase adds -- but unlike
@@ -180,6 +188,9 @@ class Settings:
             production_sync_scheduler_enabled=parse_bool(os.environ.get("NEMSEI_V2_PRODUCTION_SYNC_SCHEDULER_ENABLED"), default=False),
             production_sync_scheduler_interval_hours=int(os.environ.get("NEMSEI_V2_PRODUCTION_SYNC_SCHEDULER_INTERVAL_HOURS", "24")),
             production_sync_scheduler_connection_id=_optional_int(os.environ.get("NEMSEI_V2_PRODUCTION_SYNC_SCHEDULER_CONNECTION_ID")),
+            sigenergy_sync_scheduler_enabled=parse_bool(os.environ.get("NEMSEI_V2_SIGENERGY_SYNC_SCHEDULER_ENABLED"), default=False),
+            sigenergy_sync_scheduler_interval_hours=int(os.environ.get("NEMSEI_V2_SIGENERGY_SYNC_SCHEDULER_INTERVAL_HOURS", "24")),
+            sigenergy_sync_scheduler_connection_id=_optional_int(os.environ.get("NEMSEI_V2_SIGENERGY_SYNC_SCHEDULER_CONNECTION_ID")),
             diagnostic_incident_evaluation_enabled=parse_bool(
                 os.environ.get("NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED"), default=False
             ),

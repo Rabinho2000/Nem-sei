@@ -10,6 +10,9 @@ from nemsei.config import Settings
 from nemsei.diagnostics.incidents import evaluate_and_persist_incidents
 from nemsei.integrations.fusionsolar.device_status import FusionSolarDeviceStatusService
 from nemsei.integrations.fusionsolar.production import FusionSolarProductionService
+from nemsei.integrations.sigenergy.production import SigenergyProductionService
+from nemsei.providers.models import ProviderConnection
+from nemsei.providers.registry import ProviderCode
 from nemsei.integrations.fusionsolar.session_cache import default_session_cache
 from nemsei.jobs.repository import ClaimedJob
 from nemsei.notifications.digests import deliver_digest, generate_digest
@@ -72,6 +75,22 @@ def _date(payload: dict[str, Any], key: str, *, required: bool = False) -> date 
         raise ValueError(f"Production job {key} is invalid.") from exc
 
 
+def _execute_sigenergy_production(job: ClaimedJob, connection_id: int, *, settings: Settings, session_factory: sessionmaker[Session]) -> JobOutcome:
+    """Sigenergy has no reconciliation or backfill modes yet; only incremental.
+
+    Refusing the other two loudly is better than quietly treating them as
+    incremental, which would make a backfill request look like it succeeded
+    while covering a completely different window.
+    """
+    if job.job_type != "production.incremental":
+        raise ValueError(f"Sigenergy production supports only production.incremental, not {job.job_type}.")
+    result = SigenergyProductionService(session_factory, settings).sync_incremental(connection_id)
+    return JobOutcome(
+        status="success" if result.status in ("success", "partial") else "failed",
+        result={"mode": "daily_history", "result_status": result.status, "facts_written": result.facts_written},
+    )
+
+
 def _execute_production(job: ClaimedJob, *, settings: Settings, session_factory: sessionmaker[Session]) -> JobOutcome:
     connection_id = job.payload.get("connection_id")
     if not isinstance(connection_id, int) or connection_id <= 0:
@@ -82,6 +101,16 @@ def _execute_production(job: ClaimedJob, *, settings: Settings, session_factory:
     # docs/v2/FUSIONSOLAR_OWNERSHIP_WINDOW.md's rollout write-up for why --
     # 13 logins from a handful of test syncs tripped the provider's own
     # login rate limit before this existed).
+    # Which provider this connection belongs to decides the service. Before
+    # this the FusionSolar service was built unconditionally, so a production
+    # job for any other provider was answered with "Connection is not
+    # FusionSolar" -- the Sigenergy service could never have run at all.
+    with session_factory() as session:
+        connection = session.get(ProviderConnection, connection_id)
+        provider_code = connection.provider_code if connection else None
+    if provider_code == ProviderCode.SIGENERGY.value:
+        return _execute_sigenergy_production(job, connection_id, settings=settings, session_factory=session_factory)
+
     service = FusionSolarProductionService(session_factory, settings, session_cache=default_session_cache())
     if job.job_type == "production.incremental":
         result = service.sync_incremental(connection_id, start_date=_date(job.payload, "start_date"), end_date=_date(job.payload, "end_date"))

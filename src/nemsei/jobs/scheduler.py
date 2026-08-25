@@ -45,6 +45,14 @@ class Scheduler:
                 interval_hours=self.settings.production_sync_scheduler_interval_hours,
             )
             created = created or production_created
+        # Sigenergy, same shape and same restraint: off by default, one
+        # explicit connection, never a loop over every Sigenergy connection.
+        if self.settings.sigenergy_sync_scheduler_enabled and self.settings.sigenergy_sync_scheduler_connection_id is not None:
+            _sigen_job, sigen_created = self.repository.enqueue_due_production_incremental(
+                connection_id=self.settings.sigenergy_sync_scheduler_connection_id,
+                interval_hours=self.settings.sigenergy_sync_scheduler_interval_hours,
+            )
+            created = created or sigen_created
         # D1: off by default, no connection id or cap needed -- this evaluates
         # every asset from already-persisted facts, never calls a provider.
         if self.settings.diagnostic_incident_evaluation_enabled:

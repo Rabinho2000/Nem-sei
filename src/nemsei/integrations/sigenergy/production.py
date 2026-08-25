@@ -39,6 +39,7 @@ from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from nemsei.config import Settings
@@ -50,9 +51,10 @@ from nemsei.providers.errors import ProviderError, ProviderErrorCode
 from nemsei.providers.models import AssetProviderMapping
 from nemsei.providers.registry import ProviderCapability, ProviderCode
 from nemsei.providers.repository import ProviderRepository
+from nemsei.shared.clock import utc_now
 from nemsei.sources.service import resolve_source_policy
-from nemsei.sync.models import SyncRun
-from nemsei.sync.service import finish_sync_run, health_values_for_error, record_health, start_sync_run
+from nemsei.sync.models import SyncCursor, SyncRun
+from nemsei.sync.service import advance_cursor, finish_sync_run, health_values_for_error, record_health, start_sync_run
 
 # target metric -> (preferred payload field, legacy payload field)
 FIELD_MAP: dict[str, tuple[str, str]] = {
@@ -68,6 +70,7 @@ BATTERY_FIELDS: dict[str, tuple[str, str]] = {
     "battery_discharge_kwh": ("esDischargingKwh", "esDischarging"),
 }
 CORE_METRICS = tuple(FIELD_MAP)
+_CURSOR_KEY = "sigenergy-daily-production"
 
 
 class SigenergyHistoryUnitError(ValueError):
@@ -160,6 +163,36 @@ class SigenergyProductionService:
         )
         self._calls = SigenergyRequestController(session_factory)
 
+    def sync_incremental(self, connection_id: int, *, max_days: int = 7) -> SigenergyProductionResult:
+        """Resume from wherever the cursor got to, bounded.
+
+        The cursor is this provider's own (`sigenergy-daily-production`) and
+        advances only on a clean run, the same conservative rule FusionSolar
+        uses: replaying a completed day is safe because the facts are keyed
+        idempotently, while skipping one is not recoverable without noticing.
+
+        `max_days` is a safety bound, not a budget. Unlike FusionSolar's
+        31-day cap this one does **not** refuse when the gap is larger -- it
+        takes the oldest `max_days` and leaves the rest for the next tick,
+        because a cap that refuses is a cap that gets stuck the moment the gap
+        outgrows it, which is exactly the trap FusionSolar fell into.
+        """
+        today = utc_now().date()
+        with self._sessions() as session:
+            cursor = session.scalar(
+                select(SyncCursor).where(
+                    SyncCursor.provider_connection_id == connection_id,
+                    SyncCursor.capability == ProviderCapability.PRODUCTION_HISTORY.value,
+                    SyncCursor.cursor_key == _CURSOR_KEY,
+                )
+            )
+            last_day = (cursor.checkpoint_json or {}).get("last_completed_day") if cursor else None
+        start = date.fromisoformat(last_day) + timedelta(days=1) if isinstance(last_day, str) else today - timedelta(days=1)
+        if start > today:
+            start = today
+        end = min(today, start + timedelta(days=max_days - 1))
+        return self.sync_daily_production(connection_id, start_date=start, end_date=end)
+
     def sync_daily_production(
         self, connection_id: int, *, start_date: date, end_date: date
     ) -> SigenergyProductionResult:
@@ -217,7 +250,23 @@ class SigenergyProductionService:
                 accepted += 1
         status_error = None if accepted else (last_error or ProviderError(ProviderErrorCode.INVALID_RESPONSE, "Sigenergy history returned nothing usable."))
         partial = bool(last_error) and accepted > 0
-        return self._finish(run_id, connection_id, len(days), accepted, written, calls, status_error, partial=partial, timezone_name=contract.source_timezone_name)
+        result = self._finish(run_id, connection_id, len(days), accepted, written, calls, status_error, partial=partial, timezone_name=contract.source_timezone_name)
+        if result.status == "success":
+            self._advance_cursor(run_id, end_date, contract)
+        return result
+
+    def _advance_cursor(self, run_id: int, covered_through: date, contract: Any) -> None:
+        """Only on a clean run: a partial day must be re-read, never skipped."""
+        with self._sessions() as session:
+            run = session.get(SyncRun, run_id)
+            advance_cursor(
+                session,
+                run=run,
+                cursor_key=_CURSOR_KEY,
+                checkpoint={"last_completed_day": covered_through.isoformat(), "source_timezone": contract.source_timezone_name},
+                covered_through=datetime.combine(covered_through + timedelta(days=1), time.min, tzinfo=contract.source_timezone),
+            )
+            session.commit()
 
     def _persist(self, mapping: AssetProviderMapping, source_day: date, parsed: ParsedDay, contract: Any, run_id: int) -> int:
         """One fact per metric, keyed so a re-read of the same day is idempotent."""

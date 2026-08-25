@@ -86,6 +86,11 @@ x-v2-sigenergy-environment: &v2-sigenergy-environment
   # recusa-se a correr, em vez de adivinhar como o V1 faz.
   NEMSEI_V2_SIGENERGY_PRIMARY_PRODUCTION_TIMEZONE: Europe/Lisbon
   NEMSEI_V2_SIGENERGY_PRIMARY_PRODUCTION_UNIT: kWh
+  # Agendamento proprio: conta separada, limites separados, interruptor
+  # separado. Ligacao 5 (sigen-live). Um so sistema activo hoje, porque os
+  # outros dois nunca foram aprovados pelo cliente no onboarding do V1.
+  NEMSEI_V2_SIGENERGY_SYNC_SCHEDULER_ENABLED: "true"
+  NEMSEI_V2_SIGENERGY_SYNC_SCHEDULER_CONNECTION_ID: "5"
 
 x-v2-notification-environment: &v2-notification-environment
   NEMSEI_V2_TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_bot_token
