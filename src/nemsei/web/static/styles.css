@@ -480,3 +480,17 @@ a.status-badge:hover, a.status-badge:focus-visible { text-decoration: underline;
 @keyframes c-fade { to { opacity: 1; } }
 @keyframes c-pop { from { opacity: 0; transform: scale(0.85); transform-box: fill-box; transform-origin: center; } to { opacity: 1; transform: scale(1); } }
 .danger-figure { color: var(--danger); }
+
+/* Painel operacional: triagem. O normal nao tem cor (ISA-101). */
+.triage { display: grid; grid-template-columns: repeat(auto-fit, minmax(146px, 1fr)); gap: 10px; margin-bottom: 20px; }
+.tri { display: block; padding: 13px 15px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); position: relative; overflow: hidden; box-shadow: var(--shadow); }
+.tri::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--line-strong); }
+.tri.crit::before { background: var(--danger-mark); }
+.tri.warn::before { background: var(--warning-mark); }
+.tri.void::before { background: repeating-linear-gradient(45deg, var(--line-strong) 0 3px, transparent 3px 6px); }
+.tri:hover, .tri:focus-visible { border-color: var(--brand); outline: 3px solid var(--brand-soft); }
+.tri small { display: block; font-size: 0.68rem; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.tri b { display: block; font-size: 1.75rem; font-weight: 800; letter-spacing: -0.04em; line-height: 1.15; margin-top: 3px; }
+.tri.crit b { color: var(--danger); }
+.tri.warn b { color: var(--warning); }
+.tri em { display: block; font-style: normal; font-size: 0.73rem; color: var(--muted); }

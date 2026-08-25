@@ -1,40 +1,119 @@
 {% extends "base.html" %}
+{% import "macros/chart.html" as chart %}
+{#
+  O painel operacional. Substitui três contagens de linhas da base de dados
+  que não respondiam a pergunta nenhuma — e a primeira das quais era
+  precisamente o número que as regras deste código dizem que nunca deve ser
+  lido em bruto, porque os factos são append-only.
+
+  Regra emprestada às salas de controlo: o estado normal não tem cor. Um
+  portfolio calmo tem de parecer calmo.
+#}
 {% block content %}
 <header class="page-header">
-  <div><p class="eyebrow">Operação</p><h1>Visão geral</h1><p class="page-intro">Uma leitura rápida do portfólio, das ligações e do que precisa de revisão.</p></div>
+  <div>
+    <p class="eyebrow">Operação</p>
+    <h1>Painel</h1>
+    <p class="page-intro">
+      {% if panel.last_run %}
+        Última sincronização {{ panel.last_run.started_at.strftime('%d/%m às %H:%M') }} · {{ panel.runs_delivered }} de {{ panel.runs_last_day }} execuções entregaram nas últimas 24 h.
+      {% else %}
+        Ainda não houve nenhuma sincronização.
+      {% endif %}
+    </p>
+  </div>
   <a class="button primary" href="{{ url_for('assets.list_assets') }}">Ver centrais <span aria-hidden="true">→</span></a>
 </header>
 
-<section class="metric-grid" aria-label="Resumo do portfólio">
-  <a class="metric-card" href="{{ url_for('assets.list_assets') }}"><span class="metric-label">Centrais</span><strong>{{ dashboard.counts.assets }}</strong><span class="metric-hint">No portfólio V2</span></a>
-  <a class="metric-card" href="{{ url_for('assets.organizations') }}"><span class="metric-label">Organizações</span><strong>{{ dashboard.counts.organizations }}</strong><span class="metric-hint">Entidades importadas</span></a>
-  <a class="metric-card" href="{{ url_for('assets.provider_connections') }}"><span class="metric-label">Ligações provider</span><strong>{{ dashboard.counts.connections }}</strong><span class="metric-hint">Sem ativar integrações</span></a>
-  <a class="metric-card" href="{{ url_for('assets.list_assets', mapping='present') }}"><span class="metric-label">Mapeamentos</span><strong>{{ dashboard.counts.mappings }}</strong><span class="metric-hint">Relações importadas</span></a>
+<section class="triage" aria-label="O que precisa de atenção">
+  <a class="tri {{ 'crit' if panel.critical else '' }}" href="{{ url_for('diagnostics.incidents') }}">
+    <small>Crítico</small><b>{{ panel.critical }}</b>
+    <em>{{ 'nada parado agora' if not panel.critical else 'incidentes críticos abertos' }}</em>
+  </a>
+  <a class="tri {{ 'warn' if panel.warning else '' }}" href="{{ url_for('diagnostics.incidents', handling='untouched') }}">
+    <small>Aviso</small><b>{{ panel.warning }}</b>
+    <em>{{ panel.untouched_incidents }} por triar</em>
+  </a>
+  <a class="tri {{ 'void' if panel.silent_assets else '' }}" href="{{ url_for('assets.list_assets') }}">
+    <small>Sem leitura recente</small><b>{{ panel.silent_assets }}</b>
+    <em>de {{ panel.total_assets }} centrais</em>
+  </a>
+  <a class="tri" href="{{ url_for('assets.list_assets', mapping='present') }}">
+    <small>A reportar</small><b>{{ panel.reporting_recently }}</b>
+    <em>nos últimos 2 dias</em>
+  </a>
+  <a class="tri {{ 'void' if panel.unmapped_assets else '' }}" href="{{ url_for('assets.list_assets', mapping='absent') }}">
+    <small>Sem provider</small><b>{{ panel.unmapped_assets }}</b>
+    <em>nunca foram ligadas</em>
+  </a>
+  <a class="tri {{ 'warn' if panel.needs_review else '' }}" href="{{ url_for('assets.list_assets', needs_review='yes') }}">
+    <small>Por rever</small><b>{{ panel.needs_review }}</b>
+    <em>{{ panel.pending_mappings }} mappings pendentes</em>
+  </a>
+</section>
+
+<section class="panel chart-panel">
+  <div class="chart-head">
+    <h3>Produção do portfolio · {{ portfolio.months }} meses</h3>
+    <span class="meta">MWh · a barra fina é quantas das {{ portfolio.total_assets }} centrais reportaram</span>
+  </div>
+  {{ chart.bars(portfolio.chart, 'Produção mensal do portfolio em MWh com a cobertura de centrais') }}
+  {{ chart.legend([('Produção medida', '1'), ('Cobertura', 'cov'), ('Sem leituras', 'void')]) }}
+  <p class="panel-foot muted">Uma quebra na barra grossa acompanhada de uma quebra na barra fina é um buraco de recolha, não uma quebra de produção. É a distinção que este gráfico existe para tornar impossível de confundir.</p>
+</section>
+
+<section class="panel">
+  <div class="panel-header">
+    <div><p class="eyebrow">Prioridade</p><h2>Precisa de atenção</h2></div>
+    <a class="text-link" href="{{ url_for('diagnostics.index') }}">Ver diagnóstico <span aria-hidden="true">→</span></a>
+  </div>
+  {% if panel.attention %}
+    <div class="table-scroll">
+      <table class="data-table">
+        <thead><tr><th>Instalação</th><th>Cliente</th><th class="num">Potência</th><th>Porquê</th><th class="num">Última leitura</th></tr></thead>
+        <tbody>
+          {% for row in panel.attention %}
+            <tr class="{{ 'row-attention' if row.critical else '' }}">
+              <th scope="row"><a class="table-primary" href="{{ url_for('assets.asset_detail', asset_id=row.asset.id) }}">{{ row.asset.canonical_name }}</a></th>
+              <td class="muted">{{ row.organization_name or '—' }}</td>
+              <td class="num">{{ ('%.0f kWp'|format(row.power_kw)) if row.power_kw else '—' }}</td>
+              <td>
+                {% if row.critical %}<span class="status-badge danger">{{ row.critical }} crítico{{ 's' if row.critical != 1 else '' }}</span>{% endif %}
+                {% if row.unmapped %}<span class="status-badge warning">sem provider</span>{% endif %}
+                {% if row.never_reported and not row.unmapped %}<span class="status-badge warning">nunca reportou</span>{% endif %}
+                {% if row.warning and not row.critical %}<span class="status-badge muted">{{ row.warning }} aviso{{ 's' if row.warning != 1 else '' }}</span>{% endif %}
+              </td>
+              <td class="num">{% if row.stale_days is none %}<span class="muted">—</span>{% else %}há {{ row.stale_days }} dias{% endif %}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% else %}
+    <div class="empty-state positive"><strong>Nada precisa de atenção.</strong><p>Sem incidentes críticos, sem centrais desligadas e sem leituras em atraso.</p></div>
+  {% endif %}
 </section>
 
 <div class="content-grid two-columns">
   <section class="panel">
-    <div class="panel-header"><div><p class="eyebrow">Qualidade dos dados</p><h2>O que precisa de atenção</h2></div><a class="text-link" href="{{ url_for('reconciliation.index') }}">Ver revisão <span aria-hidden="true">→</span></a></div>
-    <div class="review-list">
-      <a class="review-row" href="{{ url_for('assets.list_assets', needs_review='yes') }}"><span class="status-marker warning" aria-hidden="true">!</span><span><strong>Centrais com revisão</strong><small>Registos importados com evidência para verificar</small></span><b>{{ dashboard.review.assets_needs_review }}</b></a>
-      <a class="review-row" href="{{ url_for('reconciliation.index') }}"><span class="status-marker warning" aria-hidden="true">!</span><span><strong>Mappings pendentes</strong><small>Relações provider ainda não confirmadas</small></span><b>{{ dashboard.review.mappings_pending_review }}</b></a>
-      <a class="review-row" href="{{ url_for('reconciliation.index') }}"><span class="status-marker muted" aria-hidden="true">i</span><span><strong>Evidência legacy não resolvida</strong><small>Quarantined, unresolved e conflitos do import</small></span><b>{{ dashboard.review.quarantined + dashboard.review.unresolved + dashboard.review.conflicts }}</b></a>
-    </div>
-  </section>
-  <section class="panel">
-    <div class="panel-header"><div><p class="eyebrow">Integrações</p><h2>Ligações provider</h2></div><a class="text-link" href="{{ url_for('assets.provider_connections') }}">Ver ligações <span aria-hidden="true">→</span></a></div>
+    <div class="panel-header"><div><p class="eyebrow">Integrações</p><h2>Ligações provider</h2></div><a class="text-link" href="{{ url_for('system.index') }}">Estado do sistema <span aria-hidden="true">→</span></a></div>
     <div class="connection-list">
       {% for connection in dashboard.connections %}
         <div class="connection-row"><span class="provider-avatar">{{ connection.provider[0] }}</span><span><strong>{{ connection.provider }}</strong><small>{{ connection.display_name }}</small></span><span class="status-badge {{ connection.state_tone }}">{{ connection.state_label }}</span><span class="connection-count">{{ connection.mapping_count }} mappings</span></div>
       {% else %}<p class="empty-state">Ainda não existem ligações provider.</p>{% endfor %}
     </div>
   </section>
+  <section class="panel system-panel">
+    <div class="panel-header"><div><p class="eyebrow">Estado do sistema</p><h2>Monitorização e produção</h2></div><span class="status-badge muted">Somente dados confirmados</span></div>
+    {% if dashboard.monitoring_observations or dashboard.production_facts or dashboard.sync_runs %}
+      <div class="system-grid">
+        <div><strong>{{ panel.mapped_assets }}</strong><span>centrais ligadas a um provider</span></div>
+        <div><strong>{{ panel.reporting_recently }}</strong><span>com leitura nos últimos 2 dias</span></div>
+        <div><strong>{{ dashboard.sync_runs }}</strong><span>execuções de sincronização</span></div>
+      </div>
+    {% else %}
+      <div class="honest-empty"><span class="empty-icon" aria-hidden="true">—</span><div><strong>A monitorização ainda não foi ativada.</strong><p>Não existem observações, produção ou sincronizações confirmadas no V2.</p></div></div>
+    {% endif %}
+  </section>
 </div>
-
-<section class="panel system-panel">
-  <div class="panel-header"><div><p class="eyebrow">Estado do sistema</p><h2>Monitorização e produção</h2></div><span class="status-badge muted">Somente dados confirmados</span></div>
-  {% if dashboard.monitoring_observations or dashboard.production_facts or dashboard.sync_runs %}
-    <div class="system-grid"><div><strong>{{ dashboard.monitoring_observations }}</strong><span>observações de monitorização</span></div><div><strong>{{ dashboard.production_facts }}</strong><span>factos de produção</span></div><div><strong>{{ dashboard.sync_runs }}</strong><span>execuções de sincronização</span></div></div>
-  {% else %}<div class="honest-empty"><span class="empty-icon" aria-hidden="true">—</span><div><strong>A monitorização ainda não foi ativada.</strong><p>Não existem observações, produção ou sincronizações confirmadas no V2.</p></div></div>{% endif %}
-</section>
 {% endblock %}

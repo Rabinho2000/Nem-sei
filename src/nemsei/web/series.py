@@ -20,6 +20,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from nemsei.assets.models import Asset
 from nemsei.monitoring.models import ProductionFact
 from nemsei.monitoring.repository import CanonicalFactRepository
 from nemsei.shared.clock import utc_now
@@ -180,3 +181,74 @@ def headline(session: Session, *, asset_id: int, days: int = 30) -> dict[str, An
         "latest_fact_on": newest.astimezone(timezone.utc).date() if newest else None,
         "stale_days": (today - newest.astimezone(timezone.utc).date()).days if newest else None,
     }
+
+
+def portfolio_monthly_series(session: Session, *, months: int = 12, total_assets: int | None = None) -> dict[str, Any]:
+    """Monthly production across the whole portfolio, with how much of it reported.
+
+    One query rather than 266, but the same reduction: `DISTINCT ON
+    (provider_mapping_id, source_fact_key) ... ORDER BY source_revision DESC`
+    is exactly what `current_production_facts_for_asset` does per asset, and
+    skipping it here would add every corrected value to the value it replaced.
+
+    Coverage is installations reporting over installations that exist, which is
+    the honest denominator: a month where 2 of 266 plants reported is not a
+    collapse in production, and the chart has to be able to say that.
+    """
+    today = utc_now().date()
+    first = date(today.year, today.month, 1)
+    starts: list[date] = []
+    cursor = first
+    for _ in range(months):
+        starts.append(cursor)
+        cursor = date(cursor.year - 1, 12, 1) if cursor.month == 1 else date(cursor.year, cursor.month - 1, 1)
+    starts.reverse()
+
+    current = (
+        select(
+            ProductionFact.asset_id,
+            ProductionFact.period_start,
+            ProductionFact.value,
+        )
+        .where(
+            ProductionFact.metric_kind == "production_energy",
+            ProductionFact.period_start >= _moment(starts[0]),
+        )
+        .distinct(ProductionFact.provider_mapping_id, ProductionFact.source_fact_key)
+        .order_by(
+            ProductionFact.provider_mapping_id,
+            ProductionFact.source_fact_key,
+            ProductionFact.source_revision.desc(),
+        )
+        .subquery()
+    )
+    bucket = func.date_trunc("month", current.c.period_start).label("bucket")
+    rows = session.execute(
+        select(bucket, func.sum(current.c.value), func.count(func.distinct(current.c.asset_id)))
+        .where(current.c.value.isnot(None))
+        .group_by(bucket)
+    ).all()
+    by_month = {
+        (row[0].astimezone(timezone.utc).year, row[0].astimezone(timezone.utc).month): (float(row[1] or 0), int(row[2]))
+        for row in rows
+    }
+
+    if total_assets is None:
+        total_assets = int(session.scalar(select(func.count(Asset.id))) or 0)
+    names = ("Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez")
+    points = []
+    for month_start in starts:
+        total, reporting = by_month.get((month_start.year, month_start.month), (None, 0))
+        points.append(
+            Point(
+                label=names[month_start.month - 1],
+                value=(total / 1000.0) if total is not None else None,
+                coverage=(reporting / total_assets) if total_assets else 0.0,
+                hint=(
+                    f"{names[month_start.month - 1]} {month_start.year}: "
+                    + (f"{total / 1000.0:.1f} MWh" if total is not None else "sem leituras")
+                    + f" · {reporting} de {total_assets} centrais"
+                ),
+            )
+        )
+    return {"chart": bar_chart(points, unit="MWh"), "total_assets": total_assets, "months": months}
