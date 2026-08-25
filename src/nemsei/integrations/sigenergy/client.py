@@ -9,7 +9,7 @@ from __future__ import annotations
 import base64
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
@@ -32,6 +32,9 @@ class SigenergyEndpoints:
     systems_endpoint: str
     energy_flow_endpoint: str
     region: str
+    # Daily history. Defaulted rather than required so an existing connection
+    # configured before production history existed keeps working unchanged.
+    history_endpoint: str = "/openapi/systems/{system_id}/history"
 
 
 @dataclass(frozen=True)
@@ -150,11 +153,31 @@ class SigenergyClient:
             raise SigenergyClientError(ProviderError(ProviderErrorCode.INVALID_RESPONSE, "Sigenergy energy-flow response is invalid."))
         return data
 
+    def get_system_history(self, system_id: str, *, target_date: date, level: str = "Day") -> dict[str, Any]:
+        """One day of cumulative energy counters for one system.
+
+        The contract is V1's, derived from its working implementation rather
+        than from documentation: `GET .../history?level=Day&date=YYYY-MM-DD`.
+        What the provider means by that date is *not* settled here -- the
+        caller supplies a day already resolved in an operator-verified source
+        timezone, the same discipline FusionSolar's daily read follows.
+        """
+        identifier = system_id.strip()
+        if not identifier:
+            raise SigenergyClientError(ProviderError(ProviderErrorCode.CONFIGURATION, "Sigenergy system identifier is required."))
+        endpoint = self.endpoints.history_endpoint.replace("{systemId}", identifier).replace("{system_id}", identifier)
+        response = self._request("GET", endpoint, params={"level": level, "date": target_date.isoformat()})
+        data = _response_data(response.payload)
+        if not isinstance(data, dict):
+            raise SigenergyClientError(ProviderError(ProviderErrorCode.INVALID_RESPONSE, "Sigenergy history response is invalid."))
+        return data
+
     def _request(
         self,
         method: str,
         endpoint: str,
         *,
+        params: dict[str, Any] | None = None,
         json_payload: dict[str, Any] | None = None,
         authenticated: bool = True,
     ) -> SigenergyHttpResponse:
@@ -168,7 +191,7 @@ class SigenergyClient:
         response = self.transport.request(
             method,
             _url(self.endpoints.base_url, endpoint),
-            params=None,
+            params=params,
             headers=headers,
             json_payload=json_payload,
             timeout_seconds=self.timeout_seconds,

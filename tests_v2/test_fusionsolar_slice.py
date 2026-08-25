@@ -86,9 +86,21 @@ def test_live_implemented_capabilities_are_narrow_and_runtime_availability_is_se
             assert status.runtime_availability is RuntimeAvailability.AVAILABLE
         else:
             assert status.implementation_support is ImplementationSupport.UNSUPPORTED
-    for capability in {ProviderCapability.CONNECTION_VALIDATION, ProviderCapability.DISCOVERY, ProviderCapability.CURRENT_MONITORING}:
+    # The cross-provider half of this test: the two providers are not the same
+    # shape, and this is where that stays visible.
+    for capability in {
+        ProviderCapability.CONNECTION_VALIDATION,
+        ProviderCapability.DISCOVERY,
+        ProviderCapability.CURRENT_MONITORING,
+        # Sigenergy gained production history on 2026-08-25, after its day and
+        # unit contract was verified against the live API.
+        ProviderCapability.PRODUCTION_HISTORY,
+    }:
         assert evaluate_capability(ProviderCode.SIGENERGY, capability, connection_configured=True).implementation_support is ImplementationSupport.SUPPORTED
-    assert evaluate_capability(ProviderCode.SIGENERGY, ProviderCapability.PRODUCTION_HISTORY, connection_configured=True).implementation_support is ImplementationSupport.UNSUPPORTED
+    # Device level stays the real difference: V1 never called a Sigenergy
+    # device endpoint at all, so there is nothing to audit a contract against.
+    for capability in {ProviderCapability.DEVICE_DISCOVERY, ProviderCapability.DEVICE_MONITORING}:
+        assert evaluate_capability(ProviderCode.SIGENERGY, capability, connection_configured=True).implementation_support is ImplementationSupport.UNSUPPORTED
 
 
 def test_discovery_paginates_deduplicates_and_reconciles_without_creating_assets(settings, monkeypatch):

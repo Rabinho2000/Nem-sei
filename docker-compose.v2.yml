@@ -77,6 +77,15 @@ x-v2-sigenergy-environment: &v2-sigenergy-environment
   NEMSEI_V2_SIGENERGY_PRIMARY_SYSTEMS_ENDPOINT: /openapi/system/list
   NEMSEI_V2_SIGENERGY_PRIMARY_ENERGY_FLOW_ENDPOINT: /openapi/systems/{system_id}/energyFlow
   NEMSEI_V2_SIGENERGY_PRIMARY_REGION: eu
+  # Contrato de producao verificado em 2026-08-25 contra a API real, nao
+  # assumido: os dias 2026-08-18, 08-17 e 08-14 devolveram 636.87, 686.44 e
+  # 236.89 kWh, exactamente os valores que o V1 tinha registado para esses
+  # dias -- tres em tres, incluindo um dia anomalo baixo. O balanco tambem
+  # fecha: autoconsumo 411.28 + injeccao 225.60 = 636.88, a producao a menos
+  # de um centimo de arredondamento. Sem estas duas variaveis o servico
+  # recusa-se a correr, em vez de adivinhar como o V1 faz.
+  NEMSEI_V2_SIGENERGY_PRIMARY_PRODUCTION_TIMEZONE: Europe/Lisbon
+  NEMSEI_V2_SIGENERGY_PRIMARY_PRODUCTION_UNIT: kWh
 
 x-v2-notification-environment: &v2-notification-environment
   NEMSEI_V2_TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_bot_token

@@ -92,6 +92,14 @@ _DESCRIPTORS = {
             ProviderCapability.CONNECTION_VALIDATION,
             ProviderCapability.DISCOVERY,
             ProviderCapability.CURRENT_MONITORING,
+            # Added 2026-08-25. The wire contract is V1's own working
+            # implementation (services/sigenergy_history.py), not documentation:
+            # GET /openapi/systems/{id}/history?level=Day&date=YYYY-MM-DD.
+            # V2 additionally refuses to run without an operator-verified
+            # source timezone and kWh unit for the account, because V1 sends
+            # the server's own date and has never checked what the provider
+            # means by it. See integrations/sigenergy/production.py.
+            ProviderCapability.PRODUCTION_HISTORY,
             # Deliberately absent: V1 never called a Sigenergy device/inverter
             # endpoint (0 provider_devices rows, 0 device_realtime_snapshots
             # rows for provider='Sigenergy'), and V1's own API docs list

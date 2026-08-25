@@ -89,7 +89,15 @@ def monitoring_service(factory, settings, transport):
 
 
 def test_sigenergy_registry_support_is_narrow_and_runtime_is_separate():
-    supported = {ProviderCapability.CONNECTION_VALIDATION, ProviderCapability.DISCOVERY, ProviderCapability.CURRENT_MONITORING}
+    # PRODUCTION_HISTORY joined on 2026-08-25 after its contract was verified
+    # against the live API; device-level capabilities stay absent because V1
+    # never called a Sigenergy device endpoint at all.
+    supported = {
+        ProviderCapability.CONNECTION_VALIDATION,
+        ProviderCapability.DISCOVERY,
+        ProviderCapability.CURRENT_MONITORING,
+        ProviderCapability.PRODUCTION_HISTORY,
+    }
     for capability in ProviderCapability:
         status = evaluate_capability(ProviderCode.SIGENERGY, capability, connection_configured=True)
         if capability in supported:
@@ -369,6 +377,38 @@ def test_discovery_identifier_requires_stable_system_id():
         plant_from_payload(1, {"systemName": "no id"})
 
 
-def test_production_remains_unsupported_until_day_and_unit_contract_is_verified():
+def test_production_is_supported_now_that_the_day_and_unit_contract_is_verified():
+    """The bar this test's previous name set has been cleared, on 2026-08-25.
+
+    The wire contract came from V1's own working implementation, and was then
+    checked against the live API: 2026-08-18, 08-17 and 08-14 returned 636.87,
+    686.44 and 236.89 kWh, exactly the values V1 had recorded for those days --
+    three of three, including one anomalously low day. The balance closes too:
+    self-use 411.28 + export 225.60 is production to within a rounding cent.
+
+    What replaces the old guard is the one below: support in the registry is
+    not permission to guess, and the service still refuses to run without an
+    operator-verified timezone and unit for the account.
+    """
     status = evaluate_capability(ProviderCode.SIGENERGY, ProviderCapability.PRODUCTION_HISTORY, connection_configured=True)
-    assert status.implementation_support is ImplementationSupport.UNSUPPORTED
+    assert status.implementation_support is ImplementationSupport.SUPPORTED
+
+
+def test_production_still_refuses_to_run_without_a_verified_contract(monkeypatch):
+    """Registry support says the code exists, never that the account is verified."""
+    from nemsei.integrations.sigenergy.client import SigenergyClientError
+    from nemsei.integrations.sigenergy.service import production_contract_for
+    from nemsei.providers.models import ProviderConnection
+
+    connection = ProviderConnection(provider_code="sigenergy", connection_key="k", display_name="k", credential_reference="ref")
+    for name in ("NEMSEI_V2_SIGENERGY_REF_PRODUCTION_TIMEZONE", "NEMSEI_V2_SIGENERGY_REF_PRODUCTION_UNIT"):
+        monkeypatch.delenv(name, raising=False)
+
+    with pytest.raises(SigenergyClientError):
+        production_contract_for(connection)
+
+    # A stated unit that is not kWh is refused just as loudly as a missing one.
+    monkeypatch.setenv("NEMSEI_V2_SIGENERGY_REF_PRODUCTION_TIMEZONE", "Europe/Lisbon")
+    monkeypatch.setenv("NEMSEI_V2_SIGENERGY_REF_PRODUCTION_UNIT", "Wh")
+    with pytest.raises(SigenergyClientError):
+        production_contract_for(connection)
