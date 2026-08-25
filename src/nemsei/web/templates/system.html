@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+{#
+  Bloco F: se um provider está a recusar, isto tem de se ver aqui e não no
+  psql. Um operador que não sabe que a ligação está degradada lê um gráfico
+  vazio como uma central parada — que é o pior engano que este produto pode
+  causar.
+#}
+{% set status_labels = {'success':'sucesso','partial':'parcial','failed':'falhou','rate_limited':'limite de chamadas','deferred':'adiado','running':'a correr','pending':'pendente'} %}
+{% set state_labels = {'healthy':'saudável','degraded':'degradado','unavailable':'indisponível','not_configured':'não configurado','unknown':'desconhecido'} %}
+{% block content %}
+<header class="page-header">
+  <div><p class="eyebrow">Configuração</p><h1>Estado do sistema</h1><p class="page-intro">Se a plataforma não está a receber dados, a razão está nesta página.</p></div>
+</header>
+
+<section class="kpis">
+  <div class="kpi"><small>Sincronizações · {{ window_hours }} h</small><b>{{ runs_attempted }}</b><span class="cov-txt">tentativas registadas</span></div>
+  <div class="kpi"><small>Não entregaram</small><b class="{{ 'danger-figure' if runs_unhappy else '' }}">{{ runs_unhappy }}</b><span class="cov-txt">falha, limite, parcial ou adiado</span></div>
+  {% for status, count in run_counts.items() %}
+    <div class="kpi"><small>{{ status_labels.get(status, status) }}</small><b>{{ count }}</b><span class="cov-txt">nas últimas {{ window_hours }} h</span></div>
+  {% endfor %}
+</section>
+
+{% for item in connections %}
+  <section class="panel">
+    <div class="panel-header">
+      <div><p class="eyebrow">{{ item.connection.provider_code }}</p><h2>{{ item.connection.display_name }}</h2></div>
+      <span class="status-badge {{ tones.get(item.worst_state, 'muted') }}">{{ state_labels.get(item.worst_state, item.worst_state) }}</span>
+    </div>
+    <div class="content-grid two-columns">
+      <div>
+        <dl class="detail-list">
+          <div><dt>Configuração</dt><dd>{{ item.connection.configuration_status }}{{ ' · ativa' if item.connection.enabled else ' · desativada' }}</dd></div>
+          {% if item.health %}
+            <div><dt>Autenticação</dt><dd>{{ state_labels.get(item.health.auth_state, item.health.auth_state) }}</dd></div>
+            <div><dt>Provider</dt><dd>{{ state_labels.get(item.health.provider_state, item.health.provider_state) }}</dd></div>
+            <div><dt>Quota</dt><dd>{{ state_labels.get(item.health.quota_state, item.health.quota_state) }}</dd></div>
+            <div><dt>Sincronização</dt><dd>{{ state_labels.get(item.health.sync_state, item.health.sync_state) }}</dd></div>
+            <div><dt>Último sucesso</dt><dd>{{ item.health.last_success_at.strftime('%Y-%m-%d %H:%M') if item.health.last_success_at else '—' }}</dd></div>
+            <div><dt>Última falha</dt><dd>{{ item.health.last_failure_at.strftime('%Y-%m-%d %H:%M') if item.health.last_failure_at else '—' }}{% if item.health.last_error_code %} · <code>{{ item.health.last_error_code }}</code>{% endif %}</dd></div>
+          {% else %}
+            <div><dt>Saúde</dt><dd><span class="muted">nunca foi contactada</span></dd></div>
+          {% endif %}
+          <div><dt>Mappings</dt><dd>{{ item.active_mappings }} ativos de {{ item.mappings }}</dd></div>
+        </dl>
+      </div>
+      <div>
+        <p class="eyebrow">Execuções recentes</p>
+        {% if item.recent %}
+          <div class="rows">
+            {% for run in item.recent %}
+              <div class="row" style="grid-template-columns:1fr auto auto">
+                <span class="nm"><b>{{ run.capability }}</b><span>{{ run.started_at.strftime('%Y-%m-%d %H:%M') }}{% if run.error_code %} · <code>{{ run.error_code }}</code>{% endif %}</span></span>
+                <span class="status-badge {{ 'success' if run.status == 'success' else 'warning' if run.status in ['partial','deferred','rate_limited'] else 'danger' if run.status == 'failed' else 'muted' }}">{{ status_labels.get(run.status, run.status) }}</span>
+              </div>
+            {% endfor %}
+          </div>
+        {% else %}
+          <p class="empty-state">Esta ligação nunca sincronizou.</p>
+        {% endif %}
+      </div>
+    </div>
+    {% if item.counts.get('rate_limited') %}
+      <div class="notice-panel" style="margin-top:14px">
+        <p><strong>{{ item.counts['rate_limited'] }} execuções travadas por limite de chamadas nas últimas {{ window_hours }} horas.</strong>
+        Não é um defeito da plataforma: é a conta do provider a recusar. A V2 partilha a conta FusionSolar com o V1 em produção e não pode juntar-se ao lease dele — o desbloqueio é uma conta própria, não uma alteração de código.</p>
+      </div>
+    {% endif %}
+  </section>
+{% endfor %}
+
+<section class="panel">
+  <div class="panel-header"><div><p class="eyebrow">Auditoria</p><h2>Quem fez o quê</h2></div><span class="status-badge muted">{{ audit_total }} registos</span></div>
+  {% if audit %}
+    <div class="table-scroll">
+      <table class="data-table compact-table">
+        <thead><tr><th>Quando</th><th>Quem</th><th>Ação</th><th>Sobre</th><th>Detalhe</th></tr></thead>
+        <tbody>
+          {% for event in audit %}
+            <tr>
+              <td>{{ event.occurred_at.strftime('%Y-%m-%d %H:%M') }}</td>
+              <td>{{ event.actor_username }}</td>
+              <td><code>{{ event.action }}</code></td>
+              <td>{{ event.entity_type }}{% if event.entity_id %} #{{ event.entity_id }}{% endif %}</td>
+              <td class="muted">{% for key, value in (event.metadata_json or {}).items() %}{{ key }}={{ value }}{% if not loop.last %} · {% endif %}{% endfor %}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% else %}
+    <div class="honest-empty"><span class="empty-icon" aria-hidden="true">—</span><div><strong>Nenhuma ação registada.</strong><p>Aprovações, edições de central e interruptores de automação passam por aqui.</p></div></div>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <div class="panel-header"><div><p class="eyebrow">Nota</p><h2>Porque não há botão de sincronizar</h2></div></div>
+  <p class="page-intro" style="max-width:74ch">Um disparo manual gastaria orçamento de chamadas da mesma conta FusionSolar de que o V1 em produção depende, e que já está a recusar as execuções agendadas. Enquanto a V2 não tiver conta própria, o botão faria mais mal do que bem — e esta página existe precisamente para que a decisão de o pedir seja tomada com números à frente.</p>
+</section>
+{% endblock %}

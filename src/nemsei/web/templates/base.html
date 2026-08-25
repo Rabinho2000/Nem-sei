@@ -42,6 +42,7 @@
             <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('sources.') else '' }}" href="{{ url_for('sources.index') }}"><span aria-hidden="true">◷</span> Políticas de fonte</a>
             <a class="nav-link {{ 'active' if request.endpoint == 'reconciliation.index' else '' }}" href="{{ url_for('reconciliation.index') }}"><span aria-hidden="true">⌁</span> Reconciliação</a>
             <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('automations.') else '' }}" href="{{ url_for('automations.index') }}"><span aria-hidden="true">◴</span> Automações</a>
+            <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('system.') else '' }}" href="{{ url_for('system.index') }}"><span aria-hidden="true">◈</span> Estado do sistema</a>
           </div>
         </nav>
         <div class="sidebar-footer">
@@ -93,6 +94,7 @@
           <a class="{{ 'active' if request.endpoint and request.endpoint.startswith('sources.') else '' }}" href="{{ url_for('sources.index') }}"><span aria-hidden="true">◷</span> Políticas de fonte</a>
           <a class="{{ 'active' if request.endpoint == 'reconciliation.index' else '' }}" href="{{ url_for('reconciliation.index') }}"><span aria-hidden="true">⌁</span> Reconciliação</a>
           <a class="{{ 'active' if request.endpoint and request.endpoint.startswith('automations.') else '' }}" href="{{ url_for('automations.index') }}"><span aria-hidden="true">◴</span> Automações</a>
+          <a class="{{ 'active' if request.endpoint and request.endpoint.startswith('system.') else '' }}" href="{{ url_for('system.index') }}"><span aria-hidden="true">◈</span> Estado do sistema</a>
         </div>
       </details>
     </nav>
