@@ -63,6 +63,21 @@ x-v2-fusionsolar-environment: &v2-fusionsolar-environment
 # HTTP" do D3. Ensaio antes de ligar: decide_notification_events criaria 0
 # eventos, porque os 644 incidentes abertos sao anteriores a baseline das
 # politicas; so incidentes novos passam a alertar.
+# Sigenergy (2026-08-25). Conta e endpoints proprios, sem relacao com a conta
+# partilhada do FusionSolar -- nao passa pelo broker de lease nem tem contencao
+# com o V1. As chaves vem de segredos montados; os endpoints nao sao segredo.
+# A V2 implementa validacao, descoberta e monitorizacao corrente para este
+# provider. NAO implementa historico de producao: nao existe metodo no cliente
+# nem capacidade registada, e o contrato de dia-fonte/fuso nunca foi verificado.
+x-v2-sigenergy-environment: &v2-sigenergy-environment
+  NEMSEI_V2_SIGENERGY_PRIMARY_APP_KEY_FILE: /run/secrets/sigenergy_primary_app_key
+  NEMSEI_V2_SIGENERGY_PRIMARY_APP_SECRET_FILE: /run/secrets/sigenergy_primary_app_secret
+  NEMSEI_V2_SIGENERGY_PRIMARY_BASE_URL: https://api-eu.sigencloud.com
+  NEMSEI_V2_SIGENERGY_PRIMARY_AUTH_ENDPOINT: /openapi/auth/login/key
+  NEMSEI_V2_SIGENERGY_PRIMARY_SYSTEMS_ENDPOINT: /openapi/system/list
+  NEMSEI_V2_SIGENERGY_PRIMARY_ENERGY_FLOW_ENDPOINT: /openapi/systems/{system_id}/energyFlow
+  NEMSEI_V2_SIGENERGY_PRIMARY_REGION: eu
+
 x-v2-notification-environment: &v2-notification-environment
   NEMSEI_V2_TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_bot_token
   NEMSEI_V2_NOTIFICATION_PROCESSING_ENABLED: "true"
@@ -119,7 +134,7 @@ services:
     restart: unless-stopped
     env_file: ${NEMSEI_V2_ENV_FILE:-.env.v2}
     environment:
-      <<: [*v2-environment, *v2-fusionsolar-environment, *v2-notification-environment]
+      <<: [*v2-environment, *v2-fusionsolar-environment, *v2-sigenergy-environment, *v2-notification-environment]
       NEMSEI_V2_PROCESS_ROLE: scheduler
     extra_hosts: ["host.docker.internal:host-gateway"]
     secrets:
@@ -128,6 +143,8 @@ services:
       - fusionsolar_primary_username
       - fusionsolar_primary_password
       - telegram_bot_token
+      - sigenergy_primary_app_key
+      - sigenergy_primary_app_secret
     depends_on: {postgres: {condition: service_healthy}}
     command: python -m nemsei.jobs.scheduler
 
@@ -136,7 +153,7 @@ services:
     restart: unless-stopped
     env_file: ${NEMSEI_V2_ENV_FILE:-.env.v2}
     environment:
-      <<: [*v2-environment, *v2-fusionsolar-environment, *v2-notification-environment]
+      <<: [*v2-environment, *v2-fusionsolar-environment, *v2-sigenergy-environment, *v2-notification-environment]
       NEMSEI_V2_PROCESS_ROLE: worker
     extra_hosts: ["host.docker.internal:host-gateway"]
     secrets:
@@ -145,6 +162,8 @@ services:
       - fusionsolar_primary_username
       - fusionsolar_primary_password
       - telegram_bot_token
+      - sigenergy_primary_app_key
+      - sigenergy_primary_app_secret
     depends_on: {postgres: {condition: service_healthy}}
     command: python -m nemsei.jobs.worker
 
@@ -173,3 +192,7 @@ secrets:
   # enviar nada -- e a garantia que substituiu o "nao existe codigo HTTP" do D3.
   telegram_bot_token:
     file: ./secrets/telegram_bot_token
+  sigenergy_primary_app_key:
+    file: ./secrets/sigenergy_primary_app_key
+  sigenergy_primary_app_secret:
+    file: ./secrets/sigenergy_primary_app_secret
