@@ -41,6 +41,31 @@ x-v2-fusionsolar-environment: &v2-fusionsolar-environment
   # failure, never a silently guessed unit or window.
   NEMSEI_V2_FUSIONSOLAR_PRIMARY_PRODUCTION_TIMEZONE: UTC
   NEMSEI_V2_FUSIONSOLAR_PRIMARY_PRODUCTION_UNIT: kWh
+  # Same operator-verified contract, for device_contract_for() in
+  # device_status.py: V1 guessed active power's unit from its own
+  # magnitude, so this is required explicitly rather than inferred.
+  # 2026-08-24 cutover: values confirmed by the FusionSolar canary runs.
+  NEMSEI_V2_FUSIONSOLAR_PRIMARY_DEVICE_POWER_UNIT: kW
+  NEMSEI_V2_FUSIONSOLAR_PRIMARY_DEVICE_ENERGY_UNIT: kWh
+  # 2026-08-24 cutover: turn on the one scheduler-driven FusionSolar
+  # capability approved for normal operation -- daily incremental
+  # production sync against the single configured connection (id 3).
+  # Device-status polling and the diagnostics/notifications schedulers
+  # stay off; those still need their own separate approval (see the
+  # header comment above and docs/v2/DEVICE_TELEMETRY.md ss10).
+  NEMSEI_V2_PRODUCTION_SYNC_SCHEDULER_ENABLED: "true"
+  NEMSEI_V2_PRODUCTION_SYNC_SCHEDULER_CONNECTION_ID: "3"
+
+# Notificacoes (D4, 2026-08-25). Ancora separada da do FusionSolar de proposito:
+# nada disto e uma chamada a provider, e misturar as duas faria um leitor futuro
+# pensar que sim. Sem o segredo montado, telegram_client.py cai para o mock e o
+# processo nao consegue enviar -- a garantia que substituiu o "nao existe codigo
+# HTTP" do D3. Ensaio antes de ligar: decide_notification_events criaria 0
+# eventos, porque os 644 incidentes abertos sao anteriores a baseline das
+# politicas; so incidentes novos passam a alertar.
+x-v2-notification-environment: &v2-notification-environment
+  NEMSEI_V2_TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_bot_token
+  NEMSEI_V2_NOTIFICATION_PROCESSING_ENABLED: "true"
 
 services:
   postgres:
@@ -94,7 +119,7 @@ services:
     restart: unless-stopped
     env_file: ${NEMSEI_V2_ENV_FILE:-.env.v2}
     environment:
-      <<: [*v2-environment, *v2-fusionsolar-environment]
+      <<: [*v2-environment, *v2-fusionsolar-environment, *v2-notification-environment]
       NEMSEI_V2_PROCESS_ROLE: scheduler
     extra_hosts: ["host.docker.internal:host-gateway"]
     secrets:
@@ -102,6 +127,7 @@ services:
       - v1_broker_token
       - fusionsolar_primary_username
       - fusionsolar_primary_password
+      - telegram_bot_token
     depends_on: {postgres: {condition: service_healthy}}
     command: python -m nemsei.jobs.scheduler
 
@@ -110,7 +136,7 @@ services:
     restart: unless-stopped
     env_file: ${NEMSEI_V2_ENV_FILE:-.env.v2}
     environment:
-      <<: [*v2-environment, *v2-fusionsolar-environment]
+      <<: [*v2-environment, *v2-fusionsolar-environment, *v2-notification-environment]
       NEMSEI_V2_PROCESS_ROLE: worker
     extra_hosts: ["host.docker.internal:host-gateway"]
     secrets:
@@ -118,6 +144,7 @@ services:
       - v1_broker_token
       - fusionsolar_primary_username
       - fusionsolar_primary_password
+      - telegram_bot_token
     depends_on: {postgres: {condition: service_healthy}}
     command: python -m nemsei.jobs.worker
 
@@ -141,3 +168,8 @@ secrets:
     file: ./secrets/fusionsolar_primary_username
   fusionsolar_primary_password:
     file: ./secrets/fusionsolar_primary_password
+  # D4: o token do bot de Telegram. Sem este segredo montado,
+  # notifications/telegram_client.py devolve o mock e o processo nao consegue
+  # enviar nada -- e a garantia que substituiu o "nao existe codigo HTTP" do D3.
+  telegram_bot_token:
+    file: ./secrets/telegram_bot_token
