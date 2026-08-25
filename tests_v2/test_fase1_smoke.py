@@ -33,6 +33,11 @@ PAGES = (
     "/reports",
     "/diagnostics",
     "/diagnostics/incidents",
+    # Ecras acrescentados depois: cobertos aqui para que a shell da marca e a
+    # navegacao movel nao possam regredir num deles sem ninguem reparar.
+    "/automations",
+    "/automations/digest-preview",
+    "/system",
 )
 
 
