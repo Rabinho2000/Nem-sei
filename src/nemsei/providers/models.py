@@ -38,6 +38,8 @@ OPERATOR_AUDIT_ACTIONS = (
     "service_contract_created",
     "service_contract_closed",
     "service_contract_renewal_updated",
+    # Which slice of the fleet a notification policy speaks for.
+    "automation_scope_changed",
 )
 
 

@@ -16,9 +16,11 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from nemsei.contracts.service import scoped_asset_ids
 from nemsei.diagnostics.models import DiagnosticIncident
 from nemsei.jobs.models import ScheduleState
 from nemsei.notifications.models import (
+    NOTIFICATION_ASSET_SCOPES,
     NOTIFICATION_SEVERITIES,
     DigestRun,
     NotificationChannel,
@@ -100,6 +102,16 @@ def scheduled_automations(session: Session) -> list[ScheduledAutomation]:
     return out
 
 
+# What each scope means on screen. V1 wrote these as `only_o&m` and
+# `only_active_contracts` in a settings dropdown; the wording here says which
+# installations are addressed, not which flag is read.
+ASSET_SCOPE_LABELS = {
+    "all": "Todo o parque",
+    "om": "Só O&M (inclui contratos expirados)",
+    "om_active": "Só O&M com contrato em vigor",
+}
+
+
 def policy_scope_counts(session: Session) -> dict[int, int]:
     """How many open incidents each enabled policy currently has in scope.
 
@@ -119,6 +131,15 @@ def policy_scope_counts(session: Session) -> dict[int, int]:
         )
         if policy.baseline_at is not None:
             statement = statement.where(DiagnosticIncident.opened_at >= policy.baseline_at)
+        # The asset scope is part of what the operator can reason about, so it
+        # belongs in the preview. Without it the column would report the whole
+        # fleet's incidents for a policy that speaks only for the O&M portfolio.
+        scoped = scoped_asset_ids(session, asset_scope=policy.asset_scope)
+        if scoped is not None:
+            if not scoped:
+                counts[policy.id] = 0
+                continue
+            statement = statement.where(DiagnosticIncident.asset_id.in_(scoped))
         counts[policy.id] = int(session.scalar(statement) or 0)
     return counts
 
@@ -135,6 +156,8 @@ def automations_overview(session: Session) -> dict[str, Any]:
         "policies": policies,
         "channels_by_id": {channel.id: channel for channel in channels},
         "scope_counts": policy_scope_counts(session),
+        "asset_scope_options": [(value, ASSET_SCOPE_LABELS[value]) for value in NOTIFICATION_ASSET_SCOPES],
+        "asset_scope_labels": ASSET_SCOPE_LABELS,
         "event_counts": {str(status): int(count) for status, count in event_counts.items()},
         "digests": list(session.scalars(select(DigestRun).order_by(DigestRun.id.desc()).limit(5))),
         "open_incidents": int(session.scalar(select(func.count(DiagnosticIncident.id)).where(DiagnosticIncident.status == "open")) or 0),
@@ -179,6 +202,33 @@ def set_policy_enabled(session: Session, *, policy_id: int, enabled: bool, actor
             action="automation_enabled" if enabled else "automation_disabled",
             entity_type="notification_policy",
             entity_id=policy.id,
+        )
+    return policy
+
+
+def set_policy_asset_scope(session: Session, *, policy_id: int, asset_scope: str, actor: str) -> NotificationPolicy:
+    """Point a policy at part of the fleet.
+
+    Narrowing is always safe: it can only ever remove candidates. Widening is
+    not a storm either, because `baseline_at` and the baseline snapshots
+    already decide what counts as pre-existing history -- an installation
+    entering scope with an incident older than the baseline stays quiet.
+    """
+    if asset_scope not in NOTIFICATION_ASSET_SCOPES:
+        raise ValueError("Âmbito de centrais desconhecido.")
+    policy = session.get(NotificationPolicy, policy_id)
+    if policy is None:
+        raise ValueError("Política desconhecida.")
+    if policy.asset_scope != asset_scope:
+        policy.asset_scope = asset_scope
+        policy.updated_at = utc_now()
+        record_operator_action(
+            session,
+            actor_username=actor,
+            action="automation_scope_changed",
+            entity_type="notification_policy",
+            entity_id=policy.id,
+            metadata={"asset_scope": asset_scope},
         )
     return policy
 

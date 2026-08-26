@@ -5,9 +5,11 @@ from flask import Blueprint, current_app, flash, redirect, render_template, requ
 
 from nemsei.notifications.digests import build_digest_payload, render_digest_text
 from nemsei.system.automations import (
+    ASSET_SCOPE_LABELS,
     automations_overview,
     digest_preview_window,
     set_channel_enabled,
+    set_policy_asset_scope,
     set_policy_enabled,
 )
 from nemsei.web.csrf import require_valid_token, token
@@ -70,6 +72,26 @@ def toggle_channel(channel_id: int):
     except ValueError as exc:
         session.rollback()
         flash(str(exc), "error")
+    return redirect(url_for("automations.index"))
+
+
+@automation_bp.post("/policies/<int:policy_id>/ambito")
+@require_authenticated
+def set_policy_scope(policy_id: int):
+    require_valid_token()
+    session = get_request_session()
+    try:
+        policy = set_policy_asset_scope(
+            session,
+            policy_id=policy_id,
+            asset_scope=request.form.get("asset_scope", "").strip(),
+            actor=actor(),
+        )
+        session.commit()
+        flash(f"Política {policy.name}: âmbito {ASSET_SCOPE_LABELS[policy.asset_scope].lower()}.", "success")
+    except (ValueError, KeyError) as exc:
+        session.rollback()
+        flash(str(exc) if isinstance(exc, ValueError) else "Âmbito de centrais desconhecido.", "error")
     return redirect(url_for("automations.index"))
 
 

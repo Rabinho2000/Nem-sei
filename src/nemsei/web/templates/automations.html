@@ -69,7 +69,7 @@
   {% if policies %}
     <div class="table-scroll">
       <table class="data-table compact-table">
-        <thead><tr><th>Política</th><th>Canal</th><th>Severidade mínima</th><th>Escalar</th><th class="num">No âmbito</th><th>Estado</th><th></th></tr></thead>
+        <thead><tr><th>Política</th><th>Canal</th><th>Severidade mínima</th><th>Centrais</th><th>Escalar</th><th class="num">No âmbito</th><th>Estado</th><th></th></tr></thead>
         <tbody>
           {% for policy in policies %}
             <tr>
@@ -77,6 +77,21 @@
               <td>{{ channels_by_id[policy.channel_id].name if policy.channel_id in channels_by_id else '—' }}
                 {% if policy.channel_id in channels_by_id and not channels_by_id[policy.channel_id].enabled %}<small>canal desativado</small>{% endif %}</td>
               <td>{{ policy.min_severity }}</td>
+              {#
+                O âmbito de centrais é o `ALERT_SCOPE` do V1. Fica editável aqui
+                porque é a definição que decide se uma central caducada continua
+                a ser avisada -- e essa é uma decisão de operação, não de deploy.
+              #}
+              <td>
+                <form method="post" action="{{ url_for('automations.set_policy_scope', policy_id=policy.id) }}" class="inline-form">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <label class="sr-only" for="scope-{{ policy.id }}">Âmbito de centrais de {{ policy.name }}</label>
+                  <select id="scope-{{ policy.id }}" name="asset_scope">
+                    {% for value, label in asset_scope_options %}<option value="{{ value }}" {{ 'selected' if policy.asset_scope == value else '' }}>{{ label }}</option>{% endfor %}
+                  </select>
+                  <button class="button secondary" type="submit">Guardar</button>
+                </form>
+              </td>
               <td>{{ (policy.escalation_after_minutes ~ ' min') if policy.escalation_after_minutes else '—' }}</td>
               <td class="num">{{ scope_counts.get(policy.id, 0) }}</td>
               <td><span class="status-badge {{ 'success' if policy.enabled else 'muted' }}">{{ 'ativa' if policy.enabled else 'inativa' }}</span></td>
@@ -92,7 +107,7 @@
         </tbody>
       </table>
     </div>
-    <p class="panel-foot muted">«No âmbito» conta os incidentes abertos que passam a severidade mínima e a data de baseline. <strong>Não é o número de mensagens</strong>: a decisão real pesa também o tempo de escalada e os eventos anteriores, e calculá-la a sério escreveria linhas — uma pré-visualização não pode fazer isso.</p>
+    <p class="panel-foot muted">«No âmbito» conta os incidentes abertos que passam a severidade mínima, o âmbito de centrais e a data de baseline. <strong>Não é o número de mensagens</strong>: a decisão real pesa também o tempo de escalada e os eventos anteriores, e calculá-la a sério escreveria linhas — uma pré-visualização não pode fazer isso.</p>
   {% else %}
     <p class="empty-state">Não há políticas definidas.</p>
   {% endif %}
