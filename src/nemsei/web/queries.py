@@ -21,7 +21,7 @@ from nemsei.reporting.models import FinancialModel
 from nemsei.shared.clock import utc_now
 from nemsei.sources.models import AssetSourcePolicy
 from nemsei.sync.models import IntegrationHealth, SyncRun
-from nemsei.web.contract_queries import om_filter_ids, om_states_for
+from nemsei.web.contract_queries import commercial_states_for, family_filter_ids, om_filter_ids, om_states_for
 
 
 PROVIDER_LABELS = {
@@ -61,9 +61,17 @@ ASSET_LIFECYCLE_LABELS = {"unknown": "Desconhecida", "active": "Ativa", "inactiv
 
 
 def _asset_filters(
-    *, search: str, needs_review: str, provider: str, mapping: str, om_ids: set[int] | None = None
+    *,
+    search: str,
+    needs_review: str,
+    provider: str,
+    mapping: str,
+    om_ids: set[int] | None = None,
+    family_ids: set[int] | None = None,
 ) -> list[Any]:
     filters: list[Any] = []
+    if family_ids is not None:
+        filters.append(Asset.id.in_(family_ids) if family_ids else false())
     if om_ids is not None:
         # Resolved to ids before the query rather than expressed as a join:
         # O&M state is derived from date arithmetic over the contract table,
@@ -170,6 +178,7 @@ def list_assets_data(
     provider: str = "",
     mapping: str = "",
     om: str = "",
+    family: str = "",
     page_value: str | None = None,
     per_page: int = 25,
 ) -> dict[str, Any]:
@@ -180,6 +189,7 @@ def list_assets_data(
         provider=provider,
         mapping=mapping,
         om_ids=om_filter_ids(session, om=om),
+        family_ids=family_filter_ids(session, family=family),
     )
     total = session.scalar(
         select(func.count(Asset.id)).outerjoin(Organization, Organization.id == Asset.owner_id).where(*filters)
@@ -192,6 +202,7 @@ def list_assets_data(
     summaries = _mapping_summaries(session, [asset.id for asset, _ in rows])
     # One page at a time, so this stays one extra query regardless of fleet size.
     om_states = om_states_for(session, asset_ids=[asset.id for asset, _ in rows])
+    commercial = commercial_states_for(session, assets={asset.id: asset.contract_type for asset, _ in rows})
     assets: list[dict[str, Any]] = []
     for asset, organization_name in rows:
         summary = summaries[asset.id]
@@ -217,12 +228,15 @@ def list_assets_data(
                 # Whether Solcor operates this plant, and until when. Derived,
                 # never stored -- see nemsei/contracts/models.py.
                 "om": om_states[asset.id],
+                # What Solcor sells here, and how urgently its problems should
+                # be worked -- see nemsei/contracts/priority.py.
+                "commercial": commercial[asset.id],
             }
         )
     return {
         "assets": assets,
         "pagination": pagination,
-        "filters": {"search": search, "needs_review": needs_review, "provider": provider, "mapping": mapping, "om": om},
+        "filters": {"search": search, "needs_review": needs_review, "provider": provider, "mapping": mapping, "om": om, "family": family},
         "provider_options": [(code, provider_label(code)) for code in PROVIDER_LABELS],
     }
 

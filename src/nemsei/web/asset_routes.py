@@ -12,6 +12,7 @@ from nemsei.providers.service import configure_connection, create_connection, cr
 from nemsei.shared.clock import utc_now
 from nemsei.web.csrf import require_valid_token, token
 from nemsei.web.db_session import get_request_session
+from nemsei.contracts.priority import COMMERCIAL_FAMILIES, FAMILY_LABELS
 from nemsei.web.contract_queries import asset_contract_panel
 from nemsei.web.home_routes import require_authenticated
 from nemsei.web.queries import asset_detail_data, commercial_panel_data, list_assets_data, organization_list_data, provider_connections_data
@@ -67,11 +68,13 @@ def list_assets() -> str:
         "provider": request.args.get("provider", "").strip(),
         "mapping": request.args.get("mapping", "").strip(),
         "om": request.args.get("om", "").strip(),
+        "family": request.args.get("family", "").strip(),
         "page_value": request.args.get("page"),
     }
     return render_template(
         "assets/list.html",
         **list_assets_data(get_request_session(), **filters),
+        family_options=[(value, FAMILY_LABELS[value]) for value in COMMERCIAL_FAMILIES],
         csrf_token=token(),
         title="Centrais",
     )

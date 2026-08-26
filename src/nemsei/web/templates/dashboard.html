@@ -26,6 +26,14 @@
 </header>
 
 <section class="triage" aria-label="O que precisa de atenção">
+  {#
+    Primeiro cartão da tira, porque é a primeira pergunta: das centrais que a
+    Solcor opera e cuja energia vende, quantas estão com problema agora.
+  #}
+  <a class="tri {{ 'warn' if panel.esco_with_incidents else '' }}" href="{{ url_for('diagnostics.incidents', family='esco') }}">
+    <small>ESCO com problema</small><b>{{ panel.esco_with_incidents }}</b>
+    <em>de {{ panel.esco_priority_assets }} ESCO em contrato</em>
+  </a>
   <a class="tri {{ 'crit' if panel.critical else '' }}" href="{{ url_for('diagnostics.incidents') }}">
     <small>Crítico</small><b>{{ panel.critical }}</b>
     <em>{{ 'nada parado agora' if not panel.critical else 'incidentes críticos abertos' }}</em>

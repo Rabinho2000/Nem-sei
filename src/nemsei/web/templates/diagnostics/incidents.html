@@ -30,6 +30,20 @@
 <section class="panel">
   <form class="filter-bar" method="get" action="{{ url_for('diagnostics.incidents') }}">
     <input type="search" name="search" value="{{ search }}" placeholder="Nome, alias ou cliente…" autofocus>
+    {#
+      O contrato é o primeiro filtro porque é a pergunta que se faz primeiro:
+      «o que é que tenho de arranjar hoje?». ESCO à cabeça — a energia é vendida
+      pela Solcor, logo a paragem sai do bolso dela.
+    #}
+    <select name="om">
+      <option value="sim" {{ 'selected' if om in ('', 'sim') else '' }}>Parque O&amp;M</option>
+      <option value="nao" {{ 'selected' if om == 'nao' else '' }}>Só fora de O&amp;M</option>
+      <option value="todos" {{ 'selected' if om == 'todos' else '' }}>Todo o parque</option>
+    </select>
+    <select name="family">
+      <option value="">Todos os contratos</option>
+      {% for value, label in family_options %}<option value="{{ value }}" {{ 'selected' if family == value else '' }}>{{ label }}</option>{% endfor %}
+    </select>
     <select name="handling">
       <option value="">Todo o tratamento</option>
       <option value="untouched" {{ 'selected' if handling == 'untouched' else '' }}>Ninguém tocou</option>
@@ -37,10 +51,13 @@
     </select>
     <button type="submit">Procurar</button>
   </form>
+  {% if om in ('', 'sim') %}
+    <p class="panel-foot muted">A mostrar incidentes do parque O&amp;M. <a href="{{ url_for('diagnostics.incidents', om='todos', search=search, handling=handling, family=family) }}">Ver todo o parque</a>.</p>
+  {% endif %}
   <table class="data-table">
     <thead>
       <tr>
-        <th>Severidade</th><th>Instalação</th><th>Dispositivo</th><th>Regra</th>
+        <th>Severidade</th><th>Prioridade</th><th>Instalação</th><th>Dispositivo</th><th>Regra</th>
         <th>Tratamento</th><th class="num">Aberto há</th><th class="num">Última confirmação há</th>
       </tr>
     </thead>
@@ -48,6 +65,10 @@
       {% for row in incidents %}
         <tr class="{{ 'row-attention' if row.incident.severity == 'critical' else '' }}">
           <td>{{ severity_pill(row.incident.severity) }}</td>
+          <td>
+            <span class="status-badge {{ row.commercial.priority_tone }}" title="{{ row.commercial.priority_reason }}">{{ row.commercial.priority_label }}</span>
+            {% if row.commercial.contract_type %}<small>{{ row.commercial.contract_type }}</small>{% endif %}
+          </td>
           <td><a href="{{ url_for('diagnostics.asset_detail', asset_id=row.asset.id) }}">{{ row.asset.canonical_name }}</a></td>
           <td class="muted">{{ row.device_label or '— (instalação)' }}</td>
           <td class="muted"><code><a href="{{ url_for('diagnostics.incident', incident_id=row.incident.id) }}">{{ row.incident.rule_code }}</a></code></td>
@@ -64,7 +85,7 @@
           há mesmo nada aberto. Com filtros, há incidentes -- estes é que não
           passam. Dizer "nenhum incidente activo" no segundo caso seria falso.
         #}
-        <tr><td colspan="7" class="empty">{% if search or handling %}Nenhum incidente corresponde a estes filtros — há outros abertos.{% else %}Nenhum incidente activo — nada a mostrar.{% endif %}</td></tr>
+        <tr><td colspan="8" class="empty">{% if search or handling or family or om == 'nao' %}Nenhum incidente corresponde a estes filtros — há outros abertos.{% else %}Nenhum incidente activo — nada a mostrar.{% endif %}</td></tr>
       {% endfor %}
     </tbody>
   </table>

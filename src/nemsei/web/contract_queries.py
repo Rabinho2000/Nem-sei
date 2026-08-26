@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from nemsei.assets.models import Asset, Organization
 from nemsei.contracts.models import RENEWAL_STATUSES
+from nemsei.contracts.priority import COMMERCIAL_FAMILIES, FAMILY_LABELS, commercial_family, describe
 from nemsei.contracts.service import (
     EXPIRY_BUCKETS,
     contracts_for,
@@ -63,11 +64,23 @@ RENEWAL_LABELS = {
 # Which buckets the renewals screen shows by default: the work, not the archive.
 ACTIONABLE_BUCKETS = ("expired", "within_90_days", "undated")
 # The filter vocabulary the list offers, mapped to the derived statuses it keeps.
+#
+# `com_om` is the default view, not `todos`: this is an O&M platform, and the
+# 175 installations Solcor does not operate are the exception a user asks for
+# rather than the backdrop everything else is read against. The screens say so
+# in words and offer the way out in one click -- a default nobody can see is a
+# missing filter, not a focused product.
 LIST_FILTERS = {
+    "com_om": ("active", "undated", "expired"),
     "ativo": ("active", "undated"),
     "expirado": ("expired",),
     "sem": ("none",),
 }
+DEFAULT_LIST_FILTER = "com_om"
+# The one value that means "do not narrow at all".
+ALL_ASSETS_FILTER = "todos"
+# What the list and the incidents page call each commercial family in a filter.
+FAMILY_FILTERS = {value: FAMILY_LABELS[value] for value in COMMERCIAL_FAMILIES}
 
 
 def decorate(state: dict[str, Any]) -> dict[str, Any]:
@@ -96,6 +109,28 @@ def om_states_for(session: Session, *, asset_ids: list[int], on: date | None = N
     }
 
 
+def commercial_states_for(
+    session: Session, *, assets: dict[int, str | None], on: date | None = None
+) -> dict[int, dict[str, Any]]:
+    """Commercial family and service priority per installation, for a table."""
+    statuses = om_status_map(session, asset_ids=list(assets), on=on)
+    return {
+        asset_id: describe(contract_type, statuses[asset_id]["status"])
+        for asset_id, contract_type in assets.items()
+    }
+
+
+def family_filter_ids(session: Session, *, family: str) -> set[int] | None:
+    """Asset ids in one commercial family, or None when the filter is off."""
+    if family not in FAMILY_FILTERS:
+        return None
+    return {
+        asset_id
+        for asset_id, contract_type in session.execute(select(Asset.id, Asset.contract_type))
+        if commercial_family(contract_type) == family
+    }
+
+
 def om_filter_ids(session: Session, *, om: str, on: date | None = None) -> set[int] | None:
     """Asset ids matching a list filter, or None when the filter is off.
 
@@ -103,7 +138,9 @@ def om_filter_ids(session: Session, *, om: str, on: date | None = None) -> set[i
     the current page would report a page count for a different question than
     the one the operator asked.
     """
-    wanted = LIST_FILTERS.get(om)
+    if om == ALL_ASSETS_FILTER:
+        return None
+    wanted = LIST_FILTERS.get(om or DEFAULT_LIST_FILTER)
     if wanted is None:
         return None
     keep = set(wanted)
@@ -164,10 +201,30 @@ def contracts_page_data(session: Session, *, bucket: str = "", on: date | None =
             .where(Asset.id.in_(asset_ids))
         )
     } if asset_ids else {}
+    # `.all()` matters: a bare Result has `.keys()`, so `dict()` treats it as a
+    # mapping and subscripts it instead of iterating the rows.
+    contract_types = (
+        {asset_id: contract_type
+         for asset_id, contract_type in session.execute(
+             select(Asset.id, Asset.contract_type).where(Asset.id.in_(asset_ids))
+         ).all()}
+        if asset_ids
+        else {}
+    )
     items = []
     for row in rows:
         name, organization = names.get(row["asset_id"], ("(desconhecida)", None))
-        items.append({**decorate(row), "canonical_name": name, "organization_name": organization})
+        items.append(
+            {
+                **decorate(row),
+                "canonical_name": name,
+                "organization_name": organization,
+                "commercial": describe(contract_types.get(row["asset_id"]), row["status"]),
+            }
+        )
+    # ESCO first inside the same expiry bucket: an ESCO contract lapsing is
+    # Solcor's own revenue going unbilled, not only a customer's paperwork.
+    items.sort(key=lambda item: (item["valid_to"] or date.max, item["commercial"]["priority_rank"], item["asset_id"]))
     summary = overview(session, on=moment)
     return {
         "contracts": items,

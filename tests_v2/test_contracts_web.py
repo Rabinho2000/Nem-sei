@@ -27,7 +27,7 @@ def seeded(settings, monkeypatch):
     organization = create_organization(session, display_name="Sol PT")
     operated = create_asset(session, canonical_name="Colmeia do Minho", owner_id=organization.id)
     lapsed = create_asset(session, canonical_name="Motassis", owner_id=organization.id)
-    outside = create_asset(session, canonical_name="Sem contrato", owner_id=organization.id)
+    outside = create_asset(session, canonical_name="Quinta do Vale", owner_id=organization.id)
     session.flush()
     today = date.today()
     set_service_contract(
@@ -67,14 +67,14 @@ def test_the_list_filters_by_derived_om_state(settings, monkeypatch):
     active = client.get("/assets?om=ativo").get_data(as_text=True)
     assert "Colmeia do Minho" in active
     assert "Motassis" not in active
-    assert "Sem contrato" not in active
+    assert "Quinta do Vale" not in active
 
     expired = client.get("/assets?om=expirado").get_data(as_text=True)
     assert "Motassis" in expired
     assert "Colmeia do Minho" not in expired
 
     none = client.get("/assets?om=sem").get_data(as_text=True)
-    assert "Sem contrato" in none
+    assert "Quinta do Vale" in none
     assert "Colmeia do Minho" not in none
 
 

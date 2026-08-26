@@ -18,6 +18,8 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from nemsei.assets.models import Asset, Organization
+from nemsei.contracts.priority import describe
+from nemsei.contracts.service import om_status_map
 from nemsei.contracts.service import overview as om_overview
 from nemsei.diagnostics.models import DiagnosticIncident
 from nemsei.monitoring.models import ProductionFact
@@ -139,12 +141,38 @@ def operational_panel(session: Session) -> dict[str, Any]:
     om = om_overview(session, on=today)
     expiring_soon = om["buckets"].get("within_90_days", 0)
 
+    # The ESCO installations under a live contract that currently have an open
+    # incident. They are 81% of the operated portfolio and the only ones whose
+    # downtime is Solcor's own lost revenue, so this is the number that answers
+    # "what do I fix first" -- see nemsei/contracts/priority.py.
+    statuses = om_status_map(session, on=today)
+    priority_assets = {
+        asset_id
+        for asset_id, contract_type in session.execute(select(Asset.id, Asset.contract_type))
+        if describe(contract_type, statuses.get(asset_id, {"status": "none"})["status"])["priority"] == "high"
+    }
+    esco_with_incidents = (
+        int(
+            session.scalar(
+                select(func.count(func.distinct(DiagnosticIncident.asset_id))).where(
+                    DiagnosticIncident.status == "open",
+                    DiagnosticIncident.asset_id.in_(priority_assets),
+                )
+            )
+            or 0
+        )
+        if priority_assets
+        else 0
+    )
+
     return {
         "om_in_scope": om["in_scope"],
         "om_active": om["active"],
         "om_expired": om["expired"],
         "om_undated": om["undated"],
         "om_expiring_soon": expiring_soon,
+        "esco_priority_assets": len(priority_assets),
+        "esco_with_incidents": esco_with_incidents,
         "total_assets": total_assets,
         "mapped_assets": mapped_assets,
         "unmapped_assets": total_assets - mapped_assets,

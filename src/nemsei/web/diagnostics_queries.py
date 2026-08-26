@@ -15,6 +15,8 @@ from sqlalchemy.orm import Session
 
 from nemsei.assets.models import Asset, Device, Organization
 from nemsei.assets.service import asset_search_clause
+from nemsei.contracts.priority import describe
+from nemsei.contracts.service import om_status_map
 from nemsei.diagnostics.findings import SEVERITY_ORDER, evaluate_asset_findings
 from nemsei.diagnostics.handling import incident_notes
 from nemsei.diagnostics.models import INCIDENT_HANDLING_STATES, DiagnosticIncident
@@ -123,13 +125,23 @@ def diagnostics_overview(session: Session, *, search: str = "", limit: int = 50)
     }
 
 
-def open_incidents_overview(session: Session, *, search: str = "", handling: str = "") -> list[dict[str, Any]]:
-    """Every open incident, portfolio-wide, worst-first then longest-open-first.
+def open_incidents_overview(
+    session: Session, *, search: str = "", handling: str = "", family: str = "", om: str = ""
+) -> list[dict[str, Any]]:
+    """Every open incident, worst-first, ESCO-first, then longest-open-first.
 
     Duration is the point of this page (`docs/v2/DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md`'s
     "Incidents" tab) -- an installation nobody has looked at for the longest is
     at least as worth surfacing as the most recently opened one at the same
     severity.
+
+    Service priority sorts *within* a severity band and never across one. An
+    ESCO warning must not outrank a plant that is actually down: `critical` here
+    means `plant_offline` or `plant_fault`, and burying one of those under a
+    stale-reading warning would be the one ordering this page must never
+    produce. Within a band, ESCO first -- that is where "fix the ESCOs first"
+    belongs, because every incident in the band is equally broken and only the
+    money differs.
     """
     statement = (
         select(DiagnosticIncident, Asset, Device)
@@ -156,18 +168,39 @@ def open_incidents_overview(session: Session, *, search: str = "", handling: str
         statement = statement.where(DiagnosticIncident.handling_state == handling)
 
     now = utc_now()
+    found = session.execute(statement).all()
+    asset_ids = [asset.id for _, asset, _ in found]
+    statuses = om_status_map(session, asset_ids=asset_ids) if asset_ids else {}
     rows: list[dict[str, Any]] = []
-    for incident, asset, device in session.execute(statement).all():
+    for incident, asset, device in found:
+        commercial = describe(asset.contract_type, statuses[asset.id]["status"])
+        if family and commercial["family"] != family:
+            continue
+        # Absent means the O&M portfolio, not the whole fleet -- the same
+        # default the assets list applies, for the same reason. "todos" is the
+        # one value that widens it back.
+        scope = om or "sim"
+        if scope == "sim" and commercial["priority"] == "low":
+            continue
+        if scope == "nao" and commercial["priority"] != "low":
+            continue
         rows.append(
             {
                 "incident": incident,
                 "asset": asset,
+                "commercial": commercial,
                 "device_label": device.label if device else None,
                 "duration": duration_label(now - incident.opened_at),
                 "since_confirmed": duration_label(now - incident.last_observed_at),
             }
         )
-    rows.sort(key=lambda row: (SEVERITY_ORDER.get(row["incident"].severity, 99), row["incident"].opened_at))
+    rows.sort(
+        key=lambda row: (
+            SEVERITY_ORDER.get(row["incident"].severity, 99),
+            row["commercial"]["priority_rank"],
+            row["incident"].opened_at,
+        )
+    )
     return rows
 
 

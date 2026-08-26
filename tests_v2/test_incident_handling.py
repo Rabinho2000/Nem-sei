@@ -164,11 +164,11 @@ def test_an_unknown_handling_state_is_refused(settings, monkeypatch) -> None:
 def test_the_list_summarises_the_backlog_and_filters_by_handling(settings, monkeypatch) -> None:
     client, incident_id = seeded(settings, monkeypatch)
 
-    untouched = client.get("/diagnostics/incidents?handling=untouched")
+    untouched = client.get("/diagnostics/incidents?om=todos&handling=untouched")
     assert "Central Incidente" in untouched.text
     assert "por triar" in untouched.text
 
     client.post(f"/diagnostics/incidents/{incident_id}/handling", data={"csrf_token": "test", "handling_state": "done"})
 
-    assert "Central Incidente" not in client.get("/diagnostics/incidents?handling=untouched").text
-    assert "Central Incidente" in client.get("/diagnostics/incidents?handling=done").text
+    assert "Central Incidente" not in client.get("/diagnostics/incidents?om=todos&handling=untouched").text
+    assert "Central Incidente" in client.get("/diagnostics/incidents?om=todos&handling=done").text

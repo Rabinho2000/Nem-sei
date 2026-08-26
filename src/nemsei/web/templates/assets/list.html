@@ -7,10 +7,11 @@
     <label class="search-field"><span class="sr-only">Pesquisar centrais</span><input type="search" name="q" value="{{ filters.search }}" placeholder="Pesquisar central, organização ou alias"></label>
     <label><span class="sr-only">Qualidade</span><select name="needs_review"><option value="">Toda a qualidade</option><option value="yes" {{ 'selected' if filters.needs_review == 'yes' else '' }}>Precisa de revisão</option></select></label>
     <label><span class="sr-only">Provider</span><select name="provider"><option value="">Todos os providers</option>{% for code, label in provider_options %}<option value="{{ code }}" {{ 'selected' if filters.provider == code else '' }}>{{ label }}</option>{% endfor %}</select></label>
-    <label><span class="sr-only">O&amp;M</span><select name="om"><option value="">Todo o parque</option><option value="ativo" {{ 'selected' if filters.om == 'ativo' else '' }}>Com O&amp;M ativo</option><option value="expirado" {{ 'selected' if filters.om == 'expirado' else '' }}>Contrato expirado</option><option value="sem" {{ 'selected' if filters.om == 'sem' else '' }}>Sem O&amp;M</option></select></label>
+    <label><span class="sr-only">O&amp;M</span><select name="om"><option value="com_om" {{ 'selected' if filters.om in ('', 'com_om') else '' }}>Parque O&amp;M</option><option value="ativo" {{ 'selected' if filters.om == 'ativo' else '' }}>Com O&amp;M ativo</option><option value="expirado" {{ 'selected' if filters.om == 'expirado' else '' }}>Contrato expirado</option><option value="sem" {{ 'selected' if filters.om == 'sem' else '' }}>Sem O&amp;M</option><option value="todos" {{ 'selected' if filters.om == 'todos' else '' }}>Todo o parque</option></select></label>
+    <label><span class="sr-only">Contrato</span><select name="family"><option value="">Todos os contratos</option>{% for value, label in family_options %}<option value="{{ value }}" {{ 'selected' if filters.family == value else '' }}>{{ label }}</option>{% endfor %}</select></label>
     <label><span class="sr-only">Mapping</span><select name="mapping"><option value="">Todos os mappings</option><option value="present" {{ 'selected' if filters.mapping == 'present' else '' }}>Com mapping</option><option value="absent" {{ 'selected' if filters.mapping == 'absent' else '' }}>Sem mapping</option></select></label>
     <button class="button secondary" type="submit">Filtrar</button>
-    {% if filters.search or filters.needs_review or filters.provider or filters.mapping or filters.om %}<a class="clear-link" href="{{ url_for('assets.list_assets') }}">Limpar</a>{% endif %}
+    {% if filters.search or filters.needs_review or filters.provider or filters.mapping or filters.om or filters.family %}<a class="clear-link" href="{{ url_for('assets.list_assets') }}">Limpar</a>{% endif %}
   </form>
 </section>
 
@@ -24,11 +25,12 @@
 <form method="post" action="{{ url_for('assets.bulk_edit_assets') }}">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   <section class="panel table-panel">
-    <div class="table-meta"><span>{{ pagination.total }} centrais encontradas</span>{% if pagination.pages > 1 %}<span>Página {{ pagination.page }} de {{ pagination.pages }}</span>{% endif %}</div>
+    <div class="table-meta"><span>{{ pagination.total }} centrais encontradas</span>
+      {% if filters.om in ('', 'com_om') %}<span class="muted">a mostrar o parque O&amp;M — <a href="{{ url_for('assets.list_assets', om='todos') }}">ver todo o parque</a></span>{% endif %}{% if pagination.pages > 1 %}<span>Página {{ pagination.page }} de {{ pagination.pages }}</span>{% endif %}</div>
     <div class="table-scroll">
       <table class="data-table wide-table">
         <caption class="sr-only">Lista de centrais</caption>
-        <thead><tr><th scope="col" class="pick-column"><span class="sr-only">Selecionar</span></th><th scope="col">Central</th><th scope="col">Organização</th><th scope="col">Potência DC</th><th scope="col">País / localidade</th><th scope="col">Fuso</th><th scope="col">Estado</th><th scope="col">O&amp;M</th><th scope="col">Mapping</th><th scope="col">Qualidade</th></tr></thead>
+        <thead><tr><th scope="col" class="pick-column"><span class="sr-only">Selecionar</span></th><th scope="col">Central</th><th scope="col">Organização</th><th scope="col">Potência DC</th><th scope="col">País / localidade</th><th scope="col">Fuso</th><th scope="col">Estado</th><th scope="col">Contrato</th><th scope="col">O&amp;M</th><th scope="col">Mapping</th><th scope="col">Qualidade</th></tr></thead>
         <tbody>
           {% for asset in assets %}
             <tr>
@@ -39,19 +41,23 @@
               <td>{{ [asset.country_code, asset.locality]|select|join(' · ') or '—' }}</td>
               <td>{% if asset.timezone %}<code>{{ asset.timezone }}</code>{% else %}<span class="status-badge warning">em falta</span>{% endif %}</td>
               <td><span class="status-badge {{ 'muted' if asset.lifecycle_status == 'unknown' else 'success' }}">{{ asset.lifecycle_label }}</span></td>
+              <td>
+                {% if asset.commercial.contract_type %}<span class="status-badge {{ asset.commercial.family_tone }}">{{ asset.commercial.contract_type }}</span>{% else %}—{% endif %}
+                {% if asset.commercial.priority == 'high' %}<small title="{{ asset.commercial.priority_reason }}">prioritária</small>{% endif %}
+              </td>
               <td>{% if asset.om.status == 'none' %}—{% else %}<span class="status-badge {{ asset.om.tone }}" title="{% if asset.om.last_covered_day %}até {{ asset.om.last_covered_day.strftime('%d/%m/%Y') }}{% else %}sem data de fim registada{% endif %}">{{ asset.om.label }}</span>{% endif %}</td>
               <td><span class="status-badge {{ asset.mapping_tone }}">{{ asset.mapping_label }}</span></td>
               <td><span class="status-badge {{ asset.review_tone }}">{{ asset.review_label }}</span></td>
             </tr>
-          {% else %}<tr><td class="table-empty" colspan="10">Não existem centrais para estes filtros.</td></tr>{% endfor %}
+          {% else %}<tr><td class="table-empty" colspan="11">Não existem centrais para estes filtros.</td></tr>{% endfor %}
         </tbody>
       </table>
     </div>
     {% if pagination.pages > 1 %}
       <nav class="pagination" aria-label="Paginação de centrais">
-        {% if pagination.has_previous %}<a href="{{ url_for('assets.list_assets', q=filters.search, needs_review=filters.needs_review, provider=filters.provider, mapping=filters.mapping, om=filters.om, page=pagination.previous) }}">Anterior</a>{% endif %}
+        {% if pagination.has_previous %}<a href="{{ url_for('assets.list_assets', q=filters.search, needs_review=filters.needs_review, provider=filters.provider, mapping=filters.mapping, om=filters.om, family=filters.family, page=pagination.previous) }}">Anterior</a>{% endif %}
         <span>Página {{ pagination.page }} / {{ pagination.pages }}</span>
-        {% if pagination.has_next %}<a href="{{ url_for('assets.list_assets', q=filters.search, needs_review=filters.needs_review, provider=filters.provider, mapping=filters.mapping, om=filters.om, page=pagination.next) }}">Seguinte</a>{% endif %}
+        {% if pagination.has_next %}<a href="{{ url_for('assets.list_assets', q=filters.search, needs_review=filters.needs_review, provider=filters.provider, mapping=filters.mapping, om=filters.om, family=filters.family, page=pagination.next) }}">Seguinte</a>{% endif %}
       </nav>
     {% endif %}
   </section>

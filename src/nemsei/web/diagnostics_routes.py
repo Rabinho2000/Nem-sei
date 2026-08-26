@@ -13,6 +13,7 @@ from nemsei.diagnostics.handling import record_incident_handling
 from nemsei.web.csrf import require_valid_token, token
 from nemsei.web.db_session import get_request_session
 from nemsei.web.diagnostics_queries import asset_diagnostics, diagnostics_overview, handling_summary, incident_detail, open_incidents_overview
+from nemsei.contracts.priority import COMMERCIAL_FAMILIES, FAMILY_LABELS
 from nemsei.web.home_routes import require_authenticated
 
 
@@ -38,13 +39,18 @@ def incidents() -> str:
     session = get_request_session()
     search = request.args.get("search", "").strip()
     handling = request.args.get("handling", "").strip()
+    family = request.args.get("family", "").strip()
+    om = request.args.get("om", "").strip()
     return render_template(
         "diagnostics/incidents.html",
         title="Incidentes",
         search=search,
         handling=handling,
+        family=family,
+        om=om,
+        family_options=[(value, FAMILY_LABELS[value]) for value in COMMERCIAL_FAMILIES],
         summary=handling_summary(session),
-        incidents=open_incidents_overview(session, search=search, handling=handling),
+        incidents=open_incidents_overview(session, search=search, handling=handling, family=family, om=om),
     )
 
 

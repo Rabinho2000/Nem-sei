@@ -68,10 +68,10 @@ def test_authenticated_home_uses_real_counts_and_honest_empty_state(settings, mo
 def test_assets_search_and_filters_use_canonical_data(settings, monkeypatch) -> None:
     client, _ = seeded_client(settings, monkeypatch)
 
-    alias_response = client.get("/assets?q=Norte+antigo")
-    review_response = client.get("/assets?needs_review=yes")
-    provider_response = client.get("/assets?provider=fusionsolar")
-    absent_response = client.get("/assets?mapping=absent")
+    alias_response = client.get("/assets?om=todos&q=Norte+antigo")
+    review_response = client.get("/assets?om=todos&needs_review=yes")
+    provider_response = client.get("/assets?om=todos&provider=fusionsolar")
+    absent_response = client.get("/assets?om=todos&mapping=absent")
 
     assert "Central Norte" in alias_response.text
     assert "Central Sul" not in alias_response.text

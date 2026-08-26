@@ -47,11 +47,12 @@
   <div class="table-scroll">
     <table class="data-table wide-table">
       <caption class="sr-only">Contratos O&amp;M por prazo</caption>
-      <thead><tr><th scope="col">Central</th><th scope="col">Organização</th><th scope="col">Fim</th><th scope="col">Prazo</th><th scope="col">Valor anual</th><th scope="col">Seguimento</th></tr></thead>
+      <thead><tr><th scope="col">Central</th><th scope="col">Contrato</th><th scope="col">Organização</th><th scope="col">Fim</th><th scope="col">Prazo</th><th scope="col">Valor anual</th><th scope="col">Seguimento</th></tr></thead>
       <tbody>
         {% for item in contracts %}
           <tr>
             <th scope="row"><a class="table-primary" href="{{ url_for('assets.asset_detail', asset_id=item.asset_id) }}#om">{{ item.canonical_name }}</a></th>
+            <td>{% if item.commercial.contract_type %}<span class="status-badge {{ item.commercial.family_tone }}">{{ item.commercial.contract_type }}</span>{% else %}—{% endif %}</td>
             <td>{{ item.organization_name or '—' }}</td>
             <td>{{ item.last_covered_day.strftime('%d/%m/%Y') if item.last_covered_day else '—' }}</td>
             <td>
@@ -76,7 +77,7 @@
             </td>
           </tr>
         {% else %}
-          <tr><td class="table-empty" colspan="6">Nenhum contrato neste prazo. {% if not selected_bucket %}Nada a renovar nos próximos {{ 90 }} dias.{% endif %}</td></tr>
+          <tr><td class="table-empty" colspan="7">Nenhum contrato neste prazo. {% if not selected_bucket %}Nada a renovar nos próximos {{ 90 }} dias.{% endif %}</td></tr>
         {% endfor %}
       </tbody>
     </table>

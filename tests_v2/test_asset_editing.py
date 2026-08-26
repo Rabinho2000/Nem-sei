@@ -216,7 +216,7 @@ def test_bulk_edit_rejects_an_invalid_lifecycle_value(settings, monkeypatch) -> 
 def test_asset_list_exposes_the_bulk_form_and_the_fields_it_edits(settings, monkeypatch) -> None:
     client, _, _ = seeded(settings, monkeypatch)
 
-    page = client.get("/assets")
+    page = client.get("/assets?om=todos")
 
     assert page.status_code == 200
     assert "/assets/bulk" in page.text

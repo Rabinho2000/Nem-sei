@@ -190,7 +190,7 @@ def test_overview_summary_counts_installations_by_worst_severity(app, two_assets
 def test_incidents_page_lists_the_open_incident_worst_first(app, two_assets_one_critical) -> None:
     client = app.test_client()
     login(client)
-    body = client.get("/diagnostics/incidents").get_data(as_text=True)
+    body = client.get("/diagnostics/incidents?om=todos").get_data(as_text=True)
     assert "Zulu Broken Plant" in body
     assert "device_unavailable" in body
     assert "Alpha Healthy Plant" not in body  # no open incident there -- must not appear
@@ -215,9 +215,9 @@ def test_incidents_page_is_empty_when_nothing_is_open(app, settings) -> None:
 def test_incidents_page_search_filters_by_installation(app, two_assets_one_critical) -> None:
     client = app.test_client()
     login(client)
-    body = client.get("/diagnostics/incidents?search=Zulu").get_data(as_text=True)
+    body = client.get("/diagnostics/incidents?om=todos&search=Zulu").get_data(as_text=True)
     assert "Zulu Broken Plant" in body
-    body_filtered_out = client.get("/diagnostics/incidents?search=Nonexistent").get_data(as_text=True)
+    body_filtered_out = client.get("/diagnostics/incidents?om=todos&search=Nonexistent").get_data(as_text=True)
     assert "Zulu Broken Plant" not in body_filtered_out
     # Bloco D: a search that hides everything is not the same as nothing being
     # open, and the page no longer says it is. The unfiltered case still reads
