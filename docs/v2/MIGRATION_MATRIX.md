@@ -18,9 +18,13 @@ validation before its data is accepted.
 | Plant claims | `asset_integrations` | `asset_provider_mappings` (`resource_kind='plant'`) | Connection plus normalized external ID | Connection-scoped collision check, imported as `pending_review` |
 | Unresolved integrations | `integration_unresolved` | `legacy_import_records` evidence only | V1 row ID | Recorded as `unresolved`; never auto-mapped |
 | Devices | `provider_devices` | `devices` plus `asset_provider_mappings` (`resource_kind='device'`) | Serial per asset; connection plus normalized external device ID | Row counts, per-row source hash, unknown device types quarantined, orphan devices excluded |
+| O&M contracts | `assets.maintenance`/`start_contract`/`end_contract`, `om_contracts` | `asset_service_contracts` | V1 asset ID in `provenance_json` | Scope count (92), derived `active_contract` reconciled against V1 (91 checks, 0 mismatches), undated and one-day windows flagged for review |
 
 Device import details, including the column-by-column mapping and what is
 deliberately left behind, are in `DEVICE_MODEL.md`.
+
+O&M contract import details, including why `active_contract` is derived rather
+than copied, are in `OM_CONTRACTS.md`.
 
 ## Not migrated
 
@@ -29,7 +33,8 @@ deliberately left behind, are in `DEVICE_MODEL.md`.
 | `provider_device_configuration_history` | All 325 rows are single-version and open; there is no device history to carry over |
 | `provider_device_expected_strings` | String-level expectation belongs with performance work, not identity |
 | Monitoring, production, availability and inverter sample tables | Facts are regenerated from providers, not migrated |
-| Contracts, portfolios, financial models, reports, tariffs, invoices | Their V2 domains do not exist yet; each needs its own matrix row first |
+| Reports, invoices | Their V2 domains do not exist yet; each needs its own matrix row first |
+| `om_contracts.pdf_path`, `om_contracts.renewal_status` | The two referenced PDFs are absent from disk; `renewal_status` has zero populated rows. See `OM_CONTRACTS.md` |
 | Credentials, endpoints, payloads, provider snapshots | Never imported |
 | `background_jobs` | V1-specific states; V2 has its own queue contract |
 

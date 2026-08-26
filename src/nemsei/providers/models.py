@@ -32,6 +32,12 @@ OPERATOR_AUDIT_ACTIONS = (
     # automations the interface can switch; the schedulers are environment.
     "automation_enabled",
     "automation_disabled",
+    # O&M contracts: creating a period, closing one, and recording renewal
+    # follow-up are the three writes the contract panel and the renewals
+    # screen can make.
+    "service_contract_created",
+    "service_contract_closed",
+    "service_contract_renewal_updated",
 )
 
 

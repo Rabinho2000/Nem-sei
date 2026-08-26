@@ -46,6 +46,15 @@
     <small>Sem provider</small><b>{{ panel.unmapped_assets }}</b>
     <em>nunca foram ligadas</em>
   </a>
+  {#
+    O&M: o número que precisa de atenção é o que está a caducar, não o âmbito.
+    O âmbito vive na legenda, para que o valor apareça sempre com o
+    denominador de que foi feito.
+  #}
+  <a class="tri {{ 'warn' if (panel.om_expired or panel.om_expiring_soon) else '' }}" href="{{ url_for('contracts.index') }}">
+    <small>Contratos a renovar</small><b>{{ panel.om_expired + panel.om_expiring_soon }}</b>
+    <em>{{ panel.om_active }} em vigor de {{ panel.om_in_scope }} no âmbito O&amp;M</em>
+  </a>
   <a class="tri {{ 'warn' if panel.needs_review else '' }}" href="{{ url_for('assets.list_assets', needs_review='yes') }}">
     <small>Por rever</small><b>{{ panel.needs_review }}</b>
     <em>{{ panel.pending_mappings }} mappings pendentes</em>

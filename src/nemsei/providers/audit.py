@@ -32,6 +32,8 @@ _ALLOWED_METADATA = {
     "fields_changed",
     "review_status",
     "asset_count",
+    "contract_id",
+    "asset_scope",
 }
 
 

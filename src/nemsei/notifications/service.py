@@ -44,6 +44,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from nemsei.assets.models import Asset, Device
 from nemsei.diagnostics.findings import SEVERITY_ORDER
+from nemsei.contracts.service import scoped_asset_ids
 from nemsei.diagnostics.models import DiagnosticIncident
 from nemsei.notifications.models import (
     NotificationBaselineSnapshot,
@@ -190,7 +191,23 @@ def _in_scope_for(severity: str, rule_code: str, *, policy: NotificationPolicy) 
     return True
 
 
-def _in_scope(incident: DiagnosticIncident, *, policy: NotificationPolicy) -> bool:
+def _asset_in_scope(incident: DiagnosticIncident, *, scoped_assets: set[int] | None) -> bool:
+    """Whether this policy speaks for the installation the incident is on.
+
+    `None` is "the whole fleet", never "nothing" -- see
+    `contracts.service.scoped_asset_ids` for why those must stay distinct.
+    Deliberately not folded into `_in_scope_for`: that function is also asked
+    about a *frozen* severity from a baseline snapshot, and the installation an
+    incident sits on is not part of what a snapshot froze.
+    """
+    return scoped_assets is None or incident.asset_id in scoped_assets
+
+
+def _in_scope(
+    incident: DiagnosticIncident, *, policy: NotificationPolicy, scoped_assets: set[int] | None = None
+) -> bool:
+    if not _asset_in_scope(incident, scoped_assets=scoped_assets):
+        return False
     return _in_scope_for(incident.severity, incident.rule_code, policy=policy)
 
 
@@ -207,7 +224,9 @@ def _is_backlog(incident: DiagnosticIncident, *, policy: NotificationPolicy) -> 
     return policy.baseline_at is not None and incident.opened_at < policy.baseline_at
 
 
-def _capture_backlog_snapshots(session: Session, *, policy: NotificationPolicy, now: datetime) -> None:
+def _capture_backlog_snapshots(
+    session: Session, *, policy: NotificationPolicy, now: datetime, scoped_assets: set[int] | None = None
+) -> None:
     """Freeze a baseline severity for every open, pre-existing incident this
     policy could ever care about -- run on *every* decide pass, before the
     per-kind branches below, specifically so a snapshot exists from the
@@ -229,6 +248,8 @@ def _capture_backlog_snapshots(session: Session, *, policy: NotificationPolicy, 
         )
     )
     for incident in candidates:
+        if not _asset_in_scope(incident, scoped_assets=scoped_assets):
+            continue
         if not _rule_code_in_scope(incident.rule_code, policy=policy):
             continue
         _get_or_create_baseline_snapshot(session, incident=incident, policy=policy, now=now)
@@ -291,14 +312,18 @@ def _decide_for_policy(
     session: Session, *, policy: NotificationPolicy, channel: NotificationChannel, now: datetime
 ) -> tuple[int, int]:
     created = skipped = 0
+    # Resolved once per pass rather than per incident: the O&M portfolio does
+    # not change while a single evaluation runs, and asking per incident would
+    # turn one query into one per open incident.
+    scoped = scoped_asset_ids(session, asset_scope=policy.asset_scope, on=now.date())
 
     if policy.notify_on_open or policy.escalation_after_minutes:
-        _capture_backlog_snapshots(session, policy=policy, now=now)
+        _capture_backlog_snapshots(session, policy=policy, now=now, scoped_assets=scoped)
 
     if policy.notify_on_open:
         candidates = session.scalars(select(DiagnosticIncident).where(DiagnosticIncident.status == "open"))
         for incident in candidates:
-            if not _in_scope(incident, policy=policy):
+            if not _in_scope(incident, policy=policy, scoped_assets=scoped):
                 continue
             if _is_backlog(incident, policy=policy):
                 # Pre-existing history, not automatically a new problem to
@@ -322,7 +347,7 @@ def _decide_for_policy(
         candidates = session.scalars(select(DiagnosticIncident).where(DiagnosticIncident.status == "open"))
         threshold = policy.escalation_after_minutes
         for incident in candidates:
-            if not _in_scope(incident, policy=policy):
+            if not _in_scope(incident, policy=policy, scoped_assets=scoped):
                 continue
             if _is_backlog(incident, policy=policy):
                 # Same snapshot rule as notify_on_open, and duration since
@@ -360,7 +385,7 @@ def _decide_for_policy(
         # "opened" or "escalated" event under this same policy/channel.
         candidates = session.scalars(select(DiagnosticIncident).where(DiagnosticIncident.status == "resolved"))
         for incident in candidates:
-            if not _in_scope(incident, policy=policy):
+            if not _in_scope(incident, policy=policy, scoped_assets=scoped):
                 continue
             if not (
                 _has_event(session, incident_id=incident.id, kind="opened", channel_id=channel.id)

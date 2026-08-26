@@ -12,6 +12,7 @@ from nemsei.web.auth_routes import auth_bp
 from nemsei.web.asset_routes import assets_bp
 from nemsei.web.automation_routes import automation_bp
 from nemsei.web.commercial_routes import commercial_bp
+from nemsei.web.contract_routes import contracts_bp
 from nemsei.web.db_session import close_request_session
 from nemsei.web.health_routes import health_bp
 from nemsei.web.home_routes import home_bp
@@ -58,6 +59,7 @@ def create_app(
     app.register_blueprint(reporting_bp)
     app.register_blueprint(automation_bp)
     app.register_blueprint(commercial_bp)
+    app.register_blueprint(contracts_bp)
     app.register_blueprint(diagnostics_bp)
     app.register_blueprint(system_bp)
     return app

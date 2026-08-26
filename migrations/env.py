@@ -16,6 +16,7 @@ import nemsei.reporting.commercial_models  # noqa: F401 - register tariff and bi
 import nemsei.portfolios.models  # noqa: F401 - register portfolio metadata
 import nemsei.diagnostics.models  # noqa: F401 - register device status metadata
 import nemsei.notifications.models  # noqa: F401 - register notification metadata
+import nemsei.contracts.models  # noqa: F401 - register O&M contract metadata
 
 
 config = context.config

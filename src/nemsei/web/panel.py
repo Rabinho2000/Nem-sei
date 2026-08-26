@@ -18,6 +18,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from nemsei.assets.models import Asset, Organization
+from nemsei.contracts.service import overview as om_overview
 from nemsei.diagnostics.models import DiagnosticIncident
 from nemsei.monitoring.models import ProductionFact
 from nemsei.providers.models import AssetProviderMapping
@@ -132,7 +133,18 @@ def operational_panel(session: Session) -> dict[str, Any]:
     run_counts = {str(status): int(count) for status, count in recent_runs}
     delivered = run_counts.get("success", 0)
 
+    # Which of those installations Solcor is actually paid to operate, and how
+    # many of those contracts are lapsing. A fleet count without this reads as
+    # if all 267 were the same kind of obligation.
+    om = om_overview(session, on=today)
+    expiring_soon = om["buckets"].get("within_90_days", 0)
+
     return {
+        "om_in_scope": om["in_scope"],
+        "om_active": om["active"],
+        "om_expired": om["expired"],
+        "om_undated": om["undated"],
+        "om_expiring_soon": expiring_soon,
         "total_assets": total_assets,
         "mapped_assets": mapped_assets,
         "unmapped_assets": total_assets - mapped_assets,

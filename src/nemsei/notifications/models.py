@@ -40,6 +40,12 @@ NOTIFICATION_EVENT_STATUSES = ("pending", "sent", "failed", "skipped")
 # `MINIMUM_ALERT_SEVERITY`, which was stored in `alert_settings` and never
 # once read by any alert decision. See DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md.
 NOTIFICATION_SEVERITIES = ("critical", "warning", "info")
+# Which installations a policy speaks for. V1 called this ALERT_SCOPE and
+# defaulted it to `only_o&m`; without it a policy addresses the whole fleet,
+# including the installations Solcor does not operate. `om` is every plant
+# with a recorded O&M engagement, live or lapsed; `om_active` is only those
+# under a contract in force on the day the policy runs.
+NOTIFICATION_ASSET_SCOPES = ("all", "om", "om_active")
 
 
 class NotificationChannel(Base):
@@ -90,6 +96,7 @@ class NotificationPolicy(Base):
     __tablename__ = "notification_policies"
     __table_args__ = (
         CheckConstraint(f"min_severity IN {NOTIFICATION_SEVERITIES!r}", name="ck_notification_policies_min_severity"),
+        CheckConstraint(f"asset_scope IN {NOTIFICATION_ASSET_SCOPES!r}", name="ck_notification_policies_asset_scope"),
         CheckConstraint(
             "escalation_after_minutes IS NULL OR escalation_after_minutes > 0",
             name="ck_notification_policies_escalation_positive",
@@ -101,6 +108,10 @@ class NotificationPolicy(Base):
     enabled: Mapped[bool] = mapped_column(nullable=False, default=False)
     channel_id: Mapped[int] = mapped_column(ForeignKey("notification_channels.id", ondelete="RESTRICT"), nullable=False)
     min_severity: Mapped[str] = mapped_column(String(24), nullable=False, default="warning")
+    # "all" keeps the pre-existing rows meaning exactly what they meant
+    # before this column existed -- a migration must not silently narrow a
+    # policy someone already switched on.
+    asset_scope: Mapped[str] = mapped_column(String(24), nullable=False, default="all")
     # NULL/empty means "every rule_code diagnostics/findings.py can produce" --
     # not the same as an empty list meaning "none", which would make the
     # policy silently notify nothing and look broken rather than unscoped.

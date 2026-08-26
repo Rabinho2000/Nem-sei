@@ -12,6 +12,7 @@ from nemsei.providers.service import configure_connection, create_connection, cr
 from nemsei.shared.clock import utc_now
 from nemsei.web.csrf import require_valid_token, token
 from nemsei.web.db_session import get_request_session
+from nemsei.web.contract_queries import asset_contract_panel
 from nemsei.web.home_routes import require_authenticated
 from nemsei.web.queries import asset_detail_data, commercial_panel_data, list_assets_data, organization_list_data, provider_connections_data
 from nemsei.web.series import daily_series, energy_balance, headline, month_calendar, monthly_series
@@ -65,6 +66,7 @@ def list_assets() -> str:
         "needs_review": request.args.get("needs_review", "").strip(),
         "provider": request.args.get("provider", "").strip(),
         "mapping": request.args.get("mapping", "").strip(),
+        "om": request.args.get("om", "").strip(),
         "page_value": request.args.get("page"),
     }
     return render_template(
@@ -140,6 +142,7 @@ def asset_detail(asset_id: int) -> str:
         organizations=repository.list_organizations(),
         connections=providers.list_connections(),
         **commercial_panel_data(session, asset_id=asset.id),
+        **asset_contract_panel(session, asset_id=asset.id),
         headline=headline(session, asset_id=asset.id),
         monthly=monthly_series(session, asset_id=asset.id),
         daily=daily_series(session, asset_id=asset.id),
