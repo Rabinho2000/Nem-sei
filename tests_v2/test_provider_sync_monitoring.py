@@ -179,3 +179,82 @@ def test_temporal_source_policy_detects_competing_primary_sources(settings, monk
         session.flush()
         with pytest.raises(ValueError, match="Competing"):
             resolve_source_policy(session, asset_id=asset.id, source_use="monitoring", on_date=date(2026, 2, 1))
+
+
+def test_a_rate_limit_without_a_retry_after_still_holds_the_family_back(settings, monkeypatch) -> None:
+    """The defect this test was written for, found live on 2026-08-30.
+
+    FusionSolar reports its own brake as `failCode 407` in a JSON body, not as
+    an HTTP 429 with a `Retry-After` header, so `retry_after_seconds` arrives
+    as `None`. `record_request_result` used to read that as
+    `timedelta(seconds=... or 0)` -- a cooldown expiring the instant it was
+    written. The persisted guard therefore deferred nothing at all: the
+    FusionSolar production sync was refused at 15:59:07, called again at
+    16:00:08 and again at 16:05:10, each one a real HTTP request into an
+    account that had just said no, and each one refused for the same reason.
+
+    An unknown retry window is the case the guard exists for. It is treated as
+    the recovery this account has actually been observed to need.
+    """
+    from nemsei.sync.service import DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+
+    with session_for(settings, monkeypatch) as session:
+        _asset, connection, _mapping = asset_mapping(session)
+        now = utc_now()
+        state, attempt, allowed = reserve_request(
+            session, provider_connection_id=connection.id, endpoint_family="production_history_daily", purpose="day-1", now=now
+        )
+        assert allowed
+        record_request_result(
+            session,
+            state=state,
+            attempt=attempt,
+            error=ProviderError(ProviderErrorCode.RATE_LIMITED, "FusionSolar rate limited the request.", transient=True),
+            now=now,
+        )
+        session.flush()
+
+        assert state.cooldown_until > now, "a rate limit that expires immediately is not a cooldown"
+        assert state.cooldown_until == now + timedelta(seconds=DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS)
+
+        # A second call one second later -- the retry the worker used to make --
+        # is now refused locally, without reaching the provider at all.
+        _state, deferred, allowed = reserve_request(
+            session,
+            provider_connection_id=connection.id,
+            endpoint_family="production_history_daily",
+            purpose="day-1-retry",
+            now=now + timedelta(seconds=1),
+        )
+        assert not allowed and deferred.status == "deferred"
+        # And the call counter did not move, because no call was made.
+        assert state.actual_call_count == 1
+
+        # Once the cooldown has passed, the family is usable again.
+        _state, resumed, allowed = reserve_request(
+            session,
+            provider_connection_id=connection.id,
+            endpoint_family="production_history_daily",
+            purpose="day-1-later",
+            now=now + timedelta(seconds=DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS + 1),
+        )
+        assert allowed and resumed.status == "reserved"
+
+
+def test_a_provider_that_does_name_its_retry_window_is_believed(settings, monkeypatch) -> None:
+    """The default is a floor for the unknown case, never an override."""
+    with session_for(settings, monkeypatch) as session:
+        _asset, connection, _mapping = asset_mapping(session)
+        now = utc_now()
+        state, attempt, _allowed = reserve_request(
+            session, provider_connection_id=connection.id, endpoint_family="history", purpose="test", now=now
+        )
+        record_request_result(
+            session,
+            state=state,
+            attempt=attempt,
+            error=ProviderError(ProviderErrorCode.RATE_LIMITED, "retry later", retry_after_seconds=45),
+            now=now,
+        )
+        session.flush()
+        assert state.cooldown_until == now + timedelta(seconds=45)

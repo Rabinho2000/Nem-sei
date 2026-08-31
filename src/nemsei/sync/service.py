@@ -21,6 +21,27 @@ from nemsei.sync.models import (
 from nemsei.sync.repository import SyncRepository
 
 
+# How long a rate-limited endpoint family is held back when the provider does
+# not say. FusionSolar does not say: it reports its own brake as `failCode 407`
+# in a JSON body rather than an HTTP 429 with `Retry-After`, so
+# `ProviderError.retry_after_seconds` arrives as None for every real rate limit
+# this deployment has ever seen.
+#
+# That used to be read as `or 0` -- a cooldown that expired the moment it was
+# written, which is to say no cooldown at all. On 2026-08-30 the production
+# sync was refused at 15:59:07, called the provider again at 16:00:08, and
+# again at 16:05:10; the guard was in the code path each time and deferred
+# nothing. Every FusionSolar production sync since 2026-08-24 ended the same
+# way.
+#
+# Ten minutes is measured, not chosen: the shared account was observed
+# recovering in about ten minutes after a burst of consecutive calls
+# (docker-compose.v2.yml's device-status note). Believing a provider that does
+# name a window is still strictly better, so an explicit value always wins --
+# this is the floor for silence, not a ceiling on the provider.
+DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 600
+
+
 def _detail(value: str | None) -> str | None:
     return value[:500] if value else None
 
@@ -252,6 +273,7 @@ def record_request_result(
     attempt: ProviderRequestAttempt,
     error: ProviderError | None = None,
     now: datetime | None = None,
+    default_rate_limit_cooldown_seconds: int = DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
 ) -> None:
     now_value = as_utc(now or utc_now())
     if attempt.status not in {"reserved", "deferred"}:
@@ -261,7 +283,14 @@ def record_request_result(
         state.last_success_at = now_value
     elif error.code is ProviderErrorCode.RATE_LIMITED:
         attempt.status = "rate_limited"
-        retry_at = now_value + timedelta(seconds=error.retry_after_seconds or 0)
+        # `is None` rather than `or`: a provider that explicitly says zero is
+        # believed, and only silence falls back to the default.
+        cooldown_seconds = (
+            error.retry_after_seconds
+            if error.retry_after_seconds is not None
+            else default_rate_limit_cooldown_seconds
+        )
+        retry_at = now_value + timedelta(seconds=cooldown_seconds)
         attempt.retry_after_at = retry_at
         state.provider_retry_at = retry_at
         state.cooldown_until = retry_at
