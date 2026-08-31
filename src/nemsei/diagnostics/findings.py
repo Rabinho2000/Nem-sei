@@ -36,7 +36,10 @@ SEVERITY_ORDER = {"critical": 0, "warning": 1, "info": 2}
 # .detector_version` (D1, docs/v2/DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md) so
 # an old incident's provenance always says which rule set actually detected
 # it, even after this module evolves. Not bumped for comments/refactors.
-RULES_VERSION = "1"
+# Bumped to "2" when the plant-level rules were added: an incident opened
+# before that has provenance from a rule set that could not see plant state
+# at all, and saying so is the whole point of persisting the version.
+RULES_VERSION = "2"
 
 # Below this power, two readings are both "essentially off" and comparing
 # their ratio would be noise (e.g. 0.02kW vs 0.05kW is a 150% "disparity"
@@ -108,6 +111,101 @@ def evaluate_asset_findings(
     findings.extend(_coverage_findings(rows, asset_id=asset_id))
     findings.sort(key=lambda finding: (SEVERITY_ORDER.get(finding.severity, 99), finding.device_label or ""))
     return findings
+
+
+def evaluate_plant_findings(
+    *,
+    asset_id: int,
+    condition: str | None,
+    observed_at: datetime | None,
+    confirmed_at: datetime | None = None,
+    now: datetime,
+    stale_after: timedelta = _DEFAULT_STALE_AFTER,
+) -> list[DiagnosticFinding]:
+    """Findings about the installation as a whole, from its latest plant reading.
+
+    Every other rule in this module judges one inverter. These judge what the
+    provider says about the *site*, which is the question an operator is
+    actually woken up for -- and the one V1 alerted on and V2 did not, because
+    nothing here had ever looked at `monitoring_observations`.
+
+    An asset with no plant reading at all produces nothing. "Never read" is an
+    onboarding gap, not an incident: opening one for every unmapped
+    installation would bury the sites that genuinely fell over under a list of
+    sites nobody ever connected.
+
+    A fresh reading whose condition is `unknown` also produces nothing, on
+    purpose. The provider answering without a usable status is already visible
+    on the installation badge and the diagnostics page; making it an incident
+    would mean a nightly warning for every Sigenergy plant, whose energy-flow
+    payload carries no status once the sun is down. "We do not know" is not
+    the same claim as "something is wrong", and only the second one is worth
+    interrupting someone for.
+
+    `confirmed_at` and `observed_at` are different questions and staleness only
+    ever asks the first. `monitoring_observations` is append-only and a new row
+    is written **only when the evidence changes** -- a plant that stays
+    operational keeps yesterday's row while being re-read every 15 minutes, and
+    `MonitoringCurrentState.last_confirmed_at` is what moves. Judging staleness
+    by `observed_at` would therefore report every healthy, unchanging plant as
+    unread within a day of its last state change, which is the opposite of the
+    truth. `observed_at` still answers "since when has it been in this state",
+    which is what the outage rules below want for `active_since`.
+    """
+    if observed_at is None:
+        return []
+    last_read = confirmed_at or observed_at
+    if now - last_read > stale_after:
+        hours = int((now - last_read).total_seconds() // 3600)
+        return [
+            DiagnosticFinding(
+                rule_code="plant_state_stale",
+                severity="warning",
+                asset_id=asset_id,
+                summary=f"Sem leitura de estado desta instalação há {hours}h — o estado mostrado já não descreve agora.",
+                evidence={"last_condition": condition, "observed_at": observed_at.isoformat(), "confirmed_at": last_read.isoformat(), "stale_after_hours": stale_after.total_seconds() / 3600},
+                observed_at=last_read,
+                active_since=last_read + stale_after,
+                missing_data="Porque parou é uma pergunta sobre a ligação ao provider, não sobre a central -- ver Estado do sistema.",
+            )
+        ]
+    if condition == "offline":
+        return [
+            DiagnosticFinding(
+                rule_code="plant_offline",
+                severity="critical",
+                asset_id=asset_id,
+                summary="A instalação está sem comunicação segundo o provider.",
+                evidence={"condition": condition, "observed_at": observed_at.isoformat()},
+                observed_at=observed_at,
+                active_since=observed_at,
+            )
+        ]
+    if condition == "fault":
+        return [
+            DiagnosticFinding(
+                rule_code="plant_fault",
+                severity="critical",
+                asset_id=asset_id,
+                summary="O provider reporta avaria nesta instalação.",
+                evidence={"condition": condition, "observed_at": observed_at.isoformat()},
+                observed_at=observed_at,
+                active_since=observed_at,
+            )
+        ]
+    if condition == "warning":
+        return [
+            DiagnosticFinding(
+                rule_code="plant_warning",
+                severity="warning",
+                asset_id=asset_id,
+                summary="O provider assinala um aviso nesta instalação.",
+                evidence={"condition": condition, "observed_at": observed_at.isoformat()},
+                observed_at=observed_at,
+                active_since=observed_at,
+            )
+        ]
+    return []
 
 
 def _device_state_findings(

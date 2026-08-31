@@ -6,7 +6,12 @@ rather than re-derived, because the raw `inverter_state` codes (512, 40960,
 768, 2...) are FusionSolar's own bitmask vocabulary and guessing what one means
 is exactly the kind of invented metric this milestone was scoped to avoid.
 `tests_v2/test_diagnostics_golden.py` checks this against every real state code
-V1 actually saw, not just the three sets below.
+V1 actually saw, not just the sets below.
+
+One code is classified here that V1 left unclassified — see
+`V2_STANDBY_INVERTER_STATES`. That is a deliberate divergence from the port,
+argued from evidence in V1's own history rather than from documentation, and
+the golden test pins it as a divergence instead of letting it read as drift.
 """
 from __future__ import annotations
 
@@ -19,6 +24,28 @@ from typing import Any
 AVAILABLE_INVERTER_STATES = {512, 513, 514, 1025, 1026, 2048}
 UNAVAILABLE_INVERTER_STATES = {768, 769, 770, 771, 772, 773, 774}
 STANDBY_INVERTER_STATES = {0, 1, 2, 3, 7, 256, 1280, 1281, 1536, 1792}
+
+# Codes V1 recorded but never classified, resolved by V2 from what V1's own
+# rows show. Adding one here requires that kind of proof — the raw history,
+# not a plausible reading of the number.
+#
+# 40960 (0xA000) is the whole set today, and it was not a marginal gap: it is
+# 10 736 of V1's 51 289 device readings, and the last reading 220 of the 325
+# imported devices ever got, which is why almost every inverter in the V2
+# diagnostics table read "desconhecido". What V1's own rows say about it:
+#
+#   * `active_power_kw` is 0 in all 10 736 rows — never null, never positive;
+#   * every observation falls between 19:00 and 05:59 UTC (20h–06h Lisbon over
+#     the June–July 2026 data), with zero occurrences from 06:00 to 18:59 UTC;
+#   * 4 384 of the rows still carry that day's accumulated energy, up to
+#     874.7 kWh — the inverter produced during the day and is now at rest.
+#
+# An inverter shut down for the night after producing is `standby` in V1's own
+# four-value vocabulary. V1 simply never added the code to its sets, so it fell
+# through to `unknown`. `test_diagnostics_golden.py` re-derives all three
+# observations from V1's database on every run, so this stops being true out
+# loud if it ever stops being true.
+V2_STANDBY_INVERTER_STATES = {40960}
 
 
 def classify_fusionsolar_inverter_availability(
@@ -50,5 +77,9 @@ def classify_fusionsolar_inverter_availability(
     if inverter_state in UNAVAILABLE_INVERTER_STATES:
         return "unavailable"
     if inverter_state in STANDBY_INVERTER_STATES:
+        return "standby"
+    # Kept as a separate check, not folded into the set above, so that the one
+    # answer V2 gives which V1 did not stays visible at the point of decision.
+    if inverter_state in V2_STANDBY_INVERTER_STATES:
         return "standby"
     return "unknown"

@@ -18,14 +18,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from nemsei.assets.models import Device
-from nemsei.diagnostics.findings import RULES_VERSION, DiagnosticFinding, evaluate_asset_findings
+from nemsei.diagnostics.findings import RULES_VERSION, DiagnosticFinding, evaluate_asset_findings, evaluate_plant_findings
 from nemsei.diagnostics.models import DiagnosticIncident
 from nemsei.diagnostics.repository import DeviceStatusRepository
 from nemsei.diagnostics.service import current_device_status
+from nemsei.monitoring.models import MonitoringCurrentState, MonitoringObservation
+from nemsei.providers.models import AssetProviderMapping
 from nemsei.shared.clock import utc_now
 from nemsei.shared.json_safe import json_safe
 
@@ -38,8 +40,40 @@ class IncidentEvaluationSummary:
     incidents_resolved: int
 
 
+def _latest_plant_states(session: Session) -> dict[int, tuple[str, datetime, datetime | None]]:
+    """Each installation's newest plant reading, and when it was last confirmed.
+
+    Ordered by `observed_at` then `id` so a superseding revision wins over the
+    row it replaced -- `monitoring_observations` is append-only, and the older
+    revision is still a row.
+
+    The third value is deliberately a different clock. A new observation row is
+    written only when the evidence *changes*, so a plant that stays operational
+    keeps the same row for days while `MonitoringCurrentState.last_confirmed_at`
+    advances on every successful read. "When did we last look" and "since when
+    has it been like this" are different questions, and staleness only ever
+    asks the first.
+    """
+    rows = session.execute(
+        select(MonitoringObservation.asset_id, MonitoringObservation.condition, MonitoringObservation.observed_at)
+        .distinct(MonitoringObservation.asset_id)
+        .order_by(MonitoringObservation.asset_id, MonitoringObservation.observed_at.desc(), MonitoringObservation.id.desc())
+    ).all()
+    confirmations = dict(
+        session.execute(
+            select(AssetProviderMapping.asset_id, func.max(MonitoringCurrentState.last_confirmed_at))
+            .join(MonitoringCurrentState, MonitoringCurrentState.provider_mapping_id == AssetProviderMapping.id)
+            .group_by(AssetProviderMapping.asset_id)
+        ).all()
+    )
+    return {
+        asset_id: (condition, observed_at, confirmations.get(asset_id))
+        for asset_id, condition, observed_at in rows
+    }
+
+
 def evaluate_and_persist_incidents(session: Session, *, now: datetime | None = None) -> IncidentEvaluationSummary:
-    """One evaluation pass over every asset that owns at least one device.
+    """One evaluation pass over every asset with a device or a plant reading.
 
     Idempotent and restart-safe by construction: the only state this reads is
     the `diagnostic_incidents` table itself (which open incidents exist right
@@ -56,16 +90,29 @@ def evaluate_and_persist_incidents(session: Session, *, now: datetime | None = N
     """
     now_value = now or utc_now()
     device_repo = DeviceStatusRepository(session)
-    asset_ids = sorted(session.scalars(select(Device.asset_id).distinct()).all())
+    # Two populations, overlapping but neither contained in the other: most
+    # installations have a plant reading and no imported devices, and the
+    # device-only ones still have to keep being evaluated. Before plant
+    # findings existed this was just "assets that own a device", which is why
+    # a plant going offline produced no incident and therefore no alert.
+    device_asset_ids = set(session.scalars(select(Device.asset_id).distinct()).all())
+    plant_states = _latest_plant_states(session)
+    asset_ids = sorted(device_asset_ids | set(plant_states))
 
     opened = confirmed = resolved = 0
     for asset_id in asset_ids:
-        rows = current_device_status(session, asset_id=asset_id)
+        rows = current_device_status(session, asset_id=asset_id) if asset_id in device_asset_ids else []
         findings = evaluate_asset_findings(
             rows,
             asset_id=asset_id,
             now=now_value,
             history_for_device=lambda device_id: device_repo.history_for_device(device_id=device_id),
+        )
+        condition, observed_at, confirmed_at = plant_states.get(asset_id, (None, None, None))
+        findings.extend(
+            evaluate_plant_findings(
+                asset_id=asset_id, condition=condition, observed_at=observed_at, confirmed_at=confirmed_at, now=now_value
+            )
         )
         counts = _reconcile_asset_incidents(session, asset_id=asset_id, findings=findings, now=now_value)
         opened += counts[0]

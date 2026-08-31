@@ -53,7 +53,11 @@ def asset_and_device(factory):
         (774, "unavailable"),
         (0, "standby"),
         (1792, "standby"),
-        (40960, "unknown"),
+        # V1's own sets leave this one out; V2 answers it from the evidence in
+        # V1's history (diagnostics/rules.py, pinned by test_diagnostics_golden).
+        (40960, "standby"),
+        # Still the fallback: a code nobody has evidence for stays unknown.
+        (31337, "unknown"),
         (None, "unknown"),
         ("not-a-number", "unknown"),
     ],
