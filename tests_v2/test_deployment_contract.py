@@ -6,6 +6,7 @@ import os
 import re
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -117,6 +118,7 @@ case "$args" in
   *"config --format json"*) cat "$RENDERED_JSON" ;;
   *"ps --format"*)          printf '%s\n' "$SCADA_STATE" ;;
   *"psql"*)                 printf '%s\n' "$LIVE_REVISION" ;;
+  *"printenv"*)             [[ -n $LIVE_COMPONENT_VALUE ]] && printf '%s\n' "$LIVE_COMPONENT_VALUE" ;;
 esac
 exit 0
 """
@@ -131,7 +133,8 @@ exit 0
 SLEEP_SHIM = "#!/usr/bin/env bash\nexit 0\n"
 
 
-def run_wrapper(tmp_path, connection_id, scada_state="running"):
+def run_wrapper(tmp_path, connection_id, scada_state="running", rendered_components=True,
+                live_component_value="true"):
     """Run the canonical deploy against a recording `docker`.
 
     Returns the recorded command lines and the completed process, so a test can
@@ -149,9 +152,24 @@ def run_wrapper(tmp_path, connection_id, scada_state="running"):
         "environment": {"NEMSEI_V2_HUAWEI_SCADA_LISTENER_CONNECTION_ID": connection_id},
         "ports": [{"host_ip": "10.0.0.4", "target": 1502, "published": "1502"}],
     }
+    # scheduler and worker carry the required components' switches, because a
+    # canonical deploy now merges deploy/v2_deployment_components.json's
+    # overlays. `rendered_components=False` is the 2026-08-21 deploy: valid
+    # configuration, overlay never merged.
+    component_env = (
+        {"NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED": "true"} if rendered_components else {}
+    )
     rendered = tmp_path / "rendered.json"
     rendered.write_text(
-        json.dumps({"services": {"postgres": {}, "web": {}, "scada-listener": listener}}),
+        json.dumps({
+            "services": {
+                "postgres": {},
+                "web": {},
+                "scheduler": {"environment": dict(component_env)},
+                "worker": {"environment": dict(component_env)},
+                "scada-listener": listener,
+            }
+        }),
         encoding="utf-8",
     )
     calls = tmp_path / "calls.txt"
@@ -169,6 +187,7 @@ def run_wrapper(tmp_path, connection_id, scada_state="running"):
             "DOCKER_CALLS": str(calls),
             "RENDERED_JSON": str(rendered),
             "SCADA_STATE": scada_state,
+            "LIVE_COMPONENT_VALUE": live_component_value,
             "LIVE_REVISION": "irrelevant-to-the-shim",
             "REPO_ROOT": str(ROOT),
             "NEMSEI_V2_DEPLOYMENT_MODE": "development",
@@ -339,3 +358,214 @@ def test_truncated_admin_hash_reports_the_escaping_cause() -> None:
     )
     with pytest.raises(ConfigurationError, match=r"\$\$"):
         settings.validate(require_auth=True)
+
+
+def deployment_components():
+    """Load the deployment-component helper, which also lives in scripts/.
+
+    Registered in `sys.modules` before execution, unlike the two loaders
+    above: this one defines dataclasses under `from __future__ import
+    annotations`, and resolving those annotations needs to find the module by
+    name.
+    """
+    path = ROOT / "scripts/v2_deployment_components.py"
+    spec = importlib.util.spec_from_file_location("v2_deployment_components", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_manifest_declares_the_incident_evaluator_as_required() -> None:
+    """The regression itself.
+
+    A canonical deploy that carried only docker-compose.v2.yml recreated
+    scheduler and worker without
+    docker-compose.v2.diagnostic-incidents.yml, and the incident evaluator
+    stopped with no error anywhere. It happened on 2026-08-21 and again
+    before 2026-08-31. This is the assertion that would have caught it.
+    """
+    manifest = deployment_components().load_manifest(ROOT)
+    required = {component.name: component for component in manifest.required_components}
+    assert "diagnostic-incidents" in required
+    assert required["diagnostic-incidents"].compose_file == "docker-compose.v2.diagnostic-incidents.yml"
+    assert "docker-compose.v2.diagnostic-incidents.yml" in manifest.compose_files()
+    assert manifest.compose_files()[0] == "docker-compose.v2.yml", "the base file merges first"
+
+    evaluated = {
+        (assertion.service, assertion.variable, assertion.value)
+        for assertion in manifest.assertions()
+    }
+    for service in ("scheduler", "worker"):
+        assert (service, "NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED", "true") in evaluated
+
+
+def test_the_wrapper_builds_its_compose_files_from_the_manifest() -> None:
+    """No `-f` may be hardcoded: that is what made the manifest necessary."""
+    script = COMPOSE_UP.read_text(encoding="utf-8")
+    assert "v2_deployment_components.py" in script
+    assert "compose-files" in script
+    assert 'compose+=(-f "$root/$compose_file")' in script
+    assert '-f "$root/docker-compose.v2.yml"' not in script
+
+
+def test_the_wrapper_checks_the_declared_components_before_and_after_starting() -> None:
+    script = COMPOSE_UP.read_text(encoding="utf-8")
+    assert "check-rendered" in script and "check-live" in script
+    # Rendered is checked before anything is started; live only makes sense
+    # once the application roles have been recreated.
+    assert script.index("check-rendered") < script.index('up -d web scheduler worker')
+    assert script.index('up -d web scheduler worker') < script.index("check-live")
+
+
+def test_a_deployment_missing_a_declared_component_is_refused() -> None:
+    module = deployment_components()
+    manifest = module.load_manifest(ROOT)
+    complete = {
+        "services": {
+            "scheduler": {"environment": {"NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED": "true"}},
+            "worker": {"environment": {"NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED": "true"}},
+        }
+    }
+    module.check_rendered(complete, manifest)
+
+    # Exactly the 2026-08-21 deploy: the overlay was never merged, so the
+    # variable is simply absent and compose renders a valid configuration.
+    dropped = {"services": {"scheduler": {"environment": {}}, "worker": {"environment": {}}}}
+    with pytest.raises(module.DeploymentComponentError, match="missing NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED"):
+        module.check_rendered(dropped, manifest)
+
+    # Merged, but pointing the other way.
+    disabled = {
+        "services": {
+            "scheduler": {"environment": {"NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED": "false"}},
+            "worker": {"environment": {"NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED": "true"}},
+        }
+    }
+    with pytest.raises(module.DeploymentComponentError, match="is not 'true'"):
+        module.check_rendered(disabled, manifest)
+
+
+def test_a_container_running_without_a_declared_component_is_refused() -> None:
+    """The half the rendered check cannot see: a service that was not recreated."""
+    module = deployment_components()
+    manifest = module.load_manifest(ROOT)
+    key = "NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED"
+
+    module.check_live({("scheduler", key): "true", ("worker", key): "true"}, manifest)
+
+    with pytest.raises(module.DeploymentComponentError, match="worker is running without"):
+        module.check_live({("scheduler", key): "true", ("worker", key): None}, manifest)
+
+    with pytest.raises(module.DeploymentComponentError, match="not set to 'true'"):
+        module.check_live({("scheduler", key): "false", ("worker", key): "true"}, manifest)
+
+
+def test_an_unset_variable_reads_back_as_unset_not_as_empty() -> None:
+    module = deployment_components()
+    observations = module.read_observations("scheduler\tA\ttrue\nworker\tA\n")
+    assert observations == {("scheduler", "A"): "true", ("worker", "A"): None}
+
+
+def test_the_manifest_must_say_whether_each_component_is_required(tmp_path: Path) -> None:
+    """There is no default: an unstated answer is a component nobody decided."""
+    module = deployment_components()
+    (tmp_path / "docker-compose.v2.yml").write_text("name: nemsei-v2\n", encoding="utf-8")
+    (tmp_path / "deploy").mkdir()
+    (tmp_path / module.MANIFEST_PATH).write_text(
+        json.dumps({
+            "base_compose_file": "docker-compose.v2.yml",
+            "components": [{"name": "x", "compose_file": "docker-compose.v2.yml"}],
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(module.DeploymentComponentError, match="must say whether it is required"):
+        module.load_manifest(tmp_path)
+
+
+def test_the_manifest_cannot_name_a_compose_file_that_is_not_there(tmp_path: Path) -> None:
+    module = deployment_components()
+    (tmp_path / "deploy").mkdir()
+    (tmp_path / module.MANIFEST_PATH).write_text(
+        json.dumps({"base_compose_file": "docker-compose.v2.yml", "components": []}),
+        encoding="utf-8",
+    )
+    with pytest.raises(module.DeploymentComponentError, match="does not exist"):
+        module.load_manifest(tmp_path)
+
+
+def test_runtime_isolation_is_checked_against_every_declared_compose_file() -> None:
+    script = COMPOSE_UP.read_text(encoding="utf-8")
+    assert '--compose-file "${isolation_files[@]}"' in script
+
+
+def test_a_canonical_deploy_carries_the_diagnostics_overlay(tmp_path) -> None:
+    """Every compose invocation names every required component's file.
+
+    Not just the `up`: the build, the migrate run and the head check all go
+    through the same array, so a component cannot be present at start-up and
+    absent from the image the migration ran with.
+    """
+    calls, completed = run_wrapper(tmp_path, connection_id="")
+    assert completed.returncode == 0, completed.stderr
+    composing = [call for call in calls if "compose" in call and "--project-name nemsei-v2" in call]
+    assert composing
+    for call in composing:
+        assert "-f" in call and "docker-compose.v2.yml" in call
+        assert "docker-compose.v2.diagnostic-incidents.yml" in call
+
+
+def test_a_deploy_whose_overlay_never_merged_is_refused_before_anything_starts(tmp_path) -> None:
+    """The 2026-08-21 regression, driven end to end.
+
+    The rendered configuration is valid and compose would happily apply it;
+    what is missing is a component the repository declares. The deploy must
+    stop before `up -d`, not after, so nothing is recreated degraded.
+    """
+    calls, completed = run_wrapper(tmp_path, connection_id="", rendered_components=False)
+    assert completed.returncode != 0
+    assert "NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED" in completed.stderr
+    assert not any("up -d web scheduler worker" in call for call in calls)
+
+
+def test_a_container_that_came_up_without_the_component_fails_the_deploy(tmp_path) -> None:
+    """Declared, merged, and still not in the process that is running."""
+    _calls, completed = run_wrapper(tmp_path, connection_id="", live_component_value="")
+    assert completed.returncode != 0
+    assert "running without NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED" in completed.stderr
+
+
+def test_the_live_check_waits_for_a_container_that_is_still_starting(tmp_path) -> None:
+    """A false negative found on this gate's first real run.
+
+    `up -d` returns when the container is started, not when it is ready, and
+    `exec` into one that is still starting fails. The scheduler answered, the
+    worker was a second behind, and the deploy failed over a variable that was
+    correctly set the whole time -- confirmed afterwards with `docker inspect`.
+    A container that never answers must still fail; one that answers late must
+    not.
+    """
+    script = COMPOSE_UP.read_text(encoding="utf-8")
+    assert "read_component_value" in script
+    assert "NEMSEI_V2_COMPONENT_READY_TIMEOUT_SECONDS" in script
+    # The retry must not swallow the real failure: the loop still gives up.
+    assert "(( SECONDS >= deadline )) && return 1" in script
+
+
+def test_the_live_check_reads_every_service_not_just_the_first(tmp_path) -> None:
+    """`docker compose exec` reads stdin, and stdin here is the work queue.
+
+    Without `< /dev/null` the first `exec` swallowed the remaining assertions,
+    the loop ended after the scheduler, and the worker was reported as running
+    without a variable it demonstrably had -- confirmed with `docker inspect`
+    while the deploy was failing over it. This is how the gate failed the first
+    two deploys it ever ran, both times as a false negative.
+    """
+    script = COMPOSE_UP.read_text(encoding="utf-8")
+    assert 'printenv "$variable" 2>/dev/null < /dev/null' in script
+
+    # And end to end: a deployment where both services answer must pass, which
+    # it cannot do if only one of them is ever asked.
+    _calls, completed = run_wrapper(tmp_path, connection_id="")
+    assert completed.returncode == 0, completed.stderr
+    assert "2 declared component settings are live" in completed.stdout

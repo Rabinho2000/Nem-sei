@@ -1,0 +1,45 @@
+{
+  "_comment": [
+    "The components this deployment is made of, and which of them are not",
+    "optional. scripts/v2_compose_up.sh reads this file: it is the wrapper's",
+    "answer to 'which -f files does a canonical deploy carry', so that answer",
+    "lives in the repository instead of in an operator's memory.",
+    "",
+    "Why this file exists: on 2026-08-21 a deploy that ran with only",
+    "docker-compose.v2.yml recreated scheduler and worker without",
+    "docker-compose.v2.diagnostic-incidents.yml, which silently turned the",
+    "incident evaluator off. Nothing failed and nothing logged it; it was found",
+    "by reading schedule_state by hand. On 2026-08-31 the same thing had",
+    "happened again and had been true for hours.",
+    "",
+    "`asserts` is the second half of the fix. Naming the file only guarantees",
+    "compose was told about it; the assertions are checked against the rendered",
+    "configuration *and* against the live container after `up -d`, so a",
+    "component that is declared but did not actually reach the process fails",
+    "the deploy instead of running silently degraded.",
+    "",
+    "Turning a required component off is a deliberate edit: set its ENABLED",
+    "value to \"false\" in its own compose file and change the assertion here to",
+    "match. Dropping the -f flag is no longer a way to do it."
+  ],
+  "base_compose_file": "docker-compose.v2.yml",
+  "components": [
+    {
+      "name": "diagnostic-incidents",
+      "compose_file": "docker-compose.v2.diagnostic-incidents.yml",
+      "required": true,
+      "why": "D1: the periodic diagnostic-incident evaluator. Makes no provider call; without it no incident opens or closes, and nothing downstream of incidents (notifications, digests) has anything to say.",
+      "asserts": [
+        {"service": "scheduler", "variable": "NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED", "value": "true"},
+        {"service": "worker", "variable": "NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED", "value": "true"}
+      ]
+    },
+    {
+      "name": "device-status-canary",
+      "compose_file": "docker-compose.v2.device-status-canary.yml",
+      "required": false,
+      "why": "M7 Fatia 3's day-plus availability canary. Superseded: docker-compose.v2.yml carries the device-status settings for normal operation since the 2026-08-25 cutover, so layering this file would re-point the poll at the canary's own connection and cap. Listed here to record that it is deliberately not part of a canonical deploy.",
+      "asserts": []
+    }
+  ]
+}

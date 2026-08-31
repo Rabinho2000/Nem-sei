@@ -26,11 +26,38 @@ if [[ ${NEMSEI_V2_WORKER_SCALE:-1} != 1 || ${NEMSEI_V2_WORKER_CONCURRENCY:-1} !=
 fi
 
 mkdir -p "$v2_root"
-python3 "$root/scripts/verify_v2_runtime_isolation.py" --v1-data-root "$v1_root" --v2-data-root "$v2_root" --compose-file "$root/docker-compose.v2.yml"
 v2_real=$(realpath -m "$v2_root")
 
-compose=(docker compose --project-name nemsei-v2 --env-file "$env_file" -f "$root/docker-compose.v2.yml")
+# Which compose files a canonical deploy carries is not this script's opinion
+# and not the operator's memory -- it is deploy/v2_deployment_components.json,
+# read here. Before this, the wrapper hardcoded docker-compose.v2.yml alone,
+# so a canonical deploy recreated scheduler and worker *without*
+# docker-compose.v2.diagnostic-incidents.yml and silently turned the incident
+# evaluator off. Nothing failed; the interface went on reporting the automation
+# as running. It happened on 2026-08-21, and it had happened again by
+# 2026-08-31.
+components=(python3 "$root/scripts/v2_deployment_components.py" --root "$root")
+mapfile -t compose_files < <("${components[@]}" compose-files)
+if (( ${#compose_files[@]} == 0 )); then
+  echo "The deployment manifest declared no compose files." >&2
+  exit 1
+fi
+
+compose=(docker compose --project-name nemsei-v2 --env-file "$env_file")
+for compose_file in "${compose_files[@]}"; do
+  compose+=(-f "$root/$compose_file")
+done
+# Isolation is checked against every file the deployment carries, now that
+# there is more than one, rather than against the base file alone.
+isolation_files=()
+for compose_file in "${compose_files[@]}"; do
+  isolation_files+=("$root/$compose_file")
+done
+python3 "$root/scripts/verify_v2_runtime_isolation.py" --v1-data-root "$v1_root" \
+  --v2-data-root "$v2_root" --compose-file "${isolation_files[@]}"
+
 rendered=$("${compose[@]}" config --format json)
+RENDERED_COMPOSE="$rendered" "${components[@]}" check-rendered
 RENDERED_COMPOSE="$rendered" python3 - "$v2_real" <<'PY'
 import json
 import os
@@ -91,6 +118,49 @@ if ! "${compose[@]}" run --rm --no-deps -T \
 fi
 
 "${compose[@]}" up -d web scheduler worker
+
+# `check-rendered` above proved compose was *told* about every required
+# component. This proves each one reached the process that is now running --
+# the case that matters when a service was already up and nothing in the new
+# configuration forced it to be recreated.
+#
+# The read is retried, because `up -d` returns as soon as the container is
+# started and `exec` into one that has not finished starting fails. Found on
+# the first real run of this gate: the scheduler answered and the worker, a
+# second behind it, did not, and the deploy failed over a variable that was in
+# fact correctly set. A container that never answers still fails the check --
+# it just has to actually never answer.
+read_component_value() {
+  local service=$1 variable=$2 deadline value
+  deadline=$((SECONDS + ${NEMSEI_V2_COMPONENT_READY_TIMEOUT_SECONDS:-60}))
+  while :; do
+    # `< /dev/null` is load-bearing: `docker compose exec` reads standard
+    # input, and this loop's standard input is the list of assertions still to
+    # be checked. Without it the first `exec` swallowed the rest of the list,
+    # the loop ended after one service, and the second was reported as running
+    # without a variable it had -- which is exactly how this gate failed the
+    # first two deploys it ever ran.
+    if value=$("${compose[@]}" exec -T "$service" printenv "$variable" 2>/dev/null < /dev/null); then
+      printf '%s' "$value" | tr -d '\r' | head -n 1
+      return 0
+    fi
+    (( SECONDS >= deadline )) && return 1
+    sleep 2
+  done
+}
+
+observations=$(while IFS=$'\t' read -r service variable _expected; do
+  [[ -n $service ]] || continue
+  # `printenv` exits non-zero for a variable the container does not define, and
+  # so does `exec` into a container that is not there at all; both end up as a
+  # line with no value, which check-live reports as "running without".
+  if value=$(read_component_value "$service" "$variable") && [[ -n $value ]]; then
+    printf '%s\t%s\t%s\n' "$service" "$variable" "$value"
+  else
+    printf '%s\t%s\n' "$service" "$variable"
+  fi
+done < <("${components[@]}" assertions))
+printf '%s\n' "$observations" | "${components[@]}" check-live
 
 # The listener joins the same deployment, and its health is a deploy gate: a
 # deployment that declares SCADA and ends without a listener has lost readings
