@@ -1,10 +1,22 @@
 name: V2 CI
 
+# The push trigger named only `rewrite/v2`, which stopped being where V2 is
+# written some time ago. Every commit on `v2/report-assembler` -- the migration
+# chain repair, the SCADA deploy gate, the backup timer -- landed without CI
+# ever running on the branch it landed on. `v2/**` covers the ones after it too.
 on:
-  pull_request:
   push:
     branches:
       - rewrite/v2
+      - "v2/**"
+  pull_request:
+    branches:
+      - main
+      - rewrite/v2
+      - "v2/**"
+  # So the structural gate can be re-run against a branch without inventing a
+  # commit to carry it.
+  workflow_dispatch:
 
 jobs:
   v2:
@@ -34,8 +46,74 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements-v2-dev.lock
       - run: python -m pip check
-      - run: python -m ruff check src/nemsei tests_v2 migrations
+      # `scripts/` is linted too: the deploy and backup helpers live there, and
+      # they are as load-bearing as anything under src/.
+      - run: python -m ruff check src/nemsei tests_v2 migrations scripts
       - run: python -m compileall src/nemsei
+
+      # The migration graph, proved the way a new clone meets it: an empty
+      # database, no fixtures, nothing already applied. `tests_v2` migrates too,
+      # but always into a database its own fixtures made, so a graph that only
+      # works from that starting point would still pass. This is the check that
+      # was missing when 0026 was absent from git for a week.
+      - name: Alembic reaches a single head on an empty database
+        env:
+          NEMSEI_V2_DATABASE_URL: postgresql+psycopg://nemsei:nemsei-test@127.0.0.1:5432/nemsei_v2_alembic_gate
+          NEMSEI_V2_ENV: test
+          NEMSEI_V2_SECRET_KEY: alembic-gate-not-a-secret
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from sqlalchemy import create_engine, text
+          from sqlalchemy.engine import make_url
+
+          url = make_url(os.environ["NEMSEI_V2_DATABASE_URL"])
+          admin = create_engine(url.set(database="postgres"), isolation_level="AUTOCOMMIT")
+          with admin.connect() as connection:
+              connection.execute(text(f'DROP DATABASE IF EXISTS "{url.database}"'))
+              connection.execute(text(f'CREATE DATABASE "{url.database}"'))
+          with create_engine(url).connect() as connection:
+              tables = connection.execute(
+                  text("SELECT count(*) FROM pg_tables WHERE schemaname = 'public'")
+              ).scalar_one()
+          if tables:
+              raise SystemExit(f"the gate database is not empty: {tables} tables")
+          print("gate database created, 0 tables")
+          PY
+          alembic upgrade head
+          # Printed for the log; the resolver below is what fails the build.
+          alembic heads
+          # The models and the migrated schema agree. Without it, a table no
+          # committed model describes invites `--autogenerate` to write a
+          # migration that drops it.
+          alembic check
+          python - <<'PY'
+          import importlib.util
+          import os
+
+          from sqlalchemy import create_engine, text
+
+          spec = importlib.util.spec_from_file_location(
+              "v2_resolve_alembic_head", "scripts/v2_resolve_alembic_head.py"
+          )
+          resolver = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(resolver)
+
+          with create_engine(os.environ["NEMSEI_V2_DATABASE_URL"]).connect() as connection:
+              live = connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+          # Raises on no head, on more than one, and on a schema that did not
+          # arrive at the head this checkout declares.
+          head = resolver.resolve_single_head("alembic.ini")
+          resolver.validate_live_revision(live, head)
+          print(f"empty database reached {head}")
+          PY
+
+      # Everything here runs against fixtures, fakes and the local PostgreSQL
+      # service. No provider credential, no Telegram token, no dongle and no V1
+      # server: the tests that would need those skip themselves, and the ones
+      # that check deployment shape drive a recording `docker` instead.
       - run: python -m pytest -q tests_v2
+
       - run: bash scripts/run_docker_recovery_acceptance.sh
       - run: bash scripts/run_postgres_operations_acceptance.sh
