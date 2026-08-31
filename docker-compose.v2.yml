@@ -321,6 +321,11 @@ services:
 volumes:
   nemsei-v2-postgres-data:
 
+# Every path here is overridable, and every default is the production one.
+# A clean checkout has none of these files -- they are deliberately not in git --
+# so a compose file that named them directly could not start a single service on
+# a CI runner, whatever the service actually needed. The acceptance scripts point
+# them at empty placeholders; nothing reads a credential it was not given.
 secrets:
   v2_database_url:
     file: ${NEMSEI_V2_DATABASE_URL_SECRET_FILE:?set NEMSEI_V2_DATABASE_URL_SECRET_FILE}
@@ -330,20 +335,20 @@ secrets:
   # credential itself -- just the bearer token for the narrow lease API in
   # docker-compose.v1-ownership-broker.yml.
   v1_broker_token:
-    file: ./runtime/fusionsolar_ownership_broker/token.secret
+    file: ${NEMSEI_V2_V1_BROKER_TOKEN_SECRET_FILE:-./runtime/fusionsolar_ownership_broker/token.secret}
   # The one shared FusionSolar account's credential, per
   # docs/v2/FUSIONSOLAR_OWNERSHIP_WINDOW.md -- same account V1 uses,
   # coordinated through the ownership broker rather than a second account.
   fusionsolar_primary_username:
-    file: ./secrets/fusionsolar_primary_username
+    file: ${NEMSEI_V2_FUSIONSOLAR_USERNAME_SECRET_FILE:-./secrets/fusionsolar_primary_username}
   fusionsolar_primary_password:
-    file: ./secrets/fusionsolar_primary_password
+    file: ${NEMSEI_V2_FUSIONSOLAR_PASSWORD_SECRET_FILE:-./secrets/fusionsolar_primary_password}
   # D4: o token do bot de Telegram. Sem este segredo montado,
   # notifications/telegram_client.py devolve o mock e o processo nao consegue
   # enviar nada -- e a garantia que substituiu o "nao existe codigo HTTP" do D3.
   telegram_bot_token:
-    file: ./secrets/telegram_bot_token
+    file: ${NEMSEI_V2_TELEGRAM_BOT_TOKEN_SECRET_FILE:-./secrets/telegram_bot_token}
   sigenergy_primary_app_key:
-    file: ./secrets/sigenergy_primary_app_key
+    file: ${NEMSEI_V2_SIGENERGY_APP_KEY_SECRET_FILE:-./secrets/sigenergy_primary_app_key}
   sigenergy_primary_app_secret:
-    file: ./secrets/sigenergy_primary_app_secret
+    file: ${NEMSEI_V2_SIGENERGY_APP_SECRET_SECRET_FILE:-./secrets/sigenergy_primary_app_secret}

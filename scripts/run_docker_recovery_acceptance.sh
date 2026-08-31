@@ -15,12 +15,27 @@ trap cleanup EXIT
 mkdir -p "$temp_root/v1-data" "$temp_root/v2-data" "$temp_root/secrets"
 printf '%s' 'nemsei-acceptance' > "$temp_root/secrets/postgres_password"
 printf '%s' 'postgresql+psycopg://nemsei:nemsei-acceptance@postgres:5432/nemsei_v2' > "$temp_root/secrets/database_url"
+# Empty stand-ins for the provider credentials. Compose bind-mounts every
+# secret a service declares whether or not the run will read one, so without
+# these files nothing starts on a clean checkout. Empty is the point: an
+# acceptance run that could authenticate against a real provider would be
+# testing the provider.
+for placeholder in v1_broker_token fusionsolar_username fusionsolar_password \
+    telegram_bot_token sigenergy_app_key sigenergy_app_secret; do
+  : > "$temp_root/secrets/$placeholder"
+done
 printf '%s\n' \
   NEMSEI_V2_ENV=test \
   NEMSEI_V2_ENV_FILE=$env_file \
   NEMSEI_V2_HOST_DATA_ROOT=$temp_root/v2-data \
   NEMSEI_V2_DATABASE_URL_SECRET_FILE=$temp_root/secrets/database_url \
   NEMSEI_V2_POSTGRES_PASSWORD_SECRET_FILE=$temp_root/secrets/postgres_password \
+  NEMSEI_V2_V1_BROKER_TOKEN_SECRET_FILE=$temp_root/secrets/v1_broker_token \
+  NEMSEI_V2_FUSIONSOLAR_USERNAME_SECRET_FILE=$temp_root/secrets/fusionsolar_username \
+  NEMSEI_V2_FUSIONSOLAR_PASSWORD_SECRET_FILE=$temp_root/secrets/fusionsolar_password \
+  NEMSEI_V2_TELEGRAM_BOT_TOKEN_SECRET_FILE=$temp_root/secrets/telegram_bot_token \
+  NEMSEI_V2_SIGENERGY_APP_KEY_SECRET_FILE=$temp_root/secrets/sigenergy_app_key \
+  NEMSEI_V2_SIGENERGY_APP_SECRET_SECRET_FILE=$temp_root/secrets/sigenergy_app_secret \
   NEMSEI_V2_SECRET_KEY=acceptance-secret \
   NEMSEI_V2_ADMIN_USERNAME=admin \
   NEMSEI_V2_ADMIN_PASSWORD_HASH= \

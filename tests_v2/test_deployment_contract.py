@@ -225,6 +225,23 @@ def test_production_compose_uses_private_pinned_postgres() -> None:
     assert "Nem-sei/data" not in compose
 
 
+def test_every_compose_secret_path_can_be_redirected() -> None:
+    """A clean checkout has none of these files, and CI must not need them.
+
+    Compose bind-mounts every secret a service declares, whether or not the run
+    reads one, so a hardcoded `./secrets/...` path stops a CI runner from
+    starting any service at all -- which is exactly how the Docker recovery
+    acceptance failed the first time this workflow ran on a real runner.
+    """
+    compose = (ROOT / "docker-compose.v2.yml").read_text(encoding="utf-8")
+    block = compose.split("\nsecrets:\n", 1)[1]
+    # Not `\S+`: the two required ones carry a `:?message` with a space in it.
+    paths = re.findall(r"^\s*file:\s*(.+?)\s*$", block, re.MULTILINE)
+    assert len(paths) == 8, paths
+    for path in paths:
+        assert path.startswith("${"), f"{path} cannot be redirected away from the repository"
+
+
 def test_canonical_deployment_validates_before_starting_roles() -> None:
     script = (ROOT / "scripts/v2_compose_up.sh").read_text(encoding="utf-8")
     preflight = script.index("verify_v2_runtime_isolation.py")
