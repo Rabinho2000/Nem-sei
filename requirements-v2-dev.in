@@ -1,3 +1,8 @@
 -r requirements-v2.lock
 pytest==9.1.1
 ruff==0.16.3
+# Reads back the pages of a rendered PDF, which is how tests_v2/test_pdf_golden.py
+# compares a V2 report against V1 page by page. Without it that whole module was
+# skipped by its module-level importorskip, and the single skip in an otherwise
+# green 1115-test run was the PDF golden not running at all.
+pypdf==6.16.2

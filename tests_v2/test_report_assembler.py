@@ -81,6 +81,21 @@ def add_fact(session, asset_id, mapping_id, day: date, value, *, key=None, quali
     )
 
 
+def add_whole_month(session, asset_id, mapping_id, year: int, month: int, value="10"):
+    """Every day of a month, so the period is genuinely final.
+
+    A test that wants to exercise what a *closed* report says has to say so with
+    days, because that is what closes a period now (`reporting/finality.py`).
+    Before, one fact in a month was enough to make `production_is_final` true,
+    and several tests were unknowingly asserting against a report that claimed
+    to be final on a thirty-first of the evidence.
+    """
+    from calendar import monthrange
+
+    for day in range(1, monthrange(year, month)[1] + 1):
+        add_fact(session, asset_id, mapping_id, date(year, month, day), value)
+
+
 def test_a_corrected_reading_replaces_the_original_instead_of_adding_to_it(prepared) -> None:
     """The shape of the only real data V2 holds: one day, corrected once.
 
@@ -123,10 +138,17 @@ def test_a_superseded_revision_does_not_inflate_the_dataset_row(prepared) -> Non
 def test_an_unsourced_field_is_absent_rather_than_zero(prepared) -> None:
     factory, (asset_id, mapping_id) = prepared
     with factory() as session, session.begin():
-        add_fact(session, asset_id, mapping_id, date(2026, 7, 24), "59.56")
+        # A complete July, so this is testing what an unsourced metric does in a
+        # *final* report rather than what a provisional one withholds.
+        add_whole_month(session, asset_id, mapping_id, 2026, 7, "59.56")
         assembled = assemble_asset_report(
-            session, asset_id=asset_id, period=monthly_period("2026-07"), built_by="operator"
+            session,
+            asset_id=asset_id,
+            period=monthly_period("2026-07"),
+            built_by="operator",
+            today=date(2026, 8, 31),
         )
+    assert assembled.payload["reporting_state"] == "final"
 
     for name in ("self_use_kwh", "export_kwh", "consumption_kwh"):
         assert assembled.payload[name] is None, f"{name} must stay missing, not become zero"
@@ -141,6 +163,69 @@ def test_an_unsourced_field_is_absent_rather_than_zero(prepared) -> None:
     # And the gap is declared on the payload itself, not only on the result.
     assert "tariff_value_eur" in assembled.payload["unavailable_fields"]
     assert "asset.contract_type" in assembled.payload["unavailable_fields"]
+
+
+def test_a_month_short_of_days_states_no_money_at_all(prepared) -> None:
+    """Expertcom's August, in miniature: 26 of 31 days, five of them absent.
+
+    The energy is reported, because it was measured. Every euro is withheld,
+    because a customer is not invoiced from five-sixths of a month -- and the
+    difference between "0,00 €" and "not calculable yet" is the whole point.
+    """
+    factory, (asset_id, mapping_id) = prepared
+    with factory() as session, session.begin():
+        for day in range(1, 32):
+            if day in {19, 20, 21, 22, 23}:
+                continue
+            add_fact(session, asset_id, mapping_id, date(2026, 8, day), "100")
+        assembled = assemble_asset_report(
+            session,
+            asset_id=asset_id,
+            period=monthly_period("2026-08"),
+            built_by="operator",
+            today=date(2026, 9, 4),
+        )
+
+    payload = assembled.payload
+    assert payload["reporting_state"] == "provisional"
+    assert payload["production_is_final"] is False
+    assert payload["observed_source_days"] == 26
+    assert payload["expected_source_days"] == 31
+    assert payload["missing_source_days"] == [f"2026-08-{day}" for day in range(19, 24)]
+    # Measured energy still reaches the report.
+    assert payload["production_kwh"] == pytest.approx(2600.0)
+    # No euro does.
+    for name in ("savings_eur", "export_revenue_eur", "solcor_payment_eur", "net_benefit_eur"):
+        assert payload[name] is None, f"{name} must not be stated for a provisional month"
+
+
+def test_the_last_day_of_a_running_month_is_provisional_even_when_nothing_is_missing(prepared) -> None:
+    """The rule the calendar alone would get wrong, in the direction that matters."""
+    factory, (asset_id, mapping_id) = prepared
+    with factory() as session, session.begin():
+        add_whole_month(session, asset_id, mapping_id, 2026, 8, "100")
+        running = assemble_asset_report(
+            session,
+            asset_id=asset_id,
+            period=monthly_period("2026-08"),
+            built_by="operator",
+            today=date(2026, 8, 31),
+        )
+        closed = assemble_asset_report(
+            session,
+            asset_id=asset_id,
+            period=monthly_period("2026-08"),
+            built_by="operator",
+            today=date(2026, 9, 1),
+        )
+
+    assert running.payload["reporting_state"] == "provisional"
+    assert "period_still_open" in running.payload["reporting_state_reasons"]
+    assert closed.payload["reporting_state"] == "final"
+    # Same facts, different answer, therefore a different report identity.
+    assert running.payload["production_kwh"] == closed.payload["production_kwh"]
+    assert running.payload["savings_eur"] is None
+    assert closed.payload["savings_eur"] is not None
 
 
 def test_a_real_zero_is_kept_apart_from_a_missing_month(prepared) -> None:
@@ -259,14 +344,21 @@ def test_a_zero_percent_donut_renders_instead_of_crashing(prepared) -> None:
     """
     factory, (asset_id, mapping_id) = prepared
     with factory() as session, session.begin():
-        add_fact(session, asset_id, mapping_id, date(2026, 7, 10), "100")
+        add_whole_month(session, asset_id, mapping_id, 2026, 7, "100")
         assembled = assemble_asset_report(
-            session, asset_id=asset_id, period=monthly_period("2026-07"), built_by="operator"
+            session,
+            asset_id=asset_id,
+            period=monthly_period("2026-07"),
+            built_by="operator",
+            today=date(2026, 8, 31),
         )
         payload = assembled.payload
 
     # The zero arrives through self-sufficiency: self-use over a consumption
-    # V2 cannot source, so the ratio is a real 0 % rather than an unknown.
+    # V2 cannot source, so the ratio is a real 0 % rather than an unknown. It
+    # only reaches the payload at all on a final period -- a provisional one
+    # withholds every ratio along with the money -- so the month is complete.
+    assert payload["reporting_state"] == "final"
     assert payload["self_sufficiency_pct"] == 0
     pdf_bytes = build_customer_report_pdf(payload)
     assert pdf_bytes[:5] == b"%PDF-"

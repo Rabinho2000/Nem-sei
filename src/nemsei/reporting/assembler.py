@@ -19,11 +19,21 @@ decide EPC against ESCO. Every such field is emitted as `None` and named in
 which numbers are absent instead of reading a zero that looks like a
 measurement. `datasets.py` makes the same distinction at the row level.
 
-Note that `prepare_customer_report` still computes the *derived* monetary fields
-from those absent inputs, and will therefore produce `0.00 €` for savings and
-export revenue. That is V1's own behaviour given the same payload and it is left
-alone: parity is the requirement, and diverging here would break the golden
-tests that prove the renderers agree.
+## Provisional against final, and why no euro appears until it is final
+
+`prepare_customer_report` computes the derived monetary fields from whatever
+energy it is given, and then withholds every one of them -- savings, export
+revenue, the Solcor payment, the net benefit -- unless `production_is_final`.
+That guard was always there; what was wrong was the flag feeding it, which
+answered "did each month total to something?" and so called a still-running
+August with five missing days final. `finality.py` now answers the question the
+guard was asking, and the payload carries `reporting_state` (`final`,
+`provisional` or `blocked`) alongside the days behind it, so a reader never has
+to infer the difference from a number that happens to be present.
+
+A provisional period therefore reports energy and reports no money. That is the
+intended reading: a customer is not invoiced from a month that is still being
+collected, and `0,00 €` and "not calculable yet" must never look alike.
 """
 from __future__ import annotations
 
@@ -48,6 +58,7 @@ from nemsei.reporting.commercial import (
     tariff_price_summary,
 )
 from nemsei.reporting.datasets import DATASET_METRICS, build_dataset
+from nemsei.reporting.finality import evaluate_period_finality
 from nemsei.reporting.models import ReportingDataset, ReportingDatasetRow
 from nemsei.reporting.periods import exclusive_end
 from nemsei.reporting.rules.types import BillingConfig, ReportPeriodType, ReportingPeriod
@@ -188,7 +199,13 @@ def monthly_rows_for(dataset_rows: list[ReportingDatasetRow]) -> list[dict[str, 
     ]
 
 
-def aggregate_rows(dataset_rows: list[ReportingDatasetRow], daily_rows: list[dict[str, Any]]) -> dict[str, Any]:
+def aggregate_rows(
+    dataset_rows: list[ReportingDatasetRow],
+    daily_rows: list[dict[str, Any]],
+    *,
+    period: ReportingPeriod | None = None,
+    today: date | None = None,
+) -> dict[str, Any]:
     """Total a period without ever turning an absent month into a zero."""
     measured = [row for row in dataset_rows if row.actual_state != "missing" and row.actual_production_kwh is not None]
     months_with_data = [row.period_start.strftime("%Y-%m") for row in measured]
@@ -225,8 +242,25 @@ def aggregate_rows(dataset_rows: list[ReportingDatasetRow], daily_rows: list[dic
     else:
         production_status = "complete"
 
+    # Whether the period is *closed*, which months alone cannot answer. See
+    # `finality.py`: a month with 25 of its 31 daily facts totals to a number
+    # and reads as "measured" here, and on the last day of that month the
+    # month has not ended anyway. Both are reasons a report must not state
+    # euros yet, and `prepare_customer_report` already withholds every
+    # monetary field when `production_is_final` is False -- it was only ever
+    # being told the wrong thing.
+    finality = evaluate_period_finality(
+        period_start=period.start if period is not None else dataset_rows[0].period_start,
+        period_end_exclusive=exclusive_end(period) if period is not None else dataset_rows[-1].period_end,
+        daily_rows=daily_rows,
+        today=today or date.today(),
+        months_missing_entirely=missing_months,
+        has_partial_month=partial,
+    )
+
     return {
         **metric_totals,
+        **finality.as_payload(),
         "production_kwh": _float_or_none(total),
         "expected_production_kwh": _float_or_none(expected_total),
         "raw_daily_total_kwh": sum(daily_values) if daily_values else None,
@@ -235,8 +269,10 @@ def aggregate_rows(dataset_rows: list[ReportingDatasetRow], daily_rows: list[dic
         "months_requiring_fallback": [],
         "coverage_pct": coverage_pct,
         "production_status": production_status,
-        # A period is final only when every month it covers is measured.
-        "production_is_final": bool(measured) and not missing_months and not partial,
+        # A period is final only when it has ended and every source day it
+        # covers is measured. "Every month totalled to something" was the old
+        # rule and it called a half-collected, still-running August final.
+        "production_is_final": finality.is_final,
         "monthly_production_quality": {
             row.period_start.strftime("%Y-%m"): row.actual_state for row in dataset_rows
         },
@@ -251,8 +287,15 @@ def assemble_asset_report(
     built_by: str,
     billing_config: BillingConfig | None = None,
     dataset: ReportingDataset | None = None,
+    today: date | None = None,
 ) -> AssembledReport:
-    """Build one asset's report payload from persisted facts alone."""
+    """Build one asset's report payload from persisted facts alone.
+
+    `today` decides only whether the period has ended. It is a parameter rather
+    than a `date.today()` call so a test can pin the answer, and so a caller
+    re-evaluating an old month months later gets the same answer it would have
+    got from the calendar at any point after that month closed.
+    """
     asset = session.get(Asset, asset_id)
     if asset is None:
         raise ValueError("Unknown asset.")
@@ -275,7 +318,7 @@ def assemble_asset_report(
         )
     dataset_rows = sorted(dataset.rows, key=lambda row: row.period_start)
     daily_rows = daily_rows_for(session, asset_id=asset_id, period=period)
-    aggregate = aggregate_rows(dataset_rows, daily_rows)
+    aggregate = aggregate_rows(dataset_rows, daily_rows, period=period, today=today)
 
 
     unavailable = list(TARIFF_SPLIT_FIELDS_WITHOUT_SOURCE + AVAILABILITY_FIELDS_WITHOUT_SOURCE)
@@ -327,6 +370,15 @@ def assemble_asset_report(
         "raw_daily_total_kwh": aggregate["raw_daily_total_kwh"],
         "production_quality_status": aggregate["production_status"],
         "production_is_final": aggregate["production_is_final"],
+        # The same answer an operator reads, carried in the payload so a frozen
+        # snapshot still states what it was when it was frozen.
+        "reporting_state": aggregate["reporting_state"],
+        "reporting_state_reasons": aggregate["reporting_state_reasons"],
+        "period_has_ended": aggregate["period_has_ended"],
+        "expected_source_days": aggregate["expected_source_days"],
+        "observed_source_days": aggregate["observed_source_days"],
+        "missing_source_days": aggregate["missing_source_days"],
+        "day_coverage_pct": aggregate["day_coverage_pct"],
         "monthly_production_quality": aggregate["monthly_production_quality"],
         "warnings": list(dataset.warnings_json or []),
         "data_source": "V2 canonical facts",

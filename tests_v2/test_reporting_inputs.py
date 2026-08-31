@@ -79,28 +79,45 @@ def add(session, asset_id, mapping_id, day: date, metric: str, value, *, quality
     )
 
 
+def add_whole_month(session, asset_id, mapping_id, year, month, values):
+    """Every day of a month, every metric, so the period is genuinely final.
+
+    A test asserting what a *closed* report states -- money, ratios, derived
+    grid import -- has to give the month all of its days, because that is what
+    closes a period (`reporting/finality.py`). Two days out of thirty-one make a
+    provisional report, and a provisional report deliberately states no euros.
+    """
+    from calendar import monthrange
+
+    metrics = ("production_energy", "self_use_energy", "export_energy",
+               "consumption_energy", "grid_import_energy")
+    for day in range(1, monthrange(year, month)[1] + 1):
+        for metric, value in zip(metrics, values, strict=True):
+            add(session, asset_id, mapping_id, date(year, month, day), metric, value)
+
+
 # --- the energy metrics -----------------------------------------------------
 
 
 def test_every_metric_reaches_the_payload_from_its_own_facts(prepared) -> None:
     factory, (asset_id, mapping_id) = prepared
     with factory() as session, session.begin():
-        day = date(2026, 7, 10)
-        add(session, asset_id, mapping_id, day, "production_energy", "100")
-        add(session, asset_id, mapping_id, day, "self_use_energy", "70")
-        add(session, asset_id, mapping_id, day, "export_energy", "30")
-        add(session, asset_id, mapping_id, day, "consumption_energy", "250")
-        add(session, asset_id, mapping_id, day, "grid_import_energy", "180")
+        add_whole_month(session, asset_id, mapping_id, 2026, 7, ("100", "70", "30", "250", "180"))
         assembled = assemble_asset_report(
-            session, asset_id=asset_id, period=monthly_period("2026-07"), built_by="operator"
+            session,
+            asset_id=asset_id,
+            period=monthly_period("2026-07"),
+            built_by="operator",
+            today=date(2026, 8, 31),
         )
         payload = assembled.payload
 
-    assert payload["production_kwh"] == pytest.approx(100.0)
-    assert payload["self_use_kwh"] == pytest.approx(70.0)
-    assert payload["export_kwh"] == pytest.approx(30.0)
-    assert payload["consumption_kwh"] == pytest.approx(250.0)
-    assert payload["grid_import_kwh"] == pytest.approx(180.0)
+    assert payload["reporting_state"] == "final"
+    assert payload["production_kwh"] == pytest.approx(3100.0)
+    assert payload["self_use_kwh"] == pytest.approx(2170.0)
+    assert payload["export_kwh"] == pytest.approx(930.0)
+    assert payload["consumption_kwh"] == pytest.approx(7750.0)
+    assert payload["grid_import_kwh"] == pytest.approx(5580.0)
     # Nothing that has a fact may still be declared unavailable.
     for name in ("self_use_kwh", "export_kwh", "consumption_kwh", "grid_import_kwh"):
         assert name not in payload["unavailable_fields"]
@@ -361,24 +378,20 @@ def test_a_complete_report_renders_from_persisted_inputs_alone(prepared) -> None
             },
             source_kind="v1_import", created_by="operator",
         )
-        for day, values in (
-            (date(2026, 7, 10), ("100", "70", "30", "250", "180")),
-            (date(2026, 7, 11), ("120", "80", "40", "260", "180")),
-        ):
-            for metric, value in zip(
-                ("production_energy", "self_use_energy", "export_energy",
-                 "consumption_energy", "grid_import_energy"),
-                values, strict=True,
-            ):
-                add(session, asset_id, mapping_id, day, metric, value)
+        add_whole_month(session, asset_id, mapping_id, 2026, 7, ("110", "75", "35", "255", "180"))
         assembled = assemble_asset_report(
-            session, asset_id=asset_id, period=monthly_period("2026-07"), built_by="operator"
+            session,
+            asset_id=asset_id,
+            period=monthly_period("2026-07"),
+            built_by="operator",
+            today=date(2026, 8, 31),
         )
         payload = assembled.payload
 
-    assert payload["production_kwh"] == pytest.approx(220.0)
-    assert payload["self_use_kwh"] == pytest.approx(150.0)
-    assert payload["export_kwh"] == pytest.approx(70.0)
+    assert payload["reporting_state"] == "final"
+    assert payload["production_kwh"] == pytest.approx(3410.0)
+    assert payload["self_use_kwh"] == pytest.approx(2325.0)
+    assert payload["export_kwh"] == pytest.approx(1085.0)
     assert payload["report_type"] == "esco"
     assert payload["tariff_type"] == "tetra-hourly"
     assert len(payload["tariff_period_breakdown"]) == 4
@@ -396,9 +409,9 @@ def test_a_complete_report_renders_from_persisted_inputs_alone(prepared) -> None
     workbook = build_asset_report_workbook(excel_payload_from_report(payload))
     energy = workbook["Energia"]
     values = {energy.cell(row, 1).value: energy.cell(row, 2).value for row in range(3, 8)}
-    assert values["production_kwh"] == "220.00"
-    assert values["self_use_kwh"] == "150.00"
-    assert values["consumption_kwh"] == "510.00"
+    assert values["production_kwh"] == "3410.00"
+    assert values["self_use_kwh"] == "2325.00"
+    assert values["consumption_kwh"] == "7905.00"
 
 
 def test_a_replacement_may_not_start_before_the_row_it_replaces(prepared) -> None:
