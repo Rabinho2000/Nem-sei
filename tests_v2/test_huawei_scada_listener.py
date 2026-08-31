@@ -320,13 +320,88 @@ def test_exactly_one_service_publishes_the_scada_port() -> None:
     assert "SCADA_BIND_ADDRESS" in publications[0]
 
 
+# --- the listener's place in the canonical deploy -----------------------------
+#
+# Two failures pull in opposite directions and both are real. Starting the
+# listener by accident opens this system's only inbound port on a deployment
+# that never asked for it. Leaving it out of the deploy -- which is what the
+# profile did until now -- means the listener serves a build older than
+# everything around it, for as long as nobody looks. The wrapper has to be
+# guarded, not absent, so these tests check the guard rather than the absence.
+
+
+def compose_up_script() -> str:
+    """The wrapper, with heredoc bodies removed.
+
+    The runtime-isolation check is Python inlined in a heredoc, and its `if`
+    statements have no `fi`; leaving them in would desynchronise the block
+    tracking below.
+    """
+    lines = (ROOT / "scripts/v2_compose_up.sh").read_text(encoding="utf-8").splitlines()
+    kept, inside = [], False
+    for line in lines:
+        if not inside and "<<'PY'" in line:
+            inside = True
+            continue
+        if inside:
+            inside = line.strip() != "PY"
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def guarded_by_declaration(script: str, index: int) -> bool:
+    """True when line `index` sits inside an `if [[ $scada_declared == true ]]`."""
+    stack: list[bool] = []
+    for line in script.splitlines()[:index]:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if stripped.startswith("if ") or stripped.startswith("if\t"):
+            stack.append("$scada_declared == true" in stripped)
+        elif stripped == "fi" and stack:
+            stack.pop()
+    return any(stack)
+
+
 def test_the_listener_does_not_start_with_the_ordinary_deployment() -> None:
-    """Turning on an inbound port has to be a deliberate act."""
+    """Turning on an inbound port is still a deliberate act."""
     compose = (ROOT / "docker-compose.v2.yml").read_text(encoding="utf-8")
     listener_block = compose.split("  scada-listener:", 1)[1]
     assert 'profiles: ["huawei-scada"]' in listener_block
-    startup = (ROOT / "scripts/v2_compose_up.sh").read_text(encoding="utf-8")
-    assert "scada-listener" not in startup
+    script = compose_up_script()
+    # The ordinary roles start without it, always.
+    ordinary = [line for line in script.splitlines() if "up -d web scheduler worker" in line]
+    assert ordinary and all("scada-listener" not in line for line in ordinary)
+    # And nothing touches the listener outside a declaration guard.
+    for index, line in enumerate(script.splitlines()):
+        if "scada-listener" in line and not line.strip().startswith("#"):
+            assert guarded_by_declaration(script, index), f"ungated: {line.strip()}"
+
+
+def test_the_canonical_deploy_does_not_ignore_a_declared_scada() -> None:
+    """The regression this wrapper change exists to prevent.
+
+    Before it, `v2_compose_up.sh` never named the listener at all, so a SCADA
+    deployment shipped new code everywhere except the one service holding an
+    open socket. Each of these four is a separate way to fall back into that:
+    not asking, not building, not starting, or starting and not checking.
+    """
+    script = compose_up_script()
+    assert "v2_scada_deployment_intent.py" in script
+    assert "build scada-listener" in script
+    assert "up -d scada-listener" in script
+    # A declared listener that does not come up fails the deploy.
+    check = script.index("up -d scada-listener")
+    assert "exit 1" in script[check:]
+
+
+def test_the_listener_is_built_before_it_is_started() -> None:
+    """Same rule the migrate image taught: never start an image you did not build."""
+    script = compose_up_script()
+    assert script.index("build scada-listener") < script.index("up -d scada-listener")
+    # And after the migration gate, like every other role.
+    assert script.index("--live-revision") < script.index("up -d scada-listener")
 
 
 @pytest.mark.parametrize(
