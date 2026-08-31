@@ -74,6 +74,26 @@ x-v2-fusionsolar-environment: &v2-fusionsolar-environment
   NEMSEI_V2_DEVICE_STATUS_POLL_CONNECTION_ID: "3"
   NEMSEI_V2_DEVICE_STATUS_POLL_INTERVAL_MINUTES: "30"
   NEMSEI_V2_DEVICE_STATUS_POLL_MAX_CYCLES: "1443"
+  # 2026-08-25: estado das centrais. A sonda de dispositivos acima cobre 2
+  # inversores de UMA estacao; isto cobre as 134 centrais mapeadas, que e a
+  # pergunta que o alerta de queda precisa e a que a V1 respondia e a V2 nao.
+  #
+  # Custo medido, nao estimado: uma corrida manual a 2026-08-25 leu 134
+  # centrais em 2 chamadas em lote (o endpoint aceita 100 por chamada) mais um
+  # login em cache -- 132 aceites, 104 operacionais, 24 sem comunicacao, 3 em
+  # avaria. A 15 minutos sao ~8 chamadas/hora para a frota inteira, menos do
+  # que a sonda de dispositivos gasta em 2 inversores.
+  #
+  # E uma faixa de limite separada: provider_request_states conta por familia
+  # de endpoint, e `current_monitoring` da ligacao 3 nao tem cooldown nenhum,
+  # enquanto quem apanha rate_limited hoje e `device_discovery` e
+  # `device_current_monitoring`. Isto nao compete com o orcamento da sonda.
+  #
+  # Sem cap vitalicio, ao contrario da sonda: nao e um canario com fim
+  # marcado, e a capacidade de que depende o alerta de queda.
+  NEMSEI_V2_CURRENT_MONITORING_SCHEDULER_ENABLED: "true"
+  NEMSEI_V2_CURRENT_MONITORING_SCHEDULER_CONNECTION_ID: "3"
+  NEMSEI_V2_CURRENT_MONITORING_SCHEDULER_INTERVAL_MINUTES: "15"
 
 # Notificacoes (D4, 2026-08-25). Ancora separada da do FusionSolar de proposito:
 # nada disto e uma chamada a provider, e misturar as duas faria um leitor futuro
@@ -114,6 +134,56 @@ x-v2-sigenergy-environment: &v2-sigenergy-environment
   # outros dois nunca foram aprovados pelo cliente no onboarding do V1.
   NEMSEI_V2_SIGENERGY_SYNC_SCHEDULER_ENABLED: "true"
   NEMSEI_V2_SIGENERGY_SYNC_SCHEDULER_CONNECTION_ID: "5"
+  # Estado das centrais, mesma cadencia da conta FusionSolar mas interruptor
+  # proprio -- conta separada, limites separados. Uma chamada por central (o
+  # energyFlow nao aceita lote), portanto 2 chamadas por ciclo hoje.
+  # O energyFlow nao traz campo de estado nenhum: o `operational` vem da
+  # potencia gerada, e a noite fica `unknown` sem gerar incidente.
+  NEMSEI_V2_SIGENERGY_CURRENT_MONITORING_SCHEDULER_ENABLED: "true"
+  NEMSEI_V2_SIGENERGY_CURRENT_MONITORING_SCHEDULER_CONNECTION_ID: "5"
+  NEMSEI_V2_SIGENERGY_CURRENT_MONITORING_SCHEDULER_INTERVAL_MINUTES: "15"
+
+# Huawei SCADA (docs/v2/HUAWEI_SCADA.md). Ancora separada porque este provider
+# nao se parece com nenhum dos outros: nao ha conta, nao ha credencial e nao ha
+# chamada de saida nenhuma. O SDongle e que liga a este servidor, e o servidor
+# responde com leituras Modbus. Nao ha edge collector, nao ha Pinggy, nao ha
+# socat -- o unico caminho e o NAT do router para a porta publicada abaixo.
+#
+# Estas variaveis descrevem o *contrato verificado* dos registos, e o rollup
+# recusa-se a correr sem elas -- e a mesma regra do FusionSolar e do Sigenergy.
+# Nenhuma e segredo: sao a leitura de um numero inteiro com ganho 1000, e a
+# decisao de qual registo conta como producao.
+x-v2-huawei-scada-environment: &v2-huawei-scada-environment
+  # Ganho 1000 sobre watts. Confirmar contra o mostrador do proprio inversor
+  # antes de ligar: se este valor estiver errado, todos os kWh ficam errados
+  # por um factor de mil e continuam a parecer plausiveis.
+  NEMSEI_V2_HUAWEI_SCADA_PRIMARY_POWER_UNIT: kW
+  # 37498 (entrada PV) ou 37516 (potencia activa total). Sao medicoes
+  # diferentes -- diferem pelas perdas de conversao -- e nada no trafego
+  # observado diz qual delas o relatorio deve chamar producao. Sem esta
+  # variavel o rollup recusa correr, em vez de escolher uma.
+  NEMSEI_V2_HUAWEI_SCADA_PRIMARY_PRODUCTION_SIGNAL: total_active_power
+  # DELIBERADAMENTE POR PREENCHER no piloto. O registo 37502 e com sinal e nada
+  # prova se positivo significa importar ou exportar. Enquanto isto estiver
+  # vazio a V2 **nao escreve** export_energy nem grid_import_energy -- nao
+  # inventa metade delas. Preencher com positive_import ou positive_export
+  # depois de comparar uma hora de leituras com o contador real.
+  # NEMSEI_V2_HUAWEI_SCADA_PRIMARY_GRID_SIGN_CONVENTION: positive_import
+  # Autoconsumo derivado (consumo - importacao) so com a convencao acima
+  # verificada, e mesmo assim o rollup salta qualquer dia em que a bateria
+  # tenha movido energia: e a bateria que absorve a diferenca e parte a
+  # identidade.
+  # NEMSEI_V2_HUAWEI_SCADA_PRIMARY_SELF_USE_DERIVATION: consumption_minus_grid_import
+  NEMSEI_V2_HUAWEI_SCADA_PRIMARY_MAX_SAMPLE_GAP_SECONDS: "900"
+  # Rollup e limpeza: dois jobs duraveis no worker, sobre linhas que a base ja
+  # tem. Zero chamadas a provider -- o listener e o unico que fala com um
+  # dongle, e nenhum job o consegue arrancar.
+  NEMSEI_V2_HUAWEI_SCADA_ROLLUP_ENABLED: "false"
+  NEMSEI_V2_HUAWEI_SCADA_ROLLUP_CONNECTION_ID: ""
+  NEMSEI_V2_HUAWEI_SCADA_ROLLUP_INTERVAL_MINUTES: "60"
+  NEMSEI_V2_HUAWEI_SCADA_ROLLUP_LOOKBACK_DAYS: "2"
+  NEMSEI_V2_HUAWEI_SCADA_RETENTION_ENABLED: "false"
+  NEMSEI_V2_HUAWEI_SCADA_RETENTION_DAYS: "90"
 
 x-v2-notification-environment: &v2-notification-environment
   NEMSEI_V2_TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_bot_token
@@ -171,7 +241,7 @@ services:
     restart: unless-stopped
     env_file: ${NEMSEI_V2_ENV_FILE:-.env.v2}
     environment:
-      <<: [*v2-environment, *v2-fusionsolar-environment, *v2-sigenergy-environment, *v2-notification-environment]
+      <<: [*v2-environment, *v2-fusionsolar-environment, *v2-sigenergy-environment, *v2-notification-environment, *v2-huawei-scada-environment]
       NEMSEI_V2_PROCESS_ROLE: scheduler
     extra_hosts: ["host.docker.internal:host-gateway"]
     secrets:
@@ -190,7 +260,7 @@ services:
     restart: unless-stopped
     env_file: ${NEMSEI_V2_ENV_FILE:-.env.v2}
     environment:
-      <<: [*v2-environment, *v2-fusionsolar-environment, *v2-sigenergy-environment, *v2-notification-environment]
+      <<: [*v2-environment, *v2-fusionsolar-environment, *v2-sigenergy-environment, *v2-notification-environment, *v2-huawei-scada-environment]
       NEMSEI_V2_PROCESS_ROLE: worker
     extra_hosts: ["host.docker.internal:host-gateway"]
     secrets:
@@ -203,6 +273,50 @@ services:
       - sigenergy_primary_app_secret
     depends_on: {postgres: {condition: service_healthy}}
     command: python -m nemsei.jobs.worker
+
+  # O processo dedicado do Huawei SCADA. Servico proprio, e nao uma thread do
+  # gunicorn, por uma razao concreta: o gunicorn pode reiniciar ou multiplicar
+  # workers a qualquer momento, e cada um desses eventos ou disputa a mesma
+  # porta TCP ou abre um segundo listener que responde a metade dos dongles.
+  #
+  # UM SO BINDING. Este e o unico servico que publica a porta, e o codigo
+  # ainda toma um advisory lock do Postgres sobre o id da ligacao -- isso
+  # apanha o caso que a porta nao apanha: um segundo listener noutra maquina
+  # apontado a mesma ligacao, que duplicaria todas as amostras sem colisao
+  # nenhuma para dar por isso.
+  #
+  # Fica atras de um profile: nao arranca com o `up -d web scheduler worker`
+  # canonico. Ligar de proposito com
+  #   docker compose -f docker-compose.v2.yml --env-file .env.v2 \
+  #     --profile huawei-scada up -d --build scada-listener
+  #
+  # O endereco e a porta publicados vem do ambiente e o valor por omissao e
+  # 127.0.0.1 -- so loopback. Para receber o dongle atraves do NAT do router e
+  # preciso dizer explicitamente em que interface e que porta escutar; nenhum
+  # endereco publico, nem porta publica, esta escrito em codigo nem aqui.
+  #
+  # TLS: nao ha. O piloto corre em claro, o que significa que quem esteja no
+  # caminho ve as leituras e pode falsificar respostas. Ver a seccao de riscos
+  # em docs/v2/HUAWEI_SCADA.md antes de por isto em producao.
+  scada-listener:
+    build: {context: ., dockerfile: Dockerfile.v2}
+    profiles: ["huawei-scada"]
+    restart: unless-stopped
+    env_file: ${NEMSEI_V2_ENV_FILE:-.env.v2}
+    environment:
+      <<: [*v2-environment, *v2-huawei-scada-environment]
+      NEMSEI_V2_PROCESS_ROLE: scada_listener
+      NEMSEI_V2_HUAWEI_SCADA_LISTENER_ENABLED: "true"
+      NEMSEI_V2_HUAWEI_SCADA_LISTENER_CONNECTION_ID: ${NEMSEI_V2_HUAWEI_SCADA_CONNECTION_ID:-}
+      NEMSEI_V2_HUAWEI_SCADA_LISTENER_PORT: "1502"
+      NEMSEI_V2_HUAWEI_SCADA_POLL_INTERVAL_SECONDS: ${NEMSEI_V2_HUAWEI_SCADA_POLL_INTERVAL_SECONDS:-30}
+      NEMSEI_V2_HUAWEI_SCADA_IDLE_TIMEOUT_SECONDS: ${NEMSEI_V2_HUAWEI_SCADA_IDLE_TIMEOUT_SECONDS:-300}
+      NEMSEI_V2_HUAWEI_SCADA_MAX_SESSIONS: ${NEMSEI_V2_HUAWEI_SCADA_MAX_SESSIONS:-32}
+    secrets:
+      - v2_database_url
+    depends_on: {postgres: {condition: service_healthy}}
+    ports: ["${NEMSEI_V2_SCADA_BIND_ADDRESS:-127.0.0.1}:${NEMSEI_V2_SCADA_BIND_PORT:-1502}:1502"]
+    command: python -m nemsei.integrations.huawei_scada.listener
 
 volumes:
   nemsei-v2-postgres-data:

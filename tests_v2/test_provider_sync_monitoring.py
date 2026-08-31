@@ -49,8 +49,18 @@ def asset_mapping(session):
 
 @pytest.mark.parametrize("provider", list(ProviderCode))
 def test_capability_support_and_runtime_availability_are_separate(provider: ProviderCode) -> None:
+    # The expectation comes from the registry's own declaration rather than a
+    # list repeated here. It used to read "everything except SMA supports
+    # discovery", which stopped being true the moment a provider arrived that
+    # deliberately does not: `huawei_scada` has no account to enumerate -- a
+    # dongle announces itself, one at a time. What this test is actually about
+    # is that the two dimensions move independently, and that holds whatever
+    # each provider declares.
+    from nemsei.providers.registry import descriptor_for
+
+    supported = ProviderCapability.DISCOVERY in descriptor_for(provider).implemented_capabilities
+    expected = ImplementationSupport.SUPPORTED if supported else ImplementationSupport.UNSUPPORTED
     unconfigured = evaluate_capability(provider, ProviderCapability.DISCOVERY, connection_configured=False)
-    expected = ImplementationSupport.UNSUPPORTED if provider is ProviderCode.SMA else ImplementationSupport.SUPPORTED
     assert unconfigured.implementation_support is expected
     assert unconfigured.runtime_availability is RuntimeAvailability.NOT_CONFIGURED
     configured = evaluate_capability(provider, ProviderCapability.DISCOVERY, connection_configured=True)

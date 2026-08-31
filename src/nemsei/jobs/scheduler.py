@@ -53,6 +53,20 @@ class Scheduler:
                 interval_hours=self.settings.sigenergy_sync_scheduler_interval_hours,
             )
             created = created or sigen_created
+        # Plant state, per provider account. One call per 100 plants, on its
+        # own endpoint-family budget -- but still off by default and still one
+        # explicit connection each, because it is a provider call and the
+        # rule here has never been "loop over what happens to be configured".
+        for enabled, connection_id, interval in (
+            (self.settings.current_monitoring_scheduler_enabled, self.settings.current_monitoring_scheduler_connection_id, self.settings.current_monitoring_scheduler_interval_minutes),
+            (self.settings.sigenergy_current_monitoring_scheduler_enabled, self.settings.sigenergy_current_monitoring_scheduler_connection_id, self.settings.sigenergy_current_monitoring_scheduler_interval_minutes),
+        ):
+            if enabled and connection_id is not None:
+                _state_job, state_created = self.repository.enqueue_due_current_monitoring(
+                    connection_id=connection_id,
+                    interval_minutes=interval,
+                )
+                created = created or state_created
         # D1: off by default, no connection id or cap needed -- this evaluates
         # every asset from already-persisted facts, never calls a provider.
         if self.settings.diagnostic_incident_evaluation_enabled:
@@ -75,6 +89,30 @@ class Scheduler:
                 interval_minutes=self.settings.digest_generation_interval_minutes,
             )
             created = created or digest_created
+        # Huawei SCADA. Both are pure database work over samples a separate
+        # listener process already collected -- no provider call, no call
+        # budget, and nothing here can start or stop the listener itself.
+        if self.settings.huawei_scada_rollup_enabled and self.settings.huawei_scada_rollup_connection_id is not None:
+            _rollup_job, rollup_created = self.repository.enqueue_due_huawei_scada_rollup(
+                connection_id=self.settings.huawei_scada_rollup_connection_id,
+                interval_minutes=self.settings.huawei_scada_rollup_interval_minutes,
+                lookback_days=self.settings.huawei_scada_rollup_lookback_days,
+            )
+            created = created or rollup_created
+        # Retention rides on the rollup's connection id: deleting samples for a
+        # connection nothing is rolling up would delete evidence that never
+        # became energy.
+        if (
+            self.settings.huawei_scada_retention_enabled
+            and self.settings.huawei_scada_rollup_enabled
+            and self.settings.huawei_scada_rollup_connection_id is not None
+        ):
+            _retention_job, retention_created = self.repository.enqueue_due_huawei_scada_retention(
+                connection_id=self.settings.huawei_scada_rollup_connection_id,
+                interval_minutes=self.settings.huawei_scada_retention_interval_minutes,
+                retention_days=self.settings.huawei_scada_retention_days,
+            )
+            created = created or retention_created
         return created
 
     def run_forever(self) -> None:

@@ -70,11 +70,21 @@ DATASET_METRICS = {
 }
 
 
-def _sum_actual(facts: Iterable[ProductionFact]) -> tuple[Decimal | None, str, list[str]]:
-    """Total one month of daily facts, keeping missing distinguishable from zero."""
-    values, sources, incomplete = [], [], False
+def _sum_actual(facts: Iterable[ProductionFact]) -> tuple[Decimal | None, str, list[str], list[str]]:
+    """Total one month of daily facts, keeping missing distinguishable from zero.
+
+    The fourth return value names the facts that state they are estimates
+    rather than measurements. Huawei SCADA's daily energy is integrated from
+    instantaneous power samples (`measurement_method=power_integral`), so a
+    total containing one is a different kind of number from a total of metered
+    daily counters, and a report has to be able to say so. It is a separate
+    list rather than a flag because the keys are what lead back to the rows.
+    """
+    values, sources, estimated, incomplete = [], [], [], False
     for fact in facts:
         sources.append(fact.source_fact_key)
+        if (fact.metadata_json or {}).get("estimated"):
+            estimated.append(fact.source_fact_key)
         if fact.value is None or fact.quality == "missing":
             incomplete = True
             continue
@@ -82,8 +92,8 @@ def _sum_actual(facts: Iterable[ProductionFact]) -> tuple[Decimal | None, str, l
             incomplete = True
         values.append(fact.value)
     if not values:
-        return None, "missing", sources
-    return sum(values, Decimal("0")), ("partial" if incomplete else "measured"), sources
+        return None, "missing", sources, estimated
+    return sum(values, Decimal("0")), ("partial" if incomplete else "measured"), sources, estimated
 
 
 def build_dataset(
@@ -142,15 +152,16 @@ def build_dataset(
     for start in months:
         end = month_end(start)
         monthly_facts = [fact for fact in facts if start <= fact.period_start.date() < end]
-        actual, actual_state, sources = _sum_actual(monthly_facts)
+        actual, actual_state, sources, estimated_keys = _sum_actual(monthly_facts)
 
         monthly_metrics: dict[str, Any] = {}
         for name in DATASET_METRICS:
             in_month = [fact for fact in other_facts[name] if start <= fact.period_start.date() < end]
-            value, state, keys = _sum_actual(in_month)
+            value, state, keys, metric_estimated = _sum_actual(in_month)
             monthly_metrics[f"{name}_kwh"] = value
             monthly_metrics[f"{name}_state"] = state
             monthly_metrics[f"{name}_fact_keys"] = keys
+            estimated_keys = estimated_keys + metric_estimated
 
         expected_row = expected_by_month.get(start.month)
         expected = expected_row.expected_production_kwh if expected_row else None
@@ -159,6 +170,11 @@ def build_dataset(
             warnings.append(f"expected_production_missing:{start.isoformat()}")
         if actual_state == "missing":
             warnings.append(f"actual_production_missing:{start.isoformat()}")
+        if estimated_keys:
+            # Reaches the report through `AssembledReport.notes`, which is
+            # built from these warnings. A month whose energy was integrated
+            # from power samples must not read like a metered month.
+            warnings.append(f"estimated_energy:{start.isoformat()}")
 
         rows.append(
             {
@@ -176,6 +192,12 @@ def build_dataset(
                     "metric_fact_keys": {
                         name: monthly_metrics[f"{name}_fact_keys"] for name in DATASET_METRICS
                     },
+                    # Present only when something in the month actually is an
+                    # estimate. Adding the key unconditionally would change
+                    # `input_digest` for every dataset ever built, so every
+                    # existing snapshot would look new without a single number
+                    # having changed.
+                    **({"estimated_fact_keys": sorted(set(estimated_keys))} if estimated_keys else {}),
                     "expected_source": (
                         {
                             "financial_model_id": financial_model.id,
@@ -206,6 +228,15 @@ def build_dataset(
             "months_by_metric": {
                 name: sum(1 for row in rows if row[f"{name}_state"] != "missing") for name in DATASET_METRICS
             },
+            # Where the numbers came from, and how many months lean on an
+            # estimate. `quality_json` is outside `input_digest`, so this is
+            # visible without making two identical datasets look different.
+            "actual_sources": sorted(
+                {key.split(":", 1)[0] for row in rows for key in row["provenance"]["actual_fact_keys"]}
+            ),
+            "months_with_estimated_energy": sum(
+                1 for row in rows if row["provenance"].get("estimated_fact_keys")
+            ),
         },
         warnings_json=sorted(set(warnings)),
         built_at=utc_now(),

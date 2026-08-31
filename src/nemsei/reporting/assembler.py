@@ -403,6 +403,20 @@ def assemble_asset_report(
 
     prepared = prepare_customer_report(report, billing_config=billing_config, months_count=period.month_count)
     prepared["unavailable_fields"] = list(unavailable)
+    # Where the energy came from, and whether any of it was estimated rather
+    # than measured. Set after `prepare_customer_report` so the payload the
+    # renderers already agree on is untouched, and read from `quality_json`,
+    # which is outside the dataset digest -- so saying this out loud cannot
+    # make two identical reports look different from each other.
+    quality = dataset.quality_json or {}
+    prepared["energy_sources"] = list(quality.get("actual_sources") or [])
+    estimated_months = int(quality.get("months_with_estimated_energy") or 0)
+    prepared["energy_estimated"] = estimated_months > 0
+    prepared["energy_estimated_months"] = estimated_months
+    if estimated_months:
+        prepared.setdefault("report_notes", []).append(
+            "energy_integrated_from_power_samples_not_metered"
+        )
     prepared["report_type_resolved"] = report["report_type_resolved"]
     prepared["report_type_source"] = report["report_type_source"]
     if persisted_billing is None and not report["report_type_resolved"]:

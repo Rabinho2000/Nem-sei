@@ -9,7 +9,11 @@ from sqlalchemy.orm import Session, sessionmaker
 from nemsei.config import Settings
 from nemsei.diagnostics.incidents import evaluate_and_persist_incidents
 from nemsei.integrations.fusionsolar.device_status import FusionSolarDeviceStatusService
+from nemsei.integrations.fusionsolar.monitoring import FusionSolarMonitoringService
 from nemsei.integrations.fusionsolar.production import FusionSolarProductionService
+from nemsei.integrations.huawei_scada.retention import purge_samples
+from nemsei.integrations.huawei_scada.rollup import HuaweiScadaRollupService
+from nemsei.integrations.sigenergy.monitoring import SigenergyMonitoringService
 from nemsei.integrations.sigenergy.production import SigenergyProductionService
 from nemsei.providers.models import ProviderConnection
 from nemsei.providers.registry import ProviderCode
@@ -48,6 +52,10 @@ def execute(
         if settings is None or session_factory is None:
             raise ValueError("Device status jobs require worker settings and sessions.")
         return _execute_device_status_poll(job, settings=settings, session_factory=session_factory)
+    if job.job_type == "monitoring.current":
+        if settings is None or session_factory is None:
+            raise ValueError("Plant state jobs require worker settings and sessions.")
+        return _execute_current_monitoring(job, settings=settings, session_factory=session_factory)
     if job.job_type == "diagnostics.evaluate_incidents":
         if session_factory is None:
             raise ValueError("Diagnostic incident evaluation requires a worker session factory.")
@@ -56,6 +64,10 @@ def execute(
         if session_factory is None:
             raise ValueError("Notification processing requires a worker session factory.")
         return _execute_notification_processing(session_factory=session_factory)
+    if job.job_type in {"huawei_scada.rollup", "huawei_scada.retention"}:
+        if settings is None or session_factory is None:
+            raise ValueError("Huawei SCADA jobs require worker settings and sessions.")
+        return _execute_huawei_scada(job, settings=settings, session_factory=session_factory)
     if job.job_type == "digests.generate":
         if settings is None or session_factory is None:
             raise ValueError("Digest generation requires worker settings and a session factory.")
@@ -88,6 +100,46 @@ def _execute_sigenergy_production(job: ClaimedJob, connection_id: int, *, settin
     return JobOutcome(
         status="success" if result.status in ("success", "partial") else "failed",
         result={"mode": "daily_history", "result_status": result.status, "facts_written": result.facts_written},
+    )
+
+
+def _execute_current_monitoring(job: ClaimedJob, *, settings: Settings, session_factory: sessionmaker[Session]) -> JobOutcome:
+    """One plant-state read for one connection, dispatched by its provider.
+
+    Dispatching on `provider_code` from the start, rather than growing a
+    FusionSolar-only path first: that was exactly the bug production had
+    (commit 094a40a), where a Sigenergy job could only ever be answered with
+    "Connection is not FusionSolar".
+
+    A rate-limited or failed read is **not** a failed job. The provider
+    refusing to answer is a known operating condition of a shared account,
+    the services already record it on the sync run and the connection's
+    health, and marking the job failed would retry it three times against an
+    account that just said no. What must never happen -- and cannot, because
+    neither service writes an observation on error -- is a failed read
+    becoming an "offline" plant.
+    """
+    connection_id = job.payload.get("connection_id")
+    if not isinstance(connection_id, int) or connection_id <= 0:
+        raise ValueError("Plant state job connection_id is invalid.")
+    with session_factory() as session:
+        connection = session.get(ProviderConnection, connection_id)
+        provider_code = connection.provider_code if connection else None
+    if provider_code == ProviderCode.SIGENERGY.value:
+        result = SigenergyMonitoringService(session_factory, settings).sync_current_monitoring(connection_id)
+    elif provider_code == ProviderCode.FUSIONSOLAR.value:
+        result = FusionSolarMonitoringService(session_factory, settings, session_cache=default_session_cache()).sync_current_monitoring(connection_id)
+    else:
+        raise ValueError(f"Plant state is not supported for provider {provider_code!r}.")
+    return JobOutcome(
+        status="success",
+        result={
+            "result_status": result.status,
+            "expected": result.expected,
+            "accepted": result.accepted,
+            "rejected": result.rejected,
+            "error_code": result.error_code,
+        },
     )
 
 
@@ -163,6 +215,53 @@ def _execute_device_status_poll(job: ClaimedJob, *, settings: Settings, session_
     if result.status in {"failed", "rate_limited", "deferred", "partial"}:
         raise RetryableJobError(f"Device status poll stopped with {result.status}.")
     return JobOutcome(status="success", result=result_json)
+
+
+def _execute_huawei_scada(job: ClaimedJob, *, settings: Settings, session_factory: sessionmaker[Session]) -> JobOutcome:
+    """Rollup or retention for one Huawei SCADA connection. Zero provider calls.
+
+    Both jobs read and write rows this deployment already holds: the listener
+    is the only thing that ever talks to a dongle, and it is a separate
+    process that no job can start. A failure here therefore cannot cost a
+    provider call, and cannot lose a sample either -- the rollup only writes
+    facts, and retention only deletes samples whose day is already final.
+    """
+    connection_id = job.payload.get("connection_id")
+    if not isinstance(connection_id, int) or connection_id <= 0:
+        raise ValueError("Huawei SCADA job connection_id is invalid.")
+    if job.job_type == "huawei_scada.retention":
+        days = job.payload.get("retention_days", settings.huawei_scada_retention_days)
+        if not isinstance(days, int) or days <= 0:
+            raise ValueError("Huawei SCADA retention_days is invalid.")
+        purged = purge_samples(session_factory, connection_id=connection_id, retention_days=days)
+        return JobOutcome(
+            status="success",
+            result={
+                "mode": "retention",
+                "days_deleted": purged.days_deleted,
+                "samples_deleted": purged.samples_deleted,
+                "mappings_examined": purged.mappings_examined,
+                "skipped": purged.skipped_reasons,
+            },
+        )
+
+    lookback = job.payload.get("lookback_days", settings.huawei_scada_rollup_lookback_days)
+    if not isinstance(lookback, int) or lookback <= 0:
+        raise ValueError("Huawei SCADA rollup lookback_days is invalid.")
+    result = HuaweiScadaRollupService(session_factory, settings).roll_up(connection_id, lookback_days=lookback)
+    return JobOutcome(
+        status="success",
+        result={
+            "mode": "power_integral_rollup",
+            "days_requested": result.days_requested,
+            "days_with_samples": result.days_with_samples,
+            "facts_written": result.facts_written,
+            "mappings_selected": result.mappings_selected,
+            "mappings_skipped": result.mappings_skipped,
+            "skipped": result.skipped_reasons,
+            "warnings": result.warnings[:20],
+        },
+    )
 
 
 def _execute_incident_evaluation(*, session_factory: sessionmaker[Session]) -> JobOutcome:

@@ -1087,6 +1087,165 @@ class JobRepository:
                 session.expunge(existing)
                 return existing, False
 
+    def _enqueue_due_cycle(
+        self,
+        *,
+        job_type: str,
+        schedule_key: str,
+        interval_minutes: int,
+        payload: dict[str, Any] | None = None,
+        priority: int = 150,
+        now: datetime | None = None,
+    ) -> tuple[Job | None, bool]:
+        """One due-slot enqueue, shared by the schedules that need nothing else.
+
+        The four `enqueue_due_*` methods above each grew their own copy of this
+        logic. The Huawei SCADA schedules deliberately do not add a fifth and a
+        sixth: they take neither a provider call budget nor a lifetime cap --
+        the rollup integrates rows already in the database and the retention
+        pass only deletes them -- so there is nothing left to specialise.
+
+        Same guarantees as the copies: a persisted `ScheduleState` so a
+        restart resumes rather than replays, `_catch_up_slot` so a scheduler
+        stopped for days enqueues one cycle instead of the whole backlog, and
+        a dedupe key that makes two concurrent ticks idempotent (with the
+        `IntegrityError` fallback for the race the unique index catches).
+        """
+        if interval_minutes <= 0:
+            raise ValueError(f"{job_type} interval must be positive.")
+        now_value = now or utc_now()
+        dedupe_key = ""
+        try:
+            with self._immediate_session() as session:
+                schedule = session.get(ScheduleState, schedule_key)
+                if schedule is not None and as_utc(schedule.next_run_at) > now_value:
+                    return None, False
+                slot = as_utc(schedule.next_run_at) if schedule is not None else now_value
+                slot = _catch_up_slot(slot, now=now_value, interval=timedelta(minutes=interval_minutes))
+                dedupe_key = f"{schedule_key}:{slot.isoformat()}"
+                existing = session.scalar(
+                    select(Job).where(
+                        Job.job_type == job_type,
+                        Job.dedupe_key == dedupe_key,
+                        Job.status.in_(ACTIVE_STATUSES),
+                    )
+                )
+                if existing is None:
+                    job = Job(
+                        job_type=job_type,
+                        status="queued",
+                        payload_json={"scheduled_for": slot.isoformat(), **(payload or {})},
+                        dedupe_key=dedupe_key,
+                        priority=priority,
+                        available_at=now_value,
+                        attempt_count=0,
+                        max_attempts=3,
+                        created_at=now_value,
+                        updated_at=now_value,
+                    )
+                    session.add(job)
+                    session.flush()
+                    self._event(
+                        session,
+                        job_id=job.id,
+                        event_type="enqueued",
+                        attempt=0,
+                        from_status=None,
+                        to_status="queued",
+                        actor_source="scheduler",
+                        metadata={"schedule_key": schedule_key, "dedupe_key": dedupe_key},
+                        occurred_at=now_value,
+                    )
+                    created = True
+                else:
+                    job = existing
+                    created = False
+                if schedule is None:
+                    schedule = ScheduleState(schedule_key=schedule_key, next_run_at=slot, updated_at=now_value)
+                    session.add(schedule)
+                schedule.last_enqueued_at = now_value
+                schedule.next_run_at = slot + timedelta(minutes=interval_minutes)
+                schedule.updated_at = now_value
+                session.flush()
+                session.expunge(job)
+                return job, created
+        except IntegrityError:
+            with self._immediate_session() as session:
+                existing = session.scalar(
+                    select(Job).where(
+                        Job.job_type == job_type,
+                        Job.dedupe_key == dedupe_key,
+                        Job.status.in_(ACTIVE_STATUSES),
+                    )
+                )
+                if existing is None:
+                    raise
+                self._event(
+                    session,
+                    job_id=existing.id,
+                    event_type="dedupe_reused",
+                    attempt=existing.attempt_count,
+                    from_status=existing.status,
+                    to_status=existing.status,
+                    actor_source="scheduler",
+                    metadata={"schedule_key": schedule_key, "dedupe_key": dedupe_key},
+                    occurred_at=now_value,
+                )
+                session.expunge(existing)
+                return existing, False
+
+    def enqueue_due_huawei_scada_rollup(
+        self, *, connection_id: int, interval_minutes: int, lookback_days: int, now: datetime | None = None
+    ) -> tuple[Job | None, bool]:
+        """Enqueue one power-to-energy rollup cycle when due. No provider call."""
+        return self._enqueue_due_cycle(
+            job_type="huawei_scada.rollup",
+            schedule_key=f"huawei_scada.rollup:{connection_id}",
+            interval_minutes=interval_minutes,
+            payload={"connection_id": connection_id, "lookback_days": lookback_days},
+            now=now,
+        )
+
+    def enqueue_due_huawei_scada_retention(
+        self, *, connection_id: int, interval_minutes: int, retention_days: int, now: datetime | None = None
+    ) -> tuple[Job | None, bool]:
+        """Enqueue one sample-retention pass when due. Deletes, never reads out."""
+        return self._enqueue_due_cycle(
+            job_type="huawei_scada.retention",
+            schedule_key=f"huawei_scada.retention:{connection_id}",
+            interval_minutes=interval_minutes,
+            payload={"connection_id": connection_id, "retention_days": retention_days},
+            # Below everything else: reclaiming disk can always wait for a
+            # report or a sync to finish first.
+            priority=200,
+            now=now,
+        )
+
+    def enqueue_due_current_monitoring(
+        self, *, connection_id: int, interval_minutes: int, now: datetime | None = None
+    ) -> tuple[Job | None, bool]:
+        """Enqueue one plant-state read when due.
+
+        The cheapest read V2 makes per installation covered: FusionSolar
+        answers up to 100 plants in a single batched call, so the whole
+        mapped fleet costs two calls plus a cached login. It also has its own
+        `current_monitoring` endpoint family in `provider_request_states`,
+        separate from the device-level lanes that carry today's rate-limit
+        pressure, so this does not compete with the device poll's budget.
+        """
+        return self._enqueue_due_cycle(
+            job_type="monitoring.current",
+            schedule_key=f"monitoring.current:{connection_id}",
+            interval_minutes=interval_minutes,
+            payload={"connection_id": connection_id},
+            # Above device diagnostics (150) and below production (100).
+            # "Is this plant up" is the question the alerting depends on, and
+            # answering it costs one call -- it should not queue behind a
+            # per-device sweep of a single station.
+            priority=120,
+            now=now,
+        )
+
     def events_for(self, job_id: int) -> list[JobEvent]:
         with self.session_factory() as session:
             return list(session.scalars(select(JobEvent).where(JobEvent.job_id == job_id).order_by(JobEvent.id)))
