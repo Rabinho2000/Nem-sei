@@ -12,7 +12,9 @@ if [[ ! -s $archive ]]; then
   echo "Backup archive must exist and be non-empty." >&2
   exit 2
 fi
-root=$(git rev-parse --show-toplevel)
+# The archives the timer writes are owned by root, so verifying one means
+# running this as root, where git refuses a repository owned by somebody else.
+root=${NEMSEI_V2_REPO_ROOT:-$(git rev-parse --show-toplevel)}
 env_file=${NEMSEI_V2_ENV_FILE:-$root/.env.v2}
 project=${NEMSEI_V2_COMPOSE_PROJECT:-nemsei-v2}
 restore_db="nemsei_v2_restore_$(date -u +%Y%m%d%H%M%S)"

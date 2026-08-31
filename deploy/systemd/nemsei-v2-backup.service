@@ -1,0 +1,46 @@
+[Unit]
+# Runs the backup script that already exists. Nothing about *how* a dump is
+# taken lives here -- this unit only decides who runs it, from where, and what
+# happens when it fails.
+Description=Nem-sei V2 PostgreSQL logical backup
+Documentation=file:/opt/server/apps/Nem-sei-v2/scripts/v2_postgres_backup.sh
+# The dump is taken through `docker compose exec postgres pg_dump`, so there is
+# nothing to back up until Docker is up. On a boot where Docker never starts,
+# the unit fails loudly rather than writing an empty archive.
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+# Root, deliberately, and not the account that happens to own the files.
+#
+# The backup needs the Docker socket and write access to a data root that is
+# mode 0700 and owned by `codex` -- a personal account whose membership of
+# `docker` could be revoked without anyone connecting it to the backups
+# quietly stopping. A dedicated service user would need the same Docker socket,
+# which is root-equivalent anyway, so it would buy the appearance of least
+# privilege and none of the substance.
+User=root
+Group=root
+
+# `git rev-parse` refuses a repository owned by somebody else, and running as
+# root makes that every deployment. The script prefers this variable, so the
+# backup path never touches git.
+WorkingDirectory=/opt/server/apps/Nem-sei-v2
+Environment=NEMSEI_V2_REPO_ROOT=/opt/server/apps/Nem-sei-v2
+
+# No credentials here. The database URL and the PostgreSQL password reach the
+# container as Compose secrets, read from the paths named in .env.v2, which the
+# script passes through with --env-file. A unit file is world-readable.
+ExecStart=/opt/server/apps/Nem-sei-v2/scripts/v2_postgres_backup.sh
+
+# `set -euo pipefail` in the script, plus its own `test -s` on the archive,
+# means a refused connection or a truncated dump exits non-zero and lands here
+# as a failed unit rather than a silent success.
+TimeoutStartSec=30min
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nemsei-v2-backup
+
+[Install]
+WantedBy=multi-user.target

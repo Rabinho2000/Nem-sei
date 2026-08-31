@@ -1,0 +1,20 @@
+[Unit]
+Description=Daily Nem-sei V2 PostgreSQL backup
+Documentation=file:/opt/server/apps/Nem-sei-v2/deploy/systemd/nemsei-v2-backup.service
+
+[Timer]
+Unit=nemsei-v2-backup.service
+# 03:30 local. The fleet is asleep, the scheduler's overnight passes have run,
+# and pg_dump's load lands where nobody is reading a report.
+OnCalendar=*-*-* 03:30:00
+# The whole point of a timer over cron: a server that was off at 03:30 runs the
+# backup once when it comes back, instead of silently skipping a day. systemd
+# keeps the last-run stamp on disk, so this survives reboots.
+Persistent=true
+# The dump is minutes of I/O against the same disk everything else uses. A
+# small spread keeps it off the exact minute of anything else scheduled nightly.
+RandomizedDelaySec=10min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

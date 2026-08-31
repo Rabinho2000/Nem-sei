@@ -5,7 +5,9 @@ set -euo pipefail
 # world-readable and then tightened afterwards.
 umask 077
 
-root=$(git rev-parse --show-toplevel)
+# A systemd timer runs this as root, where `git rev-parse` refuses a repository
+# owned by somebody else. The override keeps git out of the backup path entirely.
+root=${NEMSEI_V2_REPO_ROOT:-$(git rev-parse --show-toplevel)}
 v1_root=${NEMSEI_V1_DATA_ROOT:-/opt/server/apps/Nem-sei/data}
 v2_root=${NEMSEI_V2_HOST_DATA_ROOT:-/opt/server/apps/Nem-sei-v2-data}
 env_file=${NEMSEI_V2_ENV_FILE:-$root/.env.v2}
@@ -25,5 +27,7 @@ compose=(docker compose --project-name "$project" --env-file "$env_file" -f "$ro
 test -s "$archive"
 [[ "$(stat -c '%a' "$archive")" == "600" ]] ||
   { echo "Backup archive must be mode 600: $archive" >&2; exit 1; }
-find "$backup_dir" -maxdepth 1 -type f -name 'nemsei-v2-*.dump' -mtime +6 -print -delete
+# Seven daily, four weekly, three monthly -- see scripts/v2_backup_retention.py
+# for why the windows count dumps rather than calendar days.
+python3 "$root/scripts/v2_backup_retention.py" --directory "$backup_dir" --delete
 printf 'Created V2 PostgreSQL backup: %s\n' "$archive"
