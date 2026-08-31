@@ -141,3 +141,47 @@ def test_backfill_resolves_historical_source_policy_per_source_day(settings, mon
     result = service(factory, settings, transport).sync_bounded_backfill(connection_id, start_date=date(2026, 1, 1), end_date=date(2026, 1, 2))
     assert result.status == "success"
     assert [call[1].get("stationCodes") for call in transport.calls[1:]] == ["FS-001", "FS-002"]
+
+
+def test_a_chunked_job_gets_its_retry_budget_back_for_each_chunk_it_finishes(settings, monkeypatch) -> None:
+    """Otherwise a job cannot outlive `max_attempts` chunks, however well it goes.
+
+    `claim_next` counts every claim as an attempt, and a resumed chunk is a
+    claim. The FusionSolar catch-up from a month-wide gap needs five chunks
+    against a three-attempt job: without this, the fourth is claimed as attempt
+    4 and a single failure there is terminal with nothing left to retry.
+
+    The reset is paid for by committed progress, so it cannot become an
+    unbounded retry loop: the caller only reaches `reschedule` after a chunk
+    whose cursor advanced.
+    """
+    from nemsei.db import build_engine, build_session_factory
+    from nemsei.jobs.models import Job
+    from nemsei.jobs.repository import JobRepository
+    from nemsei.shared.clock import utc_now
+    from tests_v2.test_migrations import upgrade
+
+    upgrade(settings, monkeypatch)
+    engine = build_engine(settings)
+    session_factory = build_session_factory(engine)
+    repository = JobRepository(engine, session_factory)
+    now = utc_now()
+    with session_factory() as session:
+        job = Job(
+            job_type="production.incremental", status="queued", payload_json={"connection_id": 3},
+            dedupe_key="production.incremental:3:slot", priority=100, available_at=now,
+            attempt_count=0, max_attempts=3, created_at=now, updated_at=now,
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+    for expected_attempt in (1, 2, 3, 4, 5):
+        claimed = repository.claim_next(worker_id="chunker", lease_seconds=60)
+        assert claimed is not None and claimed.id == job_id
+        assert claimed.attempt == 1, "each finished chunk starts its successor with a full budget"
+        assert repository.reschedule(claimed, payload={"connection_id": 3, "next_source_day": f"2026-08-0{expected_attempt}"})
+        assert repository.activate_due_waiting() == 1
+
+    with session_factory() as session:
+        assert session.get(Job, job_id).status == "queued"

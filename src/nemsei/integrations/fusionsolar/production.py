@@ -172,6 +172,13 @@ class FusionSolarProductionService:
         end_date: date | None = None,
         reconciliation_days: int = 1,
     ) -> ProductionSyncResult:
+        """Cover the outstanding window one chunk at a time, resuming after each.
+
+        An explicitly bounded call (both dates given) is left alone: the caller
+        already said how much to ask for, and a manual reconciliation of three
+        named days should not silently become a resuming job.
+        """
+        explicit = start_date is not None and end_date is not None
         return self._sync_window(
             connection_id,
             start_date=start_date,
@@ -180,6 +187,7 @@ class FusionSolarProductionService:
             mode="incremental",
             allow_cursor_advance=True,
             max_source_days=self._settings.production_max_source_days,
+            chunk_days=None if explicit else self._settings.production_incremental_chunk_days,
         )
 
     def sync_reconciliation(
@@ -285,6 +293,7 @@ class FusionSolarProductionService:
         as_of: datetime | None = None,
         require_explicit_bounds: bool = False,
         force_window_error: str | None = None,
+        chunk_days: int | None = None,
     ) -> ProductionSyncResult:
         """Fetch a bounded daily window and advance only complete coverage.
 
@@ -292,6 +301,13 @@ class FusionSolarProductionService:
         has a complete selected-mapping response.  This conservative rule can
         re-fetch completed data after a partial failure, but can never skip a
         missing day; canonical idempotency makes that replay safe.
+
+        `chunk_days` bounds what a single run asks for, without touching that
+        rule. `max_source_days` still measures the *whole* outstanding gap, so
+        a window too wide to be normal work is still refused rather than
+        quietly chunked through; what chunking removes is the reason the gap
+        kept growing. A run that stops short reports the next day to resume
+        from, and the job re-queues itself after a pause.
         """
         if reconciliation_days < 0:
             raise ValueError("Reconciliation overlap cannot be negative.")
@@ -323,6 +339,13 @@ class FusionSolarProductionService:
             error = exc.error if isinstance(exc, FusionSolarClientError) else ProviderError(ProviderErrorCode.CONFIGURATION, str(exc))
             run = self._start_run(connection_id)
             return self._finish(run.id, connection_id, start_date, end_date, 0, 0, 0, 0, error, mode=mode)
+        # Clamped after `_window` has measured and vetted the full gap, so the
+        # safety limit keeps applying to the real outstanding window rather
+        # than to the slice this run happens to take from it.
+        resume_from: date | None = None
+        if chunk_days is not None and (requested_until - requested_from).days + 1 > chunk_days:
+            requested_until = requested_from + timedelta(days=chunk_days - 1)
+            resume_from = requested_until + timedelta(days=1)
         run = self._start_run(connection_id, requested_from, requested_until, contract)
         try:
             credentials = credentials_for(connection)
@@ -367,7 +390,7 @@ class FusionSolarProductionService:
                 break
 
         complete = first_error is None and not incomplete and rejected == 0
-        return self._finish(
+        result = self._finish(
             run.id,
             connection_id,
             requested_from,
@@ -382,6 +405,13 @@ class FusionSolarProductionService:
             partial=incomplete,
             mode=mode,
         )
+        # Only resume from a chunk that actually moved the cursor. A chunk that
+        # ended short leaves the cursor where it was, so resuming would ask for
+        # the very same days again -- which is the loop this change exists to
+        # break, not to reproduce a chunk at a time.
+        if resume_from is not None and result.cursor_advanced:
+            return replace(result, next_source_day=resume_from)
+        return result
 
     def _sync_day(
         self,

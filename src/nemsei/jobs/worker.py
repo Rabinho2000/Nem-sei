@@ -35,7 +35,11 @@ class Worker:
             )
             resume_payload = getattr(outcome, "resume_payload", None)
             if resume_payload is not None:
-                self.repository.reschedule(claimed, payload=resume_payload)
+                self.repository.reschedule(
+                    claimed,
+                    payload=resume_payload,
+                    delay_seconds=getattr(outcome, "resume_delay_seconds", 0),
+                )
             else:
                 self.repository.finish(claimed, status=outcome.status, result=outcome.result)
         except RetryableJobError as exc:

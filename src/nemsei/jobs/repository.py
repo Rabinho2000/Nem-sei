@@ -336,7 +336,21 @@ class JobRepository:
             return True
 
     def reschedule(self, claimed: ClaimedJob, *, payload: dict[str, Any], delay_seconds: int = 0) -> bool:
-        """Persist backfill progress before releasing the lease for the next chunk."""
+        """Persist progress before releasing the lease for the next chunk.
+
+        The attempt counter goes back to zero, because a chunk that finished is
+        progress, not a retry. `claim_next` increments the counter on every
+        claim, so without this a job that needs more than `max_attempts` chunks
+        could never finish however well each chunk went: the fourth chunk of a
+        three-attempt job is claimed as attempt 4, and one failure there is
+        terminal with no retry left. The FusionSolar catch-up needs five
+        chunks; a bounded backfill of a year needs twelve.
+
+        This is not an unbounded retry budget. A reset is only ever paid for by
+        real, committed progress -- the caller reaches here after a chunk whose
+        cursor actually advanced -- so the number of resets is bounded by the
+        data remaining, not by how many times the work can fail.
+        """
         now = utc_now()
         with self._immediate_session() as session:
             updated = session.execute(
@@ -346,6 +360,7 @@ class JobRepository:
                     status="waiting",
                     payload_json=dict(payload),
                     available_at=now + timedelta(seconds=max(0, delay_seconds)),
+                    attempt_count=0,
                     lease_owner=None,
                     lease_token=None,
                     lease_expires_at=None,

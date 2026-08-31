@@ -29,6 +29,10 @@ class JobOutcome:
     status: str
     result: dict[str, Any]
     resume_payload: dict[str, Any] | None = None
+    # How long to wait before the next chunk. Zero -- the old, only behaviour --
+    # means a chunked job resumes immediately, which turns "one small window per
+    # run" back into one long burst against the provider.
+    resume_delay_seconds: int = 0
 
 
 class RetryableJobError(RuntimeError):
@@ -185,7 +189,17 @@ def _execute_production(job: ClaimedJob, *, settings: Settings, session_factory:
         payload = dict(job.payload)
         payload["next_source_day"] = result.next_source_day.isoformat()
         payload["mode"] = result.mode
-        return JobOutcome(status="success", result=result_json, resume_payload=payload)
+        # An incremental chunk resumes from the cursor it just advanced, so the
+        # payload's `next_source_day` is a record of where it got to rather
+        # than an instruction; a bounded backfill reads it back as its resume
+        # point. Both wait: the pause between chunks is the whole reason
+        # chunking protects the account.
+        return JobOutcome(
+            status="success",
+            result=result_json,
+            resume_payload=payload,
+            resume_delay_seconds=settings.production_incremental_chunk_pause_seconds,
+        )
     return JobOutcome(status="success", result=result_json)
 
 

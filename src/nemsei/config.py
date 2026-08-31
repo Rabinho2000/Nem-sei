@@ -89,6 +89,26 @@ class Settings:
     production_reconciliation_max_source_days: int = 3
     production_backfill_max_source_days: int = 366
     production_backfill_chunk_days: int = 31
+    # How many source days one incremental run asks the provider for, and how
+    # long it waits before asking for the next chunk.
+    #
+    # The incremental sync used to request its whole outstanding window in one
+    # run: one provider call per day, back to back. On 2026-08-30 that was 31
+    # calls in sixteen seconds against a shared account whose brake is on
+    # *frequency*; it was refused on the thirtieth. Because the run then ended
+    # `partial`, the cursor -- which only advances over a fully complete window
+    # -- stayed where it was, so the next day's window was a day wider and
+    # failed a day sooner. It had failed every day since 2026-08-24 and was one
+    # day away from exceeding `production_max_source_days` entirely.
+    #
+    # Chunking breaks that loop without touching a single guard: each chunk is
+    # a window small enough to finish, so it completes, so the cursor advances
+    # by exactly the days that were actually covered, and the next chunk starts
+    # from there. Seven is well under the ~29 consecutive calls the account has
+    # been seen to tolerate, and the pause between chunks is what keeps a
+    # catch-up from becoming the same burst spread over more runs.
+    production_incremental_chunk_days: int = 7
+    production_incremental_chunk_pause_seconds: int = 300
     # M7 Fatia 3 (docs/v2/DEVICE_TELEMETRY.md): a persistent device-status
     # poll schedule, off by default and restricted to one explicit
     # connection -- there is no "poll every active FusionSolar connection"
@@ -241,6 +261,8 @@ class Settings:
             production_reconciliation_max_source_days=int(os.environ.get("NEMSEI_V2_PRODUCTION_RECONCILIATION_MAX_SOURCE_DAYS", "3")),
             production_backfill_max_source_days=int(os.environ.get("NEMSEI_V2_PRODUCTION_BACKFILL_MAX_SOURCE_DAYS", "366")),
             production_backfill_chunk_days=int(os.environ.get("NEMSEI_V2_PRODUCTION_BACKFILL_CHUNK_DAYS", "31")),
+            production_incremental_chunk_days=int(os.environ.get("NEMSEI_V2_PRODUCTION_INCREMENTAL_CHUNK_DAYS", "7")),
+            production_incremental_chunk_pause_seconds=int(os.environ.get("NEMSEI_V2_PRODUCTION_INCREMENTAL_CHUNK_PAUSE_SECONDS", "300")),
             device_status_poll_enabled=parse_bool(os.environ.get("NEMSEI_V2_DEVICE_STATUS_POLL_ENABLED"), default=False),
             device_status_poll_interval_minutes=int(os.environ.get("NEMSEI_V2_DEVICE_STATUS_POLL_INTERVAL_MINUTES", "30")),
             device_status_poll_connection_id=_optional_int(os.environ.get("NEMSEI_V2_DEVICE_STATUS_POLL_CONNECTION_ID")),
@@ -398,4 +420,10 @@ class Settings:
             raise ConfigurationError("V2 timing and pool settings must be positive.")
         if self.production_backfill_chunk_days > self.production_backfill_max_source_days:
             raise ConfigurationError("V2 production backfill chunk cannot exceed its bounded window limit.")
+        if self.production_incremental_chunk_days <= 0 or self.production_incremental_chunk_pause_seconds < 0:
+            raise ConfigurationError("V2 production incremental chunking must be positive; there is no unchunked mode.")
+        # A chunk larger than the window cap would let one run ask for more than
+        # the cap allows, which is the safety limit the cap exists to be.
+        if self.production_incremental_chunk_days > self.production_max_source_days:
+            raise ConfigurationError("V2 production incremental chunk cannot exceed the normal-sync window limit.")
         return self

@@ -361,3 +361,147 @@ def test_cursor_timezone_change_and_normal_window_limit_fail_safely(settings, mo
     with factory() as session:
         cursor = session.scalar(select(SyncCursor))
         assert cursor is not None and cursor.checkpoint_json == {"last_completed_day": "2026-08-10", "source_timezone": "UTC"}
+
+
+def cursor_at(factory, connection_id, *, last_completed_day, timezone_name="UTC"):
+    """Plant a cursor, so a test can start from a gap instead of building one."""
+    from nemsei.providers.registry import ProviderCapability
+    from nemsei.shared.clock import utc_now
+    from datetime import timedelta as _timedelta
+
+    with factory() as session:
+        session.add(
+            SyncCursor(
+                provider_connection_id=connection_id,
+                capability=ProviderCapability.PRODUCTION_HISTORY.value,
+                cursor_key="fusionsolar-daily-production",
+                checkpoint_json={"last_completed_day": last_completed_day.isoformat(), "source_timezone": timezone_name},
+                covered_through=datetime.combine(last_completed_day + _timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc),
+                last_successful_run_id=None,
+                updated_at=utc_now(),
+            )
+        )
+        session.commit()
+
+
+def test_an_incremental_run_asks_for_one_chunk_and_says_where_to_resume(settings, monkeypatch):
+    """The live failure of 2026-08-24 through 2026-08-30, and its fix.
+
+    The cursor sat at 2026-07-31 while the provider had thirty more days. The
+    old incremental asked for all of them in one run -- one call per day, back
+    to back -- was rate limited partway through, ended `partial`, and so did
+    not advance the cursor at all. The next day's window was a day wider. The
+    whole month's work was re-requested and re-refused every day for a week.
+
+    One chunk per run is what breaks that: the run completes, so the cursor
+    advances over exactly the days it covered, and it reports the day to
+    resume from.
+    """
+    configured_environment(monkeypatch)
+    factory = factory_for(settings, monkeypatch)
+    connection_id, _mappings = selected_connection(factory)
+    cursor_at(factory, connection_id, last_completed_day=date(2026, 7, 31))
+
+    chunked = replace(settings, production_incremental_chunk_days=7)
+    # A login plus one call per day of the chunk. `reconciliation_days=1` means
+    # the chunk re-reads its own first day, so 2026-07-31 through 2026-08-06.
+    transport = FakeTransport(
+        [response(LOGIN_OK, headers={"XSRF-TOKEN": "token"})] + [daily([row("FS-001", "10.0")]) for _ in range(7)]
+    )
+    result = service(factory, chunked, transport).sync_incremental(connection_id, end_date=date(2026, 8, 30))
+
+    assert result.status == "success" and result.cursor_advanced
+    assert result.requested_from == date(2026, 7, 31) and result.requested_until == date(2026, 8, 6)
+    assert result.next_source_day == date(2026, 8, 7)
+    # Seven days asked for, not thirty-one.
+    assert len([call for call in transport.calls if call[0].endswith("getKpiStationDay")]) == 7
+    with factory() as session:
+        cursor = session.scalar(select(SyncCursor))
+        assert cursor.checkpoint_json["last_completed_day"] == "2026-08-06"
+
+
+def test_successive_chunks_close_a_month_wide_gap_instead_of_replaying_it(settings, monkeypatch):
+    """Each run starts where the last one actually got to, and the gap shrinks."""
+    configured_environment(monkeypatch)
+    factory = factory_for(settings, monkeypatch)
+    connection_id, _mappings = selected_connection(factory)
+    cursor_at(factory, connection_id, last_completed_day=date(2026, 7, 31))
+    chunked = replace(settings, production_incremental_chunk_days=7)
+
+    windows = []
+    for _ in range(6):
+        transport = FakeTransport(
+            [response(LOGIN_OK, headers={"XSRF-TOKEN": "token"})] + [daily([row("FS-001", "10.0")]) for _ in range(10)]
+        )
+        result = service(factory, chunked, transport).sync_incremental(connection_id, end_date=date(2026, 8, 30))
+        windows.append((result.requested_from, result.requested_until, result.next_source_day))
+        if result.next_source_day is None:
+            break
+
+    assert windows[0][:2] == (date(2026, 7, 31), date(2026, 8, 6))
+    assert windows[1][:2] == (date(2026, 8, 6), date(2026, 8, 12))
+    # The last chunk reaches the end and stops asking to be resumed.
+    assert windows[-1][1] == date(2026, 8, 30) and windows[-1][2] is None
+    with factory() as session:
+        assert session.scalar(select(SyncCursor)).checkpoint_json["last_completed_day"] == "2026-08-30"
+
+
+def test_a_chunk_that_is_rate_limited_does_not_ask_to_resume(settings, monkeypatch):
+    """Resuming from a cursor that did not move would re-request the same days.
+
+    That is the loop, one chunk at a time, so a chunk that stops short must
+    stop the job too and let the retry policy and the provider cooldown decide
+    when to try again.
+    """
+    configured_environment(monkeypatch)
+    factory = factory_for(settings, monkeypatch)
+    connection_id, _mappings = selected_connection(factory)
+    cursor_at(factory, connection_id, last_completed_day=date(2026, 7, 31))
+    chunked = replace(settings, production_incremental_chunk_days=7)
+
+    transport = FakeTransport([
+        response(LOGIN_OK, headers={"XSRF-TOKEN": "token"}),
+        daily([row("FS-001", "10.0")]),
+        FusionSolarClientError(ProviderError(ProviderErrorCode.RATE_LIMITED, "later", transient=True)),
+    ])
+    result = service(factory, chunked, transport).sync_incremental(connection_id, end_date=date(2026, 8, 30))
+
+    assert result.status == "partial" and not result.cursor_advanced
+    assert result.next_source_day is None
+    with factory() as session:
+        assert session.scalar(select(SyncCursor)).checkpoint_json["last_completed_day"] == "2026-07-31"
+
+
+def test_the_window_safety_limit_still_measures_the_whole_gap(settings, monkeypatch):
+    """Chunking must not turn the normal-sync cap into something unreachable.
+
+    The cap exists so that a gap too wide to be routine is escalated to an
+    explicit bounded backfill instead of being ground through by the daily
+    schedule. Measuring it before the clamp keeps that true.
+    """
+    configured_environment(monkeypatch)
+    factory = factory_for(settings, monkeypatch)
+    connection_id, _mappings = selected_connection(factory)
+    cursor_at(factory, connection_id, last_completed_day=date(2026, 1, 1))
+    chunked = replace(settings, production_incremental_chunk_days=7, production_max_source_days=31)
+
+    transport = FakeTransport([response(LOGIN_OK, headers={"XSRF-TOKEN": "token"})])
+    result = service(factory, chunked, transport).sync_incremental(connection_id, end_date=date(2026, 8, 30))
+
+    assert result.status == "failed" and result.error_code == "configuration"
+    assert not transport.calls, "a window over the limit must cost no provider call"
+
+
+def test_an_explicitly_bounded_incremental_call_is_not_chunked(settings, monkeypatch):
+    """A caller that named both dates already said how much to ask for."""
+    configured_environment(monkeypatch)
+    factory = factory_for(settings, monkeypatch)
+    connection_id, _mappings = selected_connection(factory)
+    chunked = replace(settings, production_incremental_chunk_days=2)
+    transport = FakeTransport(
+        [response(LOGIN_OK, headers={"XSRF-TOKEN": "token"})] + [daily([row("FS-001", "10.0")]) for _ in range(5)]
+    )
+    result = service(factory, chunked, transport).sync_incremental(
+        connection_id, start_date=date(2026, 8, 1), end_date=date(2026, 8, 5)
+    )
+    assert result.requested_until == date(2026, 8, 5) and result.next_source_day is None
