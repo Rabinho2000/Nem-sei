@@ -67,6 +67,14 @@ class Scheduler:
                     interval_minutes=interval,
                 )
                 created = created or state_created
+        # Crash recovery for sync runs, on by default: zero provider calls, and
+        # the only rows it touches are ones whose owning process is provably
+        # gone. See sync/abandonment.py.
+        if self.settings.sync_run_sweep_enabled:
+            _sweep_job, sweep_created = self.repository.enqueue_due_sync_run_sweep(
+                interval_minutes=self.settings.sync_run_sweep_interval_minutes,
+            )
+            created = created or sweep_created
         # D1: off by default, no connection id or cap needed -- this evaluates
         # every asset from already-persisted facts, never calls a provider.
         if self.settings.diagnostic_incident_evaluation_enabled:

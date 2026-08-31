@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from sqlalchemy.orm import Session, sessionmaker
@@ -11,6 +11,7 @@ from nemsei.diagnostics.incidents import evaluate_and_persist_incidents
 from nemsei.integrations.fusionsolar.device_status import FusionSolarDeviceStatusService
 from nemsei.integrations.fusionsolar.monitoring import FusionSolarMonitoringService
 from nemsei.integrations.fusionsolar.production import FusionSolarProductionService
+from nemsei.integrations.huawei_scada.abandonment import scada_session_liveness
 from nemsei.integrations.huawei_scada.retention import purge_samples
 from nemsei.integrations.huawei_scada.rollup import HuaweiScadaRollupService
 from nemsei.integrations.sigenergy.monitoring import SigenergyMonitoringService
@@ -21,6 +22,7 @@ from nemsei.integrations.fusionsolar.session_cache import default_session_cache
 from nemsei.jobs.repository import ClaimedJob
 from nemsei.notifications.digests import deliver_digest, generate_digest
 from nemsei.notifications.service import evaluate_and_process_notifications
+from nemsei.sync.abandonment import sweep_abandoned_sync_runs
 from nemsei.system.noop_service import execute_noop
 
 
@@ -60,6 +62,10 @@ def execute(
         if settings is None or session_factory is None:
             raise ValueError("Plant state jobs require worker settings and sessions.")
         return _execute_current_monitoring(job, settings=settings, session_factory=session_factory)
+    if job.job_type == "sync_runs.sweep_abandoned":
+        if settings is None or session_factory is None:
+            raise ValueError("The sync run sweep requires worker settings and sessions.")
+        return _execute_sync_run_sweep(settings=settings, session_factory=session_factory)
     if job.job_type == "diagnostics.evaluate_incidents":
         if session_factory is None:
             raise ValueError("Diagnostic incident evaluation requires a worker session factory.")
@@ -229,6 +235,31 @@ def _execute_device_status_poll(job: ClaimedJob, *, settings: Settings, session_
     if result.status in {"failed", "rate_limited", "deferred", "partial"}:
         raise RetryableJobError(f"Device status poll stopped with {result.status}.")
     return JobOutcome(status="success", result=result_json)
+
+
+def _execute_sync_run_sweep(*, settings: Settings, session_factory: sessionmaker[Session]) -> JobOutcome:
+    """Close sync runs whose owner can no longer finish them. Zero provider calls.
+
+    This is where the provider-neutral sweep meets the one adapter that has
+    its own liveness evidence: `nemsei.sync.abandonment` knows about provider
+    request attempts and nothing else, and the Huawei SCADA resolver is handed
+    to it here because a dongle session makes no outbound call to leave an
+    attempt behind. Composing them in the handler is what keeps `nemsei.sync`
+    from importing an adapter.
+    """
+    sweep = sweep_abandoned_sync_runs(
+        session_factory,
+        silence_grace=timedelta(minutes=settings.sync_run_sweep_silence_grace_minutes),
+        owner_resolvers=(scada_session_liveness,),
+    )
+    # Two integers, because `safe_metadata` keeps a strict allowlist and a
+    # nested list would be dropped without saying so. What was abandoned, and
+    # why, is written on each `sync_run` itself -- which is where an operator
+    # looking at one of them will actually be.
+    return JobOutcome(
+        status="success",
+        result={"runs_examined": sweep.examined, "runs_abandoned": sweep.abandoned_count},
+    )
 
 
 def _execute_huawei_scada(job: ClaimedJob, *, settings: Settings, session_factory: sessionmaker[Session]) -> JobOutcome:

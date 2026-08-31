@@ -32,7 +32,14 @@ class ClaimedJob:
 
 def safe_metadata(values: dict[str, Any] | None = None) -> dict[str, Any]:
     """Keep only small, non-sensitive audit metadata values."""
-    allowed = {"reason", "delay_seconds", "schedule_key", "dedupe_key", "result_status", "mode", "next_source_day"}
+    # Counters from the abandoned-sync-run sweep. Integers with no provenance:
+    # how many runs were looked at and how many were closed. Without them the
+    # job's result is `{}` and the only way to know the sweep did anything is
+    # to diff `sync_runs` by hand.
+    allowed = {
+        "reason", "delay_seconds", "schedule_key", "dedupe_key", "result_status", "mode",
+        "next_source_day", "runs_examined", "runs_abandoned",
+    }
     return {
         key: str(value)[:200]
         for key, value in (values or {}).items()
@@ -889,6 +896,109 @@ class JobRepository:
                 existing = session.scalar(
                     select(Job).where(
                         Job.job_type == "diagnostics.evaluate_incidents",
+                        Job.dedupe_key == dedupe_key,
+                        Job.status.in_(ACTIVE_STATUSES),
+                    )
+                )
+                if existing is None:
+                    raise
+                self._event(
+                    session,
+                    job_id=existing.id,
+                    event_type="dedupe_reused",
+                    attempt=existing.attempt_count,
+                    from_status=existing.status,
+                    to_status=existing.status,
+                    actor_source="scheduler",
+                    metadata={"schedule_key": key, "dedupe_key": dedupe_key},
+                    occurred_at=now_value,
+                )
+                session.expunge(existing)
+                return existing, False
+
+
+    def enqueue_due_sync_run_sweep(
+        self, *, interval_minutes: int, now: datetime | None = None
+    ) -> tuple[Job | None, bool]:
+        """Enqueue one abandoned-sync-run sweep when due.
+
+        Same shape as `enqueue_due_incident_evaluation` above: a persisted
+        `ScheduleState`, restart-safe, idempotent dedupe key, no connection id
+        and no lifetime cap, because this makes zero provider calls -- it reads
+        `sync_runs` and closes the ones whose owner is provably gone.
+
+        On its own schedule rather than inside the worker's per-cycle recovery
+        pass, because it is not free: it scans every running run and asks each
+        one's owner-liveness resolvers. Every fifteen minutes is far more often
+        than a process dies, and a schedule makes the sweep visible on the
+        automations screen like every other automation, instead of being an
+        invisible side effect of polling.
+        """
+        if interval_minutes <= 0:
+            raise ValueError("Sync run sweep interval must be positive.")
+        now_value = now or utc_now()
+        key = "sync_runs.sweep_abandoned"
+        try:
+            with self._immediate_session() as session:
+                schedule = session.get(ScheduleState, key)
+                if schedule is not None and as_utc(schedule.next_run_at) > now_value:
+                    return None, False
+                slot = as_utc(schedule.next_run_at) if schedule is not None else now_value
+                slot = _catch_up_slot(slot, now=now_value, interval=timedelta(minutes=interval_minutes))
+                dedupe_key = f"{key}:{slot.isoformat()}"
+                existing = session.scalar(
+                    select(Job).where(
+                        Job.job_type == "sync_runs.sweep_abandoned",
+                        Job.dedupe_key == dedupe_key,
+                        Job.status.in_(ACTIVE_STATUSES),
+                    )
+                )
+                if existing is None:
+                    job = Job(
+                        job_type="sync_runs.sweep_abandoned",
+                        status="queued",
+                        payload_json={"scheduled_for": slot.isoformat()},
+                        dedupe_key=dedupe_key,
+                        # Same tier as device_status.poll: diagnostics ranks
+                        # below production/report jobs.
+                        priority=150,
+                        available_at=now_value,
+                        attempt_count=0,
+                        max_attempts=3,
+                        created_at=now_value,
+                        updated_at=now_value,
+                    )
+                    session.add(job)
+                    session.flush()
+                    self._event(
+                        session,
+                        job_id=job.id,
+                        event_type="enqueued",
+                        attempt=0,
+                        from_status=None,
+                        to_status="queued",
+                        actor_source="scheduler",
+                        metadata={"schedule_key": key, "dedupe_key": dedupe_key},
+                        occurred_at=now_value,
+                    )
+                    created = True
+                else:
+                    job = existing
+                    created = False
+                if schedule is None:
+                    schedule = ScheduleState(schedule_key=key, next_run_at=slot, updated_at=now_value)
+                    session.add(schedule)
+                schedule.last_enqueued_at = now_value
+                schedule.next_run_at = slot + timedelta(minutes=interval_minutes)
+                schedule.updated_at = now_value
+                session.flush()
+                session.expunge(job)
+                return job, created
+        except IntegrityError:
+            with self._immediate_session() as session:
+                existing = session.scalar(
+                    select(Job).where(
+                        Job.job_type == "sync_runs.sweep_abandoned",
                         Job.dedupe_key == dedupe_key,
                         Job.status.in_(ACTIVE_STATUSES),
                     )

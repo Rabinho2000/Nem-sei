@@ -186,6 +186,19 @@ class Settings:
     # across every asset that owns a device, by design.
     diagnostic_incident_evaluation_enabled: bool = False
     diagnostic_incident_evaluation_interval_minutes: int = 15
+    # Closing sync runs whose owner died. On by default, unlike every other
+    # schedule here, and deliberately: this is crash recovery, not a capability.
+    # It makes no provider call and touches nothing but rows that are already
+    # unreachable -- a run nobody can finish. Leaving it off would mean the
+    # default deployment keeps accumulating rows that say `running` forever,
+    # which is the state this exists to end. The switch is here for a
+    # deployment that wants to inspect such rows by hand first.
+    sync_run_sweep_enabled: bool = True
+    sync_run_sweep_interval_minutes: int = 15
+    # How long a run may show no evidence of life before it is classified as
+    # abandoned. See `sync/abandonment.py` for why an hour is generous rather
+    # than arbitrary.
+    sync_run_sweep_silence_grace_minutes: int = 60
     # D3 (docs/v2/DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md): the periodic
     # notification-policy evaluator. Off by default. Also makes zero
     # provider calls (only reads diagnostic_incidents, writes
@@ -297,6 +310,9 @@ class Settings:
             sigenergy_current_monitoring_scheduler_enabled=parse_bool(os.environ.get("NEMSEI_V2_SIGENERGY_CURRENT_MONITORING_SCHEDULER_ENABLED"), default=False),
             sigenergy_current_monitoring_scheduler_interval_minutes=int(os.environ.get("NEMSEI_V2_SIGENERGY_CURRENT_MONITORING_SCHEDULER_INTERVAL_MINUTES", "15")),
             sigenergy_current_monitoring_scheduler_connection_id=_optional_int(os.environ.get("NEMSEI_V2_SIGENERGY_CURRENT_MONITORING_SCHEDULER_CONNECTION_ID")),
+            sync_run_sweep_enabled=parse_bool(os.environ.get("NEMSEI_V2_SYNC_RUN_SWEEP_ENABLED"), default=True),
+            sync_run_sweep_interval_minutes=int(os.environ.get("NEMSEI_V2_SYNC_RUN_SWEEP_INTERVAL_MINUTES", "15")),
+            sync_run_sweep_silence_grace_minutes=int(os.environ.get("NEMSEI_V2_SYNC_RUN_SWEEP_SILENCE_GRACE_MINUTES", "60")),
             diagnostic_incident_evaluation_enabled=parse_bool(
                 os.environ.get("NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED"), default=False
             ),
@@ -438,6 +454,8 @@ class Settings:
             raise ConfigurationError("V2 timing and pool settings must be positive.")
         if self.production_backfill_chunk_days > self.production_backfill_max_source_days:
             raise ConfigurationError("V2 production backfill chunk cannot exceed its bounded window limit.")
+        if self.sync_run_sweep_interval_minutes <= 0 or self.sync_run_sweep_silence_grace_minutes <= 0:
+            raise ConfigurationError("Sync run sweep interval and silence grace must be positive.")
         if self.production_incremental_chunk_days <= 0 or self.production_incremental_chunk_pause_seconds < 0:
             raise ConfigurationError("V2 production incremental chunking must be positive; there is no unchunked mode.")
         # A chunk larger than the window cap would let one run ask for more than
