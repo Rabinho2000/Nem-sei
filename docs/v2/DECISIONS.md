@@ -5,9 +5,21 @@
   V1 and the V1 importer's read-only source/fixtures.
 - Alembic is the only schema migration mechanism; web does not auto-migrate.
 - Runtime data and Git worktrees are isolated from V1.
-- External capabilities default to deny.
+- External capabilities default to deny. As of 2026-08-31 that is true of
+  `notifications` as well: the switch existed from the start and was read by
+  nothing, so `NEMSEI_V2_NOTIFICATIONS=false` delivered 316 real Telegram
+  messages. See `PIPELINE_HEALTH.md` for the switch hierarchy it now sits at
+  the top of.
 - Jobs are at-least-once and all future side effects require explicit
   idempotency strategies.
+- A deploy declares its components. `deploy/v2_deployment_components.json`
+  names the compose files a canonical deploy carries and asserts what must
+  reach the running containers; forgetting a `-f` is no longer possible, and
+  no longer a silent way to turn an automation off. See `PIPELINE_HEALTH.md`.
+- Scheduler health and execution health are separate claims and are never
+  merged into one status. "The scheduler enqueued a job" is not "the work
+  succeeded"; conflating them hid a week of daily FusionSolar failures behind
+  a green row.
 
 ## Canonical device level (M1)
 
