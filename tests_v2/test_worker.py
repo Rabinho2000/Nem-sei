@@ -69,7 +69,14 @@ def test_worker_executes_a_real_incident_evaluation_end_to_end(settings, monkeyp
 def test_worker_executes_a_real_notification_processing_cycle_end_to_end(settings, monkeypatch) -> None:
     """D3, proven through the real Job/Scheduler/Worker pipeline, not by
     calling evaluate_and_process_notifications directly -- and through the
-    worker's own default client factory, which can only ever build a mock."""
+    worker's own default client factory, which lands on the mock here because
+    no bot token is mounted.
+
+    The global capability has to be on for the worker to deliver at all, the
+    same as in a real deployment; `test_a_worker_cycle_delivers_nothing_when_
+    the_kill_switch_is_off` below is the other half of that.
+    """
+    monkeypatch.setenv("NEMSEI_V2_NOTIFICATIONS", "true")
     upgrade(settings, monkeypatch)
     engine = build_engine(settings)
     session_factory = build_session_factory(engine)
@@ -109,6 +116,72 @@ def test_worker_executes_a_real_notification_processing_cycle_end_to_end(setting
     assert len(rows) == 1
     assert rows[0].kind == "opened"
     assert rows[0].status == "sent"  # decided and delivered via the worker's own mock client
+
+
+def test_a_worker_cycle_delivers_nothing_when_the_kill_switch_is_off(settings, monkeypatch) -> None:
+    """The whole pipeline runs, decides, and delivers nothing.
+
+    A kill switch is only a kill switch if it survives the thing it is meant
+    to stop being fully configured and fully working: the policy is enabled,
+    the channel is enabled and has a destination, the incident is real, and the
+    job succeeds. The event is created -- deciding costs nothing and keeps the
+    baseline moving -- and it stays `pending`, not `sent` and not `failed`,
+    because nothing was attempted. Turning the switch back on delivers it.
+    """
+    monkeypatch.setenv("NEMSEI_V2_NOTIFICATIONS", "false")
+    upgrade(settings, monkeypatch)
+    engine = build_engine(settings)
+    session_factory = build_session_factory(engine)
+    now = datetime.now(timezone.utc)
+    with session_factory() as session, session.begin():
+        asset = create_asset(session, canonical_name="Kill Switch Plant")
+        device = create_device(session, asset_id=asset.id, device_kind="inverter", label="INV-1", valid_from=date(2026, 1, 1))
+        channel = NotificationChannel(
+            name="Ops", kind="telegram", enabled=True, target_chat_id="chat-1", created_at=now, updated_at=now
+        )
+        session.add(channel)
+        session.flush()
+        session.add(
+            NotificationPolicy(
+                name="Default", enabled=True, channel_id=channel.id, min_severity="warning",
+                notify_on_open=True, notify_on_resolve=True, created_at=now, updated_at=now,
+            )
+        )
+        session.flush()
+        record_device_status(
+            session, device_id=device.id, asset_id=asset.id, source_fact_key="v1:1",
+            observed_at=now - timedelta(hours=1), availability_status="unavailable",
+        )
+
+    repository = JobRepository(engine, session_factory)
+    incident_job, _ = repository.enqueue_due_incident_evaluation(interval_minutes=15)
+    assert Worker(settings, worker_id="killswitch-incidents").run_once()
+    assert repository.events_for(incident_job.id)[-1].to_status == "success"
+
+    notification_job, created = repository.enqueue_due_notification_processing(interval_minutes=15)
+    assert created and notification_job is not None
+    assert Worker(settings, worker_id="killswitch-notifications").run_once()
+    # The job itself is healthy: a disabled capability is a policy decision,
+    # not a failure to be retried.
+    assert repository.events_for(notification_job.id)[-1].to_status == "success"
+
+    with session_factory() as session:
+        rows = session.scalars(select(NotificationEvent)).all()
+    assert len(rows) == 1
+    assert rows[0].status == "pending"
+    assert rows[0].attempt_count == 0
+    assert rows[0].last_attempted_at is None
+
+    # And the same delivery pass with the switch on does deliver it, through
+    # the same default client factory and with nothing else changed. The
+    # backlog is not lost by having been held.
+    from nemsei.notifications.service import deliver_pending_notifications
+
+    monkeypatch.setenv("NEMSEI_V2_NOTIFICATIONS", "true")
+    summary = deliver_pending_notifications(session_factory)
+    assert summary.delivery_sent == 1
+    with session_factory() as session:
+        assert session.scalars(select(NotificationEvent)).all()[0].status == "sent"
 
 
 def test_worker_executes_a_real_digest_generation_cycle_end_to_end(settings, monkeypatch) -> None:

@@ -372,7 +372,7 @@ def test_a_failed_delivery_is_recorded_and_never_falsely_marked_sent(factory, as
         decide_notification_events(session, now=utc(10))
 
     failing_client = MockTelegramClient(fail_for_chat_ids=frozenset({"chat-fails"}))
-    summary = deliver_pending_notifications(factory, now=utc(10, 1), client_factory=lambda _channel: failing_client)
+    summary = deliver_pending_notifications(factory, now=utc(10, 1), client_factory=lambda _channel: failing_client, notifications_enabled=True)
 
     assert summary.delivery_attempted == 1
     assert summary.delivery_sent == 0
@@ -393,10 +393,10 @@ def test_a_failed_delivery_can_be_retried_and_then_succeeds(factory, asset_id) -
         decide_notification_events(session, now=utc(10))
 
     failing_client = MockTelegramClient(fail_for_chat_ids=frozenset({"chat-fails"}))
-    deliver_pending_notifications(factory, now=utc(10, 1), client_factory=lambda _channel: failing_client)
+    deliver_pending_notifications(factory, now=utc(10, 1), client_factory=lambda _channel: failing_client, notifications_enabled=True)
 
     succeeding_client = MockTelegramClient()  # a later retry, e.g. after the operator fixed the chat id
-    summary = deliver_pending_notifications(factory, now=utc(11), client_factory=lambda _channel: succeeding_client)
+    summary = deliver_pending_notifications(factory, now=utc(11), client_factory=lambda _channel: succeeding_client, notifications_enabled=True)
 
     assert summary.delivery_sent == 1
     rows = events(factory)
@@ -425,7 +425,7 @@ def test_a_disabled_channel_never_calls_a_client_at_all(factory, asset_id) -> No
     def explode(_channel):
         raise AssertionError("a disabled channel must never reach the client factory")
 
-    summary = deliver_pending_notifications(factory, now=utc(11), client_factory=explode)
+    summary = deliver_pending_notifications(factory, now=utc(11), client_factory=explode, notifications_enabled=True)
     assert summary.delivery_attempted == 0
 
 
@@ -460,7 +460,7 @@ def test_a_crash_mid_batch_never_resends_an_already_delivered_message(factory, a
 
     crashing_client = _CrashingClient(crash_after=1)
     with pytest.raises(RuntimeError):
-        deliver_pending_notifications(factory, now=utc(10, 1), client_factory=lambda _channel: crashing_client)
+        deliver_pending_notifications(factory, now=utc(10, 1), client_factory=lambda _channel: crashing_client, notifications_enabled=True)
 
     rows = events(factory)
     assert len(rows) == 2  # the crash never lost or duplicated a row
@@ -473,7 +473,7 @@ def test_a_crash_mid_batch_never_resends_an_already_delivered_message(factory, a
     # "Restart": a fresh, working client resumes -- it must only see what is
     # still pending, never the one already sent.
     recovering_client = MockTelegramClient()
-    summary = deliver_pending_notifications(factory, now=utc(11), client_factory=lambda _channel: recovering_client)
+    summary = deliver_pending_notifications(factory, now=utc(11), client_factory=lambda _channel: recovering_client, notifications_enabled=True)
     assert summary.delivery_attempted == 1
     assert summary.delivery_sent == 1
     assert len(recovering_client.sent) == 1  # never re-sent the one that already went out
@@ -706,13 +706,18 @@ def test_6_repeated_and_concurrent_evaluation_never_duplicates_the_transition_ev
 # --- end-to-end: the one function the job actually calls -----------------------
 
 
-def test_evaluate_and_process_notifications_decides_and_delivers_in_one_call(factory, asset_id) -> None:
+def test_evaluate_and_process_notifications_decides_and_delivers_in_one_call(factory, asset_id, monkeypatch) -> None:
+    # No injected client factory here, so this goes through
+    # `default_client_factory` -- which needs the global capability on, exactly
+    # as a real deployment does. With no bot token mounted it still lands on
+    # the mock, so nothing leaves the process.
+    monkeypatch.setenv("NEMSEI_V2_NOTIFICATIONS", "true")
     with factory() as session, session.begin():
         channel = make_channel(session)
         make_policy(session, channel=channel)
         make_incident(session, asset_id=asset_id, opened_at=utc(9))
 
-    summary = evaluate_and_process_notifications(factory, now=utc(10))
+    summary = evaluate_and_process_notifications(factory, now=utc(10), notifications_enabled=True)
 
     assert summary.events_created == 1
     assert summary.delivery_sent == 1

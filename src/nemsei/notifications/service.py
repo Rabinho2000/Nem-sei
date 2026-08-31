@@ -52,6 +52,7 @@ from nemsei.notifications.models import (
     NotificationEvent,
     NotificationPolicy,
 )
+from nemsei.config import external_capability_enabled
 from nemsei.notifications.telegram_client import TelegramClient, default_client_factory
 from nemsei.shared.clock import utc_now
 
@@ -107,8 +108,22 @@ def deliver_pending_notifications(
     *,
     now: datetime | None = None,
     client_factory: Callable[[NotificationChannel], TelegramClient] = _default_client_factory,
+    notifications_enabled: bool | None = None,
 ) -> NotificationDeliverySummary:
     """Attempt delivery for every `pending`/`failed` event, one commit each.
+
+    `notifications_enabled` is the global kill switch (`NEMSEI_V2_NOTIFICATIONS`),
+    resolved from the process environment when not given. Off means nothing is
+    attempted at all: no client is built, no event is touched, and events stay
+    `pending` rather than being marked `failed` by a switch that was never
+    about a delivery failure. Turning the switch back on delivers the backlog,
+    which is the same thing re-enabling a channel already does.
+
+    It sits above the channel switch on purpose. The hierarchy, outermost
+    first, is: global capability, then the scheduler's
+    `NEMSEI_V2_NOTIFICATION_PROCESSING_ENABLED` (whether the job runs at all),
+    then policy `enabled` (what becomes an event), then channel `enabled`
+    (where an event may go), then the client (which needs a token to be real).
 
     Restart-safe by construction, not just by retrying: the id list is read
     once, but each event is re-checked (`status in (pending, failed)`)
@@ -123,6 +138,11 @@ def deliver_pending_notifications(
     mock only fails when a test explicitly configures it to); that belongs
     with the real client in D4, not invented here.
     """
+    if notifications_enabled is None:
+        notifications_enabled = external_capability_enabled("notifications")
+    if not notifications_enabled:
+        return NotificationDeliverySummary(delivery_attempted=0, delivery_sent=0, delivery_failed=0)
+
     now_value = now or utc_now()
     with session_factory() as session:
         pending_ids = list(
@@ -168,11 +188,21 @@ def evaluate_and_process_notifications(
     *,
     now: datetime | None = None,
     client_factory: Callable[[NotificationChannel], TelegramClient] = _default_client_factory,
+    notifications_enabled: bool | None = None,
 ) -> NotificationProcessingSummary:
+    """Decide, then deliver.
+
+    Deciding is left running even when the global switch is off: it makes no
+    network call, and it is what keeps each policy's baseline moving, so the
+    switch suspends delivery rather than rewriting what would have been
+    noticed while it was off.
+    """
     now_value = now or utc_now()
     with session_factory() as session, session.begin():
         decision = decide_notification_events(session, now=now_value)
-    delivery = deliver_pending_notifications(session_factory, now=now_value, client_factory=client_factory)
+    delivery = deliver_pending_notifications(
+        session_factory, now=now_value, client_factory=client_factory, notifications_enabled=notifications_enabled
+    )
     return NotificationProcessingSummary(
         policies_evaluated=decision.policies_evaluated,
         events_created=decision.events_created,

@@ -24,6 +24,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from nemsei.config import external_capability_enabled
 from nemsei.diagnostics.models import DiagnosticIncident
 from nemsei.notifications.models import DigestRun, NotificationChannel
 from nemsei.notifications.telegram_client import TelegramClient, default_client_factory
@@ -323,6 +324,7 @@ def deliver_digest(
     digest_run_id: int,
     now: datetime | None = None,
     client_factory: Callable[[NotificationChannel], TelegramClient] = _default_client_factory,
+    notifications_enabled: bool | None = None,
 ) -> DigestDeliveryResult:
     """Attempt delivery for one digest, one transaction, committed
     immediately -- the same reasoning as D3's `deliver_pending_notifications`:
@@ -330,6 +332,15 @@ def deliver_digest(
     replay it. No channel configured (today's real state) or a disabled one
     means this never reaches a client at all, mock or otherwise.
     """
+    # The same global kill switch `deliver_pending_notifications` honours, and
+    # for the same reason: a digest is an outbound Telegram message like any
+    # other. Nothing is attempted, so the digest stays `pending` and is
+    # delivered if and when the switch comes back on.
+    if notifications_enabled is None:
+        notifications_enabled = external_capability_enabled("notifications")
+    if not notifications_enabled:
+        return DigestDeliveryResult(attempted=False, delivered=False)
+
     now_value = now or utc_now()
     with session_factory() as session, session.begin():
         digest = session.get(DigestRun, digest_run_id)

@@ -299,13 +299,18 @@ def _execute_incident_evaluation(*, session_factory: sessionmaker[Session]) -> J
 
 
 def _execute_notification_processing(*, session_factory: sessionmaker[Session]) -> JobOutcome:
-    """One notification-policy evaluation + mock-delivery pass (D3).
+    """One notification-policy evaluation and delivery pass.
 
-    No provider calls. Delivery can only ever reach
-    `notifications.telegram_client.MockTelegramClient` -- `service.py`'s
-    default client factory has no other client to construct. A delivery
-    "failure" here is the mock's own, deterministic, test-configured
-    behaviour, never a real network error, since D4 has not happened.
+    No provider calls -- but, since D4 shipped `HttpTelegramClient` on
+    2026-08-25, delivery here does reach the real Telegram API whenever the
+    global `NEMSEI_V2_NOTIFICATIONS` capability is on, a bot token is mounted
+    and the channel is enabled. This docstring said the opposite until
+    2026-08-31, which is roughly how long the deployment believed it too.
+
+    The capability is resolved inside `evaluate_and_process_notifications`
+    from the process environment rather than passed from here, so every entry
+    point -- this job, the digest, and any future caller -- is gated by the
+    same switch without having to remember to forward it.
     """
     # No outer `session.begin()` here, deliberately -- `evaluate_and_process
     # _notifications` manages its own transactions per step (one for

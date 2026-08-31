@@ -264,7 +264,7 @@ def test_a_digest_with_no_channel_configured_is_never_delivered(factory, setting
         digest = generate_digest(session, window_end=utc(12), interval_minutes=60)
         digest_id = digest.id
 
-    result = deliver_digest(build_session_factory(create_engine(settings.database_url)), digest_run_id=digest_id)
+    result = deliver_digest(build_session_factory(create_engine(settings.database_url)), digest_run_id=digest_id, notifications_enabled=True)
     assert result.attempted is False
     with factory() as session:
         assert session.get(DigestRun, digest_id).delivery_status == "pending"
@@ -283,7 +283,8 @@ def test_a_disabled_channel_never_calls_a_client_at_all(factory, settings) -> No
         raise AssertionError("a disabled channel must never reach the client factory")
 
     result = deliver_digest(
-        build_session_factory(create_engine(settings.database_url)), digest_run_id=digest_id, client_factory=explode
+        build_session_factory(create_engine(settings.database_url)), digest_run_id=digest_id, client_factory=explode,
+        notifications_enabled=True,
     )
     assert result.attempted is False
 
@@ -300,7 +301,7 @@ def test_a_successful_delivery_marks_the_digest_delivered(factory, settings) -> 
     mock_client = MockTelegramClient()
     result = deliver_digest(
         build_session_factory(create_engine(settings.database_url)), digest_run_id=digest_id,
-        client_factory=lambda _channel: mock_client,
+        client_factory=lambda _channel: mock_client, notifications_enabled=True,
     )
     assert result.attempted is True
     assert result.delivered is True
@@ -323,7 +324,7 @@ def test_a_failed_delivery_is_auditable_and_never_falsely_marked_delivered(facto
     failing_client = MockTelegramClient(fail_for_chat_ids=frozenset({"chat-fails"}))
     result = deliver_digest(
         build_session_factory(create_engine(settings.database_url)), digest_run_id=digest_id,
-        client_factory=lambda _channel: failing_client,
+        client_factory=lambda _channel: failing_client, notifications_enabled=True,
     )
     assert result.attempted is True
     assert result.delivered is False
@@ -338,7 +339,7 @@ def test_a_failed_delivery_is_auditable_and_never_falsely_marked_delivered(facto
     succeeding_client = MockTelegramClient()
     retry_result = deliver_digest(
         build_session_factory(create_engine(settings.database_url)), digest_run_id=digest_id,
-        client_factory=lambda _channel: succeeding_client,
+        client_factory=lambda _channel: succeeding_client, notifications_enabled=True,
     )
     assert retry_result.delivered is True
     assert len(digest_runs(factory)) == 1

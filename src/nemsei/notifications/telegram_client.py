@@ -6,11 +6,26 @@ wrong. D4 -- building the real client -- was gated on explicit human approval,
 which was given on 2026-08-25.
 
 The structural guarantee is preserved rather than removed. `HttpTelegramClient`
-cannot be constructed without a bot token, and the factory in
-`notifications/service.py` falls back to the mock when no token is configured,
-so an unconfigured deployment still cannot send anything. The kill switch that
-matters most is still `NotificationChannel.enabled`, which stops the delivery
-step before any client is built at all.
+cannot be constructed without a bot token, and `default_client_factory` falls
+back to the mock when no token is configured, so an unconfigured deployment
+still cannot send anything.
+
+There are four switches above it, and they are not interchangeable:
+
+1. `NEMSEI_V2_NOTIFICATIONS` -- the global capability. Off means this process
+   may not deliver at all, whatever else is configured.
+2. `NEMSEI_V2_NOTIFICATION_PROCESSING_ENABLED` -- whether the scheduler
+   enqueues the periodic job. It governs when delivery is *attempted*, not
+   whether it is *allowed*.
+3. `NotificationPolicy.enabled` -- which incidents become events.
+4. `NotificationChannel.enabled` -- where an event may be delivered.
+
+Until 2026-08-31 only the last two were real. The first was parsed into
+`Settings.capabilities` and read by nothing, so a deployment running with
+`NEMSEI_V2_NOTIFICATIONS=false` still delivered real Telegram messages: the
+token was mounted, the channel was enabled, and nothing in between ever looked
+at the switch. `default_client_factory` now checks it, and the two delivery
+steps check it before they build a client at all.
 """
 from __future__ import annotations
 
@@ -125,20 +140,55 @@ def _safe_reason(exc: urllib.error.HTTPError) -> str:
     return str(decoded.get("description", "no description"))[:180]
 
 
-def default_client_factory(channel: object) -> TelegramClient:
-    """A real client when a bot token is configured, the mock otherwise.
+@dataclass(frozen=True)
+class DeniedTelegramClient:
+    """What the global kill switch leaves behind: a client that cannot send.
 
-    The fallback is the safety property, not a convenience: a deployment with
-    no token cannot send anything, whatever anyone switches on in the
-    interface. The token is read at call time rather than captured at import,
-    so rotating the mounted secret takes effect on the next delivery instead of
-    the next restart.
+    It raises rather than returning a failed `DeliveryResult`, and rather than
+    quietly falling back to the mock. A failed result would mark real events
+    `failed` and retry them forever; the mock would mark them `sent` when
+    nothing was sent. Both would be a kill switch that lies about what it did.
+
+    Reaching this at all is a bug in the caller -- `deliver_pending_
+    notifications` and `deliver_digest` check the capability before they get
+    here. It exists so that a future caller which forgets to check crashes
+    instead of sending.
+    """
+
+    def send_message(self, *, chat_id: str, text: str) -> DeliveryResult:
+        from nemsei.safety.external_actions import ExternalActionDenied
+
+        raise ExternalActionDenied("V2 external capability is disabled: notifications")
+
+
+def default_client_factory(channel: object) -> TelegramClient:
+    """A real client when notifications are allowed and a bot token is
+    configured; something that cannot reach the network otherwise.
+
+    Two independent conditions, and both are structural rather than advisory:
+
+    * `NEMSEI_V2_NOTIFICATIONS` is the global capability from
+      `config.CAPABILITIES`, default-deny per `safety/external_actions.py`. It
+      was parsed into `Settings.capabilities` from the beginning and then read
+      by nothing at all -- `provider_reads` is checked in eight places,
+      `notifications` in none -- so a deployment running with
+      `NEMSEI_V2_NOTIFICATIONS=false` delivered real Telegram messages anyway,
+      because the token was mounted and the channel was enabled. Checking it
+      here is what that switch was always meant to do.
+    * The token still decides real versus mock, unchanged: a deployment with no
+      token cannot send whatever anyone switches on in the interface.
+
+    Both are read at call time rather than captured at import, so flipping the
+    switch or rotating the mounted secret takes effect on the next delivery
+    instead of the next restart.
 
     Lives here, and not in `service.py` and `digests.py` separately, so there is
     exactly one place that decides whether this process can reach the network.
     """
-    from nemsei.config import read_secret_value
+    from nemsei.config import external_capability_enabled, read_secret_value
 
+    if not external_capability_enabled("notifications"):
+        return DeniedTelegramClient()
     token = read_secret_value(
         value_name="NEMSEI_V2_TELEGRAM_BOT_TOKEN",
         file_name="NEMSEI_V2_TELEGRAM_BOT_TOKEN_FILE",

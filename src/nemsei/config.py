@@ -67,6 +67,24 @@ def read_secret_value(*, value_name: str, file_name: str) -> str:
         raise ConfigurationError(f"Unable to read {file_name}.") from exc
 
 
+def external_capability_enabled(capability: str) -> bool:
+    """Whether one `CAPABILITIES` switch is on, read from the process environment.
+
+    `Settings.capabilities` says the same thing, and where a `Settings` is
+    already in hand it is the better source. This exists for the few places
+    that decide whether *this process* may touch the network and that are
+    reached without one -- notably
+    `notifications/telegram_client.default_client_factory`, which already reads
+    the bot token from the environment for the same reason.
+
+    Default-deny, matching `safety/external_actions.py`: an unset switch is
+    off, never on.
+    """
+    if capability not in CAPABILITIES:
+        raise ValueError(f"Unknown external capability: {capability}")
+    return parse_bool(os.environ.get(f"NEMSEI_V2_{capability.upper()}"), default=False)
+
+
 @dataclass(frozen=True)
 class Settings:
     environment: str

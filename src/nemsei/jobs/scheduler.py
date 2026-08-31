@@ -74,8 +74,11 @@ class Scheduler:
                 interval_minutes=self.settings.diagnostic_incident_evaluation_interval_minutes,
             )
             created = created or incident_created
-        # D3: off by default. Even enabled, delivery can only ever reach the
-        # mock Telegram client -- no real one exists in this codebase yet.
+        # D3: off by default. This switch decides whether the pass *runs*;
+        # whether it may deliver is the separate global `NEMSEI_V2_NOTIFICATIONS`
+        # capability, checked in notifications/service.py. Since D4 the client
+        # is a real one whenever a bot token is mounted, so the two are not
+        # interchangeable.
         if self.settings.notification_processing_enabled:
             _notification_job, notification_created = self.repository.enqueue_due_notification_processing(
                 interval_minutes=self.settings.notification_processing_interval_minutes,
