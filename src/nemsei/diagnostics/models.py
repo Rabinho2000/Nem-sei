@@ -132,6 +132,10 @@ class DiagnosticIncident(Base):
         ),
         Index("ix_diagnostic_incidents_status", "status", "last_observed_at"),
         Index("ix_diagnostic_incidents_asset", "asset_id", "status"),
+        # Declared here because 0023 creates it. An index the migrations build
+        # but the model never mentions is one `--autogenerate` proposes to drop
+        # the next time anyone runs it.
+        Index("ix_diagnostic_incidents_handling", "handling_state", "status"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
