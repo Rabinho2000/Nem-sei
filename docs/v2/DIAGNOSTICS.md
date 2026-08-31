@@ -109,6 +109,109 @@ cada `inverter_state` distinto real — só corre a partir do host
 (`/opt/server/apps/Nem-sei/.venv/bin/python`), pela mesma razão de WAL que os
 outros testes dourados desta sessão.
 
+### O estado da instalação (2026-08-25)
+
+Faltava a resposta de nível acima: o que é que **esta central** está a fazer
+agora. O badge ao lado do nome de uma central era o `lifecycle_status` — um
+campo administrativo (ativa/inativa/desativada) que nada calcula e que o
+importador da V1 deixou em `unknown` em 264 de 267 centrais. Uma central a
+produzir dizia "Desconhecida", que é exactamente a coisa errada para um
+produto de O&M dizer sobre uma central que está a trabalhar.
+
+`monitoring/installation_state.py` deriva esse estado — nunca o guarda,
+recalcula-o a cada chamada, como `diagnostics/findings.py` — a partir de duas
+fontes, por esta ordem: a `MonitoringObservation` da instalação (o que o
+provider diz do sistema todo) e, quando essa não diz nada de útil, as
+`DeviceStatusFact` dos seus equipamentos (um site cujos inversores estão todos
+disponíveis está a trabalhar, diga o que disser o endpoint da central).
+
+Duas respostas são deliberadamente distintas de `unknown`, porque confundi-las
+faz perder tempo a quem opera: `no_evidence` (nunca se leu nada desta central)
+e `stale` (leu-se, mas há tempo de mais para descrever "agora" — janela de 24 h,
+a mesma de `diagnostics.findings`). Só "temos leitura fresca e ela não diz" é
+`unknown`. Os factos de produção não são consultados: um total diário é
+evidência sobre ontem, e usá-lo aqui deixaria uma central que morreu de manhã
+continuar a dizer "operacional" o resto do dia.
+
+O badge aparece na ficha da central, na lista de centrais e no separador de
+instalações de um portfolio; a coluna que dizia "Estado" e mostrava o ciclo de
+vida passou a chamar-se "Ciclo de vida", que é o que sempre foi.
+
+### O alerta de queda de central (2026-08-25)
+
+A funcionalidade que a V1 tinha e a V2 não: "esta central caiu" / "voltou", no
+Telegram. Ao investigar porque é que uma mensagem da V1 dizia que uma central
+estava a trabalhar enquanto a V2 dizia "sem leitura recente", o corte apareceu
+em três sítios, nenhum deles onde se esperava:
+
+1. **Nada agendava a leitura de estado.** Não existia tipo de job
+   `monitoring.current`. O `FusionSolarMonitoringService.sync_current_monitoring`
+   estava escrito e testado desde sempre, e tinha sido chamado **uma vez**, a
+   2026-08-19. Daí as 2 linhas em `monitoring_observations`.
+2. **Os incidentes eram só de equipamento.** `evaluate_and_persist_incidents`
+   percorria `select(Device.asset_id).distinct()` — as centrais que têm
+   dispositivos importados. 132 das 134 centrais mapeadas não têm nenhum, por
+   isso uma central a cair não gerava incidente, logo não gerava alerta.
+3. A política de avisos não notifica à abertura; a de críticos sim, à abertura
+   **e** à resolução — que é exactamente o par `⚠️`/`✅` da V1.
+
+**O que foi construído:** o job `monitoring.current` (despachado por
+`provider_code` desde o primeiro dia, para não repetir o bug que a produção
+teve em 094a40a), um agendamento por conta de provider a 15 minutos, e as
+regras de nível central em `findings.py` — `plant_offline` e `plant_fault`
+(críticas), `plant_warning` e `plant_state_stale` (avisos). O avaliador de
+incidentes passou a percorrer a união das centrais com dispositivos e das
+centrais com leitura de estado.
+
+**Duas decisões que valem mais do que o código:**
+
+*Uma central nunca lida não gera finding nenhum.* "Nunca ligada" é lacuna de
+onboarding, não avaria; abrir incidente por cada instalação não mapeada
+enterrava as que realmente caíram debaixo das que ninguém ligou.
+
+*Uma leitura fresca com condição `unknown` também não.* É o caso da Sigenergy
+todas as noites — payload completo em que o provider não declara estado. "Não
+sabemos" não é a mesma afirmação que "está mal", e só a segunda justifica
+interromper alguém.
+
+E a garantia que o código já dava e que se mantém: uma leitura falhada ou
+travada por limite **nunca** vira `offline`. Nenhum dos dois serviços escreve
+observação em erro. Só o provider a dizer offline é offline.
+
+**Custo real, medido:** o FusionSolar responde até 100 centrais por chamada, o
+que põe as 134 em 2 chamadas mais um login em cache. A `current_monitoring` é
+família de endpoint própria em `provider_request_states` — sem cooldown, ao
+contrário do `device_discovery` e do `device_current_monitoring`, que são os
+que apanham `rate_limited` hoje. Não compete com o orçamento da sonda de
+dispositivos.
+
+### A divergência do 40960 (2026-08-25)
+
+A paridade com a V1 tem uma excepção declarada. O código `40960` (0xA000) era
+o buraco maior da classificação portada: 10 736 das 51 289 leituras, e a
+**última** leitura de 220 dos 325 dispositivos — ou seja, a razão pela qual a
+tabela de diagnóstico mostrava "desconhecido" em quase toda a frota. A V1
+também nunca o classificou; caía no `unknown` por omissão dos conjuntos.
+
+Foi resolvido a partir da evidência nas próprias linhas da V1, não de
+documentação da Huawei (que não temos):
+
+* `active_power_kw` é 0 nas 10 736 linhas — nunca nulo, nunca positivo;
+* todas as observações caem entre as 19:00 e as 05:59 UTC (20h–06h de Lisboa
+  nos dados de Junho–Julho de 2026), zero ocorrências entre as 06:00 e as
+  18:59 UTC;
+* 4 384 das linhas ainda trazem a energia acumulada do dia, até 874,7 kWh.
+
+Um inversor desligado à noite depois de ter produzido é `standby` no
+vocabulário da própria V1. `V2_STANDBY_INVERTER_STATES` em
+`diagnostics/rules.py` regista a decisão, e `test_diagnostics_golden.py`
+re-deriva as três observações da base da V1 em cada corrida — se a evidência
+deixar de se verificar, o teste falha em vez de o produto continuar a dar uma
+resposta que já não consegue justificar. A migração
+`0025_inverter_state_40960` reclassificou as linhas já importadas
+(`availability_status` é coluna derivada; `metadata_json->>'v1_inverter_state'`,
+que é a evidência, não é tocada).
+
 `inverter_power_samples` (54 593 linhas, só potência, um único dia) não foi
 importado nesta fatia — `device_realtime_snapshots` já cobre estado, potência
 e energia numa janela muito mais larga, e importar as duas seria trabalho

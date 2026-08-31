@@ -60,6 +60,11 @@ from nemsei.diagnostics.service import record_device_status
 from nemsei.integrations.fusionsolar.client import FusionSolarClient, FusionSolarClientError, FusionSolarCredentials
 from nemsei.integrations.fusionsolar.request_control import FusionSolarRequestController
 from nemsei.integrations.fusionsolar.service import credentials_for
+from nemsei.integrations.huawei_scada.fusionsolar_discovery import (
+    DiscoveredCollector,
+    as_metadata as as_collector_metadata,
+    collectors_in,
+)
 from nemsei.integrations.fusionsolar.session_cache import (
     FusionSolarSessionCache,
     authenticated_client,
@@ -314,6 +319,13 @@ class FusionSolarDeviceStatusService:
 
         expected_ids = frozenset(mapping.external_id.strip() for mapping in selected)
         device_types: dict[str, int] = {}
+        # Huawei collectors (SDongle, SmartLogger) seen in the same response.
+        # This call is the only one FusionSolar lets through for this account
+        # -- once per hour -- and it already carries every serial the Huawei
+        # SCADA integration needs to pre-map a plant. Recording them costs
+        # nothing and is never allowed to affect this sync.
+        asset_by_station = {code: asset_id for asset_id, code in station_codes_by_asset.items() if code}
+        collectors: list[DiscoveredCollector] = []
         received = 0
         for batch in _batches(station_codes, 100):
             rows, error = self._calls.call(
@@ -325,6 +337,10 @@ class FusionSolarDeviceStatusService:
                     invalidate_session(credentials, cache=self._session_cache)
                 return self._finish(run.id, connection_id, len(selected), 0, 0, 0, error)
             assert rows is not None
+            try:
+                collectors.extend(collectors_in(rows, asset_by_station=asset_by_station))
+            except Exception:  # pragma: no cover - a bystander must never fail the sync
+                pass
             for row in rows:
                 discovered = normalize_device_type_row(row)
                 if discovered and discovered.external_device_id in expected_ids and discovered.device_type_id in contract.inverter_device_type_ids:
@@ -369,7 +385,7 @@ class FusionSolarDeviceStatusService:
         complete = first_error is None and unresolved == 0 and accepted == len(selected)
         return self._finish(
             run.id, connection_id, len(selected), received, accepted, rejected + unresolved, first_error,
-            partial=not complete,
+            partial=not complete, collectors=collectors,
         )
 
     def _selected_device_mappings(self, connection_id: int) -> tuple[list[AssetProviderMapping], dict[int, str]]:
@@ -445,6 +461,7 @@ class FusionSolarDeviceStatusService:
     def _finish(
         self, run_id: int, connection_id: int, expected: int, received: int, accepted: int, rejected: int,
         error: ProviderError | None, *, deferred: bool = False, partial: bool = False,
+        collectors: "list[DiscoveredCollector] | None" = None,
     ) -> DeviceStatusSyncResult:
         if deferred:
             status, completeness = "deferred", "none"
@@ -467,6 +484,7 @@ class FusionSolarDeviceStatusService:
                 "items_received": received,
                 "items_accepted": accepted,
                 "items_rejected": rejected,
+                **(as_collector_metadata(collectors) if collectors else {}),
             }
             record_health(session, provider_connection_id=connection_id, partial=status == "partial", error=error, **health_values_for_error(error, operation="sync"))
             finish_sync_run(session, run=run, status=status, completeness=completeness, error=error)

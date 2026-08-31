@@ -90,9 +90,27 @@ mappings.
 Current monitoring reads only source-policy-selected mappings and does not run
 discovery. The V1-evidenced `normal`, `online`, `running`, `fault`, `error`,
 `abnormal`, `offline`, and `disconnected` words are normalized conservatively;
-an unrecognized or absent status remains `unknown`. The endpoint has no verified
+an unrecognized status remains `unknown`. The endpoint has no verified
 provider observation timestamp, so freshness remains `unknown` and receipt
-time is recorded as ingestion evidence. Each mapping is reserved and marked as
+time is recorded as ingestion evidence.
+
+An **absent** status is a different case, and since 2026-08-25 it is no longer
+simply `unknown`. `energyFlow` carries no status field at all: V1's own stored
+record of a live response for this account
+(`provider_system_inventory.metadata_json`, system `TZXRS1780315946`) lists
+exactly `acPower`, `batteryPower`, `batterySoc`, `evPower`, `gridPower`,
+`heatPumpPower`, `loadPower`, `pvPower` — and V1's inventory row for that same
+system still reads `operational_status = 'unknown'` today. Reading only for a
+status field therefore condemned every Sigenergy plant to "desconhecido"
+forever, however healthy it was. So when no status field is present, the
+condition is read from the flow: a positive `pvPower`/`acPower` is
+`operational`, because generating power is not a hint about what the plant
+might be doing, it is the plant doing it. A stated status always wins over the
+flow, including a stated fault while power is still flowing. A complete payload
+with nothing generating stays `unknown` but is recorded as a *complete* read,
+so that every night on the account does not report as a degraded sync; only an
+energyFlow with no fields at all is still `partial`. `condition_source` in the
+observation metadata records which of these produced the answer. Each mapping is reserved and marked as
 attempted immediately before its provider call. A failed mapping does not abort
 the remaining mappings; a rate-limit deferral may stop the remainder and marks
 those mappings skipped. Sync metadata records `expected_items`,
@@ -115,6 +133,33 @@ another global timezone.
 Sigenergy daily production is deliberately not implemented. Although legacy
 fixtures contain kWh-named fields, source-day/timezone semantics, correction
 behavior, and safe historical request bounds are not independently verified.
+
+## Plant-state scheduling
+
+Current monitoring is scheduled from 2026-08-25 as the job type
+`monitoring.current`, one schedule per provider account
+(`monitoring.current:<connection_id>`), dispatched to the right service by the
+connection's `provider_code`. Before that it had no job type at all: the
+services existed and were tested, and nothing ever called them, so the
+plant-state half of the product was dark while the device half ran.
+
+Cadence is 15 minutes and the interval is in minutes rather than hours because
+this is the read outage alerting depends on -- a plant that fell an hour ago is
+news that arrived an hour late. It is affordable at that cadence because
+FusionSolar answers up to 100 plants per batched call: the whole mapped fleet
+of 134 costs two calls plus a cached login, measured, not estimated. Sigenergy
+has no batch endpoint, so it costs one call per selected mapping.
+
+Rate-limit budgets are tracked per `endpoint_family` in
+`provider_request_states`, and `current_monitoring` is its own family -- the
+pressure visible on this account today sits on `device_discovery` and
+`device_current_monitoring`, which this does not share.
+
+Neither service writes an observation when a call fails, so a rate-limited or
+failed read can never present as an offline plant. The job also reports success
+when the provider refuses: the refusal is recorded on the sync run and the
+connection health, and failing the job would only retry it against an account
+that just said no.
 
 ## Production recovery modes
 

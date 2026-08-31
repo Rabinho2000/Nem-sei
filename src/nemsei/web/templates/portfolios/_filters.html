@@ -5,7 +5,7 @@
 <form class="filter-bar" method="get" action="{{ url_for('portfolios.detail', portfolio_id=portfolio.id, section=section) }}">
   <input type="hidden" name="month" value="{{ report_month }}">
   <input type="search" name="q" value="{{ filters.get('q', '') }}" placeholder="Nome, subconta ou NIF">
-  {% for key, label in [('country_code', 'País'), ('lifecycle_status', 'Estado'), ('provider_code', 'Provider'), ('contract_type', 'Contrato')] %}
+  {% for key, label in [('country_code', 'País'), ('lifecycle_status', 'Ciclo de vida'), ('provider_code', 'Provider'), ('contract_type', 'Contrato')] %}
     <select name="{{ key }}" aria-label="{{ label }}">
       <option value="">{{ label }}: todos</option>
       {% for option in filter_options.get(key, []) %}

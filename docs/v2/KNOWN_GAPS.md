@@ -124,3 +124,30 @@ semantics are independently verified. SMA has no live adapter. No live
 provider call is made by tests or by default policy.
 It has no persisted users or RBAC; the administrator is configured with a
 password hash.
+
+## Huawei SCADA (2026-08-25)
+
+A V2 recebe agora dados diretamente de um SDongle Huawei que se liga ao servidor
+(`integrations/huawei_scada/`, migração `0026`, `HUAWEI_SCADA.md`). O que **não**
+sabe fazer, por falta de evidência e não por falta de código:
+
+- **Não distingue exportação de importação.** O registo 37502 é com sinal e nada
+  no tráfego observado diz o que significa positivo. Sem uma convenção verificada
+  por comparação com um contador real, `export_energy` e `grid_import_energy`
+  não são escritos de todo — não são estimados a meio.
+- **Não tem leitura ao nível do inversor.** `unit=1` devolveu
+  `function=0x83`, `exception=0x04` nas duas instalações testadas. O registry não
+  declara `DEVICE_MONITORING` para este provider, e a sessão continua a recolher
+  o agregado do `unit=100` apesar disso.
+- **A energia diária é uma estimativa, não um contador.** Vem da integração
+  trapezoidal das amostras de potência; é sempre `quality='partial'` com
+  `measurement_method='power_integral'` e `estimated=true`. Lacunas maiores que o
+  corte configurado são excluídas em vez de interpoladas, por isso um dia com
+  falhas de comunicação fica sub-contabilizado — e di-lo na sua metadata
+  (`coverage_ratio`, `gap_count`, `largest_gap_seconds`).
+- **Não tem timestamp de origem.** O protocolo não traz nenhum, por isso
+  `observed_at` é a hora de receção do servidor, declarada em cada linha.
+- **Não tem TLS.** O piloto corre em claro; os riscos e as três saídas possíveis
+  estão em `HUAWEI_SCADA.md` §7.
+- **Nunca correu contra hardware real nesta instalação.** Toda a prova é contra
+  um logger falso que responde como o do piloto.

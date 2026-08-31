@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from nemsei.assets.models import Asset, AssetAlias, Organization
 from nemsei.assets.service import asset_search_clause, normalize_name
+from nemsei.monitoring.installation_state import current_installation_states
 from nemsei.monitoring.models import MonitoringObservation, ProductionFact
 from nemsei.providers.models import AssetProviderMapping, LegacyImportRecord, ProviderConnection
 from nemsei.providers.registry import descriptor_for
@@ -28,6 +29,7 @@ PROVIDER_LABELS = {
     "fusionsolar": "FusionSolar",
     "sigenergy": "Sigenergy",
     "sma": "SMA",
+    "huawei_scada": "Huawei SCADA",
 }
 
 
@@ -200,12 +202,14 @@ def list_assets_data(
         _asset_base_statement(filters).limit(per_page).offset((effective_page - 1) * per_page)
     ).all()
     summaries = _mapping_summaries(session, [asset.id for asset, _ in rows])
-    # One page at a time, so this stays one extra query regardless of fleet size.
+    # One page at a time, so this stays two queries regardless of fleet size.
+    states = current_installation_states(session, asset_ids=[asset.id for asset, _ in rows])
     om_states = om_states_for(session, asset_ids=[asset.id for asset, _ in rows])
     commercial = commercial_states_for(session, assets={asset.id: asset.contract_type for asset, _ in rows})
     assets: list[dict[str, Any]] = []
     for asset, organization_name in rows:
         summary = summaries[asset.id]
+        state = states[asset.id]
         assets.append(
             {
                 "id": asset.id,
@@ -219,6 +223,14 @@ def list_assets_data(
                 "timezone": asset.timezone,
                 "lifecycle_status": asset.lifecycle_status,
                 "lifecycle_label": ASSET_LIFECYCLE_LABELS.get(asset.lifecycle_status, asset.lifecycle_status),
+                # The operational answer, kept separate from the
+                # administrative one above -- they are different questions and
+                # were previously both called "Estado".
+                "state": state.state,
+                "state_label": state.label,
+                "state_tone": state.tone,
+                "state_detail": state.detail,
+                "state_observed_at": state.observed_at,
                 "review_status": asset.review_status,
                 "review_label": "Precisa de revisão" if asset.review_status == "needs_review" else "OK",
                 "review_tone": "warning" if asset.review_status == "needs_review" else "success",

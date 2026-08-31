@@ -172,17 +172,74 @@ def test_monitoring_uses_selected_mappings_without_discovery_and_confirms_state(
         assert all(session.get(MonitoringCurrentState, mapping.id).last_confirmed_at is not None for mapping in mappings)
 
 
-def test_unknown_or_missing_status_never_fabricates_offline(settings, monkeypatch):
+def test_missing_status_never_fabricates_offline(settings, monkeypatch):
+    """A payload with no status and nothing flowing is unknown -- never offline."""
     configured_environment(monkeypatch)
     factory = factory_for(settings, monkeypatch)
     connection_id, _ = selected_connection(factory)
-    transport = FakeTransport([auth_ok(), response({"code": 0, "data": {"systemId": "SIG-001", "pvPower": 1.1}})])
+    transport = FakeTransport([auth_ok(), response({"code": 0, "data": {"systemId": "SIG-001", "pvPower": 0, "batterySoc": 41}})])
     result = monitoring_service(factory, settings, transport).sync_current_monitoring(connection_id)
-    assert result.status == "partial"
     with factory() as session:
         observation = session.scalar(select(MonitoringObservation))
         assert observation is not None and observation.condition == "unknown" and observation.quality == "missing"
         assert session.scalar(select(func.count()).select_from(MonitoringObservation).where(MonitoringObservation.condition == "offline")) == 0
+    # Sigenergy sends no status field at all, so this is every night for every
+    # plant on the account. It is a complete read of everything the provider
+    # offers, and must not report the account as degraded on `/system`.
+    assert result.status == "success"
+
+
+def test_a_plant_generating_reads_operational_even_though_sigenergy_states_no_status(settings, monkeypatch):
+    """The real payload shape: eight power fields, no status field anywhere.
+
+    Field list taken from V1's stored record of a live response for this
+    account (`provider_system_inventory.metadata_json`, system
+    TZXRS1780315946), which is also why V1 still shows that plant as
+    `operational_status = 'unknown'`.
+    """
+    configured_environment(monkeypatch)
+    factory = factory_for(settings, monkeypatch)
+    connection_id, _ = selected_connection(factory)
+    flow = {"systemId": "SIG-001", "acPower": 3.4, "batteryPower": -0.2, "batterySoc": 88, "evPower": 0, "gridPower": -2.1, "heatPumpPower": 0, "loadPower": 1.3, "pvPower": 4.2}
+    transport = FakeTransport([auth_ok(), response({"code": 0, "data": flow})])
+    result = monitoring_service(factory, settings, transport).sync_current_monitoring(connection_id)
+    assert result.status == "success" and result.accepted == 1
+    with factory() as session:
+        observation = session.scalar(select(MonitoringObservation))
+        assert observation is not None
+        assert observation.condition == "operational"
+        # The provider stated nothing, and the record says so rather than
+        # inventing a code to justify the answer.
+        assert observation.raw_status_code is None
+        assert observation.metadata_json["condition_source"] == "energy_flow_generation"
+        assert observation.metadata_json["generation_field"] == "pvPower"
+
+
+def test_a_stated_status_always_wins_over_the_flow(settings, monkeypatch):
+    """Power still flowing does not overrule a provider that reports a fault."""
+    configured_environment(monkeypatch)
+    factory = factory_for(settings, monkeypatch)
+    connection_id, _ = selected_connection(factory)
+    transport = FakeTransport([auth_ok(), response({"code": 0, "data": {"systemId": "SIG-001", "systemStatus": "fault", "pvPower": 4.2}})])
+    monitoring_service(factory, settings, transport).sync_current_monitoring(connection_id)
+    with factory() as session:
+        observation = session.scalar(select(MonitoringObservation))
+        assert observation is not None and observation.condition == "fault"
+        assert observation.metadata_json["condition_source"] == "provider_status_field"
+
+
+def test_an_empty_energy_flow_is_still_an_incomplete_read(settings, monkeypatch):
+    """No status *and* no fields is a gap, and has to stay visible as one."""
+    configured_environment(monkeypatch)
+    factory = factory_for(settings, monkeypatch)
+    connection_id, _ = selected_connection(factory)
+    transport = FakeTransport([auth_ok(), response({"code": 0, "data": {"systemId": "SIG-001"}})])
+    result = monitoring_service(factory, settings, transport).sync_current_monitoring(connection_id)
+    assert result.status == "partial"
+    with factory() as session:
+        observation = session.scalar(select(MonitoringObservation))
+        assert observation is not None and observation.condition == "unknown"
+        assert observation.metadata_json["condition_source"] == "empty_energy_flow"
 
 
 def test_monitoring_continues_after_one_mapping_failure_and_records_partial_metadata(settings, monkeypatch):

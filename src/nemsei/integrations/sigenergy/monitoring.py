@@ -176,14 +176,66 @@ class SigenergyMonitoringService:
         return SigenergyMonitoringResult(connection_id, run_id, status, completeness, expected, received, accepted, rejected, error.code.value if error else None)
 
 
+# The fields a Sigenergy energyFlow response actually carries, taken from V1's
+# own record of a live response for this account rather than from
+# documentation: `provider_system_inventory.metadata_json` for system
+# TZXRS1780315946 lists exactly these eight -- and no status field, under any
+# name. V1's inventory row for that same system still reads
+# `operational_status = 'unknown'` today, which is what reading only for a
+# status field costs: a healthy plant that can never say so.
+ENERGY_FLOW_FIELDS = ("acPower", "batteryPower", "batterySoc", "evPower", "gridPower", "heatPumpPower", "loadPower", "pvPower")
+# Power the system is generating right now. Unlike the other fields, a
+# positive value here is not a hint about what the plant might be doing -- it
+# is the plant doing it, which is the whole question `operational` asks.
+GENERATION_FIELDS = ("pvPower", "acPower")
+
+
+def _positive_generation(flow: dict[str, Any]) -> tuple[str, float] | None:
+    """The first generation field reporting a positive value, if any.
+
+    No unit is claimed: Sigenergy does not document one for this payload and
+    nothing here depends on the magnitude, only on the sign.
+    """
+    for field in GENERATION_FIELDS:
+        value = flow.get(field)
+        if value in (None, ""):
+            continue
+        try:
+            number = float(str(value).strip())
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            return field, number
+    return None
+
+
 def normalize_energy_flow(external_id: str, flow: dict[str, Any]) -> SigenergyMonitoringSample:
     raw = flow.get("status") or flow.get("systemStatus") or flow.get("runningStatus") or flow.get("state")
     raw_code = str(raw).strip() if raw not in (None, "") else None
-    condition = normalize_status(raw_code)
-    quality = "complete" if raw_code is not None else "missing"
-    completeness = "complete" if raw_code is not None else "partial"
-    metadata = {"observed_at_source": "ingested_at_no_provider_timestamp", "energy_fields_present": sorted(key for key in ("pvPower", "gridPower", "batteryPower", "batterySoc", "loadPower") if flow.get(key) not in (None, ""))}
-    return SigenergyMonitoringSample(external_id, condition, quality, completeness, raw_code, raw_code, metadata)
+    present = sorted(key for key in ENERGY_FLOW_FIELDS if flow.get(key) not in (None, ""))
+    metadata: dict[str, Any] = {"observed_at_source": "ingested_at_no_provider_timestamp", "energy_fields_present": present}
+    if raw_code is not None:
+        # A provider that states its own status is always believed over
+        # anything inferred from the flow, including a stated fault while
+        # power is still flowing.
+        metadata["condition_source"] = "provider_status_field"
+        return SigenergyMonitoringSample(external_id, normalize_status(raw_code), "complete", "complete", raw_code, raw_code, metadata)
+    generating = _positive_generation(flow)
+    if generating is not None:
+        field, value = generating
+        metadata["condition_source"] = "energy_flow_generation"
+        metadata["generation_field"] = field
+        metadata["generation_value"] = value
+        return SigenergyMonitoringSample(external_id, "operational", "complete", "complete", None, None, metadata)
+    if present:
+        # Everything the provider sends arrived; what is absent is a status it
+        # never sends, and no power to settle the question in its place. That
+        # is `unknown` -- but it is not an incomplete read, so it must not mark
+        # every night's sync partial on the system-health screen.
+        metadata["condition_source"] = "energy_flow_without_generation"
+        return SigenergyMonitoringSample(external_id, "unknown", "missing", "complete", None, None, metadata)
+    metadata["condition_source"] = "empty_energy_flow"
+    return SigenergyMonitoringSample(external_id, "unknown", "missing", "partial", None, None, metadata)
 
 
 def normalize_status(raw_status: str | None) -> str:

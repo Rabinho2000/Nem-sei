@@ -299,6 +299,7 @@ code { color: var(--brand-dark); font: 0.78rem ui-monospace, SFMono-Regular, Men
 .pill-ok { background: var(--success-soft); color: var(--success); }
 .pill-warn { background: var(--warning-soft); color: var(--warning); }
 .pill-bad { background: var(--danger-soft); color: var(--danger); }
+.pill-muted { background: var(--surface-raised); color: var(--muted); }
 
 .filter-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px; }
 .filter-bar .check { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 0.85rem; }

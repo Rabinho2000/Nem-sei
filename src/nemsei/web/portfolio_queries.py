@@ -15,6 +15,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from nemsei.assets.models import Asset, Organization
+from nemsei.monitoring.installation_state import current_installation_states
 from nemsei.portfolios.datasets import assets_needing_attention, latest_dataset
 from nemsei.portfolios.diagnostics import portfolio_diagnostics_summary, portfolio_incident_rows, portfolio_installation_rows
 from nemsei.portfolios.models import (
@@ -97,10 +98,17 @@ def _member_rows(
     if dataset is not None:
         metrics_by_asset = {member.asset_id: member for member in dataset.members}
 
+    # The operational state of every member, in one pass rather than one
+    # query per row. A member with no installation resolved simply has none.
+    installation_states = current_installation_states(
+        session, asset_ids=[entry["asset_id"] for entry in members if entry.get("asset_id")]
+    )
+
     rows: list[dict[str, Any]] = []
     for entry in members:
         asset_id = entry.get("asset_id")
         asset = session.get(Asset, asset_id) if asset_id else None
+        installation_state = installation_states.get(asset_id) if asset_id else None
         member = metrics_by_asset.get(asset_id) if asset_id else None
         metrics = (member.metrics_json if member else {}) or {}
         states = (member.states_json if member else {}) or {}
@@ -130,6 +138,9 @@ def _member_rows(
                 "country_code": asset.country_code if asset else None,
                 "locality": asset.locality if asset else None,
                 "lifecycle_status": asset.lifecycle_status if asset else None,
+                "state_label": installation_state.label if installation_state else None,
+                "state_tone": installation_state.tone if installation_state else "muted",
+                "state_detail": installation_state.detail if installation_state else None,
                 "contract_type": asset.contract_type if asset else None,
                 "provider_code": provider,
                 "kwp": _number(asset.installed_dc_power_kw) if asset else None,

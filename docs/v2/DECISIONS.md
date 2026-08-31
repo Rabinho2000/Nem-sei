@@ -183,3 +183,41 @@ and `portfolio_report_profiles`, surveyed read-only on 2026-08-19 and recorded i
   power and energy over a much wider window; importing both would duplicate
   evidence without answering a new question.
 
+
+## Huawei SCADA, receção direta (2026-08-25)
+
+- **Um provider novo, não uma variante do FusionSolar.** Partilham o fabricante e
+  nada mais: sem conta, sem credencial, sem chamada de saída, e a identidade é o
+  número de série que o dongle anuncia. Enfiá-lo no adaptador do FusionSolar
+  obrigaria esse adaptador a ter dois modelos de identidade e dois modelos de
+  erro.
+- **A identidade é o número de série anunciado, e nada mais.** Não existe caminho
+  no código que mapeie um dongle pelo endereço de onde ligou. Um série
+  desconhecido vai para `huawei_scada_pending_dongles` e a sessão fecha. A razão é
+  concreta: NAT editado, lease de DHCP, mudança de ISP, ou duas centrais atrás do
+  mesmo endereço público atribuiriam a produção de um cliente a outro.
+- **Processo próprio, não uma thread do gunicorn.** O web worker pode reiniciar ou
+  multiplicar-se; cada um desses eventos ou disputa a porta ou abre um segundo
+  listener. Além da porta, um advisory lock do PostgreSQL sobre o id da ligação
+  apanha o caso que a porta não apanha: um segundo listener noutra máquina.
+- **`huawei_scada_power_samples` guarda potência, e as colunas trazem a unidade no
+  nome.** Não é uma segunda tabela de energia. A conversão para kWh é explícita,
+  documentada e marcada como estimativa.
+- **As tabelas vivem no pacote da integração, não num domínio canónico.** Uma
+  linha é um bloco de registos Modbus com número de série e endereços; não existe
+  conceito neutro de "amostra de potência instantânea" na V2, e inventar um para
+  albergar uma forma que só este provider produz seria dívida de esquema. O que é
+  canónico — estado corrente e energia diária — é escrito em
+  `monitoring_observations` e `production_facts`, no vocabulário deles.
+- **A recusa do `unit=1` é evidência, não avaria.** `0x83`/`0x04` é descodificado
+  com nome, guardado na sessão, e nunca interrompe a recolha do agregado.
+- **O que não foi verificado recusa-se a correr.** Unidade de potência e registo
+  de produção são obrigatórios; convenção de sinal da rede e derivação de
+  autoconsumo são opcionais e, sem elas, as métricas correspondentes não são
+  escritas. Mesma disciplina do contrato do `PVYield` e do histórico Sigenergy.
+- **O rollup respeita a política de origem.** `build_dataset` soma os factos de
+  todos os mappings de um asset, por isso escrever à revelia da política
+  duplicaria a produção de uma central que também tenha FusionSolar ou Sigenergy.
+- **O rollup não escreve `IntegrationHealth` nem abre `SyncRun`.** Não sincroniza
+  nada: lê linhas que a base já tem. Marcar a ligação como saudável a partir de um
+  rollup bem sucedido mascararia um listener morto há dias.

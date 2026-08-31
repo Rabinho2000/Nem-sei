@@ -7,6 +7,7 @@ from flask import Blueprint, abort, flash, redirect, render_template, request, s
 
 from nemsei.assets.repository import AssetRepository
 from nemsei.assets.service import add_alias, bulk_update_assets, create_asset, create_organization, update_asset
+from nemsei.monitoring.installation_state import current_installation_state
 from nemsei.providers.repository import ProviderRepository
 from nemsei.providers.service import configure_connection, create_connection, create_mapping, set_connection_enabled
 from nemsei.shared.clock import utc_now
@@ -144,6 +145,10 @@ def asset_detail(asset_id: int) -> str:
         **detail,
         organizations=repository.list_organizations(),
         connections=providers.list_connections(),
+        # What this installation is doing right now, as opposed to
+        # `lifecycle_status`, which is an administrative field nothing
+        # computes and which read "Desconhecida" on a plant that was working.
+        installation_state=current_installation_state(session, asset_id=asset.id),
         **commercial_panel_data(session, asset_id=asset.id),
         **asset_contract_panel(session, asset_id=asset.id),
         headline=headline(session, asset_id=asset.id),

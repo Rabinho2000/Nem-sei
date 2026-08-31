@@ -11,11 +11,27 @@
   <div>
     <a class="back-link" href="{{ url_for('assets.list_assets') }}">← Centrais</a>
     <h1>{{ asset.canonical_name }}</h1>
+    {#
+      O estado agora vem primeiro e é o único badge que responde "esta central
+      está a trabalhar?". O ciclo de vida fica identificado como tal: é um
+      campo administrativo que ninguém calcula, e sem etiqueta lia-se como se
+      fosse o estado operacional — uma central a produzir dizia "Desconhecida".
+    #}
     <div class="inline-status">
+      <span class="status-badge {{ installation_state.tone }}"
+            title="{{ installation_state.detail or 'sem leituras para esta instalação' }}{% if installation_state.observed_at %} · {{ installation_state.observed_at.strftime('%Y-%m-%d %H:%M') }}{% endif %}">{{ installation_state.label }}</span>
       <span class="status-badge {{ 'warning' if asset.review_status == 'needs_review' else 'success' }}">{{ 'Precisa de revisão' if asset.review_status == 'needs_review' else 'Revista' }}</span>
-      <span class="status-badge muted">{{ dict(lifecycles).get(asset.lifecycle_status, asset.lifecycle_status) }}</span>
+      <span class="status-badge muted">ciclo de vida: {{ dict(lifecycles).get(asset.lifecycle_status, asset.lifecycle_status) }}</span>
       {% if asset.timezone_source and asset.timezone %}<span class="status-badge muted">fuso {{ 'manual' if asset.timezone_source == 'manual' else asset.timezone_source }}</span>{% endif %}
     </div>
+    <p class="provenance">
+      {% if installation_state.observed_at %}
+        Estado apurado da leitura de {{ installation_state.observed_at.strftime('%Y-%m-%d %H:%M') }}
+        ({{ 'estado indicado pelo provider' if installation_state.source == 'plant_observation' else 'estado dos equipamentos' }}){% if installation_state.detail %} — {{ installation_state.detail }}{% endif %}.
+      {% else %}
+        Nenhuma leitura de estado chegou ainda a esta instalação.
+      {% endif %}
+    </p>
   </div>
   <a class="button secondary" href="{{ url_for('assets.list_assets') }}">Voltar à lista</a>
 </header>
@@ -68,79 +84,6 @@
   </div>
   {{ chart.bars(monthly.chart, 'Produção mensal em kWh com a cobertura de dias') }}
   {{ chart.legend([('Produção medida', '1'), ('Cobertura', 'cov'), ('Sem leituras', 'void')]) }}
-</section>
-
-{#
-  Bloco B: o contrato O&M. O estado nunca é guardado -- é derivado do período,
-  como `nemsei/contracts/models.py` explica. Renovar cria uma linha nova: o
-  histórico que o V1 destruía a cada renovação fica aqui visível.
-#}
-<section class="panel" id="om">
-  <div class="panel-header">
-    <div><p class="eyebrow">Comercial</p><h2>Contrato O&amp;M</h2></div>
-    <span class="status-badge {{ om.tone }}">{{ om.label }}</span>
-  </div>
-
-  {% if om.status == 'none' %}
-    <p class="empty-state">Esta central não está no âmbito O&amp;M. Registe um período abaixo para a incluir.</p>
-  {% else %}
-    <dl class="detail-list">
-      <div><dt>Período em vigor</dt><dd>{% if om.valid_from %}{{ om.valid_from.strftime('%d/%m/%Y') }}{% else %}início desconhecido{% endif %} — {% if om.last_covered_day %}{{ om.last_covered_day.strftime('%d/%m/%Y') }}{% else %}sem fim registado{% endif %}</dd></div>
-      {% if om.days_to_expiry is not none %}
-        <div><dt>{{ 'Expirou há' if om.days_to_expiry < 0 else 'Faltam' }}</dt><dd>{{ om.days_to_expiry|abs }} dias{% if om.bucket_label %} · <span class="status-badge {{ om.bucket_tone }}">{{ om.bucket_label }}</span>{% endif %}</dd></div>
-      {% endif %}
-      {% if om.contract and om.contract.annual_value_eur is not none %}
-        <div><dt>Valor anual</dt><dd>{{ '%.2f'|format(om.contract.annual_value_eur) }} €</dd></div>
-      {% endif %}
-      {% if om.renewal_label %}<div><dt>Renovação</dt><dd>{{ om.renewal_label }}</dd></div>{% endif %}
-    </dl>
-  {% endif %}
-
-  {% if om_history %}
-    <div class="table-scroll">
-      <table class="data-table">
-        <caption class="sr-only">Histórico de contratos O&amp;M</caption>
-        <thead><tr><th scope="col">Início</th><th scope="col">Fim</th><th scope="col">Valor anual</th><th scope="col">Origem</th><th scope="col">Estado</th></tr></thead>
-        <tbody>
-          {% for item in om_history %}
-            <tr>
-              <td>{{ item.valid_from.strftime('%d/%m/%Y') if item.valid_from else '—' }}</td>
-              <td>{{ item.last_covered_day.strftime('%d/%m/%Y') if item.last_covered_day else '—' }}</td>
-              <td>{{ ('%.2f €'|format(item.annual_value_eur)) if item.annual_value_eur is not none else '—' }}</td>
-              <td>{{ 'importado do V1' if item.source_kind == 'v1_import' else 'operador' }}</td>
-              <td>
-                {% if item.is_current %}<span class="status-badge muted">em vigor</span>{% else %}<span class="status-badge muted">encerrado</span>{% endif %}
-                {% if item.review_status == 'needs_review' %}<span class="status-badge warning" title="{{ item.review_note }}">a rever</span>{% endif %}
-              </td>
-            </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-  {% endif %}
-
-  {% if om_history and om_history[0].is_current %}
-    <form method="post" action="{{ url_for('contracts.close_contract', contract_id=om_history[0].id) }}" class="inline-form">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <input type="hidden" name="asset_id" value="{{ asset.id }}">
-      <label>Terminar o período atual em<input type="date" name="valid_to" required></label>
-      <button class="button secondary" type="submit">Fechar período</button>
-    </form>
-  {% endif %}
-
-  <form method="post" action="{{ url_for('contracts.create_contract', asset_id=asset.id) }}" class="stack-form review-form">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <div class="form-grid">
-      <label>Início<input type="date" name="valid_from"></label>
-      <label>Fim (último dia coberto)<input type="date" name="valid_to"></label>
-      <label>Valor anual (€)<input type="text" name="annual_value_eur" inputmode="decimal"></label>
-      <label>Renovação<select name="renewal_status"><option value="">—</option>{% for value, label in om_renewal_options %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select></label>
-      <label>Último contacto<input type="date" name="last_contact_on"></label>
-    </div>
-    <label>Notas<textarea name="notes" rows="2"></textarea></label>
-    <p class="form-hint">Registar um período novo fecha o anterior no dia em que este começa. O período anterior não é apagado.</p>
-    <button class="button primary" type="submit">{{ 'Registar renovação' if om_history else 'Registar contrato O&M' }}</button>
-  </form>
 </section>
 
 <div class="content-grid two-columns">
@@ -297,6 +240,79 @@
     <button class="button secondary" type="submit">Carregar</button>
   </form>
   <p class="provenance">Um livro carregado entra como rascunho. Só passa a valer depois de alguém o rever e confirmar.</p>
+</section>
+
+{#
+  Bloco B: o contrato O&M. O estado nunca é guardado -- é derivado do período,
+  como `nemsei/contracts/models.py` explica. Renovar cria uma linha nova: o
+  histórico que o V1 destruía a cada renovação fica aqui visível.
+#}
+<section class="panel" id="om">
+  <div class="panel-header">
+    <div><p class="eyebrow">Comercial</p><h2>Contrato O&amp;M</h2></div>
+    <span class="status-badge {{ om.tone }}">{{ om.label }}</span>
+  </div>
+
+  {% if om.status == 'none' %}
+    <p class="empty-state">Esta central não está no âmbito O&amp;M. Registe um período abaixo para a incluir.</p>
+  {% else %}
+    <dl class="detail-list">
+      <div><dt>Período em vigor</dt><dd>{% if om.valid_from %}{{ om.valid_from.strftime('%d/%m/%Y') }}{% else %}início desconhecido{% endif %} — {% if om.last_covered_day %}{{ om.last_covered_day.strftime('%d/%m/%Y') }}{% else %}sem fim registado{% endif %}</dd></div>
+      {% if om.days_to_expiry is not none %}
+        <div><dt>{{ 'Expirou há' if om.days_to_expiry < 0 else 'Faltam' }}</dt><dd>{{ om.days_to_expiry|abs }} dias{% if om.bucket_label %} · <span class="status-badge {{ om.bucket_tone }}">{{ om.bucket_label }}</span>{% endif %}</dd></div>
+      {% endif %}
+      {% if om.contract and om.contract.annual_value_eur is not none %}
+        <div><dt>Valor anual</dt><dd>{{ '%.2f'|format(om.contract.annual_value_eur) }} €</dd></div>
+      {% endif %}
+      {% if om.renewal_label %}<div><dt>Renovação</dt><dd>{{ om.renewal_label }}</dd></div>{% endif %}
+    </dl>
+  {% endif %}
+
+  {% if om_history %}
+    <div class="table-scroll">
+      <table class="data-table">
+        <caption class="sr-only">Histórico de contratos O&amp;M</caption>
+        <thead><tr><th scope="col">Início</th><th scope="col">Fim</th><th scope="col">Valor anual</th><th scope="col">Origem</th><th scope="col">Estado</th></tr></thead>
+        <tbody>
+          {% for item in om_history %}
+            <tr>
+              <td>{{ item.valid_from.strftime('%d/%m/%Y') if item.valid_from else '—' }}</td>
+              <td>{{ item.last_covered_day.strftime('%d/%m/%Y') if item.last_covered_day else '—' }}</td>
+              <td>{{ ('%.2f €'|format(item.annual_value_eur)) if item.annual_value_eur is not none else '—' }}</td>
+              <td>{{ 'importado do V1' if item.source_kind == 'v1_import' else 'operador' }}</td>
+              <td>
+                {% if item.is_current %}<span class="status-badge muted">em vigor</span>{% else %}<span class="status-badge muted">encerrado</span>{% endif %}
+                {% if item.review_status == 'needs_review' %}<span class="status-badge warning" title="{{ item.review_note }}">a rever</span>{% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+
+  {% if om_history and om_history[0].is_current %}
+    <form method="post" action="{{ url_for('contracts.close_contract', contract_id=om_history[0].id) }}" class="inline-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="asset_id" value="{{ asset.id }}">
+      <label>Terminar o período atual em<input type="date" name="valid_to" required></label>
+      <button class="button secondary" type="submit">Fechar período</button>
+    </form>
+  {% endif %}
+
+  <form method="post" action="{{ url_for('contracts.create_contract', asset_id=asset.id) }}" class="stack-form review-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="form-grid">
+      <label>Início<input type="date" name="valid_from"></label>
+      <label>Fim (último dia coberto)<input type="date" name="valid_to"></label>
+      <label>Valor anual (€)<input type="text" name="annual_value_eur" inputmode="decimal"></label>
+      <label>Renovação<select name="renewal_status"><option value="">—</option>{% for value, label in om_renewal_options %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select></label>
+      <label>Último contacto<input type="date" name="last_contact_on"></label>
+    </div>
+    <label>Notas<textarea name="notes" rows="2"></textarea></label>
+    <p class="form-hint">Registar um período novo fecha o anterior no dia em que este começa. O período anterior não é apagado.</p>
+    <button class="button primary" type="submit">{{ 'Registar renovação' if om_history else 'Registar contrato O&M' }}</button>
+  </form>
 </section>
 
 <div class="content-grid two-columns">

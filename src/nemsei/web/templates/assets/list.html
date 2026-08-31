@@ -30,7 +30,7 @@
     <div class="table-scroll">
       <table class="data-table wide-table">
         <caption class="sr-only">Lista de centrais</caption>
-        <thead><tr><th scope="col" class="pick-column"><span class="sr-only">Selecionar</span></th><th scope="col">Central</th><th scope="col">Organização</th><th scope="col">Potência DC</th><th scope="col">País / localidade</th><th scope="col">Fuso</th><th scope="col">Estado</th><th scope="col">Contrato</th><th scope="col">O&amp;M</th><th scope="col">Mapping</th><th scope="col">Qualidade</th></tr></thead>
+        <thead><tr><th scope="col" class="pick-column"><span class="sr-only">Selecionar</span></th><th scope="col">Central</th><th scope="col">Organização</th><th scope="col">Potência DC</th><th scope="col">País / localidade</th><th scope="col">Fuso</th><th scope="col">Estado</th><th scope="col">Ciclo de vida</th><th scope="col">Contrato</th><th scope="col">O&amp;M</th><th scope="col">Mapping</th><th scope="col">Qualidade</th></tr></thead>
         <tbody>
           {% for asset in assets %}
             <tr>
@@ -40,6 +40,7 @@
               <td>{{ ('%.1f kW'|format(asset.installed_dc_power_kw)) if asset.installed_dc_power_kw is not none else '—' }}</td>
               <td>{{ [asset.country_code, asset.locality]|select|join(' · ') or '—' }}</td>
               <td>{% if asset.timezone %}<code>{{ asset.timezone }}</code>{% else %}<span class="status-badge warning">em falta</span>{% endif %}</td>
+              <td><span class="status-badge {{ asset.state_tone }}" title="{{ asset.state_detail or 'sem leituras para esta instalação' }}">{{ asset.state_label }}</span></td>
               <td><span class="status-badge {{ 'muted' if asset.lifecycle_status == 'unknown' else 'success' }}">{{ asset.lifecycle_label }}</span></td>
               <td>
                 {% if asset.commercial.contract_type %}<span class="status-badge {{ asset.commercial.family_tone }}">{{ asset.commercial.contract_type }}</span>{% else %}—{% endif %}

@@ -5,7 +5,7 @@
   <table class="data-table">
     <thead>
       <tr>
-        <th>Instalação</th><th>Subconta</th><th>NIF</th><th>País</th><th>Estado</th><th>Provider</th>
+        <th>Instalação</th><th>Subconta</th><th>NIF</th><th>País</th><th>Estado</th><th>Ciclo de vida</th><th>Provider</th>
         <th class="num">kWp</th><th class="num">Produção</th><th class="num">Perf.</th><th>Dados</th>
       </tr>
     </thead>
@@ -19,7 +19,8 @@
           <td class="muted">{{ row.sub_account or '—' }}</td>
           <td class="muted">{{ row.tax_id or '—' }}</td>
           <td>{{ row.country_code or '—' }}</td>
-          <td>{{ row.lifecycle_status or '—' }}</td>
+          <td><span class="pill pill-{{ 'ok' if row.state_tone == 'success' else 'bad' if row.state_tone == 'danger' else 'warn' if row.state_tone == 'warning' else 'muted' }}" title="{{ row.state_detail or '' }}">{{ row.state_label or '—' }}</span></td>
+          <td class="muted">{{ row.lifecycle_status or '—' }}</td>
           <td>{{ row.provider_code or '—' }}</td>
           <td class="num">{{ kwh(row.kwp) }}</td>
           <td class="num">{{ kwh(row.production_kwh) }}</td>
@@ -27,7 +28,7 @@
           <td>{{ state_pill(row.production_state) }}</td>
         </tr>
       {% else %}
-        <tr><td colspan="10" class="empty">Nenhum membro corresponde a estes filtros.</td></tr>
+        <tr><td colspan="11" class="empty">Nenhum membro corresponde a estes filtros.</td></tr>
       {% endfor %}
     </tbody>
   </table>

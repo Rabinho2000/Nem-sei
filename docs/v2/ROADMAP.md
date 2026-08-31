@@ -39,7 +39,7 @@ commercial attributes on `Asset`.
 | Goal section | Status | Where |
 | --- | --- | --- |
 | §2 PostgreSQL only, isolated, migrated | done | `db/engine.py`, `migrations/`, `scripts/verify_v2_runtime_isolation.py` |
-| §3 Provider adapters behind stable interfaces | structure done | `providers/registry.py`, `integrations/fusionsolar/`, `integrations/sigenergy/` |
+| §3 Provider adapters behind stable interfaces | structure done | `providers/registry.py`, `integrations/fusionsolar/`, `integrations/sigenergy/`, `integrations/huawei_scada/` (o primeiro adaptador **de entrada**: o logger é que liga — ver `HUAWEI_SCADA.md`) |
 | §4 Synchronization as a subsystem | mostly done | `sync/`, `SyncRun`, `SyncCursor`, request states and attempts |
 | §5 API efficiency | designed | per-connection daily cursor, 31-day cap, batching, one login per sync |
 | §7 Current state vs historical facts | done | append-only `monitoring_observations` + `monitoring_current_states` projection |
@@ -163,6 +163,34 @@ that proves necessary, and no refactor of existing modules.
 - No secret is added to a tracked file; `scripts/check_tracked_secrets.py` is
   clean.
 
+## Huawei SCADA — receção direta do SDongle (2026-08-25)
+
+Novo provider `huawei_scada`, migração `0026`, documentado em `HUAWEI_SCADA.md`.
+É o primeiro adaptador **de entrada** da V2: o dongle liga-se ao servidor e o
+servidor lê-lhe registos Modbus por essa ligação. Sem edge collector, sem túnel e
+sem `socat`.
+
+Estado: **implementado e testado; nunca correu contra hardware real nesta
+instalação.** Todos os testes correm contra um logger falso que responde Modbus
+como o hardware do piloto — incluindo a recusa `0x83`/`0x04` do `unit=1`, que as
+duas instalações testadas devolveram. Isso prova o código, não a instalação.
+
+O que ficou deliberadamente por fazer, cada um por evidência em falta e não por
+falta de tempo:
+
+- **exportação e importação da rede** — o registo 37502 é com sinal e nada
+  observado diz se positivo significa importar ou exportar. Sem
+  `GRID_SIGN_CONVENTION` verificada, essas duas métricas simplesmente não se
+  escrevem;
+- **capacidade ao nível do dispositivo** — `unit=1` recusa-se a responder nas
+  duas instalações; não há contrato para implementar;
+- **TLS** — o piloto corre em claro, numa porta exposta, com um protocolo sem
+  autenticação nenhuma. Ver `HUAWEI_SCADA.md` §7 e o risco R8 abaixo.
+
+A energia diária chega ao `production_facts` por integração de potência, sempre
+`quality='partial'` e `estimated=true`, e o dataset e o payload do relatório
+dizem-no. Os relatórios continuam database-only.
+
 ## Risk register
 
 | # | Risk | Mitigation |
@@ -174,3 +202,4 @@ that proves necessary, and no refactor of existing modules.
 | R5 | Import residue — 21 conflicts, 2 quarantines, 56 unresolved — has no owner or deadline | M3 |
 | R6 | History backfill API budget for 267 assets against a 31-day cursor cap | Calculate the request budget before enabling backfill |
 | R7 | Terminology collision: "capability" already means external action gates and provider abilities | Use a distinct term for user authorization in M4 |
+| R8 | Huawei SCADA: porta TCP exposta, sem TLS e com um protocolo sem autenticação. Quem esteja no caminho lê as leituras e pode forjá-las; um número de série conhecido chega para injectar amostras | Piloto em rede controlada, quarentena de séries desconhecidos, e uma das três opções da §7 de `HUAWEI_SCADA.md` **antes** de produção |
