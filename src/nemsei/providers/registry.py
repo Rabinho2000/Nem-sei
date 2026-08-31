@@ -10,6 +10,7 @@ class ProviderCode(StrEnum):
     FUSIONSOLAR = "fusionsolar"
     SIGENERGY = "sigenergy"
     SMA = "sma"
+    HUAWEI_SCADA = "huawei_scada"
 
 
 class ProviderCapability(StrEnum):
@@ -106,6 +107,43 @@ _DESCRIPTORS = {
             # inverters/strings/availability as explicitly out of scope. There
             # is no evidence a device-level Sigenergy contract exists to audit,
             # let alone implement. See docs/v2/DEVICE_TELEMETRY.md.
+        }),
+    ),
+    ProviderCode.HUAWEI_SCADA: ProviderDescriptor(
+        ProviderCode.HUAWEI_SCADA,
+        "Huawei SCADA",
+        _casefold,
+        frozenset({
+            # The dongle dials in and answers aggregate register reads on the
+            # unit it announces (100 on both pilots). That is a live condition
+            # and a live power reading, so those two capabilities are claimed.
+            ProviderCapability.CURRENT_MONITORING,
+            ProviderCapability.REALTIME_PRODUCTION,
+            # Deliberately absent, each for its own evidenced reason:
+            #
+            # CONNECTION_VALIDATION -- there is nothing to validate against.
+            #   This provider has no endpoint V2 can call; the connection is
+            #   only "working" when a logger happens to be dialled in, which
+            #   is a liveness question `IntegrationHealth` answers, not a
+            #   request that can be made on demand.
+            # DISCOVERY -- a dongle announces itself, one at a time, and there
+            #   is no account to enumerate. Treating an arriving serial as
+            #   discovery would be one step from binding it automatically,
+            #   which is exactly what `huawei_scada_pending_dongles` exists to
+            #   prevent.
+            # DEVICE_MONITORING / DEVICE_DISCOVERY -- reads against `unit=1`
+            #   returned function 0x83, exception 0x04 (slave device failure)
+            #   on both piloted installations. Until a downstream unit answers
+            #   somewhere, there is no device contract here to implement.
+            # PRODUCTION_HISTORY -- the dongle serves instantaneous registers
+            #   and no historical series at all. Daily energy does reach
+            #   `production_facts`, but by integrating samples V2 already
+            #   holds (`integrations/huawei_scada/rollup.py`), which is a
+            #   local derivation with zero provider calls, not a history
+            #   capability. Claiming it would tell the activation preflight a
+            #   provider read exists that does not.
+            # PROVIDER_MUTATIONS -- never. `protocol.py` has no encoder for a
+            #   write function, so this is structural, not a policy.
         }),
     ),
     ProviderCode.SMA: ProviderDescriptor(

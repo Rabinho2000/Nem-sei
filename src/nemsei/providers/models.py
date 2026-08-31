@@ -8,7 +8,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from nemsei.db.base import Base
 
 
-PROVIDER_CODES = ("fusionsolar", "sigenergy", "sma")
+PROVIDER_CODES = ("fusionsolar", "sigenergy", "sma", "huawei_scada")
 RESOURCE_KINDS = ("plant", "device")
 CONNECTION_STATUSES = ("not_configured", "configured", "disabled")
 MAPPING_STATUSES = ("active", "superseded", "invalid", "pending_review")
