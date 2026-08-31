@@ -98,19 +98,56 @@ No `portfolio_report_runs` rows existed at the start of the session.
 
 ---
 
-## 3. Work items
+## 3. Where August stands
+
+Every installation that can honestly produce an August report has one. Read off
+the live deployment after generation:
+
+| | 2026-08 |
+|---|---:|
+| installations | 267 |
+| ESCO | 90 |
+| with August energy | 114 |
+| **August snapshots produced** | **114** (+1 predating the fields) |
+| of those, stating euros | **0** — the month has not closed |
+| no active plant mapping / no energy | 153 |
+| ESCO with no rates entered | 89 |
+| where a euro figure is possible at all | 1 |
+
+Generation failures: **0**. Every one came out `provisional`, which on the 31st
+of August is the only honest answer.
+
+### Work items
 
 | # | Item | Status |
 |---|------|--------|
 | 1 | Day-coverage-aware finality; provisional/final/blocked in the payload | done — `11fc0fc` |
 | 2 | pypdf in the dev lock so the PDF golden stops skipping itself | done — `11fc0fc` |
-| 3 | Backdate the 131 mapping/policy validity rows | done — see §1 |
+| 3 | Backdate the 131 mapping/policy validity rows | done — §1 |
 | 4 | Simple ESCO three-rate configuration, Portuguese labels, ESCO validation | done — `d37ae04` |
 | 5 | `reporting.month_close` — re-evaluate and finalise without a shell | done — `d37ae04` |
 | 6 | `/reports` as an operator workspace: readiness, blockers, ESCO first | done — `aa1ded4` |
-| 7 | August backfill through the existing durable job system | running — see §6 |
-| 8 | Expertcom July regression + August provisional, PDF and XLSX | done — see §5 |
-| 9 | Solcorelios I and II August runs, review-ready, not approved | done — see §5 |
+| 7 | Month close declared as a required deployment component | done — `60ebb88` |
+| 8 | August generated for all 114 eligible installations | done — §3 |
+| 9 | Expertcom July regression + August provisional, PDF and XLSX | done — §4 |
+| 10 | Solcorelios I and II August runs, review-ready, not approved | done — §4 |
+| 11 | Fleet August backfill 2026-08-03 … 08-30 | durable, queued — §5 |
+
+### Live deployment
+
+Deployed through `scripts/v2_compose_up.sh`. All five containers up, restart
+count 0 each, `4 declared component settings are live in the running
+containers`. `NEMSEI_V2_REPORT_MONTH_CLOSE_ENABLED=true` verified with
+`printenv` inside both scheduler and worker.
+
+`reporting.month_close` ran as job 3441 and is scheduled hourly
+(`schedule_state.reporting.month_close`). It currently tracks **40 provisional
+periods** and finalises none, twice in a row with identical output — August has
+not ended.
+
+Every reporting URL was rendered against the live database: `/reports` for two
+months, `/reports/assets` with each filter, the per-installation page, and both
+`.pdf` and `.xlsx` snapshot downloads. All 200, PDFs and workbooks real bytes.
 
 ---
 
