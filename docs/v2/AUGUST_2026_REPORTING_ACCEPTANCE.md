@@ -230,23 +230,59 @@ checkout.
 The fleet's August production is fetched by the existing durable job system,
 never by anything this session has to stay open for.
 
-Measured throughput, not estimated: sync run 2135 spent 3 provider calls and was
-refused; 2129 spent 1; **2136 spent 0** — the persisted cooldown turned it away
-before any HTTP and correctly did not charge the job an attempt, which is the
-rate-limit deferral behaviour working exactly as designed. The account allows
-roughly one fleet-day of `production_history_daily` per ~600 s cooldown.
+### The blocker, and how it was cleared
 
-A six-day window therefore cannot finish inside one attempt, and because a
-bounded backfill restarts at its window start unless it succeeded outright, each
-retry re-fetched the same first days and ran out of attempts without advancing.
-Jobs 3399–3402 were cancelled for that reason after covering 2026-08-01 and
-2026-08-02 in full.
+131 FusionSolar plant mappings and their production source policies carried
+`valid_from = 2026-08-25` — `create_mapping` defaults it to the day it runs
+(`providers/service.py:191`) and that is the day they were bulk-created.
+`_selected_mappings` filters by that date, so the sync structurally could not
+ask for 2026-08-01..08-24. Backdated to 2026-08-01 with operator approval; prior
+values recorded first. Coverage went from 351 facts across 132 assets (most with
+one or two days) to full fleet coverage of 2026-08-01 and 08-02 within minutes.
 
-Replaced by **26 single-day jobs, 3415–3440**, one source day each (two calls:
-134 mappings in batches of 100), spaced 11 minutes apart — just past the
-cooldown, so consecutive jobs do not collide. They cover every day the fleet
-still lacks: 2026-08-03 … 08-24 and 08-27 … 08-30, running through 01:50.
-They need no session, no shell and no supervision.
+### The provider limit, measured rather than assumed
+
+| sync run | window | provider calls | items accepted | outcome |
+|---|---|---:|---:|---|
+| 2135 | 08-01 | 3 | 98 | partial, then refused |
+| 2129 | 08-01 | 1 | 0 | refused |
+| 2136 | 08-07 | **0** | 0 | refused *locally*, attempt not charged |
+| 2141 | 08-03 | 2 | 0 | refused |
+| 2146 | 08-03 | 1 | 0 | refused |
+| 2147 | 08-04 | 0 | 0 | refused locally |
+
+Run 2136 is the rate-limit deferral working exactly as designed: the persisted
+cooldown turned the job away before any HTTP, and it was not charged an attempt
+for a call it never made. That mechanism needed no change.
+
+By 21:30 UTC the account was refusing on the **first** call, repeatedly, over
+forty minutes, with `production_history_daily.actual_call_count` at 265. That is
+an exhausted allowance, not a cadence problem — frequency limits back off in ten
+minutes and this did not.
+
+### What is scheduled
+
+A six-day window cannot finish inside one attempt at this throughput, and a
+bounded backfill restarts at its window start unless it succeeded outright, so
+each retry re-fetched the same first days and ran out of attempts without
+advancing. Jobs 3399–3402 were cancelled for that reason.
+
+Replaced by **26 single-day jobs, 3415–3440** — one source day each (two calls:
+134 mappings in batches of 100), `max_attempts` raised to 10 so ~600 s cooldowns
+do not exhaust them overnight. Two run now as a probe; the other 24 are spaced
+11 minutes apart from **2026-09-01 00:20 UTC to 04:33 UTC**, on the assumption a
+daily allowance rolls over at midnight. If that assumption is wrong they simply
+wait longer, which is what they are built to do.
+
+They cover every day the fleet still lacks: 2026-08-03 … 08-24 and 08-27 …
+08-30. They need no session, no shell and no supervision.
+
+### What happens when they land
+
+Nothing has to be remembered. `reporting.month_close` runs hourly, sees the day
+coverage change, and once September has begun and a month's days are all
+present it produces a **new final snapshot** beside the provisional one. The
+provisional report is not touched.
 
 ---
 
@@ -258,9 +294,12 @@ Kinds: **CODE** · **DATA** · **PROVIDER** · **OPERATOR** · **OUT OF SCOPE**
   financial report is possible for them until the three rates are entered. Not
   fixable in code; fabricating a rate is the one thing reporting must not do.
   The form to enter them now exists and validates.
-- **PROVIDER** — the FusionSolar account refuses after ~3 calls on
-  `production_history_daily` and holds a ~600 s cooldown, so the August fleet
-  backfill takes hours rather than minutes. Scheduled durably; see §5.
+- **PROVIDER** — the FusionSolar account had exhausted its
+  `production_history_daily` allowance by 21:30 UTC on 2026-08-31: refused on
+  the first call, repeatedly, for forty minutes, with the family's lifetime
+  counter at 265. 22 of August's 31 source days are still short of the fleet.
+  Scheduled durably across 00:20–04:33 UTC with ten attempts each; see §5.
+  Nothing else in the system is waiting on it.
 - **DATA** — only the 3 Sigenergy-mapped assets carry self-use, export,
   consumption and grid import. FusionSolar's verified contract exposes `PVYield`
   alone, so every FusionSolar installation can produce an *energy* report and no
@@ -281,7 +320,8 @@ Kinds: **CODE** · **DATA** · **PROVIDER** · **OPERATOR** · **OUT OF SCOPE**
 `PYTHONPATH=src`, `NEMSEI_V2_TEST_DATABASE_URL` pointing at the isolated
 `nemsei_v2_test` database (container `nemsei-v2-test-pg`, host port 55432).
 
-- `pytest -q tests_v2` — baseline before any change: 1115 passed, 1 skipped.
+- `pytest -q tests_v2` — baseline before any change: 1115 passed, 1 skipped
+  (that skip was the whole PDF golden module). After: **1159 passed, 0 skipped**.
 - `ruff check --no-cache src tests_v2`
 - `bash scripts/run_docker_recovery_acceptance.sh`
 - `bash scripts/run_postgres_operations_acceptance.sh`
