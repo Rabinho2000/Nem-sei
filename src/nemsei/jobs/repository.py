@@ -304,6 +304,70 @@ class JobRepository:
             )
             return True
 
+    def defer(self, claimed: ClaimedJob, *, available_at: datetime, reason: str, max_cycles: int, refund_attempt: bool) -> bool:
+        """Hold a job until a provider cooldown expires, without spending an attempt.
+
+        This is not `retry_or_fail` with a longer delay. The distinction it
+        exists to make is that **nothing was asked of the provider**: the
+        request controller refused the call locally against a persisted
+        cooldown, so there is no failure to count. Counting it was the whole
+        defect -- `claim_next` increments the attempt on every claim, and two
+        such refusals plus the one real one exhausted `max_attempts` and failed
+        jobs minutes before the cooldown they were waiting on had expired
+        (production job 3287 at 16:25:12, device poll 3300 at 16:38:03, both
+        2026-08-31).
+
+        So the attempt counter is put back to what it was before this claim,
+        the lease is released, and `available_at` is set to when the provider
+        said it would answer. No sleep, nothing held.
+
+        Returns False when the job has already been deferred `max_cycles`
+        times, so the caller falls back to the ordinary retry path: waiting is
+        not the same as never giving up.
+        """
+        now = utc_now()
+        with self._immediate_session() as session:
+            deferrals = int(
+                session.scalar(
+                    select(func.count())
+                    .select_from(JobEvent)
+                    .where(JobEvent.job_id == claimed.id, JobEvent.event_type == "defer_scheduled")
+                )
+                or 0
+            )
+            if deferrals >= max_cycles:
+                return False
+            updated = session.execute(
+                update(Job)
+                .where(Job.id == claimed.id, Job.status == "running", Job.lease_token == claimed.lease_token)
+                .values(
+                    status="waiting",
+                    # Back to the count before this claim when nothing was
+                    # asked of the provider. A refusal that cost a real call
+                    # keeps its attempt -- it was paid for.
+                    attempt_count=max(0, claimed.attempt - 1) if refund_attempt else claimed.attempt,
+                    available_at=available_at,
+                    lease_owner=None,
+                    lease_token=None,
+                    lease_expires_at=None,
+                    updated_at=now,
+                )
+            )
+            if updated.rowcount != 1:
+                return False
+            self._event(
+                session,
+                job_id=claimed.id,
+                event_type="defer_scheduled",
+                attempt=max(0, claimed.attempt - 1) if refund_attempt else claimed.attempt,
+                from_status="running",
+                to_status="waiting",
+                actor_source="worker",
+                metadata={"reason": reason},
+                occurred_at=now,
+            )
+            return True
+
     def retry_or_fail(self, claimed: ClaimedJob, *, error_type: str, message: str, delay_seconds: int = 60) -> bool:
         now = utc_now()
         retryable = claimed.attempt < claimed.max_attempts

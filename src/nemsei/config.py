@@ -186,6 +186,17 @@ class Settings:
     # across every asset that owns a device, by design.
     diagnostic_incident_evaluation_enabled: bool = False
     diagnostic_incident_evaluation_interval_minutes: int = 15
+    # How many times one job may be deferred by a provider cooldown before it
+    # goes back to the ordinary retry path.
+    #
+    # Deferring is not free forever. Each cycle costs exactly one real provider
+    # call per cooldown, which is not a storm, but a provider that refuses
+    # indefinitely would otherwise leave a job waiting for ever while the
+    # schedule enqueues its successors behind it. Three deferrals at the
+    # measured 600-second cooldown is half an hour -- under the tightest
+    # schedule interval this deployment runs (device status, 30 minutes), so a
+    # deferred job cannot outlive the cycle that replaces it.
+    job_defer_max_cycles: int = 3
     # Closing sync runs whose owner died. On by default, unlike every other
     # schedule here, and deliberately: this is crash recovery, not a capability.
     # It makes no provider call and touches nothing but rows that are already
@@ -310,6 +321,7 @@ class Settings:
             sigenergy_current_monitoring_scheduler_enabled=parse_bool(os.environ.get("NEMSEI_V2_SIGENERGY_CURRENT_MONITORING_SCHEDULER_ENABLED"), default=False),
             sigenergy_current_monitoring_scheduler_interval_minutes=int(os.environ.get("NEMSEI_V2_SIGENERGY_CURRENT_MONITORING_SCHEDULER_INTERVAL_MINUTES", "15")),
             sigenergy_current_monitoring_scheduler_connection_id=_optional_int(os.environ.get("NEMSEI_V2_SIGENERGY_CURRENT_MONITORING_SCHEDULER_CONNECTION_ID")),
+            job_defer_max_cycles=int(os.environ.get("NEMSEI_V2_JOB_DEFER_MAX_CYCLES", "3")),
             sync_run_sweep_enabled=parse_bool(os.environ.get("NEMSEI_V2_SYNC_RUN_SWEEP_ENABLED"), default=True),
             sync_run_sweep_interval_minutes=int(os.environ.get("NEMSEI_V2_SYNC_RUN_SWEEP_INTERVAL_MINUTES", "15")),
             sync_run_sweep_silence_grace_minutes=int(os.environ.get("NEMSEI_V2_SYNC_RUN_SWEEP_SILENCE_GRACE_MINUTES", "60")),
@@ -454,6 +466,8 @@ class Settings:
             raise ConfigurationError("V2 timing and pool settings must be positive.")
         if self.production_backfill_chunk_days > self.production_backfill_max_source_days:
             raise ConfigurationError("V2 production backfill chunk cannot exceed its bounded window limit.")
+        if self.job_defer_max_cycles < 0:
+            raise ConfigurationError("V2 job defer cycles cannot be negative.")
         if self.sync_run_sweep_interval_minutes <= 0 or self.sync_run_sweep_silence_grace_minutes <= 0:
             raise ConfigurationError("Sync run sweep interval and silence grace must be positive.")
         if self.production_incremental_chunk_days <= 0 or self.production_incremental_chunk_pause_seconds < 0:

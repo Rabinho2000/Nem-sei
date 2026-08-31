@@ -16,6 +16,7 @@ from nemsei.integrations.huawei_scada.retention import purge_samples
 from nemsei.integrations.huawei_scada.rollup import HuaweiScadaRollupService
 from nemsei.integrations.sigenergy.monitoring import SigenergyMonitoringService
 from nemsei.integrations.sigenergy.production import SigenergyProductionService
+from nemsei.providers.errors import ProviderErrorCode
 from nemsei.providers.models import ProviderConnection
 from nemsei.providers.registry import ProviderCode
 from nemsei.integrations.fusionsolar.session_cache import default_session_cache
@@ -23,6 +24,8 @@ from nemsei.jobs.repository import ClaimedJob
 from nemsei.notifications.digests import deliver_digest, generate_digest
 from nemsei.notifications.service import evaluate_and_process_notifications
 from nemsei.sync.abandonment import sweep_abandoned_sync_runs
+from nemsei.sync.models import SyncRun
+from nemsei.sync.service import active_cooldown_until
 from nemsei.system.noop_service import execute_noop
 
 
@@ -39,6 +42,60 @@ class JobOutcome:
 
 class RetryableJobError(RuntimeError):
     pass
+
+
+class DeferredJobError(RuntimeError):
+    """The provider is holding this connection back until a known moment.
+
+    Distinct from `RetryableJobError` because the two mean opposite things
+    about what just happened. A retryable error is work that was attempted and
+    went wrong. This is work that was **not attempted**: the persisted cooldown
+    refused it before any HTTP call, so there is nothing to count against the
+    job and nothing to learn from trying again sooner.
+    """
+
+    def __init__(self, message: str, *, retry_at: datetime, called_provider: bool) -> None:
+        super().__init__(message)
+        self.retry_at = retry_at
+        # Whether this attempt actually reached the provider. A refusal that
+        # cost a real call has been paid for and keeps its attempt; one that
+        # never left the process has not, and must not.
+        self.called_provider = called_provider
+
+
+def _cooldown_defer(
+    session_factory: sessionmaker[Session],
+    *,
+    connection_id: int,
+    sync_run_id: int,
+    error_code: str | None,
+    label: str,
+) -> None:
+    """Raise `DeferredJobError` when a rate limit has a real future cooldown.
+
+    Only a rate limit, and only when a cooldown is actually persisted and still
+    ahead: anything else stays on the ordinary retry path, because deferring it
+    would mean waiting on something nothing scheduled to change.
+
+    The run's own call count decides whether this attempt was paid for. The
+    first refusal of a cycle costs one real request and keeps its attempt; the
+    retries that follow inside the cooldown are turned away by
+    `reserve_request` before any HTTP, and those are the ones that were being
+    charged for a call nobody made.
+    """
+    if error_code != ProviderErrorCode.RATE_LIMITED.value:
+        return
+    with session_factory() as session:
+        retry_at = active_cooldown_until(session, provider_connection_id=connection_id)
+        run = session.get(SyncRun, sync_run_id)
+        calls = int((run.metadata_json or {}).get("actual_provider_calls") or 0) if run is not None else 0
+    if retry_at is None:
+        return
+    raise DeferredJobError(
+        f"{label} deferred until the provider cooldown expires.",
+        retry_at=retry_at,
+        called_provider=calls > 0,
+    )
 
 
 def execute(
@@ -190,6 +247,13 @@ def _execute_production(job: ClaimedJob, *, settings: Settings, session_factory:
         )
     result_json = {"mode": result.mode, "result_status": result.status}
     if result.status in {"failed", "rate_limited", "deferred", "partial"}:
+        _cooldown_defer(
+            session_factory,
+            connection_id=connection_id,
+            sync_run_id=result.sync_run_id,
+            error_code=result.error_code,
+            label=f"Production {result.mode}",
+        )
         raise RetryableJobError(f"Production {result.mode} stopped with {result.status}.")
     if result.next_source_day:
         payload = dict(job.payload)
@@ -233,6 +297,13 @@ def _execute_device_status_poll(job: ClaimedJob, *, settings: Settings, session_
         "rejected": result.rejected,
     }
     if result.status in {"failed", "rate_limited", "deferred", "partial"}:
+        _cooldown_defer(
+            session_factory,
+            connection_id=connection_id,
+            sync_run_id=result.sync_run_id,
+            error_code=result.error_code,
+            label="Device status poll",
+        )
         raise RetryableJobError(f"Device status poll stopped with {result.status}.")
     return JobOutcome(status="success", result=result_json)
 

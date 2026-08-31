@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -212,6 +212,36 @@ def advance_cursor(
     cursor.last_successful_run_id = run.id
     cursor.updated_at = now
     return cursor
+
+
+def active_cooldown_until(
+    session: Session,
+    *,
+    provider_connection_id: int,
+    now: datetime | None = None,
+) -> datetime | None:
+    """When this connection may next be called, if it is currently held back.
+
+    The latest of the three deferral fields across every endpoint family of the
+    connection, or None when nothing is holding it. `reserve_request` reads the
+    same three per family; this is the connection-wide view a *job* needs,
+    because one job spans several families (a production sync authenticates and
+    then reads history) and it must wait for the last of them.
+
+    Taking the maximum is deliberately conservative: waiting slightly longer
+    than one family strictly requires costs nothing, while waking early costs a
+    provider call that will be refused.
+    """
+    now_value = as_utc(now or utc_now())
+    candidates = session.execute(
+        select(
+            func.max(ProviderRequestState.cooldown_until),
+            func.max(ProviderRequestState.next_allowed_at),
+            func.max(ProviderRequestState.provider_retry_at),
+        ).where(ProviderRequestState.provider_connection_id == provider_connection_id)
+    ).one()
+    future = [as_utc(value) for value in candidates if value is not None and as_utc(value) > now_value]
+    return max(future) if future else None
 
 
 def reserve_request(
