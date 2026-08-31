@@ -90,6 +90,19 @@ def test_network_dependency_is_confined_to_provider_http_clients() -> None:
         # guards -- one small, single-purpose file making the only calls of
         # its kind, not network code scattered through the domain packages.
         SOURCE / "integrations" / "fusionsolar" / "v1_ownership.py",
+        # Added retroactively: `socks5_transport.py` (commit 6a73d9d) has
+        # imported `socket` since it landed, so this test has been failing on
+        # this branch ever since. It belongs in the allowlist for the same
+        # reason `client.py` does -- it is the single narrow file that carries
+        # FusionSolar's outbound bytes when a proxy is in the path.
+        SOURCE / "integrations" / "fusionsolar" / "socks5_transport.py",
+        # The third and last one, and the only *inbound* one: the Huawei
+        # SDongle dials this server, so the socket is accepted rather than
+        # opened. Same shape of concern the two above answer -- one small,
+        # single-purpose file holding all the networking -- and the same
+        # discipline: `protocol.py` and `session.py` next to it stay pure, so
+        # the whole conversation is tested without a socket in sight.
+        SOURCE / "integrations" / "huawei_scada" / "listener.py",
     }
     for package in packages:
         for path in package.rglob("*.py"):
@@ -115,6 +128,39 @@ def test_sigenergy_adapter_has_no_web_or_business_domain_dependencies() -> None:
         if any(name == item or name.startswith(f"{item}.") for item in prohibited for name in imports(path)):
             violations.append(str(path.relative_to(ROOT)))
     assert not violations
+
+
+def test_huawei_scada_adapter_has_no_web_or_business_domain_dependencies() -> None:
+    prohibited = ("flask", "nemsei.web", "monitoring_board")
+    violations = []
+    for path in (SOURCE / "integrations" / "huawei_scada").rglob("*.py"):
+        if any(name == item or name.startswith(f"{item}.") for item in prohibited for name in imports(path)):
+            violations.append(str(path.relative_to(ROOT)))
+    assert not violations
+
+
+def test_only_the_huawei_listener_touches_a_socket() -> None:
+    """The protocol and the session must stay testable without networking.
+
+    This is the property that makes fragmented frames, a mid-poll reconnect
+    and a `0x83`/`0x04` refusal all reproducible in a unit test: everything
+    except the accept loop takes its bytes from an injected transport.
+    """
+    networking = {"socket", "socketserver", "select", "asyncio", "ssl"}
+    for path in (SOURCE / "integrations" / "huawei_scada").rglob("*.py"):
+        offenders = {name.split(".", 1)[0] for name in imports(path)} & networking
+        assert not offenders or path.name == "listener.py", f"{path.name} imports {offenders}"
+
+
+def test_the_huawei_protocol_has_no_modbus_write_encoder() -> None:
+    """Read-only, structurally: there is nothing here that could command a device."""
+    source = (SOURCE / "integrations" / "huawei_scada" / "protocol.py").read_text(encoding="utf-8")
+    assert "FUNCTION_WRITE" not in source
+    builders = [line for line in source.splitlines() if line.startswith("def build_")]
+    assert builders == [
+        "def build_read_holding_registers(*, transaction_id: int, unit_id: int, address: int, quantity: int) -> bytes:",
+        "def build_read_device_identification(",
+    ]
 
 
 def test_monitoring_domain_never_imports_provider_specific_adapter_code() -> None:
