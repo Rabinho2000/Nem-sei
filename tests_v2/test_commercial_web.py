@@ -143,7 +143,11 @@ def test_asset_page_says_plainly_when_there_is_no_model(settings, monkeypatch, t
     assert "Sem modelo financeiro." in page.text
     assert "Sem modelo confirmado" in page.text
     assert "Sem tarifa registada" in page.text
-    assert "Sem configuração de faturação" in page.text
+    assert "Sem configuração comercial" in page.text
+    # The three values an ESCO contract is made of, named the way the
+    # business names them rather than after their columns.
+    for label in ("Taxa de venda", "Taxa de poupança", "Venda de excedente"):
+        assert label in page.text
 
 
 def test_saving_a_tariff_then_replacing_it_closes_the_first(settings, monkeypatch, tmp_path) -> None:
@@ -170,12 +174,23 @@ def test_saving_a_billing_configuration_records_the_report_type(settings, monkey
 
     client.post(
         f"/assets/{asset_id}/billing",
-        data={"csrf_token": "test", "report_type": "esco", "valid_from": "2026-01-01", "billing_mode": "energy", "billing_energy_base": "self_consumption", "solcor_price_per_kwh": "0.08"},
+        data={
+            "csrf_token": "test", "report_type": "esco", "valid_from": "2026-01-01",
+            "billing_mode": "energy", "billing_energy_base": "self_consumption",
+            "solcor_price_per_kwh": "0.08",
+            "default_electricity_price": "0.06",
+            "default_export_price": "0.045",
+            "export_revenue_enabled": "on",
+        },
     )
 
     session = build_session_factory(build_engine(settings))()
     config = session.scalar(select(AssetBillingConfig).where(AssetBillingConfig.asset_id == asset_id))
     assert config.report_type == "esco"
+    # All three rates land, not only the one the form used to carry an input for.
+    assert config.solcor_price_per_kwh == Decimal("0.08")
+    assert config.default_electricity_price == Decimal("0.06")
+    assert config.default_export_price == Decimal("0.045")
     assert config.solcor_price_per_kwh == Decimal("0.08")
     assert config.created_by == "admin"
     session.close()
@@ -208,3 +223,67 @@ def test_an_incomplete_cycle_tariff_is_refused_with_a_readable_reason(settings, 
     session = build_session_factory(build_engine(settings))()
     assert session.scalar(select(AssetTariff).where(AssetTariff.asset_id == asset_id)) is None
     session.close()
+
+
+def test_an_esco_saved_without_its_rates_is_refused_rather_than_zeroed(settings, monkeypatch, tmp_path) -> None:
+    """The form used to have no input for two of the three rates at all.
+
+    Posting it wrote `0` into both, and `calculate_billing` then told the
+    customer they had saved 0,00 EUR -- a statement about their month rather
+    than about a field nobody filled in. Refusing the save is the only reading
+    that keeps missing and zero apart.
+    """
+    client, asset_id, _ = seeded(settings, monkeypatch, tmp_path)
+
+    page = client.post(
+        f"/assets/{asset_id}/billing",
+        data={
+            "csrf_token": "test", "report_type": "esco", "valid_from": "2026-01-01",
+            "billing_mode": "energy", "billing_energy_base": "self_consumption",
+            "solcor_price_per_kwh": "0.08",
+        },
+        follow_redirects=True,
+    )
+
+    session = build_session_factory(build_engine(settings))()
+    assert session.scalar(select(AssetBillingConfig).where(AssetBillingConfig.asset_id == asset_id)) is None
+    assert "Taxa de poupança" in page.text
+
+
+def test_an_epc_does_not_have_to_state_esco_rates(settings, monkeypatch, tmp_path) -> None:
+    """The validation is ESCO's, not everyone's. An EPC invoices no energy."""
+    client, asset_id, _ = seeded(settings, monkeypatch, tmp_path)
+
+    client.post(
+        f"/assets/{asset_id}/billing",
+        data={
+            "csrf_token": "test", "report_type": "epc", "valid_from": "2026-01-01",
+            "billing_mode": "energy", "billing_energy_base": "self_consumption",
+        },
+    )
+
+    session = build_session_factory(build_engine(settings))()
+    config = session.scalar(select(AssetBillingConfig).where(AssetBillingConfig.asset_id == asset_id))
+    assert config is not None
+    assert config.report_type == "epc"
+
+
+def test_an_esco_on_an_avenca_needs_the_avenca_and_not_a_taxa_de_venda(settings, monkeypatch, tmp_path) -> None:
+    """The advanced arrangement stays supported, and asks for what it uses."""
+    client, asset_id, _ = seeded(settings, monkeypatch, tmp_path)
+
+    client.post(
+        f"/assets/{asset_id}/billing",
+        data={
+            "csrf_token": "test", "report_type": "esco", "valid_from": "2026-01-01",
+            "billing_mode": "fixed_monthly_fee", "billing_energy_base": "self_consumption",
+            "fixed_monthly_fee_eur": "250",
+            "default_electricity_price": "0.06",
+        },
+    )
+
+    session = build_session_factory(build_engine(settings))()
+    config = session.scalar(select(AssetBillingConfig).where(AssetBillingConfig.asset_id == asset_id))
+    assert config is not None
+    assert config.fixed_monthly_fee_eur == Decimal("250")
+    assert config.solcor_price_per_kwh == Decimal("0")

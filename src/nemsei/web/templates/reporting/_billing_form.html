@@ -1,0 +1,81 @@
+{# The three values an ESCO contract is made of, named the way the business
+   names them. `solcor_price_per_kwh`, `default_electricity_price` and
+   `default_export_price` are the columns behind them; an operator should never
+   have to know that, and no column was added merely to rename one.
+
+   Everything else -- avença, base de energia, modo -- is still here and still
+   works, one disclosure below, because it is real capability that a handful of
+   contracts use and none of it may be required of the normal ESCO flow. #}
+{% macro billing_form(asset, billing, csrf_token, report_types, billing_modes, billing_energy_bases) %}
+<form method="post" action="{{ url_for('commercial.save_billing', asset_id=asset.id) }}" class="stack-form review-form">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+  <div class="form-grid">
+    <label>Tipo de contrato
+      <select name="report_type">
+        {% for value in report_types %}
+          <option value="{{ value }}" {{ 'selected' if billing and billing.report_type == value else '' }}>{{ value|upper }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Válida desde
+      <input type="date" name="valid_from" value="{{ default_valid_from or '' }}" required>
+    </label>
+  </div>
+
+  <div class="form-grid">
+    <label>Taxa de venda <small class="muted">€/kWh</small>
+      <input name="solcor_price_per_kwh" inputmode="decimal" placeholder="0,10"
+             value="{{ billing.solcor_price_per_kwh if billing else '' }}">
+      <small class="muted">O que a Solcor fatura sobre a energia faturável.</small>
+    </label>
+    <label>Taxa de poupança <small class="muted">€/kWh</small>
+      <input name="default_electricity_price" inputmode="decimal" placeholder="0,06"
+             value="{{ billing.default_electricity_price if billing else '' }}">
+      <small class="muted">O que o cliente pagaria à rede pela energia que autoconsumiu.</small>
+    </label>
+    <label>Venda de excedente <small class="muted">€/kWh</small>
+      <input name="default_export_price" inputmode="decimal" placeholder="0,045"
+             value="{{ billing.default_export_price if billing else '' }}">
+      <small class="muted">O que a energia injetada na rede rende.</small>
+    </label>
+  </div>
+
+  <label class="inline-field" style="flex-direction:row;align-items:center;gap:8px">
+    <input type="checkbox" name="export_revenue_enabled" style="width:17px;min-height:17px"
+           {{ 'checked' if not billing or billing.export_revenue_enabled else '' }}>
+    Contabilizar receita de injeção
+  </label>
+
+  <details class="advanced-block" {{ 'open' if billing and (billing.billing_mode != 'energy' or billing.billing_energy_base != 'self_consumption') else '' }}>
+    <summary>Opções avançadas</summary>
+    <p class="muted">Um contrato ESCO normal não precisa de nada disto.</p>
+    <div class="form-grid">
+      <label>Modo de faturação
+        <select name="billing_mode">
+          {% for value in billing_modes %}
+            <option value="{{ value }}" {{ 'selected' if billing and billing.billing_mode == value else '' }}>
+              {{ {'energy': 'Por energia', 'fixed_monthly_fee': 'Avença mensal'}.get(value, value) }}
+            </option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Energia faturável
+        <select name="billing_energy_base">
+          {% for value in billing_energy_bases %}
+            <option value="{{ value }}" {{ 'selected' if billing and billing.billing_energy_base == value else '' }}>
+              {{ {'self_consumption': 'Autoconsumo', 'total_production': 'Produção total'}.get(value, value) }}
+            </option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Avença mensal <small class="muted">€</small>
+        <input name="fixed_monthly_fee_eur" inputmode="decimal"
+               value="{{ billing.fixed_monthly_fee_eur if billing else '' }}">
+      </label>
+    </div>
+  </details>
+
+  <div class="form-actions"><button class="button secondary" type="submit">Gravar configuração comercial</button></div>
+</form>
+{% endmacro %}

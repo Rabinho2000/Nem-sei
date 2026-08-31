@@ -1383,6 +1383,23 @@ class JobRepository:
                 session.expunge(existing)
                 return existing, False
 
+    def enqueue_due_report_month_close(
+        self, *, interval_minutes: int, now: datetime | None = None
+    ) -> tuple[Job | None, bool]:
+        """Enqueue one report-finalisation cycle when due. No provider call.
+
+        Same shape as the incident evaluator and for the same reasons: it runs
+        across every asset that has a provisional month rather than against one
+        provider connection, and it reads persisted facts only, so there is no
+        external budget to protect and no lifetime cap to spend.
+        """
+        return self._enqueue_due_cycle(
+            job_type="reporting.month_close",
+            schedule_key="reporting.month_close",
+            interval_minutes=interval_minutes,
+            now=now,
+        )
+
     def enqueue_due_huawei_scada_rollup(
         self, *, connection_id: int, interval_minutes: int, lookback_days: int, now: datetime | None = None
     ) -> tuple[Job | None, bool]:

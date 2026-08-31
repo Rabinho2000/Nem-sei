@@ -17,6 +17,7 @@ from nemsei.integrations.huawei_scada.rollup import HuaweiScadaRollupService
 from nemsei.integrations.sigenergy.monitoring import SigenergyMonitoringService
 from nemsei.integrations.sigenergy.production import SigenergyProductionService
 from nemsei.providers.errors import ProviderErrorCode
+from nemsei.reporting.close import close_reporting_months
 from nemsei.providers.models import ProviderConnection
 from nemsei.providers.registry import ProviderCode
 from nemsei.integrations.fusionsolar.session_cache import default_session_cache
@@ -131,6 +132,10 @@ def execute(
         if session_factory is None:
             raise ValueError("Notification processing requires a worker session factory.")
         return _execute_notification_processing(session_factory=session_factory)
+    if job.job_type == "reporting.month_close":
+        if session_factory is None:
+            raise ValueError("Report month close requires a worker session factory.")
+        return _execute_report_month_close(session_factory=session_factory)
     if job.job_type in {"huawei_scada.rollup", "huawei_scada.retention"}:
         if settings is None or session_factory is None:
             raise ValueError("Huawei SCADA jobs require worker settings and sessions.")
@@ -208,6 +213,18 @@ def _execute_current_monitoring(job: ClaimedJob, *, settings: Settings, session_
             "error_code": result.error_code,
         },
     )
+
+
+def _execute_report_month_close(*, session_factory: sessionmaker[Session]) -> JobOutcome:
+    """Finalise every provisional month whose source data has since closed.
+
+    Reads persisted facts and writes report snapshots. No provider client is
+    reachable from here, which is what makes it safe to run on a schedule
+    against an account that rate-limits.
+    """
+    with session_factory() as session, session.begin():
+        outcome = close_reporting_months(session)
+    return JobOutcome(status="success", result=outcome.as_result())
 
 
 def _execute_production(job: ClaimedJob, *, settings: Settings, session_factory: sessionmaker[Session]) -> JobOutcome:

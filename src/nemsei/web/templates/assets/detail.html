@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "reporting/_billing_form.html" import billing_form %}
 {% import "macros/chart.html" as chart %}
 {#
   Bloco A: esta página era só de leitura. As rotas de escrita existiam e
@@ -349,27 +350,16 @@
     <div class="panel-header"><div><p class="eyebrow">Comercial</p><h2>Faturação</h2></div>{% if billing %}<span class="status-badge muted">{{ billing.report_type|upper }} · desde {{ billing.valid_from }}</span>{% endif %}</div>
     {% if billing %}
       <dl class="detail-list">
-        <div><dt>Tipo de relatório</dt><dd>{{ billing.report_type|upper }}</dd></div>
-        <div><dt>Modo</dt><dd>{{ billing.billing_mode }} sobre {{ billing.billing_energy_base }}</dd></div>
-        <div><dt>Preço Solcor</dt><dd>{{ billing.solcor_price_per_kwh }} €/kWh</dd></div>
-        <div><dt>Avença mensal</dt><dd>{{ billing.fixed_monthly_fee_eur }} €</dd></div>
+        <div><dt>Tipo de contrato</dt><dd>{{ billing.report_type|upper }}</dd></div>
+        <div><dt>Taxa de venda</dt><dd>{{ billing.solcor_price_per_kwh }} €/kWh</dd></div>
+        <div><dt>Taxa de poupança</dt><dd>{{ billing.default_electricity_price }} €/kWh</dd></div>
+        <div><dt>Venda de excedente</dt><dd>{{ billing.default_export_price }} €/kWh</dd></div>
+        {% if billing.billing_mode != 'energy' %}<div><dt>Avença mensal</dt><dd>{{ billing.fixed_monthly_fee_eur }} €</dd></div>{% endif %}
       </dl>
     {% else %}
-      <p class="empty-state">Sem configuração de faturação. É isto que decide se o relatório sai EPC ou ESCO.</p>
+      <p class="empty-state">Sem configuração comercial. É isto que decide se o relatório sai EPC ou ESCO, e sem ela nenhum valor em euros pode ser apurado.</p>
     {% endif %}
-    <form method="post" action="{{ url_for('commercial.save_billing', asset_id=asset.id) }}" class="stack-form review-form">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <div class="form-grid">
-        <label>Tipo de relatório<select name="report_type">{% for value in report_types %}<option value="{{ value }}" {{ 'selected' if billing and billing.report_type == value else '' }}>{{ value|upper }}</option>{% endfor %}</select></label>
-        <label>Válida desde<input type="date" name="valid_from" required></label>
-        <label>Modo<select name="billing_mode">{% for value in billing_modes %}<option value="{{ value }}" {{ 'selected' if billing and billing.billing_mode == value else '' }}>{{ value }}</option>{% endfor %}</select></label>
-        <label>Base de energia<select name="billing_energy_base">{% for value in billing_energy_bases %}<option value="{{ value }}" {{ 'selected' if billing and billing.billing_energy_base == value else '' }}>{{ value }}</option>{% endfor %}</select></label>
-        <label>Preço Solcor €/kWh<input name="solcor_price_per_kwh" inputmode="decimal" value="{{ billing.solcor_price_per_kwh if billing else '' }}"></label>
-        <label>Avença mensal €<input name="fixed_monthly_fee_eur" inputmode="decimal" value="{{ billing.fixed_monthly_fee_eur if billing else '' }}"></label>
-      </div>
-      <label class="inline-field" style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" name="export_revenue_enabled" style="width:17px;min-height:17px" {{ 'checked' if not billing or billing.export_revenue_enabled else '' }}> Contabilizar receita de injeção</label>
-      <div class="form-actions"><button class="button secondary" type="submit">Gravar faturação</button></div>
-    </form>
+    {{ billing_form(asset, billing, csrf_token, report_types, billing_modes, billing_energy_bases) }}
   </section>
 </div>
 

@@ -82,6 +82,15 @@ class Scheduler:
                 interval_minutes=self.settings.diagnostic_incident_evaluation_interval_minutes,
             )
             created = created or incident_created
+        # Report finalisation: off by default, and provider-free like the
+        # incident evaluator above. It only ever adds a snapshot beside a
+        # provisional one; it cannot rewrite a report and cannot approve a
+        # portfolio run, both of which stay an operator's act.
+        if self.settings.report_month_close_enabled:
+            _close_job, close_created = self.repository.enqueue_due_report_month_close(
+                interval_minutes=self.settings.report_month_close_interval_minutes,
+            )
+            created = created or close_created
         # D3: off by default. This switch decides whether the pass *runs*;
         # whether it may deliver is the separate global `NEMSEI_V2_NOTIFICATIONS`
         # capability, checked in notifications/service.py. Since D4 the client

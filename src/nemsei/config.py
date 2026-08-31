@@ -186,6 +186,15 @@ class Settings:
     # across every asset that owns a device, by design.
     diagnostic_incident_evaluation_enabled: bool = False
     diagnostic_incident_evaluation_interval_minutes: int = 15
+    # Turns a provisional month into a final one once its data closes. Reads
+    # persisted facts and writes report snapshots; it cannot reach a provider,
+    # so like the incident evaluator it needs no connection id and no call cap.
+    # Hourly rather than every quarter of an hour: what it waits for is a month
+    # ending and a backfill landing, neither of which happens on a 15-minute
+    # scale, and every cycle that finds nothing is a full scan of the snapshot
+    # table.
+    report_month_close_enabled: bool = False
+    report_month_close_interval_minutes: int = 60
     # How many times one job may be deferred by a provider cooldown before it
     # goes back to the ordinary retry path.
     #
@@ -331,6 +340,12 @@ class Settings:
             diagnostic_incident_evaluation_interval_minutes=int(
                 os.environ.get("NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_INTERVAL_MINUTES", "15")
             ),
+            report_month_close_enabled=parse_bool(
+                os.environ.get("NEMSEI_V2_REPORT_MONTH_CLOSE_ENABLED"), default=False
+            ),
+            report_month_close_interval_minutes=int(
+                os.environ.get("NEMSEI_V2_REPORT_MONTH_CLOSE_INTERVAL_MINUTES", "60")
+            ),
             notification_processing_enabled=parse_bool(
                 os.environ.get("NEMSEI_V2_NOTIFICATION_PROCESSING_ENABLED"), default=False
             ),
@@ -425,6 +440,8 @@ class Settings:
                 raise ConfigurationError(f"{label} current monitoring requires an explicit connection id; there is no portfolio-wide mode.")
         if self.diagnostic_incident_evaluation_interval_minutes <= 0:
             raise ConfigurationError("Diagnostic incident evaluation interval must be positive.")
+        if self.report_month_close_interval_minutes <= 0:
+            raise ConfigurationError("Report month close interval must be positive.")
         if self.notification_processing_interval_minutes <= 0:
             raise ConfigurationError("Notification processing interval must be positive.")
         if self.digest_generation_interval_minutes <= 0:

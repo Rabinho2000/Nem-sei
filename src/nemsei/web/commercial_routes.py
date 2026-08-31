@@ -52,6 +52,25 @@ def optional_money(value: str | None, label: str) -> Decimal | None:
     return money(value, label) if value and value.strip() else None
 
 
+def required_rate(value: str | None, label: str) -> Decimal:
+    """A rate the chosen billing arrangement actually uses, refused when blank.
+
+    `money` answers zero for an empty field, which is the right default for a
+    field that means "none of this applies" and exactly the wrong one for a
+    price. A blank taxa de poupança saved as `0` does not read as unset
+    anywhere downstream: `calculate_billing` multiplies it out and the customer
+    is told they saved 0,00 EUR, which is a statement about their month rather
+    than about a form nobody filled in. So the rates an ESCO contract is made
+    of are asked for by name instead.
+    """
+    rate = money(value, label)
+    if not value or not value.strip():
+        raise ValueError(f"{label} é obrigatória. Sem ela o relatório indicaria 0,00 €, que não é o mesmo que «por preencher».")
+    if rate <= 0:
+        raise ValueError(f"{label} tem de ser maior que zero.")
+    return rate
+
+
 # The database already refuses an incomplete cycle tariff
 # (`ck_asset_tariffs_cycle_prices`). Checking here too is not redundant: an
 # IntegrityError reaches the operator as a blank 500, while this names the
@@ -68,6 +87,45 @@ def check_tariff_prices(tariff_type: str, prices: dict[str, Decimal | None]) -> 
     missing = [label for key, label in CYCLE_REQUIRED.get(tariff_type, ()) if prices.get(key) is None]
     if missing:
         raise ValueError(f"Uma tarifa {tariff_type} precisa do preço de: {', '.join(missing)}.")
+
+
+# What the operator calls the three values an ESCO contract is made of, and the
+# columns that already carry them. The mapping was verified against
+# `reporting/rules/billing.py` rather than assumed, and no column was added to
+# rename one: `solcor_price_per_kwh` multiplies the billable energy,
+# `default_electricity_price` multiplies self-consumption, `default_export_price`
+# multiplies export. Those are precisely taxa de venda, taxa de poupança and
+# venda de excedente.
+ESCO_RATE_LABELS = {
+    "solcor_price_per_kwh": "Taxa de venda",
+    "default_electricity_price": "Taxa de poupança",
+    "default_export_price": "Venda de excedente",
+    "fixed_monthly_fee_eur": "Avença mensal",
+}
+
+
+def collect_rates(form, *, report_type: str, billing_mode: str, export_revenue_enabled: bool) -> dict[str, Decimal]:
+    """Read the money fields, insisting on the ones this arrangement will use.
+
+    An ESCO on the normal energy contract needs exactly three numbers and is
+    asked for exactly those three. The avença stays supported for the
+    arrangements that are billed that way, but it is never required of the
+    simple flow -- requiring it was one of the reasons the simple flow did not
+    exist. Everything a given arrangement does *not* use stays optional and
+    defaults to zero, because there zero genuinely means "does not apply".
+    """
+    required: set[str] = set()
+    if report_type == "esco":
+        required.add("default_electricity_price")
+        required.add("solcor_price_per_kwh" if billing_mode == "energy" else "fixed_monthly_fee_eur")
+        if export_revenue_enabled:
+            required.add("default_export_price")
+
+    values: dict[str, Decimal] = {}
+    for field, label in ESCO_RATE_LABELS.items():
+        raw = form.get(field)
+        values[field] = required_rate(raw, label) if field in required else money(raw, label)
+    return values
 
 
 def required_date(value: str | None, label: str) -> date:
@@ -284,6 +342,13 @@ def save_billing(asset_id: int):
             raise ValueError("Modo de faturação desconhecido.")
         if billing_energy_base not in BILLING_ENERGY_BASES:
             raise ValueError("Base de energia desconhecida.")
+        export_revenue_enabled = request.form.get("export_revenue_enabled") == "on"
+        rates = collect_rates(
+            request.form,
+            report_type=report_type,
+            billing_mode=billing_mode,
+            export_revenue_enabled=export_revenue_enabled,
+        )
         set_billing_config(
             session,
             asset_id=asset_id,
@@ -292,12 +357,9 @@ def save_billing(asset_id: int):
             created_by=actor(),
             billing_mode=billing_mode,
             billing_energy_base=billing_energy_base,
-            solcor_price_per_kwh=money(request.form.get("solcor_price_per_kwh"), "Preço Solcor"),
-            fixed_monthly_fee_eur=money(request.form.get("fixed_monthly_fee_eur"), "Avença mensal"),
-            default_electricity_price=money(request.form.get("default_electricity_price"), "Preço de eletricidade"),
-            default_export_price=money(request.form.get("default_export_price"), "Preço de venda à rede"),
-            export_revenue_enabled=request.form.get("export_revenue_enabled") == "on",
+            export_revenue_enabled=export_revenue_enabled,
             source_kind="operator",
+            **rates,
         )
         session.commit()
         flash("Configuração de faturação gravada.", "success")
