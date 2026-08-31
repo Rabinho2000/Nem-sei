@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
 
 from sqlalchemy import select
 

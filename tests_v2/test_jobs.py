@@ -169,7 +169,7 @@ def test_device_status_poll_schedule_survives_a_scheduler_restart(settings, monk
 
 
 def test_device_status_poll_concurrent_scheduler_ticks_enqueue_one_job(settings, monkeypatch) -> None:
-    repo = repository(settings, monkeypatch)
+    repository(settings, monkeypatch)
     t0 = utc_now()
 
     def tick(_unused) -> tuple[int | None, bool]:
@@ -292,7 +292,7 @@ def test_incident_evaluation_schedule_survives_a_restart(settings, monkeypatch) 
 
 
 def test_incident_evaluation_concurrent_ticks_enqueue_one_job(settings, monkeypatch) -> None:
-    repo = repository(settings, monkeypatch)
+    repository(settings, monkeypatch)
     t0 = utc_now()
 
     def tick(_unused) -> tuple[int | None, bool]:
@@ -349,7 +349,7 @@ def test_notification_processing_schedule_survives_a_restart(settings, monkeypat
 
 
 def test_notification_processing_concurrent_ticks_enqueue_one_job(settings, monkeypatch) -> None:
-    repo = repository(settings, monkeypatch)
+    repository(settings, monkeypatch)
     t0 = utc_now()
 
     def tick(_unused) -> tuple[int | None, bool]:
@@ -406,7 +406,7 @@ def test_digest_generation_schedule_survives_a_restart(settings, monkeypatch) ->
 
 
 def test_digest_generation_concurrent_ticks_enqueue_one_job(settings, monkeypatch) -> None:
-    repo = repository(settings, monkeypatch)
+    repository(settings, monkeypatch)
     t0 = utc_now()
 
     def tick(_unused) -> tuple[int | None, bool]:
@@ -489,7 +489,7 @@ def test_production_sync_schedule_survives_a_scheduler_restart(settings, monkeyp
 
 
 def test_production_sync_concurrent_scheduler_ticks_enqueue_one_job(settings, monkeypatch) -> None:
-    repo = repository(settings, monkeypatch)
+    repository(settings, monkeypatch)
     t0 = utc_now()
 
     def tick(_unused) -> tuple[int | None, bool]:

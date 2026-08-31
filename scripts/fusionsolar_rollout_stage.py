@@ -63,7 +63,7 @@ from nemsei.db.session import build_session_factory
 from nemsei.integrations.fusionsolar.monitoring import FusionSolarMonitoringService
 from nemsei.integrations.fusionsolar.production import FusionSolarProductionService
 from nemsei.integrations.fusionsolar.session_cache import default_session_cache
-from nemsei.providers.models import AssetProviderMapping, ProviderConnection
+from nemsei.providers.models import ProviderConnection
 from nemsei.providers.service import create_mapping
 from nemsei.sources.service import create_source_policy
 

@@ -116,7 +116,8 @@ def test_multiple_authenticate_calls_share_one_login():
         client.authenticate()
         return None, None
 
-    fresh = lambda credentials: FusionSolarClient(credentials, transport=FakeTransport([response(LOGIN_OK, headers={"XSRF-TOKEN": "t"})]))
+    def fresh(credentials):
+        return FusionSolarClient(credentials, transport=FakeTransport([response(LOGIN_OK, headers={"XSRF-TOKEN": "t"})]))
 
     client1, error1, reused1 = cache.get_or_authenticate(CREDS, client_factory=fresh, authenticate=do_authenticate)
     client2, error2, reused2 = cache.get_or_authenticate(CREDS, client_factory=fresh, authenticate=do_authenticate)
@@ -162,7 +163,8 @@ def test_invalidate_forces_reauth_on_the_next_call():
         client.authenticate()
         return None, None
 
-    fresh = lambda credentials: FusionSolarClient(credentials, transport=FakeTransport([response(LOGIN_OK, headers={"XSRF-TOKEN": "t"})]))
+    def fresh(credentials):
+        return FusionSolarClient(credentials, transport=FakeTransport([response(LOGIN_OK, headers={"XSRF-TOKEN": "t"})]))
 
     cache.get_or_authenticate(CREDS, client_factory=fresh, authenticate=do_authenticate)
     assert len(login_calls) == 1
@@ -185,7 +187,8 @@ def test_concurrent_callers_produce_at_most_one_login():
         client.authenticate()
         return None, None
 
-    fresh = lambda credentials: FusionSolarClient(credentials, transport=FakeTransport([response(LOGIN_OK, headers={"XSRF-TOKEN": "t"})]))
+    def fresh(credentials):
+        return FusionSolarClient(credentials, transport=FakeTransport([response(LOGIN_OK, headers={"XSRF-TOKEN": "t"})]))
 
     results = []
     barrier = threading.Barrier(8)
@@ -212,7 +215,8 @@ def test_a_failed_login_is_never_cached():
     def failing_authenticate(client):
         return None, ProviderError(ProviderErrorCode.AUTHENTICATION, "credentials rejected")
 
-    fresh = lambda credentials: FusionSolarClient(credentials, transport=FakeTransport([]))
+    def fresh(credentials):
+        return FusionSolarClient(credentials, transport=FakeTransport([]))
     client, error, reused = cache.get_or_authenticate(CREDS, client_factory=fresh, authenticate=failing_authenticate)
     assert client is None
     assert error is not None and error.code is ProviderErrorCode.AUTHENTICATION
@@ -227,7 +231,8 @@ def test_a_failed_login_is_never_cached():
         client.authenticate()
         return None, None
 
-    fresh2 = lambda credentials: FusionSolarClient(credentials, transport=FakeTransport([response(LOGIN_OK, headers={"XSRF-TOKEN": "t"})]))
+    def fresh2(credentials):
+        return FusionSolarClient(credentials, transport=FakeTransport([response(LOGIN_OK, headers={"XSRF-TOKEN": "t"})]))
     cache.get_or_authenticate(CREDS, client_factory=fresh2, authenticate=succeeding_authenticate)
     assert len(login_calls) == 1
 

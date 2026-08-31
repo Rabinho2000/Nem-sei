@@ -184,7 +184,7 @@ def test_coverage_distinguishes_complete_partial_none_and_no_devices(factory) ->
 
         # Partial: one of two devices has a device_no_history incident.
         partial_asset = create_asset(session, canonical_name="Partial Plant")
-        partial_device_ok = create_device(session, asset_id=partial_asset.id, device_kind="inverter", label="OK", valid_from=date(2026, 1, 1))
+        create_device(session, asset_id=partial_asset.id, device_kind="inverter", label="OK", valid_from=date(2026, 1, 1))
         partial_device_missing = create_device(session, asset_id=partial_asset.id, device_kind="inverter", label="Missing", valid_from=date(2026, 1, 1))
         make_incident(session, asset_id=partial_asset.id, device_id=partial_device_missing.id, rule_code="device_no_history", severity="warning")
 

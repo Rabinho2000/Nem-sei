@@ -13,7 +13,7 @@ proved for immediate notifications.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 
 import pytest
 from alembic import command
@@ -29,10 +29,9 @@ from nemsei.notifications.digests import (
     build_digest_payload,
     deliver_digest,
     generate_digest,
-    render_digest_text,
 )
 from nemsei.notifications.models import DigestRun, NotificationChannel
-from nemsei.notifications.telegram_client import DeliveryResult, MockTelegramClient
+from nemsei.notifications.telegram_client import MockTelegramClient
 from nemsei.portfolios.service import add_member, create_portfolio
 
 

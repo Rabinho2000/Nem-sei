@@ -9,7 +9,7 @@ socket.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 
 import pytest
 from alembic import command

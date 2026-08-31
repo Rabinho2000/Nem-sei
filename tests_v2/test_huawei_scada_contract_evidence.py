@@ -13,7 +13,6 @@ from decimal import Decimal
 
 from nemsei.integrations.huawei_scada.contract_evidence import (
     MIN_BALANCE_SAMPLES,
-    MIN_SIGN_SAMPLES,
     evidence_for,
     grid_sign_evidence,
     power_scale_evidence,
