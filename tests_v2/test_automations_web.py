@@ -14,7 +14,10 @@ from sqlalchemy import select
 
 from nemsei.app import create_app
 from nemsei.db import build_engine, build_session_factory
+from nemsei.jobs.models import Job, ScheduleState
 from nemsei.notifications.models import NotificationChannel, NotificationPolicy
+from nemsei.providers.service import create_connection
+from nemsei.system.automation_health import HEARTBEAT_KEY
 from nemsei.providers.models import OperatorAuditEvent
 from nemsei.shared.clock import utc_now
 from nemsei.system.automations import set_channel_enabled
@@ -64,24 +67,65 @@ def audit(settings) -> list[str]:
         session.close()
 
 
-def test_the_page_names_each_scheduler_and_the_variable_that_controls_it(settings, monkeypatch) -> None:
+def test_the_page_invents_no_automation_that_is_not_really_scheduled(settings, monkeypatch) -> None:
+    """Rows are derived from `schedule_state`, not from a list in the code.
+
+    The screen used to render a fixed catalogue of six automations whether or
+    not any of them existed, which made "sem registo" the most common answer
+    and made the two `monitoring.current` schedules -- which really were
+    running, every fifteen minutes -- invisible because no catalogue entry
+    matched them.
+    """
     client, _ = seeded(settings, monkeypatch)
 
     page = client.get("/automations")
 
     assert page.status_code == 200
-    for label in ("Sincronização de produção", "Sonda de dispositivos", "Avaliação de incidentes", "Digest periódico"):
-        assert label in page.text
-    # The screen must say where the switch actually lives, not imply it is here.
-    assert "NEMSEI_V2_PRODUCTION_SYNC_SCHEDULER_ENABLED" in page.text
+    assert "Nenhum agendamento escreveu ainda" in page.text
+    assert "Sincronização de produção" not in page.text
+    # The scheduler's own health is a separate statement, and with no heartbeat
+    # row it must not be claimed to be alive.
+    assert "sem sinal" in page.text
     assert "só leitura" in page.text
-    # And it must not claim to know a flag it cannot see: with no schedule_state
-    # row, the honest answer is "sem registo", never "desligada".
-    assert ">sem registo</span>" in page.text
-    # ...and no row claims a flag this process cannot see. The word may appear
-    # in the explanation below the table; what must not exist is the badge.
-    assert ">desligada</span>" not in page.text
-    assert ">ligada</span>" not in page.text
+
+
+def test_the_page_separates_scheduler_health_from_execution_health(settings, monkeypatch) -> None:
+    """A schedule firing on time into a job that fails is not a healthy row."""
+    client, _ = seeded(settings, monkeypatch)
+    session = build_session_factory(build_engine(settings))()
+    now = utc_now()
+    connection = create_connection(
+        session, provider_code="fusionsolar", connection_key="fs", display_name="FusionSolar principal",
+        credential_reference="primary", enabled=True, configuration_status="configured",
+    )
+    session.flush()
+    key = f"production.incremental:{connection.id}"
+    session.add(ScheduleState(schedule_key=HEARTBEAT_KEY, next_run_at=now + timedelta(minutes=30),
+                              last_enqueued_at=now, updated_at=now))
+    session.add(ScheduleState(schedule_key=key, next_run_at=now + timedelta(hours=20),
+                              last_enqueued_at=now - timedelta(hours=4), updated_at=now))
+    session.add(Job(
+        job_type="production.incremental", status="failed", payload_json={},
+        dedupe_key=f"{key}:slot", priority=100, available_at=now - timedelta(hours=4),
+        attempt_count=3, max_attempts=3, created_at=now - timedelta(hours=4), updated_at=now - timedelta(hours=4),
+        started_at=now - timedelta(hours=4), finished_at=now - timedelta(hours=4),
+        error_type="RetryableJobError",
+    ))
+    session.commit()
+    session.close()
+
+    page = client.get("/automations")
+
+    assert page.status_code == 200
+    # The row is named for its connection, not for a generic definition.
+    assert "FusionSolar principal" in page.text
+    assert key in page.text
+    # Scheduler healthy, execution failed, and the headline follows execution.
+    assert ">falhou</span>" in page.text
+    assert "a agendar" in page.text
+    assert "vivo" in page.text
+    # The switch is still named, and still said to live outside this process.
+    assert "docker-compose.v2.yml" in page.text
 
 
 def test_enabling_a_channel_with_nowhere_to_deliver_is_refused(settings, monkeypatch) -> None:

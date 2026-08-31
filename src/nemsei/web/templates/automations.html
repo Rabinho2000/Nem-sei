@@ -12,31 +12,103 @@
 </header>
 
 <section class="panel">
-  <div class="panel-header"><div><p class="eyebrow">Agendadores</p><h2>Controlados por ambiente</h2></div><span class="status-badge muted">só leitura</span></div>
-  <p class="provenance">O estado abaixo é lido do que o próprio agendador escreveu em <code>schedule_state</code>, não das variáveis deste processo — o contentor web não tem as variáveis do contentor do agendador, e perguntar-lhas daria a resposta errada com toda a confiança.</p>
+  <div class="panel-header">
+    <div><p class="eyebrow">Agendador</p><h2>Pulsação</h2></div>
+    <span class="status-badge {{ 'success' if pulse.alive else 'danger' }}">{{ 'vivo' if pulse.alive else 'sem sinal' }}</span>
+  </div>
+  <p class="provenance">
+    {% if pulse.alive %}
+      O trabalho horário sem efeito (<code>system.noop.hourly</code>) foi agendado às
+      {{ pulse.last_enqueued_at.strftime('%H:%M') if pulse.last_enqueued_at else '—' }} e volta às
+      {{ pulse.next_run_at.strftime('%H:%M') if pulse.next_run_at else '—' }}. O ciclo do agendador está a andar,
+      por isso um agendamento em atraso é problema <strong>dessa</strong> automação — tipicamente um interruptor
+      desligado ou um override que caiu do deploy — e não do agendador.
+    {% else %}
+      A pulsação está parada{% if pulse.stale_by %} há {{ (pulse.stale_by.total_seconds() // 60) | int }} minutos{% endif %}.
+      Enquanto isto durar, <strong>nada abaixo se pode ler como problema de uma automação em particular</strong>:
+      o agendador pode simplesmente não estar a correr.
+    {% endif %}
+    {% if pulse.overdue_automations %} Há {{ pulse.overdue_automations }} agendamento(s) em atraso.{% endif %}
+  </p>
+</section>
+
+<section class="panel">
+  <div class="panel-header"><div><p class="eyebrow">Agendadores</p><h2>Saúde das automações</h2></div><span class="status-badge muted">só leitura</span></div>
+  <p class="provenance">
+    Duas perguntas separadas, porque falham por razões diferentes e resolvem-se de maneiras diferentes.
+    <strong>Agendador</strong> é o que o próprio agendador escreveu em <code>schedule_state</code>: alguém ainda põe isto na fila?
+    <strong>Execução</strong> é o que aconteceu aos <code>jobs</code> que daí saíram: o trabalho correu, e correu bem?
+    Até 2026-08-31 esta página mostrava só a primeira e chamava-lhe «a correr» — foi por isso que a sincronização de produção
+    do FusionSolar pôde falhar sete dias seguidos com a linha verde.
+  </p>
   <div class="table-scroll">
     <table class="data-table compact-table">
-      <thead><tr><th>Automação</th><th>Estado</th><th>Última vez</th><th>Próxima</th><th>Chave</th><th>Interruptor</th></tr></thead>
+      <thead><tr>
+        <th>Automação</th><th>Estado</th><th>Agendador</th><th>Última tentativa</th>
+        <th>Último sucesso</th><th>Último resultado</th><th>Próxima</th><th>Falhas seguidas</th>
+      </tr></thead>
       <tbody>
-        {% for item in scheduled %}
-          <tr class="{{ 'row-attention' if item.state == 'overdue' else '' }}">
-            <th scope="row">{{ item.label }}<small>{{ item.purpose }}</small></th>
+        {% for item in scheduled if not item.is_heartbeat %}
+          <tr class="{{ 'row-attention' if item.tone in ('warning', 'danger') else '' }}">
+            <th scope="row">
+              {{ item.label }}
+              {% if item.connection_label %}<small>{{ item.provider_code }} · {{ item.connection_label }}</small>
+              {% else %}<small>{{ item.purpose }}</small>{% endif %}
+              <small><code>{{ item.schedule_key }}</code></small>
+            </th>
+            <td><span class="status-badge {{ item.tone }}">{{ item.status_label }}</span></td>
             <td>
-              {% if item.state == 'running' %}<span class="status-badge success">a correr</span>
-              {% elif item.state == 'overdue' %}<span class="status-badge warning">atrasada</span>
-              {% else %}<span class="status-badge muted">sem registo</span>{% endif %}
+              {% if item.scheduler.state == 'ativa' %}<span class="muted">a agendar</span>
+              {% elif item.scheduler.state == 'atrasada' %}<span class="status-badge warning">em atraso</span>
+              {% else %}<span class="muted">sem registo</span>{% endif %}
             </td>
-            <td>{{ item.last_enqueued_at.strftime('%Y-%m-%d %H:%M') if item.last_enqueued_at else '—' }}</td>
-            <td>{{ item.next_run_at.strftime('%Y-%m-%d %H:%M') if item.next_run_at else '—' }}</td>
-            <td>{% if item.schedule_key %}<code>{{ item.schedule_key }}</code>{% else %}<span class="muted">—</span>{% endif %}</td>
-            <td>{% if item.setting_name != '—' %}<code>{{ item.setting_name }}</code>{% else %}<span class="muted">—</span>{% endif %}</td>
+            <td>{{ item.execution.last_attempt_at.strftime('%m-%d %H:%M') if item.execution.last_attempt_at else '—' }}</td>
+            <td>{{ item.execution.last_success_at.strftime('%m-%d %H:%M') if item.execution.last_success_at else '—' }}</td>
+            <td>
+              {{ item.execution.last_result or '—' }}
+              {% if item.execution.failure_reason %}<small>{{ item.execution.failure_reason }}</small>{% endif %}
+            </td>
+            <td>{{ item.scheduler.next_run_at.strftime('%m-%d %H:%M') if item.scheduler.next_run_at else '—' }}</td>
+            <td>{{ item.execution.consecutive_failures or '—' }}</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="8"><span class="empty-state">Nenhum agendamento escreveu ainda em <code>schedule_state</code>.</span></td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="panel-foot muted">
+    As linhas vêm dos agendamentos que <em>existem</em>, não de uma lista escrita no código: cada ligação de provider tem a sua
+    própria linha, porque <code>production.incremental:3</code> (FusionSolar) e <code>production.incremental:5</code> (Sigenergy)
+    são duas contas, dois limites de chamadas e dois modos de falha. «Desligada» quer dizer que o agendador está vivo e mesmo assim
+    não põe isto na fila — um interruptor a false ou um ficheiro de override que faltou ao deploy. Os interruptores vivem no
+    <code>docker-compose.v2.yml</code> e nos componentes declarados em <code>deploy/v2_deployment_components.json</code>, e mudá-los
+    exige um redeploy. O motivo da falha mostra o código de erro e o detalhe que o adaptador já declarou seguro — nunca a mensagem
+    crua da excepção, que pode carregar uma ligação à base de dados.
+  </p>
+</section>
+
+{% if listeners %}
+<section class="panel">
+  <div class="panel-header"><div><p class="eyebrow">Processos contínuos</p><h2>Escutas</h2></div></div>
+  <p class="provenance">Não são agendamentos: o dongle é que liga a este servidor, por isso não há nada periódico para enfileirar. A pergunta operacional é a mesma — está a receber?</p>
+  <div class="table-scroll">
+    <table class="data-table compact-table">
+      <thead><tr><th>Processo</th><th>Estado</th><th>Sessões abertas</th><th>Última leitura</th></tr></thead>
+      <tbody>
+        {% for item in listeners %}
+          <tr class="{{ 'row-attention' if item.tone in ('warning', 'danger') else '' }}">
+            <th scope="row">{{ item.label }}{% if item.connection_label %}<small>{{ item.connection_label }}</small>{% endif %}</th>
+            <td><span class="status-badge {{ item.tone }}">{{ item.status_label }}</span></td>
+            <td>{{ item.open_sessions }}</td>
+            <td>{{ item.last_seen_at.strftime('%m-%d %H:%M') if item.last_seen_at else '—' }}</td>
           </tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
-  <p class="panel-foot muted">«Sem registo» significa que esta automação nunca escreveu nada — pode estar desligada ou pode nunca ter chegado a correr, e daqui não se distingue. Os interruptores vivem no <code>docker-compose.v2.yml</code> e nos seus ficheiros de override, e são lidas uma vez quando o processo arranca. Mudá-las exige um redeploy, não um clique — e o cabeçalho do compose explica porquê omitir um override já desligou silenciosamente uma delas.</p>
 </section>
+{% endif %}
 
 <section class="panel">
   <div class="panel-header"><div><p class="eyebrow">Notificações</p><h2>Canais</h2></div><span class="status-badge muted">{{ open_incidents }} incidentes abertos</span></div>

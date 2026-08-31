@@ -6,10 +6,15 @@ so this module reports their state and their last run and offers no control --
 a toggle that quietly did nothing would be worse than no toggle. The
 notification channel and its policies are database rows, so those really can be
 switched, and switching them is audited.
+
+The scheduler half of that lives in `system/automation_health.py` now. It grew
+past a label and a timestamp: reporting a schedule as "a correr" because the
+scheduler enqueued something is not the same claim as reporting that the work
+succeeded, and this screen made that mistake for both of the failures found on
+2026-08-31.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -18,7 +23,6 @@ from sqlalchemy.orm import Session
 
 from nemsei.contracts.service import scoped_asset_ids
 from nemsei.diagnostics.models import DiagnosticIncident
-from nemsei.jobs.models import ScheduleState
 from nemsei.notifications.models import (
     NOTIFICATION_ASSET_SCOPES,
     NOTIFICATION_SEVERITIES,
@@ -29,77 +33,7 @@ from nemsei.notifications.models import (
 )
 from nemsei.providers.audit import record_operator_action
 from nemsei.shared.clock import utc_now
-
-
-@dataclass(frozen=True)
-class ScheduledAutomation:
-    """One background automation, described by what it actually did.
-
-    Deliberately **not** described by `Settings`. The schedulers run in the
-    `scheduler` container and their flags are that container's environment;
-    the web process does not have them, so reading its own `Settings` here
-    reported "Sincronização de produção: desligada" while the scheduler was
-    running it on time. That was found against production, not in review.
-
-    `schedule_state` is evidence the scheduler itself wrote: a row exists only
-    because the schedule ran, and `next_run_at` is the scheduler's own
-    statement of when it intends to run again. Reading those needs no
-    knowledge of anyone else's environment and cannot disagree with reality.
-    """
-
-    key: str
-    label: str
-    purpose: str
-    setting_name: str
-    schedule_key: str | None
-    next_run_at: datetime | None
-    last_enqueued_at: datetime | None
-
-    @property
-    def state(self) -> str:
-        """`unseen` (never ran), `overdue` (its own next run is past) or `running`."""
-        if self.schedule_key is None or self.last_enqueued_at is None:
-            return "unseen"
-        # Five minutes of grace: the scheduler ticks on its own loop and a
-        # schedule due seconds ago is not a stopped schedule.
-        if self.next_run_at is not None and self.next_run_at < utc_now() - timedelta(minutes=5):
-            return "overdue"
-        return "running"
-
-
-DEFINITIONS = (
-    ("production.incremental", "Sincronização de produção", "Lê a produção diária do provider e escreve factos.", "NEMSEI_V2_PRODUCTION_SYNC_SCHEDULER_ENABLED"),
-    ("device_status.poll", "Sonda de dispositivos", "Lê o estado e a potência de cada inversor.", "NEMSEI_V2_DEVICE_STATUS_POLL_ENABLED"),
-    ("diagnostics.evaluate_incidents", "Avaliação de incidentes", "Reavalia as regras e abre ou fecha incidentes. Não faz chamadas ao provider.", "NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED"),
-    ("notifications.process", "Processamento de notificações", "Decide e entrega notificações segundo as políticas.", "NEMSEI_V2_NOTIFICATION_PROCESSING_ENABLED"),
-    ("digest.generate", "Digest periódico", "Resume os incidentes desde o digest anterior.", "NEMSEI_V2_DIGEST_GENERATION_ENABLED"),
-    ("system.noop.hourly", "Pulsação do agendador", "Trabalho horário sem efeito, que prova que o agendador está vivo.", "—"),
-)
-
-
-def scheduled_automations(session: Session) -> list[ScheduledAutomation]:
-    """Every known automation, matched to whatever `schedule_state` proves.
-
-    Keys are matched by prefix because the two provider-bound schedules carry
-    the connection id in the key (`production.incremental:3`), and the web
-    process has no way to know which connection the scheduler was pointed at.
-    """
-    states = list(session.scalars(select(ScheduleState).order_by(ScheduleState.schedule_key)))
-    out: list[ScheduledAutomation] = []
-    for key, label, purpose, setting_name in DEFINITIONS:
-        state = next((row for row in states if row.schedule_key == key or row.schedule_key.startswith(f"{key}:")), None)
-        out.append(
-            ScheduledAutomation(
-                key=key,
-                label=label,
-                purpose=purpose,
-                setting_name=setting_name,
-                schedule_key=state.schedule_key if state else None,
-                next_run_at=state.next_run_at if state else None,
-                last_enqueued_at=state.last_enqueued_at if state else None,
-            )
-        )
-    return out
+from nemsei.system.automation_health import automations, listener_processes, scheduler_pulse
 
 
 # What each scope means on screen. V1 wrote these as `only_o&m` and
@@ -150,8 +84,11 @@ def automations_overview(session: Session) -> dict[str, Any]:
     event_counts = dict(
         session.execute(select(NotificationEvent.status, func.count(NotificationEvent.id)).group_by(NotificationEvent.status)).all()
     )
+    rows = automations(session)
     return {
-        "scheduled": scheduled_automations(session),
+        "scheduled": rows,
+        "pulse": scheduler_pulse(rows),
+        "listeners": listener_processes(session),
         "channels": channels,
         "policies": policies,
         "channels_by_id": {channel.id: channel for channel in channels},
