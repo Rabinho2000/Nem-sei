@@ -1,56 +1,161 @@
 {% extends "base.html" %}
 {% block content %}
+{#
+  The question this page answers is "what can I produce for this month, what is
+  missing, and what do I do next?" -- not "what did somebody already generate?".
+  The counts lead, the ESCOs come first, and every absence says which of the
+  three absences it is, because "no data", "no rates" and "month not closed"
+  need three different actions.
+#}
 <section class="page-header">
-  <div><h1>Relatórios</h1><p class="lede">Individuais e de portfolio, gerados e consultados a partir daqui.</p></div>
+  <div>
+    <p class="eyebrow">Relatórios</p>
+    <h1>Fecho de {{ month }}</h1>
+    <p class="lede">O que pode ser produzido, o que falta, e por onde começar.</p>
+  </div>
+  <form class="period-form" method="get" action="{{ url_for('reporting.index') }}">
+    <label class="sr-only" for="month">Mês</label>
+    <input id="month" type="month" name="month" value="{{ month }}">
+    <button type="submit">Ver mês</button>
+  </form>
+</section>
+
+<div class="kpi-strip">
+  <div class="kpi"><small>Instalações</small><strong>{{ summary.total }}</strong></div>
+  <div class="kpi"><small>ESCO</small><strong>{{ summary.esco }}</strong></div>
+  <div class="kpi"><small>Com energia no mês</small><strong>{{ summary.reportable }}</strong></div>
+  <div class="kpi"><small>Provisórios</small><strong>{{ summary.provisional }}</strong></div>
+  <div class="kpi"><small>Finais</small><strong>{{ summary.final }}</strong></div>
+  <div class="kpi"><small>Já gerados</small><strong>{{ summary.generated }}</strong></div>
+</div>
+
+<section class="panel notice-panel">
+  <header class="panel-header"><h2>O que está a bloquear</h2></header>
+  <dl class="stat-list">
+    <div>
+      <dt>Sem energia registada</dt>
+      <dd>
+        <strong>{{ summary.without_energy }}</strong>
+        <a href="{{ url_for('reporting.assets_index', month=month, state='blocked') }}">ver →</a>
+      </dd>
+    </div>
+    <div>
+      <dt>ESCO sem configuração comercial</dt>
+      <dd>
+        <strong>{{ summary.esco_needs_commercial }}</strong>
+        <a href="{{ url_for('reporting.assets_index', month=month, state='needs_commercial') }}">ver →</a>
+      </dd>
+    </div>
+    <div>
+      <dt>Com valores em euros possíveis</dt>
+      <dd><strong>{{ summary.money_possible }}</strong></dd>
+    </div>
+    <div>
+      <dt>Por gerar</dt>
+      <dd>
+        <strong>{{ summary.not_generated }}</strong>
+        <a href="{{ url_for('reporting.assets_index', month=month, generated='no') }}">ver →</a>
+      </dd>
+    </div>
+  </dl>
+  <p class="panel-foot muted">
+    Uma instalação sem autoconsumo persistido produz relatório de energia e nenhum valor
+    financeiro. Um mês por fechar produz relatório provisório e nenhum valor financeiro.
+    Em nenhum dos casos é escrito 0,00 €.
+  </p>
 </section>
 
 <div class="two-column">
   <section class="panel">
-    <header class="panel-header"><h2>Relatórios individuais recentes</h2></header>
+    <header class="panel-header">
+      <div><p class="eyebrow">Prioridade</p><h2>ESCO primeiro</h2></div>
+      <a class="button-link" href="{{ url_for('reporting.assets_index', month=month, contract='esco') }}">Ver as {{ summary.esco }} →</a>
+    </header>
     <table class="data-table">
-      <thead><tr><th>Instalação</th><th>Criado</th><th></th></tr></thead>
+      <thead><tr><th>Instalação</th><th>Estado</th><th class="num">Dias</th><th></th></tr></thead>
       <tbody>
-        {% for row in recent_snapshots %}
+        {% for row in esco_queue %}
           <tr>
-            <td><a href="{{ url_for('reporting.asset_history', asset_id=row.asset_id) }}">{{ row.asset_name }}</a></td>
-            <td class="muted">{{ row.snapshot.created_at.strftime('%Y-%m-%d %H:%M') }} · {{ row.snapshot.created_by }}</td>
-            <td class="num">
-              <a href="{{ url_for('reporting.asset_snapshot_pdf', asset_id=row.asset_id, snapshot_id=row.snapshot.id) }}">PDF</a>
-              · <a href="{{ url_for('reporting.asset_snapshot_xlsx', asset_id=row.asset_id, snapshot_id=row.snapshot.id) }}">Excel</a>
+            <td>
+              <a href="{{ url_for('reporting.asset_history', asset_id=row.asset_id, month=month) }}">{{ row.name }}</a>
+              {% if row.blockers %}<small class="muted">{{ row.blockers[0] }}</small>{% endif %}
             </td>
+            <td>
+              <span class="pill pill-{{ {'final':'ok','provisional':'warn','needs_commercial':'warn','blocked':'bad'}[row.state] }}">
+                {{ state_labels[row.state] }}
+              </span>
+            </td>
+            <td class="num">{{ row.observed_days }}/{{ row.expected_days }}</td>
+            <td class="num"><a href="{{ url_for('reporting.asset_history', asset_id=row.asset_id, month=month) }}">Abrir</a></td>
           </tr>
         {% else %}
-          <tr><td colspan="3" class="empty">Nenhum relatório individual gerado ainda.</td></tr>
+          <tr><td colspan="4" class="empty">Nenhuma instalação ESCO registada.</td></tr>
         {% endfor %}
       </tbody>
     </table>
-    <p class="panel-foot"><a href="{{ url_for('reporting.assets_index') }}">Procurar uma instalação →</a></p>
   </section>
 
   <section class="panel">
     <header class="panel-header">
-      <h2>Relatórios de portfolio</h2>
-      {% if has_pending_review %}<span class="pill pill-warn">Há períodos por rever</span>{% endif %}
+      <div><p class="eyebrow">Portfolios</p><h2>{{ month }}</h2></div>
+      {% if pending_review %}<span class="pill pill-warn">{{ pending_review|length }} por rever</span>{% endif %}
     </header>
     <table class="data-table">
-      <thead><tr><th>Portfolio</th><th>Período</th><th>Estado</th></tr></thead>
+      <thead><tr><th>Portfolio</th><th>Membros</th><th>Prontos</th><th>Estado</th></tr></thead>
       <tbody>
-        {% for row in recent_runs %}
+        {% for row in portfolios %}
           <tr>
-            <td><a href="{{ url_for('portfolios.detail', portfolio_id=row.run.portfolio_id, section='reports', month=row.run.period_start.strftime('%Y-%m')) }}">{{ row.portfolio_name }}</a></td>
-            <td class="muted">{{ row.run.period_start.strftime('%Y-%m') }}</td>
             <td>
-              <span class="pill pill-{{ 'ok' if row.run.status == 'approved' else 'warn' }}">
-                {{ {'generated':'gerado','reviewed':'revisto','approved':'aprovado'}.get(row.run.status, row.run.status) }}
-              </span>
+              <a href="{{ url_for('portfolios.detail', portfolio_id=row.portfolio.id, section='reports', month=month) }}">{{ row.portfolio.name }}</a>
+              {% if row.unresolved %}<small class="muted">{{ row.unresolved }} por resolver</small>{% endif %}
+            </td>
+            <td class="num">{{ row.members }}</td>
+            <td class="num">{{ row.ready }}</td>
+            <td>
+              {% if row.run %}
+                <span class="pill pill-{{ 'ok' if row.run.status == 'approved' else 'warn' }}">
+                  {{ {'generated':'gerado','reviewed':'revisto','approved':'aprovado'}.get(row.run.status, row.run.status) }}
+                </span>
+              {% else %}
+                <span class="pill pill-muted">por gerar</span>
+              {% endif %}
             </td>
           </tr>
         {% else %}
-          <tr><td colspan="3" class="empty">Nenhum período de portfolio gerado ainda.</td></tr>
+          <tr><td colspan="4" class="empty">Nenhum portfolio configurado.</td></tr>
         {% endfor %}
       </tbody>
     </table>
-    <p class="panel-foot"><a href="{{ url_for('reporting.portfolios_index') }}">Ver todos os períodos →</a></p>
+    <p class="panel-foot muted">
+      Um total de portfolio a que falte um membro é parcial, nunca um total mais pequeno.
+      A aprovação é sempre um ato do operador e nunca é automática.
+    </p>
   </section>
 </div>
+
+<section class="panel">
+  <header class="panel-header">
+    <h2>Relatórios recentes</h2>
+    <a class="button-link" href="{{ url_for('reporting.assets_index', month=month) }}">Procurar instalação →</a>
+  </header>
+  <table class="data-table">
+    <thead><tr><th>Instalação</th><th>Período</th><th>Estado</th><th>Criado</th><th></th></tr></thead>
+    <tbody>
+      {% for row in recent_snapshots %}
+        <tr>
+          <td><a href="{{ url_for('reporting.asset_history', asset_id=row.asset_id, month=row.period_start.strftime('%Y-%m')) }}">{{ row.asset_name }}</a></td>
+          <td class="muted">{{ row.period_start.strftime('%Y-%m') }}</td>
+          <td><span class="pill pill-{{ 'ok' if row.state == 'final' else 'warn' }}">{{ 'Final' if row.state == 'final' else 'Provisório' }}</span></td>
+          <td class="muted">{{ row.snapshot.created_at.strftime('%Y-%m-%d %H:%M') }} · {{ row.snapshot.created_by }}</td>
+          <td class="num">
+            <a href="{{ url_for('reporting.asset_snapshot_pdf', asset_id=row.asset_id, snapshot_id=row.snapshot.id) }}">PDF</a>
+            · <a href="{{ url_for('reporting.asset_snapshot_xlsx', asset_id=row.asset_id, snapshot_id=row.snapshot.id) }}">Excel</a>
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="5" class="empty">Nenhum relatório gerado ainda.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
 {% endblock %}

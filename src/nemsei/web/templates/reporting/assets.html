@@ -1,26 +1,89 @@
 {% extends "base.html" %}
 {% block content %}
 <section class="page-header">
-  <div><h1>Relatórios por instalação</h1><p class="lede">Procura uma instalação para ver o seu histórico ou gerar um relatório novo.</p></div>
+  <div>
+    <p class="eyebrow"><a class="back-link" href="{{ url_for('reporting.index', month=month) }}">← Fecho de {{ month }}</a></p>
+    <h1>Instalações</h1>
+    <p class="lede">{{ matched }} de {{ summary.total }} · ESCO primeiro, e dentro disso o pior estado primeiro.</p>
+  </div>
 </section>
 
 <section class="panel">
-  <form class="filter-bar" method="get" action="{{ url_for('reporting.assets_index') }}">
-    <input type="search" name="search" value="{{ search }}" placeholder="Nome, alias ou cliente…" autofocus>
-    <button type="submit">Procurar</button>
+  <form class="filter-form" method="get" action="{{ url_for('reporting.assets_index') }}">
+    <label>Mês<input type="month" name="month" value="{{ month }}"></label>
+    <label>Contrato
+      <select name="contract">
+        <option value="" {{ 'selected' if not filters.contract }}>Todos</option>
+        <option value="esco" {{ 'selected' if filters.contract == 'esco' }}>ESCO ({{ summary.esco }})</option>
+        <option value="epc" {{ 'selected' if filters.contract == 'epc' }}>EPC ({{ summary.epc }})</option>
+      </select>
+    </label>
+    <label>Estado
+      <select name="state">
+        <option value="" {{ 'selected' if not filters.state }}>Todos</option>
+        <option value="blocked" {{ 'selected' if filters.state == 'blocked' }}>Sem dados ({{ summary.blocked }})</option>
+        <option value="needs_commercial" {{ 'selected' if filters.state == 'needs_commercial' }}>Falta configuração ({{ summary.needs_commercial }})</option>
+        <option value="provisional" {{ 'selected' if filters.state == 'provisional' }}>Provisório ({{ summary.provisional }})</option>
+        <option value="final" {{ 'selected' if filters.state == 'final' }}>Final ({{ summary.final }})</option>
+      </select>
+    </label>
+    <label>Relatório
+      <select name="generated">
+        <option value="" {{ 'selected' if not filters.generated }}>Todos</option>
+        <option value="yes" {{ 'selected' if filters.generated == 'yes' }}>Já gerado ({{ summary.generated }})</option>
+        <option value="no" {{ 'selected' if filters.generated == 'no' }}>Por gerar ({{ summary.not_generated }})</option>
+      </select>
+    </label>
+    <label>Procurar<input type="search" name="search" value="{{ filters.search }}" placeholder="Nome, cliente ou código"></label>
+    <button type="submit">Filtrar</button>
+    {% if filters.contract or filters.state or filters.generated or filters.search %}
+      <a class="clear-link" href="{{ url_for('reporting.assets_index', month=month) }}">Limpar</a>
+    {% endif %}
   </form>
-  <table class="data-table">
-    <thead><tr><th>Instalação</th><th></th></tr></thead>
-    <tbody>
-      {% for asset in assets %}
+
+  <div class="table-scroll">
+    <table class="data-table wide-table">
+      <thead>
         <tr>
-          <td>{{ asset.canonical_name }}</td>
-          <td class="num"><a href="{{ url_for('reporting.asset_history', asset_id=asset.id) }}">Ver relatórios</a></td>
+          <th>Instalação</th><th>Contrato</th><th>Origem</th>
+          <th class="num">Dias</th><th>Estado</th><th>Em falta</th><th></th>
         </tr>
-      {% else %}
-        <tr><td colspan="2" class="empty">Sem instalações a mostrar.</td></tr>
-      {% endfor %}
-    </tbody>
-  </table>
+      </thead>
+      <tbody>
+        {% for row in assets %}
+          <tr class="{{ 'row-attention' if row.state in ('blocked', 'needs_commercial') else '' }}">
+            <td class="table-primary">
+              <a href="{{ url_for('reporting.asset_history', asset_id=row.asset_id, month=month) }}">{{ row.name }}</a>
+              {% if row.owner_name %}<small class="muted">{{ row.owner_name }}</small>{% endif %}
+            </td>
+            <td>
+              <span class="pill pill-{{ 'ok' if row.is_esco else 'muted' }}">{{ 'ESCO' if row.is_esco else 'EPC' }}</span>
+            </td>
+            <td class="muted">{{ row.provider_code or '—' }}</td>
+            <td class="num">{{ row.observed_days }}/{{ row.expected_days }}</td>
+            <td>
+              <span class="pill pill-{{ {'final':'ok','provisional':'warn','needs_commercial':'warn','blocked':'bad'}[row.state] }}">
+                {{ state_labels[row.state] }}
+              </span>
+              {% if row.has_report %}<small class="muted">gerado</small>{% endif %}
+            </td>
+            <td>
+              {% if row.blockers %}
+                <ul class="blocker-stack">{% for blocker in row.blockers %}<li>{{ blocker }}</li>{% endfor %}</ul>
+              {% else %}
+                <span class="muted">—</span>
+              {% endif %}
+            </td>
+            <td class="num"><a href="{{ url_for('reporting.asset_history', asset_id=row.asset_id, month=month) }}">Abrir</a></td>
+          </tr>
+        {% else %}
+          <tr><td colspan="7" class="empty">Nenhuma instalação corresponde a estes filtros.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if truncated %}
+    <p class="panel-foot muted">Mais {{ truncated }} instalações correspondem. Refine os filtros para as ver.</p>
+  {% endif %}
 </section>
 {% endblock %}

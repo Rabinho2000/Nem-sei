@@ -67,7 +67,59 @@ def test_the_index_renders_with_nothing_generated_yet(app) -> None:
     login(client)
     response = client.get("/reports")
     assert response.status_code == 200
-    assert "Nenhum relatório individual gerado" in response.get_data(as_text=True)
+    body = response.get_data(as_text=True)
+    assert "Nenhum relatório gerado ainda." in body
+    # The landing page leads with what can be produced, not with a file list.
+    assert "Fecho de" in body
+
+
+def test_the_index_counts_the_fleet_and_names_the_three_absences(app, asset_id) -> None:
+    """One installation, no facts, no billing: blocked, and said so out loud."""
+    client = app.test_client()
+    login(client)
+    body = client.get("/reports?month=2026-08").get_data(as_text=True)
+
+    assert "Fecho de 2026-08" in body
+    assert "Sem energia registada" in body
+    assert "ESCO sem configuração comercial" in body
+    assert "Por gerar" in body
+
+
+def test_the_installation_list_filters_by_state(app, asset_id) -> None:
+    client = app.test_client()
+    login(client)
+
+    blocked = client.get("/reports/assets?month=2026-08&state=blocked").get_data(as_text=True)
+    assert "Quinta do Relatório" in blocked
+
+    final = client.get("/reports/assets?month=2026-08&state=final").get_data(as_text=True)
+    assert "Quinta do Relatório" not in final
+    assert "Nenhuma instalação corresponde a estes filtros." in final
+
+
+def test_the_installation_list_filters_by_contract(app, asset_id) -> None:
+    client = app.test_client()
+    login(client)
+    esco = client.get("/reports/assets?month=2026-08&contract=esco").get_data(as_text=True)
+    epc = client.get("/reports/assets?month=2026-08&contract=epc").get_data(as_text=True)
+    # The fixture asset states no contract type, so it counts as neither ESCO
+    # nor -- for the purposes of this screen -- a decided EPC. It must appear
+    # in exactly one of the two lists rather than both.
+    assert ("Quinta do Relatório" in esco) != ("Quinta do Relatório" in epc)
+
+
+def test_the_asset_page_says_what_is_missing_and_offers_the_three_rates(app, asset_id) -> None:
+    client = app.test_client()
+    login(client)
+    body = client.get(f"/reports/assets/{asset_id}?month=2026-08").get_data(as_text=True)
+
+    assert "Sem energia registada para o mês" in body
+    assert "Sem configuração comercial" in body
+    for label in ("Taxa de venda", "Taxa de poupança", "Venda de excedente"):
+        assert label in body
+    # Availability and the tariff-period splits are declared absent, never zero.
+    assert "N/D — sem amostragem fiável" in body
+    assert "N/D — nenhuma origem o indica" in body
 
 
 def test_searching_assets_finds_it_by_name(app, asset_id) -> None:

@@ -1,44 +1,152 @@
 {% extends "base.html" %}
+{% from "reporting/_billing_form.html" import billing_form %}
 {% block content %}
+{#
+  Four things in the order an operator needs them: where this month stands,
+  what the contract charges, the act of generating, and what has been produced
+  before. The generate button says which of the two reports it will produce,
+  because a provisional one carries no euros and that must not be a surprise.
+#}
 <section class="page-header">
   <div>
-    <p class="eyebrow">Relatórios</p>
+    <p class="eyebrow"><a class="back-link" href="{{ url_for('reporting.assets_index', month=month) }}">← Instalações</a></p>
     <h1>{{ asset.canonical_name }}</h1>
+    <p class="lede">
+      {{ asset.contract_type or 'Contrato por indicar' }}
+      {% if readiness and readiness.provider_code %}· {{ readiness.provider_code }}{% endif %}
+      {% if readiness and readiness.external_id %}· {{ readiness.external_id }}{% endif %}
+    </p>
   </div>
-  <a class="button-link" href="{{ url_for('reporting.assets_index') }}">← Procurar outra instalação</a>
+  <form class="period-form" method="get" action="{{ url_for('reporting.asset_history', asset_id=asset.id) }}">
+    <input type="month" name="month" value="{{ month }}">
+    <button type="submit">Ver mês</button>
+  </form>
 </section>
 
+{# --- A. where the month stands ------------------------------------------ #}
+<section class="panel readiness-panel">
+  <header class="panel-header">
+    <div><p class="eyebrow">Estado</p><h2>{{ month }}</h2></div>
+    {% if readiness %}
+      <span class="pill pill-{{ {'final':'ok','provisional':'warn','needs_commercial':'warn','blocked':'bad'}[readiness.state] }}">
+        {{ state_labels[readiness.state] }}
+      </span>
+    {% endif %}
+  </header>
+  {% if readiness %}
+    <div class="kpi-strip">
+      <div class="kpi"><small>Dias com medição</small><strong>{{ readiness.observed_days }}/{{ readiness.expected_days }}</strong></div>
+      <div class="kpi"><small>Cobertura</small><strong>{{ '%.0f'|format(readiness.coverage_pct) }}%</strong></div>
+      <div class="kpi"><small>Configuração comercial</small><strong>{{ 'Sim' if readiness.has_commercial else 'Não' }}</strong></div>
+      <div class="kpi"><small>Valores em euros</small><strong>{{ 'Possíveis' if readiness.can_report_money else 'N/D' }}</strong></div>
+    </div>
+    <dl class="detail-list">
+      <div><dt>Métricas com dados</dt>
+        <dd>{{ readiness.metrics_present|join(', ') if readiness.metrics_present else 'nenhuma' }}</dd></div>
+      <div><dt>Métricas sem fonte</dt>
+        <dd class="muted">
+          {% set absent = ['production','self_use','export','consumption','grid_import']|reject('in', readiness.metrics_present)|list %}
+          {{ absent|join(', ') if absent else '—' }}
+        </dd></div>
+      <div><dt>Disponibilidade</dt><dd class="muted">N/D — sem amostragem fiável</dd></div>
+      <div><dt>Autoconsumo por período tarifário</dt><dd class="muted">N/D — nenhuma origem o indica</dd></div>
+    </dl>
+    {% if readiness.blockers %}
+      <ul class="blocker-stack">{% for blocker in readiness.blockers %}<li>{{ blocker }}</li>{% endfor %}</ul>
+    {% endif %}
+  {% else %}
+    <p class="empty-state">Sem leitura de prontidão para este mês.</p>
+  {% endif %}
+</section>
+
+{# --- B. the commercial terms -------------------------------------------- #}
 <section class="panel">
-  <header class="panel-header"><h2>Gerar relatório</h2></header>
+  <header class="panel-header">
+    <div><p class="eyebrow">Comercial</p><h2>Contrato</h2></div>
+    {% if billing %}
+      <span class="status-badge muted">{{ billing.report_type|upper }} · desde {{ billing.valid_from }}</span>
+    {% endif %}
+  </header>
+  {% if billing %}
+    <dl class="detail-list">
+      <div><dt>Taxa de venda</dt><dd>{{ billing.solcor_price_per_kwh }} €/kWh</dd></div>
+      <div><dt>Taxa de poupança</dt><dd>{{ billing.default_electricity_price }} €/kWh</dd></div>
+      <div><dt>Venda de excedente</dt><dd>{{ billing.default_export_price if billing.export_revenue_enabled else 'não contabilizada' }}{{ ' €/kWh' if billing.export_revenue_enabled }}</dd></div>
+      {% if billing.billing_mode != 'energy' %}
+        <div><dt>Avença mensal</dt><dd>{{ billing.fixed_monthly_fee_eur }} €</dd></div>
+      {% endif %}
+      {% if tariff %}<div><dt>Tarifa detalhada</dt><dd class="muted">{{ tariff.tariff_type }} · opcional</dd></div>{% endif %}
+    </dl>
+  {% else %}
+    <p class="empty-state">
+      Sem configuração comercial. Um relatório de energia continua possível; nenhum valor
+      em euros pode ser apurado, e nenhum será inventado como 0,00 €.
+    </p>
+  {% endif %}
+  <details class="advanced-block" {{ 'open' if not billing }}>
+    <summary>{{ 'Alterar configuração comercial' if billing else 'Definir configuração comercial' }}</summary>
+    {{ billing_form(asset, billing, csrf_token, report_types, billing_modes, billing_energy_bases) }}
+  </details>
+</section>
+
+{# --- C. the act of generating ------------------------------------------- #}
+<section class="panel">
+  <header class="panel-header"><div><p class="eyebrow">Ação</p><h2>Gerar relatório</h2></div></header>
   <form class="inline-form" method="post" action="{{ url_for('reporting.generate_asset_report', asset_id=asset.id) }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <input type="month" name="month" value="{{ default_month }}" required>
-    <button type="submit">Gerar</button>
+    <input type="month" name="month" value="{{ month }}" required>
+    <button type="submit">
+      {% if readiness and readiness.state == 'blocked' %}Gerar (sem dados)
+      {% elif readiness and readiness.state == 'final' %}Gerar relatório final
+      {% else %}Gerar relatório provisório{% endif %}
+    </button>
   </form>
   <p class="panel-foot muted">
-    Constrói o relatório a partir dos dados persistidos e congela-o. Gerar o mesmo período outra vez
-    devolve o relatório já existente em vez de duplicar.
+    {% if readiness and readiness.state == 'final' %}
+      O mês fechou e todos os dias têm medição: este relatório é final e indica valores em euros.
+    {% else %}
+      Enquanto o mês não fechar, ou faltarem dias, o relatório sai <strong>PROVISÓRIO</strong> e
+      não indica qualquer valor em euros. Quando os dados de origem ficarem completos, o sistema
+      produz sozinho uma versão final nova — o relatório provisório fica como está.
+    {% endif %}
+    Gerar duas vezes sobre os mesmos dados devolve o relatório existente em vez de duplicar.
   </p>
 </section>
 
+{# --- D. what has been produced ------------------------------------------ #}
 <section class="panel">
   <header class="panel-header"><h2>Histórico</h2></header>
-  <table class="data-table">
-    <thead><tr><th>Período</th><th>Criado</th><th></th></tr></thead>
-    <tbody>
-      {% for row in snapshots %}
-        <tr>
-          <td>{{ row.period_start.strftime('%Y-%m') }}</td>
-          <td class="muted">{{ row.snapshot.created_at.strftime('%Y-%m-%d %H:%M') }} · {{ row.snapshot.created_by }}</td>
-          <td class="num">
-            <a href="{{ url_for('reporting.asset_snapshot_pdf', asset_id=asset.id, snapshot_id=row.snapshot.id) }}">PDF</a>
-            · <a href="{{ url_for('reporting.asset_snapshot_xlsx', asset_id=asset.id, snapshot_id=row.snapshot.id) }}">Excel</a>
-          </td>
-        </tr>
-      {% else %}
-        <tr><td colspan="3" class="empty">Nenhum relatório gerado ainda para esta instalação.</td></tr>
-      {% endfor %}
-    </tbody>
-  </table>
+  <div class="table-scroll">
+    <table class="data-table">
+      <thead>
+        <tr><th>Período</th><th>Estado</th><th class="num">Produção</th><th class="num">Poupança</th><th>Criado</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for row in snapshots %}
+          <tr>
+            <td>{{ row.period_start.strftime('%Y-%m') }}</td>
+            <td>
+              <span class="pill pill-{{ 'ok' if row.state == 'final' else 'warn' }}">{{ 'Final' if row.state == 'final' else 'Provisório' }}</span>
+              {% if row.payload.observed_source_days is not none %}
+                <small class="muted">{{ row.payload.observed_source_days }}/{{ row.payload.expected_source_days }} dias</small>
+              {% endif %}
+            </td>
+            <td class="num">{{ '%.2f'|format(row.payload.production_kwh) ~ ' kWh' if row.payload.production_kwh is not none else 'N/D' }}</td>
+            <td class="num">{{ '%.2f'|format(row.payload.savings_eur) ~ ' €' if row.payload.savings_eur is not none else 'N/D' }}</td>
+            <td class="muted">{{ row.snapshot.created_at.strftime('%Y-%m-%d %H:%M') }} · {{ row.snapshot.created_by }}</td>
+            <td class="num">
+              <a href="{{ url_for('reporting.asset_snapshot_pdf', asset_id=asset.id, snapshot_id=row.snapshot.id) }}">PDF</a>
+              · <a href="{{ url_for('reporting.asset_snapshot_xlsx', asset_id=asset.id, snapshot_id=row.snapshot.id) }}">Excel</a>
+            </td>
+          </tr>
+        {% else %}
+          <tr><td colspan="6" class="empty">Nenhum relatório gerado ainda para esta instalação.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="panel-foot muted">
+    N/D significa que não há origem para o valor. Nunca significa zero.
+  </p>
 </section>
 {% endblock %}

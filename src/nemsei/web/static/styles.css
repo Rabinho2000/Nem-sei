@@ -495,3 +495,17 @@ a.status-badge:hover, a.status-badge:focus-visible { text-decoration: underline;
 .tri.crit b { color: var(--danger); }
 .tri.warn b { color: var(--warning); }
 .tri em { display: block; font-style: normal; font-size: 0.73rem; color: var(--muted); }
+
+/* Optional capability, one disclosure below the thing an operator normally
+   needs. The simple ESCO flow is three rates; the avença, the energy base and
+   the detailed tariff are real and stay reachable without crowding it. */
+.advanced-block { border-top: 1px solid var(--line); margin-top: 14px; padding-top: 10px; }
+.advanced-block > summary { cursor: pointer; font-size: 0.8rem; font-weight: 700; color: var(--muted); }
+.advanced-block[open] > summary { margin-bottom: 10px; color: var(--text); }
+.advanced-block .muted { font-size: 0.78rem; }
+
+/* One line per reason a month cannot be reported. A list rather than a
+   sentence because "no data", "no rates" and "days missing" are different
+   actions and an operator scans for the one that is theirs. */
+.blocker-stack { list-style: none; margin: 0; padding: 0; display: grid; gap: 3px; }
+.blocker-stack li { font-size: 0.76rem; color: var(--muted); }

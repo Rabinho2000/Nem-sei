@@ -1,10 +1,11 @@
-"""The top-level Reporting area: individual reports and portfolio runs, in one
-place, generated and downloaded from the browser instead of a Python shell.
+"""The Reporting area: a workspace for closing a month, not a list of files.
 
-Every render here goes through the same functions the golden tests pin against
-V1: `assemble_asset_report`, `snapshot_dataset`, `build_customer_report_pdf`,
-`build_asset_report_workbook`. This module supplies dates, files and HTTP
-plumbing; it computes nothing.
+Every render goes through the same functions the golden tests pin against V1 --
+`assemble_asset_report`, `snapshot_dataset`, `build_customer_report_pdf`,
+`build_asset_report_workbook`. This module supplies dates, filters, files and
+HTTP plumbing; it computes nothing, and it can reach no provider. A renderer
+that called an API would make a frozen report unreproducible, which is the one
+thing snapshots exist to prevent.
 """
 from __future__ import annotations
 
@@ -17,11 +18,17 @@ from nemsei.reporting.customer_pdf import build_customer_report_pdf
 from nemsei.reporting.datasets import rehydrate_snapshot_payload, snapshot_dataset
 from nemsei.reporting.excel import build_asset_report_workbook
 from nemsei.reporting.models import ReportingDataset, ReportSnapshot
-from nemsei.reporting.periods import ReportingPeriodError, monthly_period
+from nemsei.reporting.periods import ReportingPeriodError, monthly_period, normalize_report_month
 from nemsei.web.csrf import require_valid_token, token
 from nemsei.web.db_session import get_request_session
 from nemsei.web.home_routes import require_authenticated
-from nemsei.web.reporting_queries import asset_report_history, portfolio_runs_overview, reports_overview, searchable_assets
+from nemsei.web.reporting_queries import (
+    asset_report_history,
+    default_month,
+    portfolio_runs_overview,
+    readiness_index,
+    workspace_overview,
+)
 
 
 reporting_bp = Blueprint("reporting", __name__, url_prefix="/reports")
@@ -31,6 +38,11 @@ def _actor() -> str:
     return (browser_session.get("username") or "").strip() or "operador"
 
 
+def _month() -> str:
+    """The month being worked on, from the query string or the calendar."""
+    return normalize_report_month(request.args.get("month"), today=None) if request.args.get("month") else default_month()
+
+
 @reporting_bp.get("")
 @require_authenticated
 def index() -> str:
@@ -38,7 +50,7 @@ def index() -> str:
     return render_template(
         "reporting/index.html",
         title="Relatórios",
-        **reports_overview(session),
+        **workspace_overview(session, month=_month()),
     )
 
 
@@ -46,12 +58,17 @@ def index() -> str:
 @require_authenticated
 def assets_index() -> str:
     session = get_request_session()
-    search = request.args.get("search", "").strip()
     return render_template(
         "reporting/assets.html",
         title="Relatórios por instalação",
-        search=search,
-        assets=searchable_assets(session, search=search),
+        **readiness_index(
+            session,
+            month=_month(),
+            contract=request.args.get("contract", "").strip(),
+            state=request.args.get("state", "").strip(),
+            generated=request.args.get("generated", "").strip(),
+            search=request.args.get("search", "").strip(),
+        ),
     )
 
 
@@ -59,7 +76,7 @@ def assets_index() -> str:
 @require_authenticated
 def asset_history(asset_id: int) -> str:
     session = get_request_session()
-    context = asset_report_history(session, asset_id=asset_id)
+    context = asset_report_history(session, asset_id=asset_id, month=_month())
     if context is None:
         abort(404)
     return render_template(
@@ -76,18 +93,28 @@ def generate_asset_report(asset_id: int):
     require_valid_token()
     session = get_request_session()
     report_month = request.form.get("month", "").strip()
+    period = None
     try:
         period = monthly_period(report_month)
         with session.begin():
             assembled = assemble_asset_report(session, asset_id=asset_id, period=period, built_by=_actor())
             snapshot_dataset(session, dataset=assembled.dataset, payload=assembled.payload, created_by=_actor())
+            state = assembled.payload.get("reporting_state")
     except ReportingPeriodError:
         flash("Mês inválido.", "error")
     except ValueError as error:
         flash(str(error), "error")
     else:
-        flash(f"Relatório de {period.label} gerado.", "success")
-    return redirect(url_for("reporting.asset_history", asset_id=asset_id))
+        # Never "gerado" alone. A report that is provisional has to say so at
+        # the moment it is produced, or the operator learns it only by opening
+        # the document -- and a provisional report states no euros at all.
+        if state == "final":
+            flash(f"Relatório final de {period.label} gerado.", "success")
+        elif state == "blocked":
+            flash(f"Sem dados de energia para {period.label}: não há relatório a produzir.", "error")
+        else:
+            flash(f"Relatório PROVISÓRIO de {period.label} gerado. Sem valores em euros até o mês fechar.", "warning")
+    return redirect(url_for("reporting.asset_history", asset_id=asset_id, month=report_month or None))
 
 
 def _load_snapshot(session, asset_id: int, snapshot_id: int) -> ReportSnapshot:
@@ -135,5 +162,6 @@ def portfolios_index() -> str:
     return render_template(
         "reporting/portfolios.html",
         title="Relatórios de portfolio",
+        month=_month(),
         runs=portfolio_runs_overview(session),
     )
