@@ -105,41 +105,147 @@ No `portfolio_report_runs` rows existed at the start of the session.
 | 1 | Day-coverage-aware finality; provisional/final/blocked in the payload | done — `11fc0fc` |
 | 2 | pypdf in the dev lock so the PDF golden stops skipping itself | done — `11fc0fc` |
 | 3 | Backdate the 131 mapping/policy validity rows | done — see §1 |
-| 4 | Durable August backfill through the existing job system | in progress |
-| 5 | Simple ESCO three-rate configuration, Portuguese labels | |
-| 6 | `reporting.month_close` — re-evaluate and finalise without a shell | |
-| 7 | `/reports` as an operator workspace: readiness, blockers, ESCO first | |
-| 8 | Expertcom July regression + August provisional, PDF and XLSX | |
-| 9 | Solcorelios I and II August runs, review-ready, not approved | |
+| 4 | Simple ESCO three-rate configuration, Portuguese labels, ESCO validation | done — `d37ae04` |
+| 5 | `reporting.month_close` — re-evaluate and finalise without a shell | done — `d37ae04` |
+| 6 | `/reports` as an operator workspace: readiness, blockers, ESCO first | done — `aa1ded4` |
+| 7 | August backfill through the existing durable job system | running — see §6 |
+| 8 | Expertcom July regression + August provisional, PDF and XLSX | done — see §5 |
+| 9 | Solcorelios I and II August runs, review-ready, not approved | done — see §5 |
 
 ---
 
-## 4. Test gates
+## 4. Golden acceptance, run against the live database
 
-`PYTHONPATH=src`, `NEMSEI_V2_TEST_DATABASE_URL` pointing at the isolated
-`nemsei_v2_test` database (container `nemsei-v2-test-pg`, host port 55432).
+### A — Expertcom (asset 319), July 2026 as the regression oracle
 
-- baseline before any change: **1115 passed, 1 skipped** — the skip was the whole
-  of `test_pdf_golden.py`, now removed as a skip by item 2.
-- `ruff check --no-cache src tests_v2`
-- `bash scripts/run_docker_recovery_acceptance.sh`
-- `bash scripts/run_postgres_operations_acceptance.sh`
+Snapshot 66, dataset 213, digest `f5cc55b2fc4b`. `reporting_state = final`,
+31/31 source days, no reasons outstanding.
+
+| Metric           | V2 assembled | Oracle        |     |
+|------------------|-------------:|--------------:|-----|
+| production       |    22 965.45 |     22 965.45 | OK  |
+| self-consumption |    17 500.13 |     17 500.13 | OK  |
+| export           |     5 461.22 |      5 461.22 | OK  |
+| consumption      |    31 465.16 |     31 465.16 | OK  |
+| grid import      |    13 965.03 |     13 965.03 | OK  |
+| daily rows       |           31 |            31 | OK  |
+
+The month is closed and complete, so the euros are stated: poupança 3 120,07 €,
+receita de excedente 245,75 €, faturação ESCO 1 505,01 €, benefício líquido
+1 860,82 €. `availability_pct` and the four tariff-period splits stay N/D and
+are named in `unavailable_fields`. PDF 9 405 B, XLSX 8 259 B, both rendered from
+the frozen snapshot.
+
+### A — Expertcom, August 2026
+
+Snapshot 67, dataset 214, digest `aee8a9e9d6e5`. `reporting_state = provisional`,
+25/31 source days, reasons `period_still_open` and `missing_source_days:6`
+(2026-08-19 … 08-23, plus 08-31 which had not happened yet).
+
+Energy is reported: production 11 720,90 kWh, self-use 9 131,31, export
+2 589,64, consumption 51 156,94. **Every euro is N/D**, as is grid import,
+because the period is not closed. PDF 8 877 B, XLSX 8 168 B.
+
+11 720,90 against a raw sum of 11 804,93: one day carries a corrected revision,
+and only the current one counts.
+
+### B — Solcorelios I and II, August 2026
+
+| | Solcorelios I | Solcorelios II |
+|---|---|---|
+| run | 4 | 5 |
+| status | `generated` | `generated` |
+| approved | **no** | **no** |
+| members in period | 35 | 22 |
+| ready | 26 | 14 |
+| blocked | 9 (`sem_dados_de_producao_no_periodo`) | 8 (same) |
+| unresolved members | 12 | 11 |
+| coverage label | 26/35 | 14/22 |
+| member snapshot states | 26 × provisional | 14 × provisional |
+| Σ production of members | 56 894,17 kWh | 32 077,59 kWh |
+
+The aggregate declares its blocked and unresolved members rather than quietly
+totalling a smaller number. Neither run was approved.
+
+### C — immutability and provider isolation
+
+1. PDF and XLSX rendered with `socket.socket` and `socket.create_connection`
+   replaced by raisers. Both produced bytes: **the renderers open no
+   connection** — proven, not argued from imports.
+2. Reopening snapshot 67 returns the frozen numbers (11 720,90, provisional,
+   25 days), never a recomputation.
+3. Regenerating August over unchanged facts returned snapshot **67 again**:
+   identical input reuses the snapshot, by design.
+4. `UPDATE report_snapshots` is refused by the `report_snapshots_immutable`
+   trigger, from psql and through the ORM alike.
+
+### D — skips
+
+The only skip in the baseline suite was the whole of `test_pdf_golden.py`,
+which `importorskip`ed itself away for want of pypdf. With pypdf locked it runs:
+6 tests, 0 skips, including the page-by-page comparison against the frozen V1
+checkout.
 
 ---
 
-## 5. Blockers
+## 5. August ingestion
+
+The fleet's August production is fetched by the existing durable job system,
+never by anything this session has to stay open for.
+
+Measured throughput, not estimated: sync run 2135 spent 3 provider calls and was
+refused; 2129 spent 1; **2136 spent 0** — the persisted cooldown turned it away
+before any HTTP and correctly did not charge the job an attempt, which is the
+rate-limit deferral behaviour working exactly as designed. The account allows
+roughly one fleet-day of `production_history_daily` per ~600 s cooldown.
+
+A six-day window therefore cannot finish inside one attempt, and because a
+bounded backfill restarts at its window start unless it succeeded outright, each
+retry re-fetched the same first days and ran out of attempts without advancing.
+Jobs 3399–3402 were cancelled for that reason after covering 2026-08-01 and
+2026-08-02 in full.
+
+Replaced by **26 single-day jobs, 3415–3440**, one source day each (two calls:
+134 mappings in batches of 100), spaced 11 minutes apart — just past the
+cooldown, so consecutive jobs do not collide. They cover every day the fleet
+still lacks: 2026-08-03 … 08-24 and 08-27 … 08-30, running through 01:50.
+They need no session, no shell and no supervision.
+
+---
+
+## 6. Blockers
 
 Kinds: **CODE** · **DATA** · **PROVIDER** · **OPERATOR** · **OUT OF SCOPE**
 
 - **OPERATOR** — 266 of 267 assets have no billing configuration. No ESCO
   financial report is possible for them until the three rates are entered. Not
   fixable in code; fabricating a rate is the one thing reporting must not do.
-- **PROVIDER** — the FusionSolar account rate-limits by frequency (~25–29
-  consecutive calls, ~600 s cooldown). The August backfill is therefore
-  deliberately split into staggered durable jobs rather than one long run.
-- **DATA** — only the 3 Sigenergy-mapped assets have self-use, export,
+  The form to enter them now exists and validates.
+- **PROVIDER** — the FusionSolar account refuses after ~3 calls on
+  `production_history_daily` and holds a ~600 s cooldown, so the August fleet
+  backfill takes hours rather than minutes. Scheduled durably; see §5.
+- **DATA** — only the 3 Sigenergy-mapped assets carry self-use, export,
   consumption and grid import. FusionSolar's verified contract exposes `PVYield`
   alone, so every FusionSolar installation can produce an *energy* report and no
-  financial one, whatever its commercial configuration says.
+  financial one, whatever its commercial configuration says. `money_possible`
+  on `/reports` reads 1 for exactly this reason.
+- **DATA** — 133 of 267 assets have no active plant mapping at all and cannot
+  report any month.
 - **DATA** — `availability_pct` and the tariff-period self-use splits have no
-  trustworthy source and stay N/D. They do not block an ESCO report.
+  trustworthy source and stay N/D. Neither blocks an ESCO report.
+- **OUT OF SCOPE** — no code path builds the portfolio Excel payload from a
+  run; `build_portfolio_report_workbook` is a golden-tested pure function with
+  no caller. Individual PDF and XLSX both work end to end.
+
+---
+
+## 7. Test gates
+
+`PYTHONPATH=src`, `NEMSEI_V2_TEST_DATABASE_URL` pointing at the isolated
+`nemsei_v2_test` database (container `nemsei-v2-test-pg`, host port 55432).
+
+- `pytest -q tests_v2` — baseline before any change: 1115 passed, 1 skipped.
+- `ruff check --no-cache src tests_v2`
+- `bash scripts/run_docker_recovery_acceptance.sh`
+- `bash scripts/run_postgres_operations_acceptance.sh`
+- canonical deploy: `bash scripts/v2_compose_up.sh`

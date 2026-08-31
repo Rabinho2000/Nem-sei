@@ -157,7 +157,12 @@ def run_wrapper(tmp_path, connection_id, scada_state="running", rendered_compone
     # overlays. `rendered_components=False` is the 2026-08-21 deploy: valid
     # configuration, overlay never merged.
     component_env = (
-        {"NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED": "true"} if rendered_components else {}
+        {
+            "NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED": "true",
+            "NEMSEI_V2_REPORT_MONTH_CLOSE_ENABLED": "true",
+        }
+        if rendered_components
+        else {}
     )
     rendered = tmp_path / "rendered.json"
     rendered.write_text(
@@ -398,6 +403,20 @@ def test_the_manifest_declares_the_incident_evaluator_as_required() -> None:
     }
     for service in ("scheduler", "worker"):
         assert (service, "NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED", "true") in evaluated
+        # The report finalisation pass is required for the same reason: a
+        # deploy that quietly drops it leaves every provisional month waiting
+        # for a person, and nothing would log that it had.
+        assert (service, "NEMSEI_V2_REPORT_MONTH_CLOSE_ENABLED", "true") in evaluated
+
+
+def test_a_canonical_deploy_carries_the_report_month_close_overlay() -> None:
+    module = deployment_components()
+    manifest = module.load_manifest(ROOT)
+    required = {component.name: component for component in manifest.required_components}
+
+    assert "report-month-close" in required
+    assert required["report-month-close"].compose_file == "docker-compose.v2.report-month-close.yml"
+    assert "docker-compose.v2.report-month-close.yml" in manifest.compose_files()
 
 
 def test_the_wrapper_builds_its_compose_files_from_the_manifest() -> None:
@@ -421,10 +440,15 @@ def test_the_wrapper_checks_the_declared_components_before_and_after_starting() 
 def test_a_deployment_missing_a_declared_component_is_refused() -> None:
     module = deployment_components()
     manifest = module.load_manifest(ROOT)
+    # Built from the manifest rather than restated here, so a new required
+    # component does not silently make this fixture the thing that fails.
+    every_switch = {
+        assertion.variable: assertion.value for assertion in manifest.assertions()
+    }
     complete = {
         "services": {
-            "scheduler": {"environment": {"NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED": "true"}},
-            "worker": {"environment": {"NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED": "true"}},
+            "scheduler": {"environment": dict(every_switch)},
+            "worker": {"environment": dict(every_switch)},
         }
     }
     module.check_rendered(complete, manifest)
@@ -438,8 +462,8 @@ def test_a_deployment_missing_a_declared_component_is_refused() -> None:
     # Merged, but pointing the other way.
     disabled = {
         "services": {
-            "scheduler": {"environment": {"NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED": "false"}},
-            "worker": {"environment": {"NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED": "true"}},
+            "scheduler": {"environment": {**every_switch, "NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED": "false"}},
+            "worker": {"environment": dict(every_switch)},
         }
     }
     with pytest.raises(module.DeploymentComponentError, match="is not 'true'"):
@@ -451,14 +475,20 @@ def test_a_container_running_without_a_declared_component_is_refused() -> None:
     module = deployment_components()
     manifest = module.load_manifest(ROOT)
     key = "NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED"
+    # Every switch the manifest declares, so adding a required component does
+    # not turn this test's own fixture into the failure.
+    healthy = {
+        (assertion.service, assertion.variable): assertion.value
+        for assertion in manifest.assertions()
+    }
 
-    module.check_live({("scheduler", key): "true", ("worker", key): "true"}, manifest)
+    module.check_live(dict(healthy), manifest)
 
     with pytest.raises(module.DeploymentComponentError, match="worker is running without"):
-        module.check_live({("scheduler", key): "true", ("worker", key): None}, manifest)
+        module.check_live({**healthy, ("worker", key): None}, manifest)
 
     with pytest.raises(module.DeploymentComponentError, match="not set to 'true'"):
-        module.check_live({("scheduler", key): "false", ("worker", key): "true"}, manifest)
+        module.check_live({**healthy, ("scheduler", key): "false"}, manifest)
 
 
 def test_an_unset_variable_reads_back_as_unset_not_as_empty() -> None:
@@ -568,4 +598,7 @@ def test_the_live_check_reads_every_service_not_just_the_first(tmp_path) -> None
     # it cannot do if only one of them is ever asked.
     _calls, completed = run_wrapper(tmp_path, connection_id="")
     assert completed.returncode == 0, completed.stderr
-    assert "2 declared component settings are live" in completed.stdout
+    declared = len(deployment_components().load_manifest(ROOT).assertions())
+    assert f"{declared} declared component settings are live" in completed.stdout
+    # Two services per required component, so the loop cannot be ending early.
+    assert declared >= 4 and declared % 2 == 0

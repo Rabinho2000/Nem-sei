@@ -30,8 +30,34 @@
       "required": true,
       "why": "D1: the periodic diagnostic-incident evaluator. Makes no provider call; without it no incident opens or closes, and nothing downstream of incidents (notifications, digests) has anything to say.",
       "asserts": [
-        {"service": "scheduler", "variable": "NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED", "value": "true"},
-        {"service": "worker", "variable": "NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED", "value": "true"}
+        {
+          "service": "scheduler",
+          "variable": "NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED",
+          "value": "true"
+        },
+        {
+          "service": "worker",
+          "variable": "NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_ENABLED",
+          "value": "true"
+        }
+      ]
+    },
+    {
+      "name": "report-month-close",
+      "compose_file": "docker-compose.v2.report-month-close.yml",
+      "required": true,
+      "why": "Turns a provisional month into a final one once its source data closes. Makes no provider call -- the handler takes no Settings and so cannot build a client. Without it a month generated provisionally stays provisional until a person remembers to regenerate it, which is the manual step the whole provisional/final distinction exists to remove. It adds a new snapshot beside the provisional one; it can neither rewrite a snapshot nor approve a portfolio run.",
+      "asserts": [
+        {
+          "service": "scheduler",
+          "variable": "NEMSEI_V2_REPORT_MONTH_CLOSE_ENABLED",
+          "value": "true"
+        },
+        {
+          "service": "worker",
+          "variable": "NEMSEI_V2_REPORT_MONTH_CLOSE_ENABLED",
+          "value": "true"
+        }
       ]
     },
     {

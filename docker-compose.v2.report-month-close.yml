@@ -1,0 +1,37 @@
+# Turns on the periodic report-finalisation pass for the standing
+# scheduler/worker containers.
+#
+# What it is for: August is generated on the 31st, from an August that is
+# neither over nor complete. The report says so -- provisional, no euros -- but
+# somebody still has to notice when the missing days arrive and the month ends.
+# This is the "somebody". Without it, a provisional month stays provisional
+# until a person remembers to press Generate again.
+#
+# Like docker-compose.v2.diagnostic-incidents.yml and for the same reasons, a
+# separate override scoped to exactly the two services that need it rather than
+# an edit to the shared .env.v2, and never web or migrate. It makes zero
+# provider calls -- `_execute_report_month_close` takes no `Settings` at all,
+# so it has no way to build a provider client -- which is why there is no
+# connection id, no call budget and no cap to reason about here.
+#
+# What it can and cannot do: it adds a *new* final snapshot beside a provisional
+# one. It cannot rewrite a snapshot (`report_snapshots` refuses, by trigger) and
+# it cannot approve a portfolio run. Approval is a person signing off on a set
+# of numbers and nothing here is entitled to it.
+#
+# Kill switch: flip ENABLED to "false" here and redeploy, or drop the file from
+# the next `up -d`. Either stops new evaluations immediately and is restart
+# -safe; no report already produced is touched either way.
+name: nemsei-v2
+
+# Hourly, the code default (config.py). What it waits for is a month ending and
+# a backfill landing, neither of which happens on a fifteen-minute scale, and
+# every cycle that finds nothing still scans the snapshot table.
+services:
+  scheduler:
+    environment:
+      NEMSEI_V2_REPORT_MONTH_CLOSE_ENABLED: "true"
+
+  worker:
+    environment:
+      NEMSEI_V2_REPORT_MONTH_CLOSE_ENABLED: "true"
