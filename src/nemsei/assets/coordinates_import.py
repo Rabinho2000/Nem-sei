@@ -19,6 +19,8 @@ match. Name matching is what `resolve_duplicate_groups` exists to prevent.
 """
 from __future__ import annotations
 
+import argparse
+import json
 import sqlite3
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -30,6 +32,9 @@ from sqlalchemy.orm import Session
 
 from nemsei.assets.models import COORDINATE_CONFIDENCES, COORDINATE_SOURCES, Asset
 from nemsei.assets.v1_import import LegacyImportError, open_v1_readonly, source_sha256
+from nemsei.config import Settings
+from nemsei.db.engine import build_engine
+from nemsei.db.session import build_session_factory
 from nemsei.providers.models import LegacyImportRecord
 from nemsei.shared.clock import utc_now
 
@@ -192,3 +197,30 @@ def import_v1_coordinates(
         return summary.as_dict()
     finally:
         source_db.close()
+
+
+def main() -> None:
+    """Same shape as `nemsei.assets.v1_import`, deliberately.
+
+    A dry run opens a real session because it reads the V2 side to decide what
+    it would do -- which installations already carry a coordinate, and which
+    V1 rows link to one at all. It commits nothing.
+    """
+    parser = argparse.ArgumentParser(description="Import V1 plant coordinates into V2.")
+    parser.add_argument("--v1-db", required=True, type=Path)
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+    settings = Settings.from_environment().validate()
+    factory = build_session_factory(build_engine(settings))
+    with factory() as session:
+        if args.dry_run:
+            summary = import_v1_coordinates(session, args.v1_db, dry_run=True)
+            session.rollback()
+        else:
+            with session.begin():
+                summary = import_v1_coordinates(session, args.v1_db)
+    print(json.dumps(summary, sort_keys=True, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
