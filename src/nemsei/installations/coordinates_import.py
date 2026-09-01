@@ -1,21 +1,28 @@
 """Bring V1's plant coordinates across, with the provenance V1 recorded.
 
-Deliberately separate from `v1_import.py` rather than a column added to its
-`SELECT`. That importer fingerprints each source row with `row_hash(row,
-row.keys())` and compares the fingerprint to decide `reused` against
-`changed_source`; widening its query would change every one of the 267
-fingerprints at once and report the whole parque as changed at the source,
-destroying the very signal the mechanism exists to give.
+Deliberately separate from `assets/v1_import.py` rather than a column added
+to its `SELECT`. That importer fingerprints each source row with
+`row_hash(row, row.keys())` and compares the fingerprint to decide `reused`
+against `changed_source`; widening its query would change every one of the
+267 fingerprints at once and report the whole parque as changed at the
+source, destroying the very signal the mechanism exists to give.
 
-What this does instead is narrow and idempotent: for installations that
-already exist in V2 and have no coordinates, copy V1's pair and the two
-provenance fields alongside it. It never overwrites a value already present,
-because the only way a V2 asset can have one today is that a person put it
-there, and a bulk import must not outrank a person.
+Target is `Installation`, not `Asset` -- coordinates are a property of the
+physical site, not the technical plant, and `Asset.latitude`/`.longitude` are
+kept only for backward compatibility (see `assets/models.py`). This means the
+backfill (`installations/service.py::backfill_installations_from_assets`)
+must run before this: an Asset with no `installation_id` yet has nowhere to
+put a coordinate, and is reported as `unlinked` rather than silently skipped.
 
-The link between a V1 asset id and a V2 asset is the one the identity import
-already established -- `legacy_import_records.target_asset_id` -- never a name
-match. Name matching is what `resolve_duplicate_groups` exists to prevent.
+What this does is narrow and idempotent: for installations that already exist
+in V2 and have no coordinates, copy V1's pair and the two provenance fields
+alongside it. It never overwrites a value already present, because the only
+way a V2 installation can have one today is that a person put it there, and a
+bulk import must not outrank a person.
+
+The link between a V1 asset id and a V2 installation is the identity import's
+own record -- `legacy_import_records.target_asset_id`, followed through
+`Asset.installation_id` -- never a name match.
 """
 from __future__ import annotations
 
@@ -30,11 +37,12 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from nemsei.assets.models import COORDINATE_CONFIDENCES, COORDINATE_SOURCES, Asset
+from nemsei.assets.models import Asset
 from nemsei.assets.v1_import import LegacyImportError, open_v1_readonly, source_sha256
 from nemsei.config import Settings
 from nemsei.db.engine import build_engine
 from nemsei.db.session import build_session_factory
+from nemsei.installations.models import COORDINATE_CONFIDENCES, COORDINATE_SOURCES, Installation
 from nemsei.providers.models import LegacyImportRecord
 from nemsei.shared.clock import utc_now
 
@@ -59,6 +67,11 @@ class CoordinateImportSummary:
     already_present: int = 0
     absent_in_v1: int = 0
     unlinked: int = 0
+    # An Asset that exists but has no Installation yet -- the backfill has
+    # not run. Kept apart from `unlinked` (a V1 row with no V2 counterpart at
+    # all), because the fix for this one is "run the backfill", not "resolve
+    # an import conflict".
+    no_installation: int = 0
     rejected: list[dict[str, Any]] = field(default_factory=list)
     by_confidence: dict[str, int] = field(default_factory=dict)
 
@@ -71,6 +84,7 @@ class CoordinateImportSummary:
             "already_present": self.already_present,
             "absent_in_v1": self.absent_in_v1,
             "unlinked": self.unlinked,
+            "no_installation": self.no_installation,
             "rejected": self.rejected,
             "by_confidence": dict(sorted(self.by_confidence.items())),
         }
@@ -114,7 +128,7 @@ def _linked_assets(session: Session) -> dict[str, int]:
 def import_v1_coordinates(
     session: Session, source_path: Path, *, dry_run: bool = False
 ) -> dict[str, Any]:
-    """Copy V1 coordinates onto V2 installations that have none."""
+    """Copy V1 coordinates onto V2 Installations that have none."""
     source_path = source_path.expanduser().resolve()
     bound = session.get_bind().url.database
     if bound and Path(str(bound)).resolve() == source_path:
@@ -139,7 +153,14 @@ def import_v1_coordinates(
             if asset is None:
                 summary.unlinked += 1
                 continue
-            if asset.latitude is not None or asset.longitude is not None:
+            if asset.installation_id is None:
+                summary.no_installation += 1
+                continue
+            installation = session.get(Installation, asset.installation_id)
+            if installation is None:
+                summary.no_installation += 1
+                continue
+            if installation.latitude is not None or installation.longitude is not None:
                 summary.already_present += 1
                 continue
 
@@ -169,17 +190,18 @@ def import_v1_coordinates(
                         "legacy_id": legacy_id,
                         "project_name": row["project_name"],
                         "asset_id": asset_id,
+                        "installation_id": installation.id,
                         "reason": reason,
                     }
                 )
                 continue
 
             if not dry_run:
-                asset.latitude = latitude
-                asset.longitude = longitude
-                asset.coordinates_source = source
-                asset.coordinates_confidence = confidence
-                asset.updated_at = now
+                installation.latitude = latitude
+                installation.longitude = longitude
+                installation.coordinates_source = source
+                installation.coordinates_confidence = confidence
+                installation.updated_at = now
             summary.imported += 1
             key = confidence or "sem confiança registada"
             summary.by_confidence[key] = summary.by_confidence.get(key, 0) + 1
@@ -189,10 +211,17 @@ def import_v1_coordinates(
         # import, just plants nobody has ever located. Every one of them
         # answers `unknown` to the production window.
         offered = {linked[legacy_id] for legacy_id in legacy_rows if legacy_id in linked}
+        located_asset_ids = {
+            asset_id
+            for asset_id, latitude in session.execute(
+                select(Asset.id, Installation.latitude).join(Installation, Installation.id == Asset.installation_id)
+            ).all()
+            if latitude is not None
+        }
         summary.absent_in_v1 = sum(
             1
-            for asset_id in session.scalars(select(Asset.id).where(Asset.latitude.is_(None)))
-            if asset_id not in offered
+            for asset_id in session.scalars(select(Asset.id))
+            if asset_id not in offered and asset_id not in located_asset_ids
         )
         return summary.as_dict()
     finally:
@@ -206,7 +235,7 @@ def main() -> None:
     it would do -- which installations already carry a coordinate, and which
     V1 rows link to one at all. It commits nothing.
     """
-    parser = argparse.ArgumentParser(description="Import V1 plant coordinates into V2.")
+    parser = argparse.ArgumentParser(description="Import V1 plant coordinates into V2 Installations.")
     parser.add_argument("--v1-db", required=True, type=Path)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
