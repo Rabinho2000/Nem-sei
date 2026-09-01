@@ -11,6 +11,11 @@ from nemsei.db.base import Base
 
 
 ASSET_LIFECYCLE_STATUSES = ("unknown", "active", "inactive", "decommissioned")
+# Where a plant's coordinates came from, and how much to trust them. V1's own
+# words: `suspect` means geocoded from a postal address and never checked,
+# which can land in the middle of a municipality rather than on the roof.
+COORDINATE_SOURCES = ("google_mymaps", "openrouteservice", "manual", "operator", "provider")
+COORDINATE_CONFIDENCES = ("ok", "suspect", "manual")
 IMPORT_REVIEW_STATUSES = ("clear", "needs_review")
 # Open vocabulary: only `inverter` is populated by the V1 migration. The other
 # kinds exist so that a meter or a datalogger is a new row, not a new table.
@@ -50,8 +55,28 @@ class Asset(Base):
     __table_args__ = (
         CheckConstraint(f"lifecycle_status IN {ASSET_LIFECYCLE_STATUSES!r}", name="ck_assets_lifecycle_status"),
         CheckConstraint(f"review_status IN {IMPORT_REVIEW_STATUSES!r}", name="ck_assets_review_status"),
+        # Coordinates and their provenance travel together -- see 0031.
+        CheckConstraint(
+            "(latitude IS NULL AND longitude IS NULL) OR coordinates_source IS NOT NULL",
+            name="ck_assets_coordinates_provenance",
+        ),
+        CheckConstraint("(latitude IS NULL) = (longitude IS NULL)", name="ck_assets_coordinates_pair"),
+        CheckConstraint(
+            f"coordinates_source IS NULL OR coordinates_source IN {COORDINATE_SOURCES!r}",
+            name="ck_assets_coordinates_source",
+        ),
+        CheckConstraint(
+            f"coordinates_confidence IS NULL OR coordinates_confidence IN {COORDINATE_CONFIDENCES!r}",
+            name="ck_assets_coordinates_confidence",
+        ),
         Index("ix_assets_normalized_name", "normalized_name"),
         Index("ix_assets_owner", "owner_id"),
+        Index(
+            "ix_assets_coordinates",
+            "latitude",
+            "longitude",
+            postgresql_where=text("latitude IS NOT NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -71,6 +96,11 @@ class Asset(Base):
     locality: Mapped[str | None] = mapped_column(String(255))
     latitude: Mapped[Decimal | None] = mapped_column(Numeric(10, 7))
     longitude: Mapped[Decimal | None] = mapped_column(Numeric(10, 7))
+    # Without these two, `monitoring.production_window` cannot say when the
+    # sun is up here, and every production-absence rule has to answer
+    # `unknown`. See migration 0031 for why the provenance is not optional.
+    coordinates_source: Mapped[str | None] = mapped_column(String(32))
+    coordinates_confidence: Mapped[str | None] = mapped_column(String(32))
     technical_notes: Mapped[str | None] = mapped_column(Text)
     # What the customer contracted. These four decide EPC against ESCO, and
     # without them `detect_report_type` defaults to EPC and sends an ESCO
