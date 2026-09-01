@@ -23,6 +23,7 @@ from nemsei.shared.clock import utc_now
 from nemsei.sources.models import AssetSourcePolicy
 from nemsei.sync.models import IntegrationHealth, SyncRun
 from nemsei.web.contract_queries import commercial_states_for, family_filter_ids, om_filter_ids, om_states_for
+from nemsei.web.labels import mapping_state, mapping_summary, review_state
 
 
 PROVIDER_LABELS = {
@@ -163,12 +164,11 @@ def _mapping_summaries(session: Session, asset_ids: list[int]) -> dict[int, dict
         )
     for asset_id in asset_ids:
         item = summaries[asset_id]
-        if "pending_review" in item["statuses"]:
-            item["label"] = "Pendente"
-            item["tone"] = "warning"
-        else:
-            item["label"] = "Mapeado" if item["mappings"] else "Sem mapping"
-            item["tone"] = "success" if item["mappings"] else "muted"
+        # Worst-first, from the shared vocabulary. The previous verdict here
+        # asked only "are there any mappings at all", so an installation whose
+        # single mapping the platform had marked `invalid` reported "Mapeado"
+        # in green -- a plant receiving nothing, rendered as healthy.
+        item.update(mapping_summary(item["statuses"]))
     return summaries
 
 
@@ -231,9 +231,13 @@ def list_assets_data(
                 "state_tone": state.tone,
                 "state_detail": state.detail,
                 "state_observed_at": state.observed_at,
+                # The import review flag, never the operational one. It used
+                # to read "OK" in green next to an installation whose actual
+                # state was "Sem leitura" -- two different questions answered
+                # with one word, and the reassuring one won.
                 "review_status": asset.review_status,
-                "review_label": "Precisa de revisão" if asset.review_status == "needs_review" else "OK",
-                "review_tone": "warning" if asset.review_status == "needs_review" else "success",
+                "review_label": review_state(asset.review_status)["label"],
+                "review_tone": review_state(asset.review_status)["tone"],
                 "providers": summary["providers"],
                 "mapping_label": summary["label"],
                 "mapping_tone": summary["tone"],
@@ -359,8 +363,8 @@ def organization_list_data(session: Session, *, search: str = "", page_value: st
             "id": row["id"],
             "display_name": row["display_name"],
             "asset_count": row["asset_count"],
-            "review_label": "Precisa de revisão" if row["review_status"] == "needs_review" else "OK",
-            "review_tone": "warning" if row["review_status"] == "needs_review" else "success",
+            "review_label": review_state(row["review_status"])["label"],
+            "review_tone": review_state(row["review_status"])["tone"],
         }
         for row in rows
     ]
@@ -518,6 +522,8 @@ def mapping_review_data(
                 "external_id": mapping.external_id,
                 "external_name": mapping.external_name,
                 "mapping_status": mapping.mapping_status,
+                "mapping_label": mapping_state(mapping.mapping_status)["label"],
+                "mapping_tone": mapping_state(mapping.mapping_status)["tone"],
                 "valid_from": mapping.valid_from,
                 "valid_to": mapping.valid_to,
                 "asset_review_status": asset.review_status,
@@ -617,8 +623,8 @@ def asset_detail_data(session: Session, asset_id: int) -> dict[str, Any] | None:
             "external_name": row["external_name"],
             "external_id": row["external_id"],
             "mapping_status": row["mapping_status"],
-            "mapping_label": "Pendente" if row["mapping_status"] == "pending_review" else row["mapping_status"].replace("_", " ").capitalize(),
-            "mapping_tone": "warning" if row["mapping_status"] == "pending_review" else "success" if row["mapping_status"] == "active" else "muted",
+            "mapping_label": mapping_state(row["mapping_status"])["label"],
+            "mapping_tone": mapping_state(row["mapping_status"])["tone"],
             "valid_from": row["valid_from"],
             "valid_to": row["valid_to"],
         }

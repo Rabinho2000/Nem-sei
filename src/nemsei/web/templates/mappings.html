@@ -52,7 +52,7 @@
               <th scope="row"><a href="{{ url_for('assets.asset_detail', asset_id=mapping.asset_id) }}">{{ mapping.asset_name }}</a><small>{{ mapping.organization_name or 'Sem organização' }}</small></th>
               <td>{{ mapping.provider }}<small>{{ mapping.connection_name }}</small></td>
               <td><code>{{ mapping.external_id }}</code>{% if mapping.external_name %}<small>{{ mapping.external_name }}</small>{% endif %}</td>
-              <td><span class="status-badge {{ 'success' if mapping.mapping_status == 'active' else 'warning' if mapping.mapping_status == 'pending_review' else 'muted' }}">{{ mapping.mapping_status }}</span></td>
+              <td><span class="status-badge {{ mapping.mapping_tone }}">{{ mapping.mapping_label }}</span></td>
               <td>
                 {% if mapping.mapping_status != 'pending_review' %}
                   <small>—</small>

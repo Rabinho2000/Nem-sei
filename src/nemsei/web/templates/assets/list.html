@@ -28,7 +28,7 @@
     <div class="table-meta"><span>{{ pagination.total }} centrais encontradas</span>
       {% if filters.om in ('', 'com_om') %}<span class="muted">a mostrar o parque O&amp;M — <a href="{{ url_for('assets.list_assets', om='todos') }}">ver todo o parque</a></span>{% endif %}{% if pagination.pages > 1 %}<span>Página {{ pagination.page }} de {{ pagination.pages }}</span>{% endif %}</div>
     <div class="table-scroll">
-      <table class="data-table wide-table">
+      <table class="data-table wide-table stack-mobile">
         <caption class="sr-only">Lista de centrais</caption>
         <thead><tr><th scope="col" class="pick-column"><span class="sr-only">Selecionar</span></th><th scope="col">Central</th><th scope="col">Organização</th><th scope="col">Potência DC</th><th scope="col">País / localidade</th><th scope="col">Fuso</th><th scope="col">Estado</th><th scope="col">Ciclo de vida</th><th scope="col">Contrato</th><th scope="col">O&amp;M</th><th scope="col">Mapping</th><th scope="col">Qualidade</th></tr></thead>
         <tbody>
@@ -36,21 +36,21 @@
             <tr>
               <td class="pick-column"><label class="pick"><input type="checkbox" name="asset_ids" value="{{ asset.id }}"><span class="sr-only">Selecionar {{ asset.canonical_name }}</span></label></td>
               <th scope="row"><a class="table-primary" href="{{ url_for('assets.asset_detail', asset_id=asset.id) }}">{{ asset.canonical_name }}</a><small>ID {{ asset.id }}</small></th>
-              <td>{{ asset.organization_name or '—' }}</td>
-              <td>{{ ('%.1f kW'|format(asset.installed_dc_power_kw)) if asset.installed_dc_power_kw is not none else '—' }}</td>
-              <td>{{ [asset.country_code, asset.locality]|select|join(' · ') or '—' }}</td>
-              <td>{% if asset.timezone %}<code>{{ asset.timezone }}</code>{% else %}<span class="status-badge warning">em falta</span>{% endif %}</td>
-              <td><span class="status-badge {{ asset.state_tone }}" title="{{ asset.state_detail or 'sem leituras para esta instalação' }}">{{ asset.state_label }}</span></td>
-              <td><span class="status-badge {{ 'muted' if asset.lifecycle_status == 'unknown' else 'success' }}">{{ asset.lifecycle_label }}</span></td>
-              <td>
+              <td data-label="Organização">{{ asset.organization_name or '—' }}</td>
+              <td data-label="Potência DC">{{ ('%.1f kW'|format(asset.installed_dc_power_kw)) if asset.installed_dc_power_kw is not none else '—' }}</td>
+              <td data-label="Localidade">{{ [asset.country_code, asset.locality]|select|join(' · ') or '—' }}</td>
+              <td data-label="Fuso">{% if asset.timezone %}<code>{{ asset.timezone }}</code>{% else %}<span class="status-badge warning">em falta</span>{% endif %}</td>
+              <td data-label="Estado"><span class="status-badge {{ asset.state_tone }}" title="{{ asset.state_detail or 'sem leituras para esta instalação' }}">{{ asset.state_label }}</span></td>
+              <td data-label="Ciclo de vida"><span class="status-badge {{ 'muted' if asset.lifecycle_status == 'unknown' else 'success' }}">{{ asset.lifecycle_label }}</span></td>
+              <td data-label="Contrato">
                 {% if asset.commercial.contract_type %}<span class="status-badge {{ asset.commercial.family_tone }}">{{ asset.commercial.contract_type }}</span>{% else %}—{% endif %}
                 {% if asset.commercial.priority == 'high' %}<small title="{{ asset.commercial.priority_reason }}">prioritária</small>{% endif %}
               </td>
-              <td>{% if asset.om.status == 'none' %}—{% else %}<span class="status-badge {{ asset.om.tone }}" title="{% if asset.om.last_covered_day %}até {{ asset.om.last_covered_day.strftime('%d/%m/%Y') }}{% else %}sem data de fim registada{% endif %}">{{ asset.om.label }}</span>{% endif %}</td>
-              <td><span class="status-badge {{ asset.mapping_tone }}">{{ asset.mapping_label }}</span></td>
-              <td><span class="status-badge {{ asset.review_tone }}">{{ asset.review_label }}</span></td>
+              <td data-label="O&amp;M">{% if asset.om.status == 'none' %}—{% else %}<span class="status-badge {{ asset.om.tone }}" title="{% if asset.om.last_covered_day %}até {{ asset.om.last_covered_day.strftime('%d/%m/%Y') }}{% else %}sem data de fim registada{% endif %}">{{ asset.om.label }}</span>{% endif %}</td>
+              <td data-label="Mapping"><span class="status-badge {{ asset.mapping_tone }}">{{ asset.mapping_label }}</span></td>
+              <td data-label="Revisão"><span class="status-badge {{ asset.review_tone }}">{{ asset.review_label }}</span></td>
             </tr>
-          {% else %}<tr><td class="table-empty" colspan="11">Não existem centrais para estes filtros.</td></tr>{% endfor %}
+          {% else %}<tr><td class="table-empty" colspan="12">Não existem centrais para estes filtros.</td></tr>{% endfor %}
         </tbody>
       </table>
     </div>

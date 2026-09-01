@@ -274,6 +274,30 @@ code { color: var(--brand-dark); font: 0.78rem ui-monospace, SFMono-Regular, Men
   .form-actions .button { width: 100%; }
   .detail-list div { grid-template-columns: 1fr; gap: 3px; }
   .detail-header .button { width: auto; }
+
+  /* Tabelas densas em ecra estreito. `.data-table` tem min-width de 850 px,
+     por isso no telemovel qualquer tabela obrigava a arrastar na horizontal
+     para ler uma linha inteira -- e as colunas que importam (estado, O&M,
+     mapping) sao as ultimas, ou seja as que ficam sempre fora do ecra.
+
+     Aqui cada linha passa a ser um cartao: o cabecalho da linha e o titulo,
+     cada celula e um par etiqueta/valor. A etiqueta vem do atributo
+     `data-label` da propria celula, para nao existir uma segunda copia dos
+     nomes das colunas dentro do CSS a divergir do <thead>. O <thead> continua
+     no DOM para os leitores de ecra; so deixa de ser desenhado. */
+  .stack-mobile { min-width: 0; }
+  .stack-mobile thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .stack-mobile tbody tr { display: block; padding: 12px 14px; border-top: 1px solid var(--line); }
+  .stack-mobile tbody tr:hover { background: transparent; }
+  .stack-mobile th[scope="row"] { display: block; min-width: 0; padding: 0 0 8px; border: 0; }
+  .stack-mobile td { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; padding: 4px 0; border: 0; text-align: right; }
+  .stack-mobile td::before { content: attr(data-label); flex: 0 0 auto; color: var(--muted); font-size: 0.72rem; font-weight: 700; letter-spacing: 0.05em; text-align: left; text-transform: uppercase; }
+  /* Uma celula sem etiqueta -- a caixa de selecao, o menu de acoes -- nao e
+     um par etiqueta/valor e nao deve abrir uma linha vazia. */
+  .stack-mobile td:not([data-label]) { display: block; text-align: left; }
+  .stack-mobile td:not([data-label])::before { content: none; }
+  .stack-mobile td.pick-column { padding-bottom: 8px; }
+  .stack-mobile .table-empty { display: block; text-align: center; }
 }
 
 /* Portfolios ------------------------------------------------------------- */
