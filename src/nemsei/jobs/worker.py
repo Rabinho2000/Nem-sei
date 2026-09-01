@@ -44,9 +44,13 @@ class Worker:
                 self.repository.finish(claimed, status=outcome.status, result=outcome.result)
         except DeferredJobError as exc:
             # A cooldown, not a failure: wait for the moment the provider named
-            # rather than spending attempts against a door that is shut. Past
-            # the configured number of deferrals this falls through to the
-            # ordinary retry path, so waiting can still end.
+            # rather than spending attempts against a door that is shut.
+            #
+            # Only a deferral that cost a real provider call can fall through
+            # to the retry path below. A refusal that made no call at all
+            # always defers -- however many times in a row it happens -- because
+            # spending the retry budget on a request nobody made is what failed
+            # the 26 backfill jobs of 2026-09-01. See `JobRepository.defer`.
             if not self.repository.defer(
                 claimed,
                 available_at=exc.retry_at,

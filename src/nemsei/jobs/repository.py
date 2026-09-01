@@ -36,9 +36,13 @@ def safe_metadata(values: dict[str, Any] | None = None) -> dict[str, Any]:
     # how many runs were looked at and how many were closed. Without them the
     # job's result is `{}` and the only way to know the sweep did anything is
     # to diff `sync_runs` by hand.
+    # `called_provider` says whether a deferral cost a real provider call. It
+    # is the difference between a `defer_scheduled` and a `defer_no_call`, and
+    # without it in the allowlist the event log makes an operator infer from
+    # the event type alone which of the two they are looking at.
     allowed = {
         "reason", "delay_seconds", "schedule_key", "dedupe_key", "result_status", "mode",
-        "next_source_day", "runs_examined", "runs_abandoned",
+        "next_source_day", "runs_examined", "runs_abandoned", "called_provider",
     }
     return {
         key: str(value)[:200]
@@ -321,22 +325,51 @@ class JobRepository:
         the lease is released, and `available_at` is set to when the provider
         said it would answer. No sleep, nothing held.
 
-        Returns False when the job has already been deferred `max_cycles`
-        times, so the caller falls back to the ordinary retry path: waiting is
-        not the same as never giving up.
+        **The two kinds of deferral are not the same thing, and the bound only
+        applies to one of them.** That was the second defect, and it killed the
+        26 replacement backfill jobs 3761-3786 on 2026-09-01:
+
+        * a *paid* deferral cost a real provider call that the provider
+          refused. It keeps its attempt, and it counts against `max_cycles` --
+          a provider that genuinely refuses over and over must still end the
+          job rather than leave it waiting for ever while the schedule
+          enqueues its successors.
+        * a *free* deferral made no HTTP call at all. It costs the provider
+          nothing, holds no lease, and sleeps for nothing; `available_at` is
+          pinned to the provider's own cooldown, so it cannot spin. It is
+          refunded, it is **never counted**, and it can **never** return False.
+
+        Counting both against one bound meant that past the cap every free
+        refusal fell through to `retry_or_fail`, which spent the attempt
+        `claim_next` had already taken. Across those 26 jobs, 246 of the 247
+        attempt-spending events had `actual_provider_calls = 0`, and 25 of the
+        26 terminal `retry_exhausted` events were refusals that never reached
+        the provider. Raising `max_attempts` from 3 to 10 only moved the wall.
+
+        Returns False only for a paid deferral that has run out of real
+        attempts, so the caller falls back to the ordinary retry path: waiting
+        is not the same as never giving up, but only work that was actually
+        attempted can be given up on.
         """
         now = utc_now()
         with self._immediate_session() as session:
-            deferrals = int(
-                session.scalar(
-                    select(func.count())
-                    .select_from(JobEvent)
-                    .where(JobEvent.job_id == claimed.id, JobEvent.event_type == "defer_scheduled")
+            if not refund_attempt:
+                # A real call was made and refused. Bounded twice over, by the
+                # operator ceiling and by the job's own budget of real
+                # attempts -- without the second, a generous `max_cycles` would
+                # let a job defer past `max_attempts` for ever.
+                paid = int(
+                    session.scalar(
+                        select(func.count())
+                        .select_from(JobEvent)
+                        .where(JobEvent.job_id == claimed.id, JobEvent.event_type == "defer_scheduled")
+                    )
+                    or 0
                 )
-                or 0
-            )
-            if deferrals >= max_cycles:
-                return False
+                if paid >= max_cycles or claimed.attempt >= claimed.max_attempts:
+                    return False
+            event_type = "defer_no_call" if refund_attempt else "defer_scheduled"
+            attempt_after = max(0, claimed.attempt - 1) if refund_attempt else claimed.attempt
             updated = session.execute(
                 update(Job)
                 .where(Job.id == claimed.id, Job.status == "running", Job.lease_token == claimed.lease_token)
@@ -345,7 +378,7 @@ class JobRepository:
                     # Back to the count before this claim when nothing was
                     # asked of the provider. A refusal that cost a real call
                     # keeps its attempt -- it was paid for.
-                    attempt_count=max(0, claimed.attempt - 1) if refund_attempt else claimed.attempt,
+                    attempt_count=attempt_after,
                     available_at=available_at,
                     lease_owner=None,
                     lease_token=None,
@@ -358,12 +391,15 @@ class JobRepository:
             self._event(
                 session,
                 job_id=claimed.id,
-                event_type="defer_scheduled",
-                attempt=max(0, claimed.attempt - 1) if refund_attempt else claimed.attempt,
+                event_type=event_type,
+                attempt=attempt_after,
                 from_status="running",
                 to_status="waiting",
                 actor_source="worker",
-                metadata={"reason": reason},
+                # `called_provider` is what separates the two events, spelled
+                # out so an operator reading the log does not have to know
+                # which event type means which.
+                metadata={"reason": reason, "called_provider": not refund_attempt},
                 occurred_at=now,
             )
             return True
