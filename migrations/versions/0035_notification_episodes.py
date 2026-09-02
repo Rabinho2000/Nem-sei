@@ -195,6 +195,13 @@ def _backfill_episodes() -> None:
 
     for incident in incidents:
         family = _PROBLEM_FAMILY_BY_RULE_CODE.get(incident["rule_code"], "fault")
+        # `diagnostic_incidents.status` speaks D1's vocabulary
+        # (INCIDENT_STATUSES = "open"/"resolved"); `notification_episodes.status`
+        # speaks its own (EPISODE_STATUSES = "open"/"closed"). Passing the
+        # incident's value straight through wrote status="resolved" with
+        # closed_at set, tripping ck_notification_episodes_closed_at, which
+        # requires status="closed" whenever closed_at is not null.
+        episode_status = "closed" if incident["status"] == "resolved" else incident["status"]
         episode_id = bind.execute(
             sa.text(
                 """
@@ -216,7 +223,7 @@ def _backfill_episodes() -> None:
                 "asset_id": incident["asset_id"],
                 "device_id": incident["device_id"],
                 "family": family,
-                "status": incident["status"],
+                "status": episode_status,
                 "severity": incident["severity"],
                 "opened_at": incident["opened_at"],
                 "last_activity_at": incident["last_observed_at"],
