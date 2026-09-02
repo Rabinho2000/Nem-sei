@@ -481,13 +481,18 @@ def test_a_mapping_that_is_not_the_selected_production_source_writes_nothing(
             priority=1,
             valid_from=date(2026, 1, 1),
         )
-        # Demote the dongle to a fallback.
+        # Retire the dongle's own policy before this day -- not the same
+        # thing as demoting it to a fallback. A fallback is a real, distinct
+        # selection outcome (resolve_source_policy chooses it deliberately
+        # when the primary has nothing recorded yet); this test wants a
+        # mapping the asset's policy does not select *at all*, through any
+        # path, which `valid_to` says cleanly and unambiguously.
         from nemsei.sources.models import AssetSourcePolicy
 
         policy = session.scalar(
             select(AssetSourcePolicy).where(AssetSourcePolicy.provider_mapping_id == ids["mapping"])
         )
-        policy.is_fallback = True
+        policy.valid_to = DAY - timedelta(days=1)
 
     result = roll(factory, settings, ids)
 

@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from nemsei.integrations.fusionsolar import v1_ownership
 from nemsei.integrations.fusionsolar.client import FusionSolarClientError
 from nemsei.providers.errors import ProviderError, ProviderErrorCode
+from nemsei.providers.models import ProviderConnection
 from nemsei.sync.models import ProviderRequestAttempt, ProviderRequestState
 from nemsei.sync.service import record_request_result, reserve_request
 
@@ -19,11 +20,21 @@ from nemsei.sync.service import record_request_result, reserve_request
 T = TypeVar("T")
 
 # Mandatory by default while V1 is active, per the shared-account design in
-# docs/v2/FUSIONSOLAR_OWNERSHIP_WINDOW.md -- every real HTTP call this
-# controller makes must hold V1's account lease first. This exists only as
-# an explicit, loud escape hatch for a future point where V1 no longer runs
-# FusionSolar at all; it is not a performance knob and must not be set to
-# skip the check for convenience while V1 is still live.
+# docs/v2/FUSIONSOLAR_OWNERSHIP_WINDOW.md -- every real HTTP call against the
+# `primary` connection (the one account V1 also uses) must hold V1's account
+# lease first. This exists only as an explicit, loud escape hatch for a
+# future point where V1 no longer runs FusionSolar at all; it is not a
+# performance knob and must not be set to skip the check for convenience
+# while V1 is still live.
+#
+# It is a *global* override precisely because it is meant for that one
+# future moment, not for today's mixed fleet: a connection whose own
+# credential reference isn't "primary" (2026-09-02: `om_api2`, its own
+# Huawei account, verified to see the same station portfolio) was never V1's
+# to begin with, so `call()` below decides per-connection whether a lease is
+# even relevant, independent of this flag. Leasing V1's account for a call
+# that doesn't touch V1's account would be worse than pointless: it would
+# hold a coordination slot V1 itself might need, for no reason at all.
 _SKIP_V1_OWNERSHIP_CHECK = os.environ.get("NEMSEI_V2_SKIP_V1_OWNERSHIP_CHECK", "").strip().lower() in {"1", "true", "yes"}
 
 
@@ -52,6 +63,14 @@ class FusionSolarRequestController:
                     purpose=purpose,
                     sync_run_id=sync_run_id,
                 )
+                # Same transaction, same cheap lookup: which account this
+                # connection actually calls decides whether V1's lease means
+                # anything here. An unknown connection id is refused its own
+                # way already (`reserve_request` would have nothing to key
+                # against), so treating a missing row as "needs the lease" is
+                # the conservative default, not a guess.
+                connection = session.get(ProviderConnection, connection_id)
+                requires_v1_lease = connection is None or connection.credential_reference == "primary"
                 session.commit()
                 state_id, attempt_id = state.id, attempt.id
             if not allowed:
@@ -66,7 +85,7 @@ class FusionSolarRequestController:
                     connection_id=connection_id,
                     owner=f"nemsei-v2-req-{attempt_id}",
                 )
-                if not _SKIP_V1_OWNERSHIP_CHECK
+                if requires_v1_lease and not _SKIP_V1_OWNERSHIP_CHECK
                 else contextlib.nullcontext()
             )
             try:

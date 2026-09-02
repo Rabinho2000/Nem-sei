@@ -47,6 +47,19 @@ x-v2-fusionsolar-environment: &v2-fusionsolar-environment
   # 2026-08-24 cutover: values confirmed by the FusionSolar canary runs.
   NEMSEI_V2_FUSIONSOLAR_PRIMARY_DEVICE_POWER_UNIT: kW
   NEMSEI_V2_FUSIONSOLAR_PRIMARY_DEVICE_ENERGY_UNIT: kWh
+  # 2026-09-02: `om_api2` -- a genuinely separate Huawei account (verified to
+  # see 132/134 of the primary's own station portfolio), not the one V1
+  # shares. Its own daily provider quota, its own connection, its own
+  # request_control bucket. request_control.py already knows a connection
+  # whose credential_reference isn't "primary" never needs V1's lease -- no
+  # coordination with the broker happens for these calls at all. Same
+  # physical stations as the primary account, so the same verified
+  # timezone/unit contract applies without re-verifying it independently.
+  NEMSEI_V2_FUSIONSOLAR_OM_API2_USERNAME_FILE: /run/secrets/fusionsolar_om_api2_username
+  NEMSEI_V2_FUSIONSOLAR_OM_API2_PASSWORD_FILE: /run/secrets/fusionsolar_om_api2_password
+  NEMSEI_V2_FUSIONSOLAR_OM_API2_BASE_URL: https://eu5.fusionsolar.huawei.com
+  NEMSEI_V2_FUSIONSOLAR_OM_API2_PRODUCTION_TIMEZONE: UTC
+  NEMSEI_V2_FUSIONSOLAR_OM_API2_PRODUCTION_UNIT: kWh
   # 2026-08-24 cutover: turn on the one scheduler-driven FusionSolar
   # capability approved for normal operation -- daily incremental
   # production sync against the single configured connection (id 3).
@@ -249,6 +262,8 @@ services:
       - v1_broker_token
       - fusionsolar_primary_username
       - fusionsolar_primary_password
+      - fusionsolar_om_api2_username
+      - fusionsolar_om_api2_password
       - telegram_bot_token
       - sigenergy_primary_app_key
       - sigenergy_primary_app_secret
@@ -268,6 +283,8 @@ services:
       - v1_broker_token
       - fusionsolar_primary_username
       - fusionsolar_primary_password
+      - fusionsolar_om_api2_username
+      - fusionsolar_om_api2_password
       - telegram_bot_token
       - sigenergy_primary_app_key
       - sigenergy_primary_app_secret
@@ -343,6 +360,13 @@ secrets:
     file: ${NEMSEI_V2_FUSIONSOLAR_USERNAME_SECRET_FILE:-./secrets/fusionsolar_primary_username}
   fusionsolar_primary_password:
     file: ${NEMSEI_V2_FUSIONSOLAR_PASSWORD_SECRET_FILE:-./secrets/fusionsolar_primary_password}
+  # 2026-09-02: `om_api2`, a second, genuinely separate FusionSolar account --
+  # not V1's, no ownership-broker coordination (request_control.py only
+  # requires the lease for credential_reference == "primary").
+  fusionsolar_om_api2_username:
+    file: ${NEMSEI_V2_FUSIONSOLAR_OM_API2_USERNAME_SECRET_FILE:-./secrets/fusionsolar_om_api2_username}
+  fusionsolar_om_api2_password:
+    file: ${NEMSEI_V2_FUSIONSOLAR_OM_API2_PASSWORD_SECRET_FILE:-./secrets/fusionsolar_om_api2_password}
   # D4: o token do bot de Telegram. Sem este segredo montado,
   # notifications/telegram_client.py devolve o mock e o processo nao consegue
   # enviar nada -- e a garantia que substituiu o "nao existe codigo HTTP" do D3.

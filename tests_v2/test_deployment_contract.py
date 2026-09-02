@@ -261,7 +261,9 @@ def test_every_compose_secret_path_can_be_redirected() -> None:
     block = compose.split("\nsecrets:\n", 1)[1]
     # Not `\S+`: the two required ones carry a `:?message` with a space in it.
     paths = re.findall(r"^\s*file:\s*(.+?)\s*$", block, re.MULTILINE)
-    assert len(paths) == 8, paths
+    # 2026-09-02: +2 for `fusionsolar_om_api2_username`/`_password`, the
+    # second, genuinely separate FusionSolar account.
+    assert len(paths) == 10, paths
     for path in paths:
         assert path.startswith("${"), f"{path} cannot be redirected away from the repository"
 

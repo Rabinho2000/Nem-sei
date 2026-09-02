@@ -21,6 +21,7 @@ printf '%s' 'postgresql+psycopg://nemsei:nemsei-acceptance@postgres:5432/nemsei_
 # acceptance run that could authenticate against a real provider would be
 # testing the provider.
 for placeholder in v1_broker_token fusionsolar_username fusionsolar_password \
+    fusionsolar_om_api2_username fusionsolar_om_api2_password \
     telegram_bot_token sigenergy_app_key sigenergy_app_secret; do
   : > "$temp_root/secrets/$placeholder"
 done
@@ -33,6 +34,8 @@ printf '%s\n' \
   NEMSEI_V2_V1_BROKER_TOKEN_SECRET_FILE=$temp_root/secrets/v1_broker_token \
   NEMSEI_V2_FUSIONSOLAR_USERNAME_SECRET_FILE=$temp_root/secrets/fusionsolar_username \
   NEMSEI_V2_FUSIONSOLAR_PASSWORD_SECRET_FILE=$temp_root/secrets/fusionsolar_password \
+  NEMSEI_V2_FUSIONSOLAR_OM_API2_USERNAME_SECRET_FILE=$temp_root/secrets/fusionsolar_om_api2_username \
+  NEMSEI_V2_FUSIONSOLAR_OM_API2_PASSWORD_SECRET_FILE=$temp_root/secrets/fusionsolar_om_api2_password \
   NEMSEI_V2_TELEGRAM_BOT_TOKEN_SECRET_FILE=$temp_root/secrets/telegram_bot_token \
   NEMSEI_V2_SIGENERGY_APP_KEY_SECRET_FILE=$temp_root/secrets/sigenergy_app_key \
   NEMSEI_V2_SIGENERGY_APP_SECRET_SECRET_FILE=$temp_root/secrets/sigenergy_app_secret \
