@@ -13,6 +13,19 @@ from nemsei.diagnostics.models import INCIDENT_HANDLING_STATES, DiagnosticIncide
 from nemsei.shared.clock import utc_now
 
 
+# The same strings `diagnostics/incident.html` and `diagnostics/incidents.html`
+# already carry as a Jinja `{% set %}` literal, made available here too so a
+# non-template consumer (`timeline/service.py`) has a Python-side source
+# instead of a fourth ad-hoc guess at the same five words.
+HANDLING_STATE_LABELS: dict[str, str] = {
+    "new": "Por triar",
+    "acknowledged": "Reconhecido",
+    "investigating": "Em análise",
+    "visit_scheduled": "Visita marcada",
+    "done": "Concluído",
+}
+
+
 def incident_notes(session: Session, *, incident_id: int) -> list[IncidentNote]:
     """The handling history, oldest first. Replaying it gives the whole story."""
     return list(
