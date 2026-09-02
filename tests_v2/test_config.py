@@ -121,3 +121,42 @@ def test_production_sync_scheduler_settings_read_from_environment(monkeypatch) -
     assert settings.production_sync_scheduler_enabled is True
     assert settings.production_sync_scheduler_connection_id == 3
     assert settings.production_sync_scheduler_interval_hours == 12
+
+
+# --- Telegram O&M redesign, Fatia 4: morning briefing settings -----------------
+
+
+def test_morning_briefing_rejects_an_unknown_timezone() -> None:
+    settings = dataclasses.replace(configured(), morning_briefing_timezone="Not/A_Real_Zone")
+    with pytest.raises(ConfigurationError):
+        settings.validate()
+
+
+def test_morning_briefing_accepts_a_real_timezone() -> None:
+    settings = dataclasses.replace(configured(), morning_briefing_timezone="Europe/Lisbon")
+    assert settings.validate().morning_briefing_timezone == "Europe/Lisbon"
+
+
+@pytest.mark.parametrize("hour,minute", [(-1, 0), (24, 0), (9, -1), (9, 60)])
+def test_morning_briefing_rejects_an_invalid_time_of_day(hour: int, minute: int) -> None:
+    settings = dataclasses.replace(configured(), morning_briefing_hour=hour, morning_briefing_minute=minute)
+    with pytest.raises(ConfigurationError):
+        settings.validate()
+
+
+def test_morning_briefing_settings_read_from_environment(monkeypatch) -> None:
+    monkeypatch.setenv("NEMSEI_V2_DATABASE_URL", "postgresql+psycopg://nemsei:secret@postgres:5432/nemsei_v2")
+    monkeypatch.setenv("NEMSEI_V2_MORNING_BRIEFING_ENABLED", "true")
+    monkeypatch.setenv("NEMSEI_V2_MORNING_BRIEFING_HOUR", "9")
+    monkeypatch.setenv("NEMSEI_V2_MORNING_BRIEFING_MINUTE", "0")
+    monkeypatch.setenv("NEMSEI_V2_MORNING_BRIEFING_TIMEZONE", "Europe/Lisbon")
+    settings = Settings.from_environment()
+    assert settings.morning_briefing_enabled is True
+    assert settings.morning_briefing_hour == 9
+    assert settings.morning_briefing_timezone == "Europe/Lisbon"
+
+
+def test_recovery_digest_interval_must_be_positive() -> None:
+    settings = dataclasses.replace(configured(), recovery_digest_interval_minutes=0)
+    with pytest.raises(ConfigurationError):
+        settings.validate()

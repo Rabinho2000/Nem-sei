@@ -349,12 +349,22 @@ class NotificationBaselineSnapshot(Base):
 
 
 DIGEST_DELIVERY_STATUSES = ("pending", "delivered", "failed")
+# Three kinds sharing one table (migration 0036, Fatia 4 of the Telegram O&M
+# redesign): `diagnostics` is D6's original periodic digest, unchanged.
+# `recoveries` groups episodes whose recovery does not justify an immediate
+# push (req 13) -- `notifications/eligibility.py::eligible_for_recovery_digest`
+# decides which, this table only ever holds the rendered result.
+# `morning_briefing` is req 10/11's daily 09:00 summary. All three are "a
+# periodic summary, delivered at most once to at most one channel" -- exactly
+# what this table already was, so a column, not a second table.
+DIGEST_KINDS = ("diagnostics", "recoveries", "morning_briefing")
 
 
 class DigestRun(Base):
-    """One periodic diagnostic digest -- a *summary* of incidents over a
-    window, never a second finding or a second incident (D6,
-    `docs/v2/DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md`).
+    """One periodic digest -- a *summary*, never a second finding or a
+    second incident (D6, `docs/v2/DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md`).
+    `kind` (see `DIGEST_KINDS`) says which of the three summaries this is;
+    everything else about the row is shared machinery.
 
     Deliberately one table, not two: unlike `NotificationEvent` (one row per
     incident per channel, because many incidents can each need their own
@@ -376,14 +386,20 @@ class DigestRun(Base):
     __tablename__ = "digest_runs"
     __table_args__ = (
         CheckConstraint(f"delivery_status IN {DIGEST_DELIVERY_STATUSES!r}", name="ck_digest_runs_delivery_status"),
+        CheckConstraint(f"kind IN {DIGEST_KINDS!r}", name="ck_digest_runs_kind"),
         CheckConstraint("window_end > window_start", name="ck_digest_runs_window"),
         CheckConstraint("(delivery_status = 'delivered') = (delivered_at IS NOT NULL)", name="ck_digest_runs_delivered_at"),
         CheckConstraint("delivery_attempt_count >= 0", name="ck_digest_runs_attempt_count"),
-        UniqueConstraint("window_start", "window_end", name="uq_digest_runs_window"),
+        # Each kind window-chains against its own most recent row only --
+        # see notifications/digests.py::generate_digest -- so the identity
+        # is per-kind, not shared across the three.
+        UniqueConstraint("kind", "window_start", "window_end", name="uq_digest_runs_window"),
         Index("ix_digest_runs_window_end", "window_end"),
+        Index("ix_digest_runs_kind_window_end", "kind", "window_end"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, default="diagnostics")
     window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     window_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

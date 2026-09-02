@@ -42,9 +42,10 @@ def context(**overrides) -> NotificationContext:
         category="communication_issue", contract_family="esco", contract_family_label="ESCO",
         om_status="active", is_om=True, is_esco_priority=True,
         priority=PriorityScore(score=60, bucket="MEDIUM", reasons=["Instalação sem comunicação"]),
+        recurrence_count_24h=1,
         energy_impact=EnergyImpact(Decimal("620"), "..."), financial_impact=FinancialImpact(Decimal("84"), "..."),
         suggested_action="Verificar provider.\nConfirmar se toda a instalação está sem dados.",
-        work_order=None, contact_name="João Silva", contact_role="Facilities",
+        work_order=None, work_planned_or_in_progress_today=False, contact_name="João Silva", contact_role="Facilities",
         contact_phone="+351 9xx xxx xxx", contact_email=None,
     )
     defaults.update(overrides)

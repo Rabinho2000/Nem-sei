@@ -54,14 +54,21 @@ def _installation_name(context: NotificationContext) -> str:
     return context.installation.display_name if context.installation else context.asset.canonical_name
 
 
-def _family_label(context: NotificationContext) -> str:
-    override = _RULE_CODE_LABELS.get(context.incident.rule_code)
+def family_label(*, problem_family: str, rule_code: str) -> str:
+    """Public so `notifications/digests.py`'s morning briefing (Fatia 4)
+    reuses the exact same label table instead of keeping a second one --
+    same reasoning as `duration_label` below."""
+    override = _RULE_CODE_LABELS.get(rule_code)
     if override is not None:
         return override
-    return _FAMILY_LABELS.get(context.episode.problem_family, context.episode.problem_family)
+    return _FAMILY_LABELS.get(problem_family, problem_family)
 
 
-def _duration_label(delta: timedelta) -> str:
+def _family_label(context: NotificationContext) -> str:
+    return family_label(problem_family=context.episode.problem_family, rule_code=context.incident.rule_code)
+
+
+def duration_label(delta: timedelta) -> str:
     minutes = int(delta.total_seconds() // 60)
     hours, remainder = divmod(minutes, 60)
     if hours:
@@ -125,9 +132,9 @@ def _render_immediate(context: NotificationContext, *, now: datetime, base_url: 
 
     age = now - context.episode.opened_at
     if context.episode.problem_family == "communication":
-        lines.append(f"Offline há {_duration_label(age)}")
+        lines.append(f"Offline há {duration_label(age)}")
     else:
-        lines.append(f"Aberto há {_duration_label(age)}")
+        lines.append(f"Aberto há {duration_label(age)}")
     power = f"{context.asset.installed_dc_power_kw:g} kWp" if context.asset.installed_dc_power_kw else None
     badges = _contract_badges(context)
     lines.append(" · ".join(part for part in (power, badges) if part))
@@ -154,7 +161,7 @@ def _render_followup(
 ) -> str:
     age = now - context.episode.opened_at
     lines = [
-        f"{icon} {_installation_name(context)} — {_family_label(context)} ({heading.lower()}, há {_duration_label(age)})",
+        f"{icon} {_installation_name(context)} — {_family_label(context)} ({heading.lower()}, há {duration_label(age)})",
         "",
         _impact_line(context),
         f"Incidente: #{context.incident.id}",
@@ -172,7 +179,7 @@ def _render_followup(
 
 def _render_recovery(context: NotificationContext, *, now: datetime, base_url: str | None) -> str:
     end = context.episode.closed_at or now
-    duration = _duration_label(end - context.episode.opened_at)
+    duration = duration_label(end - context.episode.opened_at)
     lines = [
         f"{_RESOLVE_ICON} {_installation_name(context)} — {_family_label(context)} recuperado",
         "",

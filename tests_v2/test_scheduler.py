@@ -162,6 +162,61 @@ def test_scheduler_never_enqueues_digest_generation_when_disabled(settings, monk
     assert jobs == []
 
 
+def test_scheduler_enqueues_recovery_digest_when_enabled(settings, monkeypatch) -> None:
+    """Req 13: off by default, no provider call, same job type as every
+    other digest kind (`digests.generate`) -- the `kind` payload key, not a
+    second job type, is what routes it."""
+    upgrade(settings, monkeypatch)
+    recovery_settings = dataclasses.replace(
+        settings, recovery_digest_generation_enabled=True, recovery_digest_interval_minutes=120,
+    )
+    scheduler = Scheduler(recovery_settings, owner_token="scheduler-recoveries")
+    assert scheduler.run_once() is True
+    assert scheduler.run_once() is False
+
+    engine = build_engine(settings)
+    with build_session_factory(engine)() as session:
+        jobs = session.scalars(select(Job).where(Job.job_type == "digests.generate")).all()
+    assert len(jobs) == 1
+    assert jobs[0].payload_json["kind"] == "recoveries"
+
+
+def test_scheduler_never_enqueues_recovery_digest_when_disabled(settings, monkeypatch) -> None:
+    upgrade(settings, monkeypatch)
+    scheduler = Scheduler(settings, owner_token="scheduler-recoveries-off")
+    scheduler.run_once()
+    engine = build_engine(settings)
+    with build_session_factory(engine)() as session:
+        jobs = session.scalars(select(Job).where(Job.job_type == "digests.generate")).all()
+    assert jobs == []
+
+
+def test_scheduler_seeds_morning_briefing_schedule_without_firing_immediately(settings, monkeypatch) -> None:
+    """Reqs 10-11: off by default. First activation anchors to the next
+    09:00 local, so `run_once` at an arbitrary moment in the test run is not
+    guaranteed to be immediately due -- proven separately, against a real
+    clock boundary, in `test_jobs.py`. Here: the switch itself works, and a
+    disabled scheduler never enqueues one at all."""
+    upgrade(settings, monkeypatch)
+    briefing_settings = dataclasses.replace(settings, morning_briefing_enabled=True)
+    scheduler = Scheduler(briefing_settings, owner_token="scheduler-briefing")
+    scheduler.run_once()  # first activation: seeds the schedule, never immediately due
+    engine = build_engine(settings)
+    with build_session_factory(engine)() as session:
+        jobs = session.scalars(select(Job).where(Job.job_type == "digests.generate")).all()
+    assert jobs == []  # not due yet -- proves the anchor, not "the switch does nothing"
+
+
+def test_scheduler_never_enqueues_morning_briefing_when_disabled(settings, monkeypatch) -> None:
+    upgrade(settings, monkeypatch)
+    scheduler = Scheduler(settings, owner_token="scheduler-briefing-off")
+    scheduler.run_once()
+    engine = build_engine(settings)
+    with build_session_factory(engine)() as session:
+        jobs = session.scalars(select(Job).where(Job.job_type == "digests.generate")).all()
+    assert jobs == []
+
+
 def test_scheduler_enqueues_production_sync_when_enabled(settings, monkeypatch) -> None:
     upgrade(settings, monkeypatch)
     production_settings = dataclasses.replace(

@@ -2087,3 +2087,188 @@ activação real: fatia 4 (briefing/digest), depois o mesmo dry-run de
 leitura contra produção que D1-D6 já fizeram (§22/§25/§29) para confirmar
 quantas mensagens a nova política geraria hoje, antes de mexer em
 `NotificationChannel.enabled`.
+
+## 31. Fatia 4 — morning briefing 09:00 + digest de recuperações, implementado e testado (2026-09-02)
+
+Regras explícitas do pedido, todas mantidas: o briefing reutiliza **o mesmo**
+motor/read-model de prioridade dos alertas imediatos (nenhum segundo
+ranking), só contratos O&M activos, distinção clara operational fault /
+communication issue / insufficient monitoring data, ordenado por prioridade
+real com o motivo sempre visível, WorkOrder/visita incluído quando existe,
+contacto e acção sugerida quando úteis, dados económicos só quando
+calculáveis, recoveries agrupadas quando não justificam push imediato, nunca
+recovery de algo nunca notificado, sem spam de ciclos offline→recovery→offline
+(fechado na Fatia 1, `NotificationEpisode`/flap-merge, reutilizado aqui sem
+alteração). **Verificado o estado da branch partilhada antes de qualquer
+migration** -- ver §"colisões" abaixo.
+
+### Uma migration real corrigida por outra sessão, entretanto
+
+Antes de começar a Fatia 4, `git status`/`git log` mostraram que
+`migrations/versions/0035_notification_episodes.py` (committada na Fatia 1-3
+como `f64cd7a`) tinha sido corrigida por outra sessão nesta árvore partilhada
+(commit `ece676c`): o backfill escrevia `notification_episodes.status =
+'resolved'` (vocabulário de `diagnostic_incidents`) em vez de `'closed'`
+(vocabulário próprio de `notification_episodes`), violando
+`ck_notification_episodes_closed_at` -- um bug real, apanhado a bloquear um
+deploy real nesta árvore, não hipotético. Correcção adoptada tal como estava
+(certa), e coberta com um teste novo dedicado
+(`tests_v2/test_migration_0035_backfill.py`, upgrade só até `0034`, insere
+incidente+evento reais via SQL bruto, upgrade a `0035`, confirma
+`status='closed'`) -- nenhum teste ORM existente exercitava este caminho
+porque a contagem de produção de `notification_events` era 0.
+
+### `NotificationEpisode` continua a única fonte de dedup -- nada novo aqui
+
+O briefing e o digest de recuperações **não introduzem uma segunda noção de
+"o mesmo problema"**: ambos leem `notification_episodes` directamente (só
+`status='open'` para o briefing, só `status='closed'` dentro da janela para
+o digest de recuperações). O flap-merge da Fatia 1 já garante que uma
+instalação a oscilar nunca aparece como "recuperada" só para reaparecer
+minutos depois -- se reabre dentro de `flap_merge_minutes`, continua a ser a
+mesma linha `open`, nunca chega a `closed`, nunca entra em nenhum dos dois.
+
+### `digest_runs.kind` -- um terceiro (e quarto) tipo, não uma segunda tabela
+
+Migration `0036_digest_kind`: `digest_runs.kind IN ('diagnostics',
+'recoveries', 'morning_briefing')`, identidade única passa de
+`(window_start, window_end)` para `(kind, window_start, window_end)` --
+os três encadeiam janelas de forma independente. `notifications/digests.py
+::generate_digest` ganhou um parâmetro `kind` (por omissão `'diagnostics'`,
+zero alteração de comportamento para o digest já existente, confirmado por
+`alembic check` limpo e pela suite completa sem regressão) e despacha para
+o par payload/render certo. `deliver_digest` reutilizado sem qualquer
+alteração -- os três tipos partilham a mesma disciplina de entrega mock-only
+já provada em D6.
+
+### Digest de recuperações (req 13)
+
+`build_recovery_digest_payload` -- só instalações O&M activas
+(`scoped_asset_ids(asset_scope="om_active")`), só episódios `closed` cujo
+`closed_at` cai na janela, filtrados por
+`eligibility.eligible_for_recovery_digest` (já existia desde a Fatia 1: nunca
+um episódio nunca notificado, nunca um que já saiu imediato). Agrupado por
+instalação, ordenado alfabeticamente (não há uma prioridade a ordenar aqui --
+já recuperou). Janela por omissão 2h (`recovery_digest_interval_minutes`).
+
+```
+Recuperações — últimas 2h
+
+4 instalações recuperaram:
+- FC Alverca — 31min
+- Fundação Irene Rolo — 47min
+```
+
+### Morning briefing (reqs 10-12)
+
+`build_morning_briefing_payload` -- para cada activo O&M-activo com pelo
+menos um episódio aberto, calcula o representante (o pior: `communication` >
+`fault` > `coverage`, depois severidade, depois mais antigo -- uma
+instalação com dois problemas aparece **uma vez**, pelo pior) e chama
+**`notifications.enrichment.build_context`**, exactamente a mesma função que
+constrói o contexto de um alerta imediato -- `priority_score`/
+`priority_bucket`/`priority_reasons` do briefing são literalmente os
+mesmos valores que um alerta Telegram real usaria para a mesma instalação
+neste preciso momento. Provado directamente por teste
+(`test_the_briefing_score_is_identical_to_a_direct_priority_call`), não por
+inspecção.
+
+Formato real produzido (dados de teste, não de produção):
+
+```
+O&M — Estado do parque
+24/07/2026 · 09:00
+
+PRIORIDADE ALTA
+
+1. ITECMO
+   Sem comunicação há 26h
+   432 kWp
+   Impacto estimado: não calculável
+   Sem trabalho aberto
+   Ação: Verificar provider.
+   Contacto: João Silva · Facilities
+
+A VERIFICAR
+
+- FC Alverca — sem comunicação 47min
+
+RECORRENTES
+
+- Neutripuro — 4 falhas/24h
+
+RESUMO
+
+3 contratos O&M ativos
+1 operacionais
+2 offline
+0 fault
+0 sem dados suficientes
+
+1 prioritários hoje
+0 já têm trabalho planeado
+1 problema(s) sem ação
+```
+
+Distinção do req 12: `category_counts` vem de
+`notifications/problem_families.py`, que desde a correcção da colisão com a
+outra sessão (ver Fatia 1-3, §30) **reutiliza**
+`diagnostics/incident_categories.py` -- um episódio `coverage`
+(`stale_reading`/`device_unknown_status`/...) conta como "sem dados
+suficientes", nunca como "fault". Provado por teste dedicado
+(`test_a_coverage_only_installation_counts_as_insufficient_data_not_a_fault`).
+
+**Gap documentado, não resolvido**: um activo O&M-activo sem nenhum
+dispositivo nem leitura de plant nunca é avaliado por
+`diagnostics/incidents.py`, logo nunca tem episódio, logo conta como
+"operacional" -- indistinguível, com os dados de hoje, de uma instalação
+genuinamente saudável. Todo o activo com pelo menos uma leitura histórica já
+aparece via `coverage`, que é o caso comum; um activo com zero evidência
+alguma vez é o único caso que este briefing ainda não separa de "está bem".
+Documentado directamente no docstring de `build_morning_briefing_payload`,
+não escondido.
+
+### Scheduler
+
+Um job type só (`digests.generate`), reutilizado pelas três variantes via
+`payload_json["kind"]` -- `jobs/handlers.py::_execute_digest_generation`
+generalizado para ler `kind` (por omissão `"diagnostics"`, para o job já
+existente que nunca definiu esta chave) e escolher o `interval_minutes`
+certo de `Settings`. Dois `JobRepository` métodos novos:
+
+- `enqueue_due_recovery_digest` -- mesma disciplina de D6 (encadeamento de
+  janela, **sem** `_catch_up_slot`: uma janela perdida é um resumo
+  genuinamente diferente, não trabalho duplicado a saltar).
+- `enqueue_due_morning_briefing` -- usa `_enqueue_due_cycle` (com
+  `_catch_up_slot`, ao contrário do digest: um briefing é uma fotografia do
+  estado actual, três briefings atrasados depois de uma paragem seriam a
+  mesma fotografia a envelhecer, não três resumos diferentes) com um
+  parâmetro novo, `initial_slot` -- a primeira activação ancora ao **próximo**
+  09:00 em `Europe/Lisbon` (`_next_daily_local_time`, `zoneinfo`, já usado
+  noutras partes desta base de código, sensível a DST correctamente),
+  nunca a "agora": activar às 14:00 não dispara um briefing a meio da tarde.
+  Um bug real de fronteira apanhado pelo próprio teste: `_enqueue_due_cycle`
+  criava a `ScheduleState` mas não respeitava um `initial_slot` no futuro na
+  primeira chamada -- corrigido com um ramo explícito que semeia o
+  agendamento e devolve "não devido" sem criar nenhum job.
+
+Tudo desligado por omissão (`recovery_digest_generation_enabled`,
+`morning_briefing_enabled`), mesmo padrão estrutural de todo o resto desta
+base de código.
+
+### Testado
+
+52 testes novos (`test_recovery_digest.py` 6, `test_morning_briefing.py` 11,
+`test_migration_0035_backfill.py` 1, mais scheduling em
+`test_jobs.py`/`test_scheduler.py`/`test_config.py`). `alembic check` limpo
+contra uma base de dados nova (nenhuma tabela por trás de nenhum modelo,
+nenhuma operação de upgrade nova detectada). Suite completa da V2 sem
+regressão nos testes já existentes de digests/scheduler/jobs/worker.
+
+### Estado
+
+**Só código e testes locais, como nas Fatias 1-3.** Nenhuma migration
+aplicada a produção, nenhum job real activado, nenhuma mensagem Telegram
+real enviada. Commit local, âmbito restrito aos ficheiros desta fatia,
+trabalho não commitado de outras sessões nesta árvore partilhada deixado
+intocado.

@@ -24,9 +24,16 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from nemsei.assets.models import Asset
 from nemsei.config import external_capability_enabled
+from nemsei.contracts.service import scoped_asset_ids
 from nemsei.diagnostics.models import DiagnosticIncident
-from nemsei.notifications.models import DigestRun, NotificationChannel
+from nemsei.installations.models import Installation
+from nemsei.notifications.eligibility import eligible_for_recovery_digest
+from nemsei.notifications.enrichment import NotificationContext, build_context
+from nemsei.notifications.models import DIGEST_KINDS, DigestRun, NotificationChannel, NotificationEpisode
+from nemsei.notifications.problem_families import CATEGORIES
+from nemsei.notifications.render_telegram import duration_label, family_label
 from nemsei.notifications.telegram_client import TelegramClient, default_client_factory
 from nemsei.portfolios.diagnostics import (
     asset_ids_for_portfolio,
@@ -246,47 +253,334 @@ def render_digest_text(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+# --- decide: recoveries digest (req 13) ----------------------------------------
+
+
+def build_recovery_digest_payload(
+    session: Session, *, window_start: datetime, window_end: datetime, now: datetime | None = None
+) -> dict[str, Any]:
+    """Episodes that recovered inside this window but do not justify an
+    immediate push -- `notifications.eligibility.eligible_for_recovery_digest`
+    is the one place that decides which (the same hard floor as the
+    immediate path: never one that was never notified, never one already
+    sent immediately as a `resolved` `NotificationEvent`). Scoped to
+    O&M-active installations, same as every other operational surface (req
+    1) -- a recovery at an installation Solcor does not operate is not this
+    channel's concern.
+    """
+    scoped = scoped_asset_ids(session, asset_scope="om_active", on=window_end.date())
+    asset_ids = sorted(scoped) if scoped else []
+    if not asset_ids:
+        return {"window_start": window_start.isoformat(), "window_end": window_end.isoformat(), "recoveries": []}
+
+    closed = session.scalars(
+        select(NotificationEpisode).where(
+            NotificationEpisode.status == "closed",
+            NotificationEpisode.asset_id.in_(asset_ids),
+            NotificationEpisode.closed_at.is_not(None),
+            NotificationEpisode.closed_at >= window_start,
+            NotificationEpisode.closed_at < window_end,
+        )
+    )
+    rows: list[dict[str, Any]] = []
+    for episode in closed:
+        if not eligible_for_recovery_digest(episode):
+            continue
+        asset = session.get(Asset, episode.asset_id)
+        installation = session.get(Installation, asset.installation_id) if asset and asset.installation_id else None
+        name = installation.display_name if installation else (asset.canonical_name if asset else f"asset #{episode.asset_id}")
+        duration_minutes = round((episode.closed_at - episode.opened_at).total_seconds() / 60)
+        rows.append(
+            {
+                "asset_id": episode.asset_id,
+                "name": name,
+                "duration_minutes": duration_minutes,
+                "problem_family": episode.problem_family,
+            }
+        )
+    rows.sort(key=lambda row: row["name"] or "")
+    return {"window_start": window_start.isoformat(), "window_end": window_end.isoformat(), "recoveries": rows}
+
+
+def render_recovery_digest_text(payload: dict[str, Any]) -> str:
+    window_end = datetime.fromisoformat(payload["window_end"])
+    window_start = datetime.fromisoformat(payload["window_start"])
+    rows = payload["recoveries"]
+    hours = round((window_end - window_start).total_seconds() / 3600)
+    if not rows:
+        return f"Recuperações — últimas {hours}h\n\nNenhuma recuperação nesta janela."
+    lines = [f"Recuperações — últimas {hours}h", "", f"{len(rows)} instalações recuperaram:"]
+    for row in rows:
+        lines.append(f"- {row['name']} — {duration_label(timedelta(minutes=row['duration_minutes']))}")
+    return "\n".join(lines)
+
+
+# --- decide: morning O&M briefing (reqs 10-12) ----------------------------------
+
+# Worst-first tiebreak when one installation carries more than one open
+# episode: the briefing represents an installation once, by its single
+# worst problem -- "o que precisa de atenção primeiro *nesta instalação*",
+# not a second finding per episode. communication (whole plant dark) outranks
+# a confirmed fault, which outranks a coverage gap -- the same ordering
+# req 12 asks the categories themselves to respect.
+_FAMILY_RANK = {"communication": 0, "fault": 1, "coverage": 2}
+_SEVERITY_RANK = {"critical": 0, "warning": 1, "info": 2}
+
+
+def _pick_representative(episodes: list[NotificationEpisode]) -> NotificationEpisode:
+    return min(
+        episodes,
+        key=lambda episode: (
+            _FAMILY_RANK.get(episode.problem_family, 1),
+            _SEVERITY_RANK.get(episode.severity_peak, 1),
+            episode.opened_at,
+        ),
+    )
+
+
+def _briefing_row(context: NotificationContext, *, now: datetime) -> dict[str, Any]:
+    duration_minutes = round((now - context.episode.opened_at).total_seconds() / 60)
+    return {
+        "asset_id": context.asset.id,
+        "name": context.installation.display_name if context.installation else context.asset.canonical_name,
+        "problem_family": context.episode.problem_family,
+        "rule_code": context.incident.rule_code,
+        "category": context.category,
+        "duration_minutes": duration_minutes,
+        "installed_dc_power_kw": float(context.asset.installed_dc_power_kw) if context.asset.installed_dc_power_kw else None,
+        "energy_impact_kwh": float(context.energy_impact.lost_kwh) if context.energy_impact.lost_kwh is not None else None,
+        "financial_impact_eur": float(context.financial_impact.lost_eur) if context.financial_impact.lost_eur is not None else None,
+        "priority_score": context.priority.score,
+        "priority_bucket": context.priority.bucket,
+        "priority_reasons": context.priority.reasons,
+        "recurrence_count_24h": context.recurrence_count_24h,
+        "has_work_order": context.work_order is not None,
+        "work_order_label": f"WO-{context.work_order.id}" if context.work_order else None,
+        "work_planned_or_in_progress_today": context.work_planned_or_in_progress_today,
+        "is_esco_priority": context.is_esco_priority,
+        "contact_name": context.contact_name,
+        "contact_role": context.contact_role,
+        "contact_phone": context.contact_phone,
+        "suggested_action": context.suggested_action,
+        "incident_id": context.incident.id,
+    }
+
+
+def build_morning_briefing_payload(session: Session, *, now: datetime | None = None) -> dict[str, Any]:
+    """A snapshot of the O&M-active fleet's current state, ranked by
+    `notifications.priority.score_episode` -- the exact same engine and the
+    exact same `NotificationContext` (`notifications/enrichment.py::
+    build_context`) an immediate Telegram alert is rendered from. Never a
+    second ranking: the briefing's "PRIORIDADE ALTA" and an immediate
+    critical alert can never disagree about which installation matters more,
+    because they are the same function call.
+
+    This is a point-in-time snapshot, not a window aggregation like the
+    diagnostics/recoveries digests -- "what does the fleet look like right
+    now" has no meaningful "since the last briefing" delta the way "what
+    happened in the last 2h" does. `window_start`/`window_end` are still
+    recorded (by `generate_digest`'s own chaining, unchanged) purely so this
+    kind's `DigestRun` rows stay comparable/orderable with the other two,
+    not because the payload summarises the interval between them.
+
+    Known, documented gap (not solved here): an O&M-active asset with *no*
+    device and *no* plant reading ever is never evaluated by
+    `diagnostics/incidents.py` at all, so it can never have an episode and
+    reads as "operational" below -- indistinguishable, with today's data,
+    from a genuinely healthy installation. Every asset with at least one
+    historical reading already surfaces through `coverage`
+    (`stale_reading`/`device_unknown_status`/...), which is the common case;
+    a true zero-evidence asset is the one case this briefing cannot yet
+    tell apart from "fine". Revisit if that ever turns out to matter in
+    practice.
+    """
+    now_value = now or utc_now()
+    empty_counts = {category: 0 for category in CATEGORIES}
+    scoped = scoped_asset_ids(session, asset_scope="om_active", on=now_value.date())
+    asset_ids = sorted(scoped) if scoped else []
+    if not asset_ids:
+        return {
+            "generated_at": now_value.isoformat(), "om_active_count": 0, "operational_count": 0,
+            "category_counts": empty_counts, "high": [], "to_check": [], "recurring": [],
+            "work_planned_count": 0, "no_action_count": 0, "prioritized_today_count": 0,
+        }
+
+    open_episodes = list(
+        session.scalars(
+            select(NotificationEpisode).where(
+                NotificationEpisode.status == "open", NotificationEpisode.asset_id.in_(asset_ids)
+            )
+        )
+    )
+    by_asset: dict[int, list[NotificationEpisode]] = {}
+    for episode in open_episodes:
+        by_asset.setdefault(episode.asset_id, []).append(episode)
+
+    rows = [
+        _briefing_row(build_context(session, episode=_pick_representative(episodes), now=now_value), now=now_value)
+        for episodes in by_asset.values()
+    ]
+    rows.sort(key=lambda row: -row["priority_score"])
+
+    high = [row for row in rows if row["priority_bucket"] == "HIGH"]
+    to_check = [row for row in rows if row["priority_bucket"] != "HIGH"]
+    # >=3 episodes/24h, req 5's own recurrence threshold -- read straight off
+    # `recurrence_count_24h`, never re-derived with a different number here.
+    recurring = sorted((row for row in rows if row["recurrence_count_24h"] >= 3), key=lambda row: -row["recurrence_count_24h"])
+
+    category_counts = dict(empty_counts)
+    for row in rows:
+        category_counts[row["category"]] = category_counts.get(row["category"], 0) + 1
+
+    return {
+        "generated_at": now_value.isoformat(),
+        "om_active_count": len(asset_ids),
+        "operational_count": len(asset_ids) - len(rows),
+        "category_counts": category_counts,
+        "high": high,
+        "to_check": to_check,
+        "recurring": recurring,
+        "work_planned_count": sum(1 for row in rows if row["work_planned_or_in_progress_today"]),
+        "no_action_count": sum(1 for row in high if not row["has_work_order"]),
+        "prioritized_today_count": len(high),
+    }
+
+
+def _impact_text(row: dict[str, Any]) -> str:
+    kwh = row["energy_impact_kwh"]
+    if kwh is None:
+        return "não calculável"
+    eur = row["financial_impact_eur"]
+    return f"{kwh:g} kWh / ~€{eur:.0f}" if eur is not None else f"{kwh:g} kWh / € não calculável"
+
+
+def render_morning_briefing_text(payload: dict[str, Any]) -> str:
+    generated_at = datetime.fromisoformat(payload["generated_at"])
+    lines = ["O&M — Estado do parque", f"{generated_at.strftime('%d/%m/%Y')} · {generated_at.strftime('%H:%M')}"]
+
+    high = payload["high"]
+    if high:
+        lines.append("")
+        lines.append("PRIORIDADE ALTA")
+        lines.append("")
+        for index, row in enumerate(high, start=1):
+            lines.append(f"{index}. {row['name']}")
+            state = family_label(problem_family=row["problem_family"], rule_code=row["rule_code"])
+            lines.append(f"   {state} há {duration_label(timedelta(minutes=row['duration_minutes']))}")
+            if row["installed_dc_power_kw"] is not None:
+                lines.append(f"   {row['installed_dc_power_kw']:g} kWp")
+            lines.append(f"   Impacto estimado: {_impact_text(row)}")
+            lines.append(f"   Trabalho: {row['work_order_label']}" if row["work_order_label"] else "   Sem trabalho aberto")
+            if row["suggested_action"]:
+                lines.append(f"   Ação: {row['suggested_action'].splitlines()[0]}")
+            if row["contact_name"]:
+                contact = row["contact_name"] + (f" · {row['contact_role']}" if row["contact_role"] else "")
+                lines.append(f"   Contacto: {contact}")
+            if index != len(high):
+                lines.append("")
+
+    if payload["to_check"]:
+        lines.append("")
+        lines.append("A VERIFICAR")
+        lines.append("")
+        for row in payload["to_check"]:
+            state = family_label(problem_family=row["problem_family"], rule_code=row["rule_code"])
+            lines.append(f"- {row['name']} — {state.lower()} {duration_label(timedelta(minutes=row['duration_minutes']))}")
+
+    if payload["recurring"]:
+        lines.append("")
+        lines.append("RECORRENTES")
+        lines.append("")
+        for row in payload["recurring"]:
+            lines.append(f"- {row['name']} — {row['recurrence_count_24h']} falhas/24h")
+
+    lines.append("")
+    lines.append("RESUMO")
+    lines.append("")
+    counts = payload["category_counts"]
+    lines.append(f"{payload['om_active_count']} contratos O&M ativos")
+    lines.append(f"{payload['operational_count']} operacionais")
+    lines.append(f"{counts.get('communication_issue', 0)} offline")
+    lines.append(f"{counts.get('operational_fault', 0)} fault")
+    lines.append(f"{counts.get('monitoring_coverage', 0)} sem dados suficientes")
+    lines.append("")
+    lines.append(f"{payload['prioritized_today_count']} prioritários hoje")
+    lines.append(f"{payload['work_planned_count']} já têm trabalho planeado")
+    lines.append(f"{payload['no_action_count']} problema(s) sem ação")
+
+    return "\n".join(lines)
+
+
 # --- generate: idempotent, restart-safe, one row per window -------------------
 
 
-def generate_digest(session: Session, *, window_end: datetime, interval_minutes: int, now: datetime | None = None) -> DigestRun | None:
-    """One digest for the window ending at `window_end`.
+# Payload builder + renderer per kind (Fatia 4 adds the last two) -- one
+# dispatch table, not three copies of `generate_digest`'s own machinery.
+# Every builder takes the same `(session, *, window_start, window_end, now)`
+# shape even though `morning_briefing`'s payload is a snapshot *at*
+# `window_end` rather than an aggregation *over* the window -- see
+# `build_morning_briefing_payload`'s own docstring for why that is still the
+# right window semantics to store, not a schema mismatch.
+def _builders_for(kind: str) -> tuple[Callable[..., dict[str, Any]], Callable[[dict[str, Any]], str]]:
+    if kind == "recoveries":
+        return build_recovery_digest_payload, render_recovery_digest_text
+    if kind == "morning_briefing":
+        return (lambda session, *, window_start, window_end, now: build_morning_briefing_payload(session, now=now)), render_morning_briefing_text
+    return build_digest_payload, render_digest_text
 
-    `window_start` is the previous `DigestRun.window_end` when one exists --
-    windows chain, so "since the last digest" is always literally true, not
-    approximated. With no previous digest, the window is bootstrapped to
-    exactly one cadence interval, so the very first digest is shaped the
-    same as every one after it, not an arbitrarily different size.
+
+def generate_digest(
+    session: Session, *, window_end: datetime, interval_minutes: int, kind: str = "diagnostics", now: datetime | None = None
+) -> DigestRun | None:
+    """One digest of the given `kind` for the window ending at `window_end`.
+
+    `window_start` is the previous `DigestRun` *of the same kind*'s
+    `window_end` when one exists -- windows chain per kind, so "since the
+    last digest" is always literally true for that kind, never blended with
+    another kind's cadence (the diagnostics digest, the 2h recovery
+    grouping, and the daily briefing all chain independently). With no
+    previous digest of this kind, the window is bootstrapped to exactly one
+    cadence interval, so the very first digest is shaped the same as every
+    one after it.
 
     Idempotent by construction, and checked in the right order: asking for
-    the *same* `window_end` twice must return the *same* row, without ever
-    trying to chain a new window off of it -- re-deriving `window_start`
-    from "the most recent `DigestRun`" before checking whether `window_end`
-    itself was already generated would find that same row as its own
-    "previous" digest on the second call and compute an empty or negative
-    window. So the idempotency check comes first, keyed on `window_end`
-    alone (what the caller is actually asking to generate), and only a
-    genuinely new `window_end` ever reaches the chaining logic below. A
-    concurrent attempt for a new window still loses a `SAVEPOINT`-guarded
-    unique-constraint race gracefully (same pattern as D1/D3) rather than
-    aborting the caller's transaction.
+    the *same* `(kind, window_end)` twice must return the *same* row,
+    without ever trying to chain a new window off of it -- re-deriving
+    `window_start` from "the most recent `DigestRun` of this kind" before
+    checking whether `window_end` itself was already generated would find
+    that same row as its own "previous" digest on the second call and
+    compute an empty or negative window. So the idempotency check comes
+    first, keyed on `(kind, window_end)` alone (what the caller is actually
+    asking to generate), and only a genuinely new `window_end` ever reaches
+    the chaining logic below. A concurrent attempt for a new window still
+    loses a `SAVEPOINT`-guarded unique-constraint race gracefully (same
+    pattern as D1/D3) rather than aborting the caller's transaction.
     """
+    if kind not in DIGEST_KINDS:
+        raise ValueError(f"Unknown digest kind: {kind!r}")
     now_value = now or utc_now()
 
     already = session.scalar(
-        select(DigestRun).where(DigestRun.window_end == window_end).order_by(DigestRun.id.desc()).limit(1)
+        select(DigestRun)
+        .where(DigestRun.kind == kind, DigestRun.window_end == window_end)
+        .order_by(DigestRun.id.desc())
+        .limit(1)
     )
     if already is not None:
         return already
 
-    previous = session.scalar(select(DigestRun).order_by(DigestRun.window_end.desc()).limit(1))
+    previous = session.scalar(
+        select(DigestRun).where(DigestRun.kind == kind).order_by(DigestRun.window_end.desc()).limit(1)
+    )
     window_start = previous.window_end if previous is not None else window_end - timedelta(minutes=interval_minutes)
     if window_end <= window_start:
         return None
 
-    payload = build_digest_payload(session, window_start=window_start, window_end=window_end, now=now_value)
-    text = render_digest_text(payload)
+    build_payload, render_text = _builders_for(kind)
+    payload = build_payload(session, window_start=window_start, window_end=window_end, now=now_value)
+    text = render_text(payload)
     digest = DigestRun(
+        kind=kind,
         window_start=window_start,
         window_end=window_end,
         generated_at=now_value,
@@ -304,7 +598,9 @@ def generate_digest(session: Session, *, window_end: datetime, interval_minutes:
     except IntegrityError:
         # A concurrent generator won this exact window first.
         return session.scalar(
-            select(DigestRun).where(DigestRun.window_start == window_start, DigestRun.window_end == window_end)
+            select(DigestRun).where(
+                DigestRun.kind == kind, DigestRun.window_start == window_start, DigestRun.window_end == window_end
+            )
         )
     return digest
 

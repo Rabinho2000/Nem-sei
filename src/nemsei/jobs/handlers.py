@@ -511,22 +511,38 @@ def _execute_notification_processing(*, session_factory: sessionmaker[Session]) 
 
 
 def _execute_digest_generation(job: ClaimedJob, *, settings: Settings, session_factory: sessionmaker[Session]) -> JobOutcome:
-    """One digest-generation pass, then a delivery attempt (D6).
+    """One digest-generation pass, then a delivery attempt.
+
+    Serves all three `DigestRun` kinds (migration 0036, Fatia 4) -- D6's
+    original diagnostics digest, req 13's recovery grouping, and reqs
+    10-11's morning briefing -- through the one job type
+    (`digests.generate`) and the one handler, dispatching only on the
+    `kind` the enqueuing `JobRepository` method stashed in the payload.
+    `kind` defaults to `"diagnostics"` for a job enqueued before this
+    payload key existed (`enqueue_due_digest_generation` still does not set
+    it) -- not a new job type, not a second handler.
 
     `window_end` comes from the job's own `scheduled_for` payload -- the
-    same due-slot value `JobRepository.enqueue_due_digest_generation`
-    persisted -- never a fresh `datetime.now()` read here, which is what
-    makes `DigestRun`'s unique `(window_start, window_end)` constraint
-    actually catch a concurrent-retry race. No provider call anywhere in
-    this path; delivery can only ever reach the mock Telegram client.
+    same due-slot value the enqueuing method persisted -- never a fresh
+    `datetime.now()` read here, which is what makes `DigestRun`'s unique
+    `(kind, window_start, window_end)` constraint actually catch a
+    concurrent-retry race. No provider call anywhere in this path; delivery
+    can only ever reach the mock Telegram client (or the real one, since
+    D4, if a bot token is mounted and the capability is on).
     """
     scheduled_for = job.payload.get("scheduled_for")
     if not isinstance(scheduled_for, str):
         raise ValueError("Digest generation job is missing its scheduled_for window end.")
     window_end = datetime.fromisoformat(scheduled_for)
+    kind = job.payload.get("kind", "diagnostics")
+    interval_minutes = {
+        "diagnostics": settings.digest_generation_interval_minutes,
+        "recoveries": settings.recovery_digest_interval_minutes,
+        "morning_briefing": settings.morning_briefing_interval_minutes,
+    }.get(kind, settings.digest_generation_interval_minutes)
 
     with session_factory() as session, session.begin():
-        digest = generate_digest(session, window_end=window_end, interval_minutes=settings.digest_generation_interval_minutes)
+        digest = generate_digest(session, window_end=window_end, interval_minutes=interval_minutes, kind=kind)
         digest_id = digest.id if digest is not None else None
 
     delivery_attempted = False
@@ -537,6 +553,7 @@ def _execute_digest_generation(job: ClaimedJob, *, settings: Settings, session_f
     return JobOutcome(
         status="success",
         result={
+            "kind": kind,
             "digest_generated": digest_id is not None,
             "digest_id": digest_id,
             "delivery_attempted": delivery_attempted,

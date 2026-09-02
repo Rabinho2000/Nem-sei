@@ -47,10 +47,12 @@ class NotificationContext:
     is_om: bool
     is_esco_priority: bool
     priority: PriorityScore
+    recurrence_count_24h: int
     energy_impact: EnergyImpact
     financial_impact: FinancialImpact
     suggested_action: str
     work_order: WorkOrder | None  # the most recent one addressing this episode's current incident, if any
+    work_planned_or_in_progress_today: bool
     contact_name: str | None
     contact_role: str | None
     contact_phone: str | None
@@ -122,8 +124,10 @@ def build_context(session: Session, *, episode: NotificationEpisode, now: dateti
         category=category_for(episode.problem_family),
         contract_family=family, contract_family_label=_FAMILY_LABELS.get(family, family),
         om_status=om, is_om=om in ("active", "undated"), is_esco_priority=priority_family == "high",
-        priority=priority, energy_impact=energy, financial_impact=financial, suggested_action=action,
-        work_order=work_order, contact_name=contact.name if contact else None,
+        priority=priority, recurrence_count_24h=recurrence, energy_impact=energy, financial_impact=financial,
+        suggested_action=action,
+        work_order=work_order, work_planned_or_in_progress_today=work_planned_today,
+        contact_name=contact.name if contact else None,
         contact_role=contact.role if contact else None, contact_phone=contact.phone if contact else None,
         contact_email=contact.email if contact else None,
     )

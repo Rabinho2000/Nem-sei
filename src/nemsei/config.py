@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy.engine import make_url
 
@@ -243,6 +244,22 @@ class Settings:
     # 15-minute cadence.
     digest_generation_enabled: bool = False
     digest_generation_interval_minutes: int = 1440
+    # Telegram O&M redesign, Fatia 4 (req 13): recoveries that do not
+    # justify an immediate push, grouped into one message every 2h by
+    # default. Off by default, same reasoning as every other schedule here;
+    # zero provider calls (reads notification_episodes, writes digest_runs
+    # kind='recoveries').
+    recovery_digest_generation_enabled: bool = False
+    recovery_digest_interval_minutes: int = 120
+    # Reqs 10-11: the daily O&M briefing. Off by default. `_hour`/`_minute`/
+    # `_timezone` only matter for the very first activation (the anchor for
+    # `_next_daily_local_time`) -- every slot after that is
+    # `_interval_minutes` past the previous one, same as any other schedule.
+    morning_briefing_enabled: bool = False
+    morning_briefing_interval_minutes: int = 1440
+    morning_briefing_hour: int = 9
+    morning_briefing_minute: int = 0
+    morning_briefing_timezone: str = "Europe/Lisbon"
     # Huawei SCADA (docs/v2/HUAWEI_SCADA.md). Unlike every other integration
     # in this codebase, this one is *inbound*: the logger dials in and the
     # listener answers. So there is no interval to schedule and no call budget
@@ -365,6 +382,19 @@ class Settings:
             digest_generation_interval_minutes=int(
                 os.environ.get("NEMSEI_V2_DIGEST_GENERATION_INTERVAL_MINUTES", "1440")
             ),
+            recovery_digest_generation_enabled=parse_bool(
+                os.environ.get("NEMSEI_V2_RECOVERY_DIGEST_GENERATION_ENABLED"), default=False
+            ),
+            recovery_digest_interval_minutes=int(
+                os.environ.get("NEMSEI_V2_RECOVERY_DIGEST_INTERVAL_MINUTES", "120")
+            ),
+            morning_briefing_enabled=parse_bool(os.environ.get("NEMSEI_V2_MORNING_BRIEFING_ENABLED"), default=False),
+            morning_briefing_interval_minutes=int(
+                os.environ.get("NEMSEI_V2_MORNING_BRIEFING_INTERVAL_MINUTES", "1440")
+            ),
+            morning_briefing_hour=int(os.environ.get("NEMSEI_V2_MORNING_BRIEFING_HOUR", "9")),
+            morning_briefing_minute=int(os.environ.get("NEMSEI_V2_MORNING_BRIEFING_MINUTE", "0")),
+            morning_briefing_timezone=os.environ.get("NEMSEI_V2_MORNING_BRIEFING_TIMEZONE", "Europe/Lisbon").strip(),
             huawei_scada_listener_enabled=parse_bool(
                 os.environ.get("NEMSEI_V2_HUAWEI_SCADA_LISTENER_ENABLED"), default=False
             ),
@@ -455,6 +485,16 @@ class Settings:
             raise ConfigurationError("Notification processing interval must be positive.")
         if self.digest_generation_interval_minutes <= 0:
             raise ConfigurationError("Digest generation interval must be positive.")
+        if self.recovery_digest_interval_minutes <= 0:
+            raise ConfigurationError("Recovery digest interval must be positive.")
+        if self.morning_briefing_interval_minutes <= 0:
+            raise ConfigurationError("Morning briefing interval must be positive.")
+        if not 0 <= self.morning_briefing_hour <= 23 or not 0 <= self.morning_briefing_minute <= 59:
+            raise ConfigurationError("Morning briefing hour/minute must be a valid time of day.")
+        try:
+            ZoneInfo(self.morning_briefing_timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ConfigurationError(f"Unknown morning briefing timezone: {self.morning_briefing_timezone!r}") from exc
         if not 1 <= self.huawei_scada_listener_port <= 65535:
             raise ConfigurationError("Huawei SCADA listener port must be a valid TCP port.")
         if min(

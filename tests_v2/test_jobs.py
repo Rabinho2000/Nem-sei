@@ -432,6 +432,76 @@ def test_digest_generation_schedule_requires_a_positive_interval(settings, monke
         pass
 
 
+# --- Telegram O&M redesign, Fatia 4: recovery digest + morning briefing --------
+
+
+def test_recovery_digest_schedule_carries_its_kind_and_chains_like_the_diagnostics_digest(settings, monkeypatch) -> None:
+    repo = repository(settings, monkeypatch)
+    t0 = utc_now()
+
+    job, created = repo.enqueue_due_recovery_digest(interval_minutes=120, now=t0)
+    assert created and job is not None
+    assert job.job_type == "digests.generate"
+    assert job.payload_json["kind"] == "recoveries"
+
+    again, created_again = repo.enqueue_due_recovery_digest(interval_minutes=120, now=t0)
+    assert created_again is False and again is None
+
+    second, created_second = repo.enqueue_due_recovery_digest(interval_minutes=120, now=t0 + timedelta(minutes=120))
+    assert created_second and second is not None and second.id != job.id
+
+
+def test_morning_briefing_first_activation_anchors_to_the_next_local_9am(settings, monkeypatch) -> None:
+    """Req 10-11's central scheduling rule: turning this on mid-afternoon must
+    not fire a briefing mid-afternoon -- the very first slot is the *next*
+    09:00 Europe/Lisbon, in UTC, never "now"."""
+    from datetime import datetime, timezone
+
+    repo = repository(settings, monkeypatch)
+    afternoon = datetime(2026, 7, 24, 13, 0, tzinfo=timezone.utc)  # 14:00 in Lisbon summer time (UTC+1)
+
+    job, created = repo.enqueue_due_morning_briefing(now=afternoon)
+    assert created is False and job is None  # not due yet -- 09:00 tomorrow local, not this afternoon
+
+    next_morning = datetime(2026, 7, 25, 8, 0, tzinfo=timezone.utc)  # 09:00 Lisbon summer time
+    due_job, due_created = repo.enqueue_due_morning_briefing(now=next_morning)
+    assert due_created and due_job is not None
+    assert due_job.job_type == "digests.generate"
+    assert due_job.payload_json["kind"] == "morning_briefing"
+
+
+def test_morning_briefing_schedule_is_idempotent_and_advances_daily(settings, monkeypatch) -> None:
+    from datetime import datetime, timezone
+
+    repo = repository(settings, monkeypatch)
+    at_9am = datetime(2026, 7, 25, 8, 0, tzinfo=timezone.utc)  # 09:00 Lisbon
+
+    job, created = repo.enqueue_due_morning_briefing(now=at_9am)
+    assert created and job is not None
+
+    again, created_again = repo.enqueue_due_morning_briefing(now=at_9am)
+    assert created_again is False and again is None
+
+    next_day = datetime(2026, 7, 26, 8, 0, tzinfo=timezone.utc)
+    second, created_second = repo.enqueue_due_morning_briefing(now=next_day)
+    assert created_second and second is not None and second.id != job.id
+
+
+def test_morning_briefing_uses_the_configured_hour_and_timezone(settings, monkeypatch) -> None:
+    from datetime import datetime, timezone
+
+    repo = repository(settings, monkeypatch)
+    # Requesting 07:00 UTC (a fixed-offset zone, to avoid DST ambiguity in
+    # the test itself): 06:59 UTC is not yet due, 07:00 UTC is.
+    not_yet = datetime(2026, 7, 24, 6, 59, tzinfo=timezone.utc)
+    job, created = repo.enqueue_due_morning_briefing(now=not_yet, hour=7, minute=0, tz_name="UTC")
+    assert created is False and job is None
+
+    due = datetime(2026, 7, 24, 7, 0, tzinfo=timezone.utc)
+    due_job, due_created = repo.enqueue_due_morning_briefing(now=due, hour=7, minute=0, tz_name="UTC")
+    assert due_created and due_job is not None
+
+
 def test_production_backfill_progress_is_persisted_before_reschedule(settings, monkeypatch) -> None:
     repo = repository(settings, monkeypatch)
     job, _ = repo.enqueue(

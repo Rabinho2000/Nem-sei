@@ -109,6 +109,25 @@ class Scheduler:
                 interval_minutes=self.settings.digest_generation_interval_minutes,
             )
             created = created or digest_created
+        # Telegram O&M redesign, Fatia 4 (req 13): grouped recoveries, off by
+        # default, same content-digest reasoning as the diagnostics digest
+        # above -- no provider call, reads notification_episodes only.
+        if self.settings.recovery_digest_generation_enabled:
+            _recovery_job, recovery_created = self.repository.enqueue_due_recovery_digest(
+                interval_minutes=self.settings.recovery_digest_interval_minutes,
+            )
+            created = created or recovery_created
+        # Reqs 10-11: the daily O&M briefing, off by default. No provider
+        # call; reads notification_episodes/contracts/work_orders/contacts,
+        # all already-persisted.
+        if self.settings.morning_briefing_enabled:
+            _briefing_job, briefing_created = self.repository.enqueue_due_morning_briefing(
+                interval_minutes=self.settings.morning_briefing_interval_minutes,
+                hour=self.settings.morning_briefing_hour,
+                minute=self.settings.morning_briefing_minute,
+                tz_name=self.settings.morning_briefing_timezone,
+            )
+            created = created or briefing_created
         # Huawei SCADA. Both are pure database work over samples a separate
         # listener process already collected -- no provider call, no call
         # budget, and nothing here can start or stop the listener itself.

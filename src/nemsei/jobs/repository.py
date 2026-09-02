@@ -4,8 +4,9 @@ from __future__ import annotations
 import secrets
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import Engine, func, insert, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
@@ -78,6 +79,23 @@ def _catch_up_slot(slot: datetime, *, now: datetime, interval: timedelta) -> dat
     a different question with a different answer.
     """
     return now if now - slot > interval else slot
+
+
+def _next_daily_local_time(now: datetime, *, hour: int, minute: int, tz_name: str) -> datetime:
+    """The next wall-clock `hour:minute` in `tz_name`, at or after `now`,
+    expressed back in UTC -- the morning briefing's 09:00 anchor (reqs
+    10-11). A real timezone lookup (`zoneinfo`, already a dependency
+    elsewhere in this codebase -- `integrations/fusionsolar/client.py` and
+    friends), not raw UTC arithmetic: Europe/Lisbon's offset from UTC
+    changes with daylight saving, and "09:00 local" must track the wall
+    clock, not a fixed UTC hour that would drift by an hour twice a year.
+    """
+    zone = ZoneInfo(tz_name)
+    local_now = now.astimezone(zone)
+    candidate = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate < local_now:
+        candidate += timedelta(days=1)
+    return candidate.astimezone(timezone.utc)
 
 
 class JobRepository:
@@ -1355,6 +1373,147 @@ class JobRepository:
                 session.expunge(existing)
                 return existing, False
 
+    def enqueue_due_recovery_digest(
+        self, *, interval_minutes: int, now: datetime | None = None
+    ) -> tuple[Job | None, bool]:
+        """Enqueue one recovery-digest cycle when due -- req 13's grouped
+        recoveries. Same shape as `enqueue_due_digest_generation` (D6): both
+        are content summaries whose windows chain from the previous digest
+        of the same kind, not from the schedule slot, so a missed cycle
+        after downtime is a genuinely different (wider) window to summarise
+        -- not duplicate work `_catch_up_slot` should skip. Deliberately its
+        own small method, not `_enqueue_due_cycle`, for exactly that reason:
+        `_enqueue_due_cycle` always applies `_catch_up_slot`, which is right
+        for a state poll and wrong for a digest.
+        """
+        return self._enqueue_due_digest(
+            schedule_key="digests.generate.recoveries", kind="recoveries",
+            interval_minutes=interval_minutes, now=now,
+        )
+
+    def enqueue_due_morning_briefing(
+        self, *, interval_minutes: int = 1440, hour: int = 9, minute: int = 0,
+        tz_name: str = "Europe/Lisbon", now: datetime | None = None,
+    ) -> tuple[Job | None, bool]:
+        """Enqueue one morning-briefing cycle when due -- reqs 10-11.
+
+        Unlike the two digest kinds above, this is a point-in-time snapshot
+        of the fleet, not a window aggregation (see
+        `notifications/digests.py::build_morning_briefing_payload`), so it
+        uses `_enqueue_due_cycle` -- catch-up-by-skipping is the *right*
+        behaviour here: three backlogged briefings after an outage would all
+        show roughly the same growing/shrinking snapshot at different stale
+        timestamps, not three genuinely different summaries, so skipping to
+        one current briefing (same reasoning `_catch_up_slot`'s own
+        docstring gives for a device poll) is correct, not a compromise.
+
+        The very first activation anchors to the *next* 09:00 in `tz_name`
+        (`_next_daily_local_time`), not "now" -- turning this on at 14:00
+        must not fire a briefing mid-afternoon.
+        """
+        now_value = now or utc_now()
+        return self._enqueue_due_cycle(
+            job_type="digests.generate",
+            schedule_key="digests.generate.morning_briefing",
+            interval_minutes=interval_minutes,
+            payload={"kind": "morning_briefing"},
+            initial_slot=_next_daily_local_time(now_value, hour=hour, minute=minute, tz_name=tz_name),
+            now=now_value,
+        )
+
+    def _enqueue_due_digest(
+        self, *, schedule_key: str, kind: str, interval_minutes: int, now: datetime | None = None
+    ) -> tuple[Job | None, bool]:
+        """The chaining-without-catch-up shape `enqueue_due_digest_generation`
+        established for D6 -- extracted here for `enqueue_due_recovery_digest`
+        to reuse rather than duplicate, without touching that pre-existing,
+        tested method's own inline copy of the same logic (the Huawei SCADA
+        precedent: retrofitting old, working schedules onto a new shared
+        helper is a risk this codebase has already decided, twice, not to
+        take for no operational gain).
+        """
+        if interval_minutes <= 0:
+            raise ValueError(f"{schedule_key} interval must be positive.")
+        now_value = now or utc_now()
+        job_type = "digests.generate"
+        try:
+            with self._immediate_session() as session:
+                schedule = session.get(ScheduleState, schedule_key)
+                if schedule is not None and as_utc(schedule.next_run_at) > now_value:
+                    return None, False
+                slot = as_utc(schedule.next_run_at) if schedule is not None else now_value
+                dedupe_key = f"{schedule_key}:{slot.isoformat()}"
+                existing = session.scalar(
+                    select(Job).where(
+                        Job.job_type == job_type,
+                        Job.dedupe_key == dedupe_key,
+                        Job.status.in_(ACTIVE_STATUSES),
+                    )
+                )
+                if existing is None:
+                    job = Job(
+                        job_type=job_type,
+                        status="queued",
+                        payload_json={"scheduled_for": slot.isoformat(), "kind": kind},
+                        dedupe_key=dedupe_key,
+                        priority=150,
+                        available_at=now_value,
+                        attempt_count=0,
+                        max_attempts=3,
+                        created_at=now_value,
+                        updated_at=now_value,
+                    )
+                    session.add(job)
+                    session.flush()
+                    self._event(
+                        session,
+                        job_id=job.id,
+                        event_type="enqueued",
+                        attempt=0,
+                        from_status=None,
+                        to_status="queued",
+                        actor_source="scheduler",
+                        metadata={"schedule_key": schedule_key, "dedupe_key": dedupe_key},
+                        occurred_at=now_value,
+                    )
+                    created = True
+                else:
+                    job = existing
+                    created = False
+                if schedule is None:
+                    schedule = ScheduleState(schedule_key=schedule_key, next_run_at=slot, updated_at=now_value)
+                    session.add(schedule)
+                schedule.last_enqueued_at = now_value
+                schedule.next_run_at = slot + timedelta(minutes=interval_minutes)
+                schedule.updated_at = now_value
+                session.flush()
+                session.expunge(job)
+                return job, created
+        except IntegrityError:
+            with self._immediate_session() as session:
+                existing = session.scalar(
+                    select(Job).where(
+                        Job.job_type == job_type,
+                        Job.dedupe_key == dedupe_key,
+                        Job.status.in_(ACTIVE_STATUSES),
+                    )
+                )
+                if existing is None:
+                    raise
+                self._event(
+                    session,
+                    job_id=existing.id,
+                    event_type="dedupe_reused",
+                    attempt=existing.attempt_count,
+                    from_status=existing.status,
+                    to_status=existing.status,
+                    actor_source="scheduler",
+                    metadata={"schedule_key": schedule_key, "dedupe_key": dedupe_key},
+                    occurred_at=now_value,
+                )
+                session.expunge(existing)
+                return existing, False
+
     def _enqueue_due_cycle(
         self,
         *,
@@ -1363,6 +1522,7 @@ class JobRepository:
         interval_minutes: int,
         payload: dict[str, Any] | None = None,
         priority: int = 150,
+        initial_slot: datetime | None = None,
         now: datetime | None = None,
     ) -> tuple[Job | None, bool]:
         """One due-slot enqueue, shared by the schedules that need nothing else.
@@ -1378,6 +1538,14 @@ class JobRepository:
         stopped for days enqueues one cycle instead of the whole backlog, and
         a dedupe key that makes two concurrent ticks idempotent (with the
         `IntegrityError` fallback for the race the unique index catches).
+
+        `initial_slot` overrides only the very first slot, for a schedule
+        whose first due moment is not simply "whenever this got turned on" --
+        the morning briefing's next-09:00 anchor
+        (`_next_daily_local_time`/`enqueue_due_morning_briefing`), so
+        activating it at 14:00 does not fire a briefing mid-afternoon. Every
+        slot after the first still advances by `interval_minutes` and is
+        still subject to `_catch_up_slot` exactly like any other schedule.
         """
         if interval_minutes <= 0:
             raise ValueError(f"{job_type} interval must be positive.")
@@ -1386,9 +1554,22 @@ class JobRepository:
         try:
             with self._immediate_session() as session:
                 schedule = session.get(ScheduleState, schedule_key)
+                if schedule is None and initial_slot is not None and initial_slot > now_value:
+                    # First activation, anchored to a future slot (the next
+                    # 09:00 local, not "now"). Persist the schedule so it is
+                    # not recomputed -- and does not drift -- on the next
+                    # tick, but enqueue nothing until that slot actually
+                    # arrives: without this branch, the code below would
+                    # fall through and enqueue a job right now carrying a
+                    # future `scheduled_for`, which is exactly the
+                    # mid-afternoon briefing this parameter exists to
+                    # prevent.
+                    session.add(ScheduleState(schedule_key=schedule_key, next_run_at=initial_slot, updated_at=now_value))
+                    session.flush()
+                    return None, False
                 if schedule is not None and as_utc(schedule.next_run_at) > now_value:
                     return None, False
-                slot = as_utc(schedule.next_run_at) if schedule is not None else now_value
+                slot = as_utc(schedule.next_run_at) if schedule is not None else (initial_slot or now_value)
                 slot = _catch_up_slot(slot, now=now_value, interval=timedelta(minutes=interval_minutes))
                 dedupe_key = f"{schedule_key}:{slot.isoformat()}"
                 existing = session.scalar(
