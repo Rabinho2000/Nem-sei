@@ -293,3 +293,72 @@ uma distinção que a proveniência de provider não substitui. Decisão final:
   caso hipotético, e mexer no motor que classifica os incidentes reais exige a
   sua própria passagem cuidadosa contra a população real, não uma alteração
   apressada a seguir a um bloco de schema.
+
+## Timeline como projeção, e o gap das regras de incidentes fechado (2026-09-02)
+
+Sem migração em nenhum dos dois blocos.
+
+- **`timeline/service.py` é só leitura**, sem tabela nova. Junta
+  `monitoring_observations`, `device_status_facts` (colapsado a transições,
+  não uma linha por sondagem), `diagnostic_incidents`, `incident_notes`,
+  `work_orders` e `visits`, por `Installation`. `Visit.visit_date` é uma data,
+  não uma hora, e o evento correspondente fica marcado `precision: "day"` e
+  ordena à meia-noite UTC — nunca inventa uma hora que os dados não têm, o que
+  tem uma consequência real e testada: um evento de dia único pode ordenar
+  *antes* de um evento com hora do mesmo dia.
+
+- **A análise das regras existentes contra "janela produtiva" mostrou que
+  nenhuma precisava dela.** As regras de comparação entre pares
+  (`power_disparity_among_peers`, etc.) já só comparam dispositivos com
+  produção real acima de um limiar — de noite, sem pares acima do limiar, a
+  regra não corre. Um inversor em repouso já lê `standby`, não `unavailable`,
+  na camada de classificação (`diagnostics/rules.py`), antes deste módulo ver
+  o dado. A peça que faltava de facto era a única que o próprio pedido nomeia
+  sem existir ainda: **`zero_production_in_productive_window`** — produção
+  nula, evidenciada (nunca por ausência de leitura, isso já é
+  `device_no_history`/`stale_reading`), em todos os equipamentos com leitura,
+  há mais de 30 minutos, dentro do período produtivo. Como exige leituras
+  frescas para sequer avaliar, é auto-limitada à sondagem em tempo real que
+  hoje só existe para o asset da canary — não pode disparar para as 265
+  instalações sem monitorização ao vivo.
+
+- **Persistência por severidade, fechada em `diagnostics/incidents.py`**:
+  `info` nunca persiste (`partial_device_coverage` nunca disparou em
+  produção, mas o caminho existia e teria criado incidente no dia em que
+  disparasse). `warning` espera que o `active_since` da própria finding — já
+  andado a partir de histórico real, nunca "desde que o avaliador arrancou" —
+  tenha pelo menos 15 min, `WARNING_PERSISTENCE_THRESHOLD`. `critical`
+  continua imediato, como sempre foi.
+
+  **Um defeito de design apanhado pelo teste do `device_no_history`, não por
+  inspeção**: a proteção `since = finding.active_since or now` fazia o tempo
+  decorrido ser sempre zero para uma finding sem evidência de duração
+  nenhuma (`active_since=None`) — nunca haveria um `now` anterior para
+  comparar, por isso nunca cruzaria os 15 minutos, em avaliação alguma,
+  para sempre. Corrigido: sem evidência de duração, trata-se como acionável
+  já, tal como `critical` — a proteção existe para filtrar picos transitórios
+  usando evidência real; sem essa evidência não há o que medir.
+
+- **Um segundo problema, este só no teste, não no código de produção**: ao
+  reescrever `test_an_asset_level_finding_opens_one_incident_with_a_null_device_id`
+  para usar `plant_offline` em vez do agora-nunca-persistente
+  `partial_device_coverage`, o teste falhava por faltar `session.flush()`
+  antes de `evaluate_and_persist_incidents` ler de volta, na mesma sessão
+  `autoflush=False`, uma linha `MonitoringObservation` ainda só adicionada,
+  nunca gravada. Corrigido no teste.
+
+- **Recorrência é uma consulta, nunca uma coluna.** `recurrence_count`/
+  `is_recurring` contam episódios (`DiagnosticIncident.opened_at`) da mesma
+  identidade num`RECURRENCE_WINDOW` de 24h, terminando na abertura do
+  próprio incidente — nunca "agora", para que ser recorrente não deixe de o
+  ser só porque o tempo passou e a janela deslizou. Mesma razão que
+  `contracts.om_status` deriva em vez de guardar: o facto (`opened_at` de
+  linhas passadas) já existe, e uma segunda coluna derivada convida a
+  divergir dela.
+
+Verificado com uma leitura sem escrita (transação revertida) contra uma
+cópia restaurada da produção real: 136 assets avaliados, 445 incidentes
+abertos confirmados, **0 incidentes novos** (nenhuma instalação real tem
+ainda coordenadas importadas, por isso a nova regra de produção nula não
+pode disparar), **0 diferidos**, e 1 dos 445 incidentes abertos qualifica
+como recorrente hoje. Cópia descartável, sem escrita real.

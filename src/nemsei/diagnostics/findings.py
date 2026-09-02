@@ -27,6 +27,7 @@ from decimal import Decimal
 from typing import Any, Callable
 
 from nemsei.diagnostics.models import DeviceStatusFact
+from nemsei.monitoring.production_window import ProductionWindow
 
 
 SEVERITY_ORDER = {"critical": 0, "warning": 1, "info": 2}
@@ -88,6 +89,7 @@ def evaluate_asset_findings(
     now: datetime,
     history_for_device: Callable[[int], list[DeviceStatusFact]] | None = None,
     stale_after: timedelta = _DEFAULT_STALE_AFTER,
+    production_window: ProductionWindow | None = None,
 ) -> list[DiagnosticFinding]:
     """Evaluate every rule for one asset's current device rows.
 
@@ -103,12 +105,30 @@ def evaluate_asset_findings(
     latest reading. Without it, `active_since` falls back to `observed_at`
     (or `now`, for `device_no_history`) -- still honest, just less precise,
     and each such finding's `missing_data` says so.
+
+    `production_window`, when given, is the one rule in this module that
+    needs to know whether the sun is up: `_production_absence_findings`.
+    Every other rule here is already correctly silent overnight for reasons
+    that have nothing to do with sun position -- the peer-comparison rules
+    only compare devices that are actually producing (a whole site at rest
+    has no peer above the comparison floor, so nothing is compared), and a
+    resting inverter already reads `standby`, not `unavailable`, at the
+    classification layer (`diagnostics/rules.py`) before this module ever
+    sees it. Passing `None` (the default) skips the new rule entirely rather
+    than guessing a window -- exactly what every caller that predates
+    coordinates existing keeps doing, unchanged.
     """
     findings: list[DiagnosticFinding] = []
     for row in rows:
         findings.extend(_device_state_findings(row, asset_id=asset_id, now=now, history_for_device=history_for_device, stale_after=stale_after))
     findings.extend(_peer_comparison_findings(rows, asset_id=asset_id))
     findings.extend(_coverage_findings(rows, asset_id=asset_id))
+    if production_window is not None:
+        findings.extend(
+            _production_absence_findings(
+                rows, asset_id=asset_id, now=now, window=production_window, history_for_device=history_for_device
+            )
+        )
     findings.sort(key=lambda finding: (SEVERITY_ORDER.get(finding.severity, 99), finding.device_label or ""))
     return findings
 
@@ -402,6 +422,83 @@ def _peer_comparison_findings(rows: list[dict[str, Any]], *, asset_id: int) -> l
                     )
                 )
     return findings
+
+
+# How long every device with real evidence has to have read exactly zero
+# power, together, inside a productive window, before this counts as a total
+# production failure rather than a cloud passing over. The one number in
+# GOAL.md's own policy table this module did not yet have a rule for
+# ("Falha total de produção > 30 min em período produtivo | cria").
+_PRODUCTION_ABSENCE_THRESHOLD = timedelta(minutes=30)
+
+
+def _production_absence_findings(
+    rows: list[dict[str, Any]],
+    *,
+    asset_id: int,
+    now: datetime,
+    window: ProductionWindow,
+    history_for_device: Callable[[int], list[DeviceStatusFact]] | None,
+) -> list[DiagnosticFinding]:
+    """Every device with real evidence reads zero power, during daylight.
+
+    Deliberately narrow. It fires only when there is positive evidence of
+    zero -- a real reading whose `active_power_kw` is exactly zero -- never
+    from silence: an asset with no fresh reading at all is `device_no_history`
+    or `stale_reading`'s problem, a different and already-covered one, and
+    conflating "no data" with "zero power" would invent a claim the data does
+    not support. It also fires only when `window.is_productive`: at night,
+    at dawn inside the margin, or for an installation with no coordinates
+    (`window.is_known` is `False`), zero is the expected reading and this
+    rule is silent by construction rather than by a special case.
+
+    Assumes every row here is a production-capable device -- true today,
+    since `Device.device_kind` in this fleet is `inverter` on every row a
+    provider has ever populated. A meter row (day energy consumed, not
+    produced) would need excluding by kind once one exists; there are none
+    to exclude yet.
+    """
+    if not window.is_productive:
+        return []
+    readings = [row for row in rows if row["has_reading"] and row.get("active_power_kw") is not None]
+    if not readings:
+        return []
+    if any(_num(row["active_power_kw"]) > 0 for row in readings):
+        return []
+
+    since_per_device: list[datetime] = []
+    for row in readings:
+        since = _active_since(
+            row["device_id"],
+            history_for_device,
+            predicate=lambda fact: fact.active_power_kw is not None and fact.active_power_kw <= 0,
+        )
+        since_per_device.append(since or row["observed_at"])
+    # The joint "every device is at zero" condition can only have started once
+    # the *last* device to still be producing also dropped to zero -- the
+    # latest of the per-device zero-since points, not the earliest.
+    since = max(since_per_device)
+    if now - since < _PRODUCTION_ABSENCE_THRESHOLD:
+        return []
+
+    return [
+        DiagnosticFinding(
+            rule_code="zero_production_in_productive_window",
+            severity="critical",
+            asset_id=asset_id,
+            summary=f"Produção nula em todos os {len(readings)} equipamentos com leitura, há mais de "
+            f"{int(_PRODUCTION_ABSENCE_THRESHOLD.total_seconds() // 60)} min, dentro do período produtivo.",
+            evidence={
+                "devices_with_zero_reading": len(readings),
+                "since": since.isoformat(),
+                "window_starts_at": window.starts_at.isoformat() if window.starts_at else None,
+                "window_ends_at": window.ends_at.isoformat() if window.ends_at else None,
+            },
+            observed_at=now,
+            active_since=since,
+            missing_data=None if history_for_device else "Histórico não consultado; 'desde' é apenas a última leitura de cada equipamento.",
+        )
+    ]
 
 
 def _coverage_findings(rows: list[dict[str, Any]], *, asset_id: int) -> list[DiagnosticFinding]:

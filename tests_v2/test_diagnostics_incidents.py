@@ -21,6 +21,8 @@ from nemsei.diagnostics.findings import RULES_VERSION
 from nemsei.diagnostics.incidents import evaluate_and_persist_incidents
 from nemsei.diagnostics.models import DiagnosticIncident
 from nemsei.diagnostics.service import record_device_status
+from nemsei.monitoring.models import MonitoringObservation
+from nemsei.providers.service import create_connection, create_mapping
 
 
 def upgrade(settings, monkeypatch) -> None:
@@ -242,6 +244,48 @@ def test_a_new_episode_after_resolution_is_a_new_incident_not_a_reused_row(asset
 
 
 def test_an_asset_level_finding_opens_one_incident_with_a_null_device_id(factory) -> None:
+    """`plant_offline`, not `partial_device_coverage`: both are asset-level
+    (no `device_id`), but the coverage rule is `info` severity and, per the
+    persistence policy below, never persists at all -- it cannot stand in for
+    this proof any more. `plant_offline` is `critical`, bypasses the
+    persistence gate, and is exactly as asset-level."""
+    with factory() as session, session.begin():
+        asset = create_asset(session, canonical_name="Offline Plant")
+        connection = create_connection(
+            session, provider_code="fusionsolar", connection_key="main", display_name="FusionSolar",
+            credential_reference="FUSIONSOLAR_MAIN", enabled=True, configuration_status="configured",
+        )
+        mapping = create_mapping(session, asset_id=asset.id, provider_connection_id=connection.id, external_id="NE=1")
+        session.add(
+            MonitoringObservation(
+                asset_id=asset.id, provider_mapping_id=mapping.id, source_observation_key="k1",
+                observed_at=utc(9), ingested_at=utc(9), condition="offline",
+            )
+        )
+        session.flush()  # this factory's sessions are autoflush=False
+        evaluate_and_persist_incidents(session, now=utc(10))
+        evaluate_and_persist_incidents(session, now=utc(11))  # re-run: must not duplicate
+
+    with factory() as session:
+        offline_incidents = list(
+            session.scalars(select(DiagnosticIncident).where(DiagnosticIncident.rule_code == "plant_offline"))
+        )
+    assert len(offline_incidents) == 1
+    assert offline_incidents[0].device_id is None
+    assert offline_incidents[0].occurrence_count == 2
+
+
+# --- persistence policy: info never creates, warning waits ------------------
+
+
+def test_an_info_severity_finding_never_becomes_an_incident(factory) -> None:
+    """`partial_device_coverage` is the only `info`-severity rule today, and
+    it only fires when devices are genuinely split between reporting and
+    silent -- which is also exactly the condition that makes the silent
+    device's own `device_no_history` (warning) fire alongside it. That
+    second, unrelated incident is expected and asserted for; the point of
+    this test is that the `info` one never joins it.
+    GOAL.md's own policy: "Alarme informativo | não cria incidente"."""
     with factory() as session, session.begin():
         asset = create_asset(session, canonical_name="Partial Coverage Plant")
         reporting = create_device(session, asset_id=asset.id, device_kind="inverter", label="Reports", valid_from=date(2026, 1, 1))
@@ -250,16 +294,20 @@ def test_an_asset_level_finding_opens_one_incident_with_a_null_device_id(factory
             session, device_id=reporting.id, asset_id=asset.id, source_fact_key="v1:1",
             observed_at=utc(9), availability_status="available", active_power_kw=Decimal("5.0"),
         )
-        evaluate_and_persist_incidents(session, now=utc(10))
-        evaluate_and_persist_incidents(session, now=utc(11))  # re-run: must not duplicate
+        first = evaluate_and_persist_incidents(session, now=utc(10))
+        second = evaluate_and_persist_incidents(session, now=utc(11))  # re-run: still nothing, every time
 
+    # `device_no_history` for "Silent" opens (then confirms) immediately --
+    # it has no duration evidence to gate on at all. `partial_device_coverage`
+    # is the one deferred, every single run, forever.
+    assert first.incidents_opened == 1 and first.deferred == 1
+    assert second.incidents_confirmed == 1 and second.incidents_opened == 0 and second.deferred == 1
     with factory() as session:
-        coverage_incidents = list(
-            session.scalars(select(DiagnosticIncident).where(DiagnosticIncident.rule_code == "partial_device_coverage"))
-        )
-    assert len(coverage_incidents) == 1
-    assert coverage_incidents[0].device_id is None
-    assert coverage_incidents[0].occurrence_count == 2
+        rule_codes = {
+            incident.rule_code for incident in session.scalars(select(DiagnosticIncident)).all()
+        }
+    assert rule_codes == {"device_no_history"}
+    assert "partial_device_coverage" not in rule_codes
 
 
 def test_the_database_itself_rejects_a_second_open_incident_for_the_same_null_device_identity(factory) -> None:
@@ -312,3 +360,177 @@ def test_independent_devices_get_independent_incidents(factory) -> None:
     incidents = open_incidents(factory)
     assert len(incidents) == 1
     assert incidents[0].device_id == down.id
+
+
+# --- warning persistence gate --------------------------------------------
+
+
+def test_a_new_warning_finding_is_deferred_below_the_threshold(factory) -> None:
+    with factory() as session, session.begin():
+        asset = create_asset(session, canonical_name="Unknown Status Plant")
+        device = create_device(session, asset_id=asset.id, device_kind="inverter", label="INV-1", valid_from=date(2026, 1, 1))
+        record_device_status(
+            session, device_id=device.id, asset_id=asset.id, source_fact_key="v1:1",
+            observed_at=utc(10, 0), availability_status="unknown",
+        )
+        summary = evaluate_and_persist_incidents(session, now=utc(10, 10))  # 10 min old
+
+    assert summary.deferred == 1 and summary.incidents_opened == 0
+    assert all_incidents(factory) == []
+
+
+def test_a_warning_finding_creates_once_it_crosses_fifteen_minutes(factory) -> None:
+    with factory() as session, session.begin():
+        asset = create_asset(session, canonical_name="Unknown Status Plant")
+        device = create_device(session, asset_id=asset.id, device_kind="inverter", label="INV-1", valid_from=date(2026, 1, 1))
+        record_device_status(
+            session, device_id=device.id, asset_id=asset.id, source_fact_key="v1:1",
+            observed_at=utc(10, 0), availability_status="unknown",
+        )
+        evaluate_and_persist_incidents(session, now=utc(10, 10))  # still deferred
+        summary = evaluate_and_persist_incidents(session, now=utc(10, 20))  # 20 min old: crosses 15
+
+    assert summary.incidents_opened == 1 and summary.deferred == 0
+    incidents = all_incidents(factory)
+    assert len(incidents) == 1
+    # opened_at is the finding's own evidenced start, not the moment the
+    # evaluator finally acted on it.
+    assert incidents[0].opened_at == utc(10, 0)
+
+
+def test_a_critical_finding_creates_immediately_however_new(factory) -> None:
+    with factory() as session, session.begin():
+        asset = create_asset(session, canonical_name="Unavailable Plant")
+        device = create_device(session, asset_id=asset.id, device_kind="inverter", label="INV-1", valid_from=date(2026, 1, 1))
+        record_device_status(
+            session, device_id=device.id, asset_id=asset.id, source_fact_key="v1:1",
+            observed_at=utc(10, 0), availability_status="unavailable",
+        )
+        summary = evaluate_and_persist_incidents(session, now=utc(10, 1))  # one minute old
+
+    assert summary.incidents_opened == 1
+
+
+# --- recurrence -----------------------------------------------------------
+
+
+def test_a_problem_recurring_three_times_in_24h_is_marked_recurring(factory) -> None:
+    from nemsei.diagnostics.incidents import is_recurring
+
+    with factory() as session, session.begin():
+        asset = create_asset(session, canonical_name="Flapping Plant")
+        device = create_device(session, asset_id=asset.id, device_kind="inverter", label="INV-1", valid_from=date(2026, 1, 1))
+        asset_id, device_id = asset.id, device.id
+
+    def episode(down_at: datetime, up_at: datetime) -> None:
+        with factory() as session, session.begin():
+            record_device_status(
+                session, device_id=device_id, asset_id=asset_id, source_fact_key=f"down:{down_at.isoformat()}",
+                observed_at=down_at, availability_status="unavailable",
+            )
+            evaluate_and_persist_incidents(session, now=down_at + timedelta(minutes=1))  # critical: immediate
+        with factory() as session, session.begin():
+            record_device_status(
+                session, device_id=device_id, asset_id=asset_id, source_fact_key=f"up:{up_at.isoformat()}",
+                observed_at=up_at, availability_status="available", active_power_kw=Decimal("4.0"),
+            )
+            evaluate_and_persist_incidents(session, now=up_at + timedelta(minutes=1))  # resolves it
+
+    episode(utc(8, 0), utc(8, 30))
+    episode(utc(12, 0), utc(12, 30))
+    episode(utc(16, 0), utc(16, 30))
+
+    with factory() as session:
+        episodes = list(
+            session.scalars(
+                select(DiagnosticIncident)
+                .where(DiagnosticIncident.rule_code == "device_unavailable")
+                .order_by(DiagnosticIncident.opened_at)
+            )
+        )
+        assert len(episodes) == 3
+        assert is_recurring(session, incident=episodes[0]) is False
+        assert is_recurring(session, incident=episodes[1]) is False
+        assert is_recurring(session, incident=episodes[2]) is True
+
+
+def test_recurrence_only_counts_within_the_rolling_window(factory) -> None:
+    from nemsei.diagnostics.incidents import RECURRENCE_WINDOW, recurrence_count
+
+    with factory() as session, session.begin():
+        asset = create_asset(session, canonical_name="Old Episodes Plant")
+        device = create_device(session, asset_id=asset.id, device_kind="inverter", label="INV-1", valid_from=date(2026, 1, 1))
+        now = utc(12, 0)
+        for hours_ago in (23, 30, 48):  # only the first is inside a 24h window
+            incident = DiagnosticIncident(
+                rule_code="device_unavailable", asset_id=asset.id, device_id=device.id, severity="critical", status="resolved",
+                opened_at=now - timedelta(hours=hours_ago), last_observed_at=now - timedelta(hours=hours_ago),
+                resolved_at=now - timedelta(hours=hours_ago) + timedelta(minutes=5), detector_version="test",
+                created_at=now, updated_at=now,
+            )
+            session.add(incident)
+        session.flush()
+        count = recurrence_count(
+            session, rule_code="device_unavailable", asset_id=asset.id, device_id=device.id, at=now, window=RECURRENCE_WINDOW
+        )
+
+    assert count == 1
+
+
+# --- production window, end to end through the persisted evaluator ----------
+
+
+def test_zero_production_in_daylight_creates_a_critical_incident_end_to_end(factory) -> None:
+    """Proves the coordinate lookup and `window_for` wiring inside
+    `evaluate_and_persist_incidents` itself, not just the pure rule."""
+    from nemsei.installations.service import backfill_installations_from_assets, installation_for_asset
+
+    noon = datetime(2026, 6, 21, 12, 0, tzinfo=timezone.utc)  # Lisbon, deep summer noon: certainly daylight
+    with factory() as session, session.begin():
+        asset = create_asset(session, canonical_name="Lisbon Plant")
+        device = create_device(session, asset_id=asset.id, device_kind="inverter", label="INV-1", valid_from=date(2026, 1, 1))
+        backfill_installations_from_assets(session)
+        installation = installation_for_asset(session, asset_id=asset.id)
+        installation.latitude = Decimal("38.7223")
+        installation.longitude = Decimal("-9.1393")
+        installation.coordinates_source = "manual"
+        installation.coordinates_confidence = "manual"
+        record_device_status(
+            session, device_id=device.id, asset_id=asset.id, source_fact_key="k1",
+            observed_at=noon - timedelta(minutes=40), availability_status="available", active_power_kw=Decimal("0"),
+        )
+        record_device_status(
+            session, device_id=device.id, asset_id=asset.id, source_fact_key="k2",
+            observed_at=noon, availability_status="available", active_power_kw=Decimal("0"),
+        )
+        summary = evaluate_and_persist_incidents(session, now=noon)
+
+    assert summary.incidents_opened == 1
+    incidents = all_incidents(factory)
+    assert [incident.rule_code for incident in incidents] == ["zero_production_in_productive_window"]
+
+
+def test_the_same_asset_at_night_does_not_get_the_production_incident(factory) -> None:
+    from nemsei.installations.service import backfill_installations_from_assets, installation_for_asset
+
+    midnight = datetime(2026, 6, 21, 0, 0, tzinfo=timezone.utc)
+    with factory() as session, session.begin():
+        asset = create_asset(session, canonical_name="Lisbon Plant Night")
+        device = create_device(session, asset_id=asset.id, device_kind="inverter", label="INV-1", valid_from=date(2026, 1, 1))
+        backfill_installations_from_assets(session)
+        installation = installation_for_asset(session, asset_id=asset.id)
+        installation.latitude = Decimal("38.7223")
+        installation.longitude = Decimal("-9.1393")
+        installation.coordinates_source = "manual"
+        installation.coordinates_confidence = "manual"
+        record_device_status(
+            session, device_id=device.id, asset_id=asset.id, source_fact_key="k1",
+            observed_at=midnight - timedelta(minutes=40), availability_status="standby", active_power_kw=Decimal("0"),
+        )
+        record_device_status(
+            session, device_id=device.id, asset_id=asset.id, source_fact_key="k2",
+            observed_at=midnight, availability_status="standby", active_power_kw=Decimal("0"),
+        )
+        evaluate_and_persist_incidents(session, now=midnight)
+
+    assert "zero_production_in_productive_window" not in {incident.rule_code for incident in all_incidents(factory)}

@@ -462,6 +462,7 @@ def _execute_incident_evaluation(*, session_factory: sessionmaker[Session]) -> J
             "incidents_opened": summary.incidents_opened,
             "incidents_confirmed": summary.incidents_confirmed,
             "incidents_resolved": summary.incidents_resolved,
+            "deferred": summary.deferred,
         },
     )
 

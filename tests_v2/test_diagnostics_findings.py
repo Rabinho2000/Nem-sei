@@ -6,6 +6,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 from nemsei.diagnostics.findings import DiagnosticFinding, evaluate_asset_findings
+from nemsei.monitoring.production_window import ProductionWindow
 
 
 NOW = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
@@ -223,3 +224,100 @@ def test_findings_are_ordered_worst_first() -> None:
     # (warning, alphabetical by label within the tier), partial_device_coverage
     # (info, asset-level) last.
     assert [finding.severity for finding in findings] == ["critical", "warning", "warning", "info"]
+
+
+# --- production window: total production failure ----------------------
+
+
+PRODUCTIVE = ProductionWindow(state="productive")
+DARK = ProductionWindow(state="dark")
+UNKNOWN = ProductionWindow(state="unknown")
+
+
+def test_zero_power_at_night_is_not_a_finding() -> None:
+    """The whole reason `production_window` exists: nothing generated at
+    night is not a fault."""
+    rows = [row(1, "INV-1", active_power_kw=0)]
+    findings = evaluate_asset_findings(rows, asset_id=1, now=NOW, production_window=DARK)
+    assert by_rule(findings, "zero_production_in_productive_window") == []
+
+
+def test_zero_power_with_no_window_given_is_not_a_finding() -> None:
+    """The default: every caller that predates coordinates existing keeps
+    working exactly as before, silently, rather than needing to opt out."""
+    rows = [row(1, "INV-1", active_power_kw=0)]
+    findings = evaluate_asset_findings(rows, asset_id=1, now=NOW)
+    assert by_rule(findings, "zero_production_in_productive_window") == []
+
+
+def test_zero_power_with_an_unknown_window_is_not_a_finding() -> None:
+    """No coordinates recorded -- `window.is_productive` is `False` for
+    `unknown` too, and guessing would invent a claim about a location
+    nobody located."""
+    rows = [row(1, "INV-1", active_power_kw=0)]
+    findings = evaluate_asset_findings(rows, asset_id=1, now=NOW, production_window=UNKNOWN)
+    assert by_rule(findings, "zero_production_in_productive_window") == []
+
+
+def test_zero_power_during_the_day_is_not_immediately_a_finding() -> None:
+    """A cloud passing over is not a total production failure -- it needs to
+    have held for `_PRODUCTION_ABSENCE_THRESHOLD` (30 min), by real evidence,
+    exactly like every other duration-gated rule in this module."""
+    history = [SimpleNamespace(active_power_kw=Decimal("0"), observed_at=NOW)]
+    rows = [row(1, "INV-1", active_power_kw=0)]
+    findings = evaluate_asset_findings(
+        rows, asset_id=1, now=NOW, production_window=PRODUCTIVE, history_for_device=lambda device_id: history
+    )
+    assert by_rule(findings, "zero_production_in_productive_window") == []
+
+
+def test_zero_power_for_over_thirty_minutes_in_daylight_is_critical() -> None:
+    history = [
+        SimpleNamespace(active_power_kw=Decimal("0"), observed_at=NOW),
+        SimpleNamespace(active_power_kw=Decimal("0"), observed_at=NOW - timedelta(minutes=20)),
+        SimpleNamespace(active_power_kw=Decimal("0"), observed_at=NOW - timedelta(minutes=35)),
+        SimpleNamespace(active_power_kw=Decimal("4.2"), observed_at=NOW - timedelta(minutes=50)),
+    ]
+    rows = [row(1, "INV-1", active_power_kw=0)]
+    findings = evaluate_asset_findings(
+        rows, asset_id=1, now=NOW, production_window=PRODUCTIVE, history_for_device=lambda device_id: history
+    )
+    matches = by_rule(findings, "zero_production_in_productive_window")
+    assert len(matches) == 1
+    assert matches[0].severity == "critical"
+    assert matches[0].active_since == NOW - timedelta(minutes=35)
+
+
+def test_any_positive_power_reading_clears_the_finding() -> None:
+    """One inverter still producing is the opposite of a total failure."""
+    rows = [row(1, "INV-1", active_power_kw=0), row(2, "INV-2", active_power_kw=3.1)]
+    findings = evaluate_asset_findings(rows, asset_id=1, now=NOW, production_window=PRODUCTIVE)
+    assert by_rule(findings, "zero_production_in_productive_window") == []
+
+
+def test_no_reading_at_all_is_a_different_problem_not_zero_production() -> None:
+    """Silence is not evidence of zero -- `device_no_history` already covers
+    it, and conflating the two would claim a reading that does not exist."""
+    rows = [row(1, "INV-1", has_reading=False, observed_at=None)]
+    findings = evaluate_asset_findings(rows, asset_id=1, now=NOW, production_window=PRODUCTIVE)
+    assert by_rule(findings, "zero_production_in_productive_window") == []
+    assert by_rule(findings, "device_no_history") != []
+
+
+def test_the_joint_zero_since_is_the_latest_device_to_stop_not_the_earliest() -> None:
+    """Device A has read zero for an hour; Device B only stopped 10 minutes
+    ago. The asset was not "fully at zero" until B also dropped -- 10 minutes
+    ago, not an hour ago."""
+    history_a = [SimpleNamespace(active_power_kw=Decimal("0"), observed_at=NOW - timedelta(minutes=t)) for t in (0, 30, 60)]
+    history_b = [
+        SimpleNamespace(active_power_kw=Decimal("0"), observed_at=NOW),
+        SimpleNamespace(active_power_kw=Decimal("3.0"), observed_at=NOW - timedelta(minutes=10)),
+    ]
+    histories = {1: history_a, 2: history_b}
+    rows = [row(1, "INV-1", active_power_kw=0), row(2, "INV-2", active_power_kw=0)]
+    findings = evaluate_asset_findings(
+        rows, asset_id=1, now=NOW, production_window=PRODUCTIVE, history_for_device=lambda device_id: histories[device_id]
+    )
+    # Joint zero only since 10 minutes ago -- short of the 30-minute
+    # threshold, so this must not fire yet even though device A alone would.
+    assert by_rule(findings, "zero_production_in_productive_window") == []

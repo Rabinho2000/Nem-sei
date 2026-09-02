@@ -22,6 +22,8 @@ from nemsei.diagnostics.handling import incident_notes
 from nemsei.diagnostics.models import INCIDENT_HANDLING_STATES, DiagnosticIncident
 from nemsei.diagnostics.repository import DeviceStatusRepository
 from nemsei.diagnostics.service import current_device_status
+from nemsei.installations.service import coordinates_for_asset
+from nemsei.monitoring.production_window import window_for
 from nemsei.shared.clock import utc_now
 
 
@@ -240,6 +242,7 @@ def asset_diagnostics(session: Session, *, asset_id: int) -> dict[str, Any] | No
     rows = current_device_status(session, asset_id=asset_id)
     rows.sort(key=lambda row: (_SEVERITY.get(row["availability_status"], 1), row["label"] or ""))
     device_repo = DeviceStatusRepository(session)
+    latitude, longitude = coordinates_for_asset(session, asset_id=asset_id)
     findings = evaluate_asset_findings(
         rows,
         asset_id=asset_id,
@@ -247,6 +250,11 @@ def asset_diagnostics(session: Session, *, asset_id: int) -> dict[str, Any] | No
         # Real history, not just the latest reading -- lets device-level
         # findings answer "desde quando", not just "agora".
         history_for_device=lambda device_id: device_repo.history_for_device(device_id=device_id),
+        # Same window the incident evaluator now consults (`diagnostics/
+        # incidents.py`), so the live page and the persisted incident it
+        # would eventually open never disagree about whether a zero-power
+        # reading is expected right now.
+        production_window=window_for(latitude=latitude, longitude=longitude, at=utc_now()),
     )
     return {
         "asset": asset,
