@@ -21,11 +21,13 @@ from nemsei.assets.models import Asset, Organization
 from nemsei.contracts.priority import describe
 from nemsei.contracts.service import om_status_map
 from nemsei.contracts.service import overview as om_overview
+from nemsei.diagnostics.incident_categories import incident_category
 from nemsei.diagnostics.models import DiagnosticIncident
 from nemsei.monitoring.models import ProductionFact
 from nemsei.providers.models import AssetProviderMapping
 from nemsei.shared.clock import utc_now
 from nemsei.sync.models import SyncRun
+from nemsei.work_orders.service import overdue_work_orders, unscheduled_work_orders
 
 # How long an installation may go without a reading before it is worth a look.
 # Two days rather than one: a provider that labels its daily buckets in UTC can
@@ -40,6 +42,23 @@ def _latest_fact_per_asset(session: Session) -> dict[int, Any]:
         .group_by(ProductionFact.asset_id)
     ).all()
     return {int(asset_id): latest for asset_id, latest in rows}
+
+
+def fleet_incident_split(session: Session) -> dict[str, int]:
+    """Every open incident in the fleet, split fault / communication /
+    coverage. Never merged into one count: GOAL.md is explicit that a
+    monitoring-coverage gap must never present as a real fault, and a merged
+    "X incidentes abertos" number is exactly how that would happen on the
+    one screen everyone looks at first."""
+    counts = {"fault": 0, "communication": 0, "coverage": 0}
+    rows = session.execute(
+        select(DiagnosticIncident.rule_code, func.count(DiagnosticIncident.id))
+        .where(DiagnosticIncident.status == "open")
+        .group_by(DiagnosticIncident.rule_code)
+    ).all()
+    for rule_code, count in rows:
+        counts[incident_category(rule_code)] += int(count)
+    return counts
 
 
 def attention_rows(session: Session, *, limit: int = 12) -> list[dict[str, Any]]:
@@ -165,7 +184,23 @@ def operational_panel(session: Session) -> dict[str, Any]:
         else 0
     )
 
+    incident_split = fleet_incident_split(session)
+    work_overdue = overdue_work_orders(session)
+    work_unscheduled = unscheduled_work_orders(session)
+
     return {
+        # Fault / communication / coverage, never merged -- see
+        # `fleet_incident_split`. The dashboard's triage strip now reads this
+        # split rather than the detector's raw `critical`/`warning` severity
+        # (still returned below for whatever else reads it): severity alone
+        # cannot tell an operator whether "12 avisos" means twelve real
+        # equipment problems or twelve unmonitored plants, and that
+        # ambiguity is exactly what GOAL.md asks this screen never to have.
+        "fault_count": incident_split["fault"],
+        "communication_count": incident_split["communication"],
+        "coverage_count": incident_split["coverage"],
+        "work_overdue": len(work_overdue),
+        "work_unscheduled": len(work_unscheduled),
         "om_in_scope": om["in_scope"],
         "om_active": om["active"],
         "om_expired": om["expired"],

@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block content %}
+<header class="page-header"><div><p class="eyebrow">Operação</p><h1>Trabalhos</h1><p class="page-intro">Preventivas, corretivas e limpezas em todo o parque.</p></div></header>
+
+<section class="panel filter-panel">
+  <form class="filter-form" method="get" role="search">
+    <label class="search-field"><span class="sr-only">Pesquisar trabalhos</span><input type="search" name="search" value="{{ search }}" placeholder="Pesquisar por título"></label>
+    <label><span class="sr-only">Âmbito</span><select name="scope"><option value="">Todos os trabalhos</option><option value="overdue" {{ 'selected' if scope == 'overdue' else '' }}>Atrasados ({{ overdue_count }})</option><option value="unscheduled" {{ 'selected' if scope == 'unscheduled' else '' }}>Sem data ({{ unscheduled_count }})</option></select></label>
+    <label><span class="sr-only">Estado</span><select name="status"><option value="">Em curso (não concluído/cancelado)</option>{% for value in statuses %}<option value="{{ value }}" {{ 'selected' if status == value else '' }}>{{ {'open':'Aberto','planned':'Planeado','in_progress':'Em curso','completed':'Concluído','cancelled':'Cancelado'}.get(value, value) }}</option>{% endfor %}</select></label>
+    <button class="button secondary" type="submit">Filtrar</button>
+    {% if search or scope or status %}<a class="clear-link" href="{{ url_for('work_orders.index_work_orders') }}">Limpar</a>{% endif %}
+  </form>
+</section>
+
+<section class="panel table-panel">
+  <div class="table-meta"><span>{{ rows|length }} trabalhos</span></div>
+  <div class="table-scroll">
+    <table class="data-table wide-table stack-mobile">
+      <caption class="sr-only">Lista de trabalhos</caption>
+      <thead><tr><th scope="col">Título</th><th scope="col">Instalação</th><th scope="col">Tipo</th><th scope="col">Estado</th><th scope="col">Planeado</th><th scope="col">Limite</th></tr></thead>
+      <tbody>
+        {% for row in rows %}
+          <tr class="{{ 'row-attention' if row.is_overdue else '' }}">
+            <th scope="row">{{ row.work_order.title }}</th>
+            <td data-label="Instalação">{% if row.asset_id %}<a class="table-primary" href="{{ url_for('installations.detail', asset_id=row.asset_id, tab='trabalhos') }}">{{ row.asset_name or row.installation_name }}</a>{% else %}{{ row.installation_name }}{% endif %}</td>
+            <td data-label="Tipo">{{ {'corrective':'Corretiva','preventive':'Preventiva','cleaning':'Limpeza'}.get(row.work_order.work_type, row.work_order.work_type) }}</td>
+            <td data-label="Estado"><span class="status-badge {{ 'success' if row.work_order.status == 'completed' else 'muted' if row.work_order.status == 'cancelled' else 'warning' }}">{{ {'open':'Aberto','planned':'Planeado','in_progress':'Em curso','completed':'Concluído','cancelled':'Cancelado'}.get(row.work_order.status, row.work_order.status) }}</span></td>
+            <td data-label="Planeado">{% if row.work_order.planned_date %}{{ row.work_order.planned_date.strftime('%d/%m/%Y') }}{% else %}<span class="status-badge muted">sem data</span>{% endif %}</td>
+            <td data-label="Limite">{% if row.work_order.due_date %}<span class="status-badge {{ 'danger' if row.is_overdue else 'muted' }}">{{ row.work_order.due_date.strftime('%d/%m/%Y') }}</span>{% else %}—{% endif %}</td>
+          </tr>
+        {% else %}<tr><td class="table-empty" colspan="6">Não existem trabalhos para estes filtros.</td></tr>{% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

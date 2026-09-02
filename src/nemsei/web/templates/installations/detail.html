@@ -1,0 +1,190 @@
+{% extends "base.html" %}
+{% import "macros/chart.html" as chart %}
+{% block content %}
+<header class="page-header detail-header">
+  <div>
+    <a class="back-link" href="{{ url_for('installations.index') }}">← Instalações</a>
+    <h1>{{ asset.canonical_name }}</h1>
+    <div class="inline-status">
+      <span class="status-badge {{ state.tone }}" title="{{ state.detail or 'sem leituras' }}">{{ state.label }}</span>
+      {% if om.status != 'none' %}<span class="status-badge {{ om.tone }}">O&amp;M {{ 'ativo' if om.status == 'active' else om.label|lower }}</span>{% endif %}
+      {% if esco.status != 'none' %}<span class="status-badge {{ 'success' if esco.status == 'active' else 'muted' }}">ESCO {{ 'ativo' if esco.status == 'active' else esco.label|lower }}</span>{% endif %}
+      {% if not has_installation %}<span class="status-badge muted" title="A instalação ainda não foi criada em produção para esta central">Sem Instalação associada</span>{% endif %}
+    </div>
+    <p class="provenance">
+      {{ ('%.1f kWp'|format(power_kwp)) if power_kwp is not none else 'potência não registada' }}
+      {% if locality %} · {{ locality }}{% endif %}
+      {% if organization_name %} · {{ organization_name }}{% endif %}
+      {% if state.observed_at %} · dados de {{ state.observed_at.strftime('%d/%m %H:%M') }}{% endif %}
+    </p>
+  </div>
+  <a class="button secondary" href="{{ url_for('assets.asset_detail', asset_id=asset.id) }}">Ficha técnica →</a>
+</header>
+
+<nav class="section-tabs" aria-label="Secções da instalação">
+  {% for value, label in [('resumo','Resumo'), ('operacao','Operação'), ('trabalhos','Trabalhos'), ('equipamentos','Equipamentos'), ('performance','Performance'), ('timeline','Timeline')] %}
+    <a class="{{ 'active' if tab == value else '' }}" href="{{ url_for('installations.detail', asset_id=asset.id, tab=value) }}">{{ label }}</a>
+  {% endfor %}
+</nav>
+
+{% if tab == 'resumo' %}
+  <section class="kpis" aria-label="Resumo">
+    <div class="kpi"><small>Estado</small><b>{{ state.label }}</b></div>
+    <div class="kpi {{ 'noval' if headline.total_kwh is none else '' }}"><small>Produção · {{ headline.window_days }} dias</small><b>{% if headline.total_kwh is none %}—{% else %}{{ "{:,.0f}".format(headline.total_kwh).replace(",", " ") }} <u>kWh</u>{% endif %}</b></div>
+    <div class="kpi"><small>Avarias abertas</small><b>{{ incidents.fault }}</b></div>
+    <div class="kpi"><small>Comunicação</small><b>{{ incidents.communication }}</b></div>
+  </section>
+
+  <section class="panel chart-panel">
+    <div class="chart-head">
+      <h3>Produção × Consumo</h3>
+      <div class="period-form" role="group" aria-label="Período">
+        {% for value, label in period_options %}
+          <a class="pill {{ 'pill-ok' if period == value else '' }}" href="{{ url_for('installations.detail', asset_id=asset.id, tab='resumo', period=value) }}">{{ label }}</a>
+        {% endfor %}
+      </div>
+    </div>
+    {{ chart.dual_bars(production_chart.chart, 'Produção e consumo') }}
+    {{ chart.legend([('Produção', '1'), ('Consumo', '2')]) }}
+    <p class="provenance">
+      {% if production_chart.production_total is not none %}Produção: {{ "{:,.0f}".format(production_chart.production_total).replace(",", " ") }} kWh{% else %}Produção: sem registo{% endif %}
+      · {% if production_chart.consumption_total is not none %}Consumo: {{ "{:,.0f}".format(production_chart.consumption_total).replace(",", " ") }} kWh{% else %}Consumo: sem meter registado{% endif %}
+    </p>
+  </section>
+
+  <section class="panel">
+    <div class="panel-header"><div><p class="eyebrow">Histórico</p><h2>Últimos acontecimentos</h2></div><a class="text-link" href="{{ url_for('installations.detail', asset_id=asset.id, tab='timeline') }}">Ver timeline completa →</a></div>
+    {% if recent_timeline %}
+      <ul class="plain-list">
+        {% for event in recent_timeline %}
+          <li><span class="status-badge {{ event.tone }}">{{ event.kind_label }}</span> <small>{{ event.occurred_at.strftime('%d/%m %H:%M') if event.precision == 'minute' else event.occurred_at.strftime('%d/%m') }}</small><br>{{ event.detail or '—' }}</li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p class="empty-state">{{ 'Sem Instalação associada ainda; a timeline fica disponível assim que a candidatura for aplicada em produção.' if not has_installation else 'Sem acontecimentos recentes.' }}</p>
+    {% endif %}
+  </section>
+
+{% elif tab == 'operacao' %}
+  <section class="panel">
+    <div class="panel-header"><div><p class="eyebrow">Operação</p><h2>Incidentes abertos — {{ total_open }}</h2></div></div>
+    <p class="provenance">Cobertura insuficiente não é o mesmo que uma avaria confirmada — as três listas abaixo respondem a perguntas diferentes.</p>
+    {% for category in ('fault', 'communication', 'coverage') %}
+      <div class="honest-stack">
+        <strong><span class="status-badge {{ category_tones[category] }}">{{ category_labels[category] }}</span> — {{ incidents_by_category[category]|length }}</strong>
+        {% if incidents_by_category[category] %}
+          <ul class="plain-list">
+            {% for incident in incidents_by_category[category] %}
+              <li><a href="{{ url_for('diagnostics.incident', incident_id=incident.id) }}">{{ incident.rule_code }}</a> <small>desde {{ incident.opened_at.strftime('%d/%m/%Y') }}{% if incident.device_id %} · equipamento #{{ incident.device_id }}{% endif %}</small></li>
+            {% endfor %}
+          </ul>
+        {% else %}<small class="muted">Nenhum.</small>{% endif %}
+      </div>
+    {% endfor %}
+  </section>
+
+{% elif tab == 'trabalhos' %}
+  <section class="panel">
+    <div class="panel-header"><div><p class="eyebrow">Trabalhos</p><h2>Preventivas, corretivas e limpezas</h2></div><a class="button secondary" href="{{ url_for('work_orders.index_work_orders') }}">Ver todos os trabalhos →</a></div>
+    {% if blocked %}
+      <p class="empty-state">Sem Instalação associada ainda nesta central — não é possível abrir trabalhos até a candidatura ser aplicada em produção.</p>
+    {% elif work_orders %}
+      <div class="table-scroll">
+        <table class="data-table stack-mobile">
+          <thead><tr><th>Título</th><th>Tipo</th><th>Estado</th><th>Planeado</th><th>Limite</th></tr></thead>
+          <tbody>
+            {% for wo in work_orders %}
+              <tr>
+                <th scope="row">{{ wo.title }}</th>
+                <td data-label="Tipo">{{ {'corrective':'Corretiva','preventive':'Preventiva','cleaning':'Limpeza'}.get(wo.work_type, wo.work_type) }}</td>
+                <td data-label="Estado"><span class="status-badge {{ 'success' if wo.status == 'completed' else 'muted' if wo.status == 'cancelled' else 'warning' }}">{{ {'open':'Aberto','planned':'Planeado','in_progress':'Em curso','completed':'Concluído','cancelled':'Cancelado'}.get(wo.status, wo.status) }}</span></td>
+                <td data-label="Planeado">{{ wo.planned_date.strftime('%d/%m/%Y') if wo.planned_date else '—' }}</td>
+                <td data-label="Limite">{{ wo.due_date.strftime('%d/%m/%Y') if wo.due_date else '—' }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="empty-state">Sem trabalhos registados para esta instalação.</p>
+    {% endif %}
+  </section>
+
+{% elif tab == 'equipamentos' %}
+  <section class="panel">
+    <div class="panel-header"><div><p class="eyebrow">Equipamentos</p><h2>Inversores — {{ inverters|length }}</h2></div></div>
+    {% if inverters %}
+      <div class="table-scroll">
+        <table class="data-table stack-mobile">
+          <thead><tr><th>Equipamento</th><th>Modelo</th><th>Série</th><th>Potência nominal</th><th>Estado</th></tr></thead>
+          <tbody>
+            {% for device in inverters %}
+              <tr>
+                <th scope="row">{{ device.label or ('Inversor #' ~ device.id) }}</th>
+                <td data-label="Modelo">{{ device.model or '—' }}</td>
+                <td data-label="Série">{{ device.serial_number or '—' }}</td>
+                <td data-label="Potência">{{ ('%.2f kW'|format(device.rated_power_kw)) if device.rated_power_kw is not none else '—' }}</td>
+                <td data-label="Estado">{{ {'unknown':'Desconhecido','active':'Ativo','inactive':'Inativo','decommissioned':'Desativado'}.get(device.lifecycle_status, device.lifecycle_status) }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}<p class="empty-state">Sem inversores registados.</p>{% endif %}
+  </section>
+  <section class="panel">
+    <div class="panel-header"><div><p class="eyebrow">Equipamentos</p><h2>Meters — {{ meters|length }}</h2></div></div>
+    {% if meters %}<p>{{ meters|length }} meter(s) registado(s).</p>{% else %}<p class="empty-state">Sem meters registados.</p>{% endif %}
+  </section>
+  <section class="panel">
+    <div class="panel-header"><div><p class="eyebrow">Equipamentos</p><h2>Grupos de módulos</h2></div></div>
+    <p class="empty-state">Ainda não existe um modelo de grupos de módulos nesta versão — ver o registo de decisões.</p>
+  </section>
+
+{% elif tab == 'performance' %}
+  <section class="panel">
+    <div class="panel-header"><div><p class="eyebrow">Performance</p><h2>Produção do mês</h2></div></div>
+    {% if not has_production_data %}
+      <p class="empty-state">Sem produção registada este mês.</p>
+    {% else %}
+      <dl class="detail-list">
+        <div><dt>Produção</dt><dd>{{ "{:,.0f}".format(metrics.production_energy).replace(",", " ") }} kWh</dd></div>
+        <div><dt>Consumo</dt><dd>{% if metrics.consumption_energy %}{{ "{:,.0f}".format(metrics.consumption_energy).replace(",", " ") }} kWh{% else %}<span class="muted">sem meter</span>{% endif %}</dd></div>
+      </dl>
+      {% if billing is none %}
+        <p class="empty-state">{{ 'Sem configuração comercial registada — não é possível calcular poupança nem faturação.' if missing == 'billing_config' else '' }}</p>
+      {% else %}
+        <dl class="detail-list">
+          <div><dt>Autoconsumo</dt><dd>{{ '%.0f'|format(billing.autoconsumption_pct) }}%</dd></div>
+          {% if is_esco %}
+            <div><dt>Benefício energético bruto</dt><dd>{{ '%.2f €'|format(billing.gross_benefit_eur) }}</dd></div>
+            <div><dt>Receita Solcor prevista</dt><dd>{{ '%.2f €'|format(billing.solcor_payment_eur) }}</dd></div>
+            <div><dt>Poupança líquida do cliente</dt><dd>{{ '%.2f €'|format(billing.net_benefit_eur) }}</dd></div>
+          {% endif %}
+        </dl>
+        <p class="provenance">Valor a faturar calculado, não emitido — o Nem-sei não gere faturas.{% if not has_tariff %} Sem tarifa registada: alguns valores podem usar preços por omissão.{% endif %}</p>
+      {% endif %}
+    {% endif %}
+  </section>
+
+{% elif tab == 'timeline' %}
+  <section class="panel">
+    <div class="panel-header"><div><p class="eyebrow">Histórico</p><h2>Timeline operacional</h2></div></div>
+    {% if blocked %}
+      <p class="empty-state">Sem Instalação associada ainda nesta central — a timeline fica disponível assim que a candidatura for aplicada em produção.</p>
+    {% elif events %}
+      <ul class="plain-list">
+        {% for event in events %}
+          <li>
+            <strong>{{ event.occurred_at.strftime('%d/%m/%Y %H:%M') if event.precision == 'minute' else event.occurred_at.strftime('%d/%m/%Y') }}</strong>
+            <span class="status-badge {{ event.tone }}">{{ event.kind_label }}</span>
+            {{ event.detail or '' }}
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p class="empty-state">Sem acontecimentos registados nos últimos 30 dias.</p>
+    {% endif %}
+  </section>
+{% endif %}
+{% endblock %}

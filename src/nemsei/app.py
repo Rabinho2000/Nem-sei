@@ -23,6 +23,7 @@ from nemsei.web.system_routes import system_bp
 from nemsei.web.portfolio_routes import portfolio_bp
 from nemsei.web.reporting_routes import reporting_bp
 from nemsei.web.diagnostics_routes import diagnostics_bp
+from nemsei.web.installation_routes import installations_bp, work_orders_bp
 
 
 def create_app(
@@ -61,5 +62,7 @@ def create_app(
     app.register_blueprint(commercial_bp)
     app.register_blueprint(contracts_bp)
     app.register_blueprint(diagnostics_bp)
+    app.register_blueprint(installations_bp)
+    app.register_blueprint(work_orders_bp)
     app.register_blueprint(system_bp)
     return app

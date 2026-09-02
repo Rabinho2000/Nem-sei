@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{#
+  A lista operacional: as mesmas 267 linhas de /assets, lidas por Installation
+  em vez de por identidade -- estado, incidentes por categoria (nunca uma
+  cobertura apresentada como avaria), O&M/ESCO, trabalhos em atraso.
+  Identidade, aliases e mappings continuam em /assets (Administração).
+#}
+{% block content %}
+<header class="page-header"><div><p class="eyebrow">Operação</p><h1>Instalações</h1><p class="page-intro">O que está a acontecer no parque, e o que precisa de atenção.</p></div></header>
+
+<section class="panel filter-panel">
+  <form class="filter-form" method="get" role="search">
+    <label class="search-field"><span class="sr-only">Pesquisar instalações</span><input type="search" name="search" value="{{ filters.search }}" placeholder="Pesquisar instalação ou organização"></label>
+    <label><span class="sr-only">O&amp;M</span><select name="om"><option value="todos" {{ 'selected' if filters.om in ('', 'todos') else '' }}>Todo o parque</option><option value="com_om" {{ 'selected' if filters.om == 'com_om' else '' }}>Parque O&amp;M</option><option value="ativo" {{ 'selected' if filters.om == 'ativo' else '' }}>Com O&amp;M ativo</option><option value="expirado" {{ 'selected' if filters.om == 'expirado' else '' }}>Contrato expirado</option><option value="sem" {{ 'selected' if filters.om == 'sem' else '' }}>Sem O&amp;M</option></select></label>
+    <label><span class="sr-only">Contrato</span><select name="family"><option value="">Todos os contratos</option>{% for value, label in family_options %}<option value="{{ value }}" {{ 'selected' if filters.family == value else '' }}>{{ label }}</option>{% endfor %}</select></label>
+    <label><span class="sr-only">Mapping</span><select name="mapping"><option value="">Todos os mappings</option><option value="present" {{ 'selected' if filters.mapping == 'present' else '' }}>Com mapping</option><option value="absent" {{ 'selected' if filters.mapping == 'absent' else '' }}>Sem mapping</option></select></label>
+    <button class="button secondary" type="submit">Filtrar</button>
+    {% if filters.search or filters.mapping or (filters.om and filters.om != 'todos') or filters.family %}<a class="clear-link" href="{{ url_for('installations.index') }}">Limpar</a>{% endif %}
+  </form>
+</section>
+
+<section class="panel table-panel">
+  <div class="table-meta"><span>{{ pagination.total }} instalações encontradas</span>{% if pagination.pages > 1 %}<span>Página {{ pagination.page }} de {{ pagination.pages }}</span>{% endif %}</div>
+  <div class="table-scroll">
+    <table class="data-table wide-table stack-mobile">
+      <caption class="sr-only">Lista de instalações</caption>
+      <thead><tr><th scope="col">Instalação</th><th scope="col">Organização</th><th scope="col">Estado</th><th scope="col">Avaria</th><th scope="col">Comunicação</th><th scope="col">Cobertura</th><th scope="col">O&amp;M</th><th scope="col">ESCO</th><th scope="col">Trabalhos</th></tr></thead>
+      <tbody>
+        {% for asset in assets %}
+          <tr>
+            <th scope="row"><a class="table-primary" href="{{ url_for('installations.detail', asset_id=asset.id) }}">{{ asset.canonical_name }}</a><small>{{ ('%.1f kWp'|format(asset.installed_dc_power_kw)) if asset.installed_dc_power_kw is not none else '—' }}{% if asset.locality %} · {{ asset.locality }}{% endif %}</small></th>
+            <td data-label="Organização">{{ asset.organization_name or '—' }}</td>
+            <td data-label="Estado"><span class="status-badge {{ asset.state_tone }}" title="{{ asset.state_detail or 'sem leituras' }}">{{ asset.state_label }}</span></td>
+            <td data-label="Avaria">{% if asset.incidents.fault %}<span class="status-badge danger">{{ asset.incidents.fault }}</span>{% else %}<span class="status-badge success">0</span>{% endif %}</td>
+            <td data-label="Comunicação">{% if asset.incidents.communication %}<span class="status-badge warning">{{ asset.incidents.communication }}</span>{% else %}<span class="status-badge muted">0</span>{% endif %}</td>
+            <td data-label="Cobertura">{% if asset.incidents.coverage %}<span class="status-badge muted" title="Lacuna de monitorização, não uma avaria confirmada">{{ asset.incidents.coverage }}</span>{% else %}<span class="status-badge muted">0</span>{% endif %}</td>
+            <td data-label="O&amp;M">{% if asset.om.status == 'none' %}—{% else %}<span class="status-badge {{ asset.om.tone }}">{{ asset.om.label }}</span>{% endif %}</td>
+            <td data-label="ESCO">{% if asset.esco.status == 'none' %}—{% else %}<span class="status-badge {{ 'success' if asset.esco.status == 'active' else 'muted' }}">{{ 'ESCO ativo' if asset.esco.status == 'active' else asset.esco.status }}</span>{% endif %}</td>
+            <td data-label="Trabalhos">{% if asset.work.overdue %}<span class="status-badge danger" title="trabalhos em atraso">{{ asset.work.overdue }} atrasado{{ '' if asset.work.overdue == 1 else 's' }}</span>{% elif asset.work.unscheduled %}<span class="status-badge muted" title="trabalhos sem data">{{ asset.work.unscheduled }} sem data</span>{% else %}<span class="status-badge muted">—</span>{% endif %}</td>
+          </tr>
+        {% else %}<tr><td class="table-empty" colspan="9">Não existem instalações para estes filtros.</td></tr>{% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if pagination.pages > 1 %}
+    <nav class="pagination" aria-label="Paginação de instalações">
+      {% if pagination.has_previous %}<a href="{{ url_for('installations.index', search=filters.search, om=filters.om, family=filters.family, mapping=filters.mapping, page=pagination.previous) }}">Anterior</a>{% endif %}
+      <span>Página {{ pagination.page }} de {{ pagination.pages }}</span>
+      {% if pagination.has_next %}<a href="{{ url_for('installations.index', search=filters.search, om=filters.om, family=filters.family, mapping=filters.mapping, page=pagination.next) }}">Seguinte</a>{% endif %}
+    </nav>
+  {% endif %}
+</section>
+{% endblock %}

@@ -168,3 +168,90 @@ def test_a_quiet_portfolio_looks_quiet(settings, monkeypatch) -> None:
     # Normal state carries no colour: no severity stripe classes on the tiles.
     assert 'class="tri crit"' not in page.text
     assert 'class="tri warn"' not in page.text
+
+
+# --- fault / communication / coverage split -------------------------------
+
+
+def test_the_dashboard_splits_fault_communication_and_coverage(settings, monkeypatch) -> None:
+    """The whole point: 94% of a real backlog was `stale_reading` (coverage),
+    and a merged "X incidentes" number on the front page would have said
+    the fleet was on fire when it was mostly just unwatched."""
+    from datetime import date as date_
+
+    from nemsei.assets.service import create_device
+
+    session, _, connection = build(settings, monkeypatch)
+    asset, _ = add_asset(session, connection, name="Central Mista", external="NE=1")
+    device_a = create_device(session, asset_id=asset.id, device_kind="inverter", label="INV-1", valid_from=date_(2026, 1, 1))
+    device_b = create_device(session, asset_id=asset.id, device_kind="inverter", label="INV-2", valid_from=date_(2026, 1, 1))
+    session.flush()
+    now = utc_now()
+    session.add(
+        DiagnosticIncident(
+            rule_code="device_unavailable", asset_id=asset.id, device_id=device_a.id, severity="critical", status="open",
+            opened_at=now, last_observed_at=now, detector_version="test", created_at=now, updated_at=now,
+        )
+    )
+    session.add(
+        DiagnosticIncident(
+            rule_code="stale_reading", asset_id=asset.id, device_id=device_a.id, severity="warning", status="open",
+            opened_at=now, last_observed_at=now, detector_version="test", created_at=now, updated_at=now,
+        )
+    )
+    session.add(
+        DiagnosticIncident(
+            rule_code="stale_reading", asset_id=asset.id, device_id=device_b.id, severity="warning", status="open",
+            opened_at=now, last_observed_at=now, detector_version="test", created_at=now, updated_at=now,
+        )
+    )
+    session.commit()
+    session.close()
+
+    session2 = build_session_factory(build_engine(settings))()
+    panel = operational_panel(session2)
+
+    assert panel["fault_count"] == 1
+    assert panel["coverage_count"] == 2
+    assert panel["communication_count"] == 0
+
+
+def test_the_dashboard_page_never_labels_coverage_as_avaria(settings, monkeypatch) -> None:
+    session, _, connection = build(settings, monkeypatch)
+    asset, _ = add_asset(session, connection, name="Central Cobertura", external="NE=1")
+    now = utc_now()
+    session.add(
+        DiagnosticIncident(
+            rule_code="stale_reading", asset_id=asset.id, severity="warning", status="open",
+            opened_at=now, last_observed_at=now, detector_version="test", created_at=now, updated_at=now,
+        )
+    )
+    session.commit()
+    session.close()
+
+    page = client_for(settings).get("/")
+    assert "Avaria confirmada" in page.text
+    assert "Cobertura" in page.text
+    assert "lacuna de monitorização, não avaria" in page.text
+
+
+def test_the_dashboard_shows_overdue_and_unscheduled_work(settings, monkeypatch) -> None:
+    from datetime import date
+
+    from nemsei.installations.service import backfill_installations_from_assets, installation_for_asset
+    from nemsei.work_orders.service import create_work_order
+
+    session, _, connection = build(settings, monkeypatch)
+    asset, _ = add_asset(session, connection, name="Central Trabalho", external="NE=1")
+    session.flush()
+    backfill_installations_from_assets(session)
+    installation_id = installation_for_asset(session, asset_id=asset.id).id
+    create_work_order(
+        session, installation_id=installation_id, work_type="corrective", title="Atrasado",
+        created_by="op", due_date=date.today() - timedelta(days=2),
+    )
+    session.commit()
+    session.close()
+
+    page = client_for(settings).get("/")
+    assert "Trabalhos atrasados" in page.text

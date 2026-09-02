@@ -24,7 +24,7 @@ from nemsei.assets.models import Asset
 from nemsei.monitoring.models import ProductionFact
 from nemsei.monitoring.repository import CanonicalFactRepository
 from nemsei.shared.clock import utc_now
-from nemsei.web.charts import Point, bar_chart, coverage_calendar, sparkline, stacked_bars
+from nemsei.web.charts import Point, bar_chart, coverage_calendar, dual_bar_chart, sparkline, stacked_bars
 
 METRIC_LABELS = {
     "production_energy": "Produção",
@@ -122,6 +122,100 @@ def monthly_series(session: Session, *, asset_id: int, months: int = 12, metric_
         "months": months,
         "metric_label": METRIC_LABELS.get(metric_kind, metric_kind),
     }
+
+
+# Period options for the "Produção × Consumo" chart. "Hoje" is one bar --
+# `production_facts` has never carried anything finer than daily granularity
+# (verified against the real table: every one of 221 997 rows is
+# `granularity='day'`), so an hourly "today" chart would be inventing a
+# resolution the data cannot support. One honest daily bar is what "hoje"
+# means here.
+PRODUCTION_CONSUMPTION_PERIODS = ("today", "week", "month", "year")
+PERIOD_LABELS = {"today": "Hoje", "week": "7 dias", "month": "Mês", "year": "Ano"}
+
+
+def dual_daily_series(
+    session: Session, *, asset_id: int, days: int, production_kind: str = "production_energy", consumption_kind: str = "consumption_energy"
+) -> dict[str, Any]:
+    """Produção e consumo, dia a dia, na mesma escala -- ver `charts.dual_bar_chart`."""
+    today = utc_now().date()
+    start = today - timedelta(days=days - 1)
+    end = today + timedelta(days=1)
+    production_totals = _daily_totals(session, asset_id=asset_id, start=start, end=end, metric_kind=production_kind)
+    consumption_totals = _daily_totals(session, asset_id=asset_id, start=start, end=end, metric_kind=consumption_kind)
+
+    production_points, consumption_points = [], []
+    for offset in range(days):
+        day = start + timedelta(days=offset)
+        label = day.strftime("%d/%m") if days <= 14 or offset % 7 == 0 else ""
+        production_value = production_totals.get(day)
+        consumption_value = consumption_totals.get(day)
+        production_points.append(
+            Point(label, production_value, hint=f"{day.isoformat()}: produção " + (f"{production_value:.1f} kWh" if production_value is not None else "sem leitura"))
+        )
+        consumption_points.append(
+            Point(label, consumption_value, hint=f"{day.isoformat()}: consumo " + (f"{consumption_value:.1f} kWh" if consumption_value is not None else "sem leitura"))
+        )
+    return {
+        "chart": dual_bar_chart(production_points, consumption_points, unit="kWh"),
+        "production_total": sum(production_totals.values()) if production_totals else None,
+        "consumption_total": sum(consumption_totals.values()) if consumption_totals else None,
+        "days": days,
+    }
+
+
+def dual_monthly_series(
+    session: Session, *, asset_id: int, months: int = 12, production_kind: str = "production_energy", consumption_kind: str = "consumption_energy"
+) -> dict[str, Any]:
+    """Produção e consumo, mês a mês, na mesma escala. Mesmo balde de meses
+    que `monthly_series` usa, para que os dois nunca discordem sobre onde
+    cai a fronteira de um mês."""
+    today = utc_now().date()
+    first = date(today.year, today.month, 1)
+    starts: list[date] = []
+    cursor = first
+    for _ in range(months):
+        starts.append(cursor)
+        cursor = date(cursor.year - 1, 12, 1) if cursor.month == 1 else date(cursor.year, cursor.month - 1, 1)
+    starts.reverse()
+    window_end = date(first.year + 1, 1, 1) if first.month == 12 else date(first.year, first.month + 1, 1)
+
+    production_totals = _daily_totals(session, asset_id=asset_id, start=starts[0], end=window_end, metric_kind=production_kind)
+    consumption_totals = _daily_totals(session, asset_id=asset_id, start=starts[0], end=window_end, metric_kind=consumption_kind)
+
+    names = ("Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez")
+
+    def month_points(totals: dict[date, float]) -> list[Point]:
+        points = []
+        for month_start in starts:
+            in_month = {day: value for day, value in totals.items() if (day.year, day.month) == (month_start.year, month_start.month)}
+            total = sum(in_month.values()) if in_month else None
+            label = names[month_start.month - 1]
+            points.append(Point(label, total, hint=f"{label} {month_start.year}: " + (f"{total:.0f} kWh" if total is not None else "sem leituras")))
+        return points
+
+    return {
+        "chart": dual_bar_chart(month_points(production_totals), month_points(consumption_totals), unit="kWh"),
+        "production_total": sum(production_totals.values()) if production_totals else None,
+        "consumption_total": sum(consumption_totals.values()) if consumption_totals else None,
+        "months": months,
+    }
+
+
+def production_consumption_series(session: Session, *, asset_id: int, period: str) -> dict[str, Any]:
+    """The one entry point the installation detail page calls -- picks the
+    right granularity for one of `PRODUCTION_CONSUMPTION_PERIODS`."""
+    if period not in PRODUCTION_CONSUMPTION_PERIODS:
+        period = "week"
+    if period == "today":
+        return {**dual_daily_series(session, asset_id=asset_id, days=1), "period": period}
+    if period == "week":
+        return {**dual_daily_series(session, asset_id=asset_id, days=7), "period": period}
+    if period == "month":
+        today = utc_now().date()
+        days_in_month = monthrange(today.year, today.month)[1]
+        return {**dual_daily_series(session, asset_id=asset_id, days=days_in_month), "period": period}
+    return {**dual_monthly_series(session, asset_id=asset_id, months=12), "period": period}
 
 
 def month_calendar(session: Session, *, asset_id: int, year: int, month: int) -> dict[str, Any]:

@@ -18,7 +18,7 @@ STYLES = Path(__file__).resolve().parents[1] / "src" / "nemsei" / "web" / "stati
 
 # Tables that must read as cards on a phone. Adding one here without adding
 # `stack-mobile` and the data-labels to its template fails these tests.
-STACKED_TABLES = ["assets/list.html"]
+STACKED_TABLES = ["assets/list.html", "installations/list.html", "work_orders/list.html"]
 
 
 def read(name: str) -> str:

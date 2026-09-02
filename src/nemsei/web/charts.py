@@ -147,6 +147,82 @@ def bar_chart(
 
 
 @dataclass(frozen=True)
+class DualBarChart:
+    width: int
+    height: int
+    production_bars: list[Bar]
+    consumption_bars: list[Bar]
+    gridlines: list[tuple[float, str]]
+    label_y: float
+    empty: bool
+    unit: str = ""
+
+
+def dual_bar_chart(
+    production: list[Point],
+    consumption: list[Point],
+    *,
+    width: int = 720,
+    plot_height: int = 150,
+    unit: str = "",
+) -> DualBarChart:
+    """Produção e consumo, mesmos períodos, uma escala partilhada.
+
+    One shared y-axis, on purpose: comparing the two at independently scaled
+    axes would misstate which one is bigger, the same reason `stacked_bars`
+    compares shares rather than two independently-scaled absolutes.
+    `production` and `consumption` must describe the same periods in the same
+    order -- this function does not align them, the caller's query already
+    built both from the same period boundaries (`web/series.py` calls
+    `daily_series`/`monthly_series` twice, once per `metric_kind`, over the
+    same date range).
+
+    Missing stays a gap here exactly as in `bar_chart`: a period with no
+    production reading and a period with no consumption reading are drawn
+    independently, so a plant with production data but no consumption meter
+    still shows real production bars beside honest gaps, never zeros.
+    """
+    if len(production) != len(consumption):
+        raise ValueError("production and consumption must describe the same periods")
+    pad_left, pad_right, pad_top = 46, 10, 12
+    plot_bottom = pad_top + plot_height
+    label_y = plot_bottom + 15
+    height = int(label_y + 8)
+
+    if not production:
+        return DualBarChart(width, height, [], [], [], label_y, True, unit)
+
+    values = [point.value for series in (production, consumption) for point in series if point.value is not None]
+    top = _nice_ceiling(max(values)) if values else 1.0
+    inner = width - pad_left - pad_right
+    slot = inner / len(production)
+    pair_width = min(66.0, slot * 0.7)
+    bar_width = max(2.0, pair_width / 2 - 1.0)
+
+    gridlines = [
+        (plot_bottom - fraction * plot_height, _format(top * fraction))
+        for fraction in (0.0, 0.5, 1.0)
+    ]
+
+    def make_bar(point: Point, x: float, delay: float) -> Bar:
+        if point.missing:
+            return Bar(x, pad_top, bar_width, plot_height, point, delay)
+        drawn = (point.value / top) * plot_height if top else 0.0
+        drawn = max(drawn, 1.5) if point.value > 0 else 1.0
+        return Bar(x, plot_bottom - drawn, bar_width, drawn, point, delay)
+
+    production_bars: list[Bar] = []
+    consumption_bars: list[Bar] = []
+    for index, (production_point, consumption_point) in enumerate(zip(production, consumption)):
+        centre = pad_left + slot * index + slot / 2
+        delay = round(min(index * 0.035, 1.2), 3)
+        production_bars.append(make_bar(production_point, centre - pair_width / 2, delay))
+        consumption_bars.append(make_bar(consumption_point, centre - pair_width / 2 + bar_width + 2.0, delay))
+
+    return DualBarChart(width, height, production_bars, consumption_bars, gridlines, label_y, False, unit)
+
+
+@dataclass(frozen=True)
 class Sparkline:
     width: int
     height: int

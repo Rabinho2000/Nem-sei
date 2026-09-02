@@ -22,7 +22,7 @@
       {% endif %}
     </p>
   </div>
-  <a class="button primary" href="{{ url_for('assets.list_assets') }}">Ver centrais <span aria-hidden="true">→</span></a>
+  <a class="button primary" href="{{ url_for('installations.index') }}">Ver instalações <span aria-hidden="true">→</span></a>
 </header>
 
 <section class="triage" aria-label="O que precisa de atenção">
@@ -34,13 +34,22 @@
     <small>ESCO com problema</small><b>{{ panel.esco_with_incidents }}</b>
     <em>de {{ panel.esco_priority_assets }} ESCO em contrato</em>
   </a>
-  <a class="tri {{ 'crit' if panel.critical else '' }}" href="{{ url_for('diagnostics.incidents') }}">
-    <small>Crítico</small><b>{{ panel.critical }}</b>
-    <em>{{ 'nada parado agora' if not panel.critical else 'incidentes críticos abertos' }}</em>
+  {#
+    Avaria, comunicação e cobertura ficam sempre em cartões separados --
+    nunca um "X incidentes" a somar as três. A cobertura nunca fica "crit":
+    é uma lacuna de monitorização, não uma avaria confirmada.
+  #}
+  <a class="tri {{ 'crit' if panel.fault_count else '' }}" href="{{ url_for('diagnostics.incidents') }}">
+    <small>Avaria confirmada</small><b>{{ panel.fault_count }}</b>
+    <em>{{ 'nada parado agora' if not panel.fault_count else 'equipamento ou produção confirmadamente errado' }}</em>
   </a>
-  <a class="tri {{ 'warn' if panel.warning else '' }}" href="{{ url_for('diagnostics.incidents', handling='untouched') }}">
-    <small>Aviso</small><b>{{ panel.warning }}</b>
-    <em>{{ panel.untouched_incidents }} por triar</em>
+  <a class="tri {{ 'warn' if panel.communication_count else '' }}" href="{{ url_for('diagnostics.incidents') }}">
+    <small>Comunicação</small><b>{{ panel.communication_count }}</b>
+    <em>provider ou instalação sem contacto</em>
+  </a>
+  <a class="tri" href="{{ url_for('diagnostics.incidents') }}">
+    <small>Cobertura</small><b>{{ panel.coverage_count }}</b>
+    <em>lacuna de monitorização, não avaria</em>
   </a>
   <a class="tri {{ 'void' if panel.silent_assets else '' }}" href="{{ url_for('assets.list_assets') }}">
     <small>Sem leitura recente</small><b>{{ panel.silent_assets }}</b>
@@ -67,6 +76,10 @@
     <small>Por rever</small><b>{{ panel.needs_review }}</b>
     <em>{{ panel.pending_mappings }} mappings pendentes</em>
   </a>
+  <a class="tri {{ 'warn' if panel.work_overdue else '' }}" href="{{ url_for('work_orders.index_work_orders', scope='overdue') }}">
+    <small>Trabalhos atrasados</small><b>{{ panel.work_overdue }}</b>
+    <em>{{ panel.work_unscheduled }} sem data</em>
+  </a>
 </section>
 
 <section class="panel chart-panel">
@@ -91,7 +104,7 @@
         <tbody>
           {% for row in panel.attention %}
             <tr class="{{ 'row-attention' if row.critical else '' }}">
-              <th scope="row"><a class="table-primary" href="{{ url_for('assets.asset_detail', asset_id=row.asset.id) }}">{{ row.asset.canonical_name }}</a></th>
+              <th scope="row"><a class="table-primary" href="{{ url_for('installations.detail', asset_id=row.asset.id) }}">{{ row.asset.canonical_name }}</a></th>
               <td class="muted">{{ row.organization_name or '—' }}</td>
               <td class="num">{{ ('%.0f kWp'|format(row.power_kw)) if row.power_kw else '—' }}</td>
               <td>

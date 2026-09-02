@@ -470,6 +470,11 @@ a.status-badge:hover, a.status-badge:focus-visible { text-decoration: underline;
 .c-cap { font-size: 8px; text-anchor: end; letter-spacing: 0.06em; }
 .c-bar { fill: var(--c-s1); transform-box: fill-box; transform-origin: bottom; animation: c-rise 0.6s cubic-bezier(0.22, 0.9, 0.3, 1) both; animation-delay: var(--d, 0s); }
 .c-bar:hover { fill: var(--brand-dark); }
+/* Produção × Consumo (macros/chart.html:dual_bars): duas séries, duas cores
+   -- as mesmas --c-s1/--c-s2 já usadas no resto dos gráficos, para que
+   "série 1" signifique sempre a mesma cor em toda a aplicação. */
+.c-bar-production { fill: var(--c-s1); transform-box: fill-box; transform-origin: bottom; animation: c-rise 0.6s cubic-bezier(0.22, 0.9, 0.3, 1) both; animation-delay: var(--d, 0s); }
+.c-bar-consumption { fill: var(--c-s2); transform-box: fill-box; transform-origin: bottom; animation: c-rise 0.6s cubic-bezier(0.22, 0.9, 0.3, 1) both; animation-delay: var(--d, 0s); }
 /* Um dia sem leitura e um vazio tramado, nunca uma barra a zero. */
 .c-void { fill: var(--c-void); opacity: 0.4; }
 .c-cov-track { fill: var(--surface-raised); }

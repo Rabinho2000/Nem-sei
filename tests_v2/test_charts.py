@@ -7,7 +7,9 @@ a chart that flattens it is worse than no chart.
 """
 from __future__ import annotations
 
-from nemsei.web.charts import Point, bar_chart, coverage_calendar, sparkline, stacked_bars
+import pytest
+
+from nemsei.web.charts import Point, bar_chart, coverage_calendar, dual_bar_chart, sparkline, stacked_bars
 
 
 def test_a_missing_column_is_a_gap_not_a_zero_bar() -> None:
@@ -114,3 +116,60 @@ def test_stacked_columns_show_shares_not_absolutes() -> None:
 
 def test_a_balance_with_no_energy_is_empty_rather_than_a_flat_line() -> None:
     assert stacked_bars([("Produção", [("Autoconsumo", 0.0, 1)])]).empty is True
+
+
+# --- dual_bar_chart: produção × consumo, uma escala partilhada -----------
+
+
+def test_production_and_consumption_share_one_scale() -> None:
+    """The whole point: comparing at independent scales would misstate which
+    is bigger. A shared ceiling means the taller series' bars reach the top,
+    not each series independently filling its own plot."""
+    chart = dual_bar_chart(
+        [Point("Seg", 100.0), Point("Ter", 80.0)],
+        [Point("Seg", 40.0), Point("Ter", 30.0)],
+    )
+    # 100 is the joint maximum; a 100kWh production bar should reach the
+    # full plot height, not be independently re-scaled against 80.
+    assert chart.gridlines[-1][1] == "100"
+
+
+def test_a_missing_value_in_either_series_is_a_gap_not_a_zero() -> None:
+    chart = dual_bar_chart(
+        [Point("Seg", 100.0), Point("Ter", None)],
+        [Point("Seg", None), Point("Ter", 30.0)],
+    )
+    assert chart.production_bars[0].point.missing is False
+    assert chart.production_bars[1].point.missing is True
+    assert chart.consumption_bars[0].point.missing is True
+    assert chart.consumption_bars[1].point.missing is False
+
+
+def test_a_plant_with_production_but_no_consumption_meter_still_shows_production() -> None:
+    """A plant with no consumption meter must not read as having no data at
+    all -- production bars stay real, consumption bars are honest gaps."""
+    chart = dual_bar_chart([Point("Seg", 100.0)], [Point("Seg", None)])
+    assert chart.production_bars[0].point.missing is False
+    assert chart.production_bars[0].height > 0
+    assert chart.consumption_bars[0].point.missing is True
+
+
+def test_the_two_bars_of_one_period_never_overlap() -> None:
+    chart = dual_bar_chart([Point("Seg", 100.0)], [Point("Seg", 80.0)])
+    production_bar = chart.production_bars[0]
+    consumption_bar = chart.consumption_bars[0]
+    assert production_bar.x + production_bar.width <= consumption_bar.x
+
+
+def test_mismatched_period_lengths_are_refused() -> None:
+    with pytest.raises(ValueError):
+        dual_bar_chart([Point("Seg", 1.0), Point("Ter", 2.0)], [Point("Seg", 1.0)])
+
+
+def test_an_empty_pair_of_series_is_flagged_rather_than_drawn() -> None:
+    assert dual_bar_chart([], []).empty is True
+
+
+def test_a_tiny_real_value_in_either_series_still_gets_a_visible_mark() -> None:
+    chart = dual_bar_chart([Point("Seg", 10000.0)], [Point("Seg", 0.4)])
+    assert chart.consumption_bars[0].height >= 1.0

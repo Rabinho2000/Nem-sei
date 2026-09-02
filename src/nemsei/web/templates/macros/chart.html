@@ -49,6 +49,44 @@
   {% endif %}
 {% endmacro %}
 
+{% macro dual_bars(chart, caption='') %}
+  {#
+    Produção × Consumo: dois pares de barras por período, uma escala
+    partilhada -- ver web/charts.py:dual_bar_chart. Cada série tem a sua
+    própria classe de cor; um gap (sem leitura) usa sempre a mesma classe
+    `c-void` de `bars`, para que "sem dados" se leia igual em toda a
+    aplicação, seja qual for o gráfico.
+  #}
+  {% if chart.empty %}
+    <p class="chart-empty">Sem dados para desenhar. Não é um gráfico a zero — é a ausência de leituras.</p>
+  {% else %}
+    <svg class="chart" viewBox="0 0 {{ chart.width }} {{ chart.height }}" role="img"
+         aria-label="{{ caption or 'Produção e consumo' }}" preserveAspectRatio="xMidYMid meet">
+      {% for y, label in chart.gridlines %}
+        <line class="c-grid" x1="46" y1="{{ '%.1f'|format(y) }}" x2="{{ chart.width - 10 }}" y2="{{ '%.1f'|format(y) }}"/>
+        <text class="c-axis-y" x="38" y="{{ '%.1f'|format(y + 4) }}">{{ label }}</text>
+      {% endfor %}
+      {% for bar in chart.production_bars %}
+        {% if bar.point.missing %}
+          <rect class="c-void" x="{{ '%.1f'|format(bar.x) }}" y="{{ '%.1f'|format(bar.y) }}" width="{{ '%.1f'|format(bar.width) }}" height="{{ '%.1f'|format(bar.height) }}" rx="2"><title>{{ bar.point.hint }}</title></rect>
+        {% else %}
+          <rect class="c-bar c-bar-production" x="{{ '%.1f'|format(bar.x) }}" y="{{ '%.1f'|format(bar.y) }}" width="{{ '%.1f'|format(bar.width) }}" height="{{ '%.1f'|format(bar.height) }}" rx="2" style="--d:{{ bar.delay }}s"><title>{{ bar.point.hint }}</title></rect>
+        {% endif %}
+      {% endfor %}
+      {% for bar in chart.consumption_bars %}
+        {% if bar.point.missing %}
+          <rect class="c-void" x="{{ '%.1f'|format(bar.x) }}" y="{{ '%.1f'|format(bar.y) }}" width="{{ '%.1f'|format(bar.width) }}" height="{{ '%.1f'|format(bar.height) }}" rx="2"><title>{{ bar.point.hint }}</title></rect>
+        {% else %}
+          <rect class="c-bar c-bar-consumption" x="{{ '%.1f'|format(bar.x) }}" y="{{ '%.1f'|format(bar.y) }}" width="{{ '%.1f'|format(bar.width) }}" height="{{ '%.1f'|format(bar.height) }}" rx="2" style="--d:{{ bar.delay + 0.05 }}s"><title>{{ bar.point.hint }}</title></rect>
+        {% endif %}
+      {% endfor %}
+      {% for bar in chart.production_bars %}
+        {% if bar.point.label %}<text class="c-axis-x" x="{{ '%.1f'|format(bar.x + bar.width) }}" y="{{ chart.label_y }}">{{ bar.point.label }}</text>{% endif %}
+      {% endfor %}
+    </svg>
+  {% endif %}
+{% endmacro %}
+
 {% macro spark(line) %}
   {% if not line.empty %}
     <svg class="spark" viewBox="0 0 {{ line.width }} {{ line.height }}" aria-hidden="true" preserveAspectRatio="none">
