@@ -300,3 +300,133 @@ def test_overdue_and_unscheduled_counts_once_work_orders_exist(factory) -> None:
         counts = overdue_and_unscheduled_counts(session, asset_ids=[asset_id])
 
     assert counts[asset_id] == {"overdue": 1, "unscheduled": 2}
+
+
+# --- performance tab: esperado vs real -------------------------------------
+
+
+def seed_confirmed_model(session, *, asset_id: int, month: int, expected_kwh) -> int:
+    from decimal import Decimal
+
+    from nemsei.reporting.models import FinancialModel, FinancialModelMonth, ReportSourceFile
+
+    source = ReportSourceFile(
+        asset_id=asset_id, file_kind="financial_model", original_filename="modelo.xlsx",
+        stored_path="/dev/null", sha256=f"sha-{asset_id}-{month}", size_bytes=10,
+        uploaded_at=utc_now(),
+    )
+    session.add(source)
+    session.flush()
+    model = FinancialModel(
+        source_file_id=source.id, asset_id=asset_id, version=1, status="confirmed",
+        base_year_source="workbook", workbook_format="unknown",
+        parser_name="test", parser_version="1", source_file_sha256=source.sha256,
+        confirmed_by="op", confirmed_at=utc_now(), created_at=utc_now(), updated_at=utc_now(),
+    )
+    session.add(model)
+    session.flush()
+    session.add(
+        FinancialModelMonth(
+            financial_model_id=model.id, month=month,
+            expected_production_kwh=Decimal(str(expected_kwh)) if expected_kwh is not None else None,
+        )
+    )
+    session.flush()
+    return model.id
+
+
+def test_expected_vs_actual_is_unavailable_without_a_confirmed_model(factory) -> None:
+    with factory() as session, session.begin():
+        asset = create_asset(session, canonical_name="Alpha")
+        asset_id = asset.id
+
+    with factory() as session:
+        detail = installation_detail(session, asset_id=asset_id, tab="performance")
+
+    assert detail["expected"]["available"] is False
+    assert detail["expected"]["reason"] == "no_confirmed_model"
+
+
+def test_expected_vs_actual_is_unavailable_when_the_model_has_no_value_for_this_month(factory) -> None:
+    with factory() as session, session.begin():
+        asset = create_asset(session, canonical_name="Alpha")
+        other_month = 1 if utc_now().month != 1 else 2
+        seed_confirmed_model(session, asset_id=asset.id, month=other_month, expected_kwh=1000)
+        asset_id = asset.id
+
+    with factory() as session:
+        detail = installation_detail(session, asset_id=asset_id, tab="performance")
+
+    assert detail["expected"]["available"] is False
+    assert detail["expected"]["reason"] == "no_expected_value_for_month"
+
+
+def test_expected_vs_actual_compares_the_confirmed_model_against_measured_production(factory) -> None:
+    from datetime import datetime, timedelta, timezone
+    from decimal import Decimal
+
+    from nemsei.monitoring.models import ProductionFact
+    from nemsei.providers.service import create_connection, create_mapping
+
+    with factory() as session, session.begin():
+        asset = create_asset(session, canonical_name="Alpha")
+        connection = create_connection(
+            session, provider_code="fusionsolar", connection_key="k", display_name="FS",
+            credential_reference="ref", enabled=True, configuration_status="configured",
+        )
+        mapping = create_mapping(session, asset_id=asset.id, provider_connection_id=connection.id, external_id="NE=1")
+        seed_confirmed_model(session, asset_id=asset.id, month=utc_now().month, expected_kwh=1000)
+        today = utc_now().date()
+        start = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
+        session.add(
+            ProductionFact(
+                asset_id=asset.id, provider_mapping_id=mapping.id, source_fact_key="p:1", source_revision=1,
+                metric_kind="production_energy", period_start=start, period_end=start + timedelta(days=1),
+                granularity="day", value=Decimal("800"), unit="kWh", quality="complete", completeness="complete",
+                ingested_at=utc_now(), metadata_json={},
+            )
+        )
+        asset_id = asset.id
+
+    with factory() as session:
+        detail = installation_detail(session, asset_id=asset_id, tab="performance")
+
+    expected = detail["expected"]
+    assert expected["available"] is True
+    assert expected["expected_kwh"] == Decimal("1000")
+    assert expected["actual_kwh"] == Decimal("800")
+    assert expected["deviation_pct"] == Decimal("-20")
+
+
+def test_the_performance_tab_points_at_operacao_for_impact_not_a_second_number(factory) -> None:
+    """`notifications/impact.py` (the shared engine, now committed) is
+    consulted from the Operação tab, once, per incident -- Performance
+    itself never recomputes it, so there is never a second number for the
+    same incident on two screens."""
+    with factory() as session, session.begin():
+        asset = create_asset(session, canonical_name="Alpha")
+        asset_id = asset.id
+
+    with factory() as session:
+        detail = installation_detail(session, asset_id=asset_id, tab="performance")
+
+    assert detail["impact_available"] is True
+
+
+def test_the_operacao_tab_shows_estimated_impact_for_a_fault_but_not_for_coverage(factory) -> None:
+    with factory() as session, session.begin():
+        asset = create_asset(session, canonical_name="Alpha")
+        seed_incident(session, asset_id=asset.id, rule_code="device_unavailable", severity="critical")
+        seed_incident(session, asset_id=asset.id, rule_code="stale_reading")
+        asset_id = asset.id
+
+    with factory() as session:
+        detail = installation_detail(session, asset_id=asset_id, tab="operacao")
+
+    fault_incident = detail["incidents_by_category"]["fault"][0]
+    coverage_incident = detail["incidents_by_category"]["coverage"][0]
+    # No real recent power reading exists in this test, so the estimate is
+    # honestly "não calculável" -- but it must have been *asked* for the
+    # fault, and never asked at all for the coverage incident.
+    assert detail["impact_by_incident"][fault_incident.id] is not None
+    assert detail["impact_by_incident"][coverage_incident.id] is None

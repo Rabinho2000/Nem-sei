@@ -362,3 +362,55 @@ abertos confirmados, **0 incidentes novos** (nenhuma instalação real tem
 ainda coordenadas importadas, por isso a nova regra de produção nula não
 pode disparar), **0 diferidos**, e 1 dos 445 incidentes abertos qualifica
 como recorrente hoje. Cópia descartável, sem escrita real.
+
+## UI operacional, e o que não se calculou (2026-09-02)
+
+- **`Installation` continua ancorada em `Asset` no read-model da UI, nunca o
+  contrário.** `installations` está vazia em produção — o backfill existe e
+  está testado desde o Bloco 1, mas o deploy continua deliberadamente por
+  fazer. `web/installation_queries.py` lê sempre por `Asset.id` e trata
+  `Installation` como enriquecimento opcional: em falta, mostra "sem
+  Instalação associada" em vez de esconder a funcionalidade ou rebentar.
+- **Avaria / comunicação / cobertura são três números em toda a UI nova**
+  (`diagnostics/incident_categories.py`), nunca um só. Resposta direta ao
+  achado que abriu esta sessão: 94% de 447 incidentes reais eram
+  `stale_reading`/`device_unknown_status` — falta de monitorização, não
+  avaria.
+- **Sem segundo algoritmo de prioridade.** A meio da sessão confirmou-se que
+  outro contexto está a construir `notifications/priority.py`
+  (`score_episode`, `PriorityInputs`) para o Telegram e o resumo matinal.
+  `web/operational_priority.py` é o adapter — uma ordenação mínima e
+  explicitamente temporária, construída só com regras que já existem e já
+  têm teste (`contracts.priority.service_priority`, o próprio split de
+  categorias), nunca inventando um peso novo. Nunca inclui cobertura na
+  ordenação: GOAL.md é explícito que uma pilha de lacunas de monitorização
+  não pode subir uma instalação na lista de atenção.
+- **"Impacto económico das falhas" foi ligado, não recalculado.**
+  `notifications/impact.py` do outro contexto (`estimate_energy_impact`,
+  `estimate_financial_impact`) entretanto ficou commitado (`f64cd7a` e
+  seguintes) — produção perdida a partir da última potência real conhecida e
+  da janela produtiva, nunca de uma capacidade nominal, com a mesma
+  distinção None/zero que este código já pratica noutros sítios. A tab
+  Operação passou a chamar essa função por incidente (`_incident_impact`),
+  nunca por `coverage` — lacuna de monitorização não tem produção perdida
+  associada, só avaria/comunicação têm. A tab Performance já não mostra
+  "ainda não disponível": aponta para a Operação, onde o número por
+  incidente já existe, em vez de duplicar um agregado ali. Construir uma
+  segunda versão do cálculo continua a ser exatamente o erro que a instrução
+  sobre prioridade já tinha avisado — por isso a tab chama a função do outro
+  contexto, não reimplementa.
+- **"Esperado vs Real" foi calculado, porque não há sobreposição nenhuma**:
+  compara a produção medida do mês com `FinancialModelMonth
+  .expected_production_kwh` do modelo confirmado — uma pergunta diferente de
+  "quanto custou este incidente", e uma que os dados de produção (2 modelos
+  confirmados, 267 assets) já respondem para quem tem modelo.
+- **`confirmed_financial_model` deixou de estar escrito três vezes.** A
+  mesma query (`FinancialModel` do asset, `status='confirmed'`, versão mais
+  alta) existia em `reporting/service.py`, `web/commercial_routes.py` e
+  `reporting/datasets.py`, sempre para a mesma pergunta com propósitos
+  ligeiramente diferentes (quem substituir vs. de onde ler o esperado).
+  Extraída para `reporting/commercial.py`, os três sítios existentes
+  passaram a chamá-la; o quarto uso (esta tab) não escreveu uma quarta
+  cópia. Os três conjuntos de testes que já cobriam esses três sítios
+  continuam verdes sem alteração — o comportamento não mudou, só deixou de
+  estar em três sítios.

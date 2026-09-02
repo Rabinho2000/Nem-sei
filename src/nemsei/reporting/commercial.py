@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 from nemsei.assets.models import Asset
 from nemsei.contracts.models import AssetServiceContract
 from nemsei.reporting.commercial_models import AssetBillingConfig, AssetTariff, TariffPeriodRule
+from nemsei.reporting.models import FinancialModel
 from nemsei.reporting.rules.billing import detect_report_type_value
 from nemsei.reporting.rules.types import BillingConfig, BillingEnergyBase, BillingMode, ReportType
 from nemsei.shared.clock import utc_now
@@ -53,6 +54,26 @@ def resolve_tariff(session: Session, *, asset_id: int, on: date) -> AssetTariff 
             AssetTariff.asset_id == asset_id,
             _covering(AssetTariff.valid_from, AssetTariff.valid_to, on),
         )
+    )
+
+
+def confirmed_financial_model(session: Session, *, asset_id: int) -> FinancialModel | None:
+    """The confirmed model an asset's expected production comes from, if any.
+
+    The same query was written three times before this -- `reporting/
+    service.py` and `web/commercial_routes.py` both look it up to know which
+    model a new confirmation supersedes, and `reporting/datasets.py` looks it
+    up to read expected values from. One version, reused by all four,
+    instead of a fifth copy the day something else needs it.
+
+    `status == "confirmed"` is unique in practice (confirming a new model
+    supersedes the old one), but not enforced by a constraint, so the
+    highest `version` wins rather than an arbitrary row if it ever is not.
+    """
+    return session.scalar(
+        select(FinancialModel)
+        .where(FinancialModel.asset_id == asset_id, FinancialModel.status == "confirmed")
+        .order_by(FinancialModel.version.desc())
     )
 
 

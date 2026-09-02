@@ -37,9 +37,17 @@ from nemsei.contracts.service import esco_status_map, om_status_map
 from nemsei.diagnostics.incident_categories import CATEGORY_LABELS, CATEGORY_TONES, INCIDENT_CATEGORIES, incident_category
 from nemsei.diagnostics.models import DiagnosticIncident
 from nemsei.installations.models import Installation
+from nemsei.notifications.impact import estimate_energy_impact, estimate_financial_impact
 from nemsei.monitoring.installation_state import current_installation_states
 from nemsei.monitoring.production_window import window_for
-from nemsei.reporting.commercial import billing_config_from, report_type_for, resolve_billing_config, resolve_tariff
+from nemsei.reporting.commercial import (
+    billing_config_from,
+    confirmed_financial_model,
+    report_type_for,
+    resolve_billing_config,
+    resolve_tariff,
+)
+from nemsei.reporting.models import FinancialModelMonth
 from nemsei.reporting.rules.billing import calculate_billing
 from nemsei.reporting.rules.types import EnergyBreakdown, ReportType
 from nemsei.shared.clock import utc_now
@@ -170,6 +178,38 @@ def _resumo_tab(session: Session, asset: Asset, *, period: str) -> dict[str, Any
     }
 
 
+def _incident_impact(
+    session: Session, incident: DiagnosticIncident, *, latitude, longitude, billing_config
+) -> dict[str, Any] | None:
+    """Estimated lost production/revenue for one open incident, via the
+    shared engine (`notifications/impact.py`) another context built for
+    Telegram's episode alerts -- the exact GOAL.md example ("Inversor 2
+    indisponível durante 17h... Produção perdida estimada...") reaches the
+    UI through the same calculation Telegram uses, never a second one.
+    Only for `fault`/`communication` incidents: a `coverage` incident (a
+    stale reading, a device that never reported) has no honest basis to
+    estimate lost production from -- `estimate_energy_impact` already
+    refuses to guess without a real recent power reading, but asking it at
+    all for "we simply do not know the device's state" would imply a
+    confidence this category is defined by not having.
+    """
+    if incident_category(incident.rule_code) == "coverage":
+        return None
+    energy = estimate_energy_impact(
+        session, asset_id=incident.asset_id, device_id=incident.device_id,
+        start=incident.opened_at, end=utc_now(), latitude=latitude, longitude=longitude,
+    )
+    if billing_config is None:
+        return {"energy": energy, "savings": None, "solcor_revenue": None}
+    savings = estimate_financial_impact(energy=energy, price_eur_per_kwh=billing_config.default_electricity_price)
+    solcor_revenue = (
+        estimate_financial_impact(energy=energy, price_eur_per_kwh=billing_config.solcor_price_per_kwh)
+        if billing_config.report_type == "esco"
+        else None
+    )
+    return {"energy": energy, "savings": savings, "solcor_revenue": solcor_revenue}
+
+
 def _operacao_tab(session: Session, asset: Asset) -> dict[str, Any]:
     open_incidents = list(
         session.scalars(
@@ -181,11 +221,22 @@ def _operacao_tab(session: Session, asset: Asset) -> dict[str, Any]:
     by_category: dict[str, list[DiagnosticIncident]] = {category: [] for category in INCIDENT_CATEGORIES}
     for incident in open_incidents:
         by_category[incident_category(incident.rule_code)].append(incident)
+
+    installation = session.get(Installation, asset.installation_id) if asset.installation_id else None
+    latitude = installation.latitude if installation else None
+    longitude = installation.longitude if installation else None
+    billing_config = resolve_billing_config(session, asset_id=asset.id, on=utc_now().date())
+    impact_by_incident = {
+        incident.id: _incident_impact(session, incident, latitude=latitude, longitude=longitude, billing_config=billing_config)
+        for incident in open_incidents
+    }
+
     return {
         "incidents_by_category": by_category,
         "category_labels": CATEGORY_LABELS,
         "category_tones": CATEGORY_TONES,
         "total_open": len(open_incidents),
+        "impact_by_incident": impact_by_incident,
     }
 
 
@@ -207,16 +258,58 @@ def _equipamentos_tab(session: Session, asset: Asset) -> dict[str, Any]:
     }
 
 
+def _expected_vs_actual(session: Session, *, asset: Asset, on: date, actual_kwh: Decimal | None) -> dict[str, Any]:
+    """This calendar month's confirmed-model expectation against what was
+    actually measured -- reusing `FinancialModel`/`FinancialModelMonth`
+    exactly as `reporting.datasets.build_dataset` does, never re-deriving
+    "confirmed model" (`reporting.commercial.confirmed_financial_model`) or
+    the expected-production lookup a second way.
+    """
+    model = confirmed_financial_model(session, asset_id=asset.id)
+    if model is None:
+        return {"available": False, "reason": "no_confirmed_model"}
+    expected_row = session.scalar(
+        select(FinancialModelMonth).where(
+            FinancialModelMonth.financial_model_id == model.id, FinancialModelMonth.month == on.month
+        )
+    )
+    expected_kwh = expected_row.expected_production_kwh if expected_row else None
+    if expected_kwh is None:
+        return {"available": False, "reason": "no_expected_value_for_month", "model_version": model.version}
+    if actual_kwh is None:
+        return {
+            "available": True, "expected_kwh": expected_kwh, "actual_kwh": None, "deviation_pct": None,
+            "model_version": model.version,
+        }
+    deviation_pct = ((actual_kwh - expected_kwh) / expected_kwh * 100) if expected_kwh else None
+    return {
+        "available": True,
+        "expected_kwh": expected_kwh,
+        "actual_kwh": actual_kwh,
+        "deviation_pct": deviation_pct,
+        "model_version": model.version,
+    }
+
+
 def _performance_tab(session: Session, asset: Asset) -> dict[str, Any]:
     today = utc_now().date()
     month_start = date(today.year, today.month, 1)
     balance = energy_balance(session, asset_id=asset.id, start=month_start, end=today + timedelta(days=1))
     metrics = balance["metrics"]
+    actual_kwh = Decimal(str(metrics["production_energy"])) if metrics.get("production_energy") else None
     result: dict[str, Any] = {
         "metrics": metrics,
         "has_production_data": bool(metrics.get("production_energy")),
         "report_type": report_type_for(asset).value,
         "billing": None,
+        "expected": _expected_vs_actual(session, asset=asset, on=today, actual_kwh=actual_kwh),
+        # Impacto económico das falhas: agora real, por incidente aberto --
+        # ver o separador Operação. `notifications/impact.py` (o motor
+        # partilhado com o Telegram/resumo matinal) aterrou a meio desta
+        # sessão; este separador não repete o cálculo, só aponta para onde
+        # ele já aparece, para nunca haver dois números para o mesmo
+        # incidente em duas tabs.
+        "impact_available": True,
     }
     if not result["has_production_data"]:
         return result

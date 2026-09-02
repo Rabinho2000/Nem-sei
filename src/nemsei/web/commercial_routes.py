@@ -19,7 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from nemsei.assets.repository import AssetRepository
-from nemsei.reporting.commercial import set_billing_config, set_tariff
+from nemsei.reporting.commercial import confirmed_financial_model, set_billing_config, set_tariff
 from nemsei.reporting.commercial_models import BILLING_ENERGY_BASES, BILLING_MODES, REPORT_TYPES, TARIFF_TYPES
 from nemsei.reporting.financial_workbook import FinancialModelParseError
 from nemsei.reporting.models import FinancialModel, FinancialModelMonth, ReportSourceFile
@@ -239,11 +239,7 @@ def confirm_financial_model(model_id: int):
     if model.status != "draft":
         flash("Só um rascunho pode ser confirmado.", "error")
         return redirect(url_for("commercial.financial_model", model_id=model_id))
-    previous = session.scalar(
-        select(FinancialModel)
-        .where(FinancialModel.asset_id == model.asset_id, FinancialModel.status == "confirmed")
-        .order_by(FinancialModel.version.desc())
-    )
+    previous = confirmed_financial_model(session, asset_id=model.asset_id)
     if previous is not None:
         previous.status = "superseded"
         model.supersedes_model_id = previous.id

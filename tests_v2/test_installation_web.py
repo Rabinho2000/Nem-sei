@@ -164,3 +164,21 @@ def test_an_unauthenticated_request_is_redirected_not_served(settings, monkeypat
     client = create_app(settings).test_client()
     assert client.get("/instalacoes").status_code in (302, 401, 403)
     assert client.get("/trabalhos").status_code in (302, 401, 403)
+
+
+def test_the_performance_tab_renders_esperado_vs_real_and_the_impact_placeholder(settings, monkeypatch) -> None:
+    upgrade(settings, monkeypatch)
+    session = build_session_factory(build_engine(settings))()
+    with session.begin():
+        asset = create_asset(session, canonical_name="Central Performance")
+        asset_id = asset.id
+    session.close()
+
+    client = create_app(settings).test_client()
+    login(client)
+    response = client.get(f"/instalacoes/{asset_id}", query_string={"tab": "performance"})
+    assert response.status_code == 200
+    assert "Esperado vs Real" in response.text
+    assert "Impacto económico das falhas" in response.text
+    # An honest "not yet", never a fabricated number.
+    assert "Sem modelo financeiro confirmado" in response.text

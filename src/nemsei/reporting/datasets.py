@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 from nemsei.assets.models import Asset
 from nemsei.monitoring.models import ProductionFact
 from nemsei.monitoring.repository import CanonicalFactRepository
+from nemsei.reporting.commercial import confirmed_financial_model
 from nemsei.reporting.models import (
     FinancialModel,
     FinancialModelMonth,
@@ -114,11 +115,7 @@ def build_dataset(
     months = month_starts(period_start, period_end)
 
     if financial_model is None:
-        financial_model = session.scalar(
-            select(FinancialModel)
-            .where(FinancialModel.asset_id == asset_id, FinancialModel.status == "confirmed")
-            .order_by(FinancialModel.version.desc())
-        )
+        financial_model = confirmed_financial_model(session, asset_id=asset_id)
     expected_by_month: dict[int, FinancialModelMonth] = {}
     if financial_model is not None:
         expected_by_month = {

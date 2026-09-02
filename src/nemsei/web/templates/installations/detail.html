@@ -75,7 +75,19 @@
         {% if incidents_by_category[category] %}
           <ul class="plain-list">
             {% for incident in incidents_by_category[category] %}
-              <li><a href="{{ url_for('diagnostics.incident', incident_id=incident.id) }}">{{ incident.rule_code }}</a> <small>desde {{ incident.opened_at.strftime('%d/%m/%Y') }}{% if incident.device_id %} · equipamento #{{ incident.device_id }}{% endif %}</small></li>
+              {% set impact = impact_by_incident.get(incident.id) %}
+              <li>
+                <a href="{{ url_for('diagnostics.incident', incident_id=incident.id) }}">{{ incident.rule_code }}</a>
+                <small>desde {{ incident.opened_at.strftime('%d/%m/%Y') }}{% if incident.device_id %} · equipamento #{{ incident.device_id }}{% endif %}</small>
+                {% if impact %}
+                  <br><small class="muted" title="{{ impact.energy.basis }}">
+                    {% if impact.energy.lost_kwh is not none %}Produção perdida estimada: {{ '%.1f'|format(impact.energy.lost_kwh) }} kWh
+                      {% if impact.savings and impact.savings.lost_eur is not none %} · Poupança do cliente perdida: {{ '%.2f €'|format(impact.savings.lost_eur) }}{% endif %}
+                      {% if impact.solcor_revenue and impact.solcor_revenue.lost_eur is not none %} · Receita Solcor perdida: {{ '%.2f €'|format(impact.solcor_revenue.lost_eur) }}{% endif %}
+                    {% else %}Impacto: não calculável — {{ impact.energy.basis }}{% endif %}
+                  </small>
+                {% endif %}
+              </li>
             {% endfor %}
           </ul>
         {% else %}<small class="muted">Nenhum.</small>{% endif %}
@@ -165,6 +177,26 @@
         <p class="provenance">Valor a faturar calculado, não emitido — o Nem-sei não gere faturas.{% if not has_tariff %} Sem tarifa registada: alguns valores podem usar preços por omissão.{% endif %}</p>
       {% endif %}
     {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-header"><div><p class="eyebrow">Performance</p><h2>Esperado vs Real</h2></div></div>
+    {% if not expected.available %}
+      <p class="empty-state">{{ 'Sem modelo financeiro confirmado — não há produção esperada para comparar.' if expected.reason == 'no_confirmed_model' else 'O modelo confirmado (v' ~ expected.model_version ~ ') não tem um valor esperado para este mês.' }}</p>
+    {% else %}
+      <dl class="detail-list">
+        <div><dt>Esperado (modelo v{{ expected.model_version }})</dt><dd>{{ "{:,.0f}".format(expected.expected_kwh).replace(",", " ") }} kWh</dd></div>
+        <div><dt>Real</dt><dd>{% if expected.actual_kwh is not none %}{{ "{:,.0f}".format(expected.actual_kwh).replace(",", " ") }} kWh{% else %}<span class="muted">sem registo este mês</span>{% endif %}</dd></div>
+        {% if expected.deviation_pct is not none %}
+          <div><dt>Desvio</dt><dd><span class="status-badge {{ 'danger' if expected.deviation_pct < -10 else 'warning' if expected.deviation_pct < 0 else 'success' }}">{{ '%+.0f'|format(expected.deviation_pct) }}%</span></dd></div>
+        {% endif %}
+      </dl>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-header"><div><p class="eyebrow">Performance</p><h2>Impacto económico das falhas</h2></div><a class="text-link" href="{{ url_for('installations.detail', asset_id=asset.id, tab='operacao') }}">Ver por incidente →</a></div>
+    <p class="provenance">Produção e receita perdidas aparecem junto de cada incidente aberto no separador Operação, calculadas pelo mesmo motor que alimenta os alertas de Telegram e o resumo matinal — nunca dois números diferentes para o mesmo incidente.</p>
   </section>
 
 {% elif tab == 'timeline' %}

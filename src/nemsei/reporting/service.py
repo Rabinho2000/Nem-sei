@@ -15,6 +15,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from nemsei.assets.models import Asset
+from nemsei.reporting.commercial import confirmed_financial_model
 from nemsei.reporting.financial_workbook import ParsedFinancialModel, parse_financial_model_workbook
 from nemsei.reporting.models import (
     BASE_YEAR_SOURCES,
@@ -124,11 +125,7 @@ def import_financial_model(
     if workbook_format not in WORKBOOK_FORMATS:
         workbook_format = "unknown"
 
-    previous = session.scalar(
-        select(FinancialModel)
-        .where(FinancialModel.asset_id == source_file.asset_id, FinancialModel.status == "confirmed")
-        .order_by(FinancialModel.version.desc())
-    )
+    previous = confirmed_financial_model(session, asset_id=source_file.asset_id)
     next_version = (
         session.scalar(select(func.max(FinancialModel.version)).where(FinancialModel.asset_id == source_file.asset_id)) or 0
     ) + 1
