@@ -1,7 +1,7 @@
-"""O&M service contracts: which installations Solcor actually operates.
+"""Service contracts: which installations Solcor is engaged to operate, and how.
 
-V1 answered this question with five columns spread across two tables, and one
-of them was not data at all. `assets.active_contract` was *derived*:
+V1 answered the O&M question with five columns spread across two tables, and
+one of them was not data at all. `assets.active_contract` was *derived*:
 `derive_active_contract` returns "yes" when `end_contract >= today`, and a
 nightly `sync_all_contract_statuses` pass kept the stored copy from drifting.
 Checked against the frozen V1 snapshot, the derivation reproduces all 267 rows
@@ -16,6 +16,27 @@ One row is one engagement over one date range. Renewal is a new row, never an
 edit, which is what gives this table the history V1 never had: V1's
 `om_contracts` is `UNIQUE (asset_id)`, so renewing overwrote the terms that
 were true last year.
+
+An installation can hold several engagements of different kinds at once --
+O&M and ESCO are not alternatives, DIACO has both. Every function in
+`contracts/service.py` that reads or closes contracts is scoped to one
+`service_kind` for exactly this reason: before `esco` and `monitoring`
+existed there was only ever one kind per asset, so nothing needed to filter
+by it, and a function that did not would have silently closed an O&M
+engagement the moment an ESCO one was recorded for the same installation, or
+counted an ESCO period as O&M coverage. Neither has ever happened in
+production -- no ESCO contract has been recorded here yet -- but the
+scoping is required from the row that makes it possible, not from the row
+that first triggers it.
+
+`installation_id` exists for the same reason `Asset.installation_id` does
+(see `installations/models.py`): a service engagement is naturally a
+property of the site, not of one technical plant on it. It is nullable and
+unenforced during the transition -- the 92 real V1-imported rows carry only
+`asset_id`, exactly as they always have -- and is filled in by
+`contracts/service.py::backfill_installation_ids` from each contract's own
+`asset.installation_id`, the same pattern the Installation backfill itself
+uses.
 """
 from __future__ import annotations
 
@@ -30,10 +51,10 @@ from nemsei.assets.models import IMPORT_REVIEW_STATUSES, Asset, public_id
 from nemsei.db.base import Base
 
 
-# One value today. The column exists so that a monitoring-only engagement or a
-# warranty period is a new row rather than a new table -- the same reasoning
-# `DEVICE_KINDS` records for devices.
-SERVICE_KINDS = ("om",)
+# `om` is the only kind V1 evidence populates. `esco` and `monitoring` are new
+# vocabulary for engagements V2 can now represent but has not yet recorded --
+# the same open-vocabulary reasoning `DEVICE_KINDS` records for devices.
+SERVICE_KINDS = ("om", "esco", "monitoring")
 CONTRACT_SOURCE_KINDS = ("v1_import", "operator")
 # V1 offered a renewal follow-up field and populated it zero times in seven
 # rows. The vocabulary is V2's own because there is no V1 usage to preserve.
@@ -73,11 +94,17 @@ class AssetServiceContract(Base):
             name="ck_asset_service_contracts_annual_value",
         ),
         Index("ix_asset_service_contracts_validity", "asset_id", "valid_from", "valid_to"),
+        # Every read that answers "what is the OM/ESCO state" filters by kind
+        # first -- see the module docstring -- so the index leads with it.
+        Index("ix_asset_service_contracts_kind", "service_kind", "asset_id"),
+        Index("ix_asset_service_contracts_installation", "installation_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     public_id: Mapped[str] = mapped_column(String(36), unique=True, nullable=False, default=public_id)
     asset_id: Mapped[int] = mapped_column(ForeignKey("assets.id", ondelete="RESTRICT"), nullable=False)
+    # Nullable during the transition -- see the module docstring.
+    installation_id: Mapped[int | None] = mapped_column(ForeignKey("installations.id", ondelete="RESTRICT"))
     service_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="om")
 
     # Exclusive upper bound, like every other temporal window in this schema.

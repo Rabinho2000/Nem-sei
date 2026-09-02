@@ -1,8 +1,17 @@
-"""Reading and writing O&M engagements, and the state derived from them.
+"""Reading and writing service engagements, and the state derived from them.
 
 Every screen that asks "does this installation have O&M?" asks it here, so the
 question has exactly one answer in the product. `models.py` explains why the
 answer is derived rather than stored.
+
+An installation can hold several engagements of different kinds -- O&M and
+ESCO are not alternatives. `om_status_map` and `esco_status_map` are thin
+wrappers over one `_status_map`, each scoped to its own `service_kind`,
+because before ESCO existed there was only ever one kind and nothing needed
+to filter by it. Reading unscoped after adding a second kind would count an
+ESCO period as O&M coverage; writing unscoped would let recording an ESCO
+engagement silently close an unrelated open O&M one. `_close_open_contracts`
+carries the same scoping for the same reason.
 """
 from __future__ import annotations
 
@@ -18,6 +27,7 @@ from nemsei.assets.models import Asset
 from nemsei.contracts.models import (
     CONTRACT_SOURCE_KINDS,
     RENEWAL_STATUSES,
+    SERVICE_KINDS,
     AssetServiceContract,
 )
 from nemsei.shared.clock import utc_now
@@ -37,11 +47,21 @@ def today() -> date:
     return utc_now().date()
 
 
-def contracts_for(session: Session, *, asset_id: int) -> list[AssetServiceContract]:
-    """Every recorded engagement for one installation, newest window first."""
-    rows = session.scalars(
-        select(AssetServiceContract).where(AssetServiceContract.asset_id == asset_id)
-    ).all()
+def contracts_for(
+    session: Session, *, asset_id: int, service_kind: str | None = None
+) -> list[AssetServiceContract]:
+    """Every recorded engagement for one installation, newest window first.
+
+    `service_kind=None` returns every kind mixed together -- correct for a
+    full audit trail, wrong for anything that means "the O&M history" or "the
+    ESCO history" specifically. Callers building one of those must pass the
+    kind; `asset_contract_panel` in `web/contract_queries.py` is the example
+    this distinction was written for.
+    """
+    statement = select(AssetServiceContract).where(AssetServiceContract.asset_id == asset_id)
+    if service_kind is not None:
+        statement = statement.where(AssetServiceContract.service_kind == service_kind)
+    rows = session.scalars(statement).all()
     return sorted(rows, key=_recency_key, reverse=True)
 
 
@@ -52,11 +72,11 @@ def _recency_key(contract: AssetServiceContract) -> tuple[date, date]:
 
 
 def current_contract(
-    session: Session, *, asset_id: int, on: date | None = None
+    session: Session, *, asset_id: int, service_kind: str = "om", on: date | None = None
 ) -> AssetServiceContract | None:
-    """The engagement in force on `on`, if any."""
+    """The engagement of one kind in force on `on`, if any."""
     moment = on or today()
-    for contract in contracts_for(session, asset_id=asset_id):
+    for contract in contracts_for(session, asset_id=asset_id, service_kind=service_kind):
         if contract.covers(moment):
             return contract
     return None
@@ -69,14 +89,33 @@ def om_status(session: Session, *, asset_id: int, on: date | None = None) -> str
 def om_status_map(
     session: Session, *, asset_ids: Sequence[int] | None = None, on: date | None = None
 ) -> dict[int, dict[str, Any]]:
-    """Derived O&M state per installation, in one query.
+    """Derived O&M state per installation. See `_status_map`."""
+    return _status_map(session, service_kind="om", asset_ids=asset_ids, on=on)
+
+
+def esco_status_map(
+    session: Session, *, asset_ids: Sequence[int] | None = None, on: date | None = None
+) -> dict[int, dict[str, Any]]:
+    """Derived ESCO state per installation. See `_status_map`.
+
+    Structurally identical to `om_status_map` -- the derivation in
+    `_state_for` (active/expired/undated/none from a period, never stored)
+    has nothing O&M-specific in it. Only the `service_kind` filter differs.
+    """
+    return _status_map(session, service_kind="esco", asset_ids=asset_ids, on=on)
+
+
+def _status_map(
+    session: Session, *, service_kind: str, asset_ids: Sequence[int] | None = None, on: date | None = None
+) -> dict[int, dict[str, Any]]:
+    """Derived state per installation for one engagement kind, in one query.
 
     Returns an entry for every requested asset, including the ones with no
     engagement at all -- a caller rendering a table must not have to decide
     what a missing key means.
     """
     moment = on or today()
-    statement = select(AssetServiceContract)
+    statement = select(AssetServiceContract).where(AssetServiceContract.service_kind == service_kind)
     if asset_ids is not None:
         if not asset_ids:
             return {}
@@ -221,8 +260,11 @@ def set_service_contract(
     actor = (created_by or "").strip()
     if not actor:
         raise ValueError("Um contrato tem de registar quem o criou.")
-    if session.get(Asset, asset_id) is None:
+    asset = session.get(Asset, asset_id)
+    if asset is None:
         raise ValueError("Central desconhecida.")
+    if service_kind not in SERVICE_KINDS:
+        raise ValueError("Tipo de contrato desconhecido.")
     if source_kind not in CONTRACT_SOURCE_KINDS:
         raise ValueError("Origem de contrato desconhecida.")
     if renewal_status is not None and renewal_status not in RENEWAL_STATUSES:
@@ -232,12 +274,15 @@ def set_service_contract(
     if annual_value_eur is not None and annual_value_eur < 0:
         raise ValueError("O valor anual não pode ser negativo.")
 
-    _close_open_contracts(session, asset_id=asset_id, on=valid_from)
+    # Scoped to this kind: an installation can hold O&M and ESCO at once, and
+    # recording one must never close the other.
+    _close_open_contracts(session, asset_id=asset_id, service_kind=service_kind, on=valid_from)
     session.flush()
 
     now = utc_now()
     contract = AssetServiceContract(
         asset_id=asset_id,
+        installation_id=asset.installation_id,
         service_kind=service_kind,
         valid_from=valid_from,
         valid_to=valid_to,
@@ -258,19 +303,23 @@ def set_service_contract(
     return contract
 
 
-def _close_open_contracts(session: Session, *, asset_id: int, on: date | None) -> None:
-    """End an open window the day a new one starts.
+def _close_open_contracts(session: Session, *, asset_id: int, service_kind: str, on: date | None) -> None:
+    """End an open window of one engagement kind the day a new one starts.
 
     Mirrors `reporting.commercial.close_open_row`, including its refusal to
     guess: a row that already starts on or after the new one is a genuine
     conflict between two statements about the same dates, and resolving it
     silently is how V1 lost the terms that were true last year.
+
+    Scoped to `service_kind`: an installation can hold O&M and ESCO
+    simultaneously, so recording a new ESCO engagement must never touch an
+    open O&M one for the same asset, and vice versa.
     """
-    existing = contracts_for(session, asset_id=asset_id)
+    existing = contracts_for(session, asset_id=asset_id, service_kind=service_kind)
     if on is None:
-        # An engagement with an unknown start is fine as the only one -- two
-        # V1 installations are exactly that. What it cannot do is *supersede*
-        # another, because it cannot be positioned relative to it.
+        # An engagement with an unknown start is fine as the only one of its
+        # kind -- two V1 installations are exactly that. What it cannot do is
+        # *supersede* another, because it cannot be positioned relative to it.
         if existing:
             raise ValueError(
                 "Um contrato sem data de início não pode substituir outro; "
@@ -356,3 +405,31 @@ def iter_expiring(
             continue
         rows.append({"asset_id": asset_id, **state})
     return sorted(rows, key=lambda row: (row["valid_to"] or date.max, row["asset_id"]))
+
+
+def backfill_installation_ids(session: Session) -> dict[str, int]:
+    """Fill `installation_id` on every contract row that lacks one.
+
+    Same shape as `installations.service.backfill_installations_from_assets`:
+    idempotent, run separately, no row's dates or terms touched -- only the
+    new link. A contract whose asset has no Installation yet is left alone
+    and reported rather than skipped silently; run the Installation backfill
+    first.
+    """
+    considered = updated = no_installation = 0
+    rows = session.scalars(
+        select(AssetServiceContract).where(AssetServiceContract.installation_id.is_(None)).order_by(
+            AssetServiceContract.id
+        )
+    ).all()
+    now = utc_now()
+    for contract in rows:
+        considered += 1
+        asset = session.get(Asset, contract.asset_id)
+        if asset is None or asset.installation_id is None:
+            no_installation += 1
+            continue
+        contract.installation_id = asset.installation_id
+        contract.updated_at = now
+        updated += 1
+    return {"considered": considered, "updated": updated, "no_installation": no_installation}

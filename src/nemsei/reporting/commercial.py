@@ -20,6 +20,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from nemsei.assets.models import Asset
+from nemsei.contracts.models import AssetServiceContract
 from nemsei.reporting.commercial_models import AssetBillingConfig, AssetTariff, TariffPeriodRule
 from nemsei.reporting.rules.billing import detect_report_type_value
 from nemsei.reporting.rules.types import BillingConfig, BillingEnergyBase, BillingMode, ReportType
@@ -158,13 +159,24 @@ def set_billing_config(
     export_revenue_enabled: bool = True,
     source_kind: str = "operator",
     provenance: dict[str, Any] | None = None,
+    contract_id: int | None = None,
 ) -> AssetBillingConfig:
-    """Record a billing arrangement, ending whichever one it replaces."""
+    """Record a billing arrangement, ending whichever one it replaces.
+
+    `contract_id`, when given, records which `AssetServiceContract` this
+    arrangement prices -- an ESCO contract's 2031 renewal at a new tariff is a
+    new `AssetBillingConfig` row pointing at the new contract row, not an edit
+    of the old one, matching how contracts themselves are never edited in
+    place. It is provenance, not a lookup key: resolution still happens by
+    `(asset_id, on)` in `resolve_billing_config`, unchanged.
+    """
     actor = created_by.strip()
     if not actor:
         raise ValueError("A billing configuration must record who set it.")
     if session.get(Asset, asset_id) is None:
         raise ValueError("Unknown asset.")
+    if contract_id is not None and session.get(AssetServiceContract, contract_id) is None:
+        raise ValueError("Unknown contract.")
     existing = session.scalars(
         select(AssetBillingConfig).where(AssetBillingConfig.asset_id == asset_id)
     ).all()
@@ -174,6 +186,7 @@ def set_billing_config(
     now = utc_now()
     config = AssetBillingConfig(
         asset_id=asset_id,
+        contract_id=contract_id,
         report_type=report_type,
         billing_mode=billing_mode,
         billing_energy_base=billing_energy_base,

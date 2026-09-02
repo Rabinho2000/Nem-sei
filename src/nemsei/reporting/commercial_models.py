@@ -21,10 +21,12 @@ from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, ForeignKey, Ind
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from nemsei.db.base import Base
-# These tables carry foreign keys into the reporting schema, so its mappers
-# must be registered before SQLAlchemy can resolve them. Importing a module
-# that only defines tables is how that ordering is stated rather than hoped for.
+# These tables carry foreign keys into the reporting and contracts schemas, so
+# their mappers must be registered before SQLAlchemy can resolve them.
+# Importing a module that only defines tables is how that ordering is stated
+# rather than hoped for.
 import nemsei.reporting.models  # noqa: E402,F401 - register the referenced tables
+import nemsei.contracts.models  # noqa: E402,F401 - register asset_service_contracts for AssetBillingConfig.contract_id
 
 
 TARIFF_TYPES = ("simple", "bi-hourly", "tri-hourly", "tetra-hourly")
@@ -123,7 +125,18 @@ class TariffPeriodRule(Base):
 
 
 class AssetBillingConfig(Base):
-    """How an asset is billed, over one date range."""
+    """How an asset is billed, over one date range.
+
+    `contract_id` links a billing arrangement to the specific engagement it
+    prices, when one is known -- an ESCO contract running 2026-2030 at tariff
+    X and its 2031 renewal at tariff Y are two `AssetServiceContract` rows,
+    and each can point to its own `AssetBillingConfig` row without either
+    table's own temporal mechanism changing at all. It is nullable and
+    unenforced: the one real row this table holds today predates the concept
+    and is not required to gain one, and `resolve_billing_config` keeps
+    resolving by `(asset_id, on)` exactly as before -- `contract_id` is
+    provenance, not a new lookup key.
+    """
 
     __tablename__ = "asset_billing_configs"
     __table_args__ = (
@@ -138,10 +151,12 @@ class AssetBillingConfig(Base):
             name="ck_asset_billing_configs_non_negative",
         ),
         Index("ix_asset_billing_configs_validity", "asset_id", "valid_from", "valid_to"),
+        Index("ix_asset_billing_configs_contract", "contract_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     asset_id: Mapped[int] = mapped_column(ForeignKey("assets.id", ondelete="RESTRICT"), nullable=False)
+    contract_id: Mapped[int | None] = mapped_column(ForeignKey("asset_service_contracts.id", ondelete="SET NULL"))
     report_type: Mapped[str] = mapped_column(String(16), nullable=False)
     billing_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="energy")
     billing_energy_base: Mapped[str] = mapped_column(String(32), nullable=False, default="self_consumption")

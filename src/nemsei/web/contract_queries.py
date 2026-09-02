@@ -178,7 +178,10 @@ def asset_contract_panel(session: Session, *, asset_id: int, on: date | None = N
             "review_note": contract.review_note,
             "is_current": contract.covers(moment),
         }
-        for contract in contracts_for(session, asset_id=asset_id)
+        # Scoped to "om": this is the O&M history table specifically. Without
+        # the filter, an ESCO engagement recorded for the same installation
+        # would appear mixed into it as if it were an O&M period.
+        for contract in contracts_for(session, asset_id=asset_id, service_kind="om")
     ]
     return {
         "om": state,
