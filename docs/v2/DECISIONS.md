@@ -233,3 +233,63 @@ and `portfolio_report_profiles`, surveyed read-only on 2026-08-19 and recorded i
 - **O rollup não escreve `IntegrationHealth` nem abre `SyncRun`.** Não sincroniza
   nada: lê linhas que a base já tem. Marcar a ligação como saudável a partir de um
   rollup bem sucedido mascararia um listener morto há dias.
+
+## Installation, Contract scopes, WorkOrder (2026-09-02)
+
+O pedido do produto ("Solcor O&M") trazia uma hierarquia `Organization →
+Installation → Asset` com `Installation` como entidade nova. A primeira análise
+propôs não a criar, com o argumento de que `AssetProviderMapping` já resolvia a
+única multiplicidade observável nos dados (267 assets, 1 com dois providers).
+O pedido corrigiu essa análise: a razão para `Installation` nunca foi resolver
+mappings — é separar o local físico/operacional da central técnica canónica,
+uma distinção que a proveniência de provider não substitui. Decisão final:
+
+- **`Installation` existe, incremental.** Migração `0031`: tabela `installations`
+  mais `assets.installation_id` nullable. Nenhuma linha se move; nenhuma fact
+  table (`production_facts`, `device_status_facts`, `asset_provider_mappings`)
+  muda de FK. `installations/service.py::backfill_installations_from_assets` cria
+  uma Installation por Asset, à parte da migração — mesma divisão de trabalho
+  que os importadores V1 já usam (schema na migração, dados num script
+  idempotente e revisto).
+- **Coordenadas movem-se para `Installation`.** `Asset.latitude`/`.longitude`
+  (desde a `0001`, sempre NULL em produção) ficam por compatibilidade, nunca
+  mais escritas. `monitoring/production_window.py` não mudou nada: já era uma
+  função pura sobre `(latitude, longitude)`, nunca sobre um `Asset` — essa
+  decisão pagou-se sozinha no dia em que o dono das colunas mudou.
+- **`AssetServiceContract.service_kind` alarga para `esco`/`monitoring`.** Cada
+  função de leitura/fecho em `contracts/service.py` passou a ser âmbito por
+  `service_kind` — antes disso existia só `om` e nada precisava de filtrar.
+  Sem o âmbito, registar o primeiro contrato ESCO de uma instalação fecharia
+  silenciosamente o O&M aberto, e `om_status_map` contaria um período ESCO
+  como cobertura O&M.
+- **`ex_asset_service_contracts_no_overlap` (0027) tinha o mesmo defeito ao
+  nível da base de dados**, e mais grave: excluía por `(asset_id, daterange)`
+  sem `service_kind`, por isso a base recusaria um contrato ESCO datado dentro
+  de uma janela O&M aberta — o caso normal que esta mudança existe para
+  permitir, não uma exceção. Apanhado por
+  `test_recording_an_esco_engagement_does_not_close_an_open_om_one` a falhar
+  com `ExclusionViolation`, não por inspeção. Corrigido na `0032`, adicionando
+  `service_kind WITH =` à exclusão.
+- **`AssetBillingConfig.contract_id`** (nullable) liga uma configuração
+  comercial ao contrato que a determina, sem duplicar o mecanismo temporal que
+  a tabela já tinha nem mudar `resolve_billing_config`, que continua a resolver
+  por `(asset_id, on)`.
+- **`WorkOrder`/`Visit` são entidades novas; `DiagnosticIncident` não muda.**
+  O "Incident" formal pedido já existe — `DiagnosticIncident` já tem
+  deduplicação por `(rule_code, asset_id, device_id)`, `handling_state`
+  (new/acknowledged/investigating/visit_scheduled/done) e notas de auditoria.
+  O que faltava era só `WorkOrder`↔`Incident` N:N e `Visit`. `WorkOrder` liga-se
+  a `Installation`, não a `Asset` — um trabalho é despachado a um sítio, não a
+  uma central. Vocabulário de `work_type`/`status` dimensionado pela evidência
+  real da V1 (13 tickets, 4 estados realmente usados de 6 declarados,
+  `field_route_plans` com zero linhas alguma vez), não pelo esquema antigo.
+
+  **Gap conhecido, deliberadamente não fechado nesta sessão**: `findings.py`
+  não tem limiar de duração nem consulta `production_window`, por isso uma
+  regra `severity="info"` (ex.: `partial_device_coverage`) criaria hoje um
+  incidente na primeira ocorrência — contra o pedido explícito
+  "alarme informativo não cria incidente". Não aconteceu em produção (0 dos
+  1100+ incidentes reais é `info`), mas é uma lacuna real do motor, não um
+  caso hipotético, e mexer no motor que classifica os incidentes reais exige a
+  sua própria passagem cuidadosa contra a população real, não uma alteração
+  apressada a seguir a um bloco de schema.
