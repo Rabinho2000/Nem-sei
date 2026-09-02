@@ -1914,3 +1914,176 @@ dos 644 bate nas suas 3 regras), `diagnostic_incidents` inalterado (644
 Nenhuma mensagem Telegram foi enviada, nenhum cliente HTTP-capaz existe no
 código. O canal criado fica desactivado por omissão; activá-lo é uma
 decisão humana separada e explícita, ainda pendente.
+
+## 30. Redesenho operacional do Telegram O&M — Fatias 1-3, implementado e testado (2026-09-02)
+
+Pedido explícito do utilizador: o Telegram real de produção estava a fazer
+spam de `plant_offline` a cada ~16 min (instalações a oscilar
+online/offline), e o pedido completo (17 secções) pediu uma reconstrução da
+camada de notificação — episódio/cooldown, prioridade explicável, impacto
+honesto, contactos, formato compacto — sem tocar em D1 (`DiagnosticIncident`)
+nem duplicar D3/D4 (`NotificationChannel`/`Policy`/`Event`/Telegram client).
+Auditoria completa de `notifications/`, `diagnostics/`, `contracts/`,
+`installations/`, `work_orders/` feita antes de qualquer código — ver o
+plano aprovado desta sessão. **Sem deploy: nenhuma migration correu contra
+produção, nenhum canal/policy real activado, nenhuma mensagem Telegram
+real enviada.**
+
+### A causa real do storm, confirmada por leitura de código, não hipotética
+
+`diagnostics/findings.py::evaluate_plant_findings` (já existente antes desta
+sessão, ligado a `diagnostics/incidents.py`) já classifica o estado da
+instalação inteira via `monitoring/installation_state.py` em rule_codes
+`plant_offline`/`plant_fault`/`plant_warning`/`plant_state_stale` — a
+terminologia exacta do pedido já existia. Cada oscilação fecha o
+`DiagnosticIncident` (`resolved`, correcto — D1 não mudou) e abre um **novo**
+com `id` novo. D3's `NotificationEvent` era único em `(incident_id, kind,
+channel_id)` — por desenho, isto gera um evento `opened` novo a cada
+oscilação. D1-D6 nunca precisaram de resolver isto porque nunca houve dados
+reais com este padrão até agora.
+
+### NotificationEpisode — a identidade que sobrevive à oscilação
+
+Migration `0035_notification_episodes` (a seguir a `0034_installation_
+contacts`): tabela nova, `notification_events.episode_id` novo (a identidade
+real passa a ser `(episode_id, kind, channel_id)`, `incident_id` fica como
+proveniência), `notification_policies.reminder_minutes_json` novo. Índice
+único parcial `WHERE status='open'` no mesmo padrão de
+`uq_diagnostic_incidents_open_identity` (D1); `WHERE kind <> 'reminder'` na
+identidade de `notification_events` porque mais de um reminder é legítimo
+por episódio (4h, depois 24h) — só `NotificationEpisode.last_reminder_at`/
+`reminder_count` impede repetir o mesmo.
+
+`notifications/episodes.py::sync_episodes` — chamado a seguir a
+`evaluate_and_persist_incidents` (mesma transacção, `jobs/handlers.py`) e
+também dentro de `decide_notification_events` (idempotente, garante que
+qualquer chamador vê episódios frescos). Funde reaberturas dentro de
+`flap_merge_minutes` (60 min por omissão) na mesma linha —
+`opened_at` preservado do início real, `flap_count` incrementado — e só
+fecha um episódio quando a identidade desaparece dos incidentes abertos,
+usando o `resolved_at` real do incidente (não o `now` da avaliação, que
+inflacionaria a duração). SAVEPOINT + retry na criação, mesmo padrão de
+`_create_event` (D3), provado por um teste de corrida.
+
+`notifications/eligibility.py` — gates puros, sem sessão: `is_silent_period`/
+`should_notify_open` (o portão de 0-30 min, só para as famílias
+`communication`/`fault`, nunca generalizado às regras já aprovadas como
+imediatas em §28 — ver comentário em `episodes.py`), `should_notify_
+recovery_immediately`/`eligible_for_recovery_digest` (nunca recupera um
+episódio nunca notificado; imediato só para crítico/já-reminded/duração
+significativa, resto para o digest, ainda por construir), `next_reminder_
+due` (4h/24h configurável, suprimido por `has_active_work`).
+
+Um bug real evitado antes de chegar a teste: gatear o loop de reminder por
+`policy.notify_on_open` fazia o teste já existente `test_escalation_fires_
+exactly_once...` (escalation_after_minutes=240) disparar também um reminder
+na mesma passagem (a mesma marca de 240 min por coincidência), e fazia o
+teste `test_an_incident_that_stays_open_does_not_renotify_without_
+escalation_configured` deixar de ser verdade (reminder é uma segunda via de
+renotificação independente da escalação). Corrigido tornando o reminder um
+opt-in explícito por policy (`reminder_minutes_json`, `NULL` por omissão,
+como as duas policies reais em produção já têm) — zero alteração de
+comportamento para quem nunca configurar isto, mesmo padrão estrutural de
+`notification_processing_enabled` e companhia.
+
+### Prioridade, impacto, contactos, acção sugerida — reqs 5-8
+
+`notifications/priority.py` — `score_episode`, soma de componentes nomeados,
+cada um `(pontos, motivo|None)`; nunca esconde a causa. Reutiliza
+`contracts.priority.service_priority` para ESCO (não recalcula), reutiliza
+`diagnostics.incidents.recurrence_count` para "recorrente" (por episódios,
+não linhas brutas — a mesma disciplina já estabelecida no dry-run de D3).
+Duas linhas do pedido (+50 avaria crítica / +40 offline total / +30 sem
+comunicação) colapsadas numa componente só: este sistema não tem um sinal
+diferente para "offline total" vs "sem comunicação" — inventar a distinção
+seria inventar um número.
+
+`notifications/impact.py` — nunca inventa um valor. Zero real e calculado
+(não "não calculável") quando a janela cai inteiramente fora do período
+produtivo (`monitoring.production_window`, já existente); senão usa a
+última potência real conhecida do próprio activo antes do episódio começar
+(nunca `installed_dc_power_kw x factor`, que seria uma inversão de fórmula
+sobre um número que a instalação nunca produziu de facto) — sem leitura
+recente, `None`. Financeiro multiplica por `reporting.commercial.
+representative_price` só quando há tarifa configurada.
+
+`installations/contacts.py` + migration `0034_installation_contacts` —
+`InstallationContact` exactamente como pedido (`client/facility_manager/
+local_maintenance/security/owner/other`), `CHECK` na BD a recusar um
+contacto sem telefone nem email (não só validação de serviço).
+`primary_or_first_contact` devolve `None` quando não há nenhum — o
+renderer escreve "não registado", nunca um número inventado.
+
+`notifications/playbook.py` — tabela determinística, sem IA, exactamente os
+exemplos do pedido (verificar provider / código de erro / meter ESCO
+prioritário).
+
+`notifications/enrichment.py::build_context` — o único sítio que toca a BD
+nesta metade do pipeline; junta episódio+incidente+instalação+activo+
+contrato+work order+contacto num `NotificationContext`, testado
+end-to-end (episódio real → prioridade real → impacto real → contacto
+real) sem mocks.
+
+### Formato Telegram compacto — req 9
+
+`notifications/render_telegram.py::render_message` — puro, sem BD nem rede.
+`notifications/service.py::_create_event` chama-o através de um wrapper
+(`_render_enriched_or_fallback`) que nunca deixa uma excepção de
+enriquecimento abortar a transacção inteira de `decide_notification_events`
+(que decide por *todas* as policies/episódios numa só transacção) — cai
+para o texto estrutural antigo e regista `render_error` em
+`evidence_json`, um degradado auditável, não silencioso. Confirmado
+manualmente contra um episódio real (ESCO+O&M, contacto real, plant_offline
+há 3h13): a mensagem produzida bate certo com a densidade do exemplo do
+pedido.
+
+`Settings.web_public_base_url` (`NEMSEI_V2_WEB_PUBLIC_BASE_URL`, opcional) —
+sem URL configurado, a linha de links é omitida, nunca um caminho relativo
+inválido fora da VPN. `WorkOrder` ainda não tem página própria
+(`work_orders/` só tem modelo/serviço, sem rotas web) — a mensagem mostra a
+referência (`WO-142`) sem link, um gap documentado, não um bug.
+
+### Testado
+
+98 testes novos (`test_notification_episodes.py` 12,
+`test_notification_eligibility.py` 17, `test_installation_contacts.py` 6,
+`test_notification_priority.py` 14, `test_notification_impact.py` 8,
+`test_notification_enrichment.py` 3, `test_render_telegram.py` 14, mais
+`test_notifications.py` estendido para `episode_id`/`reminder_minutes_json`/
+`asset_scope`). Suite completa da V2 verde antes e depois desta sessão
+(1357 testes pré-existentes sem regressão, confirmado numa corrida
+completa contra Postgres real antes de qualquer ficheiro novo de teste
+juntar-se à suite). `ruff check` limpo em `src/nemsei` e `tests_v2`
+completos.
+
+### Requisitos do pedido original cobertos por fatia, e o que falta
+
+Cobertos (Fatias 1-3): req 1 (só O&M activo, via `asset_scope="om_active"`
+já existente), req 2 (silêncio 0-30min), req 3 (episódio/cooldown, flap
+merge, reminder 4h/24h opt-in), req 4 (recovery: piso rígido + split
+imediato/digest, digest ainda não construído), req 5 (priority score
+explicável), req 6 (impacto honesto), req 7 (acção sugerida), req 8
+(contactos), req 9 (formato compacto), req 12 (categoria monitoring_
+coverage ≠ avaria, já na estrutura de `problem_families.py`), req 14
+(WorkOrder suprime reminder), req 16 (camadas separadas e testáveis sem
+Telegram), req 17 (todos os 15 cenários pedidos têm teste directo, ver
+lista acima).
+
+**Não construído nesta sessão** (Fatia 4, próxima): req 10/11 (morning
+briefing 09:00), req 13 (digest de recuperações agrupadas em janela curta),
+o job/scheduler novo para os dois (`digests.py` precisa de um parâmetro
+`kind` e dois payload builders novos, reaproveitando a disciplina de
+janelas encadeadas de D6 — não um segundo sistema). Req 15 (links) está
+feito para Instalação/Incidente; WorkOrder falta por não ter rota web
+própria ainda, fora do âmbito desta redesenho.
+
+### Estado
+
+**Só código e testes locais.** Nenhuma migration aplicada a produção,
+nenhum `NotificationChannel`/`Policy` real tocado, nenhum `docker compose
+... up -d --build`, nenhuma mensagem Telegram real enviada — exactamente
+como pedido ("Não faças deploy para produção ainda"). Antes de qualquer
+activação real: fatia 4 (briefing/digest), depois o mesmo dry-run de
+leitura contra produção que D1-D6 já fizeram (§22/§25/§29) para confirmar
+quantas mensagens a nova política geraria hoje, antes de mexer em
+`NotificationChannel.enabled`.

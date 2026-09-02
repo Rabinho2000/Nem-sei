@@ -16,7 +16,18 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from nemsei.db.base import Base
@@ -33,7 +44,7 @@ def _sql_in_list(values: tuple[str, ...]) -> str:
 
 CHANNEL_KINDS = ("telegram",)
 
-NOTIFICATION_EVENT_KINDS = ("opened", "escalated", "resolved")
+NOTIFICATION_EVENT_KINDS = ("opened", "escalated", "resolved", "reminder")
 NOTIFICATION_EVENT_STATUSES = ("pending", "sent", "failed", "skipped")
 # "Warning" or better is worth a human's attention; "info" is dashboard-only
 # by default. Kept as a real, enforced field -- unlike V1's own
@@ -120,6 +131,100 @@ class NotificationPolicy(Base):
     notify_on_resolve: Mapped[bool] = mapped_column(nullable=False, default=True)
     escalation_after_minutes: Mapped[int | None] = mapped_column(Integer)
     baseline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Req 3's reminder cadence ("4h se continuar crítico, depois 24h"), as an
+    # ordered list of minute thresholds -- `None` (every row that existed
+    # before this column did, both real production policies included) means
+    # no reminder cadence at all, exactly what those policies already do.
+    # Deliberately not on by default for every `notify_on_open` policy: a
+    # policy that already defines `escalation_after_minutes` (the warning ->
+    # critical transition mechanism) reminding on top of that would be two
+    # renotification mechanisms firing for the same episode -- an operator
+    # opts a policy into this explicitly.
+    reminder_minutes_json: Mapped[list[int] | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+EPISODE_STATUSES = ("open", "closed")
+# One family per rule_code -- never severity, never rule_code itself:
+# dedup/priority/the morning briefing all group by *what kind of problem
+# this is*, and a rule_code changing its severity mid-episode must not
+# change which episode it belongs to. Exactly
+# `diagnostics.incident_categories.INCIDENT_CATEGORIES`
+# (`notifications/problem_families.py` mirrors it, not a second table) --
+# hardcoded here rather than imported, the same way `AVAILABILITY_STATES`
+# and friends in `diagnostics/models.py` are hardcoded rather than imported
+# from the module that also uses them.
+PROBLEM_FAMILIES = ("communication", "fault", "coverage")
+
+
+class NotificationEpisode(Base):
+    """The identity a problem keeps across a flapping detector.
+
+    `DiagnosticIncident` (D1) is correct to close and reopen a new row every
+    time a `plant_offline`-class condition flaps -- that is what "the
+    detector currently sees this" honestly means. But a human being told
+    about the same installation losing communication every ~16 minutes is
+    not being told about six problems; they are being spammed about one.
+    This table is the layer that survives the flap: one row per
+    `(asset_id, problem_family, device_id)` while the condition keeps
+    recurring within `flap_merge_minutes` (`notifications/episodes.py`), with
+    `opened_at` preserved from the *first* occurrence and `flap_count`
+    counting the reopenings folded into it.
+
+    Deliberately not a replacement for `DiagnosticIncident`: `first_incident_id`/
+    `last_incident_id` point at the real underlying rows for evidence, but
+    this table is the one `NotificationEvent` keys off (`episode_id`), because
+    it is the one whose identity does not reset on every flap.
+    """
+
+    __tablename__ = "notification_episodes"
+    __table_args__ = (
+        CheckConstraint(f"status IN {EPISODE_STATUSES!r}", name="ck_notification_episodes_status"),
+        CheckConstraint(f"problem_family IN {PROBLEM_FAMILIES!r}", name="ck_notification_episodes_family"),
+        CheckConstraint("(status = 'closed') = (closed_at IS NOT NULL)", name="ck_notification_episodes_closed_at"),
+        CheckConstraint("flap_count >= 1", name="ck_notification_episodes_flap_count"),
+        CheckConstraint("reminder_count >= 0", name="ck_notification_episodes_reminder_count"),
+        Index("ix_notification_episodes_status", "status", "last_activity_at"),
+        Index("ix_notification_episodes_asset", "asset_id", "status"),
+        # Same functional partial-unique shape as
+        # `uq_diagnostic_incidents_open_identity` (D1): only one *open*
+        # episode per identity, and COALESCE closes the NULL-device_id gap
+        # a plain UniqueConstraint would leave open.
+        Index(
+            "uq_notification_episodes_open_identity",
+            "asset_id",
+            "problem_family",
+            text("coalesce(device_id, -1)"),
+            unique=True,
+            postgresql_where=text("status = 'open'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    asset_id: Mapped[int] = mapped_column(ForeignKey("assets.id", ondelete="RESTRICT"), nullable=False)
+    device_id: Mapped[int | None] = mapped_column(ForeignKey("devices.id", ondelete="RESTRICT"))
+    problem_family: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="open")
+    # The worst severity seen across every incident folded into this episode
+    # -- a flap that briefly reads `warning` between two `critical` readings
+    # must not read as "downgraded" for priority/rendering purposes.
+    severity_peak: Mapped[str] = mapped_column(String(24), nullable=False)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_activity_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    flap_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    first_incident_id: Mapped[int] = mapped_column(ForeignKey("diagnostic_incidents.id", ondelete="RESTRICT"), nullable=False)
+    last_incident_id: Mapped[int] = mapped_column(ForeignKey("diagnostic_incidents.id", ondelete="RESTRICT"), nullable=False)
+    # When this episode first crossed the notification-eligibility gate (the
+    # 0-30min silence window, `notifications/eligibility.py`) -- NULL until
+    # it does. Distinct from `opened_at`: a problem can be real before it is
+    # notifiable.
+    eligible_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_reminder_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reminder_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    recovery_notified: Mapped[bool] = mapped_column(nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
@@ -127,13 +232,24 @@ class NotificationPolicy(Base):
 class NotificationEvent(Base):
     """One durable, auditable decision -- and, separately, its delivery.
 
-    Identity is structural, never message text:
-    `(incident_id, kind, channel_id)` is unique, so at most one `opened`,
-    one `escalated`, and one `resolved` event can ever exist for one
-    incident on one channel -- re-evaluating the same still-open incident a
-    thousand times creates nothing new, and a resolved episode reopening
-    later is a *new* `DiagnosticIncident` row (D1), so it is automatically a
-    new, distinct notification identity too, with nothing here to reset.
+    Identity is structural, never message text: `(episode_id, kind,
+    channel_id)` is unique for `kind != 'reminder'`, so at most one `opened`,
+    one `escalated`, and one `resolved` event can ever exist for one episode
+    on one channel -- re-evaluating the same still-open episode a thousand
+    times creates nothing new. `reminder` is deliberately excluded from that
+    uniqueness (see `NotificationEpisode`/`NEW_NOTIFICATION_EVENT_KINDS` in
+    migration `0035`): more than one reminder is legitimate over an episode's
+    life, and `NotificationEpisode.last_reminder_at`/`reminder_count` is what
+    prevents sending the same one twice.
+
+    Keyed on `episode_id`, not `incident_id`, since migration `0035`: a
+    resolved-then-reopened *incident* within the flap-merge window is the
+    same episode, so it must not earn a second `opened` notification. The
+    identity used to be `(incident_id, kind, channel_id)`, which was correct
+    only because D3 never had to handle a flapping detector; see
+    `notifications/episodes.py` for why that stopped being true.
+    `incident_id` remains, now meaning "the most recent underlying incident"
+    -- evidence and audit, no longer part of the notification identity.
 
     `status` covers exactly two independent questions without conflating
     them: was a notification decided (`pending`/`skipped` at decision time),
@@ -150,16 +266,25 @@ class NotificationEvent(Base):
         CheckConstraint(f"status IN {NOTIFICATION_EVENT_STATUSES!r}", name="ck_notification_events_status"),
         CheckConstraint("attempt_count >= 0", name="ck_notification_events_attempt_count"),
         CheckConstraint("(status = 'sent') = (sent_at IS NOT NULL)", name="ck_notification_events_sent_at"),
-        UniqueConstraint("incident_id", "kind", "channel_id", name="uq_notification_events_identity"),
+        Index(
+            "uq_notification_events_identity",
+            "episode_id",
+            "kind",
+            "channel_id",
+            unique=True,
+            postgresql_where=text("kind <> 'reminder'"),
+        ),
         Index("ix_notification_events_status", "status", "decided_at"),
         Index("ix_notification_events_incident", "incident_id"),
+        Index("ix_notification_events_episode", "episode_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     incident_id: Mapped[int] = mapped_column(ForeignKey("diagnostic_incidents.id", ondelete="RESTRICT"), nullable=False)
+    episode_id: Mapped[int] = mapped_column(ForeignKey("notification_episodes.id", ondelete="RESTRICT"), nullable=False)
     # Provenance: which policy decided this -- not part of the identity (two
     # policies must not be able to double-notify the same channel about the
-    # same incident episode; the channel is what a human actually receives).
+    # same episode; the channel is what a human actually receives).
     policy_id: Mapped[int] = mapped_column(ForeignKey("notification_policies.id", ondelete="RESTRICT"), nullable=False)
     channel_id: Mapped[int] = mapped_column(ForeignKey("notification_channels.id", ondelete="RESTRICT"), nullable=False)
     kind: Mapped[str] = mapped_column(String(16), nullable=False)

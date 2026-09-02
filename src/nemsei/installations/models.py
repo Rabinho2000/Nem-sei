@@ -113,3 +113,40 @@ class Installation(Base):
     notes: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+# Who Telegram should say to call. See `installations/contacts.py` and the
+# Telegram redesign plan (§8): most installations have never had one of these
+# recorded, and that absence has to render as "não registado", never as an
+# invented number -- so this table is deliberately allowed to have zero rows
+# for a real installation.
+CONTACT_TYPES = ("client", "facility_manager", "local_maintenance", "security", "owner", "other")
+
+
+class InstallationContact(Base):
+    """One person to call about one installation. An installation can have
+    several; `is_primary` is a hint for which to lead with, not the only one
+    that exists."""
+
+    __tablename__ = "installation_contacts"
+    __table_args__ = (
+        CheckConstraint(f"contact_type IN {CONTACT_TYPES!r}", name="ck_installation_contacts_type"),
+        # Known-but-unreachable ("we have a name, nobody wrote down how to
+        # reach them") is a real, visible gap -- not something this table
+        # should silently allow to look like a usable contact.
+        CheckConstraint("phone IS NOT NULL OR email IS NOT NULL", name="ck_installation_contacts_reachable"),
+        Index("ix_installation_contacts_installation", "installation_id", "is_primary"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    installation_id: Mapped[int] = mapped_column(ForeignKey("installations.id", ondelete="CASCADE"), nullable=False)
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+    role: Mapped[str | None] = mapped_column(String(120))
+    phone: Mapped[str | None] = mapped_column(String(64))
+    email: Mapped[str | None] = mapped_column(String(255))
+    contact_type: Mapped[str] = mapped_column(String(32), nullable=False, default="other")
+    is_primary: Mapped[bool] = mapped_column(nullable=False, default=False)
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[str] = mapped_column(String(120), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

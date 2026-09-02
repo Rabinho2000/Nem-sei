@@ -90,11 +90,13 @@ def make_policy(
     session, *, channel: NotificationChannel, enabled: bool = True, min_severity: str = "warning",
     rule_codes: list[str] | None = None, notify_on_open: bool = True, notify_on_resolve: bool = True,
     escalation_after_minutes: int | None = None, baseline_at: datetime | None = None,
+    asset_scope: str = "all", reminder_minutes: list[int] | None = None,
 ) -> NotificationPolicy:
     policy = NotificationPolicy(
         name="Default", enabled=enabled, channel_id=channel.id, min_severity=min_severity,
         rule_codes_json=rule_codes, notify_on_open=notify_on_open, notify_on_resolve=notify_on_resolve,
-        escalation_after_minutes=escalation_after_minutes, baseline_at=baseline_at,
+        escalation_after_minutes=escalation_after_minutes, baseline_at=baseline_at, asset_scope=asset_scope,
+        reminder_minutes_json=reminder_minutes,
         created_at=utc(), updated_at=utc(),
     )
     session.add(policy)

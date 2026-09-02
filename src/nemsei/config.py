@@ -227,6 +227,14 @@ class Settings:
     # client exists in this codebase yet (D4).
     notification_processing_enabled: bool = False
     notification_processing_interval_minutes: int = 15
+    # Telegram O&M redesign: the base URL `notifications/render_telegram.py`
+    # prefixes onto `/diagnostics/assets/<id>`/`/diagnostics/incidents/<id>`
+    # links in a message. `None` (the default) means the renderer omits the
+    # link line entirely rather than emitting a relative path nobody outside
+    # the VPN could open, or inventing a host this deployment never
+    # confirmed -- an operational message with no link is honest; one with a
+    # broken link is worse than none.
+    web_public_base_url: str | None = None
     # D6 (docs/v2/DIAGNOSTICS_PORTFOLIO_TELEGRAM_PLAN.md): the periodic
     # digest generator. Off by default, zero provider calls (reads
     # diagnostic_incidents via portfolios/diagnostics.py, writes
@@ -352,6 +360,7 @@ class Settings:
             notification_processing_interval_minutes=int(
                 os.environ.get("NEMSEI_V2_NOTIFICATION_PROCESSING_INTERVAL_MINUTES", "15")
             ),
+            web_public_base_url=(os.environ.get("NEMSEI_V2_WEB_PUBLIC_BASE_URL", "").strip() or None),
             digest_generation_enabled=parse_bool(os.environ.get("NEMSEI_V2_DIGEST_GENERATION_ENABLED"), default=False),
             digest_generation_interval_minutes=int(
                 os.environ.get("NEMSEI_V2_DIGEST_GENERATION_INTERVAL_MINUTES", "1440")

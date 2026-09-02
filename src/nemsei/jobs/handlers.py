@@ -23,6 +23,7 @@ from nemsei.providers.registry import ProviderCode
 from nemsei.integrations.fusionsolar.session_cache import default_session_cache
 from nemsei.jobs.repository import ClaimedJob
 from nemsei.notifications.digests import deliver_digest, generate_digest
+from nemsei.notifications.episodes import sync_episodes
 from nemsei.notifications.service import evaluate_and_process_notifications
 from nemsei.sync.abandonment import sweep_abandoned_sync_runs
 from nemsei.sync.models import SyncRun
@@ -447,14 +448,20 @@ def _execute_huawei_scada(job: ClaimedJob, *, settings: Settings, session_factor
 
 
 def _execute_incident_evaluation(*, session_factory: sessionmaker[Session]) -> JobOutcome:
-    """One diagnostic-incident evaluation pass. No provider calls, no retry logic
-    needed beyond the worker's own generic retry: a failure here (e.g. a
-    transient DB error) never writes a partial row, because
-    `evaluate_and_persist_incidents` flushes per asset inside the caller's
-    transaction and the whole job either commits or rolls back as one unit.
+    """One diagnostic-incident evaluation pass, then one `NotificationEpisode`
+    reconciliation pass (Telegram O&M redesign) -- same transaction, same
+    restart-safety argument: a failure here never writes a partial row,
+    because both `evaluate_and_persist_incidents` and `sync_episodes` flush
+    inside the caller's transaction and the whole job either commits or rolls
+    back as one unit. `sync_episodes` runs unconditionally, in the worker
+    rather than behind its own settings flag: it makes no provider call and
+    no Telegram call, it only reconciles `notification_episodes` against
+    `diagnostic_incidents`, which is exactly the kind of derived bookkeeping
+    the incident evaluator itself already is.
     """
     with session_factory() as session, session.begin():
         summary = evaluate_and_persist_incidents(session)
+        episode_summary = sync_episodes(session)
     return JobOutcome(
         status="success",
         result={
@@ -463,6 +470,10 @@ def _execute_incident_evaluation(*, session_factory: sessionmaker[Session]) -> J
             "incidents_confirmed": summary.incidents_confirmed,
             "incidents_resolved": summary.incidents_resolved,
             "deferred": summary.deferred,
+            "episodes_created": episode_summary.episodes_created,
+            "episodes_confirmed": episode_summary.episodes_confirmed,
+            "episodes_reopened": episode_summary.episodes_reopened,
+            "episodes_closed": episode_summary.episodes_closed,
         },
     )
 
