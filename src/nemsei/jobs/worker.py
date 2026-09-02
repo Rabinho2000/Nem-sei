@@ -51,17 +51,38 @@ class Worker:
             # always defers -- however many times in a row it happens -- because
             # spending the retry budget on a request nobody made is what failed
             # the 26 backfill jobs of 2026-09-01. See `JobRepository.defer`.
+            #
+            # `resume_payload`, when the error carries one, is durable batch
+            # progress -- a provider call that already landed -- and it is
+            # written into the job whether this cycle ends up deferred or
+            # falls through to an ordinary retry.
             if not self.repository.defer(
                 claimed,
                 available_at=exc.retry_at,
                 reason=type(exc).__name__,
                 max_cycles=self.settings.job_defer_max_cycles,
                 refund_attempt=not exc.called_provider,
+                payload=getattr(exc, "resume_payload", None),
+                event_metadata=getattr(exc, "event_metadata", None),
             ):
-                self.repository.retry_or_fail(claimed, error_type=type(exc).__name__, message=str(exc), delay_seconds=300)
+                self.repository.retry_or_fail(
+                    claimed,
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                    delay_seconds=300,
+                    payload=getattr(exc, "resume_payload", None),
+                    event_metadata=getattr(exc, "event_metadata", None),
+                )
         except RetryableJobError as exc:
             delay = 60 if claimed.attempt == 1 else 300
-            self.repository.retry_or_fail(claimed, error_type=type(exc).__name__, message=str(exc), delay_seconds=delay)
+            self.repository.retry_or_fail(
+                claimed,
+                error_type=type(exc).__name__,
+                message=str(exc),
+                delay_seconds=delay,
+                payload=getattr(exc, "resume_payload", None),
+                event_metadata=getattr(exc, "event_metadata", None),
+            )
         except Exception as exc:
             self.repository.retry_or_fail(claimed, error_type=type(exc).__name__, message=str(exc), delay_seconds=60)
         return True

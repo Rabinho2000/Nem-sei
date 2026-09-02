@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone as datetime_timezone
 from decimal import Decimal, InvalidOperation
 from itertools import islice
+from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import func, select
@@ -77,6 +78,11 @@ class ProductionSyncResult:
     error_code: str | None = None
     mode: str = "incremental"
     next_source_day: date | None = None
+    # Durable intra-day progress for a source day this run did not finish:
+    # which provider-call batches already succeeded, so the next attempt can
+    # resume at the first unfinished one instead of re-fetching from batch
+    # zero. `None` means either the day completed or nothing was attempted.
+    batch_checkpoint: dict[str, Any] | None = None
 
 
 def production_contract_for(connection: ProviderConnection) -> FusionSolarProductionContract:
@@ -216,8 +222,16 @@ class FusionSolarProductionService:
         start_date: date | None,
         end_date: date | None,
         resume_from: date | None = None,
+        batch_checkpoint: dict[str, Any] | None = None,
     ) -> ProductionSyncResult:
-        """Process one chronological, resumable bounded-backfill chunk."""
+        """Process one chronological, resumable bounded-backfill chunk.
+
+        `batch_checkpoint`, when given, is durable intra-day progress an
+        earlier attempt at this same day left behind (see `_sync_day`). It is
+        only ever applied to the day it names; a checkpoint for a different
+        day is a caller bug, not something to guess around, so `_sync_window`
+        ignores it rather than misapplying it.
+        """
         if start_date is None or end_date is None:
             return self._sync_window(
                 connection_id,
@@ -275,6 +289,7 @@ class FusionSolarProductionService:
             allow_cursor_advance=True,
             max_source_days=self._settings.production_backfill_chunk_days,
             require_explicit_bounds=True,
+            batch_checkpoint=batch_checkpoint,
         )
         if result.status == "success" and chunk_end < end_date:
             return replace(result, next_source_day=chunk_end + timedelta(days=1))
@@ -294,6 +309,7 @@ class FusionSolarProductionService:
         require_explicit_bounds: bool = False,
         force_window_error: str | None = None,
         chunk_days: int | None = None,
+        batch_checkpoint: dict[str, Any] | None = None,
     ) -> ProductionSyncResult:
         """Fetch a bounded daily window and advance only complete coverage.
 
@@ -375,16 +391,31 @@ class FusionSolarProductionService:
         received = accepted = rejected = out_of_window = 0
         first_error: ProviderError | None = None
         incomplete = bool(selection_findings)
+        day_batch_checkpoint: dict[str, Any] | None = None
         for source_day in _days(requested_from, requested_until):
             selected = selected_by_day[source_day]
             if not selected:
                 continue
-            outcome = self._sync_day(run.id, connection_id, client, source_day, contract, selected)
+            # A checkpoint only ever applies to the day it names. This window
+            # is almost always exactly that one day (bounded-backfill jobs are
+            # single-day payloads), but the guard is what makes misapplying a
+            # stale or foreign checkpoint impossible rather than merely
+            # unlikely.
+            resume_checkpoint = (
+                batch_checkpoint
+                if batch_checkpoint is not None
+                and batch_checkpoint.get("connection_id") == connection_id
+                and batch_checkpoint.get("source_day") == source_day.isoformat()
+                else None
+            )
+            outcome = self._sync_day(run.id, connection_id, client, source_day, contract, selected, resume_checkpoint=resume_checkpoint)
             received += outcome.received
             accepted += outcome.accepted
             rejected += outcome.rejected
             out_of_window += outcome.out_of_window
             incomplete = incomplete or outcome.partial
+            if outcome.batch_checkpoint is not None:
+                day_batch_checkpoint = outcome.batch_checkpoint
             if outcome.error:
                 first_error = outcome.error
                 break
@@ -405,6 +436,8 @@ class FusionSolarProductionService:
             partial=incomplete,
             mode=mode,
         )
+        if day_batch_checkpoint is not None:
+            result = replace(result, batch_checkpoint=day_batch_checkpoint)
         # Only resume from a chunk that actually moved the cursor. A chunk that
         # ended short leaves the cursor where it was, so resuming would ask for
         # the very same days again -- which is the loop this change exists to
@@ -421,13 +454,48 @@ class FusionSolarProductionService:
         source_day: date,
         contract: FusionSolarProductionContract,
         selected: list[AssetProviderMapping],
+        *,
+        resume_checkpoint: dict[str, Any] | None = None,
     ) -> "_DayOutcome":
+        """Fetch one source day, one provider-call batch at a time, persisting
+        each batch as it lands rather than waiting for the whole day.
+
+        A day with more than `_MAX_BATCH` selected mappings needs more than
+        one provider call, and a provider that allows roughly one call per
+        cooldown can take many attempts to get through all of them. Without a
+        durable batch-level checkpoint, every attempt restarted at batch one:
+        the mappings batch one already covered got re-fetched (and re-spent
+        the single call the provider allowed that cycle) while batch two never
+        got its turn. Six reportable assets sat missing from every affected
+        August day for exactly this reason.
+
+        `resume_checkpoint`, when it names this exact source day, says which
+        mapping ids already have a batch call that reached the provider
+        (`completed_mapping_ids`) plus the running totals and per-mapping
+        completeness an earlier attempt had gathered. Filtering everything
+        through the *current* `selected` id set (rather than trusting a frozen
+        order or index) is what keeps a mapping list that changed between
+        attempts from corrupting an already-started sequence: a dropped
+        mapping's old progress is simply excluded, and a newly-added one is
+        simply still outstanding.
+        """
         expected = {mapping.normalized_external_id: mapping for mapping in selected}
-        samples: dict[str, DailyProductionSample] = {}
-        received = rejected = out_of_window = 0
+        selected_ids = {mapping.id for mapping in selected}
+        checkpoint = resume_checkpoint or {}
+        completed_ids = {mapping_id for mapping_id in checkpoint.get("completed_mapping_ids", []) if mapping_id in selected_ids}
+        sample_completeness: dict[int, str] = {
+            int(mapping_id): value
+            for mapping_id, value in (checkpoint.get("sample_completeness") or {}).items()
+            if int(mapping_id) in selected_ids
+        }
+        received = int(checkpoint.get("received_total", 0) or 0)
+        rejected = int(checkpoint.get("rejected_total", 0) or 0)
+        out_of_window = int(checkpoint.get("out_of_window_total", 0) or 0)
+
+        remaining = [mapping for mapping in selected if mapping.id not in completed_ids]
         window_start = datetime.combine(source_day, time.min, tzinfo=contract.source_timezone)
         window_end = window_start + timedelta(days=1)
-        for batch in _batches(selected, _MAX_BATCH):
+        for batch in _batches(remaining, _MAX_BATCH):
             rows, error = self._calls.call(
                 connection_id=connection_id,
                 sync_run_id=run_id,
@@ -440,9 +508,17 @@ class FusionSolarProductionService:
             if error:
                 if is_session_expiry(error):
                     invalidate_session(client.credentials, cache=self._session_cache)
-                accepted = self._persist_day(run_id, source_day, contract, expected, samples)
-                return _DayOutcome(received, accepted, rejected, True, error, out_of_window)
+                checkpoint_out = _batch_checkpoint(
+                    connection_id, source_day, completed_ids, len(selected), received, rejected, out_of_window, sample_completeness,
+                )
+                return _DayOutcome(received, len(sample_completeness), rejected, True, error, out_of_window, checkpoint_out)
             assert rows is not None
+            # Scoped to this batch's own mappings, not the whole day's: a row
+            # claiming a station code from a batch that has not been asked for
+            # yet must not be accepted, or it would mark that mapping's batch
+            # complete without a call ever having been made for it.
+            batch_expected = {mapping.normalized_external_id: mapping for mapping in batch}
+            batch_samples: dict[str, DailyProductionSample] = {}
             for row in rows:
                 received += 1
                 try:
@@ -451,7 +527,7 @@ class FusionSolarProductionService:
                 except ValueError:
                     rejected += 1
                     continue
-                if normalized not in expected:
+                if normalized not in batch_expected:
                     rejected += 1
                     continue
                 # One request answers with a row per day of the month, every row
@@ -464,15 +540,25 @@ class FusionSolarProductionService:
                 if not window_start <= sample.source_timestamp < window_end:
                     out_of_window += 1
                     continue
-                if normalized in samples:
+                if normalized in batch_samples:
                     rejected += 1
                     continue
-                samples[normalized] = sample
-        accepted = self._persist_day(run_id, source_day, contract, expected, samples)
-        # A matching row with PVYield absent is persisted as an explicit missing
-        # fact, but its source day remains incomplete and cannot advance cursor.
-        partial = len(samples) != len(expected) or any(sample.completeness != "complete" for sample in samples.values())
-        return _DayOutcome(received, accepted, rejected, partial, None, out_of_window)
+                batch_samples[normalized] = sample
+            # Committed as its own unit of work before the checkpoint that
+            # marks it done ever gets written. A crash in between replays this
+            # batch's one call next time -- wasteful, never wrong, because
+            # persistence is idempotent -- rather than losing it.
+            self._persist_day(run_id, source_day, contract, expected, batch_samples)
+            for normalized, sample in batch_samples.items():
+                sample_completeness[expected[normalized].id] = sample.completeness
+            completed_ids |= {mapping.id for mapping in batch}
+
+        # Every batch this day needs has now succeeded, whether just now or on
+        # an earlier attempt. Durable evidence decides completeness here, not
+        # an in-memory tally that a resumed attempt never fully rebuilds.
+        accepted = len(sample_completeness)
+        partial = accepted != len(selected) or any(value != "complete" for value in sample_completeness.values())
+        return _DayOutcome(received, accepted, rejected, partial, None, out_of_window, None)
 
     def _persist_day(
         self,
@@ -690,6 +776,9 @@ class _DayOutcome:
     error: ProviderError | None
     # Rows for other days of the same month: legitimate provider data, not a defect.
     out_of_window: int = 0
+    # Durable resume point for this day, or None when it is done (or nothing
+    # was attempted). See `_sync_day` and `_batch_checkpoint`.
+    batch_checkpoint: dict[str, Any] | None = None
 
 
 def _can_extend_cursor(
@@ -733,6 +822,45 @@ def _batches(values: list[AssetProviderMapping], size: int):
     iterator = iter(values)
     while batch := list(islice(iterator, size)):
         yield batch
+
+
+def _batch_checkpoint(
+    connection_id: int,
+    source_day: date,
+    completed_ids: set[int],
+    mapping_count: int,
+    received: int,
+    rejected: int,
+    out_of_window: int,
+    sample_completeness: dict[int, str],
+) -> dict[str, Any]:
+    """The durable shape a job payload carries between attempts at one day.
+
+    `completed_mapping_ids` is what makes resumption skip a provider call:
+    every id in it already had its batch's HTTP round-trip succeed, in this
+    attempt or an earlier one. Everything else here is running totals and
+    per-mapping completeness so the day's eventual finish reflects the whole
+    day, not just whichever attempt happened to finish it -- and observability
+    fields (`mapping_count`, `batch_size`, `batch_count`, `batches_done`,
+    `next_batch`) so an operator reading `job_events` can see the shape of the
+    remaining work without a database query.
+    """
+    batch_count = -(-mapping_count // _MAX_BATCH) if mapping_count else 0
+    batches_done = -(-len(completed_ids) // _MAX_BATCH) if completed_ids else 0
+    return {
+        "source_day": source_day.isoformat(),
+        "connection_id": connection_id,
+        "completed_mapping_ids": sorted(completed_ids),
+        "received_total": received,
+        "rejected_total": rejected,
+        "out_of_window_total": out_of_window,
+        "sample_completeness": {str(mapping_id): value for mapping_id, value in sample_completeness.items()},
+        "mapping_count": mapping_count,
+        "batch_size": _MAX_BATCH,
+        "batch_count": batch_count,
+        "batches_done": batches_done,
+        "next_batch": batches_done,
+    }
 
 
 def _calls(session: Session, run_id: int) -> int:

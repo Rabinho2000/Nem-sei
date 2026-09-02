@@ -42,7 +42,14 @@ class JobOutcome:
 
 
 class RetryableJobError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, resume_payload: dict[str, Any] | None = None, event_metadata: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        # Durable progress to write into the job's payload before it retries,
+        # independent of whether the failure was a cooldown. A batch that
+        # already landed stays landed no matter which error path re-queues
+        # the job around it.
+        self.resume_payload = resume_payload
+        self.event_metadata = event_metadata
 
 
 class DeferredJobError(RuntimeError):
@@ -55,13 +62,23 @@ class DeferredJobError(RuntimeError):
     job and nothing to learn from trying again sooner.
     """
 
-    def __init__(self, message: str, *, retry_at: datetime, called_provider: bool) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_at: datetime,
+        called_provider: bool,
+        resume_payload: dict[str, Any] | None = None,
+        event_metadata: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.retry_at = retry_at
         # Whether this attempt actually reached the provider. A refusal that
         # cost a real call has been paid for and keeps its attempt; one that
         # never left the process has not, and must not.
         self.called_provider = called_provider
+        self.resume_payload = resume_payload
+        self.event_metadata = event_metadata
 
 
 def _cooldown_defer(
@@ -71,6 +88,8 @@ def _cooldown_defer(
     sync_run_id: int,
     error_code: str | None,
     label: str,
+    resume_payload: dict[str, Any] | None = None,
+    event_metadata: dict[str, Any] | None = None,
 ) -> None:
     """Raise `DeferredJobError` when a rate limit has a real future cooldown.
 
@@ -96,6 +115,8 @@ def _cooldown_defer(
         f"{label} deferred until the provider cooldown expires.",
         retry_at=retry_at,
         called_provider=calls > 0,
+        resume_payload=resume_payload,
+        event_metadata=event_metadata,
     )
 
 
@@ -261,21 +282,49 @@ def _execute_production(job: ClaimedJob, *, settings: Settings, session_factory:
             start_date=_date(job.payload, "start_date", required=True),
             end_date=_date(job.payload, "end_date", required=True),
             resume_from=_date(job.payload, "next_source_day"),
+            batch_checkpoint=job.payload.get("backfill_batch_checkpoint"),
         )
     result_json = {"mode": result.mode, "result_status": result.status}
     if result.status in {"failed", "rate_limited", "deferred", "partial"}:
+        # A batch checkpoint is real, committed progress -- facts a provider
+        # call already landed -- and it belongs in the job's payload before
+        # this attempt re-queues, regardless of which error path does the
+        # re-queuing. A cooldown defer and an ordinary retry both carry it.
+        resume_payload = None
+        event_metadata = None
+        if result.batch_checkpoint is not None:
+            resume_payload = dict(job.payload)
+            resume_payload["backfill_batch_checkpoint"] = result.batch_checkpoint
+            checkpoint = result.batch_checkpoint
+            event_metadata = {
+                "source_day": checkpoint.get("source_day"),
+                "mapping_count": checkpoint.get("mapping_count"),
+                "batch_size": checkpoint.get("batch_size"),
+                "batch_count": checkpoint.get("batch_count"),
+                "next_batch": checkpoint.get("next_batch"),
+                "batch_persisted": (checkpoint.get("batches_done") or 0) > 0,
+            }
         _cooldown_defer(
             session_factory,
             connection_id=connection_id,
             sync_run_id=result.sync_run_id,
             error_code=result.error_code,
             label=f"Production {result.mode}",
+            resume_payload=resume_payload,
+            event_metadata=event_metadata,
         )
-        raise RetryableJobError(f"Production {result.mode} stopped with {result.status}.")
+        raise RetryableJobError(
+            f"Production {result.mode} stopped with {result.status}.",
+            resume_payload=resume_payload,
+            event_metadata=event_metadata,
+        )
     if result.next_source_day:
         payload = dict(job.payload)
         payload["next_source_day"] = result.next_source_day.isoformat()
         payload["mode"] = result.mode
+        # Moving on to a new day; any batch checkpoint belonged to the one
+        # just finished and must not be read back for a different day.
+        payload.pop("backfill_batch_checkpoint", None)
         # An incremental chunk resumes from the cursor it just advanced, so the
         # payload's `next_source_day` is a record of where it got to rather
         # than an instruction; a bounded backfill reads it back as its resume

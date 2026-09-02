@@ -40,9 +40,15 @@ def safe_metadata(values: dict[str, Any] | None = None) -> dict[str, Any]:
     # is the difference between a `defer_scheduled` and a `defer_no_call`, and
     # without it in the allowlist the event log makes an operator infer from
     # the event type alone which of the two they are looking at.
+    # The `source_day`..`batch_persisted` keys are the batch-checkpoint
+    # observability a durable intra-day resume needs: which day, how many
+    # provider-call batches it takes, how many already landed, and whether
+    # this event's own attempt persisted one -- readable from job_events
+    # without a database query.
     allowed = {
         "reason", "delay_seconds", "schedule_key", "dedupe_key", "result_status", "mode",
         "next_source_day", "runs_examined", "runs_abandoned", "called_provider",
+        "source_day", "mapping_count", "batch_size", "batch_count", "next_batch", "batch_persisted",
     }
     return {
         key: str(value)[:200]
@@ -308,7 +314,17 @@ class JobRepository:
             )
             return True
 
-    def defer(self, claimed: ClaimedJob, *, available_at: datetime, reason: str, max_cycles: int, refund_attempt: bool) -> bool:
+    def defer(
+        self,
+        claimed: ClaimedJob,
+        *,
+        available_at: datetime,
+        reason: str,
+        max_cycles: int,
+        refund_attempt: bool,
+        payload: dict[str, Any] | None = None,
+        event_metadata: dict[str, Any] | None = None,
+    ) -> bool:
         """Hold a job until a provider cooldown expires, without spending an attempt.
 
         This is not `retry_or_fail` with a longer delay. The distinction it
@@ -370,24 +386,33 @@ class JobRepository:
                     return False
             event_type = "defer_no_call" if refund_attempt else "defer_scheduled"
             attempt_after = max(0, claimed.attempt - 1) if refund_attempt else claimed.attempt
+            values: dict[str, Any] = {
+                "status": "waiting",
+                # Back to the count before this claim when nothing was
+                # asked of the provider. A refusal that cost a real call
+                # keeps its attempt -- it was paid for.
+                "attempt_count": attempt_after,
+                "available_at": available_at,
+                "lease_owner": None,
+                "lease_token": None,
+                "lease_expires_at": None,
+                "updated_at": now,
+            }
+            if payload is not None:
+                # Durable progress -- a batch checkpoint, most concretely --
+                # that must survive this job past however many more of these
+                # cycles it takes for the cooldown to actually lift.
+                values["payload_json"] = dict(payload)
             updated = session.execute(
                 update(Job)
                 .where(Job.id == claimed.id, Job.status == "running", Job.lease_token == claimed.lease_token)
-                .values(
-                    status="waiting",
-                    # Back to the count before this claim when nothing was
-                    # asked of the provider. A refusal that cost a real call
-                    # keeps its attempt -- it was paid for.
-                    attempt_count=attempt_after,
-                    available_at=available_at,
-                    lease_owner=None,
-                    lease_token=None,
-                    lease_expires_at=None,
-                    updated_at=now,
-                )
+                .values(**values)
             )
             if updated.rowcount != 1:
                 return False
+            metadata = {"reason": reason, "called_provider": not refund_attempt}
+            if event_metadata:
+                metadata.update(event_metadata)
             self._event(
                 session,
                 job_id=claimed.id,
@@ -399,12 +424,21 @@ class JobRepository:
                 # `called_provider` is what separates the two events, spelled
                 # out so an operator reading the log does not have to know
                 # which event type means which.
-                metadata={"reason": reason, "called_provider": not refund_attempt},
+                metadata=metadata,
                 occurred_at=now,
             )
             return True
 
-    def retry_or_fail(self, claimed: ClaimedJob, *, error_type: str, message: str, delay_seconds: int = 60) -> bool:
+    def retry_or_fail(
+        self,
+        claimed: ClaimedJob,
+        *,
+        error_type: str,
+        message: str,
+        delay_seconds: int = 60,
+        payload: dict[str, Any] | None = None,
+        event_metadata: dict[str, Any] | None = None,
+    ) -> bool:
         now = utc_now()
         retryable = claimed.attempt < claimed.max_attempts
         target_status = "waiting" if retryable else "failed"
@@ -421,6 +455,12 @@ class JobRepository:
             values["available_at"] = now + timedelta(seconds=delay_seconds)
         else:
             values["finished_at"] = now
+        if payload is not None:
+            # Durable progress carried forward even on the ordinary retry
+            # path -- a batch this attempt landed does not need refetching
+            # just because the failure that ended the attempt was not a
+            # cooldown.
+            values["payload_json"] = dict(payload)
         with self._immediate_session() as session:
             updated = session.execute(
                 update(Job)
@@ -429,6 +469,9 @@ class JobRepository:
             )
             if updated.rowcount != 1:
                 return False
+            metadata: dict[str, Any] = {"delay_seconds": delay_seconds, "reason": error_type}
+            if event_metadata:
+                metadata.update(event_metadata)
             self._event(
                 session,
                 job_id=claimed.id,
@@ -437,7 +480,7 @@ class JobRepository:
                 from_status="running",
                 to_status=target_status,
                 actor_source="worker",
-                metadata={"delay_seconds": delay_seconds, "reason": error_type},
+                metadata=metadata,
                 occurred_at=now,
             )
             return True
