@@ -18,6 +18,7 @@ import nemsei.diagnostics.models  # noqa: F401 - register device status metadata
 import nemsei.notifications.models  # noqa: F401 - register notification metadata
 import nemsei.contracts.models  # noqa: F401 - register O&M contract metadata
 import nemsei.integrations.huawei_scada.models  # noqa: F401 - register Huawei SCADA session metadata
+import nemsei.work_orders.models  # noqa: F401 - register work order/visit metadata
 
 
 config = context.config
