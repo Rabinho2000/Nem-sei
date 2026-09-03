@@ -40,31 +40,23 @@
 <section class="panel">
   <header class="panel-header"><h2>O que está a bloquear</h2></header>
   <dl class="stat-list">
-    <div>
-      <dt>Sem energia registada</dt>
-      <dd>
-        <strong>{{ summary.without_energy }}</strong>
-        <a href="{{ url_for('reporting.assets_index', month=month, state='blocked') }}">ver →</a>
-      </dd>
-    </div>
-    <div>
-      <dt>ESCO sem configuração comercial</dt>
-      <dd>
-        <strong>{{ summary.esco_needs_commercial }}</strong>
-        <a href="{{ url_for('reporting.assets_index', month=month, state='needs_commercial') }}">ver →</a>
-      </dd>
-    </div>
-    <div>
-      <dt>Com valores em euros possíveis</dt>
-      <dd><strong>{{ summary.money_possible }}</strong></dd>
-    </div>
-    <div>
-      <dt>Por gerar</dt>
-      <dd>
-        <strong>{{ summary.not_generated }}</strong>
-        <a href="{{ url_for('reporting.assets_index', month=month, generated='no') }}">ver →</a>
-      </dd>
-    </div>
+    <dt>Sem energia registada</dt>
+    <dd class="stat-bad">
+      <strong>{{ summary.without_energy }}</strong>
+      <a href="{{ url_for('reporting.assets_index', month=month, state='blocked') }}">ver →</a>
+    </dd>
+    <dt>ESCO sem configuração comercial</dt>
+    <dd class="stat-warn">
+      <strong>{{ summary.esco_needs_commercial }}</strong>
+      <a href="{{ url_for('reporting.assets_index', month=month, state='needs_commercial') }}">ver →</a>
+    </dd>
+    <dt>Com valores em euros possíveis</dt>
+    <dd class="stat-ok"><strong>{{ summary.money_possible }}</strong></dd>
+    <dt>Por gerar</dt>
+    <dd>
+      <strong>{{ summary.not_generated }}</strong>
+      <a href="{{ url_for('reporting.assets_index', month=month, generated='no') }}">ver →</a>
+    </dd>
   </dl>
   <p class="panel-foot muted">
     Uma instalação sem autoconsumo persistido produz relatório de energia e nenhum valor

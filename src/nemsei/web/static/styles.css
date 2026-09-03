@@ -333,9 +333,22 @@ code { color: var(--brand-dark); font: 0.78rem ui-monospace, SFMono-Regular, Men
 .result-count { margin: 0 0 14px; color: var(--muted); font-size: 0.82rem; }
 
 .two-column { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
-.stat-list { display: grid; grid-template-columns: 1fr auto; gap: 6px 16px; margin: 0; }
+/* `dt`/`dd` are direct grid children on purpose -- a wrapping `<div>` per
+   pair (valid HTML in a `<dl>`, but not what this rule lays out) breaks the
+   two-column placement entirely, each pair landing in its own grid cell
+   instead of one column of labels against one column of values. */
+.stat-list { display: grid; grid-template-columns: 1fr auto; gap: 0 16px; margin: 0; align-items: center; }
+.stat-list dt, .stat-list dd { padding: 10px 0; border-top: 1px solid var(--line); }
+.stat-list dt:nth-child(-n+2), .stat-list dd:nth-child(-n+2) { border-top: 0; padding-top: 2px; }
 .stat-list dt { color: var(--muted); font-size: 0.85rem; }
-.stat-list dd { margin: 0; font-weight: 650; text-align: right; }
+.stat-list dd { margin: 0; font-weight: 650; text-align: right; white-space: nowrap; }
+.stat-list dd a { margin-left: 10px; font-weight: 700; font-size: 0.8rem; }
+/* Severity accents, reusing the same tokens `.pill-bad`/`.pill-warn`/
+   `.pill-ok` already use elsewhere -- a number is not just a number when
+   some of them mean "blocked" and others mean "possible". */
+.stat-list dd.stat-bad strong { color: var(--danger); }
+.stat-list dd.stat-warn strong { color: var(--warning); }
+.stat-list dd.stat-ok strong { color: var(--success); }
 .provenance { margin: 14px 0 0; color: var(--muted); font-size: 0.78rem; }
 .panel-foot { margin: 12px 0 0; font-size: 0.85rem; }
 .empty { padding: 14px 0; color: var(--muted); }
