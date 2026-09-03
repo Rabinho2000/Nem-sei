@@ -17,7 +17,7 @@ from nemsei.db.session import build_session_factory
 from nemsei.installations.service import backfill_installations_from_assets, installation_for_asset
 from nemsei.shared.clock import utc_now
 from nemsei.web.work_order_queries import planning_page
-from nemsei.work_orders.service import create_work_order
+from nemsei.work_orders.service import create_work_order, update_work_order_status
 
 
 def upgrade(settings, monkeypatch) -> None:
@@ -141,3 +141,136 @@ def test_the_planning_page_renders(settings, monkeypatch) -> None:
     assert response.status_code == 200
     assert "Planeamento" in response.text
     assert "Trocar disjuntor" in response.text
+
+
+def test_criticos_bucket_holds_only_open_critical_priority_work(factory) -> None:
+    with factory() as session, session.begin():
+        asset = create_asset(session, canonical_name="Central")
+        installation_id = _installation_id(session, asset_id=asset.id)
+        critical = create_work_order(
+            session, installation_id=installation_id, work_type="corrective", title="Crítico",
+            created_by="op", priority="critical",
+        )
+        create_work_order(
+            session, installation_id=installation_id, work_type="corrective", title="Normal",
+            created_by="op", priority="normal",
+        )
+        critical_id = critical.id
+
+    with factory() as session:
+        page = planning_page(session)
+
+    assert [row["work_order"].id for row in page["criticos"]] == [critical_id]
+
+
+def test_hoje_bucket_holds_only_work_planned_for_today(factory) -> None:
+    today = utc_now().date()
+    with factory() as session, session.begin():
+        asset = create_asset(session, canonical_name="Central")
+        installation_id = _installation_id(session, asset_id=asset.id)
+        today_wo = create_work_order(
+            session, installation_id=installation_id, work_type="corrective", title="Hoje",
+            created_by="op", planned_date=today,
+        )
+        create_work_order(
+            session, installation_id=installation_id, work_type="corrective", title="Amanhã",
+            created_by="op", planned_date=today + timedelta(days=1),
+        )
+        today_id = today_wo.id
+
+    with factory() as session:
+        page = planning_page(session)
+
+    assert [row["work_order"].id for row in page["hoje"]] == [today_id]
+
+
+def test_bloqueados_bucket_also_holds_the_explicit_waiting_material_status(factory) -> None:
+    """`material_status='pending'/'ordered'` and `status='waiting_material'`
+    are two different facts (see `work_orders/models.py`) that both belong
+    in the same "à espera de material" bucket."""
+    with factory() as session, session.begin():
+        asset = create_asset(session, canonical_name="Central")
+        installation_id = _installation_id(session, asset_id=asset.id)
+        by_material_status = create_work_order(
+            session, installation_id=installation_id, work_type="corrective", title="Material pendente",
+            created_by="op", material_status="pending",
+        )
+        by_status = create_work_order(
+            session, installation_id=installation_id, work_type="corrective", title="Parado no estado",
+            created_by="op",
+        )
+        update_work_order_status(session, work_order_id=by_status.id, status="waiting_material", actor="op")
+        by_material_status_id, by_status_id = by_material_status.id, by_status.id
+
+    with factory() as session:
+        page = planning_page(session)
+
+    assert {row["work_order"].id for row in page["bloqueados"]} == {by_material_status_id, by_status_id}
+
+
+def test_concluidos_recentes_holds_only_recently_completed_work(factory) -> None:
+    with factory() as session, session.begin():
+        asset = create_asset(session, canonical_name="Central")
+        installation_id = _installation_id(session, asset_id=asset.id)
+        recent = create_work_order(
+            session, installation_id=installation_id, work_type="cleaning", title="Feito ontem", created_by="op"
+        )
+        update_work_order_status(session, work_order_id=recent.id, status="completed", actor="op")
+        still_open = create_work_order(
+            session, installation_id=installation_id, work_type="cleaning", title="Ainda aberto", created_by="op"
+        )
+        recent_id, still_open_id = recent.id, still_open.id
+
+    with factory() as session:
+        page = planning_page(session)
+
+    completed_ids = {row["work_order"].id for row in page["concluidos_recentes"]}
+    assert recent_id in completed_ids
+    assert still_open_id not in completed_ids
+    open_ids = {row["work_order"].id for row in page["sem_data"]}
+    assert recent_id not in open_ids  # completed work never appears in an "open work" bucket
+
+
+def test_planning_filters_narrow_every_bucket_identically(factory) -> None:
+    with factory() as session, session.begin():
+        asset = create_asset(session, canonical_name="Central")
+        installation_id = _installation_id(session, asset_id=asset.id)
+        matching = create_work_order(
+            session, installation_id=installation_id, work_type="preventive", title="Filtra",
+            created_by="op", priority="high", assigned_to="Anderson",
+        )
+        create_work_order(
+            session, installation_id=installation_id, work_type="corrective", title="Não filtra",
+            created_by="op", priority="low", assigned_to="Outra Pessoa",
+        )
+        matching_id = matching.id
+
+    with factory() as session:
+        by_priority = planning_page(session, priority="high")
+        by_work_type = planning_page(session, work_type="preventive")
+        by_assigned_to = planning_page(session, assigned_to="Ander")
+
+    for page in (by_priority, by_work_type, by_assigned_to):
+        assert [row["work_order"].id for row in page["sem_data"]] == [matching_id]
+        assert page["total_open"] == 1
+
+
+def test_planning_installation_filter_isolates_one_site(factory) -> None:
+    with factory() as session, session.begin():
+        alpha = create_asset(session, canonical_name="Central Alpha")
+        alpha_installation_id = _installation_id(session, asset_id=alpha.id)
+        beta = create_asset(session, canonical_name="Central Beta")
+        beta_installation_id = _installation_id(session, asset_id=beta.id)
+        alpha_wo = create_work_order(
+            session, installation_id=alpha_installation_id, work_type="corrective", title="Em Alpha", created_by="op"
+        )
+        create_work_order(
+            session, installation_id=beta_installation_id, work_type="corrective", title="Em Beta", created_by="op"
+        )
+        alpha_id = alpha_wo.id
+
+    with factory() as session:
+        page = planning_page(session, installation="Alpha")
+
+    assert [row["work_order"].id for row in page["sem_data"]] == [alpha_id]
+    assert page["total_open"] == 1

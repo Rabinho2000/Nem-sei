@@ -25,6 +25,8 @@ from nemsei.diagnostics.service import current_device_status
 from nemsei.installations.service import coordinates_for_asset
 from nemsei.monitoring.production_window import window_for
 from nemsei.shared.clock import utc_now
+from nemsei.web.work_order_queries import incident_side_banner
+from nemsei.work_orders.service import open_work_order_summary_for_incidents, work_orders_for_incident
 
 
 # Worse first: a device with no reading at all is at least as concerning as
@@ -173,6 +175,9 @@ def open_incidents_overview(
     found = session.execute(statement).all()
     asset_ids = [asset.id for _, asset, _ in found]
     statuses = om_status_map(session, asset_ids=asset_ids) if asset_ids else {}
+    # One query for every row on this page, never one per incident -- the
+    # same discipline `om_status_map` above already applies.
+    open_work = open_work_order_summary_for_incidents(session, incident_ids=[incident.id for incident, _, _ in found])
     rows: list[dict[str, Any]] = []
     for incident, asset, device in found:
         commercial = describe(asset.contract_type, statuses[asset.id]["status"])
@@ -194,6 +199,7 @@ def open_incidents_overview(
                 "device_label": device.label if device else None,
                 "duration": duration_label(now - incident.opened_at),
                 "since_confirmed": duration_label(now - incident.last_observed_at),
+                "open_work_order": open_work.get(incident.id),
             }
         )
     rows.sort(
@@ -212,6 +218,7 @@ def incident_detail(session: Session, *, incident_id: int) -> dict[str, Any] | N
     if incident is None:
         return None
     now = utc_now()
+    work_orders = work_orders_for_incident(session, incident_id=incident.id)
     return {
         "incident": incident,
         "asset": session.get(Asset, incident.asset_id),
@@ -220,6 +227,11 @@ def incident_detail(session: Session, *, incident_id: int) -> dict[str, Any] | N
         "duration": duration_label(now - incident.opened_at),
         "since_confirmed": duration_label(now - incident.last_observed_at),
         "handling_states": INCIDENT_HANDLING_STATES,
+        "work_orders": work_orders,
+        "has_open_work_order": any(wo.status not in ("completed", "cancelled") for wo in work_orders),
+        "work_order_banner": incident_side_banner(
+            incident_status=incident.status, work_order_statuses=[wo.status for wo in work_orders]
+        ),
     }
 
 

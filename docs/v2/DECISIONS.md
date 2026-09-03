@@ -471,3 +471,69 @@ em nenhum dos dois.
   (estado não terminal) e particiona depois em memória, nunca cinco
   queries independentes que poderiam divergir sobre o que "em aberto"
   significa.
+
+## Fechar o workflow operacional: incidente → work order → visita → verificação (2026-09-03)
+
+`WorkOrder`/`Visit`/`work_order_incidents` (bloco de 2026-09-03 acima) já
+existiam com serviço e schema completos; faltava a superfície que os liga a
+um incidente real e as regras de lifecycle explícitas que o pedido do
+produto exige. Nada do que se segue reimplementa `create_work_order`,
+`add_visit`, `update_work_order_status`, `planning_page` ou
+`work_orders_page` -- todos ganharam parâmetros novos, nenhum foi
+substituído.
+
+- **`priority` não existia de todo.** Adicionada (`critical`/`high`/`normal`/
+  `low`, migração `0038_work_order_priority`) sugerida a partir da
+  severidade do incidente de origem (`critical`→`critical`, `warning`→
+  `normal`) mas sempre alterável pelo operador -- nunca a partir de
+  `contracts.priority.service_priority`, que ordena dentro da severidade e
+  nunca através dela. Misturar as duas teria feito um aviso ESCO passar à
+  frente de uma central real e parada.
+- **`waiting_material`/`waiting_customer` juntam-se aos cinco estados que já
+  existiam**, sem tocar em `material_status`, que fica exatamente o que
+  era: `material_status` é o material, `status` é o workflow. Um trabalho
+  pode ser `open` com `material_status='pending'` sem estar parado por
+  isso, ou explicitamente `waiting_material`. `planning_page`'s "à espera
+  de material" passou a incluir os dois.
+- **`updated_by` era um bug, não uma funcionalidade nova.** `update_work_order_status`
+  já recebia `actor` desde a `0033` e nunca o guardava em lado nenhum --
+  corrigido na mesma migração, com o `actor` agora obrigatório (antes
+  aceitava silenciosamente uma string vazia).
+- **A revisão da migração usa um id curto de propósito.** O nome óbvio
+  (`0038_work_order_priority_and_states`, 35 caracteres) excede o
+  `VARCHAR(32)` de `alembic_version.version_num` e falharia a meio do
+  `upgrade` com um `StringDataRightTruncation` cru -- exatamente a classe de
+  bug de deployment que este ficheiro já regista ter apanhado uma vez
+  (bloco "Timeline como projeção", `0020`). Evitado desta vez em vez de
+  reencontrado.
+- **Nenhum auto-close.** `create_work_order`, `update_work_order_status` e
+  `add_visit` continuam sem tocar em `DiagnosticIncident`; um incidente
+  fecha-se só pelo evaluator (`diagnostics/incidents.py`). Duas funções
+  puras novas (`web/work_order_queries.incident_side_banner`/
+  `work_order_side_banner`) só leem os dois `status` e devolvem uma frase
+  quando discordam -- nunca escrevem em nenhum dos dois. Mostradas na
+  página do incidente e na do trabalho.
+- **`Visit.outcome` continua texto livre.** Um vocabulário fechado
+  (`resolved_on_site`/`temporary_fix`/...) pedia CHECK constraint + migração
+  para um campo que hoje é só uma frase; em vez disso o formulário sugere
+  os cinco valores via `<datalist>` HTML -- sem alteração de schema,
+  decisão documentada aqui em vez de implementada.
+- **Duas leituras em lote novas**, mesmo desenho que `open_work_order_counts`
+  já usava: `open_work_order_summary_for_incidents` (uma leitura para N
+  incidentes, o mais recente aberto por incidente) e
+  `open_work_orders_for_incident` (a lista completa, para o ecrã "criar
+  trabalho" mostrar o que já existe antes de a criação de outro ficar
+  disponível como ação secundária). A lista de incidentes, o separador
+  Operação da instalação e o `open_incidents_overview` já usado por
+  `/diagnostics/incidents` passaram a usar a primeira -- nenhum ganhou uma
+  query por linha.
+- **Rotas novas ficaram nos blueprints que já existiam** (`diagnostics_bp`
+  para "criar trabalho a partir do incidente"; `work_orders_bp` para
+  detalhe/estado/visita), nunca um blueprint novo. A view de detalhe do
+  trabalho chama-se `show`, não `detail` -- `installations_bp` já tinha uma
+  view chamada `detail`, e o nome repetido no mesmo módulo Python
+  redefiniria a função sob o `F811` do ruff.
+- **Fora do âmbito, deliberadamente**: RBAC/utilizadores (§16 continua por
+  fazer), motor de SLA, edição de campos do trabalho depois de criado além
+  de estado/visita, calendário drag-and-drop, e qualquer chamada a
+  fornecedor a partir destas rotas (nenhuma existe).

@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{#
+  "Mostra primeiro os trabalhos existentes; permitir criar outro apenas
+  como ação secundária explícita" -- por isso a lista de trabalhos já
+  abertos vem antes do formulário, e o botão diz "novo" quando já existe
+  pelo menos um.
+#}
+{% block content %}
+<header class="page-header detail-header">
+  <div>
+    <a class="back-link" href="{{ url_for('diagnostics.incident', incident_id=incident.id) }}">← Incidente</a>
+    <h1>Criar trabalho</h1>
+    <p class="page-intro">{{ incident.rule_code }} · {{ asset.canonical_name if asset else 'Central desconhecida' }}</p>
+  </div>
+</header>
+
+{% if not has_installation %}
+  <div class="notice-panel"><p><strong>Sem Instalação associada a esta central.</strong> A candidatura da Instalação ainda não foi aplicada em produção para esta central — não é possível criar um trabalho até lá.</p></div>
+{% endif %}
+
+{% if existing_work_orders %}
+  <section class="panel">
+    <div class="panel-header"><div><p class="eyebrow">Já em curso</p><h2>Trabalho aberto para este incidente — {{ existing_work_orders|length }}</h2></div></div>
+    <ul class="plain-list">
+      {% for wo in existing_work_orders %}
+        <li>
+          <a href="{{ url_for('work_orders.show', work_order_id=wo.id) }}">{{ wo.title }}</a>
+          <span class="status-badge warning">{{ status_labels.get(wo.status, wo.status) }}</span>
+          <span class="status-badge muted">{{ priority_labels.get(wo.priority, wo.priority) }}</span>
+          <small>{{ work_type_labels.get(wo.work_type, wo.work_type) }}{% if wo.assigned_to %} · {{ wo.assigned_to }}{% endif %}{% if wo.planned_date %} · planeado {{ wo.planned_date.strftime('%d/%m/%Y') }}{% endif %}</small>
+        </li>
+      {% endfor %}
+    </ul>
+  </section>
+{% endif %}
+
+<section class="panel form-panel">
+  <div class="panel-header"><div><p class="eyebrow">Novo trabalho</p><h2>{{ 'Criar outro trabalho' if existing_work_orders else 'Dados do trabalho' }}</h2></div></div>
+  {% if has_installation %}
+    <form method="post" action="{{ url_for('diagnostics.create_work_order_from_incident', incident_id=incident.id) }}" class="stack-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <dl class="detail-list" style="margin-bottom:14px">
+        <div><dt>Instalação</dt><dd>{{ installation.display_name }}</dd></div>
+        <div><dt>Incidente</dt><dd>{{ incident.rule_code }} ({{ incident.severity }})</dd></div>
+      </dl>
+      <div class="form-grid">
+        <label>Título<input name="title" value="{{ suggested_title }}" required maxlength="255"></label>
+        <label>Tipo de trabalho
+          <select name="work_type" required>
+            {% for value in work_types %}<option value="{{ value }}" {{ 'selected' if value == 'corrective' else '' }}>{{ work_type_labels.get(value, value) }}</option>{% endfor %}
+          </select>
+        </label>
+        <label>Prioridade
+          <select name="priority">
+            {% for value in priorities %}<option value="{{ value }}" {{ 'selected' if value == suggested_priority else '' }}>{{ priority_labels.get(value, value) }}</option>{% endfor %}
+          </select>
+        </label>
+        <label>Responsável<input name="assigned_to" placeholder="Quem vai executar"></label>
+        <label>Data planeada<input type="date" name="planned_date"></label>
+        <label>Data limite<input type="date" name="due_date"></label>
+        <label>Estado do material
+          <select name="material_status">
+            {% for value in material_statuses %}<option value="{{ value }}" {{ 'selected' if value == 'not_applicable' else '' }}>{{ {'not_applicable':'N/A','pending':'Pendente','ordered':'Encomendado','ready':'Pronto'}.get(value, value) }}</option>{% endfor %}
+          </select>
+        </label>
+        <label>Custo estimado (€)<span class="field-hint">opcional</span><input name="estimated_cost_eur" inputmode="decimal"></label>
+      </div>
+      <label>Descrição / notas<textarea name="description" placeholder="O que é preciso fazer"></textarea></label>
+      <label>Notas de material<textarea name="material_notes" placeholder="O que falta, quem encomendou"></textarea></label>
+      <div class="form-actions">
+        <a class="button secondary" href="{{ url_for('diagnostics.incident', incident_id=incident.id) }}">Cancelar</a>
+        <button class="button primary" type="submit">{{ 'Criar novo trabalho' if existing_work_orders else 'Criar trabalho' }}</button>
+      </div>
+    </form>
+  {% endif %}
+</section>
+{% endblock %}

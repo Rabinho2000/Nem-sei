@@ -27,6 +27,8 @@ from nemsei.work_orders.service import (
     incidents_for_work_order,
     link_incident,
     open_work_order_counts,
+    open_work_order_summary_for_incidents,
+    open_work_orders_for_incident,
     overdue_work_orders,
     unscheduled_work_orders,
     update_work_order_status,
@@ -282,6 +284,68 @@ def test_moving_off_completed_clears_completed_at(factory) -> None:
         assert reopened.completed_at is None
 
 
+def test_a_status_change_records_who_made_it(factory) -> None:
+    """`update_work_order_status` took an `actor` argument since 0033;
+    nothing stored it until the `updated_by` column (0038)."""
+    with factory() as session, session.begin():
+        installation_id = seed_installation(session)
+        work_order = create_work_order(
+            session, installation_id=installation_id, work_type="cleaning", title="Limpeza", created_by="op"
+        )
+        work_order_id = work_order.id
+        assert work_order.updated_by is None
+
+    with factory() as session, session.begin():
+        updated = update_work_order_status(session, work_order_id=work_order_id, status="in_progress", actor="Anderson")
+        assert updated.updated_by == "Anderson"
+
+
+def test_a_status_change_without_an_actor_is_refused(factory) -> None:
+    with factory() as session, session.begin():
+        installation_id = seed_installation(session)
+        work_order = create_work_order(
+            session, installation_id=installation_id, work_type="cleaning", title="Limpeza", created_by="op"
+        )
+        with pytest.raises(ValueError, match="quem a fez"):
+            update_work_order_status(session, work_order_id=work_order.id, status="in_progress", actor="  ")
+
+
+def test_an_unknown_priority_is_refused(factory) -> None:
+    with factory() as session, session.begin():
+        installation_id = seed_installation(session)
+        with pytest.raises(ValueError, match="Prioridade desconhecida"):
+            create_work_order(
+                session, installation_id=installation_id, work_type="corrective", title="T", created_by="op",
+                priority="urgentissimo",
+            )
+
+
+def test_priority_defaults_to_normal_and_can_be_set_at_creation(factory) -> None:
+    with factory() as session, session.begin():
+        installation_id = seed_installation(session)
+        default = create_work_order(
+            session, installation_id=installation_id, work_type="corrective", title="T", created_by="op"
+        )
+        critical = create_work_order(
+            session, installation_id=installation_id, work_type="corrective", title="T2", created_by="op",
+            priority="critical",
+        )
+        assert default.priority == "normal"
+        assert critical.priority == "critical"
+
+
+def test_the_waiting_states_are_a_valid_work_order_status(factory) -> None:
+    with factory() as session, session.begin():
+        installation_id = seed_installation(session)
+        work_order = create_work_order(
+            session, installation_id=installation_id, work_type="corrective", title="T", created_by="op"
+        )
+        for status in ("waiting_material", "waiting_customer"):
+            updated = update_work_order_status(session, work_order_id=work_order.id, status=status, actor="op")
+            assert updated.status == status
+            assert updated.completed_at is None
+
+
 # --- visits ----------------------------------------------------------------
 
 
@@ -387,3 +451,51 @@ def test_work_orders_for_installation_orders_most_recently_planned_first(factory
     with factory() as session:
         titles = [wo.title for wo in work_orders_for_installation(session, installation_id=installation_id)]
         assert titles == ["Segundo", "Primeiro"]
+
+
+# --- incident -> work order lookups, batched --------------------------------
+
+
+def test_open_work_orders_for_incident_excludes_terminal_ones(factory) -> None:
+    with factory() as session, session.begin():
+        installation_id = seed_installation(session)
+        asset = create_asset(session, canonical_name="Beta")
+        session.flush()
+        incident_id = seed_incident(session, asset_id=asset.id)
+        open_wo = create_work_order(
+            session, installation_id=installation_id, work_type="corrective", title="Aberto", created_by="op",
+            incident_ids=[incident_id],
+        )
+        cancelled = create_work_order(
+            session, installation_id=installation_id, work_type="corrective", title="Cancelado", created_by="op",
+            incident_ids=[incident_id],
+        )
+        update_work_order_status(session, work_order_id=cancelled.id, status="cancelled", actor="op")
+        open_id = open_wo.id
+
+    with factory() as session:
+        results = open_work_orders_for_incident(session, incident_id=incident_id)
+        assert [wo.id for wo in results] == [open_id]
+
+
+def test_open_work_order_summary_for_incidents_picks_the_newest_open_one_per_incident(factory) -> None:
+    with factory() as session, session.begin():
+        installation_id = seed_installation(session)
+        asset = create_asset(session, canonical_name="Beta")
+        session.flush()
+        with_work = seed_incident(session, asset_id=asset.id, rule_code="device_unavailable")
+        without_work = seed_incident(session, asset_id=asset.id, rule_code="stale_reading")
+        create_work_order(
+            session, installation_id=installation_id, work_type="corrective", title="Primeiro tentativa",
+            created_by="op", incident_ids=[with_work],
+        )
+        newest = create_work_order(
+            session, installation_id=installation_id, work_type="corrective", title="Segunda tentativa",
+            created_by="op", incident_ids=[with_work],
+        )
+        newest_id = newest.id
+
+    with factory() as session:
+        summary = open_work_order_summary_for_incidents(session, incident_ids=[with_work, without_work])
+        assert set(summary) == {with_work}
+        assert summary[with_work].id == newest_id

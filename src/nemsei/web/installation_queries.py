@@ -56,7 +56,7 @@ from nemsei.web.operational_priority import installation_priority
 from nemsei.web.queries import list_assets_data
 from nemsei.web.series import energy_balance, headline, production_consumption_series
 from nemsei.web.work_order_queries import overdue_and_unscheduled_counts
-from nemsei.work_orders.service import work_orders_for_installation
+from nemsei.work_orders.service import open_work_order_summary_for_incidents, work_orders_for_installation
 
 
 def incident_counts_by_category(session: Session, *, asset_ids: list[int]) -> dict[int, dict[str, Any]]:
@@ -230,11 +230,18 @@ def _operacao_tab(session: Session, asset: Asset) -> dict[str, Any]:
         incident.id: _incident_impact(session, incident, latitude=latitude, longitude=longitude, billing_config=billing_config)
         for incident in open_incidents
     }
+    # One query for every open incident on this tab, never one per row --
+    # `web/diagnostics_queries.open_incidents_overview` applies the same
+    # batching for the same reason.
+    open_work_by_incident = open_work_order_summary_for_incidents(
+        session, incident_ids=[incident.id for incident in open_incidents]
+    )
 
     return {
         "incidents_by_category": by_category,
         "category_labels": CATEGORY_LABELS,
         "category_tones": CATEGORY_TONES,
+        "open_work_by_incident": open_work_by_incident,
         "total_open": len(open_incidents),
         "impact_by_incident": impact_by_incident,
     }

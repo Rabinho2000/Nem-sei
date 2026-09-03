@@ -55,16 +55,30 @@ WORK_TYPES = ("corrective", "preventive", "cleaning")
 # V1's real usage, not its schema: of the six declared `TICKET_STATUSES`,
 # thirteen real rows used four (`Aberto`, `Em analise`, `Resolvido`,
 # `Fechado`); `Agendado` and `Em visita` were declared but never reached.
-# This vocabulary is V2's own, sized to that evidence plus the two states a
-# planning screen needs (`planned` for "has a date", `cancelled` for "will
+# This vocabulary is V2's own, sized to that evidence plus the states a
+# planning screen needs (`planned` for "has a date", `waiting_material`/
+# `waiting_customer` for "stalled on someone else", `cancelled` for "will
 # not happen") rather than V1's nine-state material-blocking pipeline, which
 # `field_route_plans`/`material_status` show was designed for a workflow
-# that never actually ran.
-WORK_ORDER_STATUSES = ("open", "planned", "in_progress", "completed", "cancelled")
+# that never actually ran. `waiting_material`/`waiting_customer` describe
+# *why the job itself is stalled*, a workflow position; `material_status`
+# below stays a separate, narrower fact about material readiness alone --
+# a job can be `open` with `material_status='pending'` (not blocked on it
+# yet) or explicitly `waiting_material` (the whole job is stalled on it).
+WORK_ORDER_STATUSES = ("open", "planned", "in_progress", "waiting_material", "waiting_customer", "completed", "cancelled")
 # Free text until material tracking earns a workflow of its own -- see the
 # module docstring. Kept as a distinct, small vocabulary so a value is at
 # least consistent across work orders, without pretending to model blocking.
 MATERIAL_STATUSES = ("not_applicable", "pending", "ordered", "ready")
+# No V1 precedent to size this against (V1's `tickets` had no priority
+# column at all) -- this is the plain four-level vocabulary the incident
+# side already uses one of (`DiagnosticIncident.severity` is `critical`/
+# `warning`/`info`), widened to the two extra levels a dispatcher actually
+# needs to rank work that has no incident behind it at all (a preventive
+# clean has no severity to inherit). Suggested from the linked incident's
+# severity at creation time (`web/work_order_queries.py`), never enforced --
+# the operator can always override it.
+PRIORITIES = ("critical", "high", "normal", "low")
 
 
 class WorkOrder(Base):
@@ -74,6 +88,7 @@ class WorkOrder(Base):
     __table_args__ = (
         CheckConstraint(f"work_type IN {WORK_TYPES!r}", name="ck_work_orders_type"),
         CheckConstraint(f"status IN {WORK_ORDER_STATUSES!r}", name="ck_work_orders_status"),
+        CheckConstraint(f"priority IN {PRIORITIES!r}", name="ck_work_orders_priority"),
         CheckConstraint(f"material_status IN {MATERIAL_STATUSES!r}", name="ck_work_orders_material_status"),
         CheckConstraint(
             "due_date IS NULL OR planned_date IS NULL OR due_date >= planned_date",
@@ -83,6 +98,7 @@ class WorkOrder(Base):
         CheckConstraint("estimated_cost_eur IS NULL OR estimated_cost_eur >= 0", name="ck_work_orders_cost"),
         Index("ix_work_orders_installation", "installation_id", "status"),
         Index("ix_work_orders_planned_date", "planned_date"),
+        Index("ix_work_orders_priority", "priority", "status"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -90,6 +106,7 @@ class WorkOrder(Base):
     installation_id: Mapped[int] = mapped_column(ForeignKey("installations.id", ondelete="RESTRICT"), nullable=False)
     work_type: Mapped[str] = mapped_column(String(24), nullable=False)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="open")
+    priority: Mapped[str] = mapped_column(String(24), nullable=False, default="normal")
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
     planned_date: Mapped[date | None] = mapped_column(Date)
@@ -103,6 +120,10 @@ class WorkOrder(Base):
     created_by: Mapped[str] = mapped_column(String(120), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # Who made the most recent change (a status move, today) -- distinct from
+    # `created_by`, which never changes after creation. `None` for a work
+    # order that has never moved since it was created.
+    updated_by: Mapped[str | None] = mapped_column(String(120))
 
     # cascade="all, delete-orphan" matches the database's own ON DELETE
     # CASCADE on `visits.work_order_id`. Without it the ORM's default

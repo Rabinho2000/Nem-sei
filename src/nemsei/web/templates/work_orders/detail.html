@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{#
+  "Nunca apresentar completed como sinónimo de instalação recuperada." O
+  estado técnico do trabalho (work_completed) e o estado do problema
+  monitorizado (problem_status) são sempre dois badges separados, nunca um
+  só -- a mesma disciplina que diagnostics/incident.html já aplica a
+  status/handling_state.
+#}
+{% set problem_labels = {'active':'Ativo','resolved':'Resolvido','not_linked':'Sem incidente associado'} %}
+{% set problem_tones = {'active':'danger','resolved':'success','not_linked':'muted'} %}
+{% block content %}
+<header class="page-header detail-header">
+  <div>
+    <a class="back-link" href="{{ url_for('work_orders.index_work_orders') }}">← Trabalhos</a>
+    <h1>{{ work_order.title }}</h1>
+    <p class="page-intro">
+      {{ installation.display_name if installation else 'Instalação desconhecida' }}
+      {% if organization_name %} · {{ organization_name }}{% endif %}
+      {% if asset %} · {{ asset.canonical_name }}{% endif %}
+    </p>
+    <div class="inline-status">
+      <span class="status-badge {{ 'success' if work_order.status == 'completed' else 'muted' if work_order.status == 'cancelled' else 'warning' }}">{{ status_labels.get(work_order.status, work_order.status) }}</span>
+      <span class="status-badge {{ 'danger' if work_order.priority == 'critical' else 'warning' if work_order.priority == 'high' else 'muted' }}">{{ priority_labels.get(work_order.priority, work_order.priority) }}</span>
+      <span class="status-badge muted">{{ work_type_labels.get(work_order.work_type, work_order.work_type) }}</span>
+      {% if work_order.assigned_to %}<span class="status-badge muted">{{ work_order.assigned_to }}</span>{% endif %}
+    </div>
+    <p class="provenance">Aberto há {{ open_since_days }} dia{{ '' if open_since_days == 1 else 's' }} · criado por {{ work_order.created_by }}</p>
+  </div>
+  {% if installation %}<a class="button secondary" href="{{ url_for('installations.detail', asset_id=asset.id, tab='trabalhos') if asset else url_for('work_orders.index_work_orders') }}">Ver instalação →</a>{% endif %}
+</header>
+
+{% if banner %}
+  <div class="notice-panel"><p><strong>{{ banner }}</strong></p></div>
+{% endif %}
+
+<section class="panel">
+  <div class="panel-header"><div><p class="eyebrow">Estado técnico</p><h2>Duas perguntas, nunca uma só</h2></div></div>
+  <div class="honest-stack">
+    <div><strong>Trabalho operacional</strong><span class="status-badge {{ 'success' if work_completed else 'warning' }}">{{ 'Concluído' if work_completed else 'Não concluído' }}</span></div>
+    <div><strong>Problema monitorizado</strong><span class="status-badge {{ problem_tones.get(problem_status, 'muted') }}">{{ problem_labels.get(problem_status, problem_status) }}</span></div>
+  </div>
+</section>
+
+<div class="content-grid two-columns">
+  <section class="panel">
+    <div class="panel-header"><div><p class="eyebrow">Origem</p><h2>Incidentes relacionados — {{ incidents|length }}</h2></div></div>
+    {% if incidents %}
+      <ul class="plain-list">
+        {% for incident in incidents %}
+          <li>
+            <a href="{{ url_for('diagnostics.incident', incident_id=incident.id) }}">{{ incident.rule_code }}</a>
+            <span class="status-badge {{ 'danger' if incident.severity == 'critical' else 'warning' if incident.severity == 'warning' else 'muted' }}">{{ incident.severity }}</span>
+            <span class="status-badge {{ 'warning' if incident.status == 'open' else 'success' }}">{{ 'ativo' if incident.status == 'open' else 'resolvido' }}</span>
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p class="empty-state">Sem incidente associado -- trabalho aberto diretamente (preventiva, limpeza).</p>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-header"><div><p class="eyebrow">Planeamento</p><h2>Datas e material</h2></div></div>
+    <dl class="detail-list">
+      <div><dt>Planeado</dt><dd>{{ work_order.planned_date.strftime('%d/%m/%Y') if work_order.planned_date else '—' }}</dd></div>
+      <div><dt>Data limite</dt><dd>{{ work_order.due_date.strftime('%d/%m/%Y') if work_order.due_date else '—' }}</dd></div>
+      <div><dt>Material</dt><dd>{{ material_status_labels.get(work_order.material_status, work_order.material_status) }}</dd></div>
+      <div><dt>Custo estimado</dt><dd>{% if work_order.estimated_cost_eur is not none %}{{ '%.2f €'|format(work_order.estimated_cost_eur) }}{% else %}—{% endif %}</dd></div>
+    </dl>
+    {% if work_order.material_notes %}<p class="provenance">{{ work_order.material_notes }}</p>{% endif %}
+    {% if work_order.description %}<p class="provenance">{{ work_order.description }}</p>{% endif %}
+  </section>
+</div>
+
+<section class="panel">
+  <div class="panel-header"><div><p class="eyebrow">Estado</p><h2>Mudar estado do trabalho</h2></div></div>
+  <form method="post" action="{{ url_for('work_orders.update_status', work_order_id=work_order.id) }}" class="stack-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="form-actions" style="justify-content:flex-start;gap:10px">
+      <select name="status">
+        {% for value in statuses %}<option value="{{ value }}" {{ 'selected' if work_order.status == value else '' }}>{{ status_labels.get(value, value) }}</option>{% endfor %}
+      </select>
+      <button class="button primary" type="submit">Atualizar</button>
+    </div>
+    <p class="field-hint">Marcar "Concluído" regista que o trabalho no terreno terminou -- não fecha o incidente. O incidente só fecha quando os dados de diagnóstico confirmarem recuperação.</p>
+  </form>
+</section>
+
+<section class="panel">
+  <div class="panel-header"><div><p class="eyebrow">Execução</p><h2>Visitas — {{ visits|length }}</h2></div></div>
+  {% if visits %}
+    <ul class="plain-list">
+      {% for visit in visits %}
+        <li>
+          <strong>{{ visit.visit_date.strftime('%d/%m/%Y') }}{% if visit.technician %} · {{ visit.technician }}{% endif %}</strong>
+          {% if visit.outcome %}<span>{{ visit.outcome }}</span>{% endif %}
+          {% if visit.notes %}<span>{{ visit.notes }}</span>{% endif %}
+          <small>registado por {{ visit.created_by }}</small>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="empty-state">Ainda sem visitas registadas.</p>
+  {% endif %}
+
+  <form method="post" action="{{ url_for('work_orders.add_visit_route', work_order_id=work_order.id) }}" class="stack-form" style="margin-top:16px">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="form-grid">
+      <label>Data<input type="date" name="visit_date" required></label>
+      <label>Técnico<input name="technician"></label>
+      <label>Resultado<input name="outcome" list="visit-outcomes" placeholder="ex.: resolvido no local"></label>
+    </div>
+    <datalist id="visit-outcomes">
+      <option value="Resolvido no local">
+      <option value="Reparação temporária">
+      <option value="Necessita acompanhamento">
+      <option value="Sem avaria encontrada">
+      <option value="Não foi possível concluir">
+    </datalist>
+    <label>Notas<textarea name="notes" placeholder="O que foi feito"></textarea></label>
+    <div class="form-actions"><button class="button primary" type="submit">Registar visita</button></div>
+  </form>
+</section>
+{% endblock %}

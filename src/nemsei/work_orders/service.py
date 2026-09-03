@@ -13,12 +13,19 @@ from nemsei.installations.models import Installation
 from nemsei.shared.clock import utc_now
 from nemsei.work_orders.models import (
     MATERIAL_STATUSES,
+    PRIORITIES,
     WORK_ORDER_STATUSES,
     WORK_TYPES,
     Visit,
     WorkOrder,
     WorkOrderIncident,
 )
+
+# Non-terminal: what "open work" means everywhere in this module --
+# `overdue_work_orders`/`unscheduled_work_orders`/`planning_page` and the
+# incident-linking helpers below all use this same pair, never a
+# locally-redefined one that could drift from it.
+TERMINAL_STATUSES = ("completed", "cancelled")
 
 
 def create_work_order(
@@ -29,6 +36,7 @@ def create_work_order(
     title: str,
     created_by: str,
     status: str = "open",
+    priority: str = "normal",
     description: str | None = None,
     planned_date: date | None = None,
     due_date: date | None = None,
@@ -48,6 +56,8 @@ def create_work_order(
         raise ValueError("Tipo de trabalho desconhecido.")
     if status not in WORK_ORDER_STATUSES:
         raise ValueError("Estado de trabalho desconhecido.")
+    if priority not in PRIORITIES:
+        raise ValueError("Prioridade desconhecida.")
     if material_status not in MATERIAL_STATUSES:
         raise ValueError("Estado de material desconhecido.")
     name = (title or "").strip()
@@ -65,6 +75,7 @@ def create_work_order(
         installation_id=installation_id,
         work_type=work_type,
         status=status,
+        priority=priority,
         title=name,
         description=(description or "").strip() or None,
         planned_date=planned_date,
@@ -111,7 +122,17 @@ def update_work_order_status(
 ) -> WorkOrder:
     """Move a work order along. Completing it requires a `completed_at`,
     which a caller normally derives from the visit that finished the job
-    rather than typing in separately."""
+    rather than typing in separately.
+
+    Marking a work order `completed` never touches any incident it is
+    linked to -- "trabalho concluído" and "problema tecnicamente resolvido"
+    are different questions, and only the diagnostics evaluator answers the
+    second one, from evidence. See `web/work_order_queries.py` for the
+    banner that surfaces the two disagreeing to an operator.
+    """
+    author = (actor or "").strip()
+    if not author:
+        raise ValueError("Uma mudança de estado tem de registar quem a fez.")
     work_order = session.get(WorkOrder, work_order_id)
     if work_order is None:
         raise ValueError("Trabalho desconhecido.")
@@ -123,6 +144,7 @@ def update_work_order_status(
         completed_at = None
     work_order.status = status
     work_order.completed_at = completed_at
+    work_order.updated_by = author[:120]
     work_order.updated_at = utc_now()
     session.flush()
     return work_order
@@ -230,3 +252,46 @@ def unscheduled_work_orders(session: Session) -> list[WorkOrder]:
         .order_by(WorkOrder.created_at)
     ).all()
     return list(rows)
+
+
+def open_work_orders_for_incident(session: Session, *, incident_id: int) -> list[WorkOrder]:
+    """Non-terminal work orders already addressing one incident, most recent
+    first -- what the "criar trabalho" screen shows before it lets an
+    operator create another, so a second trabalho for the same incident is
+    always a deliberate, secondary action, never the accidental default."""
+    return list(
+        session.scalars(
+            select(WorkOrder)
+            .join(WorkOrderIncident, WorkOrderIncident.work_order_id == WorkOrder.id)
+            .where(WorkOrderIncident.incident_id == incident_id, WorkOrder.status.notin_(TERMINAL_STATUSES))
+            .order_by(WorkOrder.created_at.desc())
+        )
+    )
+
+
+def open_work_order_summary_for_incidents(
+    session: Session, *, incident_ids: Iterable[int]
+) -> dict[int, WorkOrder]:
+    """One representative open work order per incident id -- the most
+    recently created -- for a list page (the incidents list, an
+    installation's Operação tab) that must not run one query per row to
+    answer "does this incident already have work open".
+
+    An incident linked to more than one open work order (a repeat attempt
+    still in progress) picks the newest; the page only needs to say "yes,
+    something is open", not enumerate every one -- `work_orders_for_incident`
+    is there for whoever needs the full list.
+    """
+    ids = list(dict.fromkeys(incident_ids))
+    if not ids:
+        return {}
+    rows = session.execute(
+        select(WorkOrderIncident.incident_id, WorkOrder)
+        .join(WorkOrder, WorkOrder.id == WorkOrderIncident.work_order_id)
+        .where(WorkOrderIncident.incident_id.in_(ids), WorkOrder.status.notin_(TERMINAL_STATUSES))
+        .order_by(WorkOrderIncident.incident_id, WorkOrder.created_at.desc())
+    ).all()
+    summary: dict[int, WorkOrder] = {}
+    for incident_id, work_order in rows:
+        summary.setdefault(incident_id, work_order)
+    return summary

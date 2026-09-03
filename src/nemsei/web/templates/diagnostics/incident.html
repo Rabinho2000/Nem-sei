@@ -20,11 +20,17 @@
       {% if incident.assigned_to %}<span class="status-badge muted">{{ incident.assigned_to }}</span>{% endif %}
     </div>
   </div>
-  {% if asset %}<a class="button secondary" href="{{ url_for('diagnostics.asset_detail', asset_id=asset.id) }}">Ver a central</a>{% endif %}
+  <div class="page-header-actions">
+    <a class="button primary" href="{{ url_for('diagnostics.new_work_order', incident_id=incident.id) }}">{{ 'Ver / criar trabalho' if work_orders else 'Criar trabalho' }}</a>
+    {% if asset %}<a class="button secondary" href="{{ url_for('diagnostics.asset_detail', asset_id=asset.id) }}">Ver a central</a>{% endif %}
+  </div>
 </header>
 
 {% if incident.status == 'open' and incident.handling_state == 'done' %}
   <div class="notice-panel"><p><strong>O detetor continua a ver esta condição.</strong> Marcar como concluído diz que uma pessoa terminou com o assunto, não que o problema desapareceu — e essa discordância é informação, não um erro a esconder.</p></div>
+{% endif %}
+{% if work_order_banner %}
+  <div class="notice-panel"><p><strong>{{ work_order_banner }}</strong></p></div>
 {% endif %}
 
 <div class="content-grid two-columns">
@@ -65,6 +71,24 @@
     </form>
   </section>
 </div>
+
+<section class="panel">
+  <div class="panel-header"><div><p class="eyebrow">Intervenção</p><h2>Trabalhos ligados a este incidente — {{ work_orders|length }}</h2></div><a class="button secondary" href="{{ url_for('diagnostics.new_work_order', incident_id=incident.id) }}">{{ 'Criar outro' if work_orders else 'Criar trabalho' }}</a></div>
+  {% if work_orders %}
+    <ul class="plain-list">
+      {% for wo in work_orders %}
+        <li>
+          <a href="{{ url_for('work_orders.show', work_order_id=wo.id) }}">{{ wo.title }}</a>
+          <span class="status-badge {{ 'success' if wo.status == 'completed' else 'muted' if wo.status == 'cancelled' else 'warning' }}">{{ wo.status }}</span>
+          <span class="status-badge {{ 'danger' if wo.priority == 'critical' else 'muted' }}">{{ wo.priority }}</span>
+          <small>{% if wo.assigned_to %}{{ wo.assigned_to }} · {% endif %}{% if wo.planned_date %}planeado {{ wo.planned_date.strftime('%d/%m/%Y') }}{% else %}sem data{% endif %}</small>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="empty-state">Nenhum trabalho criado ainda para este incidente.</p>
+  {% endif %}
+</section>
 
 <section class="panel">
   <div class="panel-header"><div><p class="eyebrow">Histórico</p><h2>Quem fez o quê</h2></div><span class="status-badge muted">{{ notes|length }} registo{{ '' if notes|length == 1 else 's' }}</span></div>

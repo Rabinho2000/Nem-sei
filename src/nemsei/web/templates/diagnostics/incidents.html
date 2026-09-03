@@ -58,7 +58,7 @@
     <thead>
       <tr>
         <th>Severidade</th><th>Prioridade</th><th>Instalação</th><th>Dispositivo</th><th>Regra</th>
-        <th>Tratamento</th><th class="num">Aberto há</th><th class="num">Última confirmação há</th>
+        <th>Tratamento</th><th>Trabalho</th><th class="num">Aberto há</th><th class="num">Última confirmação há</th>
       </tr>
     </thead>
     <tbody>
@@ -76,6 +76,13 @@
             <span class="status-badge {{ 'muted' if row.incident.handling_state == 'new' else 'success' if row.incident.handling_state == 'done' else 'warning' }}">{{ labels.get(row.incident.handling_state, row.incident.handling_state) }}</span>
             {% if row.incident.assigned_to %}<small>{{ row.incident.assigned_to }}</small>{% endif %}
           </td>
+          <td>
+            {% if row.open_work_order %}
+              <a class="status-badge warning" href="{{ url_for('work_orders.show', work_order_id=row.open_work_order.id) }}">{{ 'Trabalho' if row.open_work_order.status == 'open' else row.open_work_order.status }}</a>
+            {% else %}
+              <span class="status-badge muted">sem trabalho</span>
+            {% endif %}
+          </td>
           <td class="num">{{ row.duration }}</td>
           <td class="num">{{ row.since_confirmed }}</td>
         </tr>
@@ -85,7 +92,7 @@
           há mesmo nada aberto. Com filtros, há incidentes -- estes é que não
           passam. Dizer "nenhum incidente activo" no segundo caso seria falso.
         #}
-        <tr><td colspan="8" class="empty">{% if search or handling or family or om == 'nao' %}Nenhum incidente corresponde a estes filtros — há outros abertos.{% else %}Nenhum incidente activo — nada a mostrar.{% endif %}</td></tr>
+        <tr><td colspan="9" class="empty">{% if search or handling or family or om == 'nao' %}Nenhum incidente corresponde a estes filtros — há outros abertos.{% else %}Nenhum incidente activo — nada a mostrar.{% endif %}</td></tr>
       {% endfor %}
     </tbody>
   </table>

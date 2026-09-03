@@ -78,6 +78,8 @@
               {% set impact = impact_by_incident.get(incident.id) %}
               <li>
                 <a href="{{ url_for('diagnostics.incident', incident_id=incident.id) }}">{{ incident.rule_code }}</a>
+                {% set open_wo = open_work_by_incident.get(incident.id) %}
+                {% if open_wo %}<a class="status-badge warning" href="{{ url_for('work_orders.show', work_order_id=open_wo.id) }}">trabalho aberto</a>{% endif %}
                 <small>desde {{ incident.opened_at.strftime('%d/%m/%Y') }}{% if incident.device_id %} · equipamento #{{ incident.device_id }}{% endif %}</small>
                 {% if impact %}
                   <br><small class="muted" title="{{ impact.energy.basis }}">
@@ -103,13 +105,14 @@
     {% elif work_orders %}
       <div class="table-scroll">
         <table class="data-table stack-mobile">
-          <thead><tr><th>Título</th><th>Tipo</th><th>Estado</th><th>Planeado</th><th>Limite</th></tr></thead>
+          <thead><tr><th>Título</th><th>Tipo</th><th>Prioridade</th><th>Estado</th><th>Planeado</th><th>Limite</th></tr></thead>
           <tbody>
             {% for wo in work_orders %}
               <tr>
-                <th scope="row">{{ wo.title }}</th>
+                <th scope="row"><a class="table-primary" href="{{ url_for('work_orders.show', work_order_id=wo.id) }}">{{ wo.title }}</a></th>
                 <td data-label="Tipo">{{ {'corrective':'Corretiva','preventive':'Preventiva','cleaning':'Limpeza'}.get(wo.work_type, wo.work_type) }}</td>
-                <td data-label="Estado"><span class="status-badge {{ 'success' if wo.status == 'completed' else 'muted' if wo.status == 'cancelled' else 'warning' }}">{{ {'open':'Aberto','planned':'Planeado','in_progress':'Em curso','completed':'Concluído','cancelled':'Cancelado'}.get(wo.status, wo.status) }}</span></td>
+                <td data-label="Prioridade"><span class="status-badge {{ 'danger' if wo.priority == 'critical' else 'warning' if wo.priority == 'high' else 'muted' }}">{{ {'critical':'Crítica','high':'Alta','normal':'Normal','low':'Baixa'}.get(wo.priority, wo.priority) }}</span></td>
+                <td data-label="Estado"><span class="status-badge {{ 'success' if wo.status == 'completed' else 'muted' if wo.status == 'cancelled' else 'warning' }}">{{ {'open':'Aberto','planned':'Planeado','in_progress':'Em curso','waiting_material':'À espera de material','waiting_customer':'À espera do cliente','completed':'Concluído','cancelled':'Cancelado'}.get(wo.status, wo.status) }}</span></td>
                 <td data-label="Planeado">{{ wo.planned_date.strftime('%d/%m/%Y') if wo.planned_date else '—' }}</td>
                 <td data-label="Limite">{{ wo.due_date.strftime('%d/%m/%Y') if wo.due_date else '—' }}</td>
               </tr>
