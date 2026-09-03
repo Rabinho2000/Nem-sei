@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% macro work_table(rows, empty_message, date_field='planned_date') %}
+  {% if rows %}
+    <div class="table-scroll">
+      <table class="data-table wide-table stack-mobile">
+        <thead><tr><th scope="col">Título</th><th scope="col">Instalação</th><th scope="col">Tipo</th><th scope="col">Material</th><th scope="col">{{ 'Planeado' if date_field == 'planned_date' else 'Limite' }}</th></tr></thead>
+        <tbody>
+          {% for row in rows %}
+            <tr>
+              <th scope="row">{{ row.work_order.title }}</th>
+              <td data-label="Instalação">{% if row.asset_id %}<a class="table-primary" href="{{ url_for('installations.detail', asset_id=row.asset_id, tab='trabalhos') }}">{{ row.asset_name or row.installation_name }}</a>{% else %}{{ row.installation_name }}{% endif %}</td>
+              <td data-label="Tipo">{{ {'corrective':'Corretiva','preventive':'Preventiva','cleaning':'Limpeza'}.get(row.work_order.work_type, row.work_order.work_type) }}</td>
+              <td data-label="Material">{% if row.work_order.material_status == 'not_applicable' %}<span class="muted">—</span>{% else %}<span class="status-badge {{ 'success' if row.work_order.material_status == 'ready' else 'warning' }}">{{ {'pending':'Pendente','ordered':'Encomendado','ready':'Pronto'}.get(row.work_order.material_status, row.work_order.material_status) }}</span>{% endif %}</td>
+              <td data-label="Data">
+                {% set shown = row.work_order.planned_date if date_field == 'planned_date' else row.work_order.due_date %}
+                {% if shown %}{{ shown.strftime('%d/%m/%Y') }}{% else %}<span class="status-badge muted">sem data</span>{% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% else %}
+    <div class="empty-state positive">{{ empty_message }}</div>
+  {% endif %}
+{% endmacro %}
+{% block content %}
+<header class="page-header"><div><p class="eyebrow">Operação</p><h1>Planeamento</h1><p class="page-intro">{{ total_open }} trabalhos em aberto, agrupados por quando precisam de decisão -- os grupos não são exclusivos: um trabalho atrasado e bloqueado por material aparece nos dois.</p></div></header>
+
+<section class="panel">
+  <div class="panel-header"><div><h2>Esta semana</h2></div><span class="meta">próximos {{ horizon_days }} dias, planeados</span></div>
+  {{ work_table(esta_semana, 'Nada planeado para os próximos ' ~ horizon_days ~ ' dias.') }}
+</section>
+
+<section class="panel">
+  <div class="panel-header"><div><h2>Atrasados</h2></div><span class="meta">data limite já passou</span></div>
+  {{ work_table(atrasados, 'Nenhum trabalho passou da data limite.', date_field='due_date') }}
+</section>
+
+<section class="panel">
+  <div class="panel-header"><div><h2>Bloqueados por material</h2></div><span class="meta">pendente ou encomendado</span></div>
+  {{ work_table(bloqueados, 'Nenhum trabalho está à espera de material.') }}
+</section>
+
+<section class="panel">
+  <div class="panel-header"><div><h2>Sem data</h2></div><span class="meta">nem planeado nem com limite definido</span></div>
+  {{ work_table(sem_data, 'Todos os trabalhos em aberto têm data planeada.') }}
+</section>
+
+<section class="panel">
+  <div class="panel-header"><div><h2>Próximos</h2></div><span class="meta">planeados para além de {{ horizon_days }} dias</span></div>
+  {{ work_table(proximos, 'Nada planeado para mais tarde.') }}
+</section>
+{% endblock %}

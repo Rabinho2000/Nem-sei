@@ -15,6 +15,9 @@
     {% set is_assets = request.endpoint in ['assets.list_assets', 'assets.new_asset', 'assets.asset_detail'] %}
     {% set is_diagnostics = request.endpoint and request.endpoint.startswith('diagnostics.') %}
     {% set is_work_orders = request.endpoint and request.endpoint.startswith('work_orders.') %}
+    {% set is_planning = request.endpoint and request.endpoint.startswith('planning.') %}
+    {% set is_production = request.endpoint and request.endpoint.startswith('production.') %}
+    {% set is_esco = request.endpoint and request.endpoint.startswith('esco.') %}
     {% set is_more = not (is_home or is_installations or is_diagnostics) %}
     <a class="sr-only" href="#conteudo">Saltar para o conteúdo</a>
     <div class="app-shell">
@@ -39,10 +42,13 @@
             <a class="nav-link {{ 'active' if is_installations else '' }}" href="{{ url_for('installations.index') }}"><span aria-hidden="true">▦</span> Instalações</a>
             <a class="nav-link {{ 'active' if request.endpoint == 'diagnostics.incidents' or request.endpoint == 'diagnostics.incident' else '' }}" href="{{ url_for('diagnostics.incidents') }}"><span aria-hidden="true">⚠</span> Incidentes</a>
             <a class="nav-link {{ 'active' if is_work_orders else '' }}" href="{{ url_for('work_orders.index_work_orders') }}"><span aria-hidden="true">🛠</span> Trabalhos</a>
+            <a class="nav-link {{ 'active' if is_planning else '' }}" href="{{ url_for('planning.index_planning') }}"><span aria-hidden="true">🗓</span> Planeamento</a>
             <a class="nav-link {{ 'active' if request.endpoint == 'diagnostics.index' or request.endpoint == 'diagnostics.asset_detail' else '' }}" href="{{ url_for('diagnostics.index') }}"><span aria-hidden="true">◉</span> Diagnóstico</a>
           </div>
           <div class="nav-group">
             <span class="nav-heading">Performance</span>
+            <a class="nav-link {{ 'active' if is_production else '' }}" href="{{ url_for('production.index') }}"><span aria-hidden="true">⚡</span> Produção</a>
+            <a class="nav-link {{ 'active' if is_esco else '' }}" href="{{ url_for('esco.index') }}"><span aria-hidden="true">€</span> ESCO</a>
             <a class="nav-link {{ 'active' if request.endpoint and request.endpoint.startswith('reporting.') else '' }}" href="{{ url_for('reporting.index') }}"><span aria-hidden="true">▧</span> Relatórios</a>
           </div>
           <div class="nav-group">

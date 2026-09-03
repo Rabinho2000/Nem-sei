@@ -23,7 +23,9 @@ from nemsei.web.system_routes import system_bp
 from nemsei.web.portfolio_routes import portfolio_bp
 from nemsei.web.reporting_routes import reporting_bp
 from nemsei.web.diagnostics_routes import diagnostics_bp
-from nemsei.web.installation_routes import installations_bp, work_orders_bp
+from nemsei.web.esco_routes import esco_bp
+from nemsei.web.installation_routes import installations_bp, planning_bp, work_orders_bp
+from nemsei.web.production_routes import production_bp
 
 
 def create_app(
@@ -64,5 +66,8 @@ def create_app(
     app.register_blueprint(diagnostics_bp)
     app.register_blueprint(installations_bp)
     app.register_blueprint(work_orders_bp)
+    app.register_blueprint(planning_bp)
+    app.register_blueprint(production_bp)
+    app.register_blueprint(esco_bp)
     app.register_blueprint(system_bp)
     return app

@@ -414,3 +414,60 @@ como recorrente hoje. Cópia descartável, sem escrita real.
   cópia. Os três conjuntos de testes que já cobriam esses três sítios
   continuam verdes sem alteração — o comportamento não mudou, só deixou de
   estar em três sítios.
+
+## Produção, ESCO e Planeamento (2026-09-03)
+
+Fase 3 do plano original (`lista de instalações; detalhe; incidentes;
+trabalhos; planeamento; dashboard`) e o início da Fase 4 tinham ficado
+incompletas: a navegação já listava "Planeamento", "Produção" e "ESCO" como
+itens próprios desde o bloco da UI operacional, mas os três apontavam para
+nada — só existiam as páginas por instalação. Este bloco fecha esse gap,
+escolhido em vez de ligar o `score_episode` real ao dashboard ou construir
+`ModuleGroup`: os outros dois cruzam área do outro contexto (episódios de
+notificação em WIP pesado; uma migração nova quando já há uma migração do
+outro contexto por commitar na mesma branch), e este não precisa de tocar
+em nenhum dos dois.
+
+- **"Instalação ESCO" é a mesma pergunta que `calculate_billing` já faz.**
+  `esco_queries.py` filtra por `AssetBillingConfig.report_type == "esco"`
+  em vigor hoje — não por `contracts.priority.commercial_family` (de quem
+  é o dinheiro em risco, usado para priorizar incidentes) nem por
+  `reporting.commercial.report_type_for` (a adivinha a partir do texto
+  livre do contrato, usada só onde ainda não existe configuração de
+  faturação para perguntar em vez disso). As três respondem perguntas
+  diferentes; esta página segue a que realmente decide o ramo ESCO do
+  cálculo, para nunca mostrar receita Solcor que o próprio motor de
+  faturação não calcularia.
+- **Nem `_performance_tab` nem esta página inventam um segundo motor de
+  faturação.** `calculate_billing`/`EnergyBreakdown`/`billing_config_from`
+  já existiam (Bloco C); a única peça nova é buscar as cinco métricas de
+  energia à escala do parque numa query em vez de uma por instalação (ver
+  abaixo) e passar o resultado pelo mesmo cálculo puro.
+- **`web.series.fleet_metric_totals` é `portfolio_monthly_series`
+  generalizada.** A mesma redução `DISTINCT ON (provider_mapping_id,
+  source_fact_key) ORDER BY source_revision DESC` que já existia para o
+  gráfico mensal do portfolio, parametrizada por `metric_kind` e agrupada
+  por instalação em vez de por mês. Sem isto, a página ESCO faria
+  `energy_balance` (5 queries) por cada instalação ESCO; com isto, são 5
+  queries para o parque inteiro, e o cálculo por instalação passa a ser
+  aritmética pura sobre o resultado. A página Produção usa a mesma função
+  para "hoje" e para "este mês", pela mesma razão -- 267 centrais é
+  precisamente a escala em que o padrão de uma query por instalação deixa
+  de fazer sentido, mesmo sendo o padrão certo para uma página de uma
+  instalação só.
+- **"Esperado" ao nível do parque soma só quem tem modelo confirmado.**
+  Uma instalação sem modelo não entra no total esperado como zero -- fica
+  simplesmente fora da soma, e a tabela de desvio por instalação separa-a
+  claramente ("sem modelo") de uma instalação que reportou zero produção.
+  Confundir as duas inflacionaria ou destruiria o desvio agregado consoante
+  quantas centrais ainda não têm modelo.
+- **Planeamento não é uma partição de Trabalhos.** Os cinco grupos do
+  dashboard original (esta semana / atrasados / bloqueados / sem data /
+  próximos) são perguntas independentes sobre o mesmo trabalho em aberto,
+  não mutuamente exclusivas -- um trabalho atrasado e bloqueado por
+  material aparece nas duas listas, de propósito: escondê-lo de uma porque
+  já apareceu na outra perderia exatamente o facto que explica porque
+  continua parado. `work_order_queries.planning_page` filtra uma vez
+  (estado não terminal) e particiona depois em memória, nunca cinco
+  queries independentes que poderiam divergir sobre o que "em aberto"
+  significa.

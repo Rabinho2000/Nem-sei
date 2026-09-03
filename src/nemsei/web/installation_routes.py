@@ -15,10 +15,15 @@ from nemsei.web.db_session import get_request_session
 from nemsei.web.home_routes import require_authenticated
 from nemsei.web.installation_queries import installation_detail, installation_list_rows
 from nemsei.web.series import PERIOD_LABELS, PRODUCTION_CONSUMPTION_PERIODS
-from nemsei.web.work_order_queries import work_orders_page
+from nemsei.web.work_order_queries import planning_page, work_orders_page
 
 installations_bp = Blueprint("installations", __name__, url_prefix="/instalacoes")
 work_orders_bp = Blueprint("work_orders", __name__, url_prefix="/trabalhos")
+# A sibling of `work_orders_bp`, not a sub-path of it: GOAL.md's nav lists
+# "Trabalhos" and "Planeamento" as two separate items under Operação, and
+# the flat "every work order" list answers a different question ("o que
+# existe") than the bucketed one here ("o que fazer esta semana").
+planning_bp = Blueprint("planning", __name__, url_prefix="/planeamento")
 
 
 @installations_bp.get("")
@@ -73,3 +78,10 @@ def index_work_orders() -> str:
             search=request.args.get("search", "").strip(),
         ),
     )
+
+
+@planning_bp.get("")
+@require_authenticated
+def index_planning() -> str:
+    session = get_request_session()
+    return render_template("planning/index.html", title="Planeamento", **planning_page(session))

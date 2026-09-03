@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block content %}
+<header class="page-header"><div><p class="eyebrow">Performance</p><h1>ESCO</h1><p class="page-intro">Autoconsumo, poupança do cliente e receita Solcor este mês, nas instalações cuja configuração de faturação está definida como ESCO.</p></div></header>
+
+{% if not rows %}
+  <div class="empty-state">Nenhuma instalação tem uma configuração de faturação ESCO em vigor.</div>
+{% else %}
+  <section class="kpi-strip">
+    <div class="kpi">
+      <small>Instalações ESCO</small>
+      <strong>{{ asset_count }}</strong>
+      <span class="muted">{{ billed_count }} com produção este mês</span>
+    </div>
+    {% if totals %}
+      <div class="kpi">
+        <small>Autoconsumo</small>
+        <strong>{{ "{:,.0f}".format(totals.self_use_kwh).replace(",", " ") }} kWh</strong>
+      </div>
+      <div class="kpi">
+        <small>Poupança do cliente</small>
+        <strong>{{ "{:,.0f}".format(totals.savings_eur).replace(",", " ") }} €</strong>
+        <span class="muted">benefício bruto menos o que paga à Solcor</span>
+      </div>
+      <div class="kpi kpi-coverage">
+        <small>Receita Solcor</small>
+        <strong>{{ "{:,.0f}".format(totals.solcor_revenue_eur).replace(",", " ") }} €</strong>
+        <span class="muted">valor previsto a faturar este mês</span>
+      </div>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-header"><div><p class="eyebrow">Este mês</p><h2>Por instalação</h2></div></div>
+    <div class="table-scroll">
+      <table class="data-table wide-table stack-mobile">
+        <caption class="sr-only">Instalações ESCO ordenadas por receita Solcor</caption>
+        <thead><tr><th scope="col">Instalação</th><th scope="col">Cliente</th><th scope="col" class="num">Produção</th><th scope="col" class="num">Autoconsumo</th><th scope="col" class="num">Poupança cliente</th><th scope="col" class="num">Receita Solcor</th></tr></thead>
+        <tbody>
+          {% for row in rows %}
+            <tr>
+              <th scope="row"><a class="table-primary" href="{{ url_for('installations.detail', asset_id=row.asset_id, tab='performance') }}">{{ row.name }}</a></th>
+              <td data-label="Cliente" class="muted">{{ row.organization_name or '—' }}</td>
+              {% if row.billing %}
+                <td data-label="Produção" class="num">{{ "{:,.0f}".format(row.billing.production_kwh).replace(",", " ") }} kWh</td>
+                <td data-label="Autoconsumo" class="num">{{ "{:,.0f}".format(row.billing.self_use_kwh).replace(",", " ") }} kWh</td>
+                <td data-label="Poupança cliente" class="num">{{ "{:,.0f}".format(row.billing.net_benefit_eur).replace(",", " ") }} €</td>
+                <td data-label="Receita Solcor" class="num"><strong>{{ "{:,.0f}".format(row.billing.solcor_payment_eur).replace(",", " ") }} €</strong></td>
+              {% else %}
+                <td data-label="Produção" class="num" colspan="4"><span class="muted">sem leitura de produção este mês</span></td>
+              {% endif %}
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <p class="panel-foot muted">"Instalação ESCO" aqui é a mesma pergunta que o próprio cálculo de faturação faz -- a configuração de faturação em vigor com <code>report_type = esco</code> -- nunca uma segunda classificação.</p>
+  </section>
+{% endif %}
+{% endblock %}

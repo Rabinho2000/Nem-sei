@@ -8,6 +8,7 @@ so it happens once, not once per caller.
 """
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any
 
 from sqlalchemy import select
@@ -112,4 +113,73 @@ def work_orders_page(
         "statuses": WORK_ORDER_STATUSES,
         "overdue_count": sum(1 for row in rows if row["is_overdue"]),
         "unscheduled_count": sum(1 for row in rows if row["is_unscheduled"]),
+    }
+
+
+_PLANNING_HORIZON_DAYS = 7
+_BLOCKED_MATERIAL_STATUSES = ("pending", "ordered")
+
+
+def planning_page(session: Session) -> dict[str, Any]:
+    """GOAL.md's dashboard buckets (esta semana / atrasados / bloqueados /
+    sem data / próximos) as their own screen, not just a dashboard count --
+    a dispatcher needs the actual list, not just how many.
+
+    Buckets are independent questions about the same open work, not a
+    partition: a job can be both overdue and blocked on material, and
+    hiding it from one list because it already appeared in the other would
+    lose exactly the fact that explains why it is still open.
+    """
+    today = utc_now().date()
+    horizon = today + timedelta(days=_PLANNING_HORIZON_DAYS)
+    statement = (
+        select(WorkOrder, Installation.display_name, Asset.canonical_name, Asset.id)
+        .join(Installation, Installation.id == WorkOrder.installation_id)
+        .outerjoin(Asset, Asset.installation_id == Installation.id)
+        .where(WorkOrder.status.notin_(("completed", "cancelled")))
+    )
+    seen: dict[int, dict[str, Any]] = {}
+    for work_order, installation_name, asset_name, asset_id in session.execute(statement).all():
+        if work_order.id in seen:
+            continue  # same outer-join repeat as work_orders_page, for the same reason
+        seen[work_order.id] = {
+            "work_order": work_order,
+            "installation_name": installation_name,
+            "asset_id": asset_id,
+            "asset_name": asset_name,
+        }
+    rows = list(seen.values())
+
+    def sort_by(rows: list[dict[str, Any]], key) -> list[dict[str, Any]]:
+        return sorted(rows, key=key)
+
+    esta_semana = sort_by(
+        [row for row in rows if row["work_order"].planned_date is not None and today <= row["work_order"].planned_date <= horizon],
+        lambda row: row["work_order"].planned_date,
+    )
+    atrasados = sort_by(
+        [row for row in rows if row["work_order"].due_date is not None and row["work_order"].due_date < today],
+        lambda row: row["work_order"].due_date,
+    )
+    bloqueados = sort_by(
+        [row for row in rows if row["work_order"].material_status in _BLOCKED_MATERIAL_STATUSES],
+        lambda row: (row["work_order"].due_date is None, row["work_order"].due_date or today),
+    )
+    sem_data = sort_by(
+        [row for row in rows if row["work_order"].planned_date is None],
+        lambda row: row["work_order"].created_at,
+    )
+    proximos = sort_by(
+        [row for row in rows if row["work_order"].planned_date is not None and row["work_order"].planned_date > horizon],
+        lambda row: row["work_order"].planned_date,
+    )
+    return {
+        "today": today,
+        "horizon_days": _PLANNING_HORIZON_DAYS,
+        "total_open": len(rows),
+        "esta_semana": esta_semana,
+        "atrasados": atrasados,
+        "bloqueados": bloqueados,
+        "sem_data": sem_data,
+        "proximos": proximos,
     }

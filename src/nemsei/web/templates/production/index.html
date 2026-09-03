@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% import "macros/chart.html" as chart %}
+{% block content %}
+<header class="page-header"><div><p class="eyebrow">Performance</p><h1>Produção</h1><p class="page-intro">O parque inteiro: hoje, este mês contra o modelo confirmado, e quem está mais desviado.</p></div></header>
+
+<section class="kpi-strip">
+  <div class="kpi">
+    <small>Hoje</small>
+    <strong>{% if today.total_kwh is not none %}{{ "{:,.0f}".format(today.total_kwh).replace(",", " ") }} kWh{% else %}—{% endif %}</strong>
+    <span class="muted">{{ today.reporting_assets }} de {{ today.total_assets }} centrais reportaram</span>
+  </div>
+  <div class="kpi">
+    <small>Este mês · real</small>
+    <strong>{% if month.actual_total_kwh is not none %}{{ "{:,.0f}".format(month.actual_total_kwh).replace(",", " ") }} kWh{% else %}—{% endif %}</strong>
+    <span class="muted">soma das centrais que já reportaram</span>
+  </div>
+  <div class="kpi">
+    <small>Este mês · esperado</small>
+    <strong>{% if month.expected_total_kwh is not none %}{{ "{:,.0f}".format(month.expected_total_kwh).replace(",", " ") }} kWh{% else %}—{% endif %}</strong>
+    <span class="muted">{{ month.modelled_assets }} centrais com modelo confirmado</span>
+  </div>
+  <div class="kpi kpi-coverage">
+    <small>Desvio face ao esperado</small>
+    <strong>{% if month.deviation_pct is not none %}{{ '%+.0f'|format(month.deviation_pct) }}%{% else %}—{% endif %}</strong>
+    <span class="muted">só entre as centrais com modelo confirmado</span>
+  </div>
+</section>
+
+<section class="panel chart-panel">
+  <div class="chart-head">
+    <h3>Produção mensal do portfolio · {{ trend.months }} meses</h3>
+    <span class="meta">MWh · a barra fina é quantas das {{ trend.total_assets }} centrais reportaram</span>
+  </div>
+  {{ chart.bars(trend.chart, 'Produção mensal do portfolio em MWh com a cobertura de centrais') }}
+  {{ chart.legend([('Produção medida', '1'), ('Cobertura', 'cov'), ('Sem leituras', 'void')]) }}
+</section>
+
+<section class="panel">
+  <div class="panel-header"><div><p class="eyebrow">Este mês</p><h2>Desvio por instalação</h2></div></div>
+  {% if ranking %}
+    <div class="table-scroll">
+      <table class="data-table wide-table stack-mobile">
+        <caption class="sr-only">Instalações ordenadas por desvio face ao modelo confirmado</caption>
+        <thead><tr><th scope="col">Instalação</th><th scope="col">Cliente</th><th scope="col" class="num">Real</th><th scope="col" class="num">Esperado</th><th scope="col" class="num">Desvio</th></tr></thead>
+        <tbody>
+          {% for row in ranking %}
+            <tr class="{{ 'row-attention' if row.deviation_pct is not none and row.deviation_pct < -10 else '' }}">
+              <th scope="row"><a class="table-primary" href="{{ url_for('installations.detail', asset_id=row.asset_id, tab='performance') }}">{{ row.name }}</a></th>
+              <td data-label="Cliente" class="muted">{{ row.organization_name or '—' }}</td>
+              <td data-label="Real" class="num">{% if row.actual_kwh is not none %}{{ "{:,.0f}".format(row.actual_kwh).replace(",", " ") }} kWh{% else %}<span class="muted">sem leitura</span>{% endif %}</td>
+              <td data-label="Esperado" class="num">{% if row.expected_kwh is not none %}{{ "{:,.0f}".format(row.expected_kwh).replace(",", " ") }} kWh{% else %}<span class="muted">sem modelo</span>{% endif %}</td>
+              <td data-label="Desvio" class="num">{% if row.deviation_pct is not none %}<span class="status-badge {{ 'danger' if row.deviation_pct < -10 else 'warning' if row.deviation_pct < 0 else 'success' }}">{{ '%+.0f'|format(row.deviation_pct) }}%</span>{% else %}—{% endif %}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <p class="panel-foot muted">Ordenado pelo maior défice face ao próprio modelo confirmado primeiro; instalações sem real ou sem modelo ficam no fim, sem entrar nesta comparação.</p>
+  {% else %}
+    <div class="empty-state">Nenhuma instalação tem produção medida ou modelo confirmado este mês.</div>
+  {% endif %}
+</section>
+{% endblock %}

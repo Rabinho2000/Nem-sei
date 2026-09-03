@@ -43,6 +43,22 @@ def resolve_billing_config(session: Session, *, asset_id: int, on: date) -> Asse
     )
 
 
+def resolve_billing_config_for_all(
+    session: Session, *, on: date, report_type: str | None = None
+) -> dict[int, AssetBillingConfig]:
+    """`resolve_billing_config`, every asset at once, for a fleet page that
+    needs to know which installations currently bill as ESCO (or any other
+    `report_type`) without one query per asset. `report_type=None` returns
+    every asset's config, whatever arrangement it is under.
+    """
+    statement = select(AssetBillingConfig).where(
+        _covering(AssetBillingConfig.valid_from, AssetBillingConfig.valid_to, on)
+    )
+    if report_type is not None:
+        statement = statement.where(AssetBillingConfig.report_type == report_type)
+    return {config.asset_id: config for config in session.scalars(statement)}
+
+
 def resolve_tariff(session: Session, *, asset_id: int, on: date) -> AssetTariff | None:
     """The tariff in force on a date, or None if none is recorded.
 

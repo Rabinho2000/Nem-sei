@@ -355,6 +355,41 @@ def portfolio_monthly_series(
     return {"chart": bar_chart(points, unit="MWh"), "total_assets": total_assets, "months": months}
 
 
+def fleet_metric_totals(
+    session: Session, *, start: date, end: date, metric_kind: str = "production_energy", asset_ids: list[int] | None = None
+) -> dict[int, float]:
+    """One metric, one period, every asset, in one query -- the same
+    `DISTINCT ON (provider_mapping_id, source_fact_key) ORDER BY
+    source_revision DESC` reduction `portfolio_monthly_series` uses for its
+    monthly bucket, grouped by asset instead. The batched sibling of
+    `_daily_totals`/`energy_balance`, which run one query per asset per
+    metric -- fine for one installation's page, too many for a fleet page
+    covering ~267 of them.
+    """
+    current = (
+        select(ProductionFact.asset_id, ProductionFact.value)
+        .where(
+            ProductionFact.metric_kind == metric_kind,
+            ProductionFact.period_start >= _moment(start),
+            ProductionFact.period_start < _moment(end),
+            *([ProductionFact.asset_id.in_(asset_ids)] if asset_ids is not None else []),
+        )
+        .distinct(ProductionFact.provider_mapping_id, ProductionFact.source_fact_key)
+        .order_by(
+            ProductionFact.provider_mapping_id,
+            ProductionFact.source_fact_key,
+            ProductionFact.source_revision.desc(),
+        )
+        .subquery()
+    )
+    rows = session.execute(
+        select(current.c.asset_id, func.sum(current.c.value))
+        .where(current.c.value.isnot(None))
+        .group_by(current.c.asset_id)
+    ).all()
+    return {int(asset_id): float(total or 0) for asset_id, total in rows}
+
+
 def ranked_installations(rows: list[dict[str, Any]], *, limit: int = 12) -> dict[str, Any]:
     """The period's production per installation, biggest first.
 
