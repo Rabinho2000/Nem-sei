@@ -30,7 +30,7 @@ from sqlalchemy.orm import Session
 from nemsei.assets.models import Asset, Organization
 from nemsei.monitoring.models import ProductionFact
 from nemsei.providers.models import AssetProviderMapping, ProviderConnection
-from nemsei.reporting.commercial_models import AssetBillingConfig
+from nemsei.reporting.commercial_models import AssetBillingConfig, AssetTariff
 from nemsei.reporting.models import ReportingDataset, ReportSnapshot
 
 
@@ -60,6 +60,7 @@ class AssetReadiness:
     expected_days: int
     has_energy: bool
     has_commercial: bool
+    has_tariff: bool
     metrics_present: tuple[str, ...]
     snapshot_id: int | None
     snapshot_state: str | None
@@ -116,6 +117,13 @@ class AssetReadiness:
             reasons.append("Sem taxas de venda / poupança / excedente")
         if self.has_commercial and "self_use" not in self.metrics_present:
             reasons.append("Sem autoconsumo: sem valores em euros")
+        # Distinct from the billing-config gap above: `AssetTariff` feeds the
+        # tariff summary/breakdown a report shows, not the savings/export/
+        # Solcor-payment euro figures themselves (those come from
+        # `AssetBillingConfig` alone -- see `can_report_money`). A report can
+        # be financially final and still be missing this.
+        if self.is_esco and self.has_commercial and not self.has_tariff:
+            reasons.append("Sem tarifa em vigor para o mês")
         return tuple(reasons)
 
 
@@ -226,6 +234,16 @@ def _billing_by_asset(session: Session, on: date) -> dict[int, AssetBillingConfi
     return {row.asset_id: row for row in rows}
 
 
+def _tariff_by_asset(session: Session, on: date) -> dict[int, AssetTariff]:
+    rows = session.scalars(
+        select(AssetTariff).where(
+            AssetTariff.valid_from <= on,
+            or_(AssetTariff.valid_to.is_(None), AssetTariff.valid_to > on),
+        )
+    ).all()
+    return {row.asset_id: row for row in rows}
+
+
 def _plant_claims(session: Session) -> dict[int, tuple[str | None, str | None]]:
     rows = session.execute(
         select(AssetProviderMapping.asset_id, ProviderConnection.provider_code, AssetProviderMapping.external_id)
@@ -262,6 +280,7 @@ def fleet_readiness(session: Session, *, month: str) -> list[AssetReadiness]:
     coverage = _coverage(session, start, end)
     snapshots = _latest_snapshots(session, start, end)
     billing = _billing_by_asset(session, start)
+    tariffs = _tariff_by_asset(session, start)
     claims = _plant_claims(session)
 
     owners = {
@@ -288,6 +307,7 @@ def fleet_readiness(session: Session, *, month: str) -> list[AssetReadiness]:
                 expected_days=expected_days,
                 has_energy=int(entry["days"]) > 0,
                 has_commercial=config is not None,
+                has_tariff=asset.id in tariffs,
                 metrics_present=tuple(sorted(entry["metrics"])),
                 snapshot_id=snapshot.id if snapshot else None,
                 snapshot_state=_snapshot_state(snapshot) if snapshot else None,
@@ -324,6 +344,7 @@ def summarise(rows: Iterable[AssetReadiness]) -> dict[str, Any]:
         "blocked": sum(1 for row in rows if row.state == "blocked"),
         "needs_commercial": sum(1 for row in rows if row.state == "needs_commercial"),
         "esco_needs_commercial": sum(1 for row in esco if not row.has_commercial),
+        "esco_needs_tariff": sum(1 for row in esco if row.has_commercial and not row.has_tariff),
         "without_energy": sum(1 for row in rows if not row.has_energy),
         "generated": sum(1 for row in rows if row.has_report),
         "not_generated": sum(1 for row in rows if not row.has_report),

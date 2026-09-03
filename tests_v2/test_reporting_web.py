@@ -187,3 +187,85 @@ def test_a_snapshot_belonging_to_another_asset_is_not_served(app, asset_id, sett
         other_id = other.id
 
     assert client.get(f"/reports/assets/{other_id}/snapshots/{snapshot_id}.pdf").status_code == 404
+
+
+# --- generate-all and close --------------------------------------------------
+
+
+def test_generate_all_reaches_the_fleet_from_the_browser(app, asset_id) -> None:
+    client = app.test_client()
+    login(client)
+    form = client.get("/reports?month=2026-03")
+    response = client.post(
+        "/reports/generate-all", data={"csrf_token": csrf_token(form), "month": "2026-03"}
+    )
+    assert response.status_code == 302
+
+    history = client.get(f"/reports/assets/{asset_id}").get_data(as_text=True)
+    assert "2026-03" in history
+
+
+def test_close_index_lists_an_esco_still_missing_billing_config(app, settings) -> None:
+    factory = build_session_factory(create_engine(settings.database_url))
+    with factory() as session, session.begin():
+        esco = create_asset(session, canonical_name="Esco Por Preencher")
+        esco.contract_type = "ESCO"
+        connection = create_connection(
+            session, provider_code="fusionsolar", connection_key="c-esco", display_name="C-esco",
+            credential_reference="REF", enabled=True, configuration_status="configured",
+        )
+        mapping = create_mapping(session, asset_id=esco.id, provider_connection_id=connection.id, external_id="NE=esco")
+        record_production_fact(
+            session, asset_id=esco.id, provider_mapping_id=mapping.id, source_fact_key="p:esco",
+            period_start=datetime.combine(date(2026, 3, 10), time.min, tzinfo=timezone.utc),
+            period_end=datetime.combine(date(2026, 3, 11), time.min, tzinfo=timezone.utc),
+            granularity="day", value=Decimal("300"), unit="kWh",
+            quality="complete", completeness="complete", metadata={},
+        )
+
+    client = app.test_client()
+    login(client)
+    body = client.get("/reports/close?month=2026-03").get_data(as_text=True)
+    assert "Esco Por Preencher" in body
+    assert "O que falta para fechar" in body
+
+
+def test_closing_the_month_refuses_without_a_reason_while_blocked(app, settings) -> None:
+    factory = build_session_factory(create_engine(settings.database_url))
+    with factory() as session, session.begin():
+        esco = create_asset(session, canonical_name="Esco Bloqueada")
+        esco.contract_type = "ESCO"
+        connection = create_connection(
+            session, provider_code="fusionsolar", connection_key="c-blocked", display_name="C-blocked",
+            credential_reference="REF", enabled=True, configuration_status="configured",
+        )
+        mapping = create_mapping(session, asset_id=esco.id, provider_connection_id=connection.id, external_id="NE=blocked")
+        record_production_fact(
+            session, asset_id=esco.id, provider_mapping_id=mapping.id, source_fact_key="p:blocked",
+            period_start=datetime.combine(date(2026, 3, 10), time.min, tzinfo=timezone.utc),
+            period_end=datetime.combine(date(2026, 3, 11), time.min, tzinfo=timezone.utc),
+            granularity="day", value=Decimal("300"), unit="kWh",
+            quality="complete", completeness="complete", metadata={},
+        )
+
+    client = app.test_client()
+    login(client)
+    form = client.get("/reports/close?month=2026-03")
+    response = client.post(
+        "/reports/close", data={"csrf_token": csrf_token(form), "month": "2026-03"}
+    )
+    assert response.status_code == 302
+    assert response.headers["Location"].endswith("/reports/close?month=2026-03")
+
+
+def test_closing_the_month_succeeds_when_nothing_is_missing(app, asset_id) -> None:
+    """`asset_id` is a plain EPC installation with energy -- no ESCO gap to
+    clear, so closing must go straight through."""
+    client = app.test_client()
+    login(client)
+    form = client.get("/reports/close?month=2026-03")
+    response = client.post(
+        "/reports/close", data={"csrf_token": csrf_token(form), "month": "2026-03"}
+    )
+    assert response.status_code == 302
+    assert response.headers["Location"].endswith("/reports?month=2026-03")

@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block content %}
+{#
+  Fechar um mês significa aprovar todos os PortfolioReportRun que ainda o
+  esperam (approve_run, reaproveitado tal e qual). O único bloqueio a sério:
+  uma ESCO sem configuração comercial ou sem tarifa em vigor. Sem isso, o
+  botão fecha directamente; com isso, só avança com um motivo escrito.
+#}
+<section class="page-header">
+  <div>
+    <p class="eyebrow"><a class="back-link" href="{{ url_for('reporting.index', month=month) }}">← Fecho de {{ month }}</a></p>
+    <h1>Fechar {{ month }}</h1>
+    <p class="lede">Aprova todos os portfolios do mês de uma vez. Nunca inventa um valor financeiro.</p>
+  </div>
+</section>
+
+{% if blockers %}
+  <section class="panel notice-panel">
+    <header class="panel-header"><h2>O que falta para fechar {{ month }}</h2></header>
+    <div class="table-scroll">
+      <table class="data-table">
+        <thead><tr><th>Instalação</th><th>Em falta</th><th></th></tr></thead>
+        <tbody>
+          {% for row in blockers %}
+            <tr class="row-attention">
+              <td class="table-primary">{{ row.name }}</td>
+              <td>{{ row.blockers | join(' · ') }}</td>
+              <td class="num"><a href="{{ url_for('reporting.asset_history', asset_id=row.asset_id, month=month) }}">Abrir →</a></td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <p class="panel-foot muted">
+      Preenche a tarifa/configuração comercial de cada uma (link acima) e volta aqui, ou
+      fecha o mês mesmo assim explicando porquê — a razão fica só neste ecrã, o registo
+      guarda que houve uma decisão explícita, não o texto.
+    </p>
+  </section>
+
+  <section class="panel">
+    <header class="panel-header"><h2>Fechar mesmo assim</h2></header>
+    <form class="inline-form" method="post" action="{{ url_for('reporting.close') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="month" value="{{ month }}">
+      <label class="full-width">Motivo (obrigatório)
+        <textarea name="override_reason" rows="2" required placeholder="Ex.: central offline há semanas, cliente já avisado."></textarea>
+      </label>
+      <button type="submit" class="button danger">Fechar {{ month }} mesmo assim</button>
+    </form>
+  </section>
+{% else %}
+  <section class="panel">
+    <header class="panel-header"><h2>Tudo pronto</h2></header>
+    <p class="muted">Nenhuma instalação ESCO está à espera de tarifa ou configuração comercial para {{ month }}.</p>
+    <form class="inline-form" method="post" action="{{ url_for('reporting.close') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="month" value="{{ month }}">
+      <button type="submit" class="button primary">Fechar {{ month }}</button>
+    </form>
+  </section>
+{% endif %}
+{% endblock %}

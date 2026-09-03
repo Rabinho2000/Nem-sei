@@ -14,6 +14,7 @@ import io
 from flask import Blueprint, Response, abort, flash, redirect, render_template, request, session as browser_session, url_for
 
 from nemsei.reporting.assembler import assemble_asset_report, excel_payload_from_report
+from nemsei.reporting.bulk_close import close_month, generate_all_reports, month_close_blockers
 from nemsei.reporting.customer_pdf import build_customer_report_pdf
 from nemsei.reporting.datasets import rehydrate_snapshot_payload, snapshot_dataset
 from nemsei.reporting.excel import build_asset_report_workbook
@@ -50,8 +51,74 @@ def index() -> str:
     return render_template(
         "reporting/index.html",
         title="Relatórios",
+        csrf_token=token(),
         **workspace_overview(session, month=_month()),
     )
+
+
+@reporting_bp.post("/generate-all")
+@require_authenticated
+def generate_all():
+    """One pass: every reportable installation this month has not generated
+    yet, and every portfolio without a run. Never blocks -- a report with a
+    financial gap still generates, exactly as the individual button does;
+    `/reports/close` is where a gap actually stops something.
+    """
+    require_valid_token()
+    session = get_request_session()
+    month = request.form.get("month", "").strip()
+    try:
+        with session.begin():
+            result = generate_all_reports(session, month=month, actor=_actor())
+    except ValueError as error:
+        flash(str(error), "error")
+        return redirect(url_for("reporting.index", month=month or None))
+
+    parts = [f"{result.generated_assets} instalação(ões) geradas"]
+    if result.generated_portfolio_runs:
+        parts.append(f"{result.generated_portfolio_runs} portfolio(s) gerados")
+    if result.skipped_no_energy:
+        parts.append(f"{result.skipped_no_energy} sem energia (ignoradas)")
+    message = ", ".join(parts) + "."
+    if result.blocking:
+        flash(
+            f"{message} {len(result.blocking)} instalação(ões) ESCO ainda sem tarifa/configuração — ver «Fechar mês».",
+            "warning",
+        )
+    else:
+        flash(message, "success")
+    return redirect(url_for("reporting.index", month=month or None))
+
+
+@reporting_bp.get("/close")
+@require_authenticated
+def close_index() -> str:
+    session = get_request_session()
+    month = _month()
+    return render_template(
+        "reporting/close.html",
+        title=f"Fechar {month}",
+        month=month,
+        blockers=month_close_blockers(session, month=month),
+        csrf_token=token(),
+    )
+
+
+@reporting_bp.post("/close")
+@require_authenticated
+def close():
+    require_valid_token()
+    session = get_request_session()
+    month = request.form.get("month", "").strip()
+    override_reason = request.form.get("override_reason", "").strip()
+    try:
+        with session.begin():
+            approved = close_month(session, month=month, actor=_actor(), override_reason=override_reason)
+    except ValueError as error:
+        flash(str(error), "error")
+        return redirect(url_for("reporting.close_index", month=month or None))
+    flash(f"{month} fechado — {len(approved)} portfolio(s) aprovados.", "success")
+    return redirect(url_for("reporting.index", month=month or None))
 
 
 @reporting_bp.get("/assets")

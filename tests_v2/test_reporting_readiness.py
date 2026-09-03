@@ -20,7 +20,7 @@ from nemsei.assets.service import create_asset
 from nemsei.db.session import build_session_factory
 from nemsei.monitoring.service import record_production_fact
 from nemsei.providers.service import create_connection, create_mapping
-from nemsei.reporting.commercial import set_billing_config
+from nemsei.reporting.commercial import set_billing_config, set_tariff
 from nemsei.reporting.readiness import (
     fleet_readiness,
     filter_readiness,
@@ -49,6 +49,7 @@ def world(settings, monkeypatch):
         for name, contract in (
             ("Esco Sem Dados", "ESCO"),
             ("Esco Sem Taxas", "ESCO"),
+            ("Esco Sem Tarifa", "ESCO"),
             ("Esco Completo", "ESCO"),
             ("Epc Qualquer", "EPC"),
         ):
@@ -84,18 +85,26 @@ def add(session, asset_id, mapping_id, day: date, metric="production_energy", va
 def seed(factory, ids):
     with factory() as session, session.begin():
         # "Esco Sem Dados" gets nothing at all.
-        for name in ("Esco Sem Taxas", "Esco Completo", "Epc Qualquer"):
+        for name in ("Esco Sem Taxas", "Esco Sem Tarifa", "Esco Completo", "Epc Qualquer"):
             asset_id, mapping_id = ids[name]
             for day in range(1, 21):
                 add(session, asset_id, mapping_id, date(2026, 8, day))
-        # Only one of them has both rates and a self-consumption figure.
-        asset_id, mapping_id = ids["Esco Completo"]
-        for day in range(1, 21):
-            add(session, asset_id, mapping_id, date(2026, 8, day), "self_use_energy", "70")
-        set_billing_config(
-            session, asset_id=asset_id, report_type="esco", valid_from=date(2026, 1, 1),
-            created_by="operador", solcor_price_per_kwh=Decimal("0.10"),
-            default_electricity_price=Decimal("0.06"), default_export_price=Decimal("0.045"),
+        # Both have rates and a self-consumption figure; only one also has a
+        # tariff in force, which the euro figures never depend on but the
+        # tariff summary section of the report does.
+        for name in ("Esco Sem Tarifa", "Esco Completo"):
+            asset_id, mapping_id = ids[name]
+            for day in range(1, 21):
+                add(session, asset_id, mapping_id, date(2026, 8, day), "self_use_energy", "70")
+            set_billing_config(
+                session, asset_id=asset_id, report_type="esco", valid_from=date(2026, 1, 1),
+                created_by="operador", solcor_price_per_kwh=Decimal("0.10"),
+                default_electricity_price=Decimal("0.06"), default_export_price=Decimal("0.045"),
+            )
+        asset_id, _mapping_id = ids["Esco Completo"]
+        set_tariff(
+            session, asset_id=asset_id, tariff_type="simple", valid_from=date(2026, 1, 1),
+            created_by="operador", prices={"simple": Decimal("0.18")},
         )
 
 
@@ -125,6 +134,25 @@ def test_each_state_says_what_to_do_about_it(world) -> None:
     assert "Sem energia registada para o mês" in rows["Esco Sem Dados"].blockers
     assert "Sem taxas de venda / poupança / excedente" in rows["Esco Sem Taxas"].blockers
     assert "Faltam 11 de 31 dias" in rows["Esco Completo"].blockers
+
+
+def test_a_missing_tariff_is_its_own_blocker_distinct_from_billing_config(world) -> None:
+    """`AssetTariff` feeds the tariff summary, not the euro totals -- so this
+    is a fourth, separate absence, not a rephrasing of "sem taxas"."""
+    factory, ids = world
+    seed(factory, ids)
+    with factory() as session:
+        rows = by_name(fleet_readiness(session, month="2026-08"))
+
+    sem_tarifa, completo = rows["Esco Sem Tarifa"], rows["Esco Completo"]
+    assert sem_tarifa.has_commercial is True
+    assert sem_tarifa.has_tariff is False
+    assert "Sem tarifa em vigor para o mês" in sem_tarifa.blockers
+    assert "Sem taxas de venda / poupança / excedente" not in sem_tarifa.blockers
+    # The euro figures themselves do not need a tariff at all.
+    assert sem_tarifa.can_report_money is True
+    assert completo.has_tariff is True
+    assert "Sem tarifa em vigor para o mês" not in completo.blockers
 
 
 def test_euros_need_both_the_rates_and_a_self_consumption_figure(world) -> None:
@@ -172,7 +200,7 @@ def test_escos_come_first_and_within_them_the_worst_state(world) -> None:
         rows = fleet_readiness(session, month="2026-08")
 
     names = [row.name for row in rows]
-    assert names == ["Esco Sem Dados", "Esco Sem Taxas", "Esco Completo", "Epc Qualquer"]
+    assert names == ["Esco Sem Dados", "Esco Sem Taxas", "Esco Completo", "Esco Sem Tarifa", "Epc Qualquer"]
     # And the ordering is a property of the sort, not of the seeding order.
     assert [row.name for row in sort_for_operator(reversed(rows))] == names
 
@@ -183,13 +211,14 @@ def test_the_summary_counts_what_the_landing_page_leads_with(world) -> None:
     with factory() as session:
         summary = summarise(fleet_readiness(session, month="2026-08"))
 
-    assert summary["total"] == 4
-    assert summary["esco"] == 3
+    assert summary["total"] == 5
+    assert summary["esco"] == 4
     assert summary["epc"] == 1
-    assert summary["reportable"] == 3
+    assert summary["reportable"] == 4
     assert summary["without_energy"] == 1
     assert summary["esco_needs_commercial"] == 2
-    assert summary["money_possible"] == 1
+    assert summary["esco_needs_tariff"] == 1
+    assert summary["money_possible"] == 2
     assert summary["final"] == 0
 
 
@@ -199,11 +228,11 @@ def test_the_filters_narrow_by_the_questions_the_screen_asks(world) -> None:
     with factory() as session:
         rows = fleet_readiness(session, month="2026-08")
 
-    assert len(filter_readiness(rows, contract="esco")) == 3
+    assert len(filter_readiness(rows, contract="esco")) == 4
     assert len(filter_readiness(rows, contract="epc")) == 1
     assert [row.name for row in filter_readiness(rows, state="blocked")] == ["Esco Sem Dados"]
     assert [row.name for row in filter_readiness(rows, state="needs_commercial")] == ["Esco Sem Taxas"]
-    assert len(filter_readiness(rows, generated="no")) == 4
+    assert len(filter_readiness(rows, generated="no")) == 5
     assert [row.name for row in filter_readiness(rows, search="completo")] == ["Esco Completo"]
 
 
@@ -212,7 +241,7 @@ def test_a_month_with_no_data_anywhere_reports_zero_rather_than_failing(world) -
     with factory() as session:
         summary = summarise(fleet_readiness(session, month="2025-01"))
     assert summary["reportable"] == 0
-    assert summary["blocked"] == 4
+    assert summary["blocked"] == 5
 
 
 def test_the_month_bounds_are_the_half_open_period_the_datasets_use() -> None:

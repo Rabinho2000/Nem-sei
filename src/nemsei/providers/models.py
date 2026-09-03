@@ -40,6 +40,11 @@ OPERATOR_AUDIT_ACTIONS = (
     "service_contract_renewal_updated",
     # Which slice of the fleet a notification policy speaks for.
     "automation_scope_changed",
+    # Closing a reporting month approves every portfolio run it still owes an
+    # approval to. Recorded whether or not a financial gap had to be
+    # explicitly overridden -- the override itself is what `override_reason`
+    # in the metadata is for, not a separate action.
+    "month_closed",
 )
 
 
