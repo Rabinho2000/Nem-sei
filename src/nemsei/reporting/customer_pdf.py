@@ -563,6 +563,13 @@ def draw_daily_chart(pdf: canvas.Canvas, report: dict[str, Any], x: float, y: fl
     rows = report.get("daily_rows") or []
     days = int(getattr(report.get("month_end"), "day", 31))
     by_day = {row["date"].day: row for row in rows if isinstance(row.get("date"), date)}
+    # V2 only ever persists production per day -- self-use/export/consumption
+    # stay None until a per-asset split exists (see daily_rows_for). Without
+    # this fallback the axis scales to production while the bars plot only
+    # the always-None split, drawing an empty chart under a non-zero axis.
+    split_available = any(
+        row.get("self_use_kwh") is not None or row.get("export_kwh") is not None for row in rows
+    )
     max_value = max([_number(row.get("consumption_kwh")) for row in rows] + [_number(row.get("production_kwh")) for row in rows] + [1])
     pdf.setStrokeColor(MID_GRAY)
     for step in range(5):
@@ -575,24 +582,34 @@ def draw_daily_chart(pdf: canvas.Canvas, report: dict[str, Any], x: float, y: fl
     bar_w = max((plot_w - gap * (days - 1)) / days, 2.4)
     for day in range(1, days + 1):
         row = by_day.get(day, {})
-        self_use = _number(row.get("self_use_kwh"))
-        export = _number(row.get("export_kwh"))
-        consumption = _number(row.get("consumption_kwh"))
         x_bar = plot_x + (day - 1) * (bar_w + gap)
-        if consumption:
-            pdf.setFillColor(MID_GRAY)
-            pdf.rect(x_bar, plot_y, bar_w, plot_h * consumption / max_value, fill=1, stroke=0)
-        pdf.setFillColor(ORANGE)
-        self_h = plot_h * self_use / max_value
-        pdf.rect(x_bar, plot_y, bar_w, self_h, fill=1, stroke=0)
-        if export:
-            pdf.setFillColor(_primary(pdf))
-            pdf.rect(x_bar, plot_y + self_h, bar_w, plot_h * export / max_value, fill=1, stroke=0)
+        if split_available:
+            self_use = _number(row.get("self_use_kwh"))
+            export = _number(row.get("export_kwh"))
+            consumption = _number(row.get("consumption_kwh"))
+            if consumption:
+                pdf.setFillColor(MID_GRAY)
+                pdf.rect(x_bar, plot_y, bar_w, plot_h * consumption / max_value, fill=1, stroke=0)
+            pdf.setFillColor(ORANGE)
+            self_h = plot_h * self_use / max_value
+            pdf.rect(x_bar, plot_y, bar_w, self_h, fill=1, stroke=0)
+            if export:
+                pdf.setFillColor(_primary(pdf))
+                pdf.rect(x_bar, plot_y + self_h, bar_w, plot_h * export / max_value, fill=1, stroke=0)
+        else:
+            production = _number(row.get("production_kwh"))
+            if production:
+                pdf.setFillColor(ORANGE)
+                pdf.rect(x_bar, plot_y, bar_w, plot_h * production / max_value, fill=1, stroke=0)
         if day == 1 or day == days or day % 3 == 0:
             pdf.setFillColor(TEXT_GRAY)
             pdf.setFont("Helvetica", 5)
             pdf.drawCentredString(x_bar + bar_w / 2, plot_y - 9, str(day))
-    legend = ((MID_GRAY, "Consumo da empresa"), (ORANGE, "Solar autoconsumida"), (_primary(pdf), "Solar excedente"))
+    legend = (
+        ((MID_GRAY, "Consumo da empresa"), (ORANGE, "Solar autoconsumida"), (_primary(pdf), "Solar excedente"))
+        if split_available
+        else ((ORANGE, "Produção solar"),)
+    )
     legend_x = x + 150
     for color, label in legend:
         pdf.setFillColor(color)
@@ -611,6 +628,11 @@ def draw_monthly_chart(pdf: canvas.Canvas, report: dict[str, Any], x: float, y: 
     plot_x, plot_y = x + 36, y + 28
     plot_w, plot_h = width - 52, height - 55
     rows = report.get("monthly_rows") or []
+    # Same V2-only-persists-production gap as draw_daily_chart: fall back to
+    # plotting production alone when no row carries a self-use/export split.
+    split_available = any(
+        row.get("self_use_kwh") is not None or row.get("export_kwh") is not None for row in rows
+    )
     max_value = max([_number(row.get("consumption_kwh")) for row in rows] + [_number(row.get("production_kwh")) for row in rows] + [1])
     pdf.setStrokeColor(MID_GRAY)
     for step in range(5):
@@ -627,23 +649,33 @@ def draw_monthly_chart(pdf: canvas.Canvas, report: dict[str, Any], x: float, y: 
     gap = 8
     bar_w = max((plot_w - gap * (len(rows) - 1)) / len(rows), 10)
     for index, row in enumerate(rows):
-        self_use = _number(row.get("self_use_kwh"))
-        export = _number(row.get("export_kwh"))
-        consumption = _number(row.get("consumption_kwh"))
         x_bar = plot_x + index * (bar_w + gap)
-        if consumption:
-            pdf.setFillColor(MID_GRAY)
-            pdf.rect(x_bar, plot_y, bar_w, plot_h * consumption / max_value, fill=1, stroke=0)
-        pdf.setFillColor(ORANGE)
-        self_h = plot_h * self_use / max_value
-        pdf.rect(x_bar, plot_y, bar_w, self_h, fill=1, stroke=0)
-        if export:
-            pdf.setFillColor(_primary(pdf))
-            pdf.rect(x_bar, plot_y + self_h, bar_w, plot_h * export / max_value, fill=1, stroke=0)
+        if split_available:
+            self_use = _number(row.get("self_use_kwh"))
+            export = _number(row.get("export_kwh"))
+            consumption = _number(row.get("consumption_kwh"))
+            if consumption:
+                pdf.setFillColor(MID_GRAY)
+                pdf.rect(x_bar, plot_y, bar_w, plot_h * consumption / max_value, fill=1, stroke=0)
+            pdf.setFillColor(ORANGE)
+            self_h = plot_h * self_use / max_value
+            pdf.rect(x_bar, plot_y, bar_w, self_h, fill=1, stroke=0)
+            if export:
+                pdf.setFillColor(_primary(pdf))
+                pdf.rect(x_bar, plot_y + self_h, bar_w, plot_h * export / max_value, fill=1, stroke=0)
+        else:
+            production = _number(row.get("production_kwh"))
+            if production:
+                pdf.setFillColor(ORANGE)
+                pdf.rect(x_bar, plot_y, bar_w, plot_h * production / max_value, fill=1, stroke=0)
         pdf.setFillColor(TEXT_GRAY)
         pdf.setFont("Helvetica", 5.5)
         pdf.drawCentredString(x_bar + bar_w / 2, plot_y - 9, str(row.get("label") or ""))
-    legend = ((MID_GRAY, "Consumo da empresa"), (ORANGE, "Solar autoconsumida"), (_primary(pdf), "Solar excedente"))
+    legend = (
+        ((MID_GRAY, "Consumo da empresa"), (ORANGE, "Solar autoconsumida"), (_primary(pdf), "Solar excedente"))
+        if split_available
+        else ((ORANGE, "Produção solar"),)
+    )
     legend_x = x + 150
     for color, label in legend:
         pdf.setFillColor(color)
