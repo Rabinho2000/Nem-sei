@@ -82,6 +82,25 @@ class Scheduler:
                 interval_minutes=self.settings.diagnostic_incident_evaluation_interval_minutes,
             )
             created = created or incident_created
+        # Contractual availability ingestion: off by default, one explicit
+        # connection, and the only availability job that calls a provider.
+        # Closed days only; days already ingested are skipped without a call.
+        if self.settings.availability_history_sync_enabled and self.settings.availability_history_sync_connection_id is not None:
+            _history_job, history_created = self.repository.enqueue_due_availability_history_sync(
+                connection_id=self.settings.availability_history_sync_connection_id,
+                interval_minutes=self.settings.availability_history_sync_interval_minutes,
+                lookback_days=self.settings.availability_history_sync_lookback_days,
+            )
+            created = created or history_created
+        # Availability materialization: off by default, provider-free. Only
+        # the trailing `lookback_days` window is recomputed per tick -- never
+        # the whole history -- because only recent days can still change.
+        if self.settings.availability_materialization_enabled:
+            _availability_job, availability_created = self.repository.enqueue_due_availability_materialization(
+                interval_minutes=self.settings.availability_materialization_interval_minutes,
+                lookback_days=self.settings.availability_materialization_lookback_days,
+            )
+            created = created or availability_created
         # Report finalisation: off by default, and provider-free like the
         # incident evaluator above. It only ever adds a snapshot beside a
         # provisional one; it cannot rewrite a report and cannot approve a

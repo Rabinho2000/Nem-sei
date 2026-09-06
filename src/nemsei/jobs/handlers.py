@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from nemsei.config import Settings
 from nemsei.diagnostics.incidents import evaluate_and_persist_incidents
+from nemsei.diagnostics.availability_service import materialize_availability_window
 from nemsei.integrations.fusionsolar.device_status import FusionSolarDeviceStatusService
 from nemsei.integrations.fusionsolar.monitoring import FusionSolarMonitoringService
 from nemsei.integrations.fusionsolar.production import FusionSolarProductionService
@@ -146,6 +147,14 @@ def execute(
         if settings is None or session_factory is None:
             raise ValueError("The sync run sweep requires worker settings and sessions.")
         return _execute_sync_run_sweep(settings=settings, session_factory=session_factory)
+    if job.job_type == "availability.history_sync":
+        # The one availability job that calls a provider. Closed days only,
+        # and days already ingested cost no call at all.
+        return _execute_availability_history_sync(job, settings=settings, session_factory=session_factory)
+    if job.job_type == "availability.materialize":
+        # Provider-free: recomputes derived availability from device facts a
+        # different job already collected. Never reaches a provider client.
+        return _execute_availability_materialization(job, settings=settings, session_factory=session_factory)
     if job.job_type == "diagnostics.evaluate_incidents":
         if session_factory is None:
             raise ValueError("Diagnostic incident evaluation requires a worker session factory.")
@@ -444,6 +453,98 @@ def _execute_huawei_scada(job: ClaimedJob, *, settings: Settings, session_factor
             "skipped": result.skipped_reasons,
             "warnings": result.warnings[:20],
         },
+    )
+
+
+def _execute_availability_history_sync(
+    job: ClaimedJob, *, settings: Settings, session_factory: sessionmaker[Session]
+) -> JobOutcome:
+    """Ingest closed-day device history, then materialize what it enables.
+
+    Walks the trailing `lookback_days` of **closed** days oldest-first. A day
+    whose `history_read` facts are already present is skipped before any HTTP
+    call, so a steady-state tick spends nothing; only a genuinely new closed
+    day (or one whose ingestion previously failed) costs calls.
+
+    Materialization runs immediately after a successful ingest, from the
+    facts just written -- it makes no further provider call, so the
+    contractual figure is available as soon as its evidence is.
+    """
+    from nemsei.diagnostics.availability_service import (
+        assets_missing_history_for_date,
+        materialize_contractual_window,
+    )
+    from nemsei.integrations.fusionsolar.device_history import (
+        FusionSolarDeviceHistoryService,
+        history_timezone_for,
+    )
+    from nemsei.providers.repository import ProviderRepository
+
+    connection_id = int(job.payload.get("connection_id") or settings.availability_history_sync_connection_id or 0)
+    if not connection_id:
+        return JobOutcome(status="failed", result={"reason": "no_connection_configured"})
+    lookback_days = int(job.payload.get("lookback_days", settings.availability_history_sync_lookback_days))
+
+    with session_factory() as session:
+        connection = ProviderRepository(session).connection(connection_id)
+        if connection is None:
+            return JobOutcome(status="failed", result={"reason": "unknown_connection"})
+        session.expunge(connection)
+    tz = history_timezone_for(connection)
+
+    today = datetime.now(tz).date()
+    service = FusionSolarDeviceHistoryService(session_factory, settings)
+    synced: list[str] = []
+    skipped: list[str] = []
+    api_calls = 0
+    error_reason: str | None = None
+    for offset in range(lookback_days, 0, -1):
+        target = date.fromordinal(today.toordinal() - offset)
+        with session_factory() as session:
+            pending = assets_missing_history_for_date(session, connection_id=connection_id, target_date=target)
+        if not pending:
+            skipped.append(target.isoformat())
+            continue
+        result = service.sync_device_history(connection_id, target, today=today)
+        api_calls += result.api_calls
+        if result.error is not None:
+            error_reason = result.error.code.value
+            break
+        synced.append(target.isoformat())
+        with session_factory() as session, session.begin():
+            materialize_contractual_window(session, from_date=target, to_date=target, tz=tz)
+
+    return JobOutcome(
+        status="success" if error_reason is None else "failed",
+        result={"synced_days": synced, "skipped_days": skipped, "api_calls": api_calls, "error": error_reason},
+    )
+
+
+def _execute_availability_materialization(
+    job: ClaimedJob, *, settings: Settings, session_factory: sessionmaker[Session]
+) -> JobOutcome:
+    """Re-materialize the trailing availability window, fleet-wide.
+
+    Only the lookback window, never the whole history: an old day can only
+    change if its underlying `device_status_facts` change, and that is what
+    the explicit backfill script is for. Recent days are re-evaluated on
+    every tick because they legitimately can still move -- a poll that was
+    late, or a fact corrected after the fact -- and re-materializing an
+    unchanged day is a no-op by construction (delete+insert of identical
+    values), so nothing churns.
+
+    The window is read off the job payload rather than settings, so a job
+    that was queued under one configuration still covers the window it was
+    queued for.
+    """
+    lookback_days = int(job.payload.get("lookback_days", settings.availability_materialization_lookback_days))
+    today = date.today()
+    from_date = date.fromordinal(today.toordinal() - (lookback_days - 1))
+    with session_factory() as session, session.begin():
+        summary = materialize_availability_window(session, from_date=from_date, to_date=today)
+    return JobOutcome(
+        status="success",
+        result={"from_date": from_date.isoformat(), "to_date": today.isoformat(), **summary},
     )
 
 
