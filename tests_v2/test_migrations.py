@@ -101,3 +101,86 @@ def test_portfolio_report_run_migration_refuses_to_discard_a_run(settings, monke
     with pytest.raises(RuntimeError, match="Refusing to downgrade"):
         command.downgrade(Config("alembic.ini"), "0013_portfolios")
     assert "portfolio_report_runs" in set(inspect(create_engine(settings.database_url)).get_table_names())
+
+
+def test_availability_source_kind_migration_labels_existing_rows_without_losing_them(settings, monkeypatch) -> None:
+    """0041 over a *populated* 0040 database, not an empty one.
+
+    The realistic upgrade path for this schema: production already holds
+    `fusionsolar_sampled` availability rows written before the
+    contractual/operational split existed. They must come out the other side
+    intact and labelled `operational` -- the only honest label for a port of
+    V1's sampled engine -- and a downgrade must not delete them.
+    """
+    monkeypatch.setenv("NEMSEI_V2_ENV", "test")
+    monkeypatch.setenv("NEMSEI_V2_DATABASE_URL", settings.database_url)
+    config = Config("alembic.ini")
+    command.upgrade(config, "0040_reporting_availability")
+
+    engine = create_engine(settings.database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO assets (public_id, canonical_name, normalized_name, lifecycle_status, review_status, timezone_source, created_at, updated_at) "
+                "VALUES ('asset-avail-0041', 'Availability Plant', 'availability plant', 'unknown', 'clear', 'manual', now(), now())"
+            )
+        )
+        asset_id = connection.execute(text("SELECT id FROM assets WHERE public_id = 'asset-avail-0041'")).scalar_one()
+        connection.execute(
+            text(
+                "INSERT INTO devices (asset_id, public_id, device_kind, lifecycle_status, review_status, valid_from, created_at, updated_at) "
+                "VALUES (:asset_id, 'device-avail-0041', 'inverter', 'active', 'clear', DATE '2026-01-01', now(), now())"
+            ),
+            {"asset_id": asset_id},
+        )
+        device_id = connection.execute(text("SELECT id FROM devices WHERE public_id = 'device-avail-0041'")).scalar_one()
+        connection.execute(
+            text(
+                "INSERT INTO device_availability_daily (device_id, asset_id, availability_date, availability_pct, "
+                "valid_sample_count, minimum_required_samples, coverage_status, warning_codes_json, source, "
+                "calculated_at, created_at, updated_at) "
+                "VALUES (:device_id, :asset_id, DATE '2026-09-01', 97.50, 12, 5, 'complete', '[]', "
+                "'fusionsolar_sampled', now(), now(), now())"
+            ),
+            {"device_id": device_id, "asset_id": asset_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO asset_availability_daily (asset_id, availability_date, availability_pct, valid_sample_count, "
+                "expected_device_count, observed_device_count, minimum_required_samples, coverage_status, "
+                "warning_codes_json, source, calculation_details_json, calculated_at, created_at, updated_at) "
+                "VALUES (:asset_id, DATE '2026-09-01', 97.50, 12, 1, 1, 5, 'complete', '[]', 'fusionsolar_sampled', "
+                "'{}', now(), now(), now())"
+            ),
+            {"asset_id": asset_id},
+        )
+
+    command.upgrade(config, "head")
+    engine = create_engine(settings.database_url)
+    with engine.connect() as connection:
+        rows = connection.execute(
+            text("SELECT availability_pct, source, source_kind FROM asset_availability_daily")
+        ).all()
+        assert rows == [(pytest.approx(97.50), "fusionsolar_sampled", "operational")]
+        device_rows = connection.execute(text("SELECT source, source_kind FROM device_availability_daily")).all()
+        assert device_rows == [("fusionsolar_sampled", "operational")]
+
+        # The pair constraint is structural, not a convention: the database
+        # itself refuses to store the sampled engine's output as contractual.
+        with pytest.raises(Exception):
+            connection.execute(
+                text("UPDATE asset_availability_daily SET source_kind = 'contractual'")
+            )
+
+    # Downgrade drops what 0041 added and keeps every row.
+    command.downgrade(config, "0040_reporting_availability")
+    engine = create_engine(settings.database_url)
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT count(*) FROM asset_availability_daily")).scalar() == 1
+        assert connection.execute(text("SELECT count(*) FROM device_availability_daily")).scalar() == 1
+        assert "source_kind" not in {column["name"] for column in inspect(engine).get_columns("asset_availability_daily")}
+
+    command.upgrade(config, "head")
+    assert "source_kind" in {
+        column["name"] for column in inspect(create_engine(settings.database_url)).get_columns("asset_availability_daily")
+    }

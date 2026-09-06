@@ -408,3 +408,77 @@ def test_unresolved_members_are_counted_but_not_aggregated(factory) -> None:
         assert dataset.coverage_json["unresolved_members"] == 1
         assert dataset.coverage_json["assets_in_snapshot"] == 1
         assert Decimal(dataset.totals_json["production"]["value"]) == Decimal("100")
+
+
+# ---------------------------------------------------------------------------
+# Availability rollup (item 3/5, docs/v2/AVAILABILITY_MIGRATION_PLAN.md):
+# weighted by installed capacity across portfolio members, via
+# `_row_metrics`/`build_portfolio_dataset`'s own dedicated (non-summed)
+# handling.
+# ---------------------------------------------------------------------------
+def _device_month(session, *, asset_id, mapping_id, year: int, month: int):
+    from calendar import monthrange
+    from zoneinfo import ZoneInfo
+
+    from nemsei.assets.service import create_device
+    from nemsei.diagnostics.availability_service import materialize_existing_availability
+    from nemsei.diagnostics.service import record_device_status
+    from nemsei.providers.models import AssetProviderMapping
+
+    connection_id = session.get(AssetProviderMapping, mapping_id).provider_connection_id
+    device = create_device(
+        session, asset_id=asset_id, device_kind="inverter", serial_number=f"SN-PORT-{asset_id}",
+        rated_power_kw=Decimal("20.0"), valid_from=date(year, 1, 1),
+    )
+    create_mapping(
+        session, asset_id=asset_id, provider_connection_id=connection_id, external_id=f"PORT-DEV-{asset_id}",
+        resource_kind="device", device_id=device.id, valid_from=date(year, 1, 1),
+    )
+    session.flush()
+    lisbon = ZoneInfo("Europe/Lisbon")
+    last_day = monthrange(year, month)[1]
+    for day in range(1, last_day + 1):
+        for hour in range(6, 21):
+            record_device_status(
+                session, device_id=device.id, asset_id=asset_id, source_fact_key=f"fusionsolar-device-live:{device.id}",
+                observed_at=datetime(year, month, day, hour, tzinfo=lisbon), availability_status="available",
+                active_power_kw=Decimal("5.0"), source_kind="live_read", freshness="unknown",
+                quality="complete", completeness="complete",
+            )
+    session.flush()
+    materialize_existing_availability(session, asset_id=asset_id, from_date=date(year, month, 1), to_date=date(year, month, last_day))
+
+
+def test_portfolio_availability_is_weighted_and_complete_when_every_member_is(factory) -> None:
+    with factory() as session, session.begin():
+        portfolio = create_portfolio(session, name="P", created_by="op")
+        for name in ("A", "B"):
+            asset = make_asset(session, name, installed_dc_power_kw=Decimal("50"))
+            mapping = mapping_for(session, asset.id, key=f"c-av-{name}")
+            _device_month(session, asset_id=asset.id, mapping_id=mapping.id, year=2026, month=7)
+            add_member(session, portfolio_id=portfolio.id, asset_id=asset.id, valid_from=date(2026, 1, 1), created_by="op")
+        snapshot = freeze_snapshot(session, portfolio_id=portfolio.id, period_start=date(2026, 7, 1), period_end=date(2026, 8, 1), created_by="op")
+        dataset = build_portfolio_dataset(session, snapshot=snapshot, built_by="op")
+
+        assert dataset.totals_json["availability_state"] == "measured"
+        assert dataset.totals_json["availability_pct"] == pytest.approx(100.0)
+
+
+def test_portfolio_availability_is_none_when_one_member_has_no_data(factory) -> None:
+    with factory() as session, session.begin():
+        portfolio = create_portfolio(session, name="P", created_by="op")
+        measured = make_asset(session, "Measured", installed_dc_power_kw=Decimal("50"))
+        mapping = mapping_for(session, measured.id, key="c-av-measured")
+        _device_month(session, asset_id=measured.id, mapping_id=mapping.id, year=2026, month=7)
+        silent = make_asset(session, "Silent", installed_dc_power_kw=Decimal("50"))
+        mapping_for(session, silent.id, key="c-av-silent")  # a plant mapping, but no device data at all
+        for asset in (measured, silent):
+            add_member(session, portfolio_id=portfolio.id, asset_id=asset.id, valid_from=date(2026, 1, 1), created_by="op")
+        snapshot = freeze_snapshot(session, portfolio_id=portfolio.id, period_start=date(2026, 7, 1), period_end=date(2026, 8, 1), created_by="op")
+        dataset = build_portfolio_dataset(session, snapshot=snapshot, built_by="op")
+
+        # Same conservatism as `weighted_sampled_availability`/`rollup_availability`:
+        # one member with no measured availability makes the whole portfolio
+        # figure absent, never a mean over the members that did report.
+        assert dataset.totals_json["availability_pct"] is None
+        assert dataset.totals_json["availability_state"] == "partial"

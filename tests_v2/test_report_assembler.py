@@ -475,3 +475,92 @@ def test_a_reopened_snapshot_still_draws_its_daily_chart(prepared) -> None:
     # A page that silently dropped its chart is a materially smaller document,
     # not merely a byte-identical one (reportlab stamps a creation time).
     assert len(reopened_pdf) > len(live_pdf) * 0.9
+
+
+# ---------------------------------------------------------------------------
+# Availability integration (item 6, docs/v2/AVAILABILITY_MIGRATION_PLAN.md).
+# ---------------------------------------------------------------------------
+def _full_month_device_status(session, *, asset_id, mapping_id, year: int, month: int):
+    from calendar import monthrange
+    from zoneinfo import ZoneInfo
+
+    from nemsei.assets.service import create_device
+    from nemsei.diagnostics.availability_service import materialize_existing_availability
+    from nemsei.diagnostics.service import record_device_status
+    from nemsei.providers.models import AssetProviderMapping
+
+    connection_id = session.get(AssetProviderMapping, mapping_id).provider_connection_id
+    device = create_device(
+        session, asset_id=asset_id, device_kind="inverter", serial_number="SN-ASM-1",
+        rated_power_kw=Decimal("20.0"), valid_from=date(year, 1, 1),
+    )
+    create_mapping(
+        session, asset_id=asset_id, provider_connection_id=connection_id, external_id="ASM-DEV-1",
+        resource_kind="device", device_id=device.id, valid_from=date(year, 1, 1),
+    )
+    session.flush()
+    lisbon = ZoneInfo("Europe/Lisbon")
+    last_day = monthrange(year, month)[1]
+    for day in range(1, last_day + 1):
+        for hour in range(6, 21):
+            record_device_status(
+                session, device_id=device.id, asset_id=asset_id, source_fact_key=f"fusionsolar-device-live:{device.id}",
+                observed_at=datetime(year, month, day, hour, tzinfo=lisbon), availability_status="available",
+                active_power_kw=Decimal("5.0"), source_kind="live_read", freshness="unknown",
+                quality="complete", completeness="complete",
+            )
+    session.flush()
+    materialize_existing_availability(session, asset_id=asset_id, from_date=date(year, month, 1), to_date=date(year, month, last_day))
+
+
+def test_include_availability_kpi_is_true_for_a_real_measured_month(prepared) -> None:
+    factory, (asset_id, mapping_id) = prepared
+    with factory() as session, session.begin():
+        _full_month_device_status(session, asset_id=asset_id, mapping_id=mapping_id, year=2026, month=7)
+        assembled = assemble_asset_report(
+            session, asset_id=asset_id, period=monthly_period("2026-07"), built_by="operator"
+        )
+
+    assert assembled.payload["include_availability_kpi"] is True
+    assert assembled.payload["availability_pct"] == pytest.approx(100.0)
+    assert assembled.payload["availability_state"] == "measured"
+    assert "availability_pct" not in assembled.payload["unavailable_fields"]
+
+    # Both renderers accept the payload once availability is real, not just
+    # when it is absent -- the PDF's KPI card gate reads exactly these two
+    # fields (`customer_pdf.py::draw_kpi_cards`, ported from V1's own gate).
+    pdf_bytes = build_customer_report_pdf(assembled.payload)
+    assert pdf_bytes[:5] == b"%PDF-"
+    workbook = build_asset_report_workbook(excel_payload_from_report(assembled.payload))
+    assert workbook is not None
+
+
+def test_availability_pct_is_absent_and_flagged_with_no_device_data(prepared) -> None:
+    factory, (asset_id, mapping_id) = prepared
+    with factory() as session, session.begin():
+        assembled = assemble_asset_report(
+            session, asset_id=asset_id, period=monthly_period("2026-07"), built_by="operator"
+        )
+
+    assert assembled.payload["include_availability_kpi"] is False
+    assert assembled.payload["availability_pct"] is None
+    assert assembled.payload["availability_state"] == "missing"
+    assert "availability_pct" in assembled.payload["unavailable_fields"]
+
+
+def test_excel_payload_carries_availability_in_the_quality_section(prepared) -> None:
+    factory, (asset_id, mapping_id) = prepared
+    with factory() as session, session.begin():
+        _full_month_device_status(session, asset_id=asset_id, mapping_id=mapping_id, year=2026, month=7)
+        assembled = assemble_asset_report(
+            session, asset_id=asset_id, period=monthly_period("2026-07"), built_by="operator"
+        )
+    payload = excel_payload_from_report(assembled.payload)
+    assert payload["quality"]["availability_pct"] == pytest.approx(100.0)
+    assert payload["quality"]["availability_state"] == "measured"
+
+    workbook = build_asset_report_workbook(payload)
+    quality_sheet = workbook["Qualidade dos dados"]
+    labels = [cell.value for cell in quality_sheet["A"]]
+    assert "Disponibilidade (%)" in labels
+    assert "Estado da disponibilidade" in labels
