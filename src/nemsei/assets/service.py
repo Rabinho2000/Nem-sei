@@ -24,6 +24,7 @@ from nemsei.assets.repository import AssetRepository
 # identity_decisions.py already reaches for this from inside assets/, so the
 # direction is established, not new.
 from nemsei.providers.audit import record_operator_action
+from nemsei.providers.models import AssetProviderMapping
 from nemsei.shared.clock import utc_now
 
 
@@ -366,6 +367,51 @@ def create_device(
         updated_at=now,
     )
     repository.add(device)
+    session.flush()
+    return device
+
+
+def retire_device(session: Session, *, device_id: int, valid_to: date, lifecycle_status: str = "decommissioned") -> Device:
+    """Close a device's validity window without deleting anything.
+
+    A device leaving a plant -- replaced, moved, decommissioned -- must not
+    remove it from history: availability for a past day is computed from the
+    inverters that were expected *that day*
+    (`diagnostics/availability_service.expected_devices_for_date`), so
+    deleting a retired inverter would silently change every historical figure
+    it contributed to. Closing the window keeps the row and stops it being
+    expected from `valid_to` onward.
+
+    The device's own device-scoped provider mappings are closed with it: an
+    active mapping outliving its device would keep the device "expected" via
+    the mapping join, which is the same wrong answer by a different route.
+
+    Idempotent: retiring an already-retired device to the same date is a
+    no-op, so a sync that re-observes a disappearance does not churn.
+    """
+    repository = AssetRepository(session)
+    device = repository.device(device_id)
+    if device is None:
+        raise ValueError("Unknown device.")
+    if lifecycle_status not in ASSET_LIFECYCLE_STATUSES:
+        raise ValueError("Invalid device lifecycle status.")
+    if valid_to < device.valid_from:
+        raise ValueError("A device cannot stop being valid before it started.")
+    now = utc_now()
+    if device.valid_to != valid_to or device.lifecycle_status != lifecycle_status:
+        device.valid_to = valid_to
+        device.lifecycle_status = lifecycle_status
+        device.updated_at = now
+    mappings = session.scalars(
+        select(AssetProviderMapping).where(
+            AssetProviderMapping.device_id == device_id,
+            AssetProviderMapping.resource_kind == "device",
+        )
+    ).all()
+    for mapping in mappings:
+        if mapping.valid_to is None or mapping.valid_to > valid_to:
+            mapping.valid_to = valid_to
+            mapping.updated_at = now
     session.flush()
     return device
 
