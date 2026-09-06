@@ -22,6 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from nemsei.assets.models import Asset
+from nemsei.diagnostics.availability_service import monthly_availability_for_asset
 from nemsei.monitoring.models import ProductionFact
 from nemsei.monitoring.repository import CanonicalFactRepository
 from nemsei.reporting.commercial import confirmed_financial_model
@@ -173,6 +174,18 @@ def build_dataset(
             # from power samples must not read like a metered month.
             warnings.append(f"estimated_energy:{start.isoformat()}")
 
+        # Availability: a separate fact system (`asset_availability_daily`,
+        # not `production_facts`), so it does not go through `DATASET_METRICS`
+        # -- read directly, same missing-implies-null shape as every other
+        # metric here. See docs/v2/AVAILABILITY_MIGRATION_PLAN.md.
+        availability = monthly_availability_for_asset(session, asset_id=asset_id, month_start=start, month_end_exclusive=end)
+        availability_pct = availability["availability_pct"]
+        availability_state = {"complete": "measured", "partial": "partial", "missing": "missing"}[availability["coverage_status"]]
+        if availability_state == "missing":
+            warnings.append(f"availability_missing:{start.isoformat()}")
+        elif availability_state == "partial":
+            warnings.append(f"availability_partial:{start.isoformat()}")
+
         rows.append(
             {
                 "asset_id": asset_id,
@@ -182,6 +195,10 @@ def build_dataset(
                 "actual_state": actual_state,
                 "expected_production_kwh": expected,
                 "expected_state": expected_state,
+                "availability_pct": Decimal(str(availability_pct)) if availability_pct is not None else None,
+                "availability_state": availability_state,
+                "availability_source": availability["source"],
+                "availability_source_kind": availability["source_kind"],
                 **{key: value for key, value in monthly_metrics.items() if not key.endswith("_fact_keys")},
                 "provenance": {
                     "actual_fact_keys": sources,
@@ -189,6 +206,9 @@ def build_dataset(
                     "metric_fact_keys": {
                         name: monthly_metrics[f"{name}_fact_keys"] for name in DATASET_METRICS
                     },
+                    "availability_covered_days": availability["covered_days"],
+                    "availability_expected_days": availability["expected_days"],
+                    "availability_warnings": availability["warnings"],
                     # Present only when something in the month actually is an
                     # estimate. Adding the key unconditionally would change
                     # `input_digest` for every dataset ever built, so every
@@ -252,6 +272,10 @@ def build_dataset(
                 actual_state=row["actual_state"],
                 expected_production_kwh=row["expected_production_kwh"],
                 expected_state=row["expected_state"],
+                availability_pct=row["availability_pct"],
+                availability_state=row["availability_state"],
+                availability_source=row["availability_source"],
+                availability_source_kind=row["availability_source_kind"],
                 **{
                     field: row[field]
                     for name in DATASET_METRICS
@@ -277,6 +301,24 @@ def _row_digest_payload(row: dict[str, Any]) -> dict[str, Any]:
         "actual_state": row["actual_state"],
         "expected": None if row["expected_production_kwh"] is None else format(row["expected_production_kwh"], "f"),
         "expected_state": row["expected_state"],
+        "availability_pct": None if row["availability_pct"] is None else format(row["availability_pct"], "f"),
+        "availability_state": row["availability_state"],
+        # Present only for a row that actually has a source. Source is part of
+        # what a percentage *means* -- the same number from a contractual and
+        # from an operational pipeline are not the same fact -- so it belongs
+        # in the identity. Adding the keys unconditionally would change
+        # `input_digest` for every dataset ever built, including the ones with
+        # no availability at all, making every existing snapshot look new
+        # without a number having moved; the same reason `estimated_fact_keys`
+        # above is conditional.
+        **(
+            {
+                "availability_source": row["availability_source"],
+                "availability_source_kind": row["availability_source_kind"],
+            }
+            if row["availability_source"] is not None
+            else {}
+        ),
         **{
             name: (None if row[f"{name}_kwh"] is None else format(row[f"{name}_kwh"], "f"))
             for name in DATASET_METRICS

@@ -76,8 +76,14 @@ TARIFF_SPLIT_FIELDS_WITHOUT_SOURCE = (
     "self_use_vazio_kwh",
     "self_use_super_vazio_kwh",
 )
-# Availability needs device-level facts, which V2 does not collect yet.
-AVAILABILITY_FIELDS_WITHOUT_SOURCE = ("availability_pct",)
+# `availability_pct` used to live in a tuple exactly like the one above,
+# unconditionally absent because V2 collected no device-level facts at all.
+# It no longer does: `docs/v2/AVAILABILITY_MIGRATION_PLAN.md`'s ported
+# sampled engine now computes it from `asset_availability_daily` per month
+# (`datasets.py::build_dataset`), so it is handled the same conditional way
+# every `DATASET_METRICS` field already is -- present in `unavailable_fields`
+# only for a period whose `aggregate["availability_state"] == "missing"`, not
+# unconditionally.
 
 
 @dataclass(frozen=True)
@@ -192,6 +198,8 @@ def monthly_rows_for(dataset_rows: list[ReportingDatasetRow]) -> list[dict[str, 
             "production_state": row.actual_state,
             "expected_production_kwh": _float_or_none(row.expected_production_kwh),
             "expected_state": row.expected_state,
+            "availability_pct": _float_or_none(row.availability_pct),
+            "availability_state": row.availability_state,
             **{f"{name}_kwh": _float_or_none(getattr(row, f"{name}_kwh")) for name in DATASET_METRICS},
             **{f"{name}_state": getattr(row, f"{name}_state") for name in DATASET_METRICS},
         }
@@ -235,6 +243,41 @@ def aggregate_rows(
     daily_values = [row["production_kwh"] for row in daily_rows if row["production_kwh"] is not None]
     coverage_pct = (len(months_with_data) / len(dataset_rows) * 100.0) if dataset_rows else 0.0
 
+    # Availability across the whole period: a plain mean of the months that
+    # actually measured one (unweighted -- the same asset's own capacity does
+    # not change month to month, unlike weighting different assets against
+    # each other, `rollup_availability`'s job). Any month short of `measured`
+    # makes the whole period's figure absent rather than a mean over fewer
+    # months -- the same conservatism `weighted_sampled_availability` already
+    # applies one level down, so a report never reads "available" from a
+    # period that quietly skipped an unmeasured month.
+    availability_values = [row.availability_pct for row in dataset_rows if row.availability_state == "measured" and row.availability_pct is not None]
+    if not dataset_rows or not availability_values:
+        availability_state = "missing"
+    elif len(availability_values) < len(dataset_rows):
+        availability_state = "partial"
+    else:
+        availability_state = "measured"
+    availability_pct = (
+        float(round(sum(availability_values) / len(availability_values), 2))
+        if availability_state == "measured"
+        else None
+    )
+    # The period's figure only carries a source when every measured month
+    # agrees on one. Months from different pipelines are not averageable into
+    # a single labelled number -- a mean of a warranted month and an
+    # operational one is neither -- so a mixed period reports `partial` and
+    # withholds the percentage rather than picking a label for it.
+    period_sources = {
+        (row.availability_source, row.availability_source_kind)
+        for row in dataset_rows
+        if row.availability_state == "measured" and row.availability_pct is not None
+    }
+    if availability_state == "measured" and len(period_sources) > 1:
+        availability_state = "partial"
+        availability_pct = None
+    availability_source, availability_source_kind = period_sources.pop() if len(period_sources) == 1 else (None, None)
+
     if not measured:
         production_status = "missing"
     elif partial or missing_months:
@@ -263,6 +306,10 @@ def aggregate_rows(
         **finality.as_payload(),
         "production_kwh": _float_or_none(total),
         "expected_production_kwh": _float_or_none(expected_total),
+        "availability_pct": availability_pct,
+        "availability_state": availability_state,
+        "availability_source": availability_source,
+        "availability_source_kind": availability_source_kind,
         "raw_daily_total_kwh": sum(daily_values) if daily_values else None,
         "months_with_data": months_with_data,
         "missing_months": missing_months,
@@ -321,12 +368,19 @@ def assemble_asset_report(
     aggregate = aggregate_rows(dataset_rows, daily_rows, period=period, today=today)
 
 
-    unavailable = list(TARIFF_SPLIT_FIELDS_WITHOUT_SOURCE + AVAILABILITY_FIELDS_WITHOUT_SOURCE)
+    unavailable = list(TARIFF_SPLIT_FIELDS_WITHOUT_SOURCE)
     for name in DATASET_METRICS:
         if aggregate[f"{name}_state"] == "missing":
             unavailable.append(f"{name}_kwh")
     if aggregate["production_status"] == "missing":
         unavailable.append("production_kwh")
+    if aggregate["availability_state"] == "missing":
+        # Real for every asset with no materialized `asset_availability_daily`
+        # coverage for the period -- which today means every Sigenergy asset
+        # (item 9: no device-level contract to compute from) and every
+        # FusionSolar asset whose devices have not accumulated a `complete`
+        # day yet, not a special case for either.
+        unavailable.append("availability_pct")
     if tariff is None:
         unavailable.extend(["tariff_value_eur", "tariff_type", "tariff_period_breakdown", "tariff_coverage_pct"])
     if persisted_billing is None:
@@ -430,7 +484,15 @@ def assemble_asset_report(
             "billing_config" if persisted_billing is not None
             else ("contract_attributes" if report_type_is_resolved(asset) else "default")
         ),
-        "include_availability_kpi": False,
+        # Ported gate name from V1's own `customer_reports.py`
+        # (`report.get("include_availability_kpi")`), same meaning: the PDF's
+        # availability section renders only when there is a real number to
+        # show, never a blank "Disponibilidade (%)" row.
+        "include_availability_kpi": aggregate["availability_state"] == "measured",
+        "availability_pct": aggregate["availability_pct"],
+        "availability_state": aggregate["availability_state"],
+        "availability_source": aggregate["availability_source"],
+        "availability_source_kind": aggregate["availability_source_kind"],
         # Provenance a reader can follow back to the rows it came from.
         "dataset_id": dataset.id,
         "dataset_input_digest": dataset.input_digest,
@@ -441,7 +503,7 @@ def assemble_asset_report(
         report[f"{name}_kwh"] = aggregate[f"{name}_kwh"]
         report[f"{name}_state"] = aggregate[f"{name}_state"]
     # What still has no source anywhere is explicitly absent, never zero.
-    for name in TARIFF_SPLIT_FIELDS_WITHOUT_SOURCE + AVAILABILITY_FIELDS_WITHOUT_SOURCE:
+    for name in TARIFF_SPLIT_FIELDS_WITHOUT_SOURCE:
         report[name] = None
 
     # A tariff prices the energy; it does not state a euro total. V1 computes
@@ -514,6 +576,10 @@ def excel_payload_from_report(report: dict[str, Any]) -> dict[str, Any]:
             "production_state": report.get("production_quality_status"),
             "coverage_pct": report.get("coverage_pct"),
             "daily_total_kwh": report.get("raw_daily_total_kwh"),
+            "availability_state": report.get("availability_state"),
+            "availability_pct": report.get("availability_pct"),
+            "availability_source": report.get("availability_source"),
+            "availability_source_kind": report.get("availability_source_kind"),
         },
         "metadata": {
             "period_type": report.get("period_type"),

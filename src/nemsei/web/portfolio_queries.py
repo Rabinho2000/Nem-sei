@@ -151,6 +151,13 @@ def _member_rows(
                 "consumption_kwh": _number(metrics.get("consumption")),
                 "grid_import_kwh": _number(metrics.get("grid_import")),
                 "production_state": states.get("production", "missing"),
+                "availability_pct": _number(metrics.get("availability")),
+                "availability_state": states.get("availability", "missing"),
+                # Where the figure came from and whether it may stand
+                # commercially. Shown so an operator can tell an operational
+                # estimate from a warranted number without opening the database.
+                "availability_source": states.get("availability_source"),
+                "availability_source_kind": states.get("availability_source_kind"),
                 "performance_pct": (
                     production / expected * 100 if production is not None and expected else None
                 ),
