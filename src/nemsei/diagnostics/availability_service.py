@@ -262,6 +262,122 @@ def materialize_existing_availability(
     return {"days_recalculated": days, **states}
 
 
+def _availability_row_as_candidate(row: AssetAvailabilityDaily) -> dict[str, Any]:
+    """One stored day, in the shape `select_availability` reads.
+
+    Everything the read models need travels on the candidate, so a caller
+    that has chosen a figure never has to go back to the row to learn which
+    source produced it -- which is how a sampled number would end up
+    presented as a contractual one.
+    """
+    return {
+        "date": row.availability_date,
+        "availability_pct": (float(row.availability_pct) if row.availability_pct is not None else None),
+        "coverage_status": row.coverage_status,
+        "source": row.source,
+        "source_kind": row.source_kind,
+        "valid_sample_count": row.valid_sample_count,
+        "expected_device_count": row.expected_device_count,
+        "observed_device_count": row.observed_device_count,
+        "minimum_required_samples": row.minimum_required_samples,
+        "warning_codes": list(row.warning_codes_json or []),
+        "operational_window_start": row.operational_window_start,
+        "operational_window_end": row.operational_window_end,
+        "calculated_at": row.calculated_at,
+    }
+
+
+def selected_availability_by_asset(
+    session: Session, *, asset_ids: list[int], target_date: date
+) -> dict[int, dict[str, Any] | None]:
+    """The one figure each asset may report for one day, source policy applied.
+
+    **This is the only correct way to read `asset_availability_daily` for a
+    single day.** The table's unique key is `(asset_id, availability_date,
+    source)`, so an asset can legitimately hold a contractual *and* an
+    operational row for the same day, and any caller that counts rows and
+    compares that count to the number of assets is wrong in two directions
+    at once: it under-reports (one asset with two sources looks like two
+    assets) and it can mis-pair (two assets, one with two sources, produce a
+    row count that accidentally matches while one asset is counted twice and
+    the other not at all). Both bugs existed here.
+
+    Selection goes through `reporting.rules.availability_source.
+    select_availability` and nowhere else -- contractual over operational,
+    never by recency, `availability_pct=None` treated as coverage evidence
+    rather than a figure. An asset with rows but no eligible figure maps to
+    the winning *evidence* row with `availability_pct=None`; an asset with
+    no row at all maps to `None`. The two are different facts and callers
+    that need to tell them apart can.
+
+    One query for every asset asked about, so a fleet page stays one round
+    trip rather than one per installation.
+    """
+    if not asset_ids:
+        return {}
+    rows = session.execute(
+        select(AssetAvailabilityDaily).where(
+            AssetAvailabilityDaily.asset_id.in_(asset_ids),
+            AssetAvailabilityDaily.availability_date == target_date,
+        )
+    ).scalars().all()
+    by_asset: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_asset.setdefault(row.asset_id, []).append(_availability_row_as_candidate(row))
+    selected: dict[int, dict[str, Any] | None] = {asset_id: None for asset_id in asset_ids}
+    for asset_id, candidates in by_asset.items():
+        selected[asset_id] = select_availability(candidates) or _preferred_evidence(candidates)
+    return selected
+
+
+def _preferred_evidence(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Which row explains an absent figure, when no candidate carries one.
+
+    Same tie-break as `select_availability`'s own, and for the same reason:
+    the answer must not depend on the order rows came back in. Contractual
+    first, because the report would have used the contractual number, so its
+    account of why there isn't one is the account worth showing.
+    """
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda candidate: (
+            0 if candidate["source_kind"] == KIND_CONTRACTUAL else 1,
+            str(candidate["source"]),
+        ),
+    )
+
+
+def _rollup_selected(
+    session: Session, *, asset_ids: list[int], target_date: date
+) -> float | None:
+    """Weighted rollup over the *selected* figure of each member asset.
+
+    An asset with no materialized day at all still makes the whole rollup
+    `None`: "not computed" and "computed and incomplete" are different
+    facts, but neither is a percentage, and averaging over the members that
+    do have one would publish a number for an estate that was never measured.
+    """
+    asset_ids = sorted(set(asset_ids))
+    selected = selected_availability_by_asset(session, asset_ids=asset_ids, target_date=target_date)
+    if any(selected.get(asset_id) is None for asset_id in asset_ids):
+        return None
+    powers = dict(
+        session.execute(
+            select(Asset.id, Asset.installed_dc_power_kw).where(Asset.id.in_(asset_ids))
+        ).all()
+    )
+    member_rows = [
+        {
+            "availability_pct": selected[asset_id]["availability_pct"],
+            "installed_dc_power_kw": (float(powers[asset_id]) if powers.get(asset_id) is not None else None),
+        }
+        for asset_id in asset_ids
+    ]
+    return rollup_availability(member_rows, weight_key="installed_dc_power_kw")
+
+
 def installation_availability_for_date(session: Session, *, installation_id: int, target_date: date) -> float | None:
     """Item 5: roll up an installation's already-materialized member assets.
 
@@ -275,25 +391,16 @@ def installation_availability_for_date(session: Session, *, installation_id: int
     installations. One incomplete member asset makes the whole rollup
     `None` (`rollup_availability`'s existing rule) -- confirmed as the
     intended conservatism, see `docs/v2/AVAILABILITY_MIGRATION_PLAN.md` §5.
+
+    Which of a member's availability rows counts is `select_availability`'s
+    decision, made once in `selected_availability_by_asset` -- this function
+    deliberately holds no opinion about contractual vs operational, so the
+    precedence cannot drift between here and the monthly figure.
     """
     asset_ids = list(session.scalars(select(Asset.id).where(Asset.installation_id == installation_id)).all())
     if not asset_ids:
         return None
-    rows = session.execute(
-        select(AssetAvailabilityDaily.asset_id, AssetAvailabilityDaily.availability_pct, Asset.installed_dc_power_kw)
-        .join(Asset, Asset.id == AssetAvailabilityDaily.asset_id)
-        .where(AssetAvailabilityDaily.asset_id.in_(asset_ids), AssetAvailabilityDaily.availability_date == target_date)
-    ).all()
-    if len(rows) != len(asset_ids):
-        # Not every member asset has a materialized day yet -- an honest
-        # "not computed" is not the same claim as "computed and incomplete",
-        # but neither can report a real percentage, so both return None.
-        return None
-    member_rows = [
-        {"availability_pct": (float(pct) if pct is not None else None), "installed_dc_power_kw": (float(power) if power is not None else None)}
-        for _asset_id, pct, power in rows
-    ]
-    return rollup_availability(member_rows, weight_key="installed_dc_power_kw")
+    return _rollup_selected(session, asset_ids=asset_ids, target_date=target_date)
 
 
 def portfolio_availability_for_date(session: Session, *, portfolio_id: int, target_date: date) -> float | None:
@@ -301,7 +408,8 @@ def portfolio_availability_for_date(session: Session, *, portfolio_id: int, targ
 
     Membership is resolved the same way every other portfolio view resolves
     it (`portfolios.service.resolve_members`) -- no separate notion of
-    "which assets count" invented here.
+    "which assets count" invented here, and no separate notion of which
+    availability source counts either.
     """
     from nemsei.portfolios.service import resolve_members  # local import: avoids a package-boundary cycle at import time
 
@@ -309,18 +417,107 @@ def portfolio_availability_for_date(session: Session, *, portfolio_id: int, targ
     asset_ids = [member.asset_id for member in members if member.asset_id is not None]
     if not asset_ids:
         return None
+    return _rollup_selected(session, asset_ids=asset_ids, target_date=target_date)
+
+
+
+def asset_availability_series(
+    session: Session, *, asset_id: int, from_date: date, to_date: date
+) -> list[dict[str, Any]]:
+    """One entry per calendar day in `[from_date, to_date]`, gaps included.
+
+    The daily read model behind the installation page's WAT panel. Every day
+    of the window is present, and a day with no stored row is present with
+    `availability_pct=None` and `coverage_status='missing'` -- so a chart
+    built from this can draw a gap and can never draw a zero for a day
+    nothing was measured on. That distinction is the whole point of the
+    series; collapsing it in the caller would be the same defect as summing
+    superseded production revisions.
+
+    Which of a day's rows is reported is `select_availability`'s decision,
+    taken through the same `selected_availability_by_asset` the rollups use.
+    A day holding both a contractual and an operational row reports the
+    contractual one, and says so in `source`/`source_kind`; a day holding
+    only an operational one reports it *labelled* operational. Nothing here
+    ever relabels a sampled figure as contractual, and nothing here falls
+    back to the operational figure when the contractual row exists but has
+    no percentage -- the operational row is a different measurement, not a
+    replacement for a missing one, so it only ever wins when it is the only
+    figure there is.
+
+    Query cost is one read for the whole window, not one per day.
+    """
+    if to_date < from_date:
+        raise ValueError("Availability series window is inverted.")
     rows = session.execute(
-        select(AssetAvailabilityDaily.asset_id, AssetAvailabilityDaily.availability_pct, Asset.installed_dc_power_kw)
-        .join(Asset, Asset.id == AssetAvailabilityDaily.asset_id)
-        .where(AssetAvailabilityDaily.asset_id.in_(asset_ids), AssetAvailabilityDaily.availability_date == target_date)
-    ).all()
-    if len(rows) != len(asset_ids):
-        return None
-    member_rows = [
-        {"availability_pct": (float(pct) if pct is not None else None), "installed_dc_power_kw": (float(power) if power is not None else None)}
-        for _asset_id, pct, power in rows
-    ]
-    return rollup_availability(member_rows, weight_key="installed_dc_power_kw")
+        select(AssetAvailabilityDaily).where(
+            AssetAvailabilityDaily.asset_id == asset_id,
+            AssetAvailabilityDaily.availability_date >= from_date,
+            AssetAvailabilityDaily.availability_date <= to_date,
+        )
+    ).scalars().all()
+    by_day: dict[date, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_day.setdefault(row.availability_date, []).append(_availability_row_as_candidate(row))
+
+    series: list[dict[str, Any]] = []
+    current = from_date
+    while current <= to_date:
+        candidates = by_day.get(current, [])
+        chosen = select_availability(candidates) or _preferred_evidence(candidates)
+        if chosen is None:
+            series.append(
+                {
+                    "date": current,
+                    "availability_pct": None,
+                    "coverage_status": COVERAGE_MISSING,
+                    "source": None,
+                    "source_kind": None,
+                    "valid_sample_count": 0,
+                    "expected_device_count": 0,
+                    "observed_device_count": 0,
+                    "minimum_required_samples": 0,
+                    "warning_codes": [],
+                    "operational_window_start": None,
+                    "operational_window_end": None,
+                    "calculated_at": None,
+                    # How many sources were stored for this day at all, so a
+                    # diagnostic view can say "a sampled row exists but no
+                    # contractual one" without a second query.
+                    "sources_available": [],
+                }
+            )
+        else:
+            series.append({**chosen, "date": current, "sources_available": sorted(item["source"] for item in candidates)})
+        current = date.fromordinal(current.toordinal() + 1)
+    return series
+
+
+def latest_closed_availability(
+    session: Session, *, asset_id: int, on_or_before: date, lookback_days: int = 30
+) -> dict[str, Any] | None:
+    """The most recent day that actually produced a WAT figure, or `None`.
+
+    "Último dia fechado" in the UI sense: the newest day inside the lookback
+    that carries a real percentage. A day that was materialized but came out
+    `indeterminate` is not it -- the operator asked what the last measured
+    availability was, and an absent figure is not an answer to that, so this
+    keeps walking back rather than presenting coverage evidence as a KPI.
+
+    Returns `None` when nothing in the window carries a figure. The caller
+    shows a dash and the coverage of the most recent day beside it (see
+    `web/series.availability_panel`); it never shows a zero.
+    """
+    series = asset_availability_series(
+        session,
+        asset_id=asset_id,
+        from_date=date.fromordinal(on_or_before.toordinal() - max(lookback_days - 1, 0)),
+        to_date=on_or_before,
+    )
+    for entry in reversed(series):
+        if entry["availability_pct"] is not None:
+            return entry
+    return None
 
 
 # Monthly/coverage vocabulary for `monthly_availability_for_asset`, kept
