@@ -286,6 +286,17 @@ def _execute_production(job: ClaimedJob, *, settings: Settings, session_factory:
         if not isinstance(days, int):
             raise ValueError("Production reconciliation source_days is invalid.")
         result = service.sync_reconciliation(connection_id, source_days=days)
+    elif job.payload.get("bootstrap"):
+        # A connection's first backfill. The scheduler states where the
+        # history starts (`initial_production_from_date`) and nothing else;
+        # the end of the window is provider-local yesterday, resolved inside
+        # the service against the connection's own verified timezone.
+        result = service.sync_bootstrap_backfill(
+            connection_id,
+            start_date=_date(job.payload, "start_date", required=True),
+            resume_from=_date(job.payload, "next_source_day"),
+            batch_checkpoint=job.payload.get("backfill_batch_checkpoint"),
+        )
     else:
         result = service.sync_bounded_backfill(
             connection_id,

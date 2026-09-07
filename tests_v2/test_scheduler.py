@@ -5,10 +5,14 @@ from concurrent.futures import ThreadPoolExecutor
 
 from sqlalchemy import select
 
+from datetime import date, timedelta
+
 from nemsei.db import build_engine, build_session_factory
 from nemsei.jobs.models import Job, ScheduleState
 from nemsei.jobs.repository import JobRepository
 from nemsei.jobs.scheduler import Scheduler
+from nemsei.providers.service import create_connection
+from tests_v2.production_scheduling_fixtures import seed_production_cursor
 from tests_v2.test_migrations import upgrade
 
 
@@ -218,11 +222,31 @@ def test_scheduler_never_enqueues_morning_briefing_when_disabled(settings, monke
 
 
 def test_scheduler_enqueues_production_sync_when_enabled(settings, monkeypatch) -> None:
+    """Now seeds a real connection: eligibility is read from the database.
+
+    The environment id used to be enough on its own, and the scheduler
+    enqueued for it whether or not such a connection existed. Since
+    migration 0044 a target has to be an enabled, configured FusionSolar
+    connection -- the environment id says *which* one, it no longer conjures
+    one -- so this fixture creates the connection it names and gives it the
+    cursor that puts it in incremental mode.
+    """
     upgrade(settings, monkeypatch)
+    engine = build_engine(settings)
+    factory = build_session_factory(engine)
+    with factory() as session, session.begin():
+        connection = create_connection(
+            session, provider_code="fusionsolar", connection_key="sched-prod", display_name="Conta de produção",
+            credential_reference="dev", enabled=True, configuration_status="configured",
+        )
+        session.flush()
+        connection_id = connection.id
+        seed_production_cursor(session, connection_id=connection_id, last_completed_day=date.today() - timedelta(days=1))
+
     production_settings = dataclasses.replace(
         settings,
         production_sync_scheduler_enabled=True,
-        production_sync_scheduler_connection_id=3,
+        production_sync_scheduler_connection_id=connection_id,
         production_sync_scheduler_interval_hours=24,
     )
     scheduler = Scheduler(production_settings, owner_token="scheduler-production")
@@ -230,11 +254,10 @@ def test_scheduler_enqueues_production_sync_when_enabled(settings, monkeypatch) 
     assert scheduler.run_once() is True
     assert scheduler.run_once() is False
 
-    engine = build_engine(settings)
-    with build_session_factory(engine)() as session:
+    with factory() as session:
         jobs = session.scalars(select(Job).where(Job.job_type == "production.incremental")).all()
     assert len(jobs) == 1
-    assert jobs[0].payload_json["connection_id"] == 3
+    assert jobs[0].payload_json["connection_id"] == connection_id
 
 
 def test_scheduler_never_enqueues_production_sync_when_disabled(settings, monkeypatch) -> None:

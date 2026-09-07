@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -505,3 +505,140 @@ def test_an_explicitly_bounded_incremental_call_is_not_chunked(settings, monkeyp
         connection_id, start_date=date(2026, 8, 1), end_date=date(2026, 8, 5)
     )
     assert result.requested_until == date(2026, 8, 5) and result.next_source_day is None
+
+# ---------------------------------------------------------------------------
+# Bootstrap: a primeira sincronização de uma connection sem cursor.
+# ---------------------------------------------------------------------------
+# Um incremental sem cursor recusa-se a arrancar ("The first production sync
+# requires an explicit start date"), e essa recusa está certa: adivinhar a
+# data inicial é ou um ano de chamadas que ninguém pediu, ou um buraco
+# silencioso no início. O bootstrap é a alternativa explícita -- a data vem
+# da connection, e só o fim da janela é resolvido aqui, porque "ontem" é
+# ontem na hora local do provider e mais nada.
+
+
+def test_an_incremental_without_a_cursor_still_refuses_to_guess(settings, monkeypatch):
+    """A segurança que o bootstrap não remove."""
+    configured_environment(monkeypatch)
+    factory = factory_for(settings, monkeypatch)
+    connection_id, _mappings = selected_connection(factory)
+    result = service(factory, settings, FakeTransport([])).sync_incremental(connection_id)
+    assert result.status == "failed" and result.error_code == "configuration"
+    with factory() as session:
+        assert session.scalar(select(func.count()).select_from(ProductionFact)) == 0
+
+
+def test_the_bootstrap_ends_on_provider_local_yesterday(settings, monkeypatch):
+    """O scheduler manda a data inicial e mais nada; o fim é do serviço.
+
+    O contrato de produção é que fixa o fuso ("UTC" nestes testes), e
+    `_window` recusa qualquer dia local do provider que ainda não fechou. Se
+    o fim viesse do agendador em UTC, uma conta num fuso atrás de UTC pedia
+    um dia por fechar e a corrida falhava.
+    """
+    configured_environment(monkeypatch)
+    factory = factory_for(settings, monkeypatch)
+    connection_id, _mappings = selected_connection(factory)
+    yesterday = datetime.now(timezone.utc).date() - timedelta(days=1)
+    start = yesterday - timedelta(days=1)
+    transport = FakeTransport([
+        response(LOGIN_OK, headers={"XSRF-TOKEN": "token"}),
+        daily([row("FS-001", "10")]),
+        daily([row("FS-001", "11")]),
+    ])
+    result = service(factory, settings, transport).sync_bootstrap_backfill(connection_id, start_date=start)
+    assert result.status == "success"
+    assert result.requested_from == start and result.requested_until == yesterday
+    assert result.mode == "bounded_backfill"
+    with factory() as session:
+        cursor = session.scalar(select(SyncCursor))
+    assert cursor is not None and cursor.checkpoint_json["last_completed_day"] == yesterday.isoformat()
+
+
+def test_the_bootstrap_creates_the_cursor_an_incremental_then_resumes_from(settings, monkeypatch):
+    """`cursor criado -> production.incremental passa a operar normalmente`."""
+    configured_environment(monkeypatch)
+    factory = factory_for(settings, monkeypatch)
+    connection_id, _mappings = selected_connection(factory)
+    yesterday = datetime.now(timezone.utc).date() - timedelta(days=1)
+    bootstrap_transport = FakeTransport([
+        response(LOGIN_OK, headers={"XSRF-TOKEN": "token"}),
+        daily([row("FS-001", "10")]),
+    ])
+    service(factory, settings, bootstrap_transport).sync_bootstrap_backfill(connection_id, start_date=yesterday)
+
+    # Sem data nenhuma: o incremental que antes falhava agora resolve a
+    # janela a partir do cursor que o bootstrap deixou.
+    incremental = service(factory, settings, FakeTransport([
+        response(LOGIN_OK, headers={"XSRF-TOKEN": "token"}),
+        daily([row("FS-001", "10")]),
+    ])).sync_incremental(connection_id)
+    assert incremental.status == "success"
+    assert incremental.requested_from == yesterday
+
+
+def test_the_bootstrap_is_idempotent_and_writes_no_duplicate_fact(settings, monkeypatch):
+    configured_environment(monkeypatch)
+    factory = factory_for(settings, monkeypatch)
+    connection_id, _mappings = selected_connection(factory)
+    yesterday = datetime.now(timezone.utc).date() - timedelta(days=1)
+    for _attempt in range(2):
+        service(factory, settings, FakeTransport([
+            response(LOGIN_OK, headers={"XSRF-TOKEN": "token"}),
+            daily([row("FS-001", "10")]),
+        ])).sync_bootstrap_backfill(connection_id, start_date=yesterday)
+    with factory() as session:
+        facts = list(session.scalars(select(ProductionFact)))
+    # Um facto, uma revisão: `production_facts` é append-only com
+    # idempotência canónica, por isso repetir o dia não duplica nada.
+    assert len(facts) == 1
+    assert facts[0].source_revision == 1
+
+
+def test_a_bootstrap_window_wider_than_the_limit_takes_the_oldest_allowed_slice(settings, monkeypatch):
+    """Uma história longa é percorrida em pedaços, não recusada de uma vez.
+
+    Nada marca a connection como concluída: o cursor que este pedaço deixa
+    é de onde o próximo tick recomeça, e o ecrã de cobertura continua a
+    dizer até onde chegou.
+    """
+    configured_environment(monkeypatch)
+    factory = factory_for(settings, monkeypatch)
+    connection_id, _mappings = selected_connection(factory)
+    yesterday = datetime.now(timezone.utc).date() - timedelta(days=1)
+    bounded = FusionSolarProductionService(
+        factory,
+        replace(
+            settings,
+            capabilities={**settings.capabilities, "provider_reads": True},
+            production_backfill_max_source_days=3,
+            production_backfill_chunk_days=3,
+        ),
+        client_factory=lambda credentials: FusionSolarClient(credentials, transport=FakeTransport([
+            response(LOGIN_OK, headers={"XSRF-TOKEN": "token"}),
+            daily([row("FS-001", "1")]),
+            daily([row("FS-001", "2")]),
+            daily([row("FS-001", "3")]),
+        ])),
+    )
+    start = yesterday - timedelta(days=10)
+    result = bounded.sync_bootstrap_backfill(connection_id, start_date=start)
+    assert result.requested_from == start
+    assert result.requested_until == start + timedelta(days=2)
+    # Ainda falta história: a corrida diz por onde continuar.
+    assert result.next_source_day is None or result.next_source_day > result.requested_until
+
+
+def test_a_bootstrap_without_a_verified_contract_fails_as_configuration(settings, monkeypatch):
+    """Sem fuso e unidade verificados não há bootstrap -- e a falha fica
+    registada na corrida e na saúde da ligação como qualquer outra."""
+    configured_environment(monkeypatch)
+    monkeypatch.delenv("NEMSEI_V2_FUSIONSOLAR_PRODUCTION_PRODUCTION_TIMEZONE")
+    factory = factory_for(settings, monkeypatch)
+    connection_id, _mappings = selected_connection(factory)
+    result = service(factory, settings, FakeTransport([])).sync_bootstrap_backfill(
+        connection_id, start_date=date(2026, 1, 1)
+    )
+    assert result.status == "failed" and result.error_code == "configuration"
+    with factory() as session:
+        assert session.scalar(select(func.count()).select_from(ProductionFact)) == 0

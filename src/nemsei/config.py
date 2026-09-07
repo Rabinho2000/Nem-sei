@@ -512,8 +512,14 @@ class Settings:
             raise ConfigurationError("Device status polling requires a positive lifetime cycle cap; there is no uncapped mode.")
         if self.production_sync_scheduler_interval_hours <= 0:
             raise ConfigurationError("Production sync scheduler interval must be positive.")
-        if self.production_sync_scheduler_enabled and self.production_sync_scheduler_connection_id is None:
-            raise ConfigurationError("Production sync scheduling requires an explicit connection id; there is no portfolio-wide mode.")
+        # No longer requires the environment connection id. Eligibility moved
+        # to `provider_connections.production_sync_enabled` (migration 0044),
+        # which is still explicit and still per connection -- there is no
+        # portfolio-wide mode, and turning this switch on with nothing marked
+        # eligible schedules nothing rather than sweeping the fleet. The
+        # environment id stays supported as an additional target so a
+        # deployment that has not set the column keeps syncing what it syncs
+        # today; see `sync/production_scheduling.py`.
         for label, interval, enabled, connection_id in (
             ("FusionSolar", self.current_monitoring_scheduler_interval_minutes, self.current_monitoring_scheduler_enabled, self.current_monitoring_scheduler_connection_id),
             ("Sigenergy", self.sigenergy_current_monitoring_scheduler_interval_minutes, self.sigenergy_current_monitoring_scheduler_enabled, self.sigenergy_current_monitoring_scheduler_connection_id),

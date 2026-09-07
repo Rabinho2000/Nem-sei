@@ -7,6 +7,7 @@ import uuid
 from nemsei.config import Settings
 from nemsei.db import build_engine, build_session_factory
 from nemsei.jobs.repository import JobRepository
+from nemsei.sync.production_scheduling import MODE_BOOTSTRAP, MODE_INCREMENTAL
 
 
 class Scheduler:
@@ -34,17 +35,46 @@ class Scheduler:
                 max_cycles=self.settings.device_status_poll_max_cycles,
             )
             created = created or device_created
-        # Off by default, and even when on, restricted to exactly the one
-        # connection id configured -- never a loop over every FusionSolar
-        # connection (docs/v2/FUSIONSOLAR_OWNERSHIP_WINDOW.md's rollout
-        # write-up: this is a shared, rate-limited account, so scaling here
-        # needs a deliberate second call site, not a config flip).
-        if self.settings.production_sync_scheduler_enabled and self.settings.production_sync_scheduler_connection_id is not None:
-            _production_job, production_created = self.repository.enqueue_due_production_incremental(
-                connection_id=self.settings.production_sync_scheduler_connection_id,
-                interval_hours=self.settings.production_sync_scheduler_interval_hours,
-            )
-            created = created or production_created
+        # Off by default, and even when on, restricted to connections that
+        # were each explicitly turned on -- never a loop over every
+        # FusionSolar connection (docs/v2/FUSIONSOLAR_OWNERSHIP_WINDOW.md's
+        # rollout write-up: this is a shared, rate-limited account). What
+        # changed from the single-connection rollout is where the list comes
+        # from: `provider_connections.production_sync_enabled`, default
+        # false, plus the environment id the rollout used, so a deployment
+        # that has not set the column keeps syncing what it syncs today.
+        #
+        # Each target carries its own interval, its own schedule key, its own
+        # dedupe key and its own cursor, so two accounts cannot interfere.
+        # A connection with no cursor gets a bounded backfill from its stated
+        # `initial_production_from_date` instead of an incremental run that
+        # can only fail; one with neither gets nothing at all, and no
+        # provider call, until an operator states where its history starts.
+        if self.settings.production_sync_scheduler_enabled:
+            for target in self.repository.production_schedule_targets(
+                default_interval_hours=self.settings.production_sync_scheduler_interval_hours,
+                max_incremental_gap_days=self.settings.production_max_source_days,
+                legacy_connection_id=self.settings.production_sync_scheduler_connection_id,
+            ):
+                if target.mode == MODE_INCREMENTAL:
+                    _production_job, production_created = self.repository.enqueue_due_production_incremental(
+                        connection_id=target.connection_id,
+                        interval_hours=target.interval_hours,
+                    )
+                elif target.mode == MODE_BOOTSTRAP:
+                    assert target.start_date is not None
+                    _production_job, production_created = self.repository.enqueue_due_production_bootstrap(
+                        connection_id=target.connection_id,
+                        start_date=target.start_date,
+                        interval_hours=target.interval_hours,
+                    )
+                else:
+                    # `not_initialized`: deliberately nothing. The connection
+                    # shows as "Produção não inicializada" on the coverage
+                    # screen and costs no calls until someone says where to
+                    # start.
+                    continue
+                created = created or production_created
         # Sigenergy, same shape and same restraint: off by default, one
         # explicit connection, never a loop over every Sigenergy connection.
         if self.settings.sigenergy_sync_scheduler_enabled and self.settings.sigenergy_sync_scheduler_connection_id is not None:

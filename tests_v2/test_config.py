@@ -92,13 +92,21 @@ def test_production_sync_scheduler_disabled_by_default_needs_no_extra_config() -
     assert configured().validate().production_sync_scheduler_enabled is False
 
 
-def test_production_sync_scheduler_enabled_requires_an_explicit_connection_id() -> None:
-    """Same structural restraint as device-status polling: no 'sync every
-    FusionSolar connection' mode exists -- a shared, rate-limited account
-    needs a deliberate second call site to scale, not a config flip."""
+def test_production_sync_scheduler_enabled_without_a_connection_id_validates() -> None:
+    """The restraint moved, it did not go away.
+
+    This used to refuse to start without `NEMSEI_V2_PRODUCTION_SYNC_SCHEDULER_
+    CONNECTION_ID`, because there was no other way to say which connection to
+    sync and "all of them" was never on offer. Eligibility now lives on the
+    connection itself (`provider_connections.production_sync_enabled`,
+    default false, migration 0044), so the switch alone is a valid
+    configuration -- and still schedules nothing until an operator turns a
+    specific connection on. There is still no portfolio-wide mode; see
+    `sync/production_scheduling.py` and `test_production_scheduling.py`,
+    which pins that a connection nobody enabled is never a target.
+    """
     settings = dataclasses.replace(configured(), production_sync_scheduler_enabled=True)
-    with pytest.raises(ConfigurationError):
-        settings.validate()
+    assert settings.validate().production_sync_scheduler_connection_id is None
 
 
 def test_production_sync_scheduler_enabled_with_connection_id_validates() -> None:
