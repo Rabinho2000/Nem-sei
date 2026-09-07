@@ -40,21 +40,25 @@ def _client(payload):
     return client, transport
 
 
-_REAL_ROW = {
-    "devId": 1000000154743792,
-    "sn": "ES23C0085410",
+# Sanitised: the identifiers are synthetic, the *shape* is what was captured
+# from the live account on 2026-09-06 (see docs/v2/FUSIONSOLAR_DEVICE_HISTORY.md).
+# Pinning the shape is the point of this fixture; a real inverter serial adds
+# nothing to it.
+_CAPTURED_ROW = {
+    "devId": 1000000000000001,
+    "sn": "SN-TEST-0000001",
     "collectTime": 1788480000000,
     "dataItemMap": {"active_power": 0.0, "inverter_state": 40960.0, "day_cap": 0.0, "efficiency": 0.0},
 }
 
 
 def test_posts_the_v1_payload_shape_to_the_verified_endpoint() -> None:
-    client, transport = _client({"success": True, "failCode": 0, "data": [_REAL_ROW]})
+    client, transport = _client({"success": True, "failCode": 0, "data": [_CAPTURED_ROW]})
     rows = client.device_history_batch(["A", "B"], device_type_id=1, start_time_ms=1788480000000, end_time_ms=1788566399999)
     url, payload = transport.calls[0]
     assert url.endswith("/thirdData/getDevHistoryKpi")
     assert payload == {"devIds": "A,B", "devTypeId": 1, "startTime": 1788480000000, "endTime": 1788566399999}
-    assert rows == [_REAL_ROW]
+    assert rows == [_CAPTURED_ROW]
 
 
 def test_refuses_more_than_ten_devices() -> None:
@@ -119,13 +123,13 @@ def test_the_real_captured_row_normalizes_through_the_existing_device_normalizer
     )
 
     sample = normalize_device_realtime_row(
-        _REAL_ROW,
-        expected_external_ids=frozenset({"1000000154743792"}),
+        _CAPTURED_ROW,
+        expected_external_ids=frozenset({"1000000000000001"}),
         contract=FusionSolarDeviceContract(active_power_unit="kW", day_energy_unit="kWh"),
         ingested_at=datetime(2026, 9, 6, tzinfo=timezone.utc),
     )
     assert sample is not None
-    assert sample.external_device_id == "1000000154743792"
+    assert sample.external_device_id == "1000000000000001"
     assert sample.observed_at == datetime(2026, 9, 4, 0, 0, tzinfo=timezone.utc)
     assert sample.raw_inverter_state == "40960.0"
     assert float(sample.active_power_kw) == 0.0
