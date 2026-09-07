@@ -493,31 +493,36 @@ def asset_availability_series(
     return series
 
 
-def latest_closed_availability(
-    session: Session, *, asset_id: int, on_or_before: date, lookback_days: int = 30
-) -> dict[str, Any] | None:
-    """The most recent day that actually produced a WAT figure, or `None`.
+def latest_measured_entry(series: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The newest entry of a series that actually carries a figure.
 
-    "Último dia fechado" in the UI sense: the newest day inside the lookback
-    that carries a real percentage. A day that was materialized but came out
-    `indeterminate` is not it -- the operator asked what the last measured
-    availability was, and an absent figure is not an answer to that, so this
-    keeps walking back rather than presenting coverage evidence as a KPI.
-
-    Returns `None` when nothing in the window carries a figure. The caller
-    shows a dash and the coverage of the most recent day beside it (see
-    `web/series.availability_panel`); it never shows a zero.
+    "Último dia fechado" in the UI sense, and the one place that rule lives.
+    A day that was materialized but came out `indeterminate` is not it: the
+    question is what the last *measured* availability was, and an absent
+    figure is not an answer to it, so this keeps walking back rather than
+    presenting coverage evidence as a KPI. `None` when the window carries no
+    figure at all -- the caller shows a dash and the coverage beside it, and
+    never a zero.
     """
-    series = asset_availability_series(
-        session,
-        asset_id=asset_id,
-        from_date=date.fromordinal(on_or_before.toordinal() - max(lookback_days - 1, 0)),
-        to_date=on_or_before,
-    )
     for entry in reversed(series):
         if entry["availability_pct"] is not None:
             return entry
     return None
+
+
+def latest_closed_availability(
+    session: Session, *, asset_id: int, on_or_before: date, lookback_days: int = 30
+) -> dict[str, Any] | None:
+    """`latest_measured_entry` over a freshly read window, for callers that
+    want the figure alone and have no series in hand."""
+    return latest_measured_entry(
+        asset_availability_series(
+            session,
+            asset_id=asset_id,
+            from_date=date.fromordinal(on_or_before.toordinal() - max(lookback_days - 1, 0)),
+            to_date=on_or_before,
+        )
+    )
 
 
 # Monthly/coverage vocabulary for `monthly_availability_for_asset`, kept

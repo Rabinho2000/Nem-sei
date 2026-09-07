@@ -374,25 +374,30 @@ def availability_panel(session: Session, *, asset_id: int, days: int = AVAILABIL
 def _availability_kpi(series: list[dict[str, Any]]) -> dict[str, Any]:
     """O último dia fechado com WAT -- ou o que faltou para o haver.
 
-    "Último dia fechado" é o dia mais recente da janela que traz mesmo uma
-    percentagem. Um dia materializado que saiu `indeterminate` não serve de
-    KPI: a pergunta é qual foi a última disponibilidade medida, e uma
-    ausência não é resposta a isso. Quando não há nenhuma, devolve na mesma
-    a cobertura do dia mais recente que chegou a ser materializado, para a
-    página poder dizer *porquê* em vez de só mostrar um traço.
+    Qual é esse dia é decidido por
+    `availability_service.latest_measured_entry`, não aqui: a regra ("um dia
+    materializado que saiu `indeterminate` não serve de KPI") tem de valer
+    igual em qualquer sítio que pergunte, e uma segunda cópia era o começo
+    de duas respostas diferentes para a mesma pergunta.
+
+    Quando não há nenhuma, devolve na mesma a cobertura do dia mais recente
+    que chegou a ser materializado, para a página poder dizer *porquê* em
+    vez de só mostrar um traço.
     """
-    for entry in reversed(series):
-        if entry["availability_pct"] is not None:
-            return {
-                "available": True,
-                "date": entry["date"],
-                "availability_pct": entry["availability_pct"],
-                "kind": availability_kind(entry["source_kind"]),
-                "source_label": availability_source(entry["source"]),
-                "valid_sample_count": entry["valid_sample_count"],
-                "observed_device_count": entry["observed_device_count"],
-                "expected_device_count": entry["expected_device_count"],
-            }
+    from nemsei.diagnostics.availability_service import latest_measured_entry  # local: mesmo ciclo que acima
+
+    measured = latest_measured_entry(series)
+    if measured is not None:
+        return {
+            "available": True,
+            "date": measured["date"],
+            "availability_pct": measured["availability_pct"],
+            "kind": availability_kind(measured["source_kind"]),
+            "source_label": availability_source(measured["source"]),
+            "valid_sample_count": measured["valid_sample_count"],
+            "observed_device_count": measured["observed_device_count"],
+            "expected_device_count": measured["expected_device_count"],
+        }
     for entry in reversed(series):
         if entry["source"] is not None:
             return {
