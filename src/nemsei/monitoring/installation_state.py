@@ -32,13 +32,14 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from nemsei.diagnostics.models import DeviceStatusFact
 from nemsei.monitoring.models import MonitoringCurrentState, MonitoringObservation
 from nemsei.providers.models import AssetProviderMapping
 from nemsei.shared.clock import utc_now
+from nemsei.sources.models import AssetSourcePolicy
 
 
 INSTALLATION_STATES = ("operational", "standby", "warning", "fault", "offline", "unknown", "stale", "no_evidence")
@@ -206,21 +207,64 @@ def current_installation_states(
     moment = now or utc_now()
     ids = list(dict.fromkeys(asset_ids))
 
+    # One mapping per asset -- the one the monitoring source policy selects --
+    # and then that mapping's own observation and that mapping's own
+    # confirmation. Both used to be taken independently across every mapping of
+    # the asset: the newest observation of any of them, and separately the
+    # newest `last_confirmed_at` of any of them. So a SCADA mapping polled a
+    # minute ago made a two-day-old FusionSolar observation look current, and
+    # the plant read "operacional" on evidence nobody had re-confirmed.
+    #
+    # Ranked the same way production facts are: policy primary, then policy
+    # fallback, then -- last, and only because excluding it would blank assets
+    # that have no monitoring policy at all -- a mapping with no policy.
+    on_date = moment.date()
+    policy = AssetSourcePolicy
+    chosen = (
+        select(AssetProviderMapping.asset_id, AssetProviderMapping.id.label("provider_mapping_id"))
+        .outerjoin(
+            policy,
+            and_(
+                policy.asset_id == AssetProviderMapping.asset_id,
+                policy.source_use == "monitoring",
+                policy.provider_mapping_id == AssetProviderMapping.id,
+                policy.valid_from <= on_date,
+                or_(policy.valid_to.is_(None), policy.valid_to >= on_date),
+            ),
+        )
+        .where(
+            AssetProviderMapping.asset_id.in_(ids),
+            AssetProviderMapping.mapping_status == "active",
+        )
+        .distinct(AssetProviderMapping.asset_id)
+        .order_by(
+            AssetProviderMapping.asset_id,
+            policy.is_fallback.asc().nullslast(),
+            policy.priority.asc().nullslast(),
+            AssetProviderMapping.id.asc(),
+        )
+        .subquery()
+    )
+
     observations = session.execute(
-        select(MonitoringObservation.asset_id, MonitoringObservation.condition, MonitoringObservation.observed_at)
+        select(
+            MonitoringObservation.asset_id,
+            MonitoringObservation.condition,
+            MonitoringObservation.observed_at,
+        )
+        .join(chosen, chosen.c.provider_mapping_id == MonitoringObservation.provider_mapping_id)
         .where(MonitoringObservation.asset_id.in_(ids))
         .distinct(MonitoringObservation.asset_id)
         .order_by(MonitoringObservation.asset_id, MonitoringObservation.observed_at.desc(), MonitoringObservation.id.desc())
     ).all()
     plant = {asset_id: (condition, observed_at) for asset_id, condition, observed_at in observations}
-    # When each plant was last successfully re-read, which is a different clock
-    # from the observation's own timestamp -- see classify_installation_state.
+    # When this plant was last successfully re-read *through the same mapping*,
+    # which is a different clock from the observation's own timestamp -- see
+    # classify_installation_state.
     confirmations = dict(
         session.execute(
-            select(AssetProviderMapping.asset_id, func.max(MonitoringCurrentState.last_confirmed_at))
-            .join(MonitoringCurrentState, MonitoringCurrentState.provider_mapping_id == AssetProviderMapping.id)
-            .where(AssetProviderMapping.asset_id.in_(ids))
-            .group_by(AssetProviderMapping.asset_id)
+            select(chosen.c.asset_id, MonitoringCurrentState.last_confirmed_at)
+            .join(MonitoringCurrentState, MonitoringCurrentState.provider_mapping_id == chosen.c.provider_mapping_id)
         ).all()
     )
 
