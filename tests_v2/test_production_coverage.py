@@ -30,7 +30,10 @@ from nemsei.diagnostics.production_coverage import (
     STATE_OK,
     STATE_PRODUCTION_CONTRACT_MISSING,
     STATE_RATE_LIMITED,
+    STATE_CREDENTIAL_REFERENCE_MISSING,
+    STATE_SYNC_DEFERRED,
     STATE_SYNC_FAILED,
+    STATE_UNKNOWN,
     assess_production_coverage,
     coverage_summary,
 )
@@ -257,6 +260,62 @@ def test_a_connection_with_a_cursor_but_no_schedule(settings, monkeypatch):
         finding = _finding(session)
     assert finding.state == STATE_NOT_SCHEDULED
     assert finding.scheduled is False
+
+
+def test_a_connection_with_no_credential_reference(settings, monkeypatch):
+    """Reportado antes do contrato de ambiente, porque é a referência que
+    dá o prefixo das variáveis -- sem ela não há sequer onde as procurar."""
+    factory = factory_for(settings, monkeypatch)
+    contract_environment(monkeypatch)
+    with factory() as session, session.begin():
+        connection = _connection(session)
+        _mapped_asset(session, connection)
+        connection.credential_reference = None
+    with factory() as session:
+        assert _state(session) == STATE_CREDENTIAL_REFERENCE_MISSING
+
+
+def test_a_deferred_sync_is_a_cooldown_not_a_fault(settings, monkeypatch):
+    factory = factory_for(settings, monkeypatch)
+    contract_environment(monkeypatch)
+    with factory() as session, session.begin():
+        connection = _connection(session)
+        _mapped_asset(session, connection)
+        seed_production_cursor(session, connection_id=connection.id, last_completed_day=YESTERDAY)
+        _schedule(session, connection.id)
+        _sync_run(session, connection.id, status="deferred")
+    with factory() as session:
+        finding = _finding(session)
+    assert finding.state == STATE_SYNC_DEFERRED
+    assert "esperar" in finding.recommended_action
+
+
+def test_a_primary_policy_pointing_at_a_mapping_that_is_no_longer_active(settings, monkeypatch):
+    """O estado por apurar, e a única coisa que o produz.
+
+    A central foi remapeada: o mapping novo está activo, mas a política de
+    produção ficou a apontar para o antigo, que já expirou. Não é "sem
+    mapping" (há um activo) nem "sem política" (há uma), e é por isso que
+    tem estado próprio: a acção é ir corrigir a política, não criar nada.
+
+    Se o mapping antigo fosse o único, o diagnóstico correcto passaria a
+    ser `no_provider_mapping` -- e é, o que este arranjo confirma por
+    contraste.
+    """
+    factory = factory_for(settings, monkeypatch)
+    contract_environment(monkeypatch)
+    with factory() as session, session.begin():
+        connection = _connection(session)
+        asset, old_mapping = _mapped_asset(session, connection)
+        old_mapping.valid_to = date(2020, 6, 1)
+        create_mapping(
+            session, asset_id=asset.id, provider_connection_id=connection.id,
+            external_id="ST-NOVO", valid_from=date(2020, 6, 2),
+        )
+    with factory() as session:
+        finding = _finding(session)
+    assert finding.state == STATE_UNKNOWN
+    assert "source-policies" in finding.recommended_action
 
 
 def test_a_rate_limited_connection_is_not_reported_as_a_failure(settings, monkeypatch):
