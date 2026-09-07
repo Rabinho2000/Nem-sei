@@ -24,7 +24,6 @@ from nemsei.reporting.rules.availability_slots import (
     DeviceHistorySample,
     apply_edge_tolerance,
     compute_asset_contractual_day,
-    device_day_availability,
     is_available,
     slot_of,
 )

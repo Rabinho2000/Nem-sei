@@ -11,7 +11,7 @@ não importa nenhum cliente de provider em lado nenhum.
 """
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import timedelta
 from decimal import Decimal
 
 import pytest

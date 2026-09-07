@@ -795,3 +795,61 @@ lives in **`docs/v2/FUSIONSOLAR_DEVICE_HISTORY.md`**. The short version:
   It is a density problem, not a threshold problem — `late_first_sample` and
   `early_last_sample` account for 44 warnings between them, against 6 030
   gap and 5 813 minimum-count warnings. Thresholds were left untouched.
+
+## Addendum, 2026-09-07: um bug de leitura, e a WAT diária na instalação
+
+### O bug que a coexistência das duas fontes trouxe
+
+`asset_availability_daily` tem a source na chave única
+(`uq_asset_availability_daily_day`), precisamente para o número contratual
+e o operacional poderem coexistir no mesmo dia. Os dois rollups diários —
+`installation_availability_for_date` e `portfolio_availability_for_date` —
+continuavam a ler a tabela como se a chave fosse `(asset_id,
+availability_date)`, com um `if len(rows) != len(asset_ids): return None`.
+
+Falhava nos dois sentidos, e o segundo é o grave:
+
+- um asset com duas sources contava como dois assets, e uma instalação de
+  um asset com contratual + operacional passava a `None`;
+- **dois assets, um com duas sources e outro sem nenhuma, davam uma
+  contagem que batia certo por acaso.** O guard passava, o primeiro asset
+  entrava duas vezes na média ponderada e o segundo desaparecia — uma
+  percentagem publicada para um parque que nunca foi todo medido.
+
+Corrigido com um único caminho de leitura,
+`availability_service.selected_availability_by_asset`, que carrega todas as
+linhas do dia, constrói candidates e decide em `select_availability`. A
+prioridade continua a existir num só sítio. `monthly_availability_for_asset`
+já fazia isto e não foi tocada.
+
+Testes: `tests_v2/test_availability_multi_source.py` — só contratual, só
+operacional, as duas no mesmo dia, contratual com `availability_pct=None` e
+operacional válida, dois assets com duas sources cada, asset sem nada, e
+determinismo face à ordem das linhas.
+
+### A WAT diária deixou de estar só no fecho mensal
+
+`availability_service.asset_availability_series` devolve um registo por dia
+do intervalo — **incluindo os dias sem linha nenhuma**, com
+`availability_pct=None` e `coverage_status='missing'`. É essa a garantia de
+que um gráfico construído a partir dela desenha um buraco e nunca uma barra
+a zero.
+
+`web/series.availability_panel` monta com isso o KPI do último dia fechado
+*com valor*, o gráfico de 60 dias e a tabela dia a dia da página da
+instalação. Sem valor, o KPI diz o que faltou (cobertura, inversores
+observados de esperados) em vez de um traço mudo.
+
+O vocabulário está em `web/labels.py` e obriga a fonte operacional a dizer
+"amostrada"; nunca partilha a palavra "Contratual". Renderizar a página não
+pode chamar o provider — nem `web/series.py` nem
+`diagnostics/availability_service.py` importam `nemsei.integrations`, e há
+um teste que o prende.
+
+### Produção e WAT continuam independentes
+
+`tests_v2/test_production_availability_independence.py` fixa os três casos
+(facto sem histórico, histórico sem facto, os dois) e, sobretudo, que um
+dia de 0 kWh com os inversores todos disponíveis sai a 100 %. Não existe
+fallback de disponibilidade a partir de energia diária e dois testes
+estruturais impedem que passe a existir.

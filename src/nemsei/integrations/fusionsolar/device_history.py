@@ -30,7 +30,6 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from nemsei.config import Settings
@@ -51,7 +50,7 @@ from nemsei.integrations.fusionsolar.session_cache import (
 from nemsei.diagnostics.availability_service import expected_device_mappings_for_date
 from nemsei.diagnostics.service import record_device_status
 from nemsei.providers.errors import ProviderError, ProviderErrorCode
-from nemsei.providers.models import AssetProviderMapping, ProviderConnection
+from nemsei.providers.models import ProviderConnection
 from nemsei.providers.registry import ProviderCapability, ProviderCode
 from nemsei.providers.repository import ProviderRepository
 from nemsei.shared.clock import utc_now
