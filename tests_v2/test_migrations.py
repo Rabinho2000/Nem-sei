@@ -184,3 +184,56 @@ def test_availability_source_kind_migration_labels_existing_rows_without_losing_
     assert "source_kind" in {
         column["name"] for column in inspect(create_engine(settings.database_url)).get_columns("asset_availability_daily")
     }
+
+
+def test_production_scheduling_migration_round_trips_over_a_populated_table(settings, monkeypatch) -> None:
+    """0044 corre sobre `provider_connections` com linhas, e volta atrás.
+
+    As três colunas são todas anuláveis ou com default, por isso nenhuma
+    linha existente pode violá-las e nada é reescrito -- e o downgrade não
+    perde nada derivado: os cursores, os jobs e os factos vivem noutras
+    tabelas.
+    """
+    upgrade(settings, monkeypatch)
+    engine = create_engine(settings.database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO provider_connections (provider_code, connection_key, display_name, enabled, "
+                "configuration_status, created_at, updated_at) "
+                "VALUES ('fusionsolar', 'legacy-conn', 'Conta antiga', true, 'configured', now(), now())"
+            )
+        )
+    columns = {column["name"] for column in inspect(engine).get_columns("provider_connections")}
+    assert {"production_sync_enabled", "production_sync_interval_hours", "initial_production_from_date"} <= columns
+    with engine.begin() as connection:
+        # O default é o conservador: ligar uma connection nunca começa a
+        # chamar um provider.
+        assert connection.execute(text("SELECT production_sync_enabled FROM provider_connections")).scalar() is False
+
+    command.downgrade(Config("alembic.ini"), "0043_device_history_facts")
+    after = inspect(create_engine(settings.database_url))
+    assert "production_sync_enabled" not in {column["name"] for column in after.get_columns("provider_connections")}
+    assert after.get_columns("provider_connections")  # a tabela e as suas linhas ficam
+    command.upgrade(Config("alembic.ini"), "head")
+    assert "production_sync_enabled" in {
+        column["name"] for column in inspect(create_engine(settings.database_url)).get_columns("provider_connections")
+    }
+
+
+def test_the_production_interval_column_refuses_a_non_positive_cadence(settings, monkeypatch) -> None:
+    """Um intervalo de zero horas seria um agendamento a disparar em ciclo
+    contra uma conta limitada; a base recusa-o antes de a config o ver."""
+    from sqlalchemy.exc import IntegrityError
+
+    upgrade(settings, monkeypatch)
+    engine = create_engine(settings.database_url)
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO provider_connections (provider_code, connection_key, display_name, enabled, "
+                    "configuration_status, production_sync_interval_hours, created_at, updated_at) "
+                    "VALUES ('fusionsolar', 'bad-interval', 'Conta', true, 'configured', 0, now(), now())"
+                )
+            )
