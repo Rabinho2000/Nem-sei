@@ -200,10 +200,34 @@ def _execute_sigenergy_production(job: ClaimedJob, connection_id: int, *, settin
     if job.job_type != "production.incremental":
         raise ValueError(f"Sigenergy production supports only production.incremental, not {job.job_type}.")
     result = SigenergyProductionService(session_factory, settings).sync_incremental(connection_id)
-    return JobOutcome(
-        status="success" if result.status in ("success", "partial") else "failed",
-        result={"mode": "daily_history", "result_status": result.status, "facts_written": result.facts_written},
-    )
+    result_json = {
+        "mode": "daily_history",
+        "result_status": result.status,
+        "facts_written": result.facts_written,
+        "expected": result.days_requested,
+        "accepted": result.days_accepted,
+        "rejected": result.days_rejected,
+        "error_code": result.error_code,
+    }
+    # `partial` used to map onto `success` here, in one expression, so a run
+    # that read four of five metrics -- or none at all, since an empty payload
+    # was accepted upstream -- finished the job green. Every unfinished
+    # outcome now takes the same path FusionSolar production takes: defer
+    # against a real cooldown when there is one, otherwise retry.
+    if result.status in {"failed", "rate_limited", "deferred", "partial"}:
+        _cooldown_defer(
+            session_factory,
+            connection_id=connection_id,
+            sync_run_id=result.sync_run_id,
+            error_code=result.error_code,
+            label="Sigenergy production incremental",
+            event_metadata=result_json,
+        )
+        raise RetryableJobError(
+            f"Sigenergy production incremental stopped with {result.status}.",
+            event_metadata=result_json,
+        )
+    return JobOutcome(status="success", result=result_json)
 
 
 def _execute_current_monitoring(job: ClaimedJob, *, settings: Settings, session_factory: sessionmaker[Session]) -> JobOutcome:
@@ -214,13 +238,20 @@ def _execute_current_monitoring(job: ClaimedJob, *, settings: Settings, session_
     (commit 094a40a), where a Sigenergy job could only ever be answered with
     "Connection is not FusionSolar".
 
-    A rate-limited or failed read is **not** a failed job. The provider
-    refusing to answer is a known operating condition of a shared account,
-    the services already record it on the sync run and the connection's
-    health, and marking the job failed would retry it three times against an
-    account that just said no. What must never happen -- and cannot, because
-    neither service writes an observation on error -- is a failed read
-    becoming an "offline" plant.
+    A read that collected nothing is not a successful job. This used to
+    return `success` unconditionally, whatever the service reported, so a
+    connection that was rate-limited, misconfigured or refused by policy
+    produced the same green row as one that read every plant -- and the
+    automation health page counted it among the runs that worked.
+
+    The old reasoning was sound about one thing and wrong about the other. It
+    is right that a rate limit must not burn three retries against an account
+    that just said no; that is what the cooldown deferral is for, and it is
+    used here now. It is wrong that the job should therefore claim success.
+
+    What must never happen -- and still cannot, because neither service
+    writes an observation on error -- is a failed read becoming an "offline"
+    plant.
     """
     connection_id = job.payload.get("connection_id")
     if not isinstance(connection_id, int) or connection_id <= 0:
@@ -234,16 +265,33 @@ def _execute_current_monitoring(job: ClaimedJob, *, settings: Settings, session_
         result = FusionSolarMonitoringService(session_factory, settings, session_cache=default_session_cache()).sync_current_monitoring(connection_id)
     else:
         raise ValueError(f"Plant state is not supported for provider {provider_code!r}.")
-    return JobOutcome(
-        status="success",
-        result={
-            "result_status": result.status,
-            "expected": result.expected,
-            "accepted": result.accepted,
-            "rejected": result.rejected,
-            "error_code": result.error_code,
-        },
-    )
+    result_json = {
+        "result_status": result.status,
+        "expected": result.expected,
+        "received": result.received,
+        "accepted": result.accepted,
+        "rejected": result.rejected,
+        "error_code": result.error_code,
+    }
+    if result.status == "deferred":
+        # Refused by our own policy, not by the provider. Retrying changes
+        # nothing, so it ends here -- visibly -- rather than looking collected.
+        return JobOutcome(status="failed", result={**result_json, "reason": "provider_reads_disabled"})
+    if result.status in {"failed", "rate_limited"}:
+        _cooldown_defer(
+            session_factory,
+            connection_id=connection_id,
+            sync_run_id=result.sync_run_id,
+            error_code=result.error_code,
+            label="Plant state read",
+            event_metadata=result_json,
+        )
+        raise RetryableJobError(
+            f"Plant state read stopped with {result.status}.", event_metadata=result_json
+        )
+    # `partial` is a real terminal outcome: some plants answered and some did
+    # not, and the ones that did are collected. It is not success.
+    return JobOutcome(status="success" if result.status == "success" else "partial", result=result_json)
 
 
 def _execute_report_month_close(*, session_factory: sessionmaker[Session]) -> JobOutcome:

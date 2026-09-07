@@ -152,6 +152,10 @@ class SigenergyProductionResult:
     provider_calls: int
     error_code: str | None = None
     days_rejected: int = 0
+    #: The run this result came from, so a rate-limited outcome can be
+    #: deferred against the persisted cooldown instead of spending the job's
+    #: retry budget on a call nobody made.
+    sync_run_id: int = 0
 
 
 class SigenergyProductionService:
@@ -494,5 +498,5 @@ class SigenergyProductionService:
             session.commit()
         return SigenergyProductionResult(
             status, requested, accepted, written, calls,
-            error.code.value if error else None, rejected,
+            error.code.value if error else None, rejected, run_id,
         )

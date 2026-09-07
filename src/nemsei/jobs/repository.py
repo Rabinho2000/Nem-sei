@@ -53,16 +53,36 @@ def safe_metadata(values: dict[str, Any] | None = None) -> dict[str, Any]:
     # provider-call batches it takes, how many already landed, and whether
     # this event's own attempt persisted one -- readable from job_events
     # without a database query.
+    # The counters an outcome is made of. Without them `result_json` said
+    # `partial` and never said partial *of what*: a device poll that read 11
+    # of 12 inverters and one that read 1 of 12 were the same row. They are
+    # integers with no provenance -- there is nothing in a count to leak --
+    # and they are coerced as integers rather than truncated as text, so a
+    # handler that miscounts fails here instead of storing prose.
+    counters = {
+        "expected", "received", "accepted", "rejected", "facts_written",
+        "runs_examined", "runs_abandoned", "delay_seconds",
+        "mapping_count", "batch_size", "batch_count", "next_batch",
+    }
     allowed = {
-        "reason", "delay_seconds", "schedule_key", "dedupe_key", "result_status", "mode",
-        "next_source_day", "runs_examined", "runs_abandoned", "called_provider",
-        "source_day", "mapping_count", "batch_size", "batch_count", "next_batch", "batch_persisted",
+        "reason", "schedule_key", "dedupe_key", "result_status", "mode",
+        "next_source_day", "called_provider", "error_code",
+        "source_day", "batch_persisted",
     }
-    return {
-        key: str(value)[:200]
-        for key, value in (values or {}).items()
-        if key in allowed and value is not None
-    }
+    kept: dict[str, Any] = {}
+    for key, value in (values or {}).items():
+        if value is None:
+            continue
+        if key in counters:
+            try:
+                kept[key] = str(int(value))
+            except (TypeError, ValueError):
+                # A counter that is not a number is not a counter. Dropping it
+                # is better than storing something that reads like one.
+                continue
+        elif key in allowed:
+            kept[key] = str(value)[:200]
+    return kept
 
 
 def _catch_up_slot(slot: datetime, *, now: datetime, interval: timedelta) -> datetime:
@@ -307,8 +327,15 @@ class JobRepository:
         result: dict[str, Any],
         actor_source: str = "worker",
     ) -> bool:
-        if status not in {"success", "partial"}:
-            raise ValueError("finish only accepts success or partial outcomes")
+        # `failed` belongs here. A handler that returns it has decided the
+        # work cannot be done -- `availability.history_sync` with no
+        # connection configured, for one -- and rejecting the status meant the
+        # worker's generic `except` turned a real, diagnosable outcome into a
+        # `ValueError` about this contract, then retried it twice more. The
+        # operator's event log recorded a bug in the queue instead of a
+        # misconfigured integration.
+        if status not in {"success", "partial", "failed"}:
+            raise ValueError("finish only accepts success, partial or failed outcomes")
         now = utc_now()
         with self._immediate_session() as session:
             updated = session.execute(
@@ -334,7 +361,9 @@ class JobRepository:
                 from_status="running",
                 to_status=status,
                 actor_source=actor_source,
-                metadata={"result_status": status},
+                # The handler's own reason and counters, not just the verdict:
+                # "failed" on its own leaves an operator with nothing to act on.
+                metadata={**result, "result_status": status},
                 occurred_at=now,
             )
             return True

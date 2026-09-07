@@ -124,6 +124,30 @@ def record_health(
     return health
 
 
+def record_attempt(
+    session: Session,
+    *,
+    provider_connection_id: int,
+    sync_state: str | None = None,
+) -> IntegrationHealth:
+    """Record that work was attempted, and nothing about whether it worked.
+
+    Deliberately narrower than `record_health`: it moves `last_attempt_at` and
+    may set an operation's state, but it can never write `last_success_at`,
+    `last_failure_at` or `last_error_code`. Those describe outcomes, and this
+    is called before there is one.
+    """
+    health = health_for(session, provider_connection_id)
+    if sync_state is not None:
+        if sync_state not in HEALTH_STATES:
+            raise ValueError("Invalid integration health state")
+        health.sync_state = sync_state
+    now = utc_now()
+    health.last_attempt_at = now
+    health.updated_at = now
+    return health
+
+
 def start_sync_run(
     session: Session,
     *,
@@ -143,7 +167,12 @@ def start_sync_run(
         metadata_json={},
     )
     session.add(run)
-    record_health(session, provider_connection_id=provider_connection_id, sync_state="healthy")
+    # An attempt, not an outcome. This used to call `record_health` with no
+    # error, and "no error" set `last_success_at = now` -- so opening a run
+    # renewed the very indicator an operator reads to answer "when did this
+    # last work". On 2026-09-07 that made connection 5 report a success at
+    # 15:40 when its last real successful sync had been at 10:40.
+    record_attempt(session, provider_connection_id=provider_connection_id, sync_state="healthy")
     return run
 
 

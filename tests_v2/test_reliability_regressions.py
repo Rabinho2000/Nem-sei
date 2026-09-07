@@ -770,16 +770,17 @@ def retention_module():
 
 
 def test_the_dump_is_written_under_a_name_retention_cannot_mistake_for_a_backup() -> None:
-    """`pg_dump ... > final.dump` makes the archive eligible the instant the
+    """`pg_dump ... > "$archive"` makes the archive eligible the instant the
     first byte lands. A dump killed halfway is then a file of the right name,
-    the right age and the wrong contents, and retention counts it among the
-    seven dailies."""
+    the right age and the wrong contents, and the next retention run counts it
+    among the seven dailies -- deleting an older, good copy to make room."""
     script = backup_script()
-    assert ".partial" in script
-    partial_write = [line for line in script.splitlines() if "pg_dump" in line]
-    assert partial_write and all(".partial" in line for line in partial_write), (
-        "pg_dump must write to the partial name, never straight to the final one"
-    )
+    assert 'partial="$archive.partial"' in script
+    writes = [line for line in script.splitlines() if "pg_dump" in line and ">" in line]
+    assert writes, "the script must still take a dump"
+    for line in writes:
+        assert '"$partial"' in line, f"pg_dump must write to the partial name: {line}"
+        assert '> "$archive"' not in line, f"pg_dump must not write to the final name: {line}"
 
 
 def test_the_archive_is_verified_before_it_is_renamed_into_place() -> None:
