@@ -38,7 +38,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Mapping
 
 from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session
@@ -47,12 +47,11 @@ from nemsei.assets.models import Asset
 from nemsei.jobs.models import ScheduleState
 from nemsei.monitoring.models import ProductionFact
 from nemsei.providers.models import AssetProviderMapping, ProviderConnection
-from nemsei.providers.registry import ProviderCapability, ProviderCode
+from nemsei.providers.registry import ProviderCapability, ProviderCode, descriptor_for
 from nemsei.shared.clock import as_utc, utc_now
 from nemsei.sources.models import AssetSourcePolicy
 from nemsei.sync.models import SyncRun
 from nemsei.sync.models import SyncCursor
-from nemsei.sync.production_scheduling import PRODUCTION_CURSOR_KEY
 
 
 # The states, in the order they are tested. Each one names a different thing
@@ -123,6 +122,11 @@ class ProductionCoverage:
     has_source_policy: bool = False
     primary_mapping_id: int | None = None
     scheduled: bool = False
+    # "polling" or "push". Which half of the chain was applicable, so a
+    # reader of a finding can tell a connection that has no cursor because
+    # nobody initialised it from one that has no cursor because a cursor is
+    # not a thing its source has.
+    production_ingestion: str | None = None
     cursor_last_completed_day: date | None = None
     last_sync_status: str | None = None
     last_sync_at: datetime | None = None
@@ -135,21 +139,65 @@ class ProductionCoverage:
         return self.state == STATE_OK
 
 
-def _production_contract_present(connection: ProviderConnection) -> bool:
+def _production_contract_present(
+    connection: ProviderConnection, *, env: Mapping[str, str] | None = None
+) -> bool:
     """Whether the operator-verified production contract is configured.
 
     Mirrors `integrations/fusionsolar/production.production_contract_for`'s
     own preconditions without importing it (this module must not depend on a
     provider adapter) and without reading the values back out: the answer is
     a boolean, so nothing about the account can leak through this screen.
+
+    `env` is a parameter and not a straight `os.environ` read because this
+    check answers a question about the *deployment*, and it was answering it
+    about whichever process happened to ask. Found live on 2026-09-07: the
+    page runs in `web`, which did not carry the two variables that `worker`
+    and `scheduler` do, so 134 of 267 installations were reported as
+    `production_contract_missing` while the contract was in fact configured
+    and the real cause was a stalled cursor. The deployment side of that fix
+    is env parity in `docker-compose.v2.yml`, asserted by
+    `test_deployment_contract.py`; this parameter is what lets a test state
+    the dependency instead of mutating the process environment.
     """
+    values = os.environ if env is None else env
     reference = connection.credential_reference or ""
     if not reference or not reference.replace("_", "").isalnum():
         return False
     prefix = f"NEMSEI_V2_FUSIONSOLAR_{reference.upper()}"
-    return bool(os.environ.get(f"{prefix}_PRODUCTION_TIMEZONE", "").strip()) and (
-        os.environ.get(f"{prefix}_PRODUCTION_UNIT", "").strip() == "kWh"
+    return bool(values.get(f"{prefix}_PRODUCTION_TIMEZONE", "").strip()) and (
+        values.get(f"{prefix}_PRODUCTION_UNIT", "").strip() == "kWh"
     )
+
+
+def _polls_production_history(connection: ProviderConnection) -> bool:
+    """Whether this connection's daily production is *fetched*, or *arrives*.
+
+    The difference decides which half of this chain applies at all. A polled
+    source (FusionSolar, Sigenergy) has a cursor, a bootstrap date, a
+    schedule and sync runs, and every one of those can be the reason a plant
+    is empty. A pushed source has none of them: the Huawei SCADA dongle dials
+    in and `integrations/huawei_scada/rollup.py` integrates samples V2
+    already holds into `production_facts`, with zero provider calls. Asking
+    such a connection for its production cursor and then recommending a
+    "first backfill" names a fix that does not exist and cannot be applied.
+
+    The discriminator is the provider registry's own
+    `implemented_capabilities`, which already records this and says why:
+    `PRODUCTION_HISTORY` is deliberately absent from the Huawei SCADA
+    descriptor because "the dongle serves instantaneous registers and no
+    historical series at all". So this is a structural fact the platform had
+    already written down -- not a name match, and not a new field.
+
+    An unknown provider code is treated as polled: that is the stricter
+    chain, and a provider this module has never heard of is not evidence
+    that nothing needs fetching.
+    """
+    try:
+        descriptor = descriptor_for(connection.provider_code)
+    except ValueError:
+        return True
+    return ProviderCapability.PRODUCTION_HISTORY in descriptor.implemented_capabilities
 
 
 def _latest_production_day(session: Session, *, asset_ids: list[int], since: date) -> dict[int, date]:
@@ -241,6 +289,7 @@ def assess_production_coverage(
     asset_ids: list[int] | None = None,
     on: date | None = None,
     max_incremental_gap_days: int = 31,
+    env: Mapping[str, str] | None = None,
 ) -> list[ProductionCoverage]:
     """Why each installation is, or is not, receiving daily production.
 
@@ -262,15 +311,22 @@ def assess_production_coverage(
         connection.id: connection
         for connection in session.scalars(select(ProviderConnection)).all()
     }
-    cursors = {
-        cursor.provider_connection_id: dict(cursor.checkpoint_json or {})
-        for cursor in session.scalars(
-            select(SyncCursor).where(
-                SyncCursor.capability == ProviderCapability.PRODUCTION_HISTORY.value,
-                SyncCursor.cursor_key == PRODUCTION_CURSOR_KEY,
-            )
-        ).all()
-    }
+    # Keyed by capability, not by one provider's cursor key. Each adapter
+    # names its own cursor -- FusionSolar writes
+    # `fusionsolar-daily-production`, Sigenergy writes
+    # `sigenergy-daily-production` -- and pinning the FusionSolar name here
+    # made every other provider's cursor invisible. Found live 2026-09-07:
+    # connection 5's Sigenergy cursor was current at D-0 and syncing daily,
+    # and its two installations were still reported as "produção não
+    # inicializada", recommending a bootstrap date for a connection that had
+    # never needed one. The capability is what this module actually means.
+    cursors: dict[int, dict[str, Any]] = {}
+    for cursor in session.scalars(
+        select(SyncCursor)
+        .where(SyncCursor.capability == ProviderCapability.PRODUCTION_HISTORY.value)
+        .order_by(SyncCursor.provider_connection_id, SyncCursor.updated_at.desc(), SyncCursor.id.desc())
+    ).all():
+        cursors.setdefault(cursor.provider_connection_id, dict(cursor.checkpoint_json or {}))
     scheduled_keys = {
         row.schedule_key
         for row in session.scalars(
@@ -295,6 +351,7 @@ def assess_production_coverage(
                 last_production_day=last_days.get(asset_id),
                 today=today,
                 max_incremental_gap_days=max_incremental_gap_days,
+                env=env,
             )
         )
     return findings
@@ -313,6 +370,7 @@ def _assess(
     last_production_day: date | None,
     today: date,
     max_incremental_gap_days: int,
+    env: Mapping[str, str] | None = None,
 ) -> ProductionCoverage:
     """The chain, walked once, stopping at the first broken link."""
 
@@ -393,9 +451,11 @@ def _assess(
         f"production.incremental:{connection.id}" in scheduled_keys
         or f"production.bootstrap:{connection.id}" in scheduled_keys
     )
+    polls = _polls_production_history(connection)
     base_evidence = {
         **base,
         "scheduled": scheduled,
+        "production_ingestion": "polling" if polls else "push",
         "cursor_last_completed_day": cursor_day,
         "last_sync_status": run.status if run else None,
         "last_sync_at": as_utc(run.started_at) if run else None,
@@ -414,7 +474,23 @@ def _assess(
             "A ligação não tem referência de credencial configurada: ver /system.",
             **base_evidence,
         )
-    if connection.provider_code == ProviderCode.FUSIONSOLAR.value and not _production_contract_present(connection):
+    if not polls:
+        # A pushed source has no contract to verify, no cursor to advance, no
+        # schedule to enable and no production sync run to have failed. The
+        # only question left that this screen can answer is whether the facts
+        # are actually arriving, so it is asked directly.
+        if last_production_day is None or (today - last_production_day).days > RECENT_FACT_TOLERANCE_DAYS:
+            return finding(
+                STATE_NO_RECENT_FACT,
+                "Esta central recebe produção por push e não chegam leituras recentes: "
+                "confirmar que o equipamento continua a ligar-se.",
+                **base_evidence,
+            )
+        return finding(STATE_OK, "Nada a fazer.", **base_evidence)
+
+    if connection.provider_code == ProviderCode.FUSIONSOLAR.value and not _production_contract_present(
+        connection, env=env
+    ):
         return finding(
             STATE_PRODUCTION_CONTRACT_MISSING,
             "Falta o fuso horário e a unidade kWh verificados para esta conta no ambiente do worker.",

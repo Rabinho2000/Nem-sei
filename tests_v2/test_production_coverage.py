@@ -558,3 +558,276 @@ def test_the_diagnosis_never_reads_a_secret_back_out():
 
     fields = set(ProductionCoverage.__dataclass_fields__)
     assert not {field for field in fields if "credential" in field or "password" in field or "secret" in field}
+
+
+# ---------------------------------------------------------------------------
+# Fontes push: sem cursor, sem bootstrap, sem agendamento.
+#
+# A cadeia inteira entre o contrato e a recência existe para uma série que é
+# *ida buscar*. O dongle Huawei SCADA não tem nenhuma dessas coisas: liga-se
+# sozinho e `integrations/huawei_scada/rollup.py` integra amostras que o V2 já
+# tem, sem uma única chamada ao provider. Perguntar-lhe pelo cursor e depois
+# recomendar um "primeiro backfill" nomeia uma correção que não existe.
+#
+# O discriminador é o `implemented_capabilities` do registry, onde
+# PRODUCTION_HISTORY está deliberadamente ausente para este provider e o
+# comentário diz porquê. Não é o nome da ligação.
+# ---------------------------------------------------------------------------
+
+
+def _push_connection(session, *, key="dongle", credential="primary"):
+    return create_connection(
+        session, provider_code="huawei_scada", connection_key=key,
+        display_name=f"SCADA {key}", credential_reference=credential,
+        enabled=True, configuration_status="configured",
+    )
+
+
+def test_a_push_source_with_recent_facts_is_ok_without_any_cursor(settings, monkeypatch):
+    """Caso D. Sem cursor, sem data inicial, sem agendamento — e na mesma OK."""
+    factory = factory_for(settings, monkeypatch)
+    with factory() as session:
+        connection = _push_connection(session)
+        asset, mapping = _mapped_asset(session, connection)
+        _fact(session, asset_id=asset.id, mapping_id=mapping.id, on=TODAY - timedelta(days=1))
+        finding = _finding(session)
+
+    assert finding.state == STATE_OK
+    assert finding.production_ingestion == "push"
+    # O que esta correção existe para impedir.
+    assert finding.state != STATE_NOT_INITIALIZED
+    assert "backfill" not in finding.recommended_action.lower()
+
+
+def test_a_push_source_whose_readings_stopped_is_a_recency_problem(settings, monkeypatch):
+    """Caso E. O equipamento deixou de chegar — não é falta de inicialização."""
+    factory = factory_for(settings, monkeypatch)
+    with factory() as session:
+        connection = _push_connection(session)
+        asset, mapping = _mapped_asset(session, connection)
+        _fact(
+            session, asset_id=asset.id, mapping_id=mapping.id,
+            on=TODAY - timedelta(days=RECENT_FACT_TOLERANCE_DAYS + 5),
+        )
+        finding = _finding(session)
+
+    assert finding.state == STATE_NO_RECENT_FACT
+    assert finding.production_ingestion == "push"
+    assert "backfill" not in finding.recommended_action.lower()
+
+
+def test_a_push_source_that_never_delivered_a_fact_is_still_not_uninitialised(settings, monkeypatch):
+    """Caso F. Ausência total de facto continua a ser uma questão de recência."""
+    factory = factory_for(settings, monkeypatch)
+    with factory() as session:
+        connection = _push_connection(session)
+        _mapped_asset(session, connection)
+        finding = _finding(session)
+
+    assert finding.state == STATE_NO_RECENT_FACT
+    assert finding.last_production_day is None
+    assert finding.state != STATE_NOT_INITIALIZED
+
+
+def test_a_push_source_is_never_reported_as_unscheduled(settings, monkeypatch):
+    """Não há `production.*` schedule para uma fonte push, e isso não é falha."""
+    factory = factory_for(settings, monkeypatch)
+    with factory() as session:
+        connection = _push_connection(session)
+        asset, mapping = _mapped_asset(session, connection)
+        _fact(session, asset_id=asset.id, mapping_id=mapping.id, on=TODAY - timedelta(days=1))
+        finding = _finding(session)
+
+    assert finding.scheduled is False
+    assert finding.state == STATE_OK
+
+
+def test_a_polling_source_still_requires_its_cursor_and_bootstrap(settings, monkeypatch):
+    """Caso A, ao lado do D: o alívio é só para push, não para toda a gente."""
+    factory = factory_for(settings, monkeypatch)
+    contract_environment(monkeypatch)
+    with factory() as session:
+        connection = _connection(session)
+        asset, mapping = _mapped_asset(session, connection)
+        # Facto fresco, e mesmo assim não inicializada: a fonte é de polling e
+        # o cursor continua a ser a próxima coisa a corrigir.
+        _fact(session, asset_id=asset.id, mapping_id=mapping.id, on=TODAY - timedelta(days=1))
+        finding = _finding(session)
+
+    assert finding.state == STATE_NOT_INITIALIZED
+    assert finding.production_ingestion == "polling"
+
+
+def test_a_polling_source_with_cursor_schedule_and_a_recent_fact_is_ok(settings, monkeypatch):
+    """Caso B, explícito ao lado do C que já existia."""
+    factory = factory_for(settings, monkeypatch)
+    contract_environment(monkeypatch)
+    with factory() as session:
+        connection = _connection(session)
+        asset, mapping = _mapped_asset(session, connection)
+        seed_production_cursor(session, connection_id=connection.id, last_completed_day=TODAY - timedelta(days=1))
+        _schedule(session, connection.id)
+        _fact(session, asset_id=asset.id, mapping_id=mapping.id, on=TODAY - timedelta(days=1))
+        finding = _finding(session)
+
+    assert finding.state == STATE_OK
+    assert finding.production_ingestion == "polling"
+
+
+def test_the_push_discriminator_is_the_registry_not_the_connection_name(settings, monkeypatch):
+    """Estrutural: nada aqui pode passar a decidir por nome.
+
+    Um `if "scada" in name.lower()` classificaria à mesma os casos acima, por
+    isso os testes de comportamento não chegam para fixar *como* a decisão é
+    tomada. Esta é a diferença entre um facto do registry e uma string.
+    """
+    import ast
+    from pathlib import Path
+
+    from nemsei.diagnostics.production_coverage import _polls_production_history
+    from nemsei.providers.registry import ProviderCapability, ProviderCode, descriptor_for
+
+    # O registry é a fonte, e continua a dizer o que este módulo assume.
+    assert ProviderCapability.PRODUCTION_HISTORY not in descriptor_for(
+        ProviderCode.HUAWEI_SCADA
+    ).implemented_capabilities
+    assert ProviderCapability.PRODUCTION_HISTORY in descriptor_for(
+        ProviderCode.FUSIONSOLAR
+    ).implemented_capabilities
+
+    # Uma ligação com nome enganador é classificada pela capacidade, não pelo nome.
+    class _Fake:
+        provider_code = ProviderCode.FUSIONSOLAR.value
+        display_name = "SCADA dongle push"
+
+    assert _polls_production_history(_Fake()) is True
+
+    # E o módulo não olha para nomes para decidir isto.
+    source = Path(__file__).resolve().parents[1] / "src" / "nemsei" / "diagnostics" / "production_coverage.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "_polls_production_history":
+            names = {n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)}
+            assert "display_name" not in names
+            assert "connection_key" not in names
+            break
+    else:  # pragma: no cover - a função tem de existir
+        raise AssertionError("_polls_production_history desapareceu")
+
+
+def test_an_unknown_provider_keeps_the_stricter_polling_chain(settings, monkeypatch):
+    """Um provider que este módulo não conhece não é prova de que nada é ido buscar."""
+    from nemsei.diagnostics.production_coverage import _polls_production_history
+
+    class _Unknown:
+        provider_code = "um_provider_que_nao_existe"
+
+    assert _polls_production_history(_Unknown()) is True
+
+
+# ---------------------------------------------------------------------------
+# O contrato de produção é um facto do *deployment*, não do processo que pergunta.
+# ---------------------------------------------------------------------------
+
+
+def test_the_contract_check_reads_the_environment_it_is_given(settings, monkeypatch):
+    """Encontrado em produção, 2026-09-07.
+
+    O classificador lia `os.environ` do processo. A página corre no `web`, que
+    não carregava as duas variáveis que o `worker` e o `scheduler` carregam, e
+    134 de 267 instalações apareciam como `production_contract_missing` com o
+    contrato configurado -- a causa real era um cursor encravado. O `env` é
+    explícito para que a dependência possa ser afirmada por um teste em vez de
+    depender de onde o código calhou correr.
+    """
+    factory = factory_for(settings, monkeypatch)
+    # O ambiente do processo não tem o contrato, de propósito.
+    monkeypatch.delenv("NEMSEI_V2_FUSIONSOLAR_DEV_PRODUCTION_TIMEZONE", raising=False)
+    monkeypatch.delenv("NEMSEI_V2_FUSIONSOLAR_DEV_PRODUCTION_UNIT", raising=False)
+    with factory() as session:
+        connection = _connection(session)
+        asset, mapping = _mapped_asset(session, connection)
+        seed_production_cursor(session, connection_id=connection.id, last_completed_day=TODAY - timedelta(days=1))
+        _schedule(session, connection.id)
+        _fact(session, asset_id=asset.id, mapping_id=mapping.id, on=TODAY - timedelta(days=1))
+
+        # Sem contrato visível: o diagnóstico é o do contrato em falta.
+        assert _state(session) == STATE_PRODUCTION_CONTRACT_MISSING
+
+        # Com o mesmo contrato entregue explicitamente: o veredicto muda, sem
+        # nada ter mudado na base de dados nem no ambiente do processo.
+        supplied = {
+            "NEMSEI_V2_FUSIONSOLAR_DEV_PRODUCTION_TIMEZONE": "Europe/Lisbon",
+            "NEMSEI_V2_FUSIONSOLAR_DEV_PRODUCTION_UNIT": "kWh",
+        }
+        assert _state(session, env=supplied) == STATE_OK
+
+
+def test_two_processes_with_the_same_contract_agree_about_the_fleet(settings, monkeypatch):
+    """A regressão em si: mesma base, mesmo contrato, veredicto idêntico.
+
+    É este o invariante que faltava. Enquanto o `web` e o `scheduler` virem o
+    mesmo contrato, têm de classificar a frota da mesma maneira; a paridade de
+    ambiente que o garante em produção é afirmada em
+    `test_deployment_contract.py`.
+    """
+    factory = factory_for(settings, monkeypatch)
+    contract = {
+        "NEMSEI_V2_FUSIONSOLAR_DEV_PRODUCTION_TIMEZONE": "Europe/Lisbon",
+        "NEMSEI_V2_FUSIONSOLAR_DEV_PRODUCTION_UNIT": "kWh",
+    }
+    with factory() as session:
+        connection = _connection(session)
+        asset, mapping = _mapped_asset(session, connection)
+        seed_production_cursor(session, connection_id=connection.id, last_completed_day=TODAY - timedelta(days=1))
+        _schedule(session, connection.id)
+        _fact(session, asset_id=asset.id, mapping_id=mapping.id, on=TODAY - timedelta(days=1))
+
+        as_web = assess_production_coverage(session, on=TODAY, env=contract)
+        as_scheduler = assess_production_coverage(session, on=TODAY, env=dict(contract))
+
+    assert [f.state for f in as_web] == [f.state for f in as_scheduler]
+    assert coverage_summary(as_web) == coverage_summary(as_scheduler)
+
+
+def test_a_cursor_written_under_another_providers_key_is_still_a_cursor(settings, monkeypatch):
+    """Encontrado em produção, 2026-09-07.
+
+    Cada adaptador nomeia o seu cursor: o FusionSolar escreve
+    `fusionsolar-daily-production`, o Sigenergy escreve
+    `sigenergy-daily-production`. O classificador procurava a chave do
+    FusionSolar, por isso o cursor do Sigenergy — actual, a sincronizar
+    diariamente — era invisível, e duas centrais apareciam como "produção
+    não inicializada" a pedir uma data de bootstrap a uma ligação que nunca
+    precisou de uma. A capacidade é o que este módulo quer dizer.
+    """
+    from nemsei.providers.registry import ProviderCapability
+    from nemsei.sync.models import SyncCursor
+
+    factory = factory_for(settings, monkeypatch)
+    with factory() as session:
+        connection = create_connection(
+            session, provider_code="sigenergy", connection_key="sigen",
+            display_name="Sigenergy live", credential_reference="primary",
+            enabled=True, configuration_status="configured",
+        )
+        asset, mapping = _mapped_asset(session, connection)
+        session.add(
+            SyncCursor(
+                provider_connection_id=connection.id,
+                capability=ProviderCapability.PRODUCTION_HISTORY.value,
+                cursor_key="sigenergy-daily-production",
+                checkpoint_json={"last_completed_day": (TODAY - timedelta(days=1)).isoformat()},
+                covered_through=utc_now(),
+                updated_at=utc_now(),
+            )
+        )
+        _schedule(session, connection.id)
+        _fact(session, asset_id=asset.id, mapping_id=mapping.id, on=TODAY - timedelta(days=1))
+        session.flush()
+        finding = _finding(session)
+
+    assert finding.production_ingestion == "polling"
+    assert finding.cursor_last_completed_day == TODAY - timedelta(days=1)
+    assert finding.state == STATE_OK
+    assert finding.state != STATE_NOT_INITIALIZED
