@@ -251,6 +251,41 @@ def test_an_explicit_window_cannot_be_used_to_close_the_open_day(settings, monke
     assert source_today not in {day for _, day in stub.requested}
 
 
+def test_a_tick_with_nothing_due_costs_no_provider_call(settings, monkeypatch) -> None:
+    """The cursor is already at the last closed day, so there is nothing to
+    fetch -- and nothing to log in for either. This runs every few hours
+    against an account that rate-limits, so an authentication spent on a no-op
+    is a call taken from a run that needs one."""
+    from zoneinfo import ZoneInfo
+
+    from nemsei.integrations.sigenergy.production import SigenergyProductionService
+
+    factory, asset_id, connection_id, _ = sigenergy_fixture(settings, monkeypatch)
+    stub = RecordingClient()
+    calls: list[str] = []
+    service = SigenergyProductionService(
+        factory, settings.__class__.from_environment(),
+        client_factory=lambda credentials, endpoints, transport: (calls.append("built"), stub)[1],
+    )
+    yesterday = datetime.now(tz=ZoneInfo("Europe/Lisbon")).date() - timedelta(days=1)
+
+    # One clean run brings the cursor up to the last closed day...
+    first = service.sync_daily_production(connection_id, start_date=yesterday, end_date=yesterday)
+    assert first.status == "success"
+    assert cursor_day(factory, connection_id) == yesterday.isoformat()
+
+    # ...and the next tick has nothing to do.
+    calls.clear()
+    stub.requested.clear()
+    second = service.sync_incremental(connection_id)
+
+    assert second.status == "success"
+    assert second.days_requested == 0
+    assert stub.requested == []
+    assert calls == [], "a tick with nothing due must not even build a client"
+    assert cursor_day(factory, connection_id) == yesterday.isoformat()
+
+
 def test_a_window_bound_of_zero_days_is_refused_rather_than_inverted(settings, monkeypatch) -> None:
     """`max_days=0` computes `end = start - 1`, an inverted window. It has to
     be rejected as the configuration error it is."""

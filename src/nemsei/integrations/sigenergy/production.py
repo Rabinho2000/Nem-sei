@@ -237,16 +237,15 @@ class SigenergyProductionService:
         except SigenergyClientError as exc:
             return self._finish(run_id, connection_id, 0, 0, 0, 0, exc.error)
 
-        client = self._client_factory(credentials, endpoints, self._transport)
-        _value, error = self._calls.call(
-            connection_id=connection_id, sync_run_id=run_id, endpoint_family="authentication",
-            purpose="sigenergy_production_authentication", operation=client.authenticate,
-        )
-        if error:
-            return self._finish(run_id, connection_id, 0, 0, 0, 1, error)
-
-        # The last day the source has finished. Everything after it is a
-        # counter still moving, and a counter still moving is not a total.
+        # The window is decided before the client is built, so a tick with
+        # nothing due costs no provider call at all -- not even the login. This
+        # runs every few hours against an account that rate-limits, and after
+        # the cursor reaches the last closed day most of those ticks have
+        # nothing to fetch.
+        #
+        # `last_closed_day` is the last day the source has finished. Everything
+        # after it is a counter still moving, and a counter still moving is not
+        # a total.
         last_closed_day = utc_now().astimezone(contract.source_timezone).date() - timedelta(days=1)
         if start_date is None:
             start_date = self._resume_from(connection_id, default=last_closed_day)
@@ -260,9 +259,17 @@ class SigenergyProductionService:
             # no obligations, not a failure -- and, crucially, not a reason to
             # move the cursor anywhere.
             return self._finish(
-                run_id, connection_id, 0, 0, 0, 1, None,
+                run_id, connection_id, 0, 0, 0, 0, None,
                 timezone_name=contract.source_timezone_name, nothing_due=True,
             )
+
+        client = self._client_factory(credentials, endpoints, self._transport)
+        _value, error = self._calls.call(
+            connection_id=connection_id, sync_run_id=run_id, endpoint_family="authentication",
+            purpose="sigenergy_production_authentication", operation=client.authenticate,
+        )
+        if error:
+            return self._finish(run_id, connection_id, 0, 0, 0, 1, error)
 
         days = [start_date + timedelta(days=offset) for offset in range((window_end - start_date).days + 1)]
         expected, accepted, rejected, written, calls = 0, 0, 0, 0, 1
