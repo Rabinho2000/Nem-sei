@@ -711,9 +711,12 @@ def test_6_repeated_and_concurrent_evaluation_never_duplicates_the_transition_ev
 def test_evaluate_and_process_notifications_decides_and_delivers_in_one_call(factory, asset_id, monkeypatch) -> None:
     # No injected client factory here, so this goes through
     # `default_client_factory` -- which needs the global capability on, exactly
-    # as a real deployment does. With no bot token mounted it still lands on
-    # the mock, so nothing leaves the process.
+    # as a real deployment does. `NEMSEI_V2_TESTING` is what now keeps it on
+    # the mock: a missing bot token used to be enough, and that was the defect
+    # (an unconfigured runtime recorded events `sent`). A test that wants the
+    # mock has to say so.
     monkeypatch.setenv("NEMSEI_V2_NOTIFICATIONS", "true")
+    monkeypatch.setenv("NEMSEI_V2_TESTING", "true")
     with factory() as session, session.begin():
         channel = make_channel(session)
         make_policy(session, channel=channel)

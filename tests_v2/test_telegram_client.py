@@ -54,12 +54,30 @@ def test_a_client_cannot_exist_without_a_token() -> None:
         HttpTelegramClient(bot_token="   ")
 
 
-def test_the_factory_falls_back_to_the_mock_when_no_token_is_configured(monkeypatch) -> None:
+def test_a_runtime_with_no_token_gets_a_client_that_cannot_claim_delivery(monkeypatch) -> None:
     # The safety property that replaces D3's "no HTTP code exists": a
     # deployment with no token cannot send, whatever is switched on in the UI.
     # The capability is on here so that the token, and only the token, is what
     # this test is about.
+    #
+    # This used to assert `MockTelegramClient`, and that was the defect: the
+    # mock reports `delivered=True`, so "no token mounted" and "the message
+    # went out" produced the same `sent` row. The property being protected is
+    # that nothing leaves the process; reporting a delivery was never part of
+    # it.
     monkeypatch.setenv("NEMSEI_V2_NOTIFICATIONS", "true")
+    monkeypatch.delenv("NEMSEI_V2_TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("NEMSEI_V2_TELEGRAM_BOT_TOKEN_FILE", raising=False)
+    monkeypatch.delenv("NEMSEI_V2_TESTING", raising=False)
+
+    client = default_client_factory(None)
+    assert not isinstance(client, MockTelegramClient)
+    assert client.send_message(chat_id="1", text="x").delivered is False
+
+
+def test_a_declared_test_run_still_gets_the_mock(monkeypatch) -> None:
+    monkeypatch.setenv("NEMSEI_V2_NOTIFICATIONS", "true")
+    monkeypatch.setenv("NEMSEI_V2_TESTING", "true")
     monkeypatch.delenv("NEMSEI_V2_TELEGRAM_BOT_TOKEN", raising=False)
     monkeypatch.delenv("NEMSEI_V2_TELEGRAM_BOT_TOKEN_FILE", raising=False)
 

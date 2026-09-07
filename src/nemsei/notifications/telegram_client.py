@@ -5,10 +5,13 @@ that "no real messages" was structural rather than a flag someone could get
 wrong. D4 -- building the real client -- was gated on explicit human approval,
 which was given on 2026-08-25.
 
-The structural guarantee is preserved rather than removed. `HttpTelegramClient`
-cannot be constructed without a bot token, and `default_client_factory` falls
-back to the mock when no token is configured, so an unconfigured deployment
-still cannot send anything.
+The structural guarantee is preserved rather than removed, but it no longer
+runs through the mock. `HttpTelegramClient` cannot be constructed without a bot
+token, and `default_client_factory` answers a missing token with
+`UnconfiguredTelegramClient`, which reports every message *undelivered* with a
+reason. The mock returns `delivered=True`, so reaching it by accident in a
+runtime turned "we cannot send" into "we sent it"; it is now reachable only
+from a run that declares itself a test.
 
 There are four switches above it, and they are not interchangeable:
 
@@ -30,6 +33,7 @@ steps check it before they build a client at all.
 from __future__ import annotations
 
 import json
+import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -64,10 +68,10 @@ class TelegramClient(Protocol):
 class MockTelegramClient:
     """Records every call it receives; never makes a network call.
 
-    The only `TelegramClient` this codebase can construct today --
-    `notifications/service.py` has no factory path that could produce
-    anything else, which is what makes "no real Telegram in D3" a structural
-    guarantee rather than a configuration choice.
+    It reports success, which is what makes it useful in a test and dangerous
+    anywhere else. `default_client_factory` will only build one when
+    `NEMSEI_V2_TESTING` is set; a runtime without a token gets
+    `UnconfiguredTelegramClient` instead.
     """
 
     # Configurable for tests that need to prove the failure path (proof #8,
@@ -141,6 +145,32 @@ def _safe_reason(exc: urllib.error.HTTPError) -> str:
 
 
 @dataclass(frozen=True)
+class UnconfiguredTelegramClient:
+    """What a runtime with notifications on and no bot token leaves behind.
+
+    Until this existed, that combination fell back to `MockTelegramClient`,
+    whose `send_message` returns `delivered=True`. So an alert that could not
+    possibly have reached anyone was recorded `sent`, with a timestamp, in the
+    row an operator checks to confirm the alert went out. That is the worst
+    failure mode a notification system has, because it is indistinguishable
+    from working -- the only way to discover it is for somebody to not receive
+    something and think to ask.
+
+    It returns a failed result rather than raising, unlike
+    `DeniedTelegramClient`: the kill switch being on is a decision, while a
+    missing token is a misconfiguration, and a misconfiguration should leave
+    the event `failed` with a reason an operator can read and fix. The event
+    is then retried by the ordinary delivery path once the token is mounted.
+    """
+
+    def send_message(self, *, chat_id: str, text: str) -> DeliveryResult:
+        return DeliveryResult(
+            delivered=False,
+            error="telegram is enabled but no bot token is configured",
+        )
+
+
+@dataclass(frozen=True)
 class DeniedTelegramClient:
     """What the global kill switch leaves behind: a client that cannot send.
 
@@ -182,10 +212,17 @@ def default_client_factory(channel: object) -> TelegramClient:
     switch or rotating the mounted secret takes effect on the next delivery
     instead of the next restart.
 
+    What the missing token no longer buys is the mock. It used to: no token
+    meant `MockTelegramClient`, which reports every message delivered, so an
+    unconfigured production deployment recorded alerts as `sent` that nobody
+    could have received. The mock is now reachable only from a run that says
+    it is a test (`NEMSEI_V2_TESTING`), and a runtime without a token gets a
+    client that fails with a reason.
+
     Lives here, and not in `service.py` and `digests.py` separately, so there is
     exactly one place that decides whether this process can reach the network.
     """
-    from nemsei.config import external_capability_enabled, read_secret_value
+    from nemsei.config import external_capability_enabled, parse_bool, read_secret_value
 
     if not external_capability_enabled("notifications"):
         return DeniedTelegramClient()
@@ -193,4 +230,8 @@ def default_client_factory(channel: object) -> TelegramClient:
         value_name="NEMSEI_V2_TELEGRAM_BOT_TOKEN",
         file_name="NEMSEI_V2_TELEGRAM_BOT_TOKEN_FILE",
     )
-    return HttpTelegramClient(bot_token=token) if token else MockTelegramClient()
+    if token:
+        return HttpTelegramClient(bot_token=token)
+    if parse_bool(os.environ.get("NEMSEI_V2_TESTING"), default=False):
+        return MockTelegramClient()
+    return UnconfiguredTelegramClient()
