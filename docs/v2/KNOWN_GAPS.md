@@ -151,3 +151,52 @@ sabe fazer, por falta de evidência e não por falta de código:
   estão em `HUAWEI_SCADA.md` §7.
 - **Nunca correu contra hardware real nesta instalação.** Toda a prova é contra
   um logger falso que responde como o do piloto.
+
+## Fiabilidade da recolha — o que a Fase 0 fechou e o que ficou aberto
+
+Corrigido, com testes de regressão em `tests_v2/test_reliability_regressions.py`
+que falhavam antes de cada correção:
+
+- **Sigenergy fechava o dia ainda a decorrer.** A janela era calculada em UTC
+  antes de o contrato ser conhecido, e incluía hoje. Os 145 factos Sigenergy
+  desta base foram todos escritos por uma execução iniciada às 10:40 UTC
+  *dentro* do dia que estava a guardar. A janela passou a resolver-se no
+  calendário da fonte e termina no último dia fechado.
+- **Payload vazio contava como dia recolhido** e o cursor avançava por cima.
+  Completude passou a ser contada: `expected`, `accepted` e `rejected` contam
+  todos mapping-dias, um dia só é aceite com as cinco métricas, e nada além de
+  uma execução completa move o cursor.
+- **`success` significava execução, não recolha.** Produção Sigenergy `partial`
+  virava `success`; monitorização devolvia `success` sempre; `finish` recusava o
+  `failed` que um handler legitimamente devolve.
+- **Contadores perdidos.** `expected/received/accepted/rejected/facts_written/
+  error_code` eram removidos antes de chegarem a `jobs.result_json`.
+- **`last_success_at` renovado ao começar.** Abrir uma execução renovava o
+  indicador que responde a "quando é que isto funcionou pela última vez".
+- **Duas fontes somadas para o mesmo dia.** 132 dos 267 ativos têm dois
+  mappings ativos. O ativo 180 tinha 119,11 kWh num dia que fez ~59,56.
+- **Frescura de uma fonte a refrescar a observação de outra** no estado da
+  instalação.
+- **Telegram sem token devolvia entregue** através do mock.
+- **Dump parcial elegível para retenção** com o nome final.
+
+Aberto, e por ordem de importância:
+
+- **Não há inventário de obrigações de recolha.** Continua a não existir forma
+  de provar que nenhuma recolha esperada desapareceu; contar `sync_runs` não
+  responde a isso. É o que `collection_runs` (ING-001/ING-002) existe para
+  resolver, e é a razão pela qual isto ainda não é uma fonte operacional
+  principal.
+- **Os 145 factos Sigenergy já escritos continuam errados.** O código deixou de
+  os produzir; repará-los é re-ler os dias da fonte para que uma nova revisão
+  substitua o valor. `scripts/v2_sigenergy_day_diagnosis.sql` lista quais.
+- **Lease de worker sem heartbeat** (30 s) e ownership só na linha do job, não
+  nos commits do handler.
+- **`reporting/readiness.py::_coverage` conta um dia como coberto mesmo quando
+  só a fonte não canónica o tem.** Não soma duas vezes — conta dias distintos —
+  mas a decisão de fonte não é a mesma que a dos totais.
+- **Políticas primárias em conflito** (mesma prioridade, mesmo período) são
+  resolvidas de forma determinística pelos leitores em vez de gerarem um
+  finding explícito.
+- **Nenhum restore foi ensaiado neste turno.** O timer está instalado e ativo;
+  a última recuperação verificada é `unknown`.
