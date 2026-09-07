@@ -65,6 +65,18 @@ QUALITY_FIELDS = (
     ("Estado da producao", "production_state"),
     ("Cobertura", "coverage_pct"),
     ("Total diario bruto kWh", "daily_total_kwh"),
+    # Added here, not to "Resumo"'s KPI grid: that sheet's layout is a
+    # verbatim copy of one real V1 export (this module's own docstring), and
+    # V1's own historical density essentially never populated availability in
+    # a real, capturable sample (3 of 6 720 device-days,
+    # `docs/v2/AVAILABILITY_MIGRATION_PLAN.md`) -- there is no real V1
+    # reference row to copy the exact position/format from. "Qualidade dos
+    # dados" already lists coverage/quality signals for exactly this reason:
+    # a value that exists but is not proven to production-parity for this
+    # sheet belongs with the other quality fields, not invented into the
+    # parity-locked summary grid.
+    ("Estado da disponibilidade", "availability_state"),
+    ("Disponibilidade (%)", "availability_pct"),
 )
 SHEET_NAMES = ("Resumo", "Energia", "Financeiro", "Qualidade dos dados", "Metadados")
 

@@ -187,6 +187,28 @@ class Settings:
     # across every asset that owns a device, by design.
     diagnostic_incident_evaluation_enabled: bool = False
     diagnostic_incident_evaluation_interval_minutes: int = 15
+    # Recomputes daily availability from already-collected device facts.
+    # Provider-free like the incident evaluator, so no connection id and no
+    # call cap. The lookback is the whole recompute policy: only the trailing
+    # window can still change (a late or corrected device fact), so older days
+    # are left alone and move only via the explicit backfill script. Three days
+    # covers a poll that was down overnight without re-deriving history hourly.
+    # Contractual availability ingestion: pulls `/thirdData/getDevHistoryKpi`
+    # for *closed* days only. Off by default and pinned to one explicit
+    # connection, like every other provider-calling schedule here -- this one
+    # spends real calls on a shared, rate-limited account (~1 call per 10
+    # inverters per day), so it is never allowed to loop over whatever
+    # connections happen to exist. The lookback is deliberately short: a
+    # closed day's history does not change, so re-fetching old days would buy
+    # nothing and cost the account. Days already ingested are skipped without
+    # an API call at all.
+    availability_history_sync_enabled: bool = False
+    availability_history_sync_connection_id: int | None = None
+    availability_history_sync_interval_minutes: int = 360
+    availability_history_sync_lookback_days: int = 3
+    availability_materialization_enabled: bool = False
+    availability_materialization_interval_minutes: int = 60
+    availability_materialization_lookback_days: int = 3
     # Turns a provisional month into a final one once its data closes. Reads
     # persisted facts and writes report snapshots; it cannot reach a provider,
     # so like the incident evaluator it needs no connection id and no call cap.
@@ -365,6 +387,29 @@ class Settings:
             diagnostic_incident_evaluation_interval_minutes=int(
                 os.environ.get("NEMSEI_V2_DIAGNOSTIC_INCIDENT_EVALUATION_INTERVAL_MINUTES", "15")
             ),
+            availability_history_sync_enabled=parse_bool(
+                os.environ.get("NEMSEI_V2_AVAILABILITY_HISTORY_SYNC_ENABLED"), default=False
+            ),
+            availability_history_sync_connection_id=(
+                int(os.environ["NEMSEI_V2_AVAILABILITY_HISTORY_SYNC_CONNECTION_ID"])
+                if os.environ.get("NEMSEI_V2_AVAILABILITY_HISTORY_SYNC_CONNECTION_ID")
+                else None
+            ),
+            availability_history_sync_interval_minutes=int(
+                os.environ.get("NEMSEI_V2_AVAILABILITY_HISTORY_SYNC_INTERVAL_MINUTES", "360")
+            ),
+            availability_history_sync_lookback_days=int(
+                os.environ.get("NEMSEI_V2_AVAILABILITY_HISTORY_SYNC_LOOKBACK_DAYS", "3")
+            ),
+            availability_materialization_enabled=parse_bool(
+                os.environ.get("NEMSEI_V2_AVAILABILITY_MATERIALIZATION_ENABLED"), default=False
+            ),
+            availability_materialization_interval_minutes=int(
+                os.environ.get("NEMSEI_V2_AVAILABILITY_MATERIALIZATION_INTERVAL_MINUTES", "60")
+            ),
+            availability_materialization_lookback_days=int(
+                os.environ.get("NEMSEI_V2_AVAILABILITY_MATERIALIZATION_LOOKBACK_DAYS", "3")
+            ),
             report_month_close_enabled=parse_bool(
                 os.environ.get("NEMSEI_V2_REPORT_MONTH_CLOSE_ENABLED"), default=False
             ),
@@ -467,8 +512,14 @@ class Settings:
             raise ConfigurationError("Device status polling requires a positive lifetime cycle cap; there is no uncapped mode.")
         if self.production_sync_scheduler_interval_hours <= 0:
             raise ConfigurationError("Production sync scheduler interval must be positive.")
-        if self.production_sync_scheduler_enabled and self.production_sync_scheduler_connection_id is None:
-            raise ConfigurationError("Production sync scheduling requires an explicit connection id; there is no portfolio-wide mode.")
+        # No longer requires the environment connection id. Eligibility moved
+        # to `provider_connections.production_sync_enabled` (migration 0044),
+        # which is still explicit and still per connection -- there is no
+        # portfolio-wide mode, and turning this switch on with nothing marked
+        # eligible schedules nothing rather than sweeping the fleet. The
+        # environment id stays supported as an additional target so a
+        # deployment that has not set the column keeps syncing what it syncs
+        # today; see `sync/production_scheduling.py`.
         for label, interval, enabled, connection_id in (
             ("FusionSolar", self.current_monitoring_scheduler_interval_minutes, self.current_monitoring_scheduler_enabled, self.current_monitoring_scheduler_connection_id),
             ("Sigenergy", self.sigenergy_current_monitoring_scheduler_interval_minutes, self.sigenergy_current_monitoring_scheduler_enabled, self.sigenergy_current_monitoring_scheduler_connection_id),
@@ -479,6 +530,16 @@ class Settings:
                 raise ConfigurationError(f"{label} current monitoring requires an explicit connection id; there is no portfolio-wide mode.")
         if self.diagnostic_incident_evaluation_interval_minutes <= 0:
             raise ConfigurationError("Diagnostic incident evaluation interval must be positive.")
+        if self.availability_history_sync_interval_minutes <= 0:
+            raise ConfigurationError("Availability history sync interval must be positive.")
+        if self.availability_history_sync_lookback_days <= 0:
+            raise ConfigurationError("Availability history sync lookback must be positive.")
+        if self.availability_history_sync_enabled and self.availability_history_sync_connection_id is None:
+            raise ConfigurationError("Availability history sync requires an explicit connection id; there is no portfolio-wide mode.")
+        if self.availability_materialization_interval_minutes <= 0:
+            raise ConfigurationError("Availability materialization interval must be positive.")
+        if self.availability_materialization_lookback_days <= 0:
+            raise ConfigurationError("Availability materialization lookback must be positive.")
         if self.report_month_close_interval_minutes <= 0:
             raise ConfigurationError("Report month close interval must be positive.")
         if self.notification_processing_interval_minutes <= 0:

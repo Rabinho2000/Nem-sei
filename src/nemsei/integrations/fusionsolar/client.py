@@ -100,6 +100,7 @@ class FusionSolarClient:
     daily_production_endpoint: str = "/thirdData/getKpiStationDay"
     device_list_endpoint: str = "/thirdData/getDevList"
     device_current_monitoring_endpoint: str = "/thirdData/getDevRealKpi"
+    device_history_endpoint: str = "/thirdData/getDevHistoryKpi"
 
     def authenticate(self) -> None:
         response = self._post(
@@ -190,6 +191,63 @@ class FusionSolarClient:
         rows = response.payload.get("data")
         if not isinstance(rows, list):
             raise FusionSolarClientError(ProviderError(ProviderErrorCode.INVALID_RESPONSE, "FusionSolar device monitoring response has no device list."))
+        return [row for row in rows if isinstance(row, dict)]
+
+    def device_history_batch(
+        self,
+        device_ids: list[str],
+        *,
+        device_type_id: int,
+        start_time_ms: int,
+        end_time_ms: int,
+    ) -> list[dict[str, Any]]:
+        """Read one device-history KPI batch for one device type and window.
+
+        The contractual-availability source. Verified live against the real
+        account on 2026-09-06 (`docs/v2/FUSIONSOLAR_DEVICE_HISTORY.md`):
+        `data` is a flat list of `{devId, sn, collectTime, dataItemMap}` rows
+        at **5-minute** granularity, so one full day is ~288 rows per device,
+        carrying both `active_power` and `inverter_state` -- the same two
+        fields `getDevRealKpi` returns, which is why
+        `device_status.normalize_device_realtime_row` can read these rows
+        unchanged.
+
+        **At most 10 device IDs per call**, unlike the 100 every other batch
+        on this client accepts. That is V1's own chunk size
+        (`fusionsolar_client.device_history_kpi`), kept because this endpoint
+        returns ~288 rows per device per day: ten devices is already ~2 880
+        rows in one response, and V1 never established that a larger batch is
+        accepted. The window is passed as explicit epoch milliseconds rather
+        than a date, because the caller -- not this client -- owns the
+        decision of which timezone defines a provider day (V1 silently used
+        the calling process's local timezone, which is exactly the kind of
+        implicit contract V2 refuses to inherit).
+        """
+        if self._token is None:
+            raise FusionSolarClientError(ProviderError(ProviderErrorCode.AUTHENTICATION, "FusionSolar authentication is required."))
+        ids = [value.strip() for value in device_ids if value and value.strip()]
+        if not ids or len(ids) > 10:
+            raise FusionSolarClientError(
+                ProviderError(ProviderErrorCode.CONFIGURATION, "FusionSolar device history batch must contain one to 10 device IDs.")
+            )
+        if end_time_ms <= start_time_ms:
+            raise FusionSolarClientError(
+                ProviderError(ProviderErrorCode.CONFIGURATION, "FusionSolar device history window must end after it starts.")
+            )
+        response = self._post(
+            self.device_history_endpoint,
+            {
+                "devIds": ",".join(ids),
+                "devTypeId": device_type_id,
+                "startTime": start_time_ms,
+                "endTime": end_time_ms,
+            },
+            include_token=True,
+        )
+        self._validate(response, phase="device_history")
+        rows = response.payload.get("data")
+        if not isinstance(rows, list):
+            raise FusionSolarClientError(ProviderError(ProviderErrorCode.INVALID_RESPONSE, "FusionSolar device history response has no row list."))
         return [row for row in rows if isinstance(row, dict)]
 
     def daily_production_batch(

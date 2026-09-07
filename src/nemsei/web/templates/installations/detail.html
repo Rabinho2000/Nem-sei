@@ -30,6 +30,26 @@
 {% if tab == 'resumo' %}
   <section class="kpis" aria-label="Resumo">
     <div class="kpi"><small>Estado</small><b>{{ state.label }}</b></div>
+    {#
+      WAT · último dia fechado. Um dia sem valor mostra o traço e a razão,
+      nunca 0 % — e a origem aparece sempre por baixo do número, porque uma
+      disponibilidade amostrada e uma contratual não valem o mesmo e a
+      diferença tem de estar à vista, não no código.
+    #}
+    <div class="kpi {{ 'noval' if not availability.kpi.available else '' }}">
+      <small>WAT · último dia fechado</small>
+      <b>{% if availability.kpi.available %}{{ '%.2f'|format(availability.kpi.availability_pct)|replace('.', ',') }} <u>%</u>{% else %}—{% endif %}</b>
+      <span class="cov-txt">
+        {% if availability.kpi.available %}
+          <span class="status-badge {{ availability.kpi.kind.tone }}">{{ availability.kpi.kind.label }}</span>
+          {{ availability.kpi.date.strftime('%d/%m/%Y') }} · {{ availability.kpi.valid_sample_count }} slots válidos
+        {% elif availability.kpi.date %}
+          {{ availability.kpi.coverage.label }} · {{ availability.kpi.observed_device_count }}/{{ availability.kpi.expected_device_count }} inversores com histórico
+        {% else %}
+          Sem disponibilidade calculada nos últimos {{ availability.window_days }} dias
+        {% endif %}
+      </span>
+    </div>
     <div class="kpi {{ 'noval' if headline.total_kwh is none else '' }}"><small>Produção · {{ headline.window_days }} dias</small><b>{% if headline.total_kwh is none %}—{% else %}{{ "{:,.0f}".format(headline.total_kwh).replace(",", " ") }} <u>kWh</u>{% endif %}</b></div>
     <div class="kpi"><small>Avarias abertas</small><b>{{ incidents.fault }}</b></div>
     <div class="kpi"><small>Comunicação</small><b>{{ incidents.communication }}</b></div>
@@ -50,6 +70,47 @@
       {% if production_chart.production_total is not none %}Produção: {{ "{:,.0f}".format(production_chart.production_total).replace(",", " ") }} kWh{% else %}Produção: sem registo{% endif %}
       · {% if production_chart.consumption_total is not none %}Consumo: {{ "{:,.0f}".format(production_chart.consumption_total).replace(",", " ") }} kWh{% else %}Consumo: sem meter registado{% endif %}
     </p>
+  </section>
+
+  <section class="panel chart-panel">
+    <div class="chart-head">
+      <h3>WAT diária · últimos {{ availability.window_days }} dias</h3>
+      <span class="status-badge {{ 'success' if availability.contractual_available else 'muted' }}">
+        {{ availability.contractual_days }} dia{{ '' if availability.contractual_days == 1 else 's' }} contratual{{ '' if availability.contractual_days == 1 else 'ais' }}
+      </span>
+    </div>
+    {{ chart.bars(availability.chart, 'Disponibilidade diária') }}
+    <p class="provenance">
+      {{ availability.days_with_value }} de {{ availability.window_days }} dias com valor.
+      Dias sem valor ficam em branco — é ausência de medição, não 0 %.
+      {% if not availability.contractual_available %}
+        Nenhum dia desta janela tem disponibilidade <strong>contratual</strong>; o que aqui aparece é a estimativa operacional da sonda.
+      {% endif %}
+    </p>
+    <details class="honest-stack">
+      <summary>Ver dia a dia</summary>
+      <div class="table-scroll">
+        <table class="data-table stack-mobile">
+          <thead><tr><th>Dia</th><th>WAT</th><th>Estado</th><th>Origem</th><th>Slots válidos</th><th>Inversores</th></tr></thead>
+          <tbody>
+            {% for row in availability.rows %}
+              <tr>
+                <th scope="row">{{ row.date.strftime('%d/%m/%Y') }}</th>
+                <td data-label="WAT">{% if row.availability_pct is not none %}{{ '%.2f'|format(row.availability_pct)|replace('.', ',') }} %{% else %}—{% endif %}</td>
+                <td data-label="Estado"><span class="status-badge {{ row.coverage.tone }}">{{ row.coverage.label }}</span></td>
+                <td data-label="Origem">
+                  <span class="status-badge {{ row.kind.tone }}">{{ row.kind.label }}</span>
+                  {% if row.sources_available|length > 1 %}<small class="muted" title="Também existe uma leitura da outra origem para este dia">+1 origem</small>{% endif %}
+                  <br><small class="muted">{{ row.source_label }}</small>
+                </td>
+                <td data-label="Slots válidos">{{ row.valid_sample_count if row.source else '—' }}</td>
+                <td data-label="Inversores">{% if row.source %}{{ row.observed_device_count }}/{{ row.expected_device_count }}{% else %}—{% endif %}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </details>
   </section>
 
   <section class="panel">

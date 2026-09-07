@@ -3,28 +3,53 @@
 <section class="panel">
   <header class="panel-header"><h2>Disponibilidade</h2></header>
   {#
-    Stated honestly rather than filled with a plausible number. The weighted
-    availability calculation is ported and pinned against V1, but it needs
-    device-level facts and V2 collects none yet.
+    Ported from V1's sampled engine (docs/v2/AVAILABILITY_MIGRATION_PLAN.md),
+    computed from device_status_facts -> asset_availability_daily -> this
+    portfolio's monthly rollup (nemsei.portfolios.datasets.build_portfolio_dataset).
+    A percentage only ever appears for a row whose availability_state is
+    'measured' -- 'partial'/'missing' show the coverage state instead of a
+    number, never a zero standing in for "not proven yet".
   #}
   <p class="empty">
-    A disponibilidade ponderada está implementada e validada contra a V1, mas depende de factos ao nível
-    do equipamento — e a V2 ainda não os recolhe. Enquanto isso, esta secção mostra a cobertura de dados,
-    que é a pergunta operacional mais próxima que os dados actuais conseguem responder.
+    Disponibilidade ponderada por potência instalada, calculada a partir das amostras reais dos
+    inversores (FusionSolar). Uma instalação sem contrato de equipamento verificado (p.ex. Sigenergy) ou
+    sem um mês completo de amostras mostra o estado dos dados em vez de uma percentagem.
   </p>
   <table class="data-table">
-    <thead><tr><th>Instalação</th><th>Estado dos dados</th><th class="num">Produção</th></tr></thead>
+    <thead><tr><th>Instalação</th><th>Estado da disponibilidade</th><th class="num">Disponibilidade</th><th>Origem</th><th>Estado da produção</th><th class="num">Produção</th></tr></thead>
     <tbody>
       {% for row in rows if row.asset_id %}
-        <tr class="{{ 'row-attention' if row.production_state != 'measured' else '' }}">
+        <tr class="{{ 'row-attention' if row.availability_state != 'measured' else '' }}">
           <td><a href="{{ url_for('assets.asset_detail', asset_id=row.asset_id) }}">{{ row.name }}</a></td>
+          <td>{{ state_pill(row.availability_state) }}</td>
+          <td class="num">{{ pct(row.availability_pct) }}</td>
+          {#
+            Origem: contratual (pode sustentar um contrato) vs operacional
+            (estimativa a partir de amostras em tempo real). Um número
+            operacional nunca é apresentado como se fosse garantido.
+          #}
+          <td>
+            {% if row.availability_source_kind == 'contractual' %}
+              <span class="pill pill-ok" title="{{ row.availability_source }}">Contratual</span>
+            {% elif row.availability_source_kind == 'operational' %}
+              <span class="pill pill-warn" title="{{ row.availability_source }}">Operacional (amostrada)</span>
+            {% else %}
+              <span class="muted">—</span>
+            {% endif %}
+          </td>
           <td>{{ state_pill(row.production_state) }}</td>
           <td class="num">{{ kwh(row.production_kwh) }}</td>
         </tr>
       {% else %}
-        <tr><td colspan="3" class="empty">Sem instalações a mostrar.</td></tr>
+        <tr><td colspan="6" class="empty">Sem instalações a mostrar.</td></tr>
       {% endfor %}
     </tbody>
   </table>
+  {% if totals and totals.availability_pct is defined %}
+  <p class="totals">
+    Disponibilidade do portfolio: {{ pct(totals.availability_pct) }}
+    ({{ state_pill(totals.availability_state) }})
+  </p>
+  {% endif %}
 </section>
 {% endblock %}

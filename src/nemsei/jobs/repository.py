@@ -4,7 +4,7 @@ from __future__ import annotations
 import secrets
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -15,10 +15,17 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from nemsei.jobs.models import ACTOR_SOURCES, Job, JobEvent, ScheduleState, SchedulerLease
 from nemsei.shared.clock import as_utc, utc_now
+from nemsei.sync.production_scheduling import ProductionScheduleTarget, production_schedule_targets
 
 
 ACTIVE_STATUSES = ("queued", "running", "waiting")
 TERMINAL_STATUSES = ("success", "partial", "failed", "cancelled")
+
+# A connection's first backfill moves months of history and must never win a
+# claim over another connection's `production.incremental` for today, which
+# runs at the default 100. `claim_next` takes the lowest `priority` value
+# first, so this number has to stay *above* 100 to lose that race.
+BOOTSTRAP_JOB_PRIORITY = 150
 
 
 @dataclass(frozen=True)
@@ -978,6 +985,157 @@ class JobRepository:
                 session.expunge(existing)
                 return existing, False
 
+    def production_schedule_targets(
+        self,
+        *,
+        default_interval_hours: int,
+        max_incremental_gap_days: int,
+        legacy_connection_id: int | None = None,
+        today: date | None = None,
+    ) -> list[ProductionScheduleTarget]:
+        """Which connections have a standing production schedule, and in what mode.
+
+        A thin read: the rule itself lives in `sync/production_scheduling.py`
+        so the coverage screen and the scheduler answer the question with the
+        same code rather than two implementations that can disagree about
+        which connections are synced.
+        """
+        with self.session_factory() as session:
+            return production_schedule_targets(
+                session,
+                default_interval_hours=default_interval_hours,
+                max_incremental_gap_days=max_incremental_gap_days,
+                legacy_connection_id=legacy_connection_id,
+                today=today,
+            )
+
+    def enqueue_due_production_bootstrap(
+        self, *, connection_id: int, start_date: date, interval_hours: int, now: datetime | None = None
+    ) -> tuple[Job | None, bool]:
+        """Enqueue the first bounded backfill for a connection with no cursor.
+
+        A connection that has never synced cannot run `production.incremental`
+        at all: `FusionSolarProductionService._window` refuses to invent a
+        first start date, so the job fails every tick with "The first
+        production sync requires an explicit start date" and the connection
+        never starts. Turning the scheduler on was therefore not enough to
+        onboard a new account, which is exactly the gap that left
+        installations with no daily production.
+
+        This is the explicit, safe alternative to relaxing that refusal. The
+        start date is a stated fact on the connection
+        (`initial_production_from_date`); nothing here guesses one, and a
+        connection without it produces no target at all (see
+        `production_schedule_targets`), so an un-onboarded account makes zero
+        provider calls rather than fetching a window nobody asked for.
+
+        The enqueued job carries `bootstrap: true` and no `end_date`. The
+        end is resolved by the service against the connection's own verified
+        production timezone (`sync_bootstrap_backfill`), because provider-local
+        yesterday is the only day boundary a backfill may end on and the
+        scheduler has no business knowing that timezone.
+
+        Idempotent three times over, which is what makes re-running it safe:
+        the persisted `ScheduleState` means a restart resumes rather than
+        replays, the per-slot `dedupe_key` means two concurrent ticks produce
+        one job, and the mode itself disappears the moment the backfill
+        creates a cursor -- from then on `production_schedule_targets` returns
+        `incremental` for this connection and this method is never called for
+        it again. Re-running the underlying backfill is safe regardless:
+        `production_facts` is append-only with canonical idempotency, so a
+        replayed day writes no duplicate.
+        """
+        if interval_hours <= 0:
+            raise ValueError("Production bootstrap interval must be positive.")
+        now_value = now or utc_now()
+        key = f"production.bootstrap:{connection_id}"
+        try:
+            with self._immediate_session() as session:
+                schedule = session.get(ScheduleState, key)
+                if schedule is not None and as_utc(schedule.next_run_at) > now_value:
+                    return None, False
+                slot = as_utc(schedule.next_run_at) if schedule is not None else now_value
+                slot = _catch_up_slot(slot, now=now_value, interval=timedelta(hours=interval_hours))
+                dedupe_key = f"{key}:{slot.isoformat()}"
+                existing = session.scalar(
+                    select(Job).where(
+                        Job.job_type == "production.bounded_backfill",
+                        Job.dedupe_key == dedupe_key,
+                        Job.status.in_(ACTIVE_STATUSES),
+                    )
+                )
+                if existing is None:
+                    # A bootstrap moves months of history and must lose the
+                    # claim race to today's incremental sync for any other
+                    # connection, hence the backfill priority rather than 100.
+                    job = Job(
+                        job_type="production.bounded_backfill",
+                        status="queued",
+                        payload_json={
+                            "connection_id": connection_id,
+                            "bootstrap": True,
+                            "start_date": start_date.isoformat(),
+                            "scheduled_for": slot.isoformat(),
+                        },
+                        dedupe_key=dedupe_key,
+                        priority=BOOTSTRAP_JOB_PRIORITY,
+                        available_at=now_value,
+                        attempt_count=0,
+                        max_attempts=3,
+                        created_at=now_value,
+                        updated_at=now_value,
+                    )
+                    session.add(job)
+                    session.flush()
+                    self._event(
+                        session,
+                        job_id=job.id,
+                        event_type="enqueued",
+                        attempt=0,
+                        from_status=None,
+                        to_status="queued",
+                        actor_source="scheduler",
+                        metadata={"schedule_key": key, "dedupe_key": dedupe_key},
+                        occurred_at=now_value,
+                    )
+                    created = True
+                else:
+                    job = existing
+                    created = False
+                if schedule is None:
+                    schedule = ScheduleState(schedule_key=key, next_run_at=slot, updated_at=now_value)
+                    session.add(schedule)
+                schedule.last_enqueued_at = now_value
+                schedule.next_run_at = slot + timedelta(hours=interval_hours)
+                schedule.updated_at = now_value
+                session.flush()
+                session.expunge(job)
+                return job, created
+        except IntegrityError:
+            with self._immediate_session() as session:
+                existing = session.scalar(
+                    select(Job).where(
+                        Job.job_type == "production.bounded_backfill",
+                        Job.dedupe_key == dedupe_key,
+                        Job.status.in_(ACTIVE_STATUSES),
+                    )
+                )
+                if existing is None:
+                    raise
+                self._event(
+                    session,
+                    job_id=existing.id,
+                    event_type="dedupe_reused",
+                    attempt=existing.attempt_count,
+                    from_status=existing.status,
+                    to_status=existing.status,
+                    actor_source="scheduler",
+                    metadata={"schedule_key": key, "dedupe_key": dedupe_key},
+                    occurred_at=now_value,
+                )
+                session.expunge(existing)
+                return existing, False
+
     def enqueue_due_incident_evaluation(
         self, *, interval_minutes: int, now: datetime | None = None
     ) -> tuple[Job | None, bool]:
@@ -1057,6 +1215,218 @@ class JobRepository:
                 existing = session.scalar(
                     select(Job).where(
                         Job.job_type == "diagnostics.evaluate_incidents",
+                        Job.dedupe_key == dedupe_key,
+                        Job.status.in_(ACTIVE_STATUSES),
+                    )
+                )
+                if existing is None:
+                    raise
+                self._event(
+                    session,
+                    job_id=existing.id,
+                    event_type="dedupe_reused",
+                    attempt=existing.attempt_count,
+                    from_status=existing.status,
+                    to_status=existing.status,
+                    actor_source="scheduler",
+                    metadata={"schedule_key": key, "dedupe_key": dedupe_key},
+                    occurred_at=now_value,
+                )
+                session.expunge(existing)
+                return existing, False
+
+
+    def enqueue_due_availability_materialization(
+        self, *, interval_minutes: int, lookback_days: int, now: datetime | None = None
+    ) -> tuple[Job | None, bool]:
+        """Enqueue one availability-materialization cycle when due.
+
+        Identical shape to `enqueue_due_incident_evaluation` above, and for
+        the same reason: this job makes **zero provider calls**. It only
+        recomputes `device_availability_daily`/`asset_availability_daily`
+        from `device_status_facts` rows some other job already collected, so
+        there is no connection id to scope and no call budget to cap.
+
+        `lookback_days` is what stops this from being a full-history
+        recompute on every tick: only the trailing window is re-materialized,
+        because only recent days can still change (a late-arriving or
+        corrected `device_status_fact`). Older days move only when someone
+        runs the backfill script deliberately.
+        """
+        if interval_minutes <= 0:
+            raise ValueError("Availability materialization interval must be positive.")
+        if lookback_days <= 0:
+            raise ValueError("Availability materialization lookback must be positive.")
+        now_value = now or utc_now()
+        key = "availability.materialize"
+        try:
+            with self._immediate_session() as session:
+                schedule = session.get(ScheduleState, key)
+                if schedule is not None and as_utc(schedule.next_run_at) > now_value:
+                    return None, False
+                slot = as_utc(schedule.next_run_at) if schedule is not None else now_value
+                slot = _catch_up_slot(slot, now=now_value, interval=timedelta(minutes=interval_minutes))
+                dedupe_key = f"{key}:{slot.isoformat()}"
+                existing = session.scalar(
+                    select(Job).where(
+                        Job.job_type == "availability.materialize",
+                        Job.dedupe_key == dedupe_key,
+                        Job.status.in_(ACTIVE_STATUSES),
+                    )
+                )
+                if existing is None:
+                    job = Job(
+                        job_type="availability.materialize",
+                        status="queued",
+                        # The window travels on the job, not only in config, so a job
+                        # row says which days it was supposed to cover.
+                        payload_json={"scheduled_for": slot.isoformat(), "lookback_days": lookback_days},
+                        dedupe_key=dedupe_key,
+                        # Same tier as diagnostics: derived aggregates rank
+                        # below production/report jobs.
+                        priority=150,
+                        available_at=now_value,
+                        attempt_count=0,
+                        max_attempts=3,
+                        created_at=now_value,
+                        updated_at=now_value,
+                    )
+                    session.add(job)
+                    session.flush()
+                    self._event(
+                        session,
+                        job_id=job.id,
+                        event_type="enqueued",
+                        attempt=0,
+                        from_status=None,
+                        to_status="queued",
+                        actor_source="scheduler",
+                        metadata={"schedule_key": key, "dedupe_key": dedupe_key},
+                        occurred_at=now_value,
+                    )
+                    created = True
+                else:
+                    job = existing
+                    created = False
+                if schedule is None:
+                    schedule = ScheduleState(schedule_key=key, next_run_at=slot, updated_at=now_value)
+                    session.add(schedule)
+                schedule.last_enqueued_at = now_value
+                schedule.next_run_at = slot + timedelta(minutes=interval_minutes)
+                schedule.updated_at = now_value
+                session.flush()
+                session.expunge(job)
+                return job, created
+        except IntegrityError:
+            with self._immediate_session() as session:
+                existing = session.scalar(
+                    select(Job).where(
+                        Job.job_type == "availability.materialize",
+                        Job.dedupe_key == dedupe_key,
+                        Job.status.in_(ACTIVE_STATUSES),
+                    )
+                )
+                if existing is None:
+                    raise
+                self._event(
+                    session,
+                    job_id=existing.id,
+                    event_type="dedupe_reused",
+                    attempt=existing.attempt_count,
+                    from_status=existing.status,
+                    to_status=existing.status,
+                    actor_source="scheduler",
+                    metadata={"schedule_key": key, "dedupe_key": dedupe_key},
+                    occurred_at=now_value,
+                )
+                session.expunge(existing)
+                return existing, False
+
+    def enqueue_due_availability_history_sync(
+        self, *, connection_id: int, interval_minutes: int, lookback_days: int, now: datetime | None = None
+    ) -> tuple[Job | None, bool]:
+        """Enqueue one closed-day device-history ingestion cycle when due.
+
+        Unlike `enqueue_due_availability_materialization` above, this job
+        **does** call the provider, so it carries a `connection_id` and is
+        pinned to exactly one connection -- the same restraint every other
+        provider-calling schedule in this file applies to a shared,
+        rate-limited account.
+
+        `lookback_days` is small on purpose: a closed day's history is final,
+        so there is nothing to gain from re-fetching old days and real call
+        budget to lose. The handler additionally skips any day already
+        ingested, so a steady state costs zero provider calls.
+        """
+        if interval_minutes <= 0:
+            raise ValueError("Availability history sync interval must be positive.")
+        if lookback_days <= 0:
+            raise ValueError("Availability history sync lookback must be positive.")
+        now_value = now or utc_now()
+        key = f"availability.history_sync:{connection_id}"
+        try:
+            with self._immediate_session() as session:
+                schedule = session.get(ScheduleState, key)
+                if schedule is not None and as_utc(schedule.next_run_at) > now_value:
+                    return None, False
+                slot = as_utc(schedule.next_run_at) if schedule is not None else now_value
+                slot = _catch_up_slot(slot, now=now_value, interval=timedelta(minutes=interval_minutes))
+                dedupe_key = f"{key}:{slot.isoformat()}"
+                existing = session.scalar(
+                    select(Job).where(
+                        Job.job_type == "availability.history_sync",
+                        Job.dedupe_key == dedupe_key,
+                        Job.status.in_(ACTIVE_STATUSES),
+                    )
+                )
+                if existing is None:
+                    job = Job(
+                        job_type="availability.history_sync",
+                        status="queued",
+                        # The window travels on the job, not only in config, so a job
+                        # row says which days it was supposed to cover.
+                        payload_json={"scheduled_for": slot.isoformat(), "connection_id": connection_id, "lookback_days": lookback_days},
+                        dedupe_key=dedupe_key,
+                        # A provider call, so it ranks with the other
+                        # provider syncs rather than with derived work.
+                        priority=140,
+                        available_at=now_value,
+                        attempt_count=0,
+                        max_attempts=3,
+                        created_at=now_value,
+                        updated_at=now_value,
+                    )
+                    session.add(job)
+                    session.flush()
+                    self._event(
+                        session,
+                        job_id=job.id,
+                        event_type="enqueued",
+                        attempt=0,
+                        from_status=None,
+                        to_status="queued",
+                        actor_source="scheduler",
+                        metadata={"schedule_key": key, "dedupe_key": dedupe_key},
+                        occurred_at=now_value,
+                    )
+                    created = True
+                else:
+                    job = existing
+                    created = False
+                if schedule is None:
+                    schedule = ScheduleState(schedule_key=key, next_run_at=slot, updated_at=now_value)
+                    session.add(schedule)
+                schedule.last_enqueued_at = now_value
+                schedule.next_run_at = slot + timedelta(minutes=interval_minutes)
+                schedule.updated_at = now_value
+                session.flush()
+                session.expunge(job)
+                return job, created
+        except IntegrityError:
+            with self._immediate_session() as session:
+                existing = session.scalar(
+                    select(Job).where(
+                        Job.job_type == "availability.history_sync",
                         Job.dedupe_key == dedupe_key,
                         Job.status.in_(ACTIVE_STATUSES),
                     )

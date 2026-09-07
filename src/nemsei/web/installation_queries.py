@@ -54,7 +54,7 @@ from nemsei.shared.clock import utc_now
 from nemsei.timeline.service import installation_timeline
 from nemsei.web.operational_priority import installation_priority
 from nemsei.web.queries import list_assets_data
-from nemsei.web.series import energy_balance, headline, production_consumption_series
+from nemsei.web.series import availability_panel, energy_balance, headline, production_consumption_series
 from nemsei.web.work_order_queries import overdue_and_unscheduled_counts
 from nemsei.work_orders.service import open_work_order_summary_for_incidents, work_orders_for_installation
 
@@ -168,6 +168,12 @@ def _resumo_tab(session: Session, asset: Asset, *, period: str) -> dict[str, Any
     counts = incident_counts_by_category(session, asset_ids=[asset.id])[asset.id]
     return {
         "headline": headline(session, asset_id=asset.id),
+        # WAT diária. Produção e disponibilidade são dois sistemas de factos
+        # independentes (`production_facts` vs `asset_availability_daily`) e
+        # continuam-no aqui: nenhum dos dois blocos desta tab lê o outro, e
+        # uma instalação sem produção diária mostra na mesma a WAT que o
+        # histórico de dispositivo já permitiu calcular.
+        "availability": availability_panel(session, asset_id=asset.id),
         # Not "chart" -- the template imports web/templates/macros/chart.html
         # as `chart`, and a context key of the same name would shadow it.
         "production_chart": production_consumption_series(session, asset_id=asset.id, period=period),

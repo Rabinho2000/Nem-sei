@@ -9,9 +9,12 @@ from alembic.config import Config
 from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
-from nemsei.assets.service import create_asset
+from nemsei.assets.service import create_asset, create_device
 from nemsei.db.session import build_session_factory
+from nemsei.diagnostics.availability_service import materialize_existing_availability
+from nemsei.diagnostics.service import record_device_status
 from nemsei.monitoring.service import record_production_fact
+from nemsei.providers.models import AssetProviderMapping
 from nemsei.reporting.datasets import build_dataset, digest_of, month_starts, snapshot_dataset
 from nemsei.reporting.models import ReportSnapshot, ReportingDataset, ReportingDatasetRow
 from nemsei.providers.service import create_connection, create_mapping
@@ -176,3 +179,70 @@ def test_dataset_building_never_reaches_a_provider() -> None:
     source = inspect.getsource(datasets)
     for forbidden in ("integrations", "requests", "urllib", "http", "FusionSolar", "provider_reads"):
         assert forbidden not in source, forbidden
+
+
+# ---------------------------------------------------------------------------
+# Availability integration (item 6, docs/v2/AVAILABILITY_MIGRATION_PLAN.md):
+# `build_dataset` reads `asset_availability_daily` (via
+# `monthly_availability_for_asset`) directly, not through `DATASET_METRICS`
+# (a `production_facts` mechanism availability facts do not go through).
+# ---------------------------------------------------------------------------
+def _device_with_full_month(session, *, asset_id, connection_id, month_start: date):
+    from zoneinfo import ZoneInfo
+
+    device = create_device(session, asset_id=asset_id, device_kind="inverter", serial_number="SN-AVAIL-1", rated_power_kw=Decimal("20.0"), valid_from=date(2026, 1, 1))
+    create_mapping(
+        session, asset_id=asset_id, provider_connection_id=connection_id, external_id="AVAIL-DEV-1",
+        resource_kind="device", device_id=device.id, valid_from=date(2026, 1, 1),
+    )
+    session.flush()
+    lisbon = ZoneInfo("Europe/Lisbon")
+    days_in_month = 31 if month_start.month in (1, 3, 5, 7, 8, 10, 12) else (30 if month_start.month != 2 else 28)
+    for day_offset in range(days_in_month):
+        day = date.fromordinal(month_start.toordinal() + day_offset)
+        for hour in range(6, 21):
+            record_device_status(
+                session, device_id=device.id, asset_id=asset_id, source_fact_key=f"fusionsolar-device-live:{device.id}",
+                observed_at=datetime(day.year, day.month, day.day, hour, tzinfo=lisbon),
+                availability_status="available", active_power_kw=Decimal("5.0"), source_kind="live_read",
+                freshness="unknown", quality="complete", completeness="complete",
+            )
+    session.commit()
+    return device, days_in_month
+
+
+def test_dataset_row_carries_a_real_availability_pct_for_a_complete_month(prepared) -> None:
+    factory, (asset_id, mapping_id) = prepared
+    with factory() as session:
+        connection_id = session.get(AssetProviderMapping, mapping_id).provider_connection_id
+        _device, days_in_month = _device_with_full_month(session, asset_id=asset_id, connection_id=connection_id, month_start=date(2026, 1, 1))
+
+    with factory() as session:
+        summary = materialize_existing_availability(session, asset_id=asset_id, from_date=date(2026, 1, 1), to_date=date(2026, 1, 31))
+        session.commit()
+        assert summary["days_recalculated"] == 31
+        assert summary.get("complete") == 31
+
+    with factory() as session, session.begin():
+        dataset = build_dataset(session, asset_id=asset_id, period_start=date(2026, 1, 1), period_end=date(2026, 2, 1), built_by="operator")
+        dataset_id = dataset.id
+
+    with factory() as session:
+        rows = session.scalars(select(ReportingDatasetRow).where(ReportingDatasetRow.dataset_id == dataset_id)).all()
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.availability_state == "measured"
+        assert row.availability_pct == Decimal("100.00")
+        assert row.provenance_json["availability_covered_days"] == 31
+        assert row.provenance_json["availability_expected_days"] == 31
+
+
+def test_dataset_row_availability_is_missing_with_no_materialized_days(prepared) -> None:
+    factory, (asset_id, _mapping_id) = prepared
+    with factory() as session, session.begin():
+        dataset = build_dataset(session, asset_id=asset_id, period_start=date(2026, 1, 1), period_end=date(2026, 2, 1), built_by="operator")
+        dataset_id = dataset.id
+    with factory() as session:
+        row = session.scalars(select(ReportingDatasetRow).where(ReportingDatasetRow.dataset_id == dataset_id)).one()
+        assert row.availability_state == "missing"
+        assert row.availability_pct is None

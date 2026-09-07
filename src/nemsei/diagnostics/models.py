@@ -15,14 +15,22 @@ provider connection is currently usable.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, JSON, Numeric, String, Text, UniqueConstraint, text
+from sqlalchemy import CheckConstraint, Date, DateTime, ForeignKey, Index, Integer, JSON, Numeric, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from nemsei.db.base import Base
+from nemsei.reporting.rules.availability_window import COVERAGE_STATES
+from nemsei.reporting.rules.availability_source import (
+    AVAILABILITY_SOURCE_KINDS,
+    AVAILABILITY_SOURCES,
+    KIND_OPERATIONAL,
+    SOURCE_FUSIONSOLAR_SAMPLED,
+    SOURCE_KIND_BY_SOURCE,
+)
 
 
 # V1's own vocabulary (`services/fusionsolar.py:classify_fusionsolar_inverter_availability`),
@@ -30,7 +38,14 @@ from nemsei.db.base import Base
 # which was designed for provider-connection observations, not physical
 # inverter states, and has no honest mapping for "standby".
 AVAILABILITY_STATES = ("available", "standby", "unavailable", "unknown")
-SOURCE_KINDS = ("v1_import", "live_read")
+# `history_read`: a row pulled from `/thirdData/getDevHistoryKpi` for a
+# closed day (5-minute granularity), the evidence contractual availability is
+# computed from. Kept in this same table rather than a new one because a
+# history row *is* a device status reading -- same fields, same normalizer
+# (`device_status.normalize_device_realtime_row`), same revision/provenance
+# machinery. The three kinds are told apart by this column, and the two
+# availability engines each read exactly one of them.
+SOURCE_KINDS = ("v1_import", "live_read", "history_read")
 # Same vocabulary as monitoring.FRESHNESS_STATES/QUALITY_STATES (migration
 # 0016). Added for Fatia 2's live reads; every Fatia 1 (`v1_import`) row
 # defaults to `unknown` on all three rather than a guessed value, since V1
@@ -202,3 +217,119 @@ class IncidentNote(Base):
     handling_state_after: Mapped[str | None] = mapped_column(String(24))
     assigned_to_after: Mapped[str | None] = mapped_column(String(120))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+# Materialized daily availability, ported from V1's
+# `inverter_availability_sampled_daily` / `plant_availability_sampled_daily`
+# (`monitoring_board/services/sampled_availability.py`). See
+# `docs/v2/AVAILABILITY_MIGRATION_PLAN.md`.
+#
+# Idempotent aggregates, not append-only facts, deliberately unlike
+# `DeviceStatusFact` above: re-running the day's materializer against the
+# same `device_status_facts` is the correction mechanism (delete+insert per
+# key), exactly as V1's own `_store_sampled_result` did. There is nothing
+# here to supersede -- the raw evidence it is computed from already carries
+# its own revision history.
+# Vocabulary and the contractual/operational split both live in
+# `reporting/rules/availability_source.py` -- see that module for why the
+# split is a stored fact here rather than a convention. `_SOURCE_KIND_PAIRS`
+# renders the code-level mapping into a SQL predicate so the database itself
+# refuses e.g. ('fusionsolar_sampled', 'contractual'); keeping the two in
+# sync is not left to a writer remembering to.
+_SOURCE_KIND_PAIRS = " OR ".join(
+    f"(source = '{source}' AND source_kind = '{kind}')" for source, kind in sorted(SOURCE_KIND_BY_SOURCE.items())
+)
+
+
+class DeviceAvailabilityDaily(Base):
+    """One device's materialized coverage/availability for one calendar day."""
+
+    __tablename__ = "device_availability_daily"
+    __table_args__ = (
+        CheckConstraint(f"coverage_status IN {COVERAGE_STATES!r}", name="ck_device_availability_daily_coverage"),
+        CheckConstraint(f"source IN {AVAILABILITY_SOURCES!r}", name="ck_device_availability_daily_source"),
+        CheckConstraint(f"source_kind IN {AVAILABILITY_SOURCE_KINDS!r}", name="ck_device_availability_daily_source_kind"),
+        CheckConstraint(_SOURCE_KIND_PAIRS, name="ck_device_availability_daily_source_kind_pair"),
+        CheckConstraint(
+            "availability_pct IS NULL OR (availability_pct >= 0 AND availability_pct <= 100)",
+            name="ck_device_availability_daily_pct_range",
+        ),
+        # Ported invariant from V1's `_store_sampled_result`: a percentage is
+        # only ever attached to a day this module itself judged complete.
+        CheckConstraint(
+            "coverage_status = 'complete' OR availability_pct IS NULL",
+            name="ck_device_availability_daily_pct_requires_complete",
+        ),
+        # Source is part of the key: contractual and operational figures for the
+        # same day coexist, and the selection policy
+        # (`reporting/rules/availability_source.py`) chooses between them.
+        UniqueConstraint("device_id", "availability_date", "source", name="uq_device_availability_daily_day"),
+        Index("ix_device_availability_daily_asset_date", "asset_id", "availability_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    device_id: Mapped[int] = mapped_column(ForeignKey("devices.id", ondelete="RESTRICT"), nullable=False)
+    asset_id: Mapped[int] = mapped_column(ForeignKey("assets.id", ondelete="RESTRICT"), nullable=False)
+    availability_date: Mapped[date] = mapped_column(Date, nullable=False)
+    availability_pct: Mapped[Decimal | None] = mapped_column(Numeric(5, 2))
+    valid_sample_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    minimum_required_samples: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    coverage_status: Mapped[str] = mapped_column(String(24), nullable=False)
+    warning_codes_json: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    operational_window_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    operational_window_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default=SOURCE_FUSIONSOLAR_SAMPLED)
+    # Whether this figure may stand commercially. Stored, not derived at
+    # read time, so a report can never reinterpret a row it did not write.
+    source_kind: Mapped[str] = mapped_column(String(16), nullable=False, default=KIND_OPERATIONAL)
+    calculated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AssetAvailabilityDaily(Base):
+    """One asset's (plant's) materialized coverage/availability for one day.
+
+    All-or-nothing over its own devices, ported from V1's plant-level
+    `coverage_status`: `complete` only when every expected device is
+    `complete` for that day (`availability_window.compute_asset_day_availability`).
+    """
+
+    __tablename__ = "asset_availability_daily"
+    __table_args__ = (
+        CheckConstraint(f"coverage_status IN {COVERAGE_STATES!r}", name="ck_asset_availability_daily_coverage"),
+        CheckConstraint(f"source IN {AVAILABILITY_SOURCES!r}", name="ck_asset_availability_daily_source"),
+        CheckConstraint(f"source_kind IN {AVAILABILITY_SOURCE_KINDS!r}", name="ck_asset_availability_daily_source_kind"),
+        CheckConstraint(_SOURCE_KIND_PAIRS, name="ck_asset_availability_daily_source_kind_pair"),
+        CheckConstraint(
+            "availability_pct IS NULL OR (availability_pct >= 0 AND availability_pct <= 100)",
+            name="ck_asset_availability_daily_pct_range",
+        ),
+        CheckConstraint(
+            "coverage_status = 'complete' OR availability_pct IS NULL",
+            name="ck_asset_availability_daily_pct_requires_complete",
+        ),
+        UniqueConstraint("asset_id", "availability_date", "source", name="uq_asset_availability_daily_day"),
+        Index("ix_asset_availability_daily_date", "availability_date", "asset_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    asset_id: Mapped[int] = mapped_column(ForeignKey("assets.id", ondelete="RESTRICT"), nullable=False)
+    availability_date: Mapped[date] = mapped_column(Date, nullable=False)
+    availability_pct: Mapped[Decimal | None] = mapped_column(Numeric(5, 2))
+    valid_sample_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    expected_device_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    observed_device_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    minimum_required_samples: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    coverage_status: Mapped[str] = mapped_column(String(24), nullable=False)
+    warning_codes_json: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    operational_window_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    operational_window_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default=SOURCE_FUSIONSOLAR_SAMPLED)
+    # Whether this figure may stand commercially. Stored, not derived at
+    # read time, so a report can never reinterpret a row it did not write.
+    source_kind: Mapped[str] = mapped_column(String(16), nullable=False, default=KIND_OPERATIONAL)
+    calculation_details_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    calculated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

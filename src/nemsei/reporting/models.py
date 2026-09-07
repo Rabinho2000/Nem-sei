@@ -16,6 +16,7 @@ from sqlalchemy import CheckConstraint, Date, DateTime, ForeignKey, Index, Integ
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from nemsei.db.base import Base
+from nemsei.reporting.rules.availability_source import AVAILABILITY_SOURCE_KINDS, AVAILABILITY_SOURCES
 
 
 SOURCE_FILE_KINDS = ("financial_model",)
@@ -206,6 +207,34 @@ class ReportingDatasetRow(Base):
         CheckConstraint("consumption_state <> 'missing' OR consumption_kwh IS NULL", name="ck_reporting_dataset_rows_missing_consumption"),
         CheckConstraint(f"grid_import_state IN {VALUE_STATES!r}", name="ck_reporting_dataset_rows_grid_import_state"),
         CheckConstraint("grid_import_state <> 'missing' OR grid_import_kwh IS NULL", name="ck_reporting_dataset_rows_missing_grid_import"),
+        # Availability, ported from V1's sampled engine
+        # (docs/v2/AVAILABILITY_MIGRATION_PLAN.md). Same missing-implies-null
+        # shape as every other metric here -- a month with no materialized
+        # `asset_availability_daily` coverage reports an absent percentage,
+        # never a zero.
+        CheckConstraint(f"availability_state IN {VALUE_STATES!r}", name="ck_reporting_dataset_rows_availability_state"),
+        CheckConstraint("availability_state <> 'missing' OR availability_pct IS NULL", name="ck_reporting_dataset_rows_missing_availability"),
+        CheckConstraint(
+            f"availability_source IS NULL OR availability_source IN {AVAILABILITY_SOURCES!r}",
+            name="ck_reporting_dataset_rows_availability_source",
+        ),
+        CheckConstraint(
+            f"availability_source_kind IS NULL OR availability_source_kind IN {AVAILABILITY_SOURCE_KINDS!r}",
+            name="ck_reporting_dataset_rows_availability_source_kind",
+        ),
+        CheckConstraint(
+            "(availability_source IS NULL) = (availability_source_kind IS NULL)",
+            name="ck_reporting_dataset_rows_availability_source_pair",
+        ),
+        # A reportable percentage must say where it came from.
+        CheckConstraint(
+            "availability_pct IS NULL OR availability_source IS NOT NULL",
+            name="ck_reporting_dataset_rows_availability_pct_has_source",
+        ),
+        CheckConstraint(
+            "availability_pct IS NULL OR (availability_pct >= 0 AND availability_pct <= 100)",
+            name="ck_reporting_dataset_rows_availability_pct_range",
+        ),
         UniqueConstraint("dataset_id", "asset_id", "period_start", name="uq_reporting_dataset_rows_period"),
     )
 
@@ -230,6 +259,20 @@ class ReportingDatasetRow(Base):
     consumption_state: Mapped[str] = mapped_column(String(16), nullable=False, default="missing")
     grid_import_kwh: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
     grid_import_state: Mapped[str] = mapped_column(String(16), nullable=False, default="missing")
+
+    # Weighted plant availability for this asset-month, from
+    # `diagnostics.availability_service.monthly_availability_for_asset`
+    # (itself rolled up from `asset_availability_daily`). Never a V1 import,
+    # never backfilled blindly -- only ever the ported sampled engine's own
+    # output. `Numeric(5, 2)` matches `AssetAvailabilityDaily.availability_pct`.
+    availability_pct: Mapped[Decimal | None] = mapped_column(Numeric(5, 2))
+    availability_state: Mapped[str] = mapped_column(String(16), nullable=False, default="missing")
+    # Which pipeline produced `availability_pct`, and whether that pipeline's
+    # output may stand as a commercial figure
+    # (`reporting/rules/availability_source.py`). Nullable together: a month
+    # with no materialized availability has no source to name.
+    availability_source: Mapped[str | None] = mapped_column(String(32))
+    availability_source_kind: Mapped[str | None] = mapped_column(String(16))
 
     provenance_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
 

@@ -12,6 +12,11 @@
   <div><p class="eyebrow">Configuração</p><h1>Estado do sistema</h1><p class="page-intro">Se a plataforma não está a receber dados, a razão está nesta página.</p></div>
 </header>
 
+<nav class="section-tabs" aria-label="Secções do estado do sistema">
+  <a class="active" href="{{ url_for('system.index') }}">Ligações</a>
+  <a href="{{ url_for('system.production_coverage') }}">Cobertura de produção</a>
+</nav>
+
 <section class="kpis">
   <div class="kpi"><small>Sincronizações · {{ window_hours }} h</small><b>{{ runs_attempted }}</b><span class="cov-txt">tentativas registadas</span></div>
   <div class="kpi"><small>Não entregaram</small><b class="{{ 'danger-figure' if runs_unhappy else '' }}">{{ runs_unhappy }}</b><span class="cov-txt">falha, limite, parcial ou adiado</span></div>

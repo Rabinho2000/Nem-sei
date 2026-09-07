@@ -53,8 +53,13 @@ class ProviderConnection(Base):
     __table_args__ = (
         CheckConstraint(f"provider_code IN {PROVIDER_CODES!r}", name="ck_provider_connections_provider_code"),
         CheckConstraint(f"configuration_status IN {CONNECTION_STATUSES!r}", name="ck_provider_connections_configuration_status"),
+        CheckConstraint(
+            "production_sync_interval_hours IS NULL OR production_sync_interval_hours > 0",
+            name="ck_provider_connections_production_interval",
+        ),
         UniqueConstraint("provider_code", "connection_key", name="uq_provider_connections_provider_key"),
         Index("ix_provider_connections_provider", "provider_code", "enabled"),
+        Index("ix_provider_connections_production_sync", "production_sync_enabled", "enabled"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -66,6 +71,21 @@ class ProviderConnection(Base):
     credential_reference: Mapped[str | None] = mapped_column(String(255))
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     configuration_status: Mapped[str] = mapped_column(String(32), nullable=False, default="not_configured")
+    # Production scheduling, stated per connection rather than in one
+    # environment variable. `enabled` above says the platform may talk to
+    # this account at all; this says the daily production sync is one of the
+    # things it may do on a schedule. Two switches, because turning a
+    # connection on to run a one-off mapping reconciliation is not the same
+    # decision as putting it on a standing budget of provider calls.
+    production_sync_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # `None` means "use the global default interval". A second account with a
+    # different tolerance does not have to share the first one's cadence.
+    production_sync_interval_hours: Mapped[int | None] = mapped_column(Integer)
+    # Where this connection's history starts. Nothing guesses it: without it
+    # a connection with no cursor is reported as not initialised and makes no
+    # provider call, because an incremental sync has no start date to resume
+    # from and inventing one would fetch a window nobody asked for.
+    initial_production_from_date: Mapped[date | None] = mapped_column(Date)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 

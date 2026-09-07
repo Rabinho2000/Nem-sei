@@ -24,7 +24,9 @@ from nemsei.assets.models import Asset
 from nemsei.monitoring.models import ProductionFact
 from nemsei.monitoring.repository import CanonicalFactRepository
 from nemsei.shared.clock import utc_now
+from nemsei.reporting.rules.availability_source import KIND_CONTRACTUAL
 from nemsei.web.charts import Point, bar_chart, coverage_calendar, dual_bar_chart, sparkline, stacked_bars
+from nemsei.web.labels import availability_coverage, availability_kind, availability_source
 
 METRIC_LABELS = {
     "production_energy": "Produção",
@@ -274,6 +276,151 @@ def headline(session: Session, *, asset_id: int, days: int = 30) -> dict[str, An
         "spark": sparkline(ordered),
         "latest_fact_on": newest.astimezone(timezone.utc).date() if newest else None,
         "stale_days": (today - newest.astimezone(timezone.utc).date()).days if newest else None,
+    }
+
+
+
+# ---------------------------------------------------------------------------
+# WAT diária, ao nível da instalação.
+# ---------------------------------------------------------------------------
+# A disponibilidade só existia no fecho mensal e no portfolio, e é diária que
+# um operador precisa dela: para saber, hoje, se o dia fechado ontem produziu
+# um número contratual ou se ficou sem cobertura. Nada aqui calcula nada --
+# lê `asset_availability_daily` através de
+# `diagnostics.availability_service.asset_availability_series`, que já aplica
+# `select_availability`. Renderizar uma página nunca faz uma chamada ao
+# provider, e este caminho não tem por onde: o serviço que lê não importa
+# nenhum cliente.
+
+AVAILABILITY_WINDOW_DAYS = 60
+
+
+def availability_panel(session: Session, *, asset_id: int, days: int = AVAILABILITY_WINDOW_DAYS) -> dict[str, Any]:
+    """O KPI, o gráfico e a tabela da WAT diária de uma instalação.
+
+    Três regras que a página não pode quebrar, e que por isso são resolvidas
+    aqui e não no template:
+
+    1. **Um dia sem valor é um buraco, nunca um zero.** O `Point` sem valor já
+       desenha `c-void` em `macros/chart.html`; o que este módulo garante é
+       que nenhum dia sem linha entra na série como `0.0`.
+    2. **Uma figura amostrada nunca aparece rotulada como contratual.** Cada
+       ponto e cada linha da tabela carrega o seu `source_kind`, vindo da
+       linha guardada -- não de uma suposição sobre qual das duas fontes
+       "deve" estar lá.
+    3. **A ausência explica-se.** Sem valor no último dia fechado, o KPI diz o
+       que faltou (cobertura, inversores observados de esperados) em vez de
+       mostrar um traço mudo.
+    """
+    from nemsei.diagnostics.availability_service import asset_availability_series  # local: evita ciclo web -> diagnostics -> web
+
+    today = utc_now().date()
+    start = today - timedelta(days=days - 1)
+    series = asset_availability_series(session, asset_id=asset_id, from_date=start, to_date=today)
+
+    points = []
+    for index, entry in enumerate(series):
+        day = entry["date"]
+        kind = availability_kind(entry["source_kind"])
+        if entry["availability_pct"] is None:
+            hint = f"{day.strftime('%d/%m/%Y')}: sem WAT · {availability_coverage(entry['coverage_status'])['label'].lower()}"
+        else:
+            hint = (
+                f"{day.strftime('%d/%m/%Y')}: {entry['availability_pct']:.2f} % · {kind['label']}"
+                f" · {entry['valid_sample_count']} slots válidos"
+            )
+        points.append(
+            Point(
+                label=day.strftime("%d/%m") if index % 7 == 0 else "",
+                value=entry["availability_pct"],
+                hint=hint,
+            )
+        )
+
+    rows = [
+        {
+            "date": entry["date"],
+            "availability_pct": entry["availability_pct"],
+            "coverage": availability_coverage(entry["coverage_status"]),
+            "kind": availability_kind(entry["source_kind"]),
+            "source_label": availability_source(entry["source"]) if entry["source"] else "—",
+            "valid_sample_count": entry["valid_sample_count"],
+            "observed_device_count": entry["observed_device_count"],
+            "expected_device_count": entry["expected_device_count"],
+            # Both sources present for this day, so the table can say that a
+            # sampled figure exists beside a contractual one that has no
+            # percentage -- the case an operator most needs to tell apart.
+            "sources_available": entry["sources_available"],
+        }
+        for entry in reversed(series)
+    ]
+
+    measured = [entry for entry in series if entry["availability_pct"] is not None]
+    contractual_days = sum(1 for entry in measured if entry["source_kind"] == KIND_CONTRACTUAL)
+    return {
+        "kpi": _availability_kpi(series),
+        "chart": bar_chart(points, unit="%"),
+        "rows": rows,
+        "window_days": days,
+        "days_with_value": len(measured),
+        "contractual_days": contractual_days,
+        # A window whose only figures are sampled is a real and reportable
+        # state: the contractual pipeline has produced nothing for this
+        # installation yet. Named so the template does not have to infer it.
+        "contractual_available": contractual_days > 0,
+    }
+
+
+def _availability_kpi(series: list[dict[str, Any]]) -> dict[str, Any]:
+    """O último dia fechado com WAT -- ou o que faltou para o haver.
+
+    Qual é esse dia é decidido por
+    `availability_service.latest_measured_entry`, não aqui: a regra ("um dia
+    materializado que saiu `indeterminate` não serve de KPI") tem de valer
+    igual em qualquer sítio que pergunte, e uma segunda cópia era o começo
+    de duas respostas diferentes para a mesma pergunta.
+
+    Quando não há nenhuma, devolve na mesma a cobertura do dia mais recente
+    que chegou a ser materializado, para a página poder dizer *porquê* em
+    vez de só mostrar um traço.
+    """
+    from nemsei.diagnostics.availability_service import latest_measured_entry  # local: mesmo ciclo que acima
+
+    measured = latest_measured_entry(series)
+    if measured is not None:
+        return {
+            "available": True,
+            "date": measured["date"],
+            "availability_pct": measured["availability_pct"],
+            "kind": availability_kind(measured["source_kind"]),
+            "source_label": availability_source(measured["source"]),
+            "valid_sample_count": measured["valid_sample_count"],
+            "observed_device_count": measured["observed_device_count"],
+            "expected_device_count": measured["expected_device_count"],
+        }
+    for entry in reversed(series):
+        if entry["source"] is not None:
+            return {
+                "available": False,
+                "date": entry["date"],
+                "availability_pct": None,
+                "coverage": availability_coverage(entry["coverage_status"]),
+                "kind": availability_kind(entry["source_kind"]),
+                "source_label": availability_source(entry["source"]),
+                "valid_sample_count": entry["valid_sample_count"],
+                "observed_device_count": entry["observed_device_count"],
+                "expected_device_count": entry["expected_device_count"],
+            }
+    return {
+        "available": False,
+        "date": None,
+        "availability_pct": None,
+        "coverage": availability_coverage("missing"),
+        "kind": availability_kind(None),
+        "source_label": "—",
+        "valid_sample_count": 0,
+        "observed_device_count": 0,
+        "expected_device_count": 0,
     }
 
 

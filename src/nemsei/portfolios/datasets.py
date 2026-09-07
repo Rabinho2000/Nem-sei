@@ -31,6 +31,7 @@ from nemsei.portfolios.models import (
 )
 from nemsei.reporting.datasets import DATASET_METRICS, build_dataset
 from nemsei.reporting.models import ReportingDataset
+from nemsei.reporting.rules.availability_window import rollup_availability
 from nemsei.shared.clock import utc_now
 
 
@@ -79,6 +80,38 @@ def _row_metrics(dataset: ReportingDataset) -> tuple[dict[str, Decimal | None], 
     values["expected"], states["expected"] = total("expected_production_kwh", "expected_state")
     for name in DATASET_METRICS:
         values[name], states[name] = total(f"{name}_kwh", f"{name}_state")
+
+    # Availability is a percentage, not an energy total -- averaged across
+    # this asset's own months in the period, never summed. Same
+    # missing-implies-null shape and the same conservative gate `total()`
+    # already applies: a month short of `measured` makes the whole span
+    # `None` rather than a mean over fewer months (matches
+    # `assembler.py::aggregate_rows`'s identical rule one layer up).
+    availability_rows = [row for row in rows]
+    measured_pct = [row.availability_pct for row in availability_rows if row.availability_state == "measured" and row.availability_pct is not None]
+    if not availability_rows or not measured_pct:
+        values["availability"], states["availability"] = None, "missing"
+    elif len(measured_pct) < len(availability_rows):
+        values["availability"], states["availability"] = None, "partial"
+    else:
+        values["availability"], states["availability"] = sum(measured_pct, Decimal("0")) / len(measured_pct), "measured"
+
+    # Which pipeline the figure came from, and whether it may stand
+    # commercially (`reporting/rules/availability_source.py`). Only reported
+    # when every measured month agrees -- months from different sources are
+    # not averageable into one labelled number, the same rule
+    # `assembler.py::aggregate_rows` applies one layer up.
+    sources = {
+        (row.availability_source, row.availability_source_kind)
+        for row in availability_rows
+        if row.availability_state == "measured" and row.availability_pct is not None
+    }
+    if len(sources) == 1:
+        states["availability_source"], states["availability_source_kind"] = sources.pop()
+    else:
+        states["availability_source"], states["availability_source_kind"] = None, None
+        if len(sources) > 1:
+            values["availability"], states["availability"] = None, "partial"
     return values, states
 
 
@@ -166,6 +199,27 @@ def build_portfolio_dataset(
     ):
         performance = float(Decimal(production["value"]) / Decimal(expected["value"]) * 100)
     totals["performance_pct"] = performance
+
+    # Portfolio availability: weighted by each member's installed capacity,
+    # via the same conservative `rollup_availability` an installation's own
+    # rollup already uses (`diagnostics.availability_service`) -- one
+    # member short of `measured` makes the whole portfolio figure `None`
+    # rather than a mean over fewer members, item 3/5 of
+    # docs/v2/AVAILABILITY_MIGRATION_PLAN.md.
+    availability_member_rows = [
+        {
+            "availability_pct": (float(row["values"]["availability"]) if row["values"]["availability"] is not None else None),
+            "installed_dc_power_kw": (float(row["installed_dc_power_kw"]) if row["installed_dc_power_kw"] is not None else None),
+        }
+        for row in member_rows
+    ]
+    portfolio_availability_pct = rollup_availability(availability_member_rows, weight_key="installed_dc_power_kw") if availability_member_rows else None
+    availability_measured = sum(1 for row in member_rows if row["states"]["availability"] == "measured")
+    totals["availability_pct"] = portfolio_availability_pct
+    totals["availability_state"] = (
+        "measured" if portfolio_availability_pct is not None
+        else ("partial" if availability_measured else "missing")
+    )
 
     members_total = len(member_rows)
     complete = sum(

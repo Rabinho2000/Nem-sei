@@ -295,6 +295,65 @@ class FusionSolarProductionService:
             return replace(result, next_source_day=chunk_end + timedelta(days=1))
         return result
 
+    def sync_bootstrap_backfill(
+        self,
+        connection_id: int,
+        *,
+        start_date: date,
+        resume_from: date | None = None,
+        batch_checkpoint: dict[str, Any] | None = None,
+    ) -> ProductionSyncResult:
+        """The first backfill for a connection that has never synced.
+
+        Identical to `sync_bounded_backfill` in every respect except one: the
+        end of the window is resolved here rather than supplied by the
+        caller. It has to be, because the only day a backfill may end on is
+        provider-local yesterday -- an incomplete or future provider-local day
+        is refused outright by `_window` -- and provider-local is a property
+        of the connection's own verified production contract. The scheduler
+        that enqueues this job has no business loading that timezone, and a
+        UTC-derived "yesterday" would be the wrong day for any account whose
+        timezone sits behind UTC.
+
+        The window is also clamped to `production_backfill_max_source_days`.
+        A connection whose stated first day is further back than that gets
+        the oldest allowed slice now; the cursor it leaves behind is what the
+        next bootstrap tick resumes from, so a long history is walked in
+        bounded pieces instead of being refused as one oversized request.
+        There is no silent truncation: nothing marks the connection done, and
+        the coverage screen keeps reporting how far the cursor has got.
+        """
+        try:
+            contract = production_contract_for(self._connection(connection_id))
+        except (FusionSolarClientError, ValueError) as exc:
+            # Configuration is missing or unreadable. Reported through the
+            # ordinary window path so it lands on a sync run and on the
+            # connection's health like any other configuration failure,
+            # rather than raising out of a scheduled job.
+            return self._sync_window(
+                connection_id,
+                start_date=start_date,
+                end_date=None,
+                reconciliation_days=0,
+                mode="bounded_backfill",
+                allow_cursor_advance=True,
+                max_source_days=self._settings.production_backfill_chunk_days,
+                require_explicit_bounds=True,
+                force_window_error=(exc.error.safe_message if isinstance(exc, FusionSolarClientError) else str(exc)),
+            )
+        provider_yesterday = datetime.now(contract.source_timezone).date() - timedelta(days=1)
+        end_date = min(
+            provider_yesterday,
+            start_date + timedelta(days=self._settings.production_backfill_max_source_days - 1),
+        )
+        return self.sync_bounded_backfill(
+            connection_id,
+            start_date=start_date,
+            end_date=end_date,
+            resume_from=resume_from,
+            batch_checkpoint=batch_checkpoint,
+        )
+
     def _sync_window(
         self,
         connection_id: int,
