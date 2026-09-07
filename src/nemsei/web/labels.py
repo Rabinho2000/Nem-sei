@@ -18,6 +18,18 @@ from __future__ import annotations
 
 
 from nemsei.providers.models import MAPPING_STATUSES
+from nemsei.reporting.rules.availability_source import (
+    AVAILABILITY_SOURCE_KINDS,
+    AVAILABILITY_SOURCES,
+    KIND_CONTRACTUAL,
+    KIND_OPERATIONAL,
+    SOURCE_FUSIONSOLAR_DEVICE_HISTORY,
+    SOURCE_FUSIONSOLAR_SAMPLED,
+    SOURCE_MANUAL,
+    SOURCE_PROVIDER_DEVICE_AVAILABILITY,
+    SOURCE_PROVIDER_WAT,
+)
+from nemsei.reporting.rules.availability_window import COVERAGE_STATES
 
 
 # A tone is a claim about whether the operator needs to do something:
@@ -83,3 +95,68 @@ def review_state(status: str | None) -> dict[str, str]:
     label, tone = REVIEW_STATE_LABELS.get(status or "", (status or "—", "muted"))
     return {"status": status or "", "label": label, "tone": tone}
 
+
+
+# ---------------------------------------------------------------------------
+# Availability: what produced a number, and whether it may stand as a WAT.
+# ---------------------------------------------------------------------------
+# The one label pair in this module where getting it wrong is a commercial
+# error rather than a cosmetic one. `fusionsolar_sampled` is derived from the
+# realtime poll and V1 never let it reach a customer report; if the interface
+# prints it under the same word as the contractual figure, an operator reads
+# an operational estimate as the warranted availability the contract is
+# written on. So the kind is always spelled out beside the number, the
+# operational label always carries the word "amostrada", and neither label is
+# ever derived from the other.
+
+AVAILABILITY_KIND_LABELS: dict[str, tuple[str, str]] = {
+    KIND_CONTRACTUAL: ("Contratual", "success"),
+    KIND_OPERATIONAL: ("Operacional · amostrada", "muted"),
+}
+
+# What computed the figure, for the provenance line under it. Deliberately
+# says "derivada": FusionSolar publishes no availability or WAT of its own,
+# and a label that implied the provider stated the number would be a claim
+# about the contract that nobody can support.
+AVAILABILITY_SOURCE_LABELS: dict[str, str] = {
+    SOURCE_FUSIONSOLAR_DEVICE_HISTORY: "Histórico de dispositivo (5 min, dia fechado)",
+    SOURCE_FUSIONSOLAR_SAMPLED: "Sonda em tempo real",
+    SOURCE_PROVIDER_WAT: "WAT publicada pelo provider",
+    SOURCE_PROVIDER_DEVICE_AVAILABILITY: "Disponibilidade publicada pelo provider",
+    SOURCE_MANUAL: "Introduzida por operador",
+}
+
+# A day's coverage. `missing` and `indeterminate` are kept apart because they
+# are different facts: nothing was computed, versus computed and it could not
+# produce a figure. Both render as an absence, never as a zero.
+AVAILABILITY_COVERAGE_LABELS: dict[str, tuple[str, str]] = {
+    "complete": ("Completo", "success"),
+    "partial": ("Parcial", "warning"),
+    "indeterminate": ("Indeterminado", "warning"),
+    "missing": ("Sem dados", "muted"),
+}
+
+UNLABELLED_AVAILABILITY_SOURCES = tuple(sorted(set(AVAILABILITY_SOURCES) - set(AVAILABILITY_SOURCE_LABELS)))
+UNLABELLED_AVAILABILITY_KINDS = tuple(sorted(set(AVAILABILITY_SOURCE_KINDS) - set(AVAILABILITY_KIND_LABELS)))
+UNLABELLED_COVERAGE_STATES = tuple(sorted(set(COVERAGE_STATES) - set(AVAILABILITY_COVERAGE_LABELS)))
+
+
+def availability_kind(source_kind: str | None) -> dict[str, str]:
+    """Contractual or operational, as label and tone.
+
+    `None` is not "unknown styling" -- it is a day with no stored figure at
+    all, and it says so rather than borrowing either kind's word.
+    """
+    if not source_kind:
+        return {"kind": "", "label": "Sem origem", "tone": "muted"}
+    label, tone = AVAILABILITY_KIND_LABELS.get(source_kind, (source_kind, "muted"))
+    return {"kind": source_kind, "label": label, "tone": tone}
+
+
+def availability_source(source: str | None) -> str:
+    return AVAILABILITY_SOURCE_LABELS.get(source or "", source or "—")
+
+
+def availability_coverage(coverage_status: str | None) -> dict[str, str]:
+    label, tone = AVAILABILITY_COVERAGE_LABELS.get(coverage_status or "", (coverage_status or "—", "muted"))
+    return {"status": coverage_status or "", "label": label, "tone": tone}
