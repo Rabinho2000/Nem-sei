@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{#
+  Cobertura de produção. A pergunta "porque é que esta central está vazia"
+  tinha sete respostas possíveis e todas se apuravam no psql. Aqui está a
+  cadeia inteira, uma linha por instalação, com o elo que partiu e o que
+  fazer a seguir.
+
+  Não há botões de acção nesta página, e é de propósito: o que conserta
+  estes estados vive em /mappings, /source-policies e /system, cada um com
+  a sua auditoria — e um disparo daqui gastaria orçamento de chamadas da
+  conta partilhada precisamente quando ela já está a recusar.
+#}
+{% block content %}
+<header class="page-header">
+  <div>
+    <p class="eyebrow">Operação</p>
+    <h1>Cobertura de produção</h1>
+    <p class="page-intro">Porque é que uma central não está a receber produção diária — o elo da cadeia que partiu, não uma lista de tudo o que também é verdade.</p>
+  </div>
+  <a class="button secondary" href="{{ url_for('system.index') }}">Estado do sistema →</a>
+</header>
+
+<section class="kpis" aria-label="Resumo da frota">
+  <div class="kpi"><small>Instalações</small><b>{{ summary.total }}</b></div>
+  <div class="kpi"><small>Com produção recente</small><b class="{{ 'danger-figure' if summary.with_recent_production == 0 else '' }}">{{ summary.with_recent_production }}</b></div>
+  <div class="kpi"><small>Com problema</small><b class="{{ 'danger-figure' if summary.with_problem else '' }}">{{ summary.with_problem }}</b></div>
+  {% for value, label, count in state_options %}
+    {% if value != 'ok' %}
+      <div class="kpi"><small>{{ label }}</small><b>{{ count }}</b></div>
+    {% endif %}
+  {% endfor %}
+</section>
+
+<section class="panel">
+  <form class="filter-form" method="get" action="{{ url_for('system.production_coverage') }}">
+    <label><input type="checkbox" name="only_problems" value="1" {{ 'checked' if filters.only_problems }}> Só com problema</label>
+    <label>Provider
+      <select name="provider">
+        <option value="">Todos</option>
+        {% for value in provider_options %}<option value="{{ value }}" {{ 'selected' if filters.provider == value }}>{{ value }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>Ligação
+      <select name="connection">
+        <option value="">Todas</option>
+        {% for value, name in connection_options %}<option value="{{ value }}" {{ 'selected' if filters.connection == value|string }}>{{ name }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>Estado
+      <select name="state">
+        <option value="">Todos</option>
+        {% for value, label, count in state_options %}<option value="{{ value }}" {{ 'selected' if filters.state == value }}>{{ label }} ({{ count }})</option>{% endfor %}
+      </select>
+    </label>
+    <button class="button" type="submit">Filtrar</button>
+    <a class="text-link" href="{{ url_for('system.production_coverage') }}">Limpar</a>
+  </form>
+
+  <p class="provenance">{{ showing }} de {{ summary.total }} instalações. O resumo acima conta sempre a frota inteira, não o filtro.</p>
+
+  {% if rows %}
+    <div class="table-scroll">
+      <table class="data-table stack-mobile">
+        <thead>
+          <tr>
+            <th>Instalação</th><th>Provider</th><th>Ligação</th><th>Mapping</th><th>Política</th>
+            <th>Último dia com produção</th><th>Cursor</th><th>Última sincronização</th><th>Estado</th><th>Ação recomendada</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+            {% set item = row.finding %}
+            <tr>
+              <th scope="row"><a class="table-primary" href="{{ url_for('installations.detail', asset_id=item.asset_id) }}">{{ item.asset_name }}</a></th>
+              <td data-label="Provider">{{ item.provider_code or '—' }}</td>
+              <td data-label="Ligação">{{ item.connection_name or '—' }}</td>
+              <td data-label="Mapping">{{ 'ativo' if item.mapping_status == 'active' else (item.mapping_status or '—') }}</td>
+              <td data-label="Política">{{ 'sim' if item.has_source_policy else 'não' }}</td>
+              <td data-label="Último dia com produção">{{ item.last_production_day.strftime('%d/%m/%Y') if item.last_production_day else '—' }}</td>
+              <td data-label="Cursor">{{ item.cursor_last_completed_day.strftime('%d/%m/%Y') if item.cursor_last_completed_day else '—' }}</td>
+              <td data-label="Última sincronização">
+                {% if item.last_sync_at %}
+                  {{ item.last_sync_at.strftime('%d/%m %H:%M') }}<br>
+                  <small class="muted">{{ item.last_sync_status }}{% if item.last_sync_error_code %} · <code>{{ item.last_sync_error_code }}</code>{% endif %}</small>
+                {% else %}—{% endif %}
+              </td>
+              <td data-label="Estado"><span class="status-badge {{ row.state.tone }}">{{ row.state.label }}</span></td>
+              <td data-label="Ação recomendada" class="muted">{{ item.recommended_action }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% else %}
+    <div class="honest-empty"><span class="empty-icon" aria-hidden="true">—</span><div><strong>Nenhuma instalação corresponde a este filtro.</strong><p>Não quer dizer que esteja tudo bem: limpe o filtro para ver a frota inteira.</p></div></div>
+  {% endif %}
+</section>
+{% endblock %}
