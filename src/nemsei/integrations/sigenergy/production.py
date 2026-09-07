@@ -136,12 +136,22 @@ def parse_daily_history(payload: dict[str, Any], *, confirmed_unit: str) -> Pars
 
 @dataclass
 class SigenergyProductionResult:
+    """What one run was obliged to collect, and what it actually got.
+
+    `days_requested`/`days_accepted` are kept under their original names
+    because callers and stored job results use them, but both now count the
+    same unit -- **mapping-days**, one obligation per system per day. They
+    previously counted different things (`len(days)` against a per-mapping
+    tally), so a two-system account could report accepting five of three.
+    """
+
     status: str
     days_requested: int
     days_accepted: int
     facts_written: int
     provider_calls: int
     error_code: str | None = None
+    days_rejected: int = 0
 
 
 class SigenergyProductionService:
@@ -176,28 +186,34 @@ class SigenergyProductionService:
         takes the oldest `max_days` and leaves the rest for the next tick,
         because a cap that refuses is a cap that gets stuck the moment the gap
         outgrows it, which is exactly the trap FusionSolar fell into.
+
+        The window itself is resolved **inside** the run, after the contract
+        is known, and never here. It used to be computed from `utc_now()`
+        before anything had established which day the provider is in, so a run
+        at 23:30 UTC in September asked Lisbon for a day that had another hour
+        to go and stored the counter it was holding at that moment as the
+        day's total. V1 refused `target_date >= today` for exactly this
+        reason; the refusal is back, against the source's own calendar.
         """
-        today = utc_now().date()
-        with self._sessions() as session:
-            cursor = session.scalar(
-                select(SyncCursor).where(
-                    SyncCursor.provider_connection_id == connection_id,
-                    SyncCursor.capability == ProviderCapability.PRODUCTION_HISTORY.value,
-                    SyncCursor.cursor_key == _CURSOR_KEY,
-                )
-            )
-            last_day = (cursor.checkpoint_json or {}).get("last_completed_day") if cursor else None
-        start = date.fromisoformat(last_day) + timedelta(days=1) if isinstance(last_day, str) else today - timedelta(days=1)
-        if start > today:
-            start = today
-        end = min(today, start + timedelta(days=max_days - 1))
-        return self.sync_daily_production(connection_id, start_date=start, end_date=end)
+        if max_days <= 0:
+            raise ValueError("Sigenergy production window must span at least one day.")
+        return self._sync(connection_id, start_date=None, end_date=None, max_days=max_days)
 
     def sync_daily_production(
         self, connection_id: int, *, start_date: date, end_date: date
     ) -> SigenergyProductionResult:
         if end_date < start_date:
             raise ValueError("Sigenergy production window is invalid.")
+        return self._sync(connection_id, start_date=start_date, end_date=end_date, max_days=None)
+
+    def _sync(
+        self,
+        connection_id: int,
+        *,
+        start_date: date | None,
+        end_date: date | None,
+        max_days: int | None,
+    ) -> SigenergyProductionResult:
         with self._sessions() as session:
             connection = ProviderRepository(session).connection(connection_id)
             if connection is None:
@@ -225,11 +241,46 @@ class SigenergyProductionService:
         if error:
             return self._finish(run_id, connection_id, 0, 0, 0, 1, error)
 
-        days = [start_date + timedelta(days=offset) for offset in range((end_date - start_date).days + 1)]
-        accepted, written, calls, last_error = 0, 0, 1, None
+        # The last day the source has finished. Everything after it is a
+        # counter still moving, and a counter still moving is not a total.
+        last_closed_day = utc_now().astimezone(contract.source_timezone).date() - timedelta(days=1)
+        if start_date is None:
+            start_date = self._resume_from(connection_id, default=last_closed_day)
+        window_end = end_date if end_date is not None else start_date + timedelta(days=(max_days or 1) - 1)
+        window_end = min(window_end, last_closed_day)
+        if max_days is not None:
+            window_end = min(window_end, start_date + timedelta(days=max_days - 1))
+
+        if window_end < start_date:
+            # Nothing has closed since the cursor. That is a complete run with
+            # no obligations, not a failure -- and, crucially, not a reason to
+            # move the cursor anywhere.
+            return self._finish(
+                run_id, connection_id, 0, 0, 0, 1, None,
+                timezone_name=contract.source_timezone_name, nothing_due=True,
+            )
+
+        days = [start_date + timedelta(days=offset) for offset in range((window_end - start_date).days + 1)]
+        expected, accepted, rejected, written, calls = 0, 0, 0, 0, 1
+        # Mapping-days that came back with *some* real readings. They are not
+        # accepted -- the day is not collected -- but they are the difference
+        # between "the provider answered incompletely", which is worth another
+        # attempt, and "the provider had nothing", which is not the same thing.
+        partly_collected = 0
+        last_error: ProviderError | None = None
+        unresolved: list[str] = []
         for source_day in days:
-            selected = self._selected_mappings(connection_id, source_day)
+            selected, findings = self._selected_mappings(connection_id, source_day)
+            unresolved.extend(findings)
+            if not selected:
+                # A day nobody is configured to read is not a day that was
+                # read. Counting it as neither expected nor rejected is how a
+                # gap in the source policy became invisible.
+                rejected += 1
+                expected += 1
+                continue
             for mapping in selected:
+                expected += 1
                 payload, error = self._calls.call(
                     connection_id=connection_id, sync_run_id=run_id, endpoint_family="production_history_daily",
                     purpose="sigenergy_daily_history",
@@ -240,20 +291,75 @@ class SigenergyProductionService:
                 calls += 1
                 if error:
                     last_error = error
+                    rejected += 1
                     continue
                 try:
                     parsed = parse_daily_history(payload, confirmed_unit=contract.canonical_unit)
                 except (ValueError, SigenergyHistoryUnitError) as exc:
                     last_error = ProviderError(ProviderErrorCode.INVALID_RESPONSE, str(exc))
+                    rejected += 1
                     continue
+                # The evidence is written either way -- a `missing` fact is a
+                # durable record that this day was asked for and came back
+                # empty, which is worth more than silence. What it is not is a
+                # collected day, so only a complete one counts as accepted.
                 written += self._persist(mapping, source_day, parsed, contract, run_id)
-                accepted += 1
-        status_error = None if accepted else (last_error or ProviderError(ProviderErrorCode.INVALID_RESPONSE, "Sigenergy history returned nothing usable."))
-        partial = bool(last_error) and accepted > 0
-        result = self._finish(run_id, connection_id, len(days), accepted, written, calls, status_error, partial=partial, timezone_name=contract.source_timezone_name)
-        if result.status == "success":
-            self._advance_cursor(run_id, end_date, contract)
+                if parsed.completeness == "complete":
+                    accepted += 1
+                    continue
+                rejected += 1
+                if parsed.completeness == "missing":
+                    last_error = last_error or ProviderError(
+                        ProviderErrorCode.INVALID_RESPONSE,
+                        "Sigenergy returned no readings for a day that should have closed.",
+                    )
+                else:
+                    partly_collected += 1
+                    last_error = last_error or ProviderError(
+                        ProviderErrorCode.INVALID_RESPONSE,
+                        "Sigenergy returned only part of a day's metrics.",
+                    )
+        if unresolved:
+            last_error = last_error or ProviderError(
+                ProviderErrorCode.CONFIGURATION,
+                "Sigenergy production has mappings with no resolvable source policy.",
+            )
+        status_error = None if accepted else (
+            last_error or ProviderError(ProviderErrorCode.INVALID_RESPONSE, "Sigenergy history returned nothing usable.")
+        )
+        # Complete means every obligation met. Anything less holds the cursor:
+        # replaying a day already stored costs one call and is idempotent,
+        # while stepping over one loses it with nothing left to notice by.
+        complete = accepted == expected and expected > 0 and not unresolved
+        partial = (accepted > 0 or partly_collected > 0) and not complete
+        result = self._finish(
+            run_id, connection_id, expected, accepted, written, calls,
+            None if complete else status_error,
+            partial=partial, timezone_name=contract.source_timezone_name, rejected=rejected,
+        )
+        if complete and result.status == "success":
+            self._advance_cursor(run_id, window_end, contract)
         return result
+
+    def _resume_from(self, connection_id: int, *, default: date) -> date:
+        """The first day this connection still owes, from its own cursor."""
+        with self._sessions() as session:
+            cursor = session.scalar(
+                select(SyncCursor).where(
+                    SyncCursor.provider_connection_id == connection_id,
+                    SyncCursor.capability == ProviderCapability.PRODUCTION_HISTORY.value,
+                    SyncCursor.cursor_key == _CURSOR_KEY,
+                )
+            )
+            last_day = (cursor.checkpoint_json or {}).get("last_completed_day") if cursor else None
+        if not isinstance(last_day, str):
+            return default
+        try:
+            return date.fromisoformat(last_day) + timedelta(days=1)
+        except ValueError:
+            # A checkpoint nobody can read is not a checkpoint to trust; fall
+            # back to the bounded default rather than skipping history on it.
+            return default
 
     def _advance_cursor(self, run_id: int, covered_through: date, contract: Any) -> None:
         """Only on a clean run: a partial day must be re-read, never skipped."""
@@ -300,21 +406,33 @@ class SigenergyProductionService:
             session.commit()
         return written
 
-    def _selected_mappings(self, connection_id: int, source_day: date) -> list[AssetProviderMapping]:
+    def _selected_mappings(
+        self, connection_id: int, source_day: date
+    ) -> tuple[list[AssetProviderMapping], list[str]]:
+        """The mappings this day is read through, and the ones nobody could resolve.
+
+        The unresolvable ones used to be swallowed: a `ValueError` from
+        `resolve_source_policy` -- no primary policy valid for the period, or
+        two primaries competing at the same priority -- simply removed the
+        mapping from the run. The day then looked fully collected because
+        nothing was left in it to fail.
+        """
         with self._sessions() as session:
             selected: list[AssetProviderMapping] = []
+            unresolved: list[str] = []
             for mapping in ProviderRepository(session).mappings_for_connection_on_date(connection_id, source_day):
                 if mapping.mapping_status != "active" or mapping.resource_kind != "plant":
                     continue
                 try:
                     policy = resolve_source_policy(session, asset_id=mapping.asset_id, source_use="production", on_date=source_day)
-                except ValueError:
+                except ValueError as exc:
+                    unresolved.append(f"{source_day.isoformat()}:{mapping.external_id}:{exc}")
                     continue
                 if policy.provider_mapping_id == mapping.id:
                     selected.append(mapping)
             for mapping in selected:
                 session.expunge(mapping)
-            return selected
+            return selected, unresolved
 
     def _start_run(self, connection_id: int) -> int:
         with self._sessions() as session:
@@ -325,14 +443,28 @@ class SigenergyProductionService:
     def _finish(
         self, run_id: int, connection_id: int, requested: int, accepted: int, written: int,
         calls: int, error: ProviderError | None, *, deferred: bool = False, partial: bool = False,
-        timezone_name: str | None = None,
+        timezone_name: str | None = None, rejected: int = 0, nothing_due: bool = False,
     ) -> SigenergyProductionResult:
+        """Turn what happened into one status, with nothing rounded upwards.
+
+        `nothing_due` is the one case where zero accepted is still success:
+        the cursor is already at the last closed day, so the run had no
+        obligations to meet. Every other zero-accepted outcome is a failure,
+        including the one that used to reach here as success -- a payload that
+        parsed cleanly and contained no readings.
+        """
         if deferred:
             status = "deferred"
-        elif error and not accepted:
-            status = "rate_limited" if error.code == ProviderErrorCode.RATE_LIMITED else "failed"
+        elif nothing_due:
+            status = "success"
         elif partial:
+            # Checked before the error, deliberately: a run that collected
+            # something real and something not is partial whatever error it
+            # also carries, and calling it failed would hide the part that
+            # landed from anything counting coverage.
             status = "partial"
+        elif error:
+            status = "rate_limited" if error.code == ProviderErrorCode.RATE_LIMITED else "failed"
         else:
             status = "success"
         completeness = "complete" if status == "success" else ("partial" if status == "partial" else "none")
@@ -341,10 +473,13 @@ class SigenergyProductionService:
             assert run is not None
             run.metadata_json = {
                 "actual_provider_calls": calls,
+                # All three count the same unit -- mapping-days -- so
+                # `accepted + rejected <= expected` is a statement that means
+                # something. They used to mix days with mapping-days.
                 "expected_items": requested,
-                "items_received": accepted,
+                "items_received": accepted + rejected,
                 "items_accepted": accepted,
-                "items_rejected": 0,
+                "items_rejected": rejected,
                 "source_period_timezone": timezone_name,
                 "production_mode": "daily_history",
             }
@@ -357,4 +492,7 @@ class SigenergyProductionService:
                 error=error if status not in ("success", "partial") else None,
             )
             session.commit()
-        return SigenergyProductionResult(status, requested, accepted, written, calls, error.code.value if error else None)
+        return SigenergyProductionResult(
+            status, requested, accepted, written, calls,
+            error.code.value if error else None, rejected,
+        )

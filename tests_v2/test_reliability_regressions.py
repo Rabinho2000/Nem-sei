@@ -18,6 +18,7 @@ import importlib.util
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import select
@@ -176,8 +177,11 @@ def test_one_unread_day_holds_back_coverage_for_the_whole_window(settings, monke
                 ProductionFact.value.is_not(None),
             )
         ).all()
+    # Read back in the source's calendar, which is the one the day was
+    # anchored in -- a Lisbon day starts at 23:00 the previous UTC date.
+    source_days = {fact.period_start.astimezone(ZoneInfo("Europe/Lisbon")).date() for fact in kept}
     # Two real days landed and stay landed; only the missing one is owed.
-    assert {fact.period_start.date() for fact in kept} == {date(2026, 8, 18), date(2026, 8, 20)}
+    assert source_days == {date(2026, 8, 18), date(2026, 8, 20)}
 
 
 def test_a_genuine_zero_is_a_reading_and_not_an_absence(settings, monkeypatch) -> None:
