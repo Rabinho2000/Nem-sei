@@ -321,3 +321,17 @@ def test_the_heartbeat_is_not_listed_among_the_automations_it_qualifies(settings
     rows = rows_for(factory, seed)
     assert rows[HEARTBEAT_KEY].is_heartbeat is True
     assert [key for key, row in rows.items() if not row.is_heartbeat] == ["digests.generate"]
+
+
+def test_the_bootstrap_schedule_has_its_own_wording() -> None:
+    """`production.bootstrap:7` e `production.incremental:3` são duas
+    automações diferentes, com contas, cadências e modos de falha
+    diferentes. Sem entrada no catálogo, a primeira aparecia no ecrã com o
+    nome cru da sua própria chave -- exactamente o que o catálogo existe
+    para evitar."""
+    from nemsei.system.automation_health import describe
+
+    bootstrap = describe("production.bootstrap:7")
+    assert bootstrap.label == "Arranque da produção"
+    assert bootstrap.label != describe("production.incremental:3").label
+    assert bootstrap.capability == "production_history"

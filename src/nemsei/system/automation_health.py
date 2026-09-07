@@ -84,6 +84,13 @@ CATALOGUE: dict[str, ScheduleDescription] = {
         "NEMSEI_V2_PRODUCTION_SYNC_SCHEDULER_ENABLED",
         capability="production_history",
     ),
+    "production.bootstrap": ScheduleDescription(
+        "Arranque da produção",
+        "Primeiro backfill de uma ligação sem cursor, desde a data inicial declarada até ontem. "
+        "Desaparece assim que o cursor existe.",
+        "NEMSEI_V2_PRODUCTION_SYNC_SCHEDULER_ENABLED",
+        capability="production_history",
+    ),
     "monitoring.current": ScheduleDescription(
         "Estado das centrais",
         "Lê o estado corrente de cada central e regista a observação.",
