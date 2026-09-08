@@ -16,7 +16,6 @@ from datetime import date
 
 from nemsei.config import Settings
 from tests_v2.test_reliability_regressions import (
-    COMPLETE_DAY,
     RecordingClient,
     sigenergy_fixture,
 )
