@@ -23,6 +23,7 @@ from nemsei.sync.collection_models import (
     STATUS_LOST_OWNERSHIP,
     STATUS_PARTIAL,
     STATUS_RUNNING,
+    STATUS_SUPERSEDED,
     CollectionRun,
 )
 from nemsei.sync.collection_service import (
@@ -290,8 +291,12 @@ def test_the_database_refuses_fulfilled_without_evidence(settings, monkeypatch):
         session.rollback()
 
 
-def test_two_fulfilled_runs_for_one_scope_are_impossible(settings, monkeypatch):
-    """The last line of defence against double fulfilment."""
+def test_a_second_run_for_a_collected_scope_is_superseded_not_fulfilled(settings, monkeypatch):
+    """A replay is not a failure, and it is not a second fulfilment either.
+
+    Detected under the scope lock, so the legitimate case resolves cleanly
+    instead of surfacing as an IntegrityError from the queue.
+    """
     factory = factory_for(settings, monkeypatch)
     with factory() as session:
         connection = _connection(session)
@@ -307,21 +312,55 @@ def test_two_fulfilled_runs_for_one_scope_are_impossible(settings, monkeypatch):
         session.commit()
 
         second = _start(session, connection, job)
-        # The index refuses at flush, inside finalize -- before the caller
-        # ever gets to decide whether to commit.
-        with pytest.raises(IntegrityError):
-            finalize_collection_run(
-                session,
-                second,
-                fence=fence,
-                evidence=CollectionEvidence(scopes_required=1, scopes_written=1, cursor_advanced=True),
-                requires_cursor=True,
-            )
-        session.rollback()
+        finalize_collection_run(
+            session,
+            second,
+            fence=fence,
+            evidence=CollectionEvidence(scopes_required=1, scopes_written=1, cursor_advanced=True),
+            requires_cursor=True,
+        )
+        session.commit()
+        assert second.status == STATUS_SUPERSEDED
 
     with factory() as session:
         fulfilled = session.query(CollectionRun).filter(CollectionRun.status == STATUS_FULFILLED).count()
         assert fulfilled == 1
+
+
+def test_the_index_still_refuses_two_fulfilled_rows_behind_the_service(settings, monkeypatch):
+    """The service now resolves the replay, so the index is never reached in
+    normal operation. It still has to hold: it is what protects the invariant
+    from a future write path that does not go through the service at all."""
+    factory = factory_for(settings, monkeypatch)
+    with factory() as session:
+        connection = _connection(session)
+        job, fence = _running_job(session)
+        run = _start(session, connection, job)
+        finalize_collection_run(
+            session,
+            run,
+            fence=fence,
+            evidence=CollectionEvidence(scopes_required=1, scopes_written=1, cursor_advanced=True),
+            requires_cursor=True,
+        )
+        session.commit()
+        connection_id = connection.id
+
+    with factory() as session:
+        with pytest.raises(IntegrityError):
+            session.execute(
+                text(
+                    "INSERT INTO collection_runs ("
+                    " provider_connection_id, capability, scope_kind, scope_key,"
+                    " period_start, period_end, attempt, status, started_at, finished_at,"
+                    " facts_written, scopes_required, scopes_written, cursor_advanced,"
+                    " lease_generation, created_at, updated_at)"
+                    " VALUES (:c, 'production_history', 'connection', :k,"
+                    " :s, :e, 2, 'fulfilled', now(), now(), 0, 1, 1, true, 10, now(), now())"
+                ),
+                {"c": connection_id, "k": str(connection_id), "s": PERIOD_START, "e": PERIOD_END},
+            )
+        session.rollback()
 
 
 def test_lost_ownership_is_recorded_in_its_own_transaction(settings, monkeypatch):

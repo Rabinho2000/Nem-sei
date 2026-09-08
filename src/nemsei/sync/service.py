@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from nemsei.providers.errors import ProviderError, ProviderErrorCode
 from nemsei.shared.clock import as_utc, utc_now
+from nemsei.jobs.ownership import OwnershipFence, assert_ownership
 from nemsei.sync.models import (
     HEALTH_STATES,
     SYNC_RUN_STATUSES,
@@ -216,10 +217,30 @@ def advance_cursor(
     cursor_key: str,
     checkpoint: dict,
     covered_through: datetime | None,
+    fence: OwnershipFence | None = None,
 ) -> SyncCursor:
+    """Move a connection's coverage forward, never backward.
+
+    `fence` is required of collection-managed callers and re-proves ownership
+    against the live job row before the cursor moves. It is optional only for
+    the paths that have no job to be owned by (imports, direct service calls
+    in tests); those keep the previous behaviour.
+
+    The row is taken `FOR UPDATE`. The advisory scope lock already serialises
+    the writers this module expects, but the lock and the row are different
+    objects and a future caller that forgets the lock should still not be able
+    to interleave a read-modify-write here.
+    """
     if run.status != "success":
         raise ValueError("Only a successful sync can advance coverage")
-    cursor = SyncRepository(session).cursor(provider_connection_id=run.provider_connection_id, capability=run.capability, cursor_key=cursor_key)
+    if fence is not None:
+        assert_ownership(session, fence)
+    cursor = SyncRepository(session).cursor(
+        provider_connection_id=run.provider_connection_id,
+        capability=run.capability,
+        cursor_key=cursor_key,
+        for_update=True,
+    )
     now = utc_now()
     if cursor is None:
         cursor = SyncCursor(

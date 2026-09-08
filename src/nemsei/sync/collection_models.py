@@ -72,6 +72,10 @@ ALLOWED_TRANSITIONS: dict[str, tuple[str, ...]] = {
         STATUS_FAILED,
         STATUS_LOST_OWNERSHIP,
         STATUS_CANCELLED,
+        # A replay of a scope another run already collected. The work was
+        # real and idempotent; the fulfilment was simply not this run's to
+        # claim.
+        STATUS_SUPERSEDED,
     ),
     STATUS_FULFILLED: (),
     STATUS_PARTIAL: (STATUS_SUPERSEDED,),

@@ -34,6 +34,7 @@ from nemsei.sync.collection_models import (
     STATUS_LOST_OWNERSHIP,
     STATUS_PARTIAL,
     STATUS_RUNNING,
+    STATUS_SUPERSEDED,
     CollectionRun,
 )
 
@@ -141,6 +142,29 @@ def start_collection_run(
     return run
 
 
+def _fulfilled_run_exists(session: Session, run: CollectionRun) -> bool:
+    """Is this scope already collected by some other run?
+
+    Called while the caller holds the scope's advisory lock, so the answer
+    cannot change underneath the decision that follows it.
+    """
+    existing = session.scalar(
+        select(CollectionRun.id)
+        .where(
+            CollectionRun.provider_connection_id == run.provider_connection_id,
+            CollectionRun.capability == run.capability,
+            CollectionRun.scope_kind == run.scope_kind,
+            CollectionRun.scope_key == run.scope_key,
+            CollectionRun.period_start == run.period_start,
+            CollectionRun.period_end == run.period_end,
+            CollectionRun.status == STATUS_FULFILLED,
+            CollectionRun.id != run.id,
+        )
+        .limit(1)
+    )
+    return existing is not None
+
+
 def _transition(run: CollectionRun, target: str) -> None:
     allowed = ALLOWED_TRANSITIONS.get(run.status, ())
     if target not in allowed:
@@ -174,7 +198,23 @@ def finalize_collection_run(
 
     moment = as_utc(now) if now is not None else utc_now()
     if can_fulfill_collection_run(evidence, requires_cursor=requires_cursor):
-        target = STATUS_FULFILLED
+        if _fulfilled_run_exists(session, run):
+            # Another run already collected this scope. The work here was
+            # real and idempotent -- the facts are the same facts -- but the
+            # fulfilment is not this run's to claim. Detected under the scope
+            # lock, so the unique index stays a last line of defence rather
+            # than the thing that decides, and a legitimate replay does not
+            # crash the queue with an IntegrityError.
+            target = STATUS_SUPERSEDED
+        else:
+            target = STATUS_FULFILLED
+    elif evidence.scopes_written > 0 or evidence.facts_written > 0:
+        # Something real landed -- a completed scope, or evidence short of
+        # one, such as four of a day's five metrics. Partial is checked before
+        # the error for the same reason `_finish` checks it first: calling
+        # this failed would hide the part that did arrive from anything
+        # counting coverage.
+        target = STATUS_PARTIAL
     elif evidence.error_code is not None:
         target = STATUS_FAILED
     else:

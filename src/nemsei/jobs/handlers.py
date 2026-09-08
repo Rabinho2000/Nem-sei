@@ -199,7 +199,12 @@ def _execute_sigenergy_production(job: ClaimedJob, connection_id: int, *, settin
     """
     if job.job_type != "production.incremental":
         raise ValueError(f"Sigenergy production supports only production.incremental, not {job.job_type}.")
-    result = SigenergyProductionService(session_factory, settings).sync_incremental(connection_id)
+    # The fence travels from the claim into the authoritative transaction.
+    # Without it the service would still be atomic but would prove nothing
+    # about who owned the job when it committed.
+    result = SigenergyProductionService(session_factory, settings).sync_incremental(
+        connection_id, fence=job.fence
+    )
     result_json = {
         "mode": "daily_history",
         "result_status": result.status,
