@@ -362,3 +362,46 @@ def test_existing_facts_alone_never_create_a_collection_run(settings, monkeypatc
         session.commit()
 
     assert _runs(factory) == []
+
+
+# ---------------------------------------------------------------------------
+# A ligação do handler: o fence tem de sair mesmo do claim.
+# ---------------------------------------------------------------------------
+
+
+def test_the_handler_hands_the_service_its_claim_fence(settings, monkeypatch):
+    """The wiring, asserted rather than assumed.
+
+    `ClaimedJob.fence` is only useful if the handler actually passes it. A
+    service that quietly received `None` would still be atomic and would prove
+    nothing about ownership -- and every test in this file that builds the
+    fence by hand would still pass.
+    """
+    from nemsei.jobs import handlers
+
+    factory, _asset_id, connection_id, _mapping = sigenergy_fixture(settings, monkeypatch)
+    claimed = _claimed(settings, factory)
+    seen: dict = {}
+
+    class Spy:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def sync_incremental(self, cid, *, fence=None, **kwargs):
+            seen["connection_id"] = cid
+            seen["fence"] = fence
+            from nemsei.integrations.sigenergy.production import SigenergyProductionResult
+
+            return SigenergyProductionResult("success", 1, 1, 5, 1, None, 0, 1)
+
+    monkeypatch.setattr(handlers, "SigenergyProductionService", Spy)
+    outcome = handlers._execute_sigenergy_production(
+        claimed, connection_id, settings=Settings.from_environment(), session_factory=factory
+    )
+
+    assert outcome.status == "success"
+    assert seen["connection_id"] == connection_id
+    assert seen["fence"] is not None
+    assert seen["fence"].job_id == claimed.id
+    assert seen["fence"].lease_token == claimed.lease_token
+    assert seen["fence"].lease_generation == claimed.lease_generation

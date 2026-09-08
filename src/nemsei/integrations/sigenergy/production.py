@@ -499,9 +499,17 @@ class SigenergyProductionService:
                 if advance:
                     run = session.get(SyncRun, run_id)
                     assert run is not None
-                    # `advance_cursor` refuses anything but a successful run,
-                    # and the run is still `running` here, so the status is
-                    # set for the check and settled for real by `_finish`.
+                    # `advance_cursor` refuses to move coverage for a run
+                    # that is not successful, and the `SyncRun` is still
+                    # `running` at this point because `_finish` runs after this
+                    # transaction. The flip is not a lie -- `advance` is only
+                    # true when the window is complete, which is exactly the
+                    # condition under which `_finish` will write `success` a
+                    # moment later -- but it is restored before commit so that
+                    # a crash in between leaves the run `running` for the
+                    # abandoned-run sweep rather than `success` with no
+                    # counters. Removing the guard instead would weaken a check
+                    # that protects every other caller.
                     previous_status = run.status
                     run.status = "success"
                     advance_cursor(
