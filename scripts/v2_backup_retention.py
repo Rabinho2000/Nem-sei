@@ -28,7 +28,13 @@ DAILY = 7
 WEEKLY = 4
 MONTHLY = 3
 
-# `nemsei-v2-20260831T092641Z.dump`, written by v2_postgres_backup.sh.
+# `nemsei-v2-20260831T092641Z.dump`, written by v2_postgres_backup.sh once the
+# dump has finished and passed `pg_restore --list`. Anchored at both ends on
+# purpose: an in-flight dump is `...dump.partial`, and it must be invisible to
+# this rule in both directions -- never counted as one of the seven kept, and
+# never deleted either, since cleaning those up is a separate policy with a
+# separate reason. `parse_stamp` returning None is what gives both properties,
+# so the anchor is load-bearing rather than tidiness.
 STAMP = re.compile(r"^nemsei-v2-(\d{8}T\d{6}Z)\.dump$")
 
 

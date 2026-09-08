@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 
 from nemsei.assets.models import Asset
 from nemsei.monitoring.models import ProductionFact
-from nemsei.monitoring.repository import CanonicalFactRepository
+from nemsei.monitoring.repository import CanonicalFactRepository, canonical_facts
 from nemsei.shared.clock import utc_now
 from nemsei.reporting.rules.availability_source import KIND_CONTRACTUAL
 from nemsei.web.charts import Point, bar_chart, coverage_calendar, dual_bar_chart, sparkline, stacked_bars
@@ -433,10 +433,12 @@ def portfolio_monthly_series(
 ) -> dict[str, Any]:
     """Monthly production across the whole portfolio, with how much of it reported.
 
-    One query rather than 266, but the same reduction: `DISTINCT ON
-    (provider_mapping_id, source_fact_key) ... ORDER BY source_revision DESC`
-    is exactly what `current_production_facts_for_asset` does per asset, and
-    skipping it here would add every corrected value to the value it replaced.
+    One query rather than 266, and the same reduction:
+    `monitoring.repository.canonical_facts` picks the newest revision *and*
+    the source the policy selects, which is exactly what
+    `current_production_facts_for_asset` does per asset. Doing it by hand here
+    is how this chart came to add a fallback's reading to the primary's for
+    the same day, on top of the corrected-revision defect it already handled.
 
     Coverage is installations reporting over installations that exist, which is
     the honest denominator: a month where 2 of 266 plants reported is not a
@@ -451,25 +453,11 @@ def portfolio_monthly_series(
         cursor = date(cursor.year - 1, 12, 1) if cursor.month == 1 else date(cursor.year, cursor.month - 1, 1)
     starts.reverse()
 
-    current = (
-        select(
-            ProductionFact.asset_id,
-            ProductionFact.period_start,
-            ProductionFact.value,
-        )
-        .where(
-            ProductionFact.metric_kind == "production_energy",
-            ProductionFact.period_start >= _moment(starts[0]),
-            *([ProductionFact.asset_id.in_(asset_ids)] if asset_ids is not None else []),
-        )
-        .distinct(ProductionFact.provider_mapping_id, ProductionFact.source_fact_key)
-        .order_by(
-            ProductionFact.provider_mapping_id,
-            ProductionFact.source_fact_key,
-            ProductionFact.source_revision.desc(),
-        )
-        .subquery()
-    )
+    current = canonical_facts(
+        metric_kind="production_energy",
+        period_start=_moment(starts[0]),
+        asset_ids=asset_ids,
+    ).subquery()
     bucket = func.date_trunc("month", current.c.period_start).label("bucket")
     rows = session.execute(
         select(bucket, func.sum(current.c.value), func.count(func.distinct(current.c.asset_id)))
@@ -506,29 +494,21 @@ def fleet_metric_totals(
     session: Session, *, start: date, end: date, metric_kind: str = "production_energy", asset_ids: list[int] | None = None
 ) -> dict[int, float]:
     """One metric, one period, every asset, in one query -- the same
-    `DISTINCT ON (provider_mapping_id, source_fact_key) ORDER BY
-    source_revision DESC` reduction `portfolio_monthly_series` uses for its
+    `canonical_facts` reduction `portfolio_monthly_series` uses for its
     monthly bucket, grouped by asset instead. The batched sibling of
     `_daily_totals`/`energy_balance`, which run one query per asset per
     metric -- fine for one installation's page, too many for a fleet page
     covering ~267 of them.
+
+    Sharing the reduction is the point: a fleet total and an installation
+    chart that disagree are two wrong answers, not one right one.
     """
-    current = (
-        select(ProductionFact.asset_id, ProductionFact.value)
-        .where(
-            ProductionFact.metric_kind == metric_kind,
-            ProductionFact.period_start >= _moment(start),
-            ProductionFact.period_start < _moment(end),
-            *([ProductionFact.asset_id.in_(asset_ids)] if asset_ids is not None else []),
-        )
-        .distinct(ProductionFact.provider_mapping_id, ProductionFact.source_fact_key)
-        .order_by(
-            ProductionFact.provider_mapping_id,
-            ProductionFact.source_fact_key,
-            ProductionFact.source_revision.desc(),
-        )
-        .subquery()
-    )
+    current = canonical_facts(
+        metric_kind=metric_kind,
+        period_start=_moment(start),
+        period_end=_moment(end),
+        asset_ids=asset_ids,
+    ).subquery()
     rows = session.execute(
         select(current.c.asset_id, func.sum(current.c.value))
         .where(current.c.value.isnot(None))

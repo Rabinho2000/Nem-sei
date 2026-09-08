@@ -106,6 +106,11 @@ def test_worker_executes_a_real_notification_processing_cycle_end_to_end(setting
     assert Worker(settings, worker_id="test-worker-incidents-for-notifications").run_once()
     assert incident_repo.events_for(incident_job.id)[-1].to_status == "success"
 
+    # `NEMSEI_V2_TESTING` is what keeps this on the mock. A missing bot token
+    # used to be enough, and that was the defect: an unconfigured runtime
+    # recorded events `sent` that nobody could have received. A test that wants
+    # the mock has to say so.
+    monkeypatch.setenv("NEMSEI_V2_TESTING", "true")
     notification_job, created = incident_repo.enqueue_due_notification_processing(interval_minutes=15)
     assert created and notification_job is not None
     assert Worker(settings, worker_id="test-worker-notifications").run_once()
@@ -178,6 +183,7 @@ def test_a_worker_cycle_delivers_nothing_when_the_kill_switch_is_off(settings, m
     from nemsei.notifications.service import deliver_pending_notifications
 
     monkeypatch.setenv("NEMSEI_V2_NOTIFICATIONS", "true")
+    monkeypatch.setenv("NEMSEI_V2_TESTING", "true")
     summary = deliver_pending_notifications(session_factory)
     assert summary.delivery_sent == 1
     with session_factory() as session:
