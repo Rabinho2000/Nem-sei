@@ -18,6 +18,10 @@ class Job(Base):
     __table_args__ = (
         CheckConstraint(f"status IN {JOB_STATUSES!r}", name="ck_jobs_status"),
         Index("ix_jobs_due", "status", "available_at", "priority", "id"),
+        # The fence reads one job row by primary key and compares the
+        # generation; on the pair, that read is index-only rather than a heap
+        # fetch on the queue's hottest table.
+        Index("ix_jobs_lease_generation", "id", "lease_generation"),
         Index(
             "uq_jobs_active_dedupe",
             "job_type",
