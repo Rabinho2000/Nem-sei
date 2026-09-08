@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, JSON, String, Text, text
+from sqlalchemy import BigInteger, CheckConstraint, DateTime, ForeignKey, Index, Integer, JSON, String, Text, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from nemsei.db.base import Base
@@ -38,6 +38,11 @@ class Job(Base):
     max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
     lease_owner: Mapped[str | None] = mapped_column(String(120))
     lease_token: Mapped[str | None] = mapped_column(String(64))
+    # Monotonic, from `jobs_lease_generation_seq`, allocated only by
+    # `claim_next`. `lease_token` says *which* claim; this says *when*, so a
+    # stale worker's write can be rejected by comparison. See
+    # `nemsei.jobs.ownership`.
+    lease_generation: Mapped[int | None] = mapped_column(BigInteger)
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
