@@ -14,6 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from nemsei.jobs.models import ACTOR_SOURCES, Job, JobEvent, ScheduleState, SchedulerLease
+from nemsei.jobs.ownership import OwnershipFence
 from nemsei.shared.clock import as_utc, utc_now
 from nemsei.sync.production_scheduling import ProductionScheduleTarget, production_schedule_targets
 
@@ -36,6 +37,21 @@ class ClaimedJob:
     attempt: int
     max_attempts: int
     lease_token: str
+    # Allocated by `claim_next` from `jobs_lease_generation_seq`. Optional
+    # only so a test can build a ClaimedJob without a database; every claim
+    # made by this repository has one.
+    lease_generation: int | None = None
+
+    @property
+    def fence(self) -> OwnershipFence:
+        """The proof this claim carries into authoritative writes."""
+        if self.lease_generation is None:
+            raise ValueError("This claim carries no lease generation and cannot fence a write.")
+        return OwnershipFence(
+            job_id=self.id,
+            lease_token=self.lease_token,
+            lease_generation=self.lease_generation,
+        )
 
 
 def safe_metadata(values: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -280,6 +296,13 @@ class JobRepository:
                 if row is None:
                     return None
                 attempt = int(row["attempt_count"]) + 1
+                # The one place a generation is allocated. Read inside the
+                # same transaction as the UPDATE that takes ownership, so a
+                # claim that loses the `status = 'queued'` race below simply
+                # burns a number rather than handing out a live one.
+                lease_generation = int(
+                    connection.execute(select(func.nextval("jobs_lease_generation_seq"))).scalar_one()
+                )
                 result = connection.execute(
                     update(Job)
                     .where(Job.id == row["id"], Job.status == "queued")
@@ -288,6 +311,7 @@ class JobRepository:
                         attempt_count=attempt,
                         lease_owner=worker_id,
                         lease_token=lease_token,
+                        lease_generation=lease_generation,
                         claimed_at=now_value,
                         lease_expires_at=lease_until,
                         started_at=now_value,
@@ -315,6 +339,7 @@ class JobRepository:
                     attempt=attempt,
                     max_attempts=int(row["max_attempts"]),
                     lease_token=lease_token,
+                    lease_generation=lease_generation,
                 )
             except Exception:
                 raise
@@ -348,6 +373,7 @@ class JobRepository:
                     updated_at=now,
                     lease_owner=None,
                     lease_token=None,
+                    lease_generation=None,
                     lease_expires_at=None,
                 )
             )
@@ -449,6 +475,7 @@ class JobRepository:
                 "available_at": available_at,
                 "lease_owner": None,
                 "lease_token": None,
+                "lease_generation": None,
                 "lease_expires_at": None,
                 "updated_at": now,
             }
@@ -503,6 +530,7 @@ class JobRepository:
             "updated_at": now,
             "lease_owner": None,
             "lease_token": None,
+            "lease_generation": None,
             "lease_expires_at": None,
         }
         if retryable:
@@ -567,6 +595,7 @@ class JobRepository:
                     attempt_count=0,
                     lease_owner=None,
                     lease_token=None,
+                    lease_generation=None,
                     lease_expires_at=None,
                     updated_at=now,
                 )
@@ -649,6 +678,7 @@ class JobRepository:
                     "status": target_status,
                     "lease_owner": None,
                     "lease_token": None,
+                    "lease_generation": None,
                     "lease_expires_at": None,
                     "updated_at": now_value,
                     "error_type": "LeaseExpired",

@@ -53,7 +53,16 @@ from nemsei.providers.registry import ProviderCapability, ProviderCode
 from nemsei.providers.repository import ProviderRepository
 from nemsei.shared.clock import utc_now
 from nemsei.sources.service import resolve_source_policy
+from nemsei.jobs.ownership import OwnershipFence, OwnershipLost, assert_ownership
+from nemsei.sync.collection_models import CollectionRun
+from nemsei.sync.collection_service import (
+    CollectionEvidence,
+    finalize_collection_run,
+    mark_collection_run_lost_ownership,
+    start_collection_run,
+)
 from nemsei.sync.models import SyncCursor, SyncRun
+from nemsei.sync.scope_lock import SCOPE_KIND_CONNECTION, acquire_collection_scope_lock
 from nemsei.sync.service import advance_cursor, finish_sync_run, health_values_for_error, record_health, start_sync_run
 
 # target metric -> (preferred payload field, legacy payload field)
@@ -177,7 +186,9 @@ class SigenergyProductionService:
         )
         self._calls = SigenergyRequestController(session_factory)
 
-    def sync_incremental(self, connection_id: int, *, max_days: int = 7) -> SigenergyProductionResult:
+    def sync_incremental(
+        self, connection_id: int, *, max_days: int = 7, fence: OwnershipFence | None = None
+    ) -> SigenergyProductionResult:
         """Resume from wherever the cursor got to, bounded.
 
         The cursor is this provider's own (`sigenergy-daily-production`) and
@@ -201,14 +212,16 @@ class SigenergyProductionService:
         """
         if max_days <= 0:
             raise ValueError("Sigenergy production window must span at least one day.")
-        return self._sync(connection_id, start_date=None, end_date=None, max_days=max_days)
+        return self._sync(connection_id, start_date=None, end_date=None, max_days=max_days, fence=fence)
 
     def sync_daily_production(
-        self, connection_id: int, *, start_date: date, end_date: date
+        self, connection_id: int, *, start_date: date, end_date: date, fence: OwnershipFence | None = None
     ) -> SigenergyProductionResult:
         if end_date < start_date:
             raise ValueError("Sigenergy production window is invalid.")
-        return self._sync(connection_id, start_date=start_date, end_date=end_date, max_days=None)
+        return self._sync(
+            connection_id, start_date=start_date, end_date=end_date, max_days=None, fence=fence
+        )
 
     def _sync(
         self,
@@ -217,6 +230,7 @@ class SigenergyProductionService:
         start_date: date | None,
         end_date: date | None,
         max_days: int | None,
+        fence: OwnershipFence | None = None,
     ) -> SigenergyProductionResult:
         with self._sessions() as session:
             connection = ProviderRepository(session).connection(connection_id)
@@ -273,6 +287,11 @@ class SigenergyProductionService:
 
         days = [start_date + timedelta(days=offset) for offset in range((window_end - start_date).days + 1)]
         expected, accepted, rejected, written, calls = 0, 0, 0, 0, 1
+        # (mapping, source_day, parsed) for every day that produced evidence.
+        # Bounded by `max_days` x mappings-per-connection: seven days across a
+        # handful of Sigenergy systems, so holding it is cheaper than holding
+        # a transaction open across the fetch.
+        pending: list[tuple[AssetProviderMapping, date, ParsedDay]] = []
         # Mapping-days that came back with *some* real readings. They are not
         # accepted -- the day is not collected -- but they are the difference
         # between "the provider answered incompletely", which is worth another
@@ -314,7 +333,10 @@ class SigenergyProductionService:
                 # durable record that this day was asked for and came back
                 # empty, which is worth more than silence. What it is not is a
                 # collected day, so only a complete one counts as accepted.
-                written += self._persist(mapping, source_day, parsed, contract, run_id)
+                # Buffered, not written. The provider is still on the other
+                # end of this loop and an authoritative transaction must not
+                # be open while we wait on the network.
+                pending.append((mapping, source_day, parsed))
                 if parsed.completeness == "complete":
                     accepted += 1
                     continue
@@ -343,14 +365,38 @@ class SigenergyProductionService:
         # while stepping over one loses it with nothing left to notice by.
         complete = accepted == expected and expected > 0 and not unresolved
         partial = (accepted > 0 or partly_collected > 0) and not complete
-        result = self._finish(
+        # Everything the provider had to say has been said. Only now does an
+        # authoritative transaction open: facts, cursor and collection run all
+        # land together or none of them do.
+        written, cursor_advanced, ownership_error = self._commit_collection(
+            connection_id=connection_id,
+            run_id=run_id,
+            pending=pending,
+            contract=contract,
+            window_start=start_date,
+            window_end=window_end,
+            advance=complete,
+            fence=fence,
+            expected=expected,
+            accepted=accepted,
+            last_closed_day=last_closed_day,
+            error_code=None if complete else (status_error.code.value if status_error else None),
+        )
+        if ownership_error is not None:
+            # The transaction was discarded. Nothing was written, the cursor
+            # did not move, and the run cannot be fulfilled -- so the job must
+            # not report success either.
+            return self._finish(
+                run_id, connection_id, expected, 0, 0, calls,
+                ProviderError(ProviderErrorCode.CONFIGURATION, f"Ownership lost: {ownership_error}"),
+                timezone_name=contract.source_timezone_name, rejected=rejected,
+            )
+        return self._finish(
             run_id, connection_id, expected, accepted, written, calls,
             None if complete else status_error,
             partial=partial, timezone_name=contract.source_timezone_name, rejected=rejected,
+            cursor_advanced=cursor_advanced,
         )
-        if complete and result.status == "success":
-            self._advance_cursor(run_id, window_end, contract)
-        return result
 
     def _resume_from(self, connection_id: int, *, default: date) -> date:
         """The first day this connection still owes, from its own cursor."""
@@ -372,49 +418,199 @@ class SigenergyProductionService:
             # back to the bounded default rather than skipping history on it.
             return default
 
-    def _advance_cursor(self, run_id: int, covered_through: date, contract: Any) -> None:
-        """Only on a clean run: a partial day must be re-read, never skipped."""
-        with self._sessions() as session:
-            run = session.get(SyncRun, run_id)
-            advance_cursor(
-                session,
-                run=run,
-                cursor_key=_CURSOR_KEY,
-                checkpoint={"last_completed_day": covered_through.isoformat(), "source_timezone": contract.source_timezone_name},
-                covered_through=datetime.combine(covered_through + timedelta(days=1), time.min, tzinfo=contract.source_timezone),
-            )
-            session.commit()
+    def _commit_collection(
+        self,
+        *,
+        connection_id: int,
+        run_id: int,
+        pending: list[tuple[AssetProviderMapping, date, ParsedDay]],
+        contract: Any,
+        window_start: date,
+        window_end: date,
+        advance: bool,
+        fence: OwnershipFence | None,
+        expected: int,
+        accepted: int,
+        last_closed_day: date,
+        error_code: str | None,
+    ) -> tuple[int, bool, str | None]:
+        """The whole authoritative unit, in one transaction.
 
-    def _persist(self, mapping: AssetProviderMapping, source_day: date, parsed: ParsedDay, contract: Any, run_id: int) -> int:
-        """One fact per metric, keyed so a re-read of the same day is idempotent."""
+        lock -> ownership -> facts -> cursor -> ownership -> run -> COMMIT.
+
+        The second ownership assertion is not defensive duplication. The first
+        one proves this worker owned the job when the writes began; a 30-second
+        lease can expire while those writes are legitimately in progress, and
+        an expired lease must not be able to close a run or leave a cursor
+        behind. Only a check taken after the last write can say anything about
+        the moment of commit.
+
+        Returns `(facts_written, cursor_advanced, ownership_error)`. On lost
+        ownership the transaction is rolled back and the loss is recorded
+        separately -- never inside the transaction being discarded, which
+        would throw the record away with it.
+        """
+        period_start = datetime.combine(window_start, time.min, tzinfo=contract.source_timezone)
+        period_end = datetime.combine(window_end + timedelta(days=1), time.min, tzinfo=contract.source_timezone)
+        collection_run_id: int | None = None
+        if fence is not None:
+            # The attempt is recorded before the authoritative transaction and
+            # committed on its own. If it were created inside that transaction
+            # it would be rolled back along with everything else, and a run
+            # that lost its lease would leave no trace at all -- there would be
+            # no row left to mark `lost_ownership`. A `running` row left behind
+            # by a crashed worker is not a defect either; it is the honest
+            # record that an attempt began and never reported back.
+            with self._sessions() as session:
+                collection_run_id = start_collection_run(
+                    session,
+                    provider_connection_id=connection_id,
+                    capability=ProviderCapability.PRODUCTION_HISTORY.value,
+                    scope_kind=SCOPE_KIND_CONNECTION,
+                    scope_key=str(connection_id),
+                    period_start=period_start,
+                    period_end=period_end,
+                    job_id=fence.job_id,
+                    lease_generation=fence.lease_generation,
+                ).id
+                session.commit()
+        try:
+            with self._sessions() as session:
+                acquire_collection_scope_lock(
+                    session,
+                    connection_id=connection_id,
+                    capability=ProviderCapability.PRODUCTION_HISTORY.value,
+                    scope_kind=SCOPE_KIND_CONNECTION,
+                    scope_key=str(connection_id),
+                    period_start=period_start,
+                    period_end=period_end,
+                )
+                collection_run = None
+                if fence is not None:
+                    assert_ownership(session, fence)
+                    collection_run = session.get(CollectionRun, collection_run_id)
+                    assert collection_run is not None
+
+                written = 0
+                for mapping, source_day, parsed in pending:
+                    written += self._persist(session, mapping, source_day, parsed, contract, run_id)
+
+                cursor_advanced = False
+                if advance:
+                    run = session.get(SyncRun, run_id)
+                    assert run is not None
+                    # `advance_cursor` refuses to move coverage for a run
+                    # that is not successful, and the `SyncRun` is still
+                    # `running` at this point because `_finish` runs after this
+                    # transaction. The flip is not a lie -- `advance` is only
+                    # true when the window is complete, which is exactly the
+                    # condition under which `_finish` will write `success` a
+                    # moment later -- but it is restored before commit so that
+                    # a crash in between leaves the run `running` for the
+                    # abandoned-run sweep rather than `success` with no
+                    # counters. Removing the guard instead would weaken a check
+                    # that protects every other caller.
+                    previous_status = run.status
+                    run.status = "success"
+                    advance_cursor(
+                        session,
+                        run=run,
+                        cursor_key=_CURSOR_KEY,
+                        checkpoint={
+                            "last_completed_day": window_end.isoformat(),
+                            "source_timezone": contract.source_timezone_name,
+                        },
+                        covered_through=datetime.combine(
+                            window_end + timedelta(days=1), time.min, tzinfo=contract.source_timezone
+                        ),
+                        fence=fence,
+                    )
+                    run.status = previous_status
+                    cursor_advanced = True
+
+                if fence is not None and collection_run is not None:
+                    finalize_collection_run(
+                        session,
+                        collection_run,
+                        fence=fence,
+                        evidence=CollectionEvidence(
+                            facts_written=written,
+                            scopes_required=expected,
+                            scopes_written=accepted,
+                            cursor_advanced=cursor_advanced,
+                            # `window_end` is clamped to `last_closed_day`
+                            # upstream, so this holds by construction -- stated
+                            # rather than assumed, because the clamp is one
+                            # edit away from being lost.
+                            period_closed=window_end <= last_closed_day,
+                            error_code=error_code,
+                        ),
+                        requires_cursor=True,
+                    )
+                session.commit()
+                return written, cursor_advanced, None
+        except OwnershipLost as exc:
+            if collection_run_id is not None:
+                self._record_lost_ownership(collection_run_id, exc.reason)
+            return 0, False, exc.reason
+
+    def _record_lost_ownership(self, collection_run_id: int, reason: str) -> None:
+        """Best effort, in its own transaction, after the rollback.
+
+        Failing to record the loss must never be able to resurrect the commit
+        that was discarded, so this swallows its own errors.
+        """
+        try:
+            with self._sessions() as session:
+                mark_collection_run_lost_ownership(session, collection_run_id, reason=reason)
+                session.commit()
+        except Exception:  # pragma: no cover - diagnostics must not mask the loss
+            pass
+
+    def _persist(
+        self,
+        session: Session,
+        mapping: AssetProviderMapping,
+        source_day: date,
+        parsed: ParsedDay,
+        contract: Any,
+        run_id: int,
+    ) -> int:
+        """One fact per metric, keyed so a re-read of the same day is idempotent.
+
+        Borrows the caller's session and never commits. It used to open its
+        own and commit per mapping-day, which meant a run's facts landed in as
+        many transactions as it had mapping-days and the cursor landed in one
+        more. There was no point at which the two were consistent, and a crash
+        between them left facts with no cursor or -- worse, since the cursor
+        moved last -- a cursor for facts that had failed.
+        """
         period_start = datetime.combine(source_day, time.min, tzinfo=contract.source_timezone)
         written = 0
-        with self._sessions() as session:
-            for metric, value in parsed.values.items():
-                record_production_fact(
-                    session,
-                    asset_id=mapping.asset_id,
-                    provider_mapping_id=mapping.id,
-                    sync_run_id=run_id,
-                    source_fact_key=f"sigenergy:{metric}:{source_day.isoformat()}",
-                    metric_kind=metric,
-                    period_start=period_start,
-                    period_end=period_start + timedelta(days=1),
-                    granularity="day",
-                    value=Decimal(str(value)) if value is not None else None,
-                    unit="kWh",
-                    quality=parsed.quality if value is not None else "missing",
-                    completeness=parsed.completeness,
-                    metadata={
-                        "source_timezone": contract.source_timezone_name,
-                        "source_unit": parsed.source_unit,
-                        # Battery counters have no canonical metric; kept as
-                        # evidence rather than dropped or forced into one.
-                        **{name: value for name, value in parsed.battery.items() if value is not None},
-                    },
-                )
-                written += 1
-            session.commit()
+        for metric, value in parsed.values.items():
+            record_production_fact(
+                session,
+                asset_id=mapping.asset_id,
+                provider_mapping_id=mapping.id,
+                sync_run_id=run_id,
+                source_fact_key=f"sigenergy:{metric}:{source_day.isoformat()}",
+                metric_kind=metric,
+                period_start=period_start,
+                period_end=period_start + timedelta(days=1),
+                granularity="day",
+                value=Decimal(str(value)) if value is not None else None,
+                unit="kWh",
+                quality=parsed.quality if value is not None else "missing",
+                completeness=parsed.completeness,
+                metadata={
+                    "source_timezone": contract.source_timezone_name,
+                    "source_unit": parsed.source_unit,
+                    # Battery counters have no canonical metric; kept as
+                    # evidence rather than dropped or forced into one.
+                    **{name: value for name, value in parsed.battery.items() if value is not None},
+                },
+            )
+            written += 1
         return written
 
     def _selected_mappings(
@@ -455,6 +651,7 @@ class SigenergyProductionService:
         self, run_id: int, connection_id: int, requested: int, accepted: int, written: int,
         calls: int, error: ProviderError | None, *, deferred: bool = False, partial: bool = False,
         timezone_name: str | None = None, rejected: int = 0, nothing_due: bool = False,
+        cursor_advanced: bool = False,
     ) -> SigenergyProductionResult:
         """Turn what happened into one status, with nothing rounded upwards.
 
@@ -493,6 +690,7 @@ class SigenergyProductionService:
                 "items_rejected": rejected,
                 "source_period_timezone": timezone_name,
                 "production_mode": "daily_history",
+                "cursor_advanced": cursor_advanced,
             }
             record_health(
                 session, provider_connection_id=connection_id, partial=status == "partial",

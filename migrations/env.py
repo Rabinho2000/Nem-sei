@@ -9,6 +9,7 @@ import nemsei.jobs.models  # noqa: F401 - register foundation metadata
 import nemsei.assets.models  # noqa: F401 - register asset metadata
 import nemsei.providers.models  # noqa: F401 - register provider metadata
 import nemsei.sync.models  # noqa: F401 - register sync metadata
+import nemsei.sync.collection_models  # noqa: F401 - register collection run metadata
 import nemsei.monitoring.models  # noqa: F401 - register canonical fact metadata
 import nemsei.sources.models  # noqa: F401 - register source policy metadata
 import nemsei.reporting.models  # noqa: F401 - register reporting metadata

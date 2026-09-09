@@ -182,16 +182,28 @@ que falhavam antes de cada correção:
 
 Aberto, e por ordem de importância:
 
-- **Não há inventário de obrigações de recolha.** Continua a não existir forma
-  de provar que nenhuma recolha esperada desapareceu; contar `sync_runs` não
-  responde a isso. É o que `collection_runs` (ING-001/ING-002) existe para
-  resolver, e é a razão pela qual isto ainda não é uma fonte operacional
-  principal.
+- **O inventário de obrigações ainda não existe; `collection_runs` já existe.**
+  ING-001 acrescentou o registo de *tentativas* — o que foi tentado, por quem,
+  com que resultado e com que prova — mas nada declara ainda o que era
+  *esperado*. Sem isso continua a não haver forma de provar que uma recolha
+  esperada não desapareceu, porque só se vê o que alguém chegou a tentar. É o
+  que ING-002 (`collection_obligations`) existe para fechar, e continua a ser a
+  razão para isto não ser fonte operacional principal.
+- **Só a produção Sigenergy está sob `collection_runs`.** FusionSolar
+  production, device history, current monitoring e o rollup Huawei SCADA ainda
+  escrevem sem fence e sem run. Ver `docs/v2/COLLECTION_RUNS.md` §13.
 - **Os 145 factos Sigenergy já escritos continuam errados.** O código deixou de
   os produzir; repará-los é re-ler os dias da fonte para que uma nova revisão
   substitua o valor. `scripts/v2_sigenergy_day_diagnosis.sql` lista quais.
-- **Lease de worker sem heartbeat** (30 s) e ownership só na linha do job, não
-  nos commits do handler.
+- **Lease de worker sem heartbeat** (30 s). O ownership deixou de estar só na
+  linha do job — `OwnershipFence` chega às escritas autoritativas do Sigenergy
+  e um lease expirado deixa de as autorizar — mas o fence resolve a corrupção,
+  não o desperdício: o trabalho do worker antigo perde-se na mesma, e nada o
+  avisa de que deixou de ser dono.
+- **Runs de recolha órfãos em `running`.** Um worker que morre a meio da
+  transação autoritativa deixa a linha da tentativa em `running` para sempre.
+  É o registo honesto de que algo começou e nunca reportou, mas acumula: falta
+  uma varredura equivalente à `sync_runs.sweep_abandoned`.
 - **`reporting/readiness.py::_coverage` conta um dia como coberto mesmo quando
   só a fonte não canónica o tem.** Não soma duas vezes — conta dias distintos —
   mas a decisão de fonte não é a mesma que a dos totais.
