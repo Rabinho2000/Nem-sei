@@ -17,8 +17,7 @@ por uma ordem que já era preciso conhecer:
 3. há exactamente uma primária aplicável?
 4. a ligação está activa e configurada?
 5. tem referência de credencial, e o contrato de produção verificado no
-   ambiente do worker (`<PREFIX>_PRODUCTION_TIMEZONE`,
-   `<PREFIX>_PRODUCTION_UNIT=kWh`)?
+   ambiente (`<PREFIX>_PRODUCTION_TIMEZONE`, `<PREFIX>_PRODUCTION_UNIT=kWh`)?
 6. existe cursor (`production_history` / `fusionsolar-daily-production`)?
 7. há agendamento para essa ligação, e o que disse a última corrida?
 
@@ -26,6 +25,44 @@ por uma ordem que já era preciso conhecer:
 devolve **o primeiro elo partido**. A ordem não é arbitrária: dizer "sem
 política de fonte" a uma central que nem mapping tem manda o operador ao
 ecrã errado.
+
+### Nem toda a produção é ida buscar
+
+As perguntas 5 a 7 só fazem sentido para uma série que o V2 vai **buscar**
+por polling. Uma fonte **push** não tem contrato de chamada, nem cursor, nem
+data inicial, nem agendamento: o dongle Huawei SCADA liga-se sozinho e
+`integrations/huawei_scada/rollup.py` integra amostras que o V2 já tem,
+sem uma única chamada ao provider.
+
+O discriminador é o `implemented_capabilities` do registry, onde
+`PRODUCTION_HISTORY` está deliberadamente ausente do descritor Huawei SCADA
+— e o comentário lá diz porquê. **Não** é o nome da ligação.
+
+```
+polling → contrato → cursor/bootstrap → agendamento → última corrida → recência
+push    → recência
+```
+
+Encontrado em produção a 2026-09-07: 8 centrais SCADA com produção fresca de
+2026-09-06 apareciam como `production_not_initialized`, a recomendar um
+"primeiro backfill" que não existe para elas. Uma fonte push nunca é
+classificada `production_not_initialized`; se não chegam leituras, isso é
+`no_recent_fact`, que é a verdade.
+
+### O contrato é do deployment, não do processo
+
+`production_contract_missing` responde a uma pergunta sobre o *deployment*, e
+respondia-a sobre o processo que calhasse perguntar. A 2026-09-07 o `web`
+— onde esta página corre — não carregava as duas variáveis que o `worker` e
+o `scheduler` carregavam: 134 de 267 instalações apareciam com o contrato em
+falta, com o contrato configurado e a causa real a ser um cursor encravado.
+
+A correcção tem duas metades. O `docker-compose.v2.yml` isola o contrato
+verificado no seu próprio anchor (`x-v2-fusionsolar-production-contract`),
+que o `web` passa a receber **sem** receber credenciais nenhumas; e
+`tests_v2/test_deployment_contract.py` afirma que os três serviços continuam
+a concordar. Do lado do código, o predicado aceita o ambiente por parâmetro,
+para que a dependência possa ser afirmada por um teste.
 
 O ecrã é `/system/cobertura-producao`. Não executa nada: as coisas que
 consertam estes estados vivem em `/mappings`, `/source-policies` e
@@ -44,15 +81,15 @@ porque é que as chamadas falham era pior do que não existir.
 | `ambiguous_production_source_policy` | Duas primárias na mesma prioridade | Reconciliar em `/source-policies` |
 | `connection_disabled` | Ligação desactivada ou por configurar | `/system` |
 | `credential_reference_missing` | Sem referência de credencial | `/system` |
-| `production_contract_missing` | Falta fuso/unidade verificados no worker | Variáveis de ambiente do worker |
-| `production_not_initialized` | Sem cursor e sem data inicial | Indicar `initial_production_from_date` |
+| `production_contract_missing` | Falta fuso/unidade verificados (só fontes de polling) | Variáveis de ambiente partilhadas por web/worker/scheduler |
+| `production_not_initialized` | Sem cursor e sem data inicial (só fontes de polling) | Indicar `initial_production_from_date` |
 | `production_cursor_missing` | Data inicial posta, bootstrap por correr | Confirmar `production_sync_enabled` |
 | `scheduler_not_enabled_for_connection` | Cursor existe, ligação sem agendamento | Ligar a sincronização de produção |
 | `production_cursor_stale` | Cursor mais atrasado do que um incremental pode cobrir | Bounded backfill |
 | `rate_limited` | O provider recusou | Nada; recupera sozinho |
 | `sync_deferred` | Cooldown da conta | Nada; esperar |
 | `sync_failed` | Última corrida falhou | `/system` |
-| `no_recent_fact` | Tudo saudável, esta central não recebe nada | Confirmar que o código de estação ainda existe na conta |
+| `no_recent_fact` | Tudo saudável, esta central não recebe nada — e o estado de qualquer fonte push sem leituras | Polling: confirmar que o código de estação ainda existe na conta. Push: confirmar que o equipamento continua a ligar-se |
 | `unknown` | A política primária aponta para um mapping que a central não tem activo | `/source-policies` |
 
 `production_cursor_stale` merece uma nota. `production_max_source_days` é

@@ -604,3 +604,91 @@ def test_the_live_check_reads_every_service_not_just_the_first(tmp_path) -> None
     assert f"{declared} declared component settings are live" in completed.stdout
     # Two services per required component, so the loop cannot be ending early.
     assert declared >= 4 and declared % 2 == 0
+
+
+# The production contract has to look the same from every process that reads
+# it. Found live 2026-09-07: `web` renders /system/cobertura-producao, which
+# asks whether each account's verified timezone/unit are configured, but only
+# `worker` and `scheduler` carried them. The page therefore reported 134 of
+# 267 installations as `production_contract_missing` while the contract was
+# configured and the real cause was a stalled cursor. Same database, same
+# code, two different answers.
+
+PRODUCTION_CONTRACT_ANCHOR = "v2-fusionsolar-production-contract"
+DIAGNOSTIC_CONTRACT_SERVICES = ("web", "worker", "scheduler")
+
+
+def _compose_text() -> str:
+    return (ROOT / "docker-compose.v2.yml").read_text(encoding="utf-8")
+
+
+def _anchor_block(compose: str, anchor: str) -> str:
+    """The body of a top-level `x-...: &anchor` block."""
+    start = compose.index(f"&{anchor}\n") + len(f"&{anchor}\n")
+    rest = compose[start:]
+    lines = []
+    for line in rest.splitlines():
+        if line and not line.startswith((" ", "#")):
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _service_environment_merge(compose: str, service: str) -> str:
+    """The `<<:` line of a service's `environment:` mapping."""
+    block = compose.split(f"\n  {service}:\n", 1)[1]
+    environment = block.split("environment:\n", 1)[1]
+    for line in environment.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("<<:"):
+            return stripped
+        if stripped and not stripped.startswith("#"):
+            break
+    return ""
+
+
+def test_the_production_contract_lives_in_exactly_one_place() -> None:
+    """No duplicated literals: one anchor owns the verified timezone/unit."""
+    compose = _compose_text()
+    block = _anchor_block(compose, PRODUCTION_CONTRACT_ANCHOR)
+    declared = re.findall(r"^\s*(NEMSEI_V2_FUSIONSOLAR_\w*PRODUCTION_(?:TIMEZONE|UNIT)):", block, re.MULTILINE)
+    assert declared, "the production-contract anchor declares nothing"
+    for variable in declared:
+        # Once as its declaration, and never again as a second literal.
+        assert compose.count(f"{variable}:") == 1, f"{variable} is declared more than once"
+
+
+def test_every_service_that_diagnoses_the_contract_sees_the_same_one() -> None:
+    """web, worker and scheduler all merge the one contract anchor."""
+    compose = _compose_text()
+    for service in DIAGNOSTIC_CONTRACT_SERVICES:
+        merge = _service_environment_merge(compose, service)
+        assert merge, f"{service} has no environment merge line"
+        if PRODUCTION_CONTRACT_ANCHOR in merge:
+            continue
+        # Or transitively, through the anchor that carries the credentials.
+        assert "v2-fusionsolar-environment" in merge, (
+            f"{service} sees neither the production contract nor the FusionSolar block"
+        )
+        credentials = _anchor_block(compose, "v2-fusionsolar-environment")
+        assert f"*{PRODUCTION_CONTRACT_ANCHOR}" in credentials, (
+            f"{service} inherits a FusionSolar block that dropped the production contract"
+        )
+
+
+def test_the_web_role_reads_the_contract_without_gaining_a_credential() -> None:
+    """Parity is not an excuse to hand the page an account.
+
+    `web` needs to know what the account means by a day and a kWh. It must not
+    learn who the account is: no username/password file, no base URL, no
+    broker token, and `NEMSEI_V2_PROVIDER_READS` stays false for it.
+    """
+    compose = _compose_text()
+    merge = _service_environment_merge(compose, "web")
+    assert PRODUCTION_CONTRACT_ANCHOR in merge
+    assert "v2-fusionsolar-environment" not in merge, "web must not merge the credential block"
+
+    web_block = compose.split("\n  web:\n", 1)[1].split("\n  scheduler:", 1)[0]
+    for forbidden in ("USERNAME_FILE", "PASSWORD_FILE", "BROKER_TOKEN", "BASE_URL"):
+        assert forbidden not in web_block, f"web must not carry {forbidden}"
+    assert "fusionsolar_primary_username" not in web_block
